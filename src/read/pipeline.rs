@@ -56,10 +56,11 @@ impl UnindexedFilterNote {
         }
         self.pending = false;
         if blob.index().is_none() {
-            // Once per run: multi-pass commands open several filtered
-            // pipelines over the same input.
+            // Once per invocation: multi-pass commands open several
+            // filtered pipelines over the same input.
             crate::host::diag_once!(
                 diagnostics,
+                invocation,
                 Note,
                 "reader.filter_without_indexdata",
                 "Input has no indexdata on its first data blob; blob type and spatial filters cannot skip unindexed blobs"
@@ -416,8 +417,6 @@ where
         cancel.check()?;
         pending.push(seq, (item, permit));
         metrics.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(feature = "test-hooks")]
-        cancel.faults().record_reorder_filled(pending.filled_len());
 
         while let Some((item, permit)) = pending.pop_ready() {
             match item {

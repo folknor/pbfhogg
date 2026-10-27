@@ -403,9 +403,11 @@ impl<R: Read + Send> BlobReader<R> {
     /// (page-cache advice, the pipelined engines' counters, their
     /// decompression pools) counts into that invocation.
     ///
-    /// Bind it before the first read. A reader built by a file constructor
-    /// has already advised readahead at open under a fresh token of its own;
-    /// [`BlobReader::open_with`] binds the invocation from the open.
+    /// Bind it before the first read. A reader built by a tokenless file
+    /// constructor has already advised readahead at open under the fresh
+    /// token it observes until rebound, so a failed advice at open stays
+    /// counted there; [`BlobReader::open_with`] binds the invocation from the
+    /// open.
     #[must_use]
     pub fn invocation(mut self, invocation: crate::host::Invocation) -> Self {
         self.frames.set_cancel(invocation);
@@ -639,8 +641,11 @@ impl BlobReader<FileReader> {
     /// # foo().unwrap();
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let reader = FileReader::buffered(path.as_ref())?;
-        Ok(Self::from_reader(reader, path.as_ref()))
+        // One fresh token for the open and the reader, so a failed readahead
+        // advice at open counts into the invocation the reader reports.
+        let invocation = crate::host::Invocation::new();
+        let reader = FileReader::buffered_in(path.as_ref(), &invocation)?;
+        Ok(Self::from_reader(reader, path.as_ref()).invocation(invocation))
     }
 
     /// Open a file for reading with O_DIRECT (bypasses page cache).
@@ -691,8 +696,10 @@ impl BlobReader<FileReader> {
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     /// The page cache is left alone; see [`BlobReader::evict_page_cache`].
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
-        let reader = FileReader::open(path.as_ref(), direct)?;
-        Ok(Self::from_reader(reader, path.as_ref()))
+        // As `from_path`: the open and the reader share one fresh token.
+        let invocation = crate::host::Invocation::new();
+        let reader = FileReader::open_in(path.as_ref(), direct, &invocation)?;
+        Ok(Self::from_reader(reader, path.as_ref()).invocation(invocation))
     }
 
     /// A reader over `reader`, opened from `path`.

@@ -98,7 +98,11 @@ NAME` list each harness in turn to find one test.
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another
-  concurrently running unit test.
+  concurrently running unit test. An integration test in `all` cannot swap
+  the hook at all; one that needs a deliberate unwind on a pool thread
+  (where libtest's output capture does not reach) to stay quiet raises it
+  with `std::panic::resume_unwind`, which unwinds without running the panic
+  hook (the panicking-sink test in `host_contract.rs` does).
 - **Fault hooks are per run, so fault tests share the harness.** No
   fault hook is process-global: their state lives in the fault plan
   carried by the run's cancellation token (see "Conventions"), so an

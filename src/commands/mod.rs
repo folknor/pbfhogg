@@ -511,6 +511,7 @@ pub(crate) fn indexdata_policy(
         // from the same run are folded into it.
         crate::host::diag_once!(
             host.diagnostics,
+            &host.invocation,
             Note,
             "reader.filter_without_indexdata",
             "Input contains blobs without indexdata; proceeding without it, this run is slower"

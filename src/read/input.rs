@@ -712,9 +712,10 @@ mod pin_tests {
         let err = pin.open().unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
         assert_eq!(err.source_path(), Some(input.as_path()));
-        let err = crate::file_reader::FileReader::open(&pin, false)
-            .err()
-            .unwrap();
+        let err =
+            crate::file_reader::FileReader::open_in(&pin, false, &crate::host::Invocation::new())
+                .err()
+                .unwrap();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
     }
 

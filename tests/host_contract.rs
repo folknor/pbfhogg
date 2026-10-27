@@ -367,31 +367,173 @@ fn instrumentation_reaches_only_the_invocations_own_sink() {
 }
 
 /// A sink that panics is switched off, and the run it observes completes.
+///
+/// The sink unwinds with `resume_unwind`, which does not run the panic hook:
+/// a `panic!` on a pool thread prints its message past libtest's capture,
+/// and this test shares the `all` binary, so it cannot install a quiet
+/// process-wide hook. The library's containment (`catch_unwind` in
+/// `Invocation::deliver`) sees the same unwind either way. The payload
+/// counts its own drops: the library must forget a caught payload, not drop
+/// it, because the payload's destructor is caller code too.
 #[test]
 fn a_panicking_sink_does_not_fail_the_run() {
-    struct Panicking(std::sync::atomic::AtomicUsize);
-    impl pbfhogg::debug::InstrumentSink for Panicking {
-        fn marker(&self, _name: &str) {
+    struct Payload(Arc<AtomicUsize>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
             self.0.fetch_add(1, Relaxed);
-            panic!("sink failure");
-        }
-        fn counter(&self, _name: &str, _value: i64) {
-            self.0.fetch_add(1, Relaxed);
-            panic!("sink failure");
         }
     }
-    let sink = Arc::new(Panicking(AtomicUsize::new(0)));
+    struct Panicking {
+        calls: AtomicUsize,
+        payload_drops: Arc<AtomicUsize>,
+    }
+    impl Panicking {
+        fn fail(&self) -> ! {
+            self.calls.fetch_add(1, Relaxed);
+            std::panic::resume_unwind(Box::new(Payload(Arc::clone(&self.payload_drops))))
+        }
+    }
+    impl pbfhogg::debug::InstrumentSink for Panicking {
+        fn marker(&self, _name: &str) {
+            self.fail()
+        }
+        fn counter(&self, _name: &str, _value: i64) {
+            self.fail()
+        }
+    }
+    let sink = Arc::new(Panicking {
+        calls: AtomicUsize::new(0),
+        payload_drops: Arc::new(AtomicUsize::new(0)),
+    });
     let invocation = pbfhogg::host::Invocation::with_sink(
         Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
     );
     assert!(invocation.instrumented());
     assert!(instrumented_cat(5, invocation.clone()) > 0);
     assert!(!invocation.instrumented(), "the sink must be latched off");
-    assert_eq!(sink.0.load(Relaxed), 1, "no call after the first panic");
+    assert_eq!(sink.calls.load(Relaxed), 1, "no call after the first panic");
+    assert_eq!(
+        sink.payload_drops.load(Relaxed),
+        0,
+        "a caught sink panic's payload must be forgotten, not dropped"
+    );
 }
 
+/// Records the publication events of its invocation, and holds every
+/// `PUBLISH_START` until a second one arrives or `PUBLISH_OVERLAP_WAIT`
+/// passes, so two publications that could overlap do.
+struct PublishOrder {
+    events: std::sync::Mutex<Vec<(String, Option<i64>)>>,
+    starts: std::sync::Mutex<usize>,
+    started: std::sync::Condvar,
+}
+/// Long enough for the second publication, already past its hooks, to reach
+/// `PUBLISH_START` if nothing holds it back.
+const PUBLISH_OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+impl pbfhogg::debug::InstrumentSink for PublishOrder {
+    fn marker(&self, name: &str) {
+        if !name.starts_with("PUBLISH_") {
+            return;
+        }
+        self.events
+            .lock()
+            .expect("events")
+            .push((name.to_owned(), None));
+        if name == "PUBLISH_START" {
+            let mut starts = self.starts.lock().expect("starts");
+            *starts += 1;
+            self.started.notify_all();
+            drop(
+                self.started
+                    .wait_timeout_while(starts, PUBLISH_OVERLAP_WAIT, |n| *n < 2)
+                    .expect("starts"),
+            );
+        }
+    }
+    fn counter(&self, name: &str, value: i64) {
+        if name.starts_with("publish_sync_") {
+            self.events
+                .lock()
+                .expect("events")
+                .push((name.to_owned(), Some(value)));
+        }
+    }
+}
+
+/// Two publications of one invocation, at once: each `PUBLISH_START` is
+/// followed by its own `publish_sync_calls`, `publish_sync_ns` and
+/// `PUBLISH_END` before the other publication's span begins, so a stream
+/// reader can pair every sample with its span. Both runs are held at their
+/// `before_publish` hooks until both are there, and the sink holds the first
+/// span open, so without the invocation's publication lock the two spans
+/// interleave on the stream.
 #[test]
-fn unrecognised_indexdata_warning_is_per_handle() {
+fn concurrent_publications_of_one_invocation_do_not_interleave() {
+    let sink = Arc::new(PublishOrder {
+        events: std::sync::Mutex::new(Vec::new()),
+        starts: std::sync::Mutex::new(0),
+        started: std::sync::Condvar::new(),
+    });
+    let mut host = crate::common::test_host();
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    let dir = crate::common::test_scratch();
+    let base = input(dir.path());
+    let at_hooks = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        for name in ["a.pbf", "b.pbf"] {
+            let at_hooks = Arc::clone(&at_hooks);
+            let (host, base, output) = (&host, &base, dir.path().join(name));
+            scope.spawn(move || {
+                let output = crate::common::out(output).before_publish(move || {
+                    at_hooks.wait();
+                });
+                pbfhogg::cat::cat(
+                    &[base],
+                    output,
+                    None,
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                    host,
+                )
+                .expect("cat");
+            });
+        }
+    });
+    let events = sink.events.lock().expect("events");
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    let span = [
+        "PUBLISH_START",
+        "publish_sync_calls",
+        "publish_sync_ns",
+        "PUBLISH_END",
+    ];
+    assert_eq!(names, [span, span].concat(), "{events:?}");
+    let calls: Vec<i64> = events
+        .iter()
+        .filter(|(name, _)| name == "publish_sync_calls")
+        .filter_map(|(_, value)| *value)
+        .collect();
+    assert!(
+        calls.iter().all(|&n| n > 0),
+        "each publication syncs its own output: {calls:?}"
+    );
+    assert!(
+        calls.iter().sum::<i64>()
+            <= i64::try_from(counter(&host.invocation, "writer_sync_all_calls")).expect("calls"),
+        "a publication's syncs are part of its invocation's writer_sync_all_calls"
+    );
+}
+
+/// The once-only unrecognised-indexdata warning is once per invocation, not
+/// per `Diagnostics` handle: readers under separate invocations each warn,
+/// even through clones of one handle (two runs given clones of one
+/// `Diagnostics` used to suppress each other's warning), and readers under
+/// one invocation warn once between them, whichever handle they report to.
+#[test]
+fn unrecognised_indexdata_warning_is_per_invocation() {
     let sink = Arc::new(Recording::default());
     let first = pbfhogg::host::Diagnostics::new(
         Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
@@ -402,15 +544,25 @@ fn unrecognised_indexdata_warning_is_per_handle() {
     let dir = crate::common::test_scratch();
     let bad = dir.path().join("bad-indexdata.osm.pbf");
     crate::common::write_bad_indexdata_pbf(&bad);
-    for (diagnostics, expected) in [(first.clone(), 1), (second, 2), (first, 2)] {
+    let read = |diagnostics: &pbfhogg::host::Diagnostics,
+                invocation: &pbfhogg::host::Invocation| {
         let reader = pbfhogg::BlobReader::from_path(&bad)
             .expect("reader")
-            .diagnostics(diagnostics);
+            .diagnostics(diagnostics.clone())
+            .invocation(invocation.clone());
         for blob in reader {
             blob.expect("blob");
         }
-        assert_eq!(sink.0.lock().expect("sink").len(), expected);
-    }
+        sink.0.lock().expect("sink").len()
+    };
+    // Separate invocations, one handle and its clone: each warns.
+    assert_eq!(read(&first, &pbfhogg::host::Invocation::new()), 1);
+    assert_eq!(read(&first.clone(), &pbfhogg::host::Invocation::new()), 2);
+    // One invocation, either handle: one warning between them.
+    let shared = pbfhogg::host::Invocation::new();
+    assert_eq!(read(&first, &shared), 3);
+    assert_eq!(read(&second, &shared), 3);
+    assert_eq!(read(&first, &shared.clone()), 3);
 }
 fn one_thread_pool() -> Arc<rayon::ThreadPool> {
     Arc::new(

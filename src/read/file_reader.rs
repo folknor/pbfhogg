@@ -79,13 +79,18 @@ impl FileReader {
         }
     }
 
-    /// Open a file for buffered reading (256 KB `BufReader`).
+    /// Open a file for buffered reading (256 KB `BufReader`) under
+    /// `invocation`.
     ///
     /// On Linux, advises the kernel for sequential readahead via
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`, as osmium does, in every
     /// build: the hint is not tied to the `O_DIRECT` or `io_uring` features.
-    pub fn buffered(path: &Path) -> Result<Self> {
-        Self::buffered_from(InputSource::Path(path), &crate::host::Invocation::new())
+    /// A failed advice counts into `invocation`'s `fadvise_failures`: pass
+    /// the invocation the reader built over this one will run under
+    /// ([`BlobReader::invocation`](crate::BlobReader::invocation)), or the
+    /// count lands where nobody reads it. The reader holds no token itself.
+    pub fn buffered_in(path: &Path, invocation: &crate::host::Invocation) -> Result<Self> {
+        Self::buffered_from(InputSource::Path(path), invocation)
     }
 
     fn buffered_from(
@@ -128,20 +133,14 @@ impl FileReader {
         })?))
     }
 
-    /// Open an input, selecting buffered or O_DIRECT based on the `direct`
-    /// flag. A path (`&Path`, `&PathBuf`) is opened as given; a
-    /// [`PinnedInput`](crate::read::input::PinnedInput) is opened as the
-    /// file it pinned.
+    /// Open an input under `invocation`, selecting buffered or O_DIRECT based
+    /// on the `direct` flag. A path (`&Path`, `&PathBuf`) is opened as
+    /// given; a [`PinnedInput`](crate::read::input::PinnedInput) is opened as
+    /// the file it pinned. A buffered open's failed readahead advice counts
+    /// into `invocation` (see [`FileReader::buffered_in`]).
     ///
     /// Returns an error if `direct` is true but the `linux-direct-io` feature
-    /// is not enabled. The open runs under a fresh invocation of its own; use
-    /// [`FileReader::open_in`] to open under a caller's.
-    pub fn open<'a>(source: impl Into<InputSource<'a>>, direct: bool) -> Result<Self> {
-        Self::open_in(source, direct, &crate::host::Invocation::new())
-    }
-
-    /// [`FileReader::open`] under `invocation`: a failed readahead advice at
-    /// open counts into its `fadvise_failures`.
+    /// is not enabled.
     pub fn open_in<'a>(
         source: impl Into<InputSource<'a>>,
         direct: bool,
@@ -250,11 +249,12 @@ mod tests {
         let path = dir.path().join("in.bin");
         std::fs::write(&path, b"bytes").unwrap();
         let before = attempts(Advice::Sequential);
-        let _reader = super::FileReader::buffered(&path).unwrap();
+        let _reader =
+            super::FileReader::buffered_in(&path, &crate::host::Invocation::new()).unwrap();
         assert_eq!(
             attempts(Advice::Sequential),
             before + 1,
-            "FileReader::buffered must advise POSIX_FADV_SEQUENTIAL exactly once"
+            "FileReader::buffered_in must advise POSIX_FADV_SEQUENTIAL exactly once"
         );
     }
 }

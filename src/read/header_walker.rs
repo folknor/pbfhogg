@@ -476,6 +476,7 @@ impl<P: Positional> HeaderWalker<P> {
         self.reported_unindexed_filter = true;
         crate::host::diag_once!(
             self.diagnostics,
+            self.frames.cancel_token(),
             Note,
             "reader.filter_without_indexdata",
             "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"

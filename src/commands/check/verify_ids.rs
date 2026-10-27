@@ -375,7 +375,7 @@ fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
         );
         // The schedule walker would add its unindexed-filter note for the
         // same condition; this warning already says it.
-        host.diagnostics
+        host.invocation
             .mark_reported("reader.filter_without_indexdata");
     }
 }

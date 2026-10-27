@@ -404,18 +404,20 @@ impl std::fmt::Display for BlobSite<'_> {
     }
 }
 
-/// Report, once per run, a `BlobHeader.indexdata` whose length this crate does
-/// not recognise. The wire lengths are not version numbers: v1 is
+/// Report, once per invocation, a `BlobHeader.indexdata` whose length this
+/// crate does not recognise. The wire lengths are not version numbers: v1 is
 /// [`INDEX_SIZE_V1`] bytes while v2 and v3 are both [`INDEX_SIZE`]. A new
 /// version need not add a length; the version/length consistency check lives
 /// in blob_meta.
 pub(crate) fn warn_unrecognised_indexdata(
     diagnostics: &crate::host::Diagnostics,
+    invocation: &crate::host::Invocation,
     len: usize,
     site: BlobSite<'_>,
 ) {
     crate::host::diag_once!(
         diagnostics,
+        invocation,
         Warning,
         "indexdata.unrecognised_length",
         "BlobHeader.indexdata has an unrecognised length ({len} bytes; \

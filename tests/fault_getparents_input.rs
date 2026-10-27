@@ -184,11 +184,13 @@ fn run<'a>(
 /// Whether the run on `host` ran the full-scan arm's pipeline. Read before
 /// anything else uses the token.
 fn ran_full_scan(host: &pbfhogg::host::Host) -> bool {
-    host.invocation
-        .faults()
-        .reorder_filled_high_water
-        .load(Ordering::Relaxed)
-        > 0
+    let mut high_water = 0;
+    host.invocation.for_each_counter(|name, value| {
+        if name == "pipeline_reorder_high_water" {
+            high_water = value;
+        }
+    });
+    high_water > 0
 }
 
 /// The output's elements as (kind, id), in file order.

@@ -61,9 +61,6 @@ pub struct FaultPlan {
     // --- read pipeline (`read::pipeline::run_pipeline`) ---
     decode_gate: Mutex<DecodeGate>,
     decode_gate_cv: Condvar,
-    /// Highest number of filled reorder slots any pipelined read under this
-    /// token has held (plain block reads and command transforms alike).
-    pub reorder_filled_high_water: AtomicUsize,
 
     // --- multi-extract (`commands::extract::multi`) ---
     /// Decline the region grid, so classification runs the linear scan even
@@ -281,7 +278,6 @@ impl FaultPlan {
                 released: false,
             }),
             decode_gate_cv: Condvar::new(),
-            reorder_filled_high_water: AtomicUsize::new(0),
             force_linear_region_grid: AtomicBool::new(false),
             region_grids_declined: AtomicU64::new(0),
             pool_worker_panic: AtomicU64::new(u64::MAX),
@@ -481,12 +477,6 @@ impl FaultPlan {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-    }
-
-    /// Called by a pipelined read's consumer after each reorder push.
-    pub(crate) fn record_reorder_filled(&self, filled: usize) {
-        self.reorder_filled_high_water
-            .fetch_max(filled, Ordering::Relaxed);
     }
 
     // ---- parallel pwrite writer ----------------------------------------

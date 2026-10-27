@@ -9,9 +9,8 @@
 //!
 //! Every backend that splices uses these two loops and nothing else:
 //!
-//! - the buffered sink and the unpipelined `PbfWriter::write_raw_copy` call
-//!   [`copy_range`] with [`CopyOut::Cursor`] (the output fd's position,
-//!   which the copy advances);
+//! - the buffered sink calls [`copy_range`] with [`CopyOut::Cursor`] (the
+//!   output fd's position, which the copy advances);
 //! - the `pwrite` pool calls it with [`CopyOut::At`] (an explicit offset; the
 //!   fd's position is never touched, so concurrent workers cannot race on
 //!   it);
@@ -165,7 +164,7 @@ fn len_to_usize(len: u64) -> usize {
 ///   permission problem (an immutable output) is not masked: the fallback's
 ///   own write fails with it.
 /// - `EINVAL`: the kernel also uses it for "not a regular file" (an output
-///   that is `/dev/null` or a FIFO, which `FileWriter::buffered` accepts),
+///   that is `/dev/null` or a FIFO, which `PbfWriter::to_path` accepts),
 ///   where the fallback is correct. Its other meanings are argument bugs, and
 ///   none can reach the fallback: flags are always 0, the two range checks
 ///   below refuse offsets the syscall cannot represent, and the same-file

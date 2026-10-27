@@ -140,7 +140,14 @@ output any other way.
   no scratch, which is the cheaper leftover.
   The publication span is `PUBLISH_START` .. `PUBLISH_END` (the end marker on
   every return, best effort like every marker: the sidecar drops one when its
-  pipe is full). Everything before `PUBLISH_START` is the run's work. An
+  pipe is full). Publications of one invocation are serialized: each holds
+  the invocation's publication lock from before `PUBLISH_START` until after
+  `PUBLISH_END`, so on the invocation's stream every span's
+  `publish_sync_calls` / `publish_sync_ns` lie inside that span alone, even
+  when a caller runs several commands at once under one token. The lock is
+  taken after the cancellation decision and the `before_publish` hooks, so a
+  token tripped while a publication waits does not stop it.
+  Everything before `PUBLISH_START` is the run's work. An
   in-process timer that must not include publication stops in
   `Output::before_publish`, a hook that runs at the start of publication before
   anything is synced or installed and not at all when publication is refused up

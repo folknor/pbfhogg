@@ -570,6 +570,7 @@ impl<S: FrameSource> Frames<S> {
         if let Some(len) = header.unrecognised_indexdata_len {
             warn_unrecognised_indexdata(
                 &self.diagnostics,
+                &self.cancel,
                 len,
                 BlobSite {
                     source: self.path.as_deref(),

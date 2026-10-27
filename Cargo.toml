@@ -78,6 +78,11 @@ autotests = false
 default = ["commands"]
 geocode-reader = ["dep:s2"]
 commands = ["dep:serde_json", "geocode-reader"]
+# Function-level profiling for brokkr's `--hotpath` / `--alloc` modes. Unlike
+# the per-invocation counters and sink, the hotpath crate's state is
+# process-wide (static queues, one guard per process, and under
+# `hotpath-alloc` a global allocator the CLI installs), so concurrent runs in
+# one process share their figures. Meaningful for one run per process only.
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 linux-direct-io = []

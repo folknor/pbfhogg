@@ -15,7 +15,6 @@ use crate::block_builder::OwnedBlock;
 use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
-use crate::write::copy_range::{CopyOut, copy_range};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WriterMetrics;
 use std::borrow::Cow;
@@ -1009,11 +1008,11 @@ impl<W: Write> PbfWriter<W> {
             RawPayload::Chunks(chunks) => chunks
                 .iter()
                 .try_for_each(|chunk| write_accepted(&mut *w, chunk, metrics)),
-            // A splice needs the file under the writer; only
-            // `PbfWriter<FileWriter>::write_raw_copy` has it, and it writes
-            // its copy range itself.
+            // A splice is only ever sent to a pipeline's writer thread
+            // (`PbfWriter<FileWriter>::write_raw_copy`); no synchronous
+            // writer has a file to splice into.
             RawPayload::CopyRange { .. } => Err(Error::internal(
-                "a synchronous copy range is written by write_raw_copy",
+                "a copy range is only written through a pipeline",
             )),
         });
         if result.is_ok() {
@@ -1399,35 +1398,12 @@ impl PbfWriter<FileWriter> {
             self.mark_pending();
             Ok(())
         } else {
-            // This is reachable through FileWriter::buffered plus the public
-            // generic PbfWriter::new constructor. Counted and timed like the
-            // pipelined sink's copy range (see `write_raw_sync`).
-            let metrics = &self.cancel.metrics().writer;
-            RawPayload::CopyRange {
-                in_file,
-                offset,
-                len,
-            }
-            .count(metrics);
-            let writer = self
-                .writer
-                .as_mut()
-                .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
-            let cancel = &self.cancel;
-            let result = metrics.time_handoff(|| -> Result<()> {
-                let out = writer.flush_and_file()?.ok_or_else(|| {
-                    Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
-                })?;
-                // `copy_range` decides on the original errno (whether the
-                // userspace fallback takes over) before anything converts it.
-                copy_range(in_file, CopyOut::Cursor(out), offset, len, cancel)?;
-                metrics.record_accepted(len);
-                Ok(())
-            });
-            if result.is_ok() {
-                self.mark_pending();
-            }
-            result
+            // Every `PbfWriter<FileWriter>` is pipelined (`FileWriter` has no
+            // public constructor, and the crate never builds a synchronous
+            // writer over one), so no pipeline means `flush` has already
+            // joined the writer thread: a write after the end of stream,
+            // refused before anything is counted.
+            Err(Error::invalid_argument(WRITER_CONSUMED))
         }
     }
 }

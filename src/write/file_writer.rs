@@ -17,15 +17,24 @@ use super::metrics::WriterMetrics;
 ///
 /// Implements [`Write`] by delegating to the active variant. Its write and
 /// sync counters (`writer_buffered_write_*`, `writer_direct_write_*`,
-/// `writer_sync_all_*`) count into the invocation it was opened under; the
-/// public constructors open it under a fresh one of its own.
+/// `writer_sync_all_*`) count into the invocation it was opened under.
+///
+/// Public only as the output type of the path constructors'
+/// `PbfWriter<FileWriter>`; there is no public constructor. Only the
+/// `PbfWriter` that owns it opens one, under the writer's own invocation,
+/// so the file's counters and the writer's are always one invocation's. A
+/// `FileWriter` a caller could build and hand to
+/// [`PbfWriter::new_in`](crate::writer::PbfWriter::new_in) would hold a
+/// token of its own and split the run's writer totals across two
+/// invocations without any error. A synchronous writer over a file is
+/// [`PbfWriter::to_path_sync`](crate::writer::PbfWriter::to_path_sync).
 pub struct FileWriter {
     inner: Inner,
     invocation: crate::host::Invocation,
 }
 
 enum Inner {
-    /// Buffered output; `FileWriter::buffered` uses a 256 KiB buffer.
+    /// Buffered output; `FileWriter::buffered_in` uses a 256 KiB buffer.
     Buffered(BufWriter<File>),
 
     /// O_DIRECT writer with page-aligned buffering.
@@ -34,16 +43,13 @@ enum Inner {
 }
 
 impl FileWriter {
-    /// Create a buffered file writer (default path).
-    pub fn buffered(path: &Path) -> crate::Result<Self> {
-        Self::buffered_in(path, &crate::host::Invocation::new())
-    }
-
-    /// [`FileWriter::buffered`] under `invocation`: its write and sync
-    /// counters record there. A `PbfWriter` composed over it
-    /// ([`PbfWriter::new_in`](crate::writer::PbfWriter::new_in)) should be
-    /// given the same invocation, or its totals are split across two.
-    pub fn buffered_in(path: &Path, invocation: &crate::host::Invocation) -> crate::Result<Self> {
+    /// A buffered (256 KiB) file writer under `invocation`, the invocation
+    /// of the `PbfWriter` that will own it: its write and sync counters
+    /// record there.
+    pub(crate) fn buffered_in(
+        path: &Path,
+        invocation: &crate::host::Invocation,
+    ) -> crate::Result<Self> {
         let file = super::create_backend_file(path)?;
         Ok(Self {
             inner: Inner::Buffered(BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file)),
@@ -51,16 +57,13 @@ impl FileWriter {
         })
     }
 
-    /// Create an `O_DIRECT` file writer.
-    #[cfg(feature = "linux-direct-io")]
-    pub fn direct(path: &Path) -> crate::Result<Self> {
-        Self::direct_in(path, &crate::host::Invocation::new())
-    }
-
-    /// [`FileWriter::direct`] under `invocation` (see
+    /// An `O_DIRECT` file writer under `invocation` (see
     /// [`FileWriter::buffered_in`]).
     #[cfg(feature = "linux-direct-io")]
-    pub fn direct_in(path: &Path, invocation: &crate::host::Invocation) -> crate::Result<Self> {
+    pub(crate) fn direct_in(
+        path: &Path,
+        invocation: &crate::host::Invocation,
+    ) -> crate::Result<Self> {
         Ok(Self {
             inner: Inner::Direct(DirectWriter::create(path)?),
             invocation: invocation.clone(),
@@ -86,7 +89,7 @@ impl FileWriter {
     /// returned. That is reported as success, not as a failed write. Regular
     /// files and block devices propagate every
     /// `fsync` error, `EINVAL` included.
-    pub fn sync(&mut self) -> crate::Result<()> {
+    pub(crate) fn sync(&mut self) -> crate::Result<()> {
         self.flush()?;
         let metrics = &self.invocation.metrics().writer;
         let result = match &mut self.inner {
@@ -265,7 +268,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sync_on_dev_null_succeeds() {
-        let mut w = FileWriter::buffered(std::path::Path::new("/dev/null")).unwrap();
+        let mut w = FileWriter::buffered_in(
+            std::path::Path::new("/dev/null"),
+            &crate::host::Invocation::new(),
+        )
+        .unwrap();
         w.write_all(b"bytes").unwrap();
         w.sync().unwrap();
     }

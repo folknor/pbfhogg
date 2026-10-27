@@ -196,10 +196,11 @@ fn run_skip(path: &Path) -> Outcome {
 /// fixtures here are by construction; the frame layer under test is the same
 /// with the refusal off, as on the public `BlobReader` sources.
 fn file_frames(path: &Path) -> Frames<FileReader> {
+    let host = crate::host::Host::for_tests();
     let mut frames = Frames::of_input(
-        FileReader::buffered(path).unwrap(),
+        FileReader::buffered_in(path, &host.invocation).unwrap(),
         path,
-        &crate::host::Host::for_tests(),
+        &host,
     );
     frames.accept_partial_index();
     frames

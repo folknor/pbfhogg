@@ -77,6 +77,7 @@ pub fn report_writer_degradations(host: &crate::host::Host) {
     if dropped != 0 {
         crate::host::diag_once!(
             diagnostics,
+            &host.invocation,
             Warning,
             "writer.tagdata_dropped_oversize",
             "{dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
@@ -91,6 +92,7 @@ pub fn report_writer_degradations(host: &crate::host::Host) {
         let first = std::io::Error::from_raw_os_error(errno);
         crate::host::diag_once!(
             diagnostics,
+            &host.invocation,
             Note,
             "writer.copy_range_fallback",
             "the kernel refused copy_file_range for {ranges} passthrough ranges ({bytes} bytes requested), so they were routed to the userspace copy, which moves every byte through this process; first refusal: {name}, {first}"

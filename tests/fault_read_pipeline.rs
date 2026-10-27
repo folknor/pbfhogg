@@ -5,7 +5,6 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -38,6 +37,18 @@ impl Drop for Driver {
     fn drop(&mut self) {
         self.release_and_join();
     }
+}
+
+/// The invocation's own `pipeline_reorder_high_water` counter: the most
+/// filled reorder slots any pipelined read under it has held.
+fn reorder_high_water(invocation: &Invocation) -> u64 {
+    let mut value = 0;
+    invocation.for_each_counter(|name, v| {
+        if name == "pipeline_reorder_high_water" {
+            value = v;
+        }
+    });
+    value
 }
 
 #[test]
@@ -74,7 +85,7 @@ fn admission_high_water_bounded_under_slow_first_decode() {
     }
 
     let start = Instant::now();
-    while faults.reorder_filled_high_water.load(Relaxed) < 1 {
+    while reorder_high_water(&cancel) < 1 {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "later decode did not reach the reorder buffer"
@@ -89,5 +100,5 @@ fn admission_high_water_bounded_under_slow_first_decode() {
     driver.release_and_join();
     result.unwrap();
 
-    assert!(faults.reorder_filled_high_water.load(Relaxed) <= 2);
+    assert!(reorder_high_water(&cancel) <= 2);
 }

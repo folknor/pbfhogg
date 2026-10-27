@@ -17,8 +17,8 @@ pub struct Host {
     /// instrumentation. Every command run under this host stops at its next
     /// checkpoint once the token is tripped and returns
     /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled). A token is
-    /// sticky and its counters accumulate: give each independent invocation a
-    /// fresh one.
+    /// sticky, its counters accumulate and its once-only diagnostics stay
+    /// reported: give each independent invocation a fresh one.
     pub invocation: Invocation,
 }
 
@@ -57,6 +57,12 @@ pub struct Host {
 /// Two invocations are two streams; a caller that wants several runs on one
 /// stream gives each its own sink forwarding to a shared collector, so it can
 /// tell them apart.
+///
+/// The invocation is also the unit of the diagnostics a run reports only
+/// once (see [`Diagnostics`]): every pass of the run shares its report-once
+/// keys, whichever `Diagnostics` handle it reports through, so several calls
+/// grouped under one invocation report each such diagnostic once between
+/// them, and separate invocations each report their own.
 #[derive(Clone, Default)]
 pub struct Invocation(Arc<InvocationState>);
 
@@ -81,6 +87,15 @@ struct InvocationState {
     sink: Option<Arc<dyn crate::debug::InstrumentSink>>,
     /// Set once the sink has panicked: later emissions skip it.
     sink_failed: std::sync::atomic::AtomicBool,
+    /// The keys of the once-per-invocation diagnostics already reported (or
+    /// covered by a more specific report). Touched only where such a
+    /// diagnostic is about to be emitted, never on a per-element path.
+    reported: std::sync::Mutex<std::collections::HashSet<&'static str>>,
+    /// Held across one publication's span (`PUBLISH_START` to `PUBLISH_END`
+    /// and the syncs and installs between), so two publications of one
+    /// invocation never overlap and each span's `publish_sync_*` samples are
+    /// its own on the stream.
+    publishing: std::sync::Mutex<()>,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -233,6 +248,40 @@ impl Invocation {
     #[inline]
     pub(crate) fn metrics(&self) -> &crate::counters::InvocationMetrics {
         &self.0.metrics
+    }
+
+    /// Claim the once-per-invocation diagnostic `key`: `true` the first time
+    /// any part of this invocation asks (the caller then emits it), `false`
+    /// ever after, and after [`mark_reported`](Self::mark_reported). The
+    /// lock is released before the caller emits, so a slow diagnostic sink
+    /// never holds it.
+    pub(crate) fn first_report(&self, key: &'static str) -> bool {
+        self.0
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+    }
+
+    /// Record that the once-per-invocation diagnostic `key` is already
+    /// covered, so a later `diag_once!` with that key under this invocation
+    /// stays silent. For a command that has just reported the same condition
+    /// in its own, more specific words.
+    pub(crate) fn mark_reported(&self, key: &'static str) {
+        self.first_report(key);
+    }
+
+    /// Serialize one publication of this invocation against any other: the
+    /// guard is held from before `PUBLISH_START` until after `PUBLISH_END`.
+    /// Caller code that runs under it (the instrument sink) must not publish
+    /// under the same invocation, which its contract already forbids. A
+    /// poisoned lock is recovered: it guards no state, only the span's
+    /// exclusion.
+    pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .publishing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Visit every engine-level counter this invocation has recorded so
@@ -783,14 +832,18 @@ pub enum EventKind {
 pub trait DiagnosticSink: Send + Sync {
     fn event(&self, event: &Event<'_>);
 }
-#[derive(Default)]
-pub struct OnceKeys {
-    keys: std::sync::Mutex<std::collections::HashSet<&'static str>>,
-}
+/// Where a run's diagnostic events go: a handle on a [`DiagnosticSink`].
+///
+/// Cloning shares the sink and nothing else. A `Diagnostics` holds no run
+/// state: the diagnostics a run reports only once (a missing-indexdata note,
+/// an unrecognised-indexdata warning, a writer degradation) are once per
+/// [`Invocation`], whose report-once keys every part of the run shares. Two
+/// invocations handed one `Diagnostics` (or clones of it) each report their
+/// own; several calls grouped under one `Invocation` report each such
+/// diagnostic once between them.
 #[derive(Clone)]
 pub struct Diagnostics {
     sink: Arc<dyn DiagnosticSink>,
-    once: Arc<OnceKeys>,
 }
 impl std::fmt::Debug for Diagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -803,10 +856,7 @@ impl DiagnosticSink for Discard {
 }
 impl Diagnostics {
     pub fn new(sink: Arc<dyn DiagnosticSink>) -> Self {
-        Self::with_once(sink, Arc::new(OnceKeys::default()))
-    }
-    pub fn with_once(sink: Arc<dyn DiagnosticSink>, once: Arc<OnceKeys>) -> Self {
-        Self { sink, once }
+        Self { sink }
     }
     pub fn discard() -> Self {
         Self::new(Arc::new(Discard))
@@ -821,29 +871,17 @@ impl Diagnostics {
     pub(crate) fn emit(&self, kind: EventKind, key: &'static str, args: std::fmt::Arguments<'_>) {
         self.sink.event(&Event { kind, key, args });
     }
-    /// Record that the event with `key` is already covered, so a later
-    /// `diag_once!` with that key stays silent. For a command that has just
-    /// reported the same condition in its own, more specific words.
-    pub(crate) fn mark_reported(&self, key: &'static str) {
-        self.once
-            .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key);
-    }
+    /// Emit the event once per `invocation`: the first `diag_once!` with
+    /// `key` under that invocation (or a clone of it) reaches the sink, every
+    /// later one, and any after [`Invocation::mark_reported`], stays silent.
     pub(crate) fn emit_once(
         &self,
+        invocation: &Invocation,
         kind: EventKind,
         key: &'static str,
         args: std::fmt::Arguments<'_>,
     ) {
-        let first = self
-            .once
-            .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key);
-        if first {
+        if invocation.first_report(key) {
             self.emit(kind, key, args);
         }
     }
@@ -885,8 +923,10 @@ impl Drop for SummaryWriter<'_> {
 macro_rules! diag {
     ($d:expr, $kind:ident, $key:literal, $($args:tt)+) => { $d.emit($crate::host::EventKind::$kind, $key, format_args!($($args)+)) };
 }
+/// `diag_once!(diagnostics, invocation, Kind, "key", ...)`: emit once per
+/// invocation (see [`Diagnostics::emit_once`]).
 macro_rules! diag_once {
-    ($d:expr, $kind:ident, $key:literal, $($args:tt)+) => { $d.emit_once($crate::host::EventKind::$kind, $key, format_args!($($args)+)) };
+    ($d:expr, $inv:expr, $kind:ident, $key:literal, $($args:tt)+) => { $d.emit_once($inv, $crate::host::EventKind::$kind, $key, format_args!($($args)+)) };
 }
 pub(crate) use {diag, diag_once};
 
@@ -901,29 +941,39 @@ mod diagnostic_tests {
             self.0.lock().expect("sink").push(e.args.to_string());
         }
     }
+    /// Report-once keys belong to the invocation, not the `Diagnostics`
+    /// handle: one handle (or its clones) under two invocations reports
+    /// twice, two handles under one invocation (or its clones) once.
     #[test]
-    fn once_keys_share_only_when_requested() {
+    fn once_keys_are_per_invocation() {
         let sink = Arc::new(Sink::default());
-        let once = Arc::new(OnceKeys::default());
-        let first = Diagnostics::with_once(
-            Arc::clone(&sink) as Arc<dyn DiagnosticSink>,
-            Arc::clone(&once),
-        );
-        let shared = Diagnostics::with_once(Arc::clone(&sink) as Arc<dyn DiagnosticSink>, once);
-        let separate = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        for d in [first, shared, separate] {
-            d.emit_once(EventKind::Warning, "key", format_args!("warning"));
-        }
-        assert_eq!(*sink.0.lock().expect("sink"), ["warning", "warning"]);
+        let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        let other = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        let (first, second) = (Invocation::new(), Invocation::new());
+        d.emit_once(&first, EventKind::Warning, "key", format_args!("first"));
+        d.clone()
+            .emit_once(&second, EventKind::Warning, "key", format_args!("second"));
+        let shared = first.clone();
+        other.emit_once(&shared, EventKind::Warning, "key", format_args!("again"));
+        d.emit_once(&second, EventKind::Warning, "key", format_args!("again"));
+        assert_eq!(*sink.0.lock().expect("sink"), ["first", "second"]);
     }
     #[test]
     fn a_reported_key_silences_a_later_once_event() {
         let sink = Arc::new(Sink::default());
         let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        d.mark_reported("key");
-        d.emit_once(EventKind::Note, "key", format_args!("note"));
-        d.emit_once(EventKind::Note, "other", format_args!("other"));
-        assert_eq!(*sink.0.lock().expect("sink"), ["other"]);
+        let invocation = Invocation::new();
+        invocation.mark_reported("key");
+        d.emit_once(&invocation, EventKind::Note, "key", format_args!("note"));
+        d.emit_once(&invocation, EventKind::Note, "other", format_args!("other"));
+        // Another invocation is not covered by the first one's report.
+        d.emit_once(
+            &Invocation::new(),
+            EventKind::Note,
+            "key",
+            format_args!("fresh"),
+        );
+        assert_eq!(*sink.0.lock().expect("sink"), ["other", "fresh"]);
     }
     #[test]
     fn summary_writer_splits_lines_and_keeps_partial_on_drop() {

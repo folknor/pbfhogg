@@ -40,7 +40,9 @@ only exists under library use is unverified:
   records that stage 1 opens thousands of shard files at once);
 - no stderr from the library (diagnostics only through `host::Diagnostics`).
 
-Undecided: what brokkr ships for this. The likely shape is a small harness
+Filed as brokkr#46, now that each `Invocation` owns its counters and its
+instrumentation sink (`0370e462` to `0fe60da5`). Undecided: what brokkr
+ships for this. The likely shape is a small harness
 binary depending on pbfhogg as a library, running a scripted sequence of calls
 in one process (sequential and concurrent), with a brokkr subcommand that runs
 it, records walls and stalls per call, and compares its outputs with the CLI's.
@@ -131,10 +133,29 @@ v2). The CLI surface redesign is deferred past 0.6.0.
   delta of the run's `writer_sync_all_*` (same values for a CLI run, which
   never publishes concurrently). (`merge_header_read_ms` widening at
   `a3f1a1bc` was ruled to need no entry; the comment at its timer says it.)
-- **`check` small-file sizing.** The change reverted on 2026-10-26
-  (letting a small file pre-allocate less than the per-kind floor) is safe
-  to retry since `23c53a0b` moved overflow IDs into a side set, if anyone
-  wants the memory back.
+- **`IdSet::pre_allocate` touches every page it allocates.** `new_dense`
+  in `src/idset.rs` builds each 4 MiB bit-array chunk by collecting
+  `AtomicU64::new(0)`, which writes every word, so a pre-allocated range is
+  resident at once. `check --refs` pre-allocates its node set to the
+  per-kind floor (14B IDs, about 1.6 GB) whatever the file's size, so a
+  three-node test file runs at about 1.2 GB RSS and most of a second of
+  CPU zeroing it (seen 2026-10-27 under `brokkr lock`: `pbfhogg check
+  --refs dangling.osm.pbf`, a musl debug test, 1.2 GB RSS at 820 ms). Every
+  small file pays the same, in `check` and in every other `pre_allocate`
+  caller (renumber, the geocode builder). Candidate: allocate chunks zeroed
+  (`Box::<[AtomicU64]>::new_zeroed_slice`, sound since an all-zero
+  `AtomicU64` is valid), so large chunks come from `calloc` / `mmap` as
+  untouched zero pages and RSS follows the pages written. The floor, the
+  file-length bound and the hostile-input exposure stay as they are; only
+  residency changes. This supersedes the small-file sizing change reverted
+  on 2026-10-26 (letting a small file reserve less than the floor), which
+  was retryable only because `23c53a0b` moved overflow IDs into a side set
+  and is not needed if allocation stops touching pages. Owed before it
+  lands: a matched planet cell for `check --refs` and one `pre_allocate`
+  caller each of renumber and the geocode builder, since demand faults
+  spread over the run replace one zero-fill up front (and transparent huge
+  pages may or may not back the zeroed mapping), plus a peak-RSS reading on
+  a small file.
 - **brokkr and `cat --clean --force`**: since `8da26b23`, `--clean --force`
   without `--type` is refused by clap. Unchecked whether any brokkr cell
   passes that combination; check before the cat `--clean` cells.

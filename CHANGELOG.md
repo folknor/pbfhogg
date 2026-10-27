@@ -20,10 +20,17 @@
   and writers bind the invocation at construction: the `cancel(token)`
   setters on `BlobReader` and `ElementReader` are `invocation(token)`, and
   `BlobReader::open_with`, `ElementReader::open_with`, `FileReader::open_in`,
-  `FileWriter::buffered_in` / `direct_in`, `PbfWriter::to_path_with` and
-  `PbfWriter::new_in` open under a caller's host or token. A writer built by
+  `FileReader::buffered_in`, `PbfWriter::to_path_with` and
+  `PbfWriter::new_in` open under a caller's host or token; the tokenless
+  `FileReader::open` and `FileReader::buffered` are gone. A writer built by
   a tokenless constructor counts into its own, `PbfWriter::invocation`.
-  `FileWriter` is a struct; its variants are no longer public.
+  `FileWriter` is a struct with no public constructor (`FileWriter::buffered`,
+  `direct` and `sync` are gone): it exists only inside the `PbfWriter` the
+  path constructors return, under that writer's invocation, because a
+  `FileWriter` handed to `PbfWriter::new_in` would have recorded its writes
+  and syncs into a token of its own, splitting the run's `writer_*` totals
+  without an error. For a synchronous file writer use
+  `PbfWriter::to_path_sync`.
 - **Instrumentation goes to the invocation's sink.** Every phase marker and
   counter sample a run emits goes to its `Invocation`'s
   `debug::InstrumentSink` (`Invocation::with_sink`), so concurrent library
@@ -39,7 +46,18 @@
   session was opened under a different `Invocation`; `OutputDir::writer`
   takes the invocation. `publish_sync_calls` / `publish_sync_ns` now count
   exactly the publication's own syncs rather than a delta of the run's
-  totals.
+  totals. Publications of one invocation are serialized, so two commands
+  publishing at once under one token no longer interleave their
+  `PUBLISH_START` .. `PUBLISH_END` spans and `publish_sync_*` samples on the
+  invocation's stream; the second waits for the first's syncs.
+- **Once-only diagnostics are once per invocation, not per `Diagnostics`.**
+  The warnings and notes a run reports only once (missing or unrecognised
+  indexdata, writer degradations) used to be keyed on the `Diagnostics`
+  handle, so two runs given clones of one `Diagnostics`, under separate
+  invocations, silently suppressed each other's. They are now keyed on the
+  `Invocation`: each invocation reports its own, and calls grouped under one
+  `Invocation` report each once between them. `Diagnostics` is only a sink
+  handle; `host::OnceKeys` and `Diagnostics::with_once` are gone.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming

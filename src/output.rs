@@ -328,20 +328,36 @@ impl<'a> PublishSync<'a> {
 /// closes on every return. Just before `PUBLISH_END` it emits the
 /// publication's own syncs, `publish_sync_calls` and `publish_sync_ns`, from
 /// its [`PublishSync`] tally (repeated publications emit repeated values),
-/// so a reader can tell the syncs publication did from any a writer did,
-/// exact even while another publication of the same invocation runs. Two
-/// concurrent publications of one invocation still emit under the same
-/// names, so a stream reader cannot tell their values apart. Markers and
-/// counters are best effort: the sidecar drops one when its pipe is full.
+/// so a reader can tell the syncs publication did from any a writer did.
+///
+/// The span holds the invocation's publication lock from before
+/// `PUBLISH_START` until after `PUBLISH_END`, so two publications of one
+/// invocation (a caller running two commands at once under one token) run
+/// their spans one after the other: on the stream each `PUBLISH_START` is
+/// followed by its own two counters and `PUBLISH_END` before the next
+/// publication's `PUBLISH_START`. Only the publication spans are made
+/// pairable this way; other phase spans of concurrent calls grouped under
+/// one invocation can still overlap under the same names. Publication has
+/// already made its cancellation decision before it waits for the lock, so a
+/// token tripped while it waits does not stop it. Markers and counters are
+/// best effort: the sidecar drops one when its pipe is full.
 struct PublishSpan<'a> {
     invocation: &'a crate::host::Invocation,
     sync: &'a PublishSync<'a>,
+    /// Released after `drop` has emitted `PUBLISH_END` (fields drop after
+    /// the `Drop` body).
+    _exclusive: std::sync::MutexGuard<'a, ()>,
 }
 
 impl<'a> PublishSpan<'a> {
     fn start(invocation: &'a crate::host::Invocation, sync: &'a PublishSync<'a>) -> Self {
+        let exclusive = invocation.publication_lock();
         invocation.marker("PUBLISH_START");
-        Self { invocation, sync }
+        Self {
+            invocation,
+            sync,
+            _exclusive: exclusive,
+        }
     }
 }
 

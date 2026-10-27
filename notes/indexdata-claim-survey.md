@@ -146,8 +146,10 @@ phase below except altw and time-filter: repack, degrade, the sort and dedupe
 sweep, diff and derive, geocode, extract and multi-extract, tags-filter,
 tags-count, `inspect --nodes`, getid and getparents. The kind rows of this
 section are DONE for those commands; slice 2 did the apply-changes and sweep
-rows (kind, range, count and order, below); diff `-c`, time-filter and the
-altw rows are not done. The raw-walker adopters (extract simple, geocode Pass 1.5)
+rows (kind, range, count and order, below); slice 3 did altw (both
+backends: kind, exact range and count on every decoded blob, order on every
+external decode), time-filter (order, versions, snapshot duplicates) and
+diff `-c` (decoded counts), and the `sort --distrust-metadata` remedy. The raw-walker adopters (extract simple, geocode Pass 1.5)
 take the `KindSet` the `src/scan` node and way walkers now return from tags
 they already read, so no adopter walks a blob twice.
 
@@ -207,14 +209,15 @@ they already read, so no adopter walks a blob twice.
 - **sort / `cat --dedupe` sweep order:** an overstated claimed min makes the
   sweep pop out of order, undetected; `pop_one` and the write closure see
   every written element, so "not below the last written ID" is one compare.
-- **altw sparse pass 1:** a node blob's tuples and every ID are visited in
+- **DONE (slice 3): altw sparse pass 1:** a node blob's tuples and every ID are visited in
   the rank loop; count and range checks are free if the claim reached the
   closure (it does not today). External stage 2 already reads `last()` and
   has the claimed range.
-- **diff count-only paths:** `diff_stats` and `-c` single-sided counts use
+- **DONE (slice 3, decoded runs; a byte-equal pair stays on the claim):
+  diff count-only paths:** `diff_stats` and `-c` single-sided counts use
   the claimed `index.count` even though the block is decoded (wrong number,
   right lines).
-- **time-filter** trusts `Sort.Type_then_ID` for grouping versions: an
+- **DONE (slice 3): time-filter** trusts `Sort.Type_then_ID` for grouping versions: an
   unsorted file emits the same object more than once. The previous
   `(kind, id)` is already held, so the order check is one compare. No
   indexdata involved, and time-filter has no `--force`.
@@ -254,23 +257,32 @@ bound; altw external `check_range` and `assemble_block`.
 
 ### D. Lateral findings (bugs or smells outside the claim question)
 
-- altw `decode_one` (sparse; external stage 4 only when stage 1 also found
-  zero ways) re-indexes a node blob labelled way as a Way blob with count 0
+- DONE (slice 3: unreachable after the kind refusals, and both reframes
+  refuse a claim over no way): altw `decode_one` (sparse; external stage 4
+  only when stage 1 also found zero ways) re-indexes a node blob labelled way as a Way blob with count 0
   and IDs 0..0: pbfhogg writes a false claim the next run believes. Free
   check: `stats.way_count` against `desc.count`.
-- altw backends disagree on a way inside a non-way-claimed blob: external
+- DONE (slice 3: both refuse, IndexdataMismatch with the contradiction):
+  altw backends disagree on a way inside a non-way-claimed blob: external
   always refuses, sparse refuses only under `inject_prepass` and otherwise
   handles it, so `--index-type` changes what is accepted.
 - `blob_filter_check` ignores `node_bbox`, though `uses_index()` counts a
   bbox as an index-backed filter (where a spatial `BlobFilter` reaches it is
   untraced).
-- `ElementReader`'s sort-claim check is a `debug_assert` on node IDs only.
+- DONE (slice 3: removed; it panicked debug builds on a lying file and
+  checked nothing in release, and the commands that depend on order check
+  it): `ElementReader`'s sort-claim check is a `debug_assert` on node IDs
+  only.
 - `BlobIndex::deserialize` bounds neither `count` nor the ID range by kind;
   unreadable bytes on one blob count as unindexed and trip the
   partial-index refusal rather than a mismatch.
 - `block_type()` returns `Mixed` for a changeset group too.
 - `sort` under an unsorted header copies unverified tagdata when the index
-  claim holds.
+  claim holds (`--distrust-metadata` checks it; the default unsorted-header
+  path still does not).
+- Open (slice 3): a sorted claim the input breaks is carried into the
+  output by commands that do not depend on order (sparse altw, the snapshot
+  path aside, extract): the output repeats the input's lie.
 - repack's "cannot tell a mislabel from a replicated unindexed blob" comment
   looks stale now that partial indexes are refused.
 - `inspect --show`'s sorted early exit compares numeric `min_id` against
@@ -281,7 +293,9 @@ bound; altw external `check_range` and `assemble_block`.
   indexdata does not parse (inferred).
 - A false sort claim is carried into extract's output header
   (`OutputFacts::carry`, inferred).
-- The CLI's advice for `ErrorKind::Unsorted` is `pbfhogg sort`, but on a
+- DONE (slice 3: the advice is `sort --distrust-metadata`, which scans every
+  blob whatever the header claims): The CLI's advice for
+  `ErrorKind::Unsorted` is `pbfhogg sort`, but on a
   file whose header claims sorted while a blob is internally out of order
   (what apply-changes now refuses) `sort` takes its header-only fast path
   and copies that blob through unchanged, so the advice reproduces the

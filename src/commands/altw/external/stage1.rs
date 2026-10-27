@@ -84,6 +84,8 @@ pub(super) struct WayBlobTask {
     pub(super) seq: u32,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
+    /// The blob's indexdata claim, which pass A holds to the ways it scans.
+    pub(super) claim: crate::blob_meta::BlobIndex,
 }
 
 /// One pass A worker's shard, owned by the caller so the id-shard writers
@@ -115,6 +117,14 @@ struct Stage1Consumer<'a> {
     varint_buf: Vec<u8>,
     total_refs: u64,
     counters: &'a PassACounters,
+    /// The way blobs in input order, held to the sorted header across blob
+    /// boundaries by their decoded first ways. Each blob's own walk checks
+    /// the order inside it, and its claim's exact range bounds its last key,
+    /// but a mixed-sign range cannot name its first element (blobs `[-1]`
+    /// then `[0, -2, 1]` pass the metadata scan's range watermark).
+    schedule: &'a [WayBlobTask],
+    order: crate::osm_id::OrderWatermark,
+    input: &'a std::path::Path,
 }
 
 impl Stage1Consumer<'_> {
@@ -129,12 +139,33 @@ impl Stage1Consumer<'_> {
     }
 }
 
-impl crate::ordered_pool::OrderedConsumer<(u64, Vec<u32>)> for Stage1Consumer<'_> {
+impl crate::ordered_pool::OrderedConsumer<(u64, Vec<u32>, Option<i64>)> for Stage1Consumer<'_> {
     fn consume(
         &mut self,
-        _task: usize,
-        (ref_count, per_way_rcs): (u64, Vec<u32>),
+        task: usize,
+        (ref_count, per_way_rcs, first): (u64, Vec<u32>, Option<i64>),
     ) -> crate::Result<()> {
+        // A way blob holds at least one way (its exact claim was checked),
+        // so `first` is always present here.
+        if let Some(first) = first {
+            let claim = &self.schedule[task].claim;
+            if let Err(v) = self.order.observe_keys(
+                crate::ElementKind::Way.ordinal(),
+                crate::osm_id::osm_id_key(first),
+                crate::osm_id::blob_osm_last_key(claim.min_id, claim.max_id),
+            ) {
+                return Err(crate::error::new_unsorted(format!(
+                    "altw external: refusing an input whose blob contradicts its \
+                     Sort.Type_then_ID header - a way blob starting at way {} follows way \
+                     blobs already reaching way {}",
+                    v.first_id, v.previous_id
+                ))
+                .locate_blob(crate::error::Location::at_offset(
+                    self.input,
+                    self.schedule[task].data_offset,
+                )));
+            }
+        }
         self.sidecar_writer.write_all(&ref_count.to_le_bytes())?;
         self.total_refs += ref_count;
 
@@ -227,6 +258,7 @@ pub(super) fn build_way_schedule(
             seq,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
+            claim: meta.claim(),
         });
         seq += 1;
     }
@@ -296,6 +328,9 @@ pub(super) fn stage1_pass_a(
         varint_buf: Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY),
         total_refs: 0,
         counters: counters_ref,
+        schedule,
+        order: crate::osm_id::OrderWatermark::default(),
+        input,
     };
 
     // The ordered pool writes the two sidecars in blob order; cancellation
@@ -338,7 +373,7 @@ pub(super) fn stage1_pass_a(
                 e.locate_blob(crate::error::Location::at_offset(input, task.data_offset))
             };
 
-            let result: crate::Result<(u64, Vec<u32>)> = (|| {
+            let result: crate::Result<(u64, Vec<u32>, Option<i64>)> = (|| {
                 let t0 = crate::counters::Stopwatch::start();
                 read_buf.resize(task.data_size, 0);
                 file.read_exact_at(read_buf, task.data_offset)
@@ -358,11 +393,25 @@ pub(super) fn stage1_pass_a(
                 let mut blob_node_ids: Vec<i64> = Vec::new();
                 let mut per_way_rcs: Vec<u32> = Vec::new();
                 let mut closure_slots: Vec<bool> = Vec::new();
-                crate::scan::way::scan_way_refs(
+                // Every way blob is scanned here, so each one's claim is held
+                // to its ways: no foreign kind (the reframe would copy it
+                // through unindexed), the exact range and count, and the
+                // header's order.
+                let mut walk = crate::blob_meta::ClaimWalk::new(
+                    Some(&task.claim),
+                    super::blob_meta::EXTERNAL_ORDER,
+                );
+                let mut walk_error: Option<Error> = None;
+                let kinds = crate::scan::way::scan_way_refs(
                     decompress_buf,
                     refs_buf,
                     group_starts,
-                    |_way_id, refs| {
+                    |way_id, refs| {
+                        if walk_error.is_none()
+                            && let Err(e) = walk.observe(way_id)
+                        {
+                            walk_error = Some(e);
+                        }
                         blob_node_ids.extend_from_slice(refs);
                         // Closure flags exist only to feed the
                         // stage-2 pin logic, which is gated on
@@ -381,6 +430,13 @@ pub(super) fn stage1_pass_a(
                     },
                 )
                 .map_err(in_input)?;
+                kinds
+                    .refuse_under(Some(crate::ElementKind::Way))
+                    .map_err(in_input)?;
+                if let Some(e) = walk_error {
+                    return Err(in_input(e));
+                }
+                let first_way = walk.finish().map_err(in_input)?;
                 t2.record_ms(&counters_ref.scan_way_refs_ms);
 
                 // Emit IdRecords per ref into
@@ -454,7 +510,7 @@ pub(super) fn stage1_pass_a(
                     .id_shard_bytes_written
                     .fetch_add(blob_bytes, Relaxed);
 
-                Ok((blob_node_ids.len() as u64, per_way_rcs))
+                Ok((blob_node_ids.len() as u64, per_way_rcs, first_way))
             })();
             result
         },
@@ -512,6 +568,7 @@ pub(super) fn build_node_blob_mapping(
             data_size: meta.data_size,
             min_id: meta.min_id,
             max_id: meta.max_id,
+            count: meta.count,
         });
     }
 

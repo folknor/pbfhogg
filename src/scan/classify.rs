@@ -437,6 +437,34 @@ pub(crate) fn build_classify_schedule<'a>(
     Ok((schedule, file))
 }
 
+/// [`build_classify_schedule`] under [`KindClaims::Refuse`], also returning
+/// each entry's whole indexdata claim (kind, range, count), by schedule
+/// position, `None` for an unindexed blob. For a phase that checks the range
+/// and count of the blobs it decodes against their claims
+/// ([`ClaimWalk`](crate::blob_meta::ClaimWalk)): [`ScheduledBlob`] carries
+/// only the kind.
+pub(crate) fn build_classify_schedule_with_claims<'a>(
+    input: impl Into<InputSource<'a>>,
+    kind_filter: Option<crate::ElementKind>,
+    host: &crate::host::Host,
+) -> Result<(
+    Vec<ScheduledBlob>,
+    Vec<Option<crate::blob_meta::BlobIndex>>,
+    InputFile,
+)> {
+    let mut indexes = Vec::new();
+    let (schedule, file, _skipped) = schedule_walk(
+        input,
+        kind_filter,
+        None,
+        false,
+        KindClaims::Refuse,
+        Some(&mut indexes),
+        host,
+    )?;
+    Ok((schedule, indexes, file))
+}
+
 /// Read the first frame of `input` and require it to be the OSMHeader.
 fn consume_leading_header(
     walker: &mut crate::read::header_walker::HeaderWalker,
@@ -469,7 +497,7 @@ pub(crate) fn build_classify_schedule_blob_filtered<'a>(
     claims: KindClaims,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
-    schedule_walk(input, kind_filter, blob_filter, false, claims, host)
+    schedule_walk(input, kind_filter, blob_filter, false, claims, None, host)
 }
 
 /// [`build_classify_schedule_blob_filtered`] exempt from the partial-index
@@ -491,16 +519,20 @@ pub(crate) fn build_classify_schedule_blob_filtered_accepting_partial<'a>(
         blob_filter,
         true,
         KindClaims::Unchecked,
+        None,
         host,
     )
 }
 
+/// The one schedule walk. `indexes`, when given, receives each scheduled
+/// entry's indexdata claim at the entry's position.
 fn schedule_walk<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     accept_partial: bool,
     claims: KindClaims,
+    mut indexes: Option<&mut Vec<Option<crate::blob_meta::BlobIndex>>>,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     let source = input.into();
@@ -554,6 +586,9 @@ fn schedule_walk<'a>(
         // `reference/truncation-handling.md`, shape 4). Every walker-built
         // schedule inherits that, so no builder repeats it.
         schedule.push(ScheduledBlob::from_meta(&meta, claims)?);
+        if let Some(indexes) = indexes.as_deref_mut() {
+            indexes.push(meta.index);
+        }
     }
     host.invocation.marker("SCHEDULE_SCAN_LOOP_END");
 

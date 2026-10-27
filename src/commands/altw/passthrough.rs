@@ -81,6 +81,9 @@ struct BlobDescriptor {
     /// Element count from indexdata. Used to populate stats on the
     /// passthrough path (no decode available for a live count).
     count: u64,
+    /// The whole indexdata claim, which a way blob's reframe must find
+    /// exact.
+    claim: Option<BlobIndex>,
 }
 
 crate::counters::counter_set! {
@@ -162,6 +165,7 @@ fn build_schedule(
                     is_passthrough,
                     kind,
                     count,
+                    claim: meta.index,
                 });
             }
         }
@@ -252,6 +256,15 @@ fn decode_one(
             relation_member_way_ids,
             inject_prepass,
         )?;
+        // The output index below is the reframe's count and range, so a
+        // claim it does not match exactly (a blob claiming ways that holds
+        // none above all, which would be re-indexed as Way count 0 over IDs
+        // 0..0) is refused rather than rewritten. Pass 0 already refused a
+        // foreign kind in this blob.
+        if let Some(claim) = &desc.claim {
+            crate::blob_meta::IdTally::of(stats.way_count, stats.min_way_id, stats.max_way_id)
+                .refuse_inexact(claim)?;
+        }
         let index = BlobIndex {
             kind: ElementKind::Way,
             min_id: stats.min_way_id,
@@ -303,21 +316,14 @@ fn decode_one(
         &mut scratch.st_scratch,
         &mut scratch.gr_scratch,
     )?;
-    // A Way in a blob the index classified as non-way would be emitted without
-    // field 9/10/20 and would be absent from every field-5 payload, silently
-    // breaking the WayMembers superset. Reject it, mirroring the external
-    // backend's assemble_block guard.
-    if inject_prepass
-        && block
-            .elements_skip_metadata()
-            .any(|e| matches!(e, crate::Element::Way(_)))
-    {
-        return Err(crate::error::new_indexdata_mismatch(format!(
-            "inject_prepass: blob {} classified as non-way by its indexdata contains a Way \
-             element; refusing to emit unenriched ways",
-            desc.blob_index,
-        )));
-    }
+    // A way in a blob claiming nodes would be written without locations (its
+    // refs were never collected in pass 0) and outside every field-5
+    // payload; a relation would have missed the member scan. Pass 1 refused
+    // either already, since it decodes every node blob; this is the same
+    // one-compare refusal at the decode that would publish it, the one
+    // external's stage 4 makes. An unindexed blob (`--force`) carries no
+    // claim and is handled by its elements' real kinds.
+    block.refuse_foreign_kind(desc.kind)?;
     let block_stats = process_block(
         &block,
         &mut scratch.bb,

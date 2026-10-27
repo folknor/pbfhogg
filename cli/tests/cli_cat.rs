@@ -2565,12 +2565,28 @@ fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
     );
 }
 
-/// A way blob `sort` reframes for a false index loses its blob-header field
-/// 5, so the output may no longer declare `WayMembers-v1`, although the blob
-/// carried indexdata in the input. The declaration follows what pass 2
-/// writes, not what the input header said.
+/// A copy of `pbf` whose frame `frame` carries `field` (length-delimited,
+/// `bytes`) appended to its BlobHeader, everything else unchanged.
+fn with_header_field(pbf: &[u8], frame: usize, field: u8, bytes: &[u8]) -> Vec<u8> {
+    let target = crate::common::adversarial::locate_blobs(pbf)[frame];
+    let mut header = pbf[target.header_start..target.header_end].to_vec();
+    header.push(field << 3 | 2);
+    header.push(u8::try_from(bytes.len()).expect("short field"));
+    header.extend_from_slice(bytes);
+    let mut out = pbf[..target.frame_start].to_vec();
+    out.extend_from_slice(&u32::try_from(header.len()).expect("header").to_be_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&pbf[target.blob_start..]);
+    out
+}
+
+/// A way blob `sort` reframes for a false index keeps every other header
+/// field, its field-5 way members included (the payload, and so each way's
+/// position, is unchanged), so the output keeps declaring `WayMembers-v1`.
+/// The reframe used to rebuild the header from the index and tag keys
+/// alone, dropping field 5 and with it the declaration.
 #[test]
-fn sort_drops_way_members_when_it_reframes_a_false_way_index() {
+fn sort_keeps_way_members_when_it_reframes_a_false_way_index() {
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2595,9 +2611,12 @@ fn sort_drops_way_members_when_it_reframes_a_false_way_index() {
         let count = u64::from_le_bytes(ix[18..26].try_into().expect("count"));
         ix[18..26].copy_from_slice(&(count + 1).to_le_bytes());
     });
+    // Field 5: WayMembers v1, one way, not a member.
+    let lying_bytes = with_header_field(&lying_bytes, 2, 5, &[1, 1, 0]);
     let lying = dir.path().join("lying.osm.pbf");
     std::fs::write(&lying, lying_bytes).expect("write lying fixture");
     assert!(crate::common::read_header(&lying).has_way_members_v1());
+    assert_eq!(data_blob_header_field(&lying, 5), vec![false, true]);
 
     let output = dir.path().join("sorted.osm.pbf");
     let out = CliInvoker::new()
@@ -2609,8 +2628,13 @@ fn sort_drops_way_members_when_it_reframes_a_false_way_index() {
     assert!(out.status.success(), "{}", out.stderr_str());
     out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
     assert!(
-        !crate::common::read_header(&output).has_way_members_v1(),
-        "a reframed way blob has no field 5, so WayMembers-v1 must go"
+        crate::common::read_header(&output).has_way_members_v1(),
+        "the reframed way blob keeps field 5, so WayMembers-v1 stays"
+    );
+    assert_eq!(
+        data_blob_header_field(&output, 5),
+        vec![false, true],
+        "field 5 survives the reframe"
     );
     CliInvoker::new()
         .arg("check")

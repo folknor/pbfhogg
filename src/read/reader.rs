@@ -160,9 +160,11 @@ impl<R: Read + Send> ElementReader<R> {
     }
 
     /// Decodes the PBF structure sequentially on the calling thread - no background I/O,
-    /// no rayon, no channels. Elements are delivered in file order. If
-    /// [`header().is_sorted()`](HeaderBlock::is_sorted) returns `true`, nodes arrive in
-    /// canonical OSM ID order. History files may repeat an ID for multiple versions.
+    /// no rayon, no channels. Elements are delivered in file order, which is canonical
+    /// OSM ID order when [`header().is_sorted()`](HeaderBlock::is_sorted) is `true` and
+    /// the file keeps that claim: the reader does not check it, and a caller whose
+    /// result depends on the order checks the elements it receives. History files may
+    /// repeat an ID for multiple versions.
     ///
     /// This is **6x slower** than [`for_each_pipelined`](Self::for_each_pipelined) on large
     /// files. Prefer `for_each_pipelined` for production workloads - it has the same
@@ -203,11 +205,7 @@ impl<R: Read + Send> ElementReader<R> {
         // This sequential API decodes every OsmData blob and does not apply
         // BlobFilter. It is a blob-level omission based on optional indexdata,
         // not a post-decode element predicate shared by every reader engine.
-        let Self {
-            blob_iter, header, ..
-        } = self;
-        let order = check_sorted_order(&header);
-        let mut last_node_id = None;
+        let Self { blob_iter, .. } = self;
 
         // Loop-local decode scratch. `decompress_into` fills `buf` straight from
         // the compressed payload; `std::mem::take` then MOVES that allocation
@@ -245,15 +243,7 @@ impl<R: Read + Send> ElementReader<R> {
                 &mut gr_scratch,
             )
             .map_err(|e| blob.locate_error(source.as_ref(), e))?;
-            block.for_each_element(|element| {
-                if !matches!(order, NodeSortOrder::Unchecked)
-                    && let Some(id) = node_id(&element)
-                {
-                    order.check_node_id(last_node_id, id);
-                    last_node_id = Some(id);
-                }
-                f(element);
-            });
+            block.for_each_element(&mut f);
         }
 
         Ok(())
@@ -263,27 +253,17 @@ impl<R: Read + Send> ElementReader<R> {
     /// element, preserving file order. Overlaps I/O with parallel decompression and protobuf
     /// parsing while delivering elements to an `FnMut` closure on the calling thread.
     ///
-    /// Elements are delivered in file order. If [`header().is_sorted()`](HeaderBlock::is_sorted)
-    /// returns `true`, nodes arrive in canonical OSM ID order. History files may repeat an ID for
-    /// multiple versions.
+    /// Elements are delivered in file order, which is canonical OSM ID order when
+    /// [`header().is_sorted()`](HeaderBlock::is_sorted) is `true` and the file keeps that
+    /// claim: the reader does not check it. History files may repeat an ID for multiple
+    /// versions.
     #[hotpath::measure]
     pub fn for_each_pipelined<F>(self, mut f: F) -> Result<()>
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        let order = check_sorted_order(&self.header);
-        let mut last_node_id = None;
-
         self.for_each_block_pipelined(|block| {
-            block.for_each_element(|element| {
-                if !matches!(order, NodeSortOrder::Unchecked)
-                    && let Some(id) = node_id(&element)
-                {
-                    order.check_node_id(last_node_id, id);
-                    last_node_id = Some(id);
-                }
-                f(element);
-            });
+            block.for_each_element(&mut f);
             Ok(())
         })
     }
@@ -1200,48 +1180,6 @@ fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<Hea
     }
 }
 
-/// Extract the node ID from an element, if it is a node.
-fn node_id(element: &Element<'_>) -> Option<i64> {
-    match element {
-        Element::Node(n) => Some(n.id()),
-        Element::DenseNode(n) => Some(n.id()),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy)]
-enum NodeSortOrder {
-    Unchecked,
-    Strict,
-    History,
-}
-
-fn check_sorted_order(header: &HeaderBlock) -> NodeSortOrder {
-    if !header.is_sorted() {
-        NodeSortOrder::Unchecked
-    } else if header.has_historical_information() {
-        NodeSortOrder::History
-    } else {
-        NodeSortOrder::Strict
-    }
-}
-
-impl NodeSortOrder {
-    fn check_node_id(self, previous: Option<i64>, id: i64) {
-        match (self, previous) {
-            (Self::Strict, Some(previous)) => debug_assert!(
-                crate::osm_id::osm_id_cmp(id, previous) == std::cmp::Ordering::Greater,
-                "Sort.Type_then_ID violated: node {id} does not follow previous {previous}"
-            ),
-            (Self::History, Some(previous)) => debug_assert!(
-                crate::osm_id::osm_id_cmp(id, previous) != std::cmp::Ordering::Less,
-                "Sort.Type_then_ID violated: node {id} precedes previous {previous}"
-            ),
-            (Self::Unchecked, _) | (_, None) => {}
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PipelinedBlocks iterator
 // ---------------------------------------------------------------------------
@@ -1374,21 +1312,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    fn sorted_node_assertions_accept_canonical_negative_id_order() {
-        use super::NodeSortOrder;
-
-        for order in [NodeSortOrder::Strict, NodeSortOrder::History] {
-            let mut previous = None;
-            for id in [0, -1, -2, i64::MIN, 1, 2] {
-                order.check_node_id(previous, id);
-                previous = Some(id);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
     fn sorted_history_allows_repeated_node_ids_in_both_iteration_paths() {
         use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
         use crate::writer::{Compression, PbfWriter};

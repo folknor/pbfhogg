@@ -191,6 +191,7 @@ fn plan_merge(
                 "Cat dedupe requires sorted inputs so it can merge them in type-then-ID order.",
             ),
             accept_partial_index: true,
+            distrust_metadata: false,
         },
         opts.direct_reads,
         host,

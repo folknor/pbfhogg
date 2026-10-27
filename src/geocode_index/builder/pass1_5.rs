@@ -97,21 +97,6 @@ fn record_way_refs(
     negative_count
 }
 
-/// Refuse a blob scheduled as ways whose groups hold another element kind.
-/// `kinds` is the set the way scanner recorded while it walked the groups.
-/// `claim` is the entry's enforced claim; a claimless (unindexed) entry may
-/// legally hold several kinds and is never refused.
-fn refuse_foreign_kinds(
-    claim: Option<crate::ElementKind>,
-    kinds: crate::element_kind::KindSet,
-) -> Result<()> {
-    let Some(claim) = claim else { return Ok(()) };
-    match kinds.foreign_to(claim) {
-        Some(found) => Err(crate::error::new_kind_contradiction(claim, found)),
-        None => Ok(()),
-    }
-}
-
 /// Whether any worker has already reported an error.
 fn has_first_err(slot: &Mutex<Option<Error>>) -> bool {
     slot.lock()
@@ -310,7 +295,7 @@ pub(super) fn run_pass1_5(
                             // The scan above reads only way messages, so a
                             // blob claiming ways but holding other kinds
                             // would silently lose them: refuse it.
-                            refuse_foreign_kinds(entry.claim(), kinds)?;
+                            kinds.refuse_under(entry.claim())?;
                             compact_overflow_nodes(
                                 &mut overflow_nodes,
                                 &mut overflow_compacted_len,

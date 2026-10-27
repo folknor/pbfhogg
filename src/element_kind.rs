@@ -121,6 +121,20 @@ impl KindSet {
             .into_iter()
             .find(|&kind| kind != claimed && self.has(kind))
     }
+
+    /// Refuse the set when `claim` names a kind and the set holds another:
+    /// `IndexdataMismatch` with the `KindContradiction`, unlocated (the
+    /// caller locates it at the blob). A blob with no claim is never refused.
+    /// One compare when the set agrees.
+    #[inline]
+    pub(crate) fn refuse_under(self, claim: Option<ElementKind>) -> crate::error::Result<()> {
+        if let Some(claimed) = claim
+            && let Some(found) = self.foreign_to(claimed)
+        {
+            return Err(crate::error::new_kind_contradiction(claimed, found));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for ElementKind {

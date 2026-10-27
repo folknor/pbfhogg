@@ -15,8 +15,8 @@ use crate::idset::IdSet;
 use super::common::{
     BboxInt, BlobDesc, ExtractPass2IdSets, Passthrough, build_blob_schedule_with_passthrough,
     dense_only_payload, extract_block_pass2, merge_extract_stats, pread_execute,
-    refuse_blob_foreign_kind, refuse_foreign_kind_raw, relation_has_matched_member,
-    spatial_blob_filter, warn_passthrough_demotions,
+    refuse_blob_foreign_kind, relation_has_matched_member, spatial_blob_filter,
+    warn_passthrough_demotions,
 };
 use super::{ExtractStats, Region};
 
@@ -414,7 +414,7 @@ fn extract_simple_single_pass(
                     crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
                 // The scanner reads only nodes, so ways or relations under a
                 // node claim are ones it would never see.
-                refuse_foreign_kind_raw(kinds, node_schedule_ref[position].kind)?;
+                kinds.refuse_under(node_schedule_ref[position].kind)?;
                 // Classification is the same for every blob, candidate or
                 // not, so verification can never change which nodes are
                 // selected.
@@ -499,7 +499,7 @@ fn extract_simple_single_pass(
                 )?;
                 // The scanner reads only ways, so nodes or relations under a
                 // way claim are ones it would never see.
-                refuse_foreign_kind_raw(kinds, way_schedule_ref[position].kind)?;
+                kinds.refuse_under(way_schedule_ref[position].kind)?;
                 Ok(matching)
             },
             |_position, matching_ids: Vec<i64>| {

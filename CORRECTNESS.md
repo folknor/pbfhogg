@@ -356,20 +356,27 @@ rewritten through the sweep like an overlapping blob - which also drops any
 exact duplicates inside it - rather than copied through under the sorted
 stamp.
 
-**Residual - precondition on the header claim:** A file whose header claims
-`Sort.Type_then_ID` while its blobs are internally unsorted is passed
-through undetected. That file already violates its own declared contract;
-every reader in the ecosystem (including pbfhogg's `ElementReader` ordering
-guarantees) trusts the claim, and pbfhogg's own sorted producers (`sort`,
-`repack`, `apply-changes`) uphold it. Trusting an explicit format-level
-declaration is categorically different from inferring sortedness from the
-mere presence of an implementation-detail sidecar field. No `--verify-blobs`
-flag: an input that wants verification simply arrives without the claim and
-gets the checked scan by default. Producers were deliberately left
-unchanged: indexdata (kind/range/count/bbox) is valid for an unsorted blob,
-and every consumer other than sort's former inference only uses it for range
-queries - stripping or gating it in `cat`/`PbfWriter` would punish those
-consumers to protect an inference sort no longer makes.
+**Residual - precondition on the header claim, and its repair:** By default
+a file whose header claims `Sort.Type_then_ID` while its blobs are
+internally unsorted is passed through undetected. That file already violates
+its own declared contract; pbfhogg's own sorted producers (`sort`, `repack`,
+`apply-changes`) uphold it, and trusting an explicit format-level declaration
+is categorically different from inferring sortedness from the mere presence
+of an implementation-detail sidecar field. `ElementReader` does not check the
+claim either (it used to `debug_assert` node order, which panicked debug
+builds on a lying file and checked nothing in release); the commands whose
+answer depends on order check it on the elements they already visit
+(apply-changes, `add-locations-to-ways --index-type external`, time-filter,
+renumber, digest) and refuse the file as `Unsorted`. Such a file cannot be
+expected to arrive without its claim, so the advice those refusals give is
+`sort --distrust-metadata`, which takes the checked scan whatever the header
+claims and rewrites the disordered blobs (reference/indexdata-trust.md, "The
+remedy for `Unsorted`"); plain `sort` keeps the passthrough fast path.
+Producers were deliberately left unchanged: indexdata (kind/range/count/bbox)
+is valid for an unsorted blob, and every consumer other than sort's former
+inference only uses it for range queries - stripping or gating it in
+`cat`/`PbfWriter` would punish those consumers to protect an inference sort
+no longer makes.
 
 ## Blob sidecar metadata: `indexdata` and `tagdata` are a trust boundary
 

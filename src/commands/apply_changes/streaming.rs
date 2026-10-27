@@ -67,7 +67,7 @@ use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::writer::{Compression, frame_blob_pipelined, reframe_raw_with_index};
 
-use super::classify::{BlobWalk, block_overlaps_diff};
+use super::classify::{blob_walk, block_overlaps_diff};
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
@@ -573,7 +573,7 @@ fn handle_candidate(
             .loc_refresh_blobs_scanned
             .fetch_add(1, Ordering::Relaxed);
         let t_scan = crate::counters::Stopwatch::start();
-        let mut walk = BlobWalk::new(claim.as_ref());
+        let mut walk = blob_walk(claim.as_ref());
         let detection = detect_stale_wire(
             decompress_buf,
             probe,
@@ -661,7 +661,7 @@ fn handle_candidate(
     };
 
     let t_precise = crate::counters::Stopwatch::start();
-    let mut walk = BlobWalk::new(claim.as_ref());
+    let mut walk = blob_walk(claim.as_ref());
     let overlaps = block_overlaps_diff(&block, ranges, &mut walk)?;
     if !overlaps {
         // A miss visited every element: the walk is complete.
@@ -823,7 +823,7 @@ fn handle_candidate(
     // The rewrite's own walk: on a precise-check hit the walk above stopped
     // at the hit, so this is the complete one, ended before any block is
     // framed or sent.
-    let mut rewrite_walk = BlobWalk::new(claim.as_ref());
+    let mut rewrite_walk = blob_walk(claim.as_ref());
     let output = rewrite_block_parallel(
         &block,
         diff,

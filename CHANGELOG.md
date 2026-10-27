@@ -1102,6 +1102,16 @@
 
 ### Added
 
+- **`sort --distrust-metadata` sorts a file whose claims are false.** It
+  believes neither the header's `Sort.Type_then_ID` nor any blob's
+  indexdata or tagdata: every blob is decoded in pass 1, a blob out of order
+  inside is rewritten, and one whose indexdata or tag keys its payload
+  contradicts is reframed under scanned ones; honest blobs are copied as
+  they are. It needs no indexdata (no `--force`) and accepts a partially
+  indexed file. Plain `sort` keeps its fast path, which copies a
+  sorted-claiming file's blobs unchanged. Library:
+  `sort::sort_with(.., &SortOptions { write, distrust_metadata }, ..)`.
+
 - **`cat --reindex` repairs false indexdata losslessly.** It rewrites every
   data blob's indexdata and tag key index from the blob's own payload,
   copying the compressed payload and every other blob-header field
@@ -1441,6 +1451,49 @@
   decoded blob's first element, and a blob whose first element sorts before
   the previous blob's last is refused as unsorted where its range alone
   hid it.
+
+- **`add-locations-to-ways` refuses a false claim on any blob it decodes,
+  on both index types alike.** A way blob labelled node or relation was
+  written without locations (sparse) or refused with an untyped error
+  (external); a node blob labelled way was copied through unindexed and
+  re-indexed as a way blob with count 0 and IDs 0..0, a false index the
+  next run believed; a blob whose claimed range or count was wrong carried
+  it into the output and the statistics, and lost present locations under
+  `--index-type external`. These now fail with `IndexdataMismatch` (exit
+  2), pointing at `check --index` and `cat --reindex`, and publish nothing.
+  `--index-type external` also refuses, as unsorted, a blob out of order
+  under the sorted header that it decodes, which used to turn present nodes
+  into missing locations (zeros under `--ignore-missing-nodes`). Sparse,
+  which does not depend on order, still joins such a file.
+
+- **`time-filter` checks the order it relies on.** An object out of
+  `Sort.Type_then_ID` order in a history input was written more than once;
+  an element out of order now fails as unsorted on both paths. A history
+  object whose versions do not strictly ascend (the older version was
+  silently picked) and an object appearing twice in a non-history input
+  (both were written) fail as invalid data. Unindexed input is unaffected.
+
+- **`ElementReader` no longer panics a debug build on a lying sort claim.**
+  `for_each` and `for_each_pipelined` `debug_assert`ed node order under a
+  sorted header, a panic on untrusted input in debug builds and no check in
+  release. They deliver file order and say so; a caller whose answer
+  depends on order checks it.
+
+- **`diff -c` and `diff_stats` count decoded runs.** A run of elements only
+  one side has was counted by its blob's claimed count although the blob
+  was decoded, so a false count changed `created` or `deleted`; they now
+  count the decoded elements. A byte-identical pair skipped undecoded is
+  still counted by its claim in `common`.
+
+- **The advice for an unsorted input now repairs it.** Every `Unsorted`
+  refusal advised `pbfhogg sort`, which copies a sorted-claiming file's
+  blobs as they are and reproduced the refused file; it now advises
+  `sort --distrust-metadata` (Added).
+
+- **`sort` and `cat --dedupe` keep a reframed blob's other header fields.**
+  A blob reframed under scanned indexdata lost its way-members field 5 and
+  any unknown header field, and the output stopped declaring
+  `WayMembers-v1`; the header is now rebuilt as `cat --reindex` rebuilds it.
 
 - **`sort` and `cat --dedupe` refuse a false range on a blob they merge.**
   Under a header claiming sorted order an indexed blob's range decides

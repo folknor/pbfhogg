@@ -87,27 +87,70 @@ pub fn sort<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
+    sort_with(
+        input,
+        output,
+        &SortOptions {
+            write: *opts,
+            distrust_metadata: false,
+        },
+        overrides,
+        host,
+    )
+}
+
+/// Configuration for [`sort_with`].
+#[derive(Clone, Copy, Debug)]
+pub struct SortOptions {
+    /// Output compression, backend and the shared input flags.
+    pub write: WriteOptions,
+    /// Believe no claim the input makes about itself: decode every blob,
+    /// checking its order and scanning its kind, ID range, count, bbox and
+    /// tag keys, as for an input whose header does not claim
+    /// `Sort.Type_then_ID`. A blob whose indexdata or tagdata the scan
+    /// contradicts is reframed under the scanned ones (every other header
+    /// field kept); an internally unsorted blob is rewritten in order. The
+    /// repair for a file refused as `Unsorted` while its header claims
+    /// sorted, which the default fast path copies unchanged because it
+    /// believes that claim and the blobs' indexdata. Waives the indexdata
+    /// precondition (`force` is not needed alongside it) and accepts a
+    /// partially indexed input.
+    pub distrust_metadata: bool,
+}
+
+/// [`sort`] with every option: see [`SortOptions`].
+pub fn sort_with<'a>(
+    input: impl Into<InputSource<'a>>,
+    output: crate::output::Output,
+    opts: &SortOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<SortStats> {
     host.invocation.check()?;
     let result = sort_to(input, &output, opts, overrides, host)?;
     output.publish(&host.invocation)?;
     Ok(result)
 }
 
-/// [`sort`] writing to a borrowed output it does not publish.
+/// [`sort_with`] writing to a borrowed output it does not publish.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub(crate) fn sort_to<'a>(
     input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
-    opts: &WriteOptions,
+    opts: &SortOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
-    let WriteOptions {
-        compression,
-        backend,
-        direct_reads: direct_io,
-        force,
+    let SortOptions {
+        write:
+            WriteOptions {
+                compression,
+                backend,
+                direct_reads: direct_io,
+                force,
+            },
+        distrust_metadata,
     } = *opts;
     // Every pass below opens the input again, each through its own open
     // file description (the front read, pass 1's header walker and pass 2's
@@ -120,13 +163,25 @@ pub(crate) fn sort_to<'a>(
     // The indexdata precondition is answered by a front read of its own,
     // dropped at once: pass 1's walker reads the header again on its own
     // description (`FADV_RANDOM`, or `O_DIRECT` under `--direct-io`).
-    let indexed = crate::commands::input_front::InputFront::open(&pin, direct_io, host)?
-        .require_indexdata(
-            force,
-            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-             decompressed to scan element IDs (significantly slower).",
-            host,
-        )?;
+    // Distrusting metadata reads no indexdata, so it needs none: pass 1
+    // decodes every blob whatever it carries.
+    let indexed = distrust_metadata
+        || crate::commands::input_front::InputFront::open(&pin, direct_io, host)?
+            .require_indexdata(
+                force,
+                "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+                 decompressed to scan element IDs (significantly slower).",
+                host,
+            )?;
+    if distrust_metadata {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "sort.distrust_metadata",
+            "believing no header sort claim, indexdata or tagdata; pass 1 decodes every \
+             blob payload"
+        );
+    }
     if !indexed {
         crate::host::diag!(
             host.diagnostics,
@@ -158,6 +213,7 @@ pub(crate) fn sort_to<'a>(
         &IndexPolicy {
             require_sorted: None,
             accept_partial_index: false,
+            distrust_metadata,
         },
         direct_io,
         host,
@@ -230,8 +286,9 @@ pub(crate) fn sort_to<'a>(
             host.diagnostics,
             Note,
             "sort.false_indexdata",
-            "{} blobs carried indexdata their payload contradicts; they were copied \
-             under indexdata and tagdata scanned from the payload",
+            "{} blobs carried indexdata their payload contradicts (or, when distrusting \
+             metadata, tagdata); they were copied under indexdata and tagdata scanned \
+             from the payload",
             plan.false_claims_replaced
         );
     }

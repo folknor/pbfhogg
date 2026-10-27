@@ -160,27 +160,6 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
     Ok(true)
 }
 
-/// Refuse a raw-scanned block holding an element of a kind other than the
-/// blob's indexdata claim: the raw classify walkers build no `PrimitiveBlock`
-/// and read only their own kind, so a foreign element is one the run would
-/// never see (`IndexdataMismatch` with a `KindContradiction`). A blob with no
-/// claim is never refused.
-///
-/// `kinds` is the set the raw walker recorded while it walked the groups
-/// (the crate's `KindSet` rule), so this costs nothing beyond the compare.
-pub(super) fn refuse_foreign_kind_raw(
-    kinds: crate::element_kind::KindSet,
-    claim: Option<crate::ElementKind>,
-) -> crate::error::Result<()> {
-    let Some(claimed) = claim else {
-        return Ok(());
-    };
-    match kinds.foreign_to(claimed) {
-        Some(found) => Err(crate::error::new_kind_contradiction(claimed, found)),
-        None => Ok(()),
-    }
-}
-
 /// Refuse a block decoded from `blob` when it holds an element of a kind
 /// other than the blob's indexdata claim, located at the blob. For the
 /// sequential sweeps, which decode with `BlobReader` rather than a classify

@@ -1663,3 +1663,243 @@ fn plain_nodes_supply_coordinates_to_both_backends() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Indexdata claims held to what each decoded blob holds
+// ---------------------------------------------------------------------------
+
+/// Frames of [`write_claims_fixture`]'s file: the header, two node blobs
+/// (nodes 1 to 3 and 4 to 6), one way blob (ways 10 to 12) and one relation
+/// blob (relation 100).
+const NODE_BLOB: usize = 1;
+const SECOND_NODE_BLOB: usize = 2;
+const WAY_BLOB: usize = 3;
+const RELATION_BLOB: usize = 4;
+
+/// A sorted, honestly indexed input, three elements per blob.
+fn write_claims_fixture(path: &Path) {
+    let nodes: Vec<TestNode> = (1..=6).map(node_at).collect();
+    let ways = vec![
+        way_over(10, &[1, 4]),
+        way_over(11, &[2, 5]),
+        way_over(12, &[3, 6]),
+    ];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    write_multi_block_test_pbf(path, &nodes, &ways, &relations, 3);
+}
+
+/// The fixture with `forge` applied to it, written beside it as `name`.
+fn forged_claims_fixture(
+    dir: &Path,
+    name: &str,
+    forge: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_claims_fixture(&honest);
+    let bytes = std::fs::read(&honest).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, forge(&bytes)).unwrap();
+    path
+}
+
+/// The fixture with frame `frame`'s claimed kind byte set to `kind` (0 node,
+/// 1 way, 2 relation), range and count left as they were.
+fn relabelled(bytes: &[u8], frame: usize, kind: u8) -> Vec<u8> {
+    crate::common::adversarial::mutate_blob_header_indexdata(bytes, frame, |index| {
+        assert_ne!(index[1], kind, "frame {frame} already claims kind {kind}");
+        index[1] = kind;
+    })
+}
+
+/// Run both backends on `input` with `--ignore-missing-nodes` (so a lie that
+/// only loses node locations could not hide behind the missing-location
+/// refusal), and assert each refuses with `needle` and publishes nothing.
+fn assert_both_backends_refuse(input: &Path, needle: &str) {
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = input.with_extension(format!("{}.out.pbf", backend.flag().unwrap()));
+        let out = run_altw_ignoring_missing(input, &output, false, backend);
+        let stderr = out.stderr_str();
+        assert!(
+            !out.status.success(),
+            "{}: must refuse; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(
+            stderr.contains(needle),
+            "{}: wanted {needle:?}; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(
+            stderr.contains("check --index"),
+            "{}: the indexdata hint must reach the refusal; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(!output.exists(), "a refused run publishes nothing");
+    }
+}
+
+/// A way blob whose indexdata claims nodes or relations used to be read by
+/// that kind's phase only: under a node claim sparse wrote its ways without
+/// their refs ever collected (zeros under `--ignore-missing-nodes`) and
+/// external refused with an untyped error; under a relation claim both
+/// copied it through without locations. Both backends now refuse it the
+/// same way.
+#[test]
+fn both_backends_refuse_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    for (kind, claimed) in [(0, "node"), (2, "relation")] {
+        let input = forged_claims_fixture(dir.path(), &format!("way-as-{claimed}.osm.pbf"), |b| {
+            relabelled(b, WAY_BLOB, kind)
+        });
+        assert_both_backends_refuse(
+            &input,
+            &format!("blob indexdata claims {claimed} elements but the blob holds way elements"),
+        );
+    }
+}
+
+/// A node blob claiming ways was reframed as a way blob: its nodes were
+/// copied through unindexed and the blob was re-indexed as Way, count 0,
+/// IDs 0..0, a false claim pbfhogg wrote and the next run believed. The
+/// second node blob is relabelled, so the claimed kinds still follow type
+/// order and the lie is visible only in the payload.
+#[test]
+fn both_backends_refuse_a_node_blob_claiming_ways() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claims_fixture(dir.path(), "node-as-way.osm.pbf", |b| {
+        relabelled(b, SECOND_NODE_BLOB, 1)
+    });
+    assert_both_backends_refuse(
+        &input,
+        "blob indexdata claims way elements but the blob holds node elements",
+    );
+}
+
+/// A way blob holding no way under a way claim: the reframe used to write
+/// it back as Way, count 0, IDs 0..0, whatever the claim said. No index
+/// describes a blob without elements, so even a claim of exactly that is
+/// refused, and nothing writes that index.
+#[test]
+fn both_backends_refuse_a_way_claim_over_no_way() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claims_fixture(dir.path(), "empty-way-blob.osm.pbf", |b| {
+        // An empty StringTable and one empty PrimitiveGroup.
+        let emptied = crate::common::adversarial::mutate_blob_payload(b, WAY_BLOB, |payload| {
+            *payload = vec![0x0A, 0x00, 0x12, 0x00];
+        });
+        crate::common::adversarial::forge_indexdata_range(&emptied, WAY_BLOB, 0, 0, Some(0))
+    });
+    assert_both_backends_refuse(&input, "no element");
+}
+
+/// Ranges and counts no decoded blob matches: the backends re-index what
+/// they reframe, so these used to pass, carrying a passed-through blob's
+/// false claim and count into the output and its statistics. External
+/// partitions node blobs by range, where an understated one loses present
+/// nodes. Every blob either backend decodes is now held to its claim.
+#[test]
+fn both_backends_refuse_inexact_ranges_and_counts() {
+    let dir = crate::common::test_scratch();
+    for (name, frame, min, max, count) in [
+        ("node-overstated", SECOND_NODE_BLOB, 4, 7, Some(3)),
+        ("node-understated", SECOND_NODE_BLOB, 4, 5, None),
+        ("node-count", NODE_BLOB, 1, 3, Some(4)),
+        ("way-understated", WAY_BLOB, 10, 11, None),
+        ("relation-count", RELATION_BLOB, 100, 100, Some(2)),
+    ] {
+        let input = forged_claims_fixture(dir.path(), &format!("{name}.osm.pbf"), |b| {
+            crate::common::adversarial::forge_indexdata_range(b, frame, min, max, count)
+        });
+        assert_both_backends_refuse(&input, "but the decoded blob holds");
+    }
+}
+
+/// The honest fixture joins on both backends: the claim checks refuse lies
+/// only.
+#[test]
+fn both_backends_join_the_honest_claims_fixture() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("honest.osm.pbf");
+    write_claims_fixture(&input);
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = dir
+            .path()
+            .join(format!("{}.osm.pbf", backend.flag().unwrap()));
+        let out = run_altw(&input, &output, false, backend, false);
+        assert!(out.status.success(), "{}", out.stderr_str());
+        let located = read_way_locations(&output);
+        assert_eq!(located.len(), 3);
+        let first = node_at(1);
+        assert_eq!(located[0].1[0], (first.lat, first.lon));
+    }
+}
+
+/// Way blobs `[-1, -2, -3]` then `[0, -4, 1]`: each is in canonical order
+/// inside, and the second's mixed-sign range `[-4, 1]` cannot show its
+/// leading 0, which sorts before -3, so the metadata scan's range watermark
+/// passed the pair and external wrote the descent under the sorted header.
+/// Stage 1 now holds each blob's decoded first way to the one before.
+#[test]
+fn external_refuses_a_way_blob_descending_behind_a_mixed_sign_range() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("mixed-sign-ways.osm.pbf");
+    let ways: Vec<TestWay> = [-1, -2, -3, 0, -4, 1]
+        .iter()
+        .map(|&id| way_over(id, &[1, 2]))
+        .collect();
+    write_three_per_blob(&input, &[1, 2, 3], &ways);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a way blob starting at way 0"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!output.exists(), "a refused run publishes nothing");
+}
+
+/// A node blob whose elements are out of order under the sorted header
+/// (honest range, payload 2, 1, 3): external's stage 2 merge walk passed
+/// node 1 and wrote it as a missing location, zeroed under
+/// `--ignore-missing-nodes`. It now refuses the file as unsorted. Sparse
+/// takes nodes in any order and joins it.
+#[test]
+fn external_refuses_a_node_blob_out_of_order_inside() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra-unsorted.osm.pbf");
+    write_three_per_blob(&input, &[2, 1, 3, 4, 5, 6], &[way_over(10, &[1, 4])]);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::External);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("out of the order its header declares")
+            && stderr.contains("sort --distrust-metadata"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!output.exists(), "a refused run publishes nothing");
+
+    let sparse = dir.path().join("sparse.osm.pbf");
+    let out = run_altw(&input, &sparse, true, IndexBackend::Sparse, false);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    let (one, four) = (node_at(1), node_at(4));
+    assert_eq!(
+        read_way_locations(&sparse),
+        vec![(10, vec![(one.lat, one.lon), (four.lat, four.lon)])]
+    );
+}

@@ -38,6 +38,16 @@ impl IdTally {
         self.max = self.max.max(id);
     }
 
+    /// The tally of a walk that counted `count` elements with numeric ID
+    /// extremes `min` and `max` itself (a reframe that tracks them for the
+    /// index it writes). `min` and `max` are ignored when `count` is 0.
+    pub(crate) fn of(count: u64, min: i64, max: i64) -> Self {
+        if count == 0 {
+            return Self::default();
+        }
+        Self { count, min, max }
+    }
+
     /// Elements added so far.
     pub(crate) fn count(&self) -> u64 {
         self.count
@@ -92,7 +102,121 @@ impl IdTally {
     }
 }
 
+/// Whether a [`ClaimWalk`] also holds the blob to the header's
+/// `Sort.Type_then_ID` order, and who to name when it does not.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Order {
+    /// Every element's ID must not sort below its predecessor's in canonical
+    /// OSM order, else `ErrorKind::Unsorted`. The text opens the refusal,
+    /// naming the command and what the order is needed for.
+    Required(&'static str),
+    /// The walk checks the claim only: the run does not depend on order.
+    Free,
+}
+
+/// One complete walk of a decoded blob's elements, checked against the
+/// blob's indexdata claim and, when asked, the header's order claim as it
+/// goes.
+///
+/// Each element's ID goes to [`observe`](Self::observe) (an increment and a
+/// branchless min and max, and under [`Order::Required`] one key compare
+/// with the previous ID), and the complete walk ends in
+/// [`finish`](Self::finish):
+///
+/// - a claim that is not exact for the walk is `IndexdataMismatch`
+///   ([`IdTally::refuse_inexact`]: a blob with no element under a claim is
+///   refused too), also when the walk breaks order on an ID the claim does
+///   not cover, since that makes the claim the false one;
+/// - otherwise an ID sorting below its predecessor is `Unsorted`.
+///
+/// An unindexed blob (`--force`) makes no claim and is checked for order
+/// only. The claimed kind is checked apart, once per blob
+/// ([`KindSet::refuse_under`](crate::element_kind::KindSet::refuse_under)),
+/// so every ID a walk observes is of one kind.
+pub(crate) struct ClaimWalk<'c> {
+    claim: Option<&'c BlobIndex>,
+    order: Order,
+    tally: IdTally,
+    /// The first ID observed, valid once `tally` has counted one.
+    first: i64,
+    previous: crate::osm_id::OsmIdKey,
+}
+
+impl<'c> ClaimWalk<'c> {
+    /// A walk of a blob carrying `claim` (`None` for an unindexed blob).
+    pub(crate) fn new(claim: Option<&'c BlobIndex>, order: Order) -> Self {
+        Self {
+            claim,
+            order,
+            tally: IdTally::default(),
+            first: 0,
+            previous: crate::osm_id::osm_id_key(0),
+        }
+    }
+
+    /// The next element's ID, in iteration order.
+    #[inline]
+    pub(crate) fn observe(&mut self, id: i64) -> Result<()> {
+        if let Order::Required(_) = self.order {
+            let key = crate::osm_id::osm_id_key(id);
+            // Key 0 is the least key, so the first element always passes.
+            if key < self.previous {
+                return Err(self.disorder(id));
+            }
+            self.previous = key;
+        }
+        if self.tally.count() == 0 {
+            self.first = id;
+        }
+        self.tally.add(id);
+        Ok(())
+    }
+
+    /// The blob's first element in iteration order, once one has been
+    /// observed.
+    pub(crate) fn first(&self) -> Option<i64> {
+        (self.tally.count() != 0).then_some(self.first)
+    }
+
+    /// What the walk has counted so far, for a caller that holds the claim
+    /// apart from the walk (a pool whose worker cannot see its position).
+    pub(crate) fn tally(&self) -> IdTally {
+        self.tally
+    }
+
+    /// End a complete walk: the claim, when there is one, must be exact.
+    /// Returns the first element's ID, `None` for an unindexed blob with no
+    /// element (an indexed one is refused).
+    pub(crate) fn finish(&self) -> Result<Option<i64>> {
+        if let Some(claim) = self.claim {
+            self.tally.refuse_inexact(claim)?;
+        }
+        Ok(self.first())
+    }
+
+    #[cold]
+    fn disorder(&self, id: i64) -> Error {
+        if let Some(claim) = self.claim {
+            let mut seen = self.tally;
+            seen.add(id);
+            if seen.escapes(claim) {
+                return seen.mismatch(claim, false);
+            }
+        }
+        let context = match self.order {
+            Order::Required(context) => context,
+            Order::Free => "",
+        };
+        crate::error::new_unsorted(format!(
+            "{context} - a blob holds id {id} after id {}, out of the order its header \
+             declares",
+            crate::osm_id::osm_id_from_key(self.previous)
+        ))
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::ElementKind;
@@ -142,5 +266,45 @@ mod tests {
         assert!(!tally(&[10, 15]).escapes(&claim(10, 20, 3)));
         assert!(tally(&[9]).escapes(&claim(10, 20, 3)));
         assert!(tally(&[21]).escapes(&claim(10, 20, 3)));
+    }
+
+    fn walk(ids: &[i64], c: Option<&BlobIndex>, order: Order) -> Result<Option<i64>> {
+        let mut w = ClaimWalk::new(c, order);
+        for &id in ids {
+            w.observe(id)?;
+        }
+        w.finish()
+    }
+
+    /// Order is refused only when required; a free walk checks the claim
+    /// alone. A descent onto an ID the claim does not cover is the claim's
+    /// fault, so it is the mismatch, not the disorder.
+    #[test]
+    fn a_walk_refuses_disorder_only_when_order_is_required() {
+        let required = Order::Required("test");
+        let honest = claim(1, 3, 3);
+        assert_eq!(walk(&[1, 2, 3], Some(&honest), required).unwrap(), Some(1));
+        let err = walk(&[2, 1, 3], Some(&honest), required).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Unsorted { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            walk(&[2, 1, 3], Some(&honest), Order::Free).unwrap(),
+            Some(2)
+        );
+        // Equal IDs are in order (duplicates are another concern).
+        assert!(walk(&[1, 1, 3], Some(&honest), required).is_ok());
+        // Canonical order: negatives by magnitude after zero.
+        assert!(walk(&[-1, -2], Some(&claim(-2, -1, 2)), required).is_ok());
+        let err = walk(&[2, 0, 3], Some(&honest), required).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::IndexdataMismatch { .. }),
+            "{err}"
+        );
+        // No claim: order only, and an empty walk is accepted.
+        assert_eq!(walk(&[], None, required).unwrap(), None);
+        // A claim over no element is refused.
+        assert!(walk(&[], Some(&claim(0, 0, 0)), Order::Free).is_err());
     }
 }

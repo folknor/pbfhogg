@@ -440,6 +440,9 @@ pub struct PrimitiveBlock {
     /// The kinds of the elements the block holds, recorded by the
     /// construction-time validation pass.
     kinds: crate::element_kind::KindSet,
+    /// How many elements [`elements`](Self::elements) yields, counted by the
+    /// same validation pass.
+    element_count: u64,
 }
 
 impl std::fmt::Debug for PrimitiveBlock {
@@ -462,7 +465,7 @@ impl PrimitiveBlock {
         let data: &[u8] = &bytes;
         let block = WireBlock::from_inline(data, meta);
 
-        let kinds = validate_groups_strict(&block)?;
+        let (kinds, element_count) = validate_groups_strict(&block)?;
 
         // Validate every stringtable entry once at construction time.
         for index in 0..block.stringtable.len() {
@@ -478,6 +481,7 @@ impl PrimitiveBlock {
             _buffer: bytes,
             block,
             kinds,
+            element_count,
         })
     }
 
@@ -488,12 +492,15 @@ impl PrimitiveBlock {
     /// the blob.
     #[inline]
     pub(crate) fn refuse_foreign_kind(&self, claim: Option<crate::ElementKind>) -> Result<()> {
-        if let Some(claimed) = claim
-            && let Some(found) = self.kinds.foreign_to(claimed)
-        {
-            return Err(crate::error::new_kind_contradiction(claimed, found));
-        }
-        Ok(())
+        self.kinds.refuse_under(claim)
+    }
+
+    /// How many elements [`elements`](Self::elements) yields: one per plain
+    /// node, way and relation and one per dense ID, counted when the block
+    /// was validated, so it is the decoded count, never a blob's claim.
+    #[inline]
+    pub(crate) fn element_count(&self) -> u64 {
+        self.element_count
     }
 
     /// Parse a `PrimitiveBlock` from decompressed protobuf bytes, inlining
@@ -905,12 +912,15 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// Returns the kinds of the elements the block holds
 /// ([`KindSet`](crate::element_kind::KindSet)), recorded in the loops this
 /// pass runs anyway: one bit-or per element, and one per dense group with at
-/// least one ID.
-fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::KindSet> {
+/// least one ID. And how many elements the block holds, the count
+/// `PrimitiveBlock::elements` yields: one per plain node, way and relation
+/// message and the dense ID count each dense group's validation computes.
+fn validate_groups_strict(block: &WireBlock<'_>) -> Result<(crate::element_kind::KindSet, u64)> {
     use super::wire::Cursor;
     use crate::ElementKind;
 
     let mut kinds = crate::element_kind::KindSet::default();
+    let mut count: u64 = 0;
     for index in 0..block.group_count() {
         let data = block.group(index);
 
@@ -928,6 +938,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::
         //    parallel-array invariants the zipping iterators depend on.
         for element in group.nodes() {
             kinds.add(ElementKind::Node);
+            count += 1;
             let node = WireNode::parse(element)?;
             validate_info(node.info_data)?;
             validate_tag_arrays(
@@ -938,6 +949,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::
         }
         for element in group.ways() {
             kinds.add(ElementKind::Way);
+            count += 1;
             let way = WireWay::parse(element)?;
             validate_info(way.info_data)?;
             validate_tag_arrays(
@@ -949,6 +961,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::
         }
         for element in group.relations() {
             kinds.add(ElementKind::Relation);
+            count += 1;
             let relation = WireRelation::parse(element)?;
             validate_info(relation.info_data)?;
             validate_tag_arrays(
@@ -978,10 +991,11 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::
             if ids > 0 {
                 kinds.add(ElementKind::Node);
             }
+            count += ids as u64;
         }
     }
 
-    Ok(kinds)
+    Ok((kinds, count))
 }
 
 /// Validate an element's packed `keys` / `vals` tag arrays.
@@ -1892,6 +1906,7 @@ mod strict_validation_tests {
             _buffer: bytes,
             block,
             kinds: crate::element_kind::KindSet::default(),
+            element_count: 0,
         }
     }
 

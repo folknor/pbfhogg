@@ -454,9 +454,9 @@ pub(crate) struct BlockRun<'a> {
     /// for a block that crosses its window's upper end. `None` runs to the
     /// end of the block.
     pub(crate) end: Option<usize>,
-    /// Elements in the run: `end - skip` when bounded (counted), the blob's
-    /// claimed count less `skip` otherwise (trusted, as everywhere in the
-    /// block-pair engine).
+    /// Elements in the run: `end - skip` when bounded, the decoded block's
+    /// element count less `skip` otherwise. Counted either way, never the
+    /// blob's claimed count.
     pub(crate) count: u64,
 }
 
@@ -529,7 +529,10 @@ impl BlockState {
     fn run(&self) -> BlockRun<'_> {
         let count = match self.end {
             Some(end) => (end - self.skip_count.min(end)) as u64,
-            None => self.index.count.saturating_sub(self.skip_count as u64),
+            None => self
+                .block
+                .element_count()
+                .saturating_sub(self.skip_count as u64),
         };
         BlockRun {
             block: &self.block,
@@ -1072,9 +1075,12 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                         continue;
                     }
                     stats.pairs_overlapping_decoded += 1;
-                    stats.elements_overlapping_decoded += op.index.count + np.index.count;
-                    old_decoded = Some(old.decode(op)?).filter(|bs| !bs.spent());
-                    new_decoded = Some(new.decode(np)?).filter(|bs| !bs.spent());
+                    let os = old.decode(op)?;
+                    let ns = new.decode(np)?;
+                    stats.elements_overlapping_decoded +=
+                        os.block.element_count() + ns.block.element_count();
+                    old_decoded = Some(os).filter(|bs| !bs.spent());
+                    new_decoded = Some(ns).filter(|bs| !bs.spent());
                 }
             }
         }

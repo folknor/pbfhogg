@@ -965,20 +965,14 @@ fn sorted_pbf_no_assertion_failure() {
     reader.for_each_pipelined(|_| {}).unwrap();
 }
 
-/// Debug assertion fires on unsorted nodes when Sort.Type_then_ID is declared.
-///
-/// Requires `debug_assertions` to be enabled in the test profile.
-/// Nightly 1.95 (2026-02-25) has a regression where `debug_assertions` is
-/// off in test builds, so the test compiles to nothing in our environment.
-/// `cfg(debug_assertions)` is the correct gate: the test is only
-/// meaningful when the runtime assertion can fire, and `include_ignored`
-/// can't resurrect a compile-excluded item (which `#[ignore]` alone left
-/// vulnerable - tier 3 / `--profile full` in brokkr.toml runs ignored
-/// tests and hit the unfireable-panic case).
-#[cfg(debug_assertions)]
+/// A file whose header declares Sort.Type_then_ID while its nodes are out of
+/// order is untrusted input, not a broken invariant: the reader delivers its
+/// elements in file order on both paths and leaves the order to the caller
+/// whose answer depends on it (time-filter, apply-changes and the others
+/// refuse it as `Unsorted`). It used to `debug_assert` on it, which panicked
+/// debug builds on a lying file and checked nothing in release.
 #[test]
-#[should_panic(expected = "Sort.Type_then_ID violated")]
-fn sorted_flag_but_unsorted_nodes_panics() {
+fn sorted_flag_but_unsorted_nodes_is_delivered_in_file_order() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("liar.osm.pbf");
 
@@ -1013,8 +1007,23 @@ fn sorted_flag_but_unsorted_nodes_panics() {
 
     writer.flush().unwrap();
 
-    let reader = ElementReader::from_path(&path).unwrap();
-    reader.for_each(|_| {}).unwrap();
+    let id = |e: Element<'_>| match e {
+        Element::DenseNode(n) => n.id(),
+        Element::Node(n) => n.id(),
+        _ => 0,
+    };
+    let mut sequential = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
+        .for_each(|e| sequential.push(id(e)))
+        .unwrap();
+    let mut pipelined = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
+        .for_each_pipelined(|e| pipelined.push(id(e)))
+        .unwrap();
+    assert_eq!(sequential, vec![100, 50]);
+    assert_eq!(pipelined, vec![100, 50]);
 }
 
 // ---------------------------------------------------------------------------

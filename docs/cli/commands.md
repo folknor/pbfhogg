@@ -541,6 +541,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed on unindexed input with the slower fallback |
+| `--distrust-metadata` | Believe no claim the input makes about itself (the header's sort claim, indexdata, tagdata): decode every blob, rewrite one found out of order, and reframe one whose indexdata or tag keys its payload contradicts. Needs no indexdata. The repair a command's `Unsorted` refusal names: by default a sorted-claiming file's blobs are copied as they are |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -888,6 +889,11 @@ Embed node coordinates in ways. Two index strategies:
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
+Every blob either index type decodes must match its indexdata: a blob holding
+another kind than it claims, or whose claimed ID range or count is wrong, fails
+the run and nothing is written. The external index also refuses an input whose
+blobs it finds out of order under the sorted header.
+
 ```
 pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 ```
@@ -920,6 +926,11 @@ The timestamp can be UNIX seconds or RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 The output's replication timestamp is the earlier of the input's and the
 cutoff; the input's sequence number is kept only when the input's timestamp is
 known and not after the cutoff.
+
+The input must be sorted, and is checked as it is read: an element out of
+order fails the run (sort it with `sort --distrust-metadata`), as do a history
+object whose versions do not strictly ascend and an object appearing twice in
+a non-history input.
 
 | Flag | Description |
 |------|-------------|

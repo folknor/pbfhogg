@@ -409,9 +409,25 @@ pub(super) struct NodeBlobInfo {
     /// blobs intersecting each id bucket; stage 2's merge walk uses
     /// `node_tuples.last().id` (the actual decoded last id) as the
     /// upper consumption bound rather than `max_id` itself, so loose
-    /// indexdata can't cause silent record loss.
+    /// indexdata can't cause silent record loss. Stage 2 also holds the
+    /// claim exact for every node blob it decodes.
     pub min_id: i64,
     pub max_id: i64,
+    /// Indexdata-advertised element count, held exact with the range.
+    pub count: u64,
+}
+
+impl NodeBlobInfo {
+    /// The node blob's indexdata claim.
+    pub(super) fn claim(&self) -> crate::blob_meta::BlobIndex {
+        crate::blob_meta::BlobIndex {
+            kind: crate::ElementKind::Node,
+            min_id: self.min_id,
+            max_id: self.max_id,
+            count: self.count,
+            bbox: None,
+        }
+    }
 }
 
 /// An id-bucketed occurrence record emitted by stage 1 pass A.

@@ -48,7 +48,7 @@ use crate::owned::{
 };
 use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
 use crate::read::input::{InputFile, PinnedInput};
-use crate::writer::{PbfWriter, reframe_raw_with_index};
+use crate::writer::PbfWriter;
 
 // ---------------------------------------------------------------------------
 // Blob index
@@ -136,6 +136,13 @@ pub(crate) struct IndexPolicy {
     /// the remedy, scanning each unindexed blob (reference/indexdata-trust.md,
     /// "Missing and partial indexdata").
     pub(crate) accept_partial_index: bool,
+    /// Believe no claim (`sort --distrust-metadata`): every blob is scanned
+    /// from its payload as under a header without the sorted claim, its tag
+    /// keys included, and a blob whose indexdata or tagdata the scan
+    /// contradicts is reframed under the scanned ones. The remedy for a file
+    /// refused as unsorted, which a plain sort under the file's sorted claim
+    /// would copy unchanged.
+    pub(crate) distrust_metadata: bool,
 }
 
 /// Pass 1: walk every input, in order, and index its OSMData blobs.
@@ -246,7 +253,7 @@ impl Walk<'_> {
         input: &PinnedInput,
         mut walker: HeaderWalker<P>,
     ) -> Result<crate::HeaderBlock> {
-        if self.policy.accept_partial_index {
+        if self.policy.accept_partial_index || self.policy.distrust_metadata {
             walker = walker.accepting_partial_index();
         }
         let mut header: Option<crate::HeaderBlock> = None;
@@ -259,7 +266,8 @@ impl Walk<'_> {
                     return Err(crate::error::new_missing_header(input.path()));
                 }
                 BlobKind::OsmData => {
-                    self.data_blob(source, &walker, &meta, claims_sorted == Some(true))?;
+                    let believed = claims_sorted == Some(true) && !self.policy.distrust_metadata;
+                    self.data_blob(source, &walker, &meta, believed)?;
                 }
                 // Unknown extension blob: the walk has already stepped past it.
                 _ => {}
@@ -323,7 +331,8 @@ impl Walk<'_> {
             }
             claimed => claimed,
         };
-        if claimed.is_some() && !self.noted_unclaimed {
+        let distrust = self.policy.distrust_metadata;
+        if claimed.is_some() && !self.noted_unclaimed && !distrust {
             self.noted_unclaimed = true;
             // Only `sort` reaches this: `cat --dedupe` refuses an input
             // whose header does not claim sorted.
@@ -336,11 +345,13 @@ impl Walk<'_> {
             );
         }
         let located = |e| walker.locate_meta(meta, e);
-        // Tag keys are wanted only where a passthrough is reframed: a blob
-        // without indexdata. An indexed one is copied whole unless its claim
-        // turns out false, which rescans the buffer below.
+        // Tag keys are wanted where a passthrough is reframed: a blob
+        // without indexdata, and under distrust every blob, whose carried
+        // key set is checked against them. Otherwise an indexed blob is
+        // copied whole unless its claim turns out false, which rescans the
+        // buffer below.
         let scanned = self
-            .scan_payload(walker, meta, claimed.is_none())
+            .scan_payload(walker, meta, claimed.is_none() || distrust)
             .map_err(located)?;
         match scanned {
             Scanned::Block {
@@ -348,13 +359,20 @@ impl Walk<'_> {
                 sorted,
                 tagdata,
             } => {
+                let tags_hold =
+                    !distrust || carried_tags_hold(meta.tagdata.as_deref(), tagdata.as_deref());
                 new_frame.reindex = match claimed {
                     None => Some(Reindex {
                         index,
                         tagdata,
                         replaces_false_claim: false,
                     }),
-                    Some(claim) if claim_holds(&claim, &index) => None,
+                    Some(claim) if claim_holds(&claim, &index) && tags_hold => None,
+                    Some(_) if distrust => Some(Reindex {
+                        index,
+                        tagdata,
+                        replaces_false_claim: true,
+                    }),
                     Some(_) => Some(Reindex {
                         index,
                         tagdata: scanned_tagdata(&self.decompress_buf).map_err(located)?,
@@ -429,6 +447,28 @@ fn claim_holds(claim: &BlobIndex, scanned: &BlobIndex) -> bool {
             claim.bbox_claim(scanned),
             BboxClaim::Absent | BboxClaim::Holds
         )
+}
+
+/// Whether a blob's carried tagdata, compared as a key set, is the set the
+/// scan found (`scanned`, serialized). Absent carried tagdata claims nothing
+/// and holds; carried bytes that do not parse, or a scanned set too large to
+/// encode, cannot match.
+fn carried_tags_hold(carried: Option<&[u8]>, scanned: Option<&[u8]>) -> bool {
+    let Some(carried) = carried else {
+        return true;
+    };
+    let (Some(carried), Some(scanned)) = (
+        TagIndex::deserialize(carried),
+        scanned.and_then(TagIndex::deserialize),
+    ) else {
+        return false;
+    };
+    let mut keys: Vec<&[u8]> = carried.keys().iter().map(AsRef::as_ref).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.iter()
+        .copied()
+        .eq(scanned.keys().iter().map(AsRef::as_ref))
 }
 
 /// The serialized tag key set of a block one index describes.
@@ -631,20 +671,17 @@ pub(crate) fn plan(indexed: Indexed) -> Plan {
 
 impl Plan {
     /// What the output's way blobs are, for the output header: a way blob in
-    /// a rewrite run is re-encoded without enrichments, a reframed
-    /// passthrough way blob keeps its payload under a new header (field 5
-    /// dropped), every other way blob is copied whole.
+    /// a rewrite run is re-encoded without enrichments; every other way blob
+    /// keeps its payload and every header field but its index and tag keys,
+    /// which a reframed passthrough replaces (`write_passthrough`), so its
+    /// field 5 still describes its ways.
     pub(crate) fn ways(&self) -> crate::commands::output_header::Ways {
-        let way_blobs = || {
-            self.entries
-                .iter()
-                .zip(&self.rewrite)
-                .filter(|(e, _)| e.index.kind == ElementKind::Way)
-        };
-        crate::commands::output_header::Ways::from_copy(
-            way_blobs().any(|(_, &r)| r),
-            way_blobs().any(|(e, &r)| !r && self.frames[e.frame].reindex.is_some()),
-        )
+        let any_way_rewritten = self
+            .entries
+            .iter()
+            .zip(&self.rewrite)
+            .any(|(e, &r)| r && e.index.kind == ElementKind::Way);
+        crate::commands::output_header::Ways::from_copy(any_way_rewritten, false)
     }
 }
 
@@ -1011,7 +1048,9 @@ impl CopyRun {
 
 /// Passthrough without the copy path: the frame raw when it keeps its own
 /// header (an output that cannot splice, such as `--direct-io`), else
-/// reframed with the index and tag keys pass 1 scanned.
+/// reframed with the index and tag keys pass 1 scanned, every other header
+/// field (way members included: the payload, and so each way's position,
+/// is unchanged) kept as `cat --reindex` keeps it.
 fn write_passthrough(
     frame: &Frame,
     reindex: Option<&Reindex>,
@@ -1023,13 +1062,15 @@ fn write_passthrough(
     match reindex {
         None => writer.write_raw(frame_buf)?,
         Some(reindex) => {
-            let reframed = blob_bytes(frame_buf)
-                .and_then(|blob| {
-                    reframe_raw_with_index(
+            let mut header_buf = Vec::new();
+            let reframed = frame_parts(frame_buf)
+                .and_then(|(header, blob)| {
+                    crate::commands::cat::reindex::reframe_preserving(
+                        header,
                         blob,
                         &reindex.index.serialize(),
                         reindex.tagdata.as_deref(),
-                        &writer.cancel_token().metrics().writer,
+                        &mut header_buf,
                     )
                 })
                 .map_err(|e| source.locate_at(frame.file_offset, e))?;
@@ -1075,13 +1116,14 @@ pub(crate) fn read_block(
     buf: &mut Vec<u8>,
 ) -> Result<crate::PrimitiveBlock> {
     read_frame(source, frame, buf)?;
-    blob_bytes(buf)
-        .and_then(decode_blob_to_primitiveblock)
+    frame_parts(buf)
+        .and_then(|(_, blob)| decode_blob_to_primitiveblock(blob))
         .map_err(|e| source.locate_at(frame.file_offset, e))
 }
 
-/// The Blob bytes of a complete frame, `[4-byte header_len][BlobHeader][Blob]`.
-fn blob_bytes(frame: &[u8]) -> Result<&[u8]> {
+/// The BlobHeader and Blob bytes of a complete frame,
+/// `[4-byte header_len][BlobHeader][Blob]`.
+fn frame_parts(frame: &[u8]) -> Result<(&[u8], &[u8])> {
     if frame.len() < 4 {
         return Err(Error::invalid_data("frame too short"));
     }
@@ -1091,7 +1133,7 @@ fn blob_bytes(frame: &[u8]) -> Result<&[u8]> {
     if blob_start > frame.len() {
         return Err(Error::invalid_data("invalid header length"));
     }
-    Ok(&frame[blob_start..])
+    Ok((&frame[4..blob_start], &frame[blob_start..]))
 }
 
 // ---------------------------------------------------------------------------

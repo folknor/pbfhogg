@@ -82,14 +82,20 @@ fn blob_is_passthrough(kind: Option<crate::ElementKind>, keep_untagged_nodes: bo
 /// Select relation dependencies without owning their accumulation strategy.
 /// Sparse streams per-blob vectors into one IdSet; external inserts directly
 /// while preading its existing metadata table. Keep those measured shapes.
+///
+/// Every relation's ID goes to `walk`, memberless ones included, so the
+/// caller can hold the blob's claim to what it holds. The block holds only
+/// relations: both callers refuse a foreign kind first.
 fn relation_member_ids(
     block: &PrimitiveBlock,
     want_nodes: bool,
     want_ways: bool,
+    walk: &mut crate::blob_meta::ClaimWalk<'_>,
     mut emit: impl FnMut(bool, i64),
-) {
+) -> Result<()> {
     for element in block.elements_skip_metadata() {
         if let Element::Relation(r) = element {
+            walk.observe(r.id())?;
             let complete = r
                 .tags()
                 .any(|(key, value)| key == "type" && matches!(value, "multipolygon" | "boundary"));
@@ -102,6 +108,7 @@ fn relation_member_ids(
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -889,9 +896,10 @@ fn collect_way_referenced_node_ids(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::ElementKind::Way),
-        crate::scan::classify::KindClaims::Unchecked,
+        crate::scan::classify::KindClaims::Refuse,
         host,
     )?;
+    let schedule_ref = &schedule;
     let mut referenced = IdSet::new();
     // Prepass needs two independent facts: whether an ID has been seen at
     // all, and whether it was referenced again (a closed ring's repeated last
@@ -915,9 +923,9 @@ fn collect_way_referenced_node_ids(
         &schedule,
         None,
         || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-        |_position, decompressed, (refs_buf, group_starts)| {
+        |position, decompressed, (refs_buf, group_starts)| {
             let mut refs_vec: Vec<i64> = Vec::new();
-            crate::scan::way::scan_way_refs(
+            let kinds = crate::scan::way::scan_way_refs(
                 decompressed,
                 refs_buf,
                 group_starts,
@@ -934,6 +942,11 @@ fn collect_way_referenced_node_ids(
                     }
                 },
             )?;
+            // The walker reads only ways, so nodes or relations under a way
+            // claim would be copied through the reframe unindexed and
+            // unscanned. The way claim's range and count are checked where
+            // the reframe counts them (`passthrough::decode_one`).
+            kinds.refuse_under(schedule_ref[position].claim())?;
             Ok(refs_vec)
         },
         |_seq, refs_vec| {
@@ -999,27 +1012,39 @@ pub(crate) fn collect_relation_member_ids(
     want_ways: bool,
     host: &crate::host::Host,
 ) -> Result<(Option<IdSet>, Option<IdSet>)> {
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        input,
-        Some(crate::ElementKind::Relation),
-        crate::scan::classify::KindClaims::Unchecked,
-        host,
-    )?;
+    // Every relation blob is decoded here, so its claim is held to what it
+    // holds: a foreign kind by the pool (`KindClaims::Refuse`), range and
+    // count in the merge, which knows the blob's position. Order is not
+    // checked: the sparse path does not depend on it.
+    let (schedule, claims, shared_file) =
+        crate::scan::classify::build_classify_schedule_with_claims(
+            input,
+            Some(crate::ElementKind::Relation),
+            host,
+        )?;
     let mut member_node_ids = want_nodes.then(IdSet::new);
     let mut member_way_ids = want_ways.then(IdSet::new);
-    crate::scan::classify::parallel_classify_phase(
+    let mut refused: Option<Error> = None;
+    crate::scan::classify::parallel_classify_phase_abortable(
         &shared_file,
         &schedule,
         None,
         || (),
         |block, _state| {
             let mut ids: Vec<(bool, i64)> = Vec::new();
-            relation_member_ids(block, want_nodes, want_ways, |way, id| {
+            let mut walk = crate::blob_meta::ClaimWalk::new(None, crate::blob_meta::Order::Free);
+            relation_member_ids(block, want_nodes, want_ways, &mut walk, |way, id| {
                 ids.push((way, id));
-            });
-            Ok(ids)
+            })?;
+            Ok((ids, walk.tally()))
         },
-        |_seq, ids| {
+        |seq, (ids, tally)| {
+            if let Some(claim) = &claims[seq]
+                && let Err(e) = tally.refuse_inexact(claim)
+            {
+                refused = Some(shared_file.locate_blob(&schedule[seq], e));
+                return std::ops::ControlFlow::Break(());
+            }
             for (way, id) in ids {
                 // A kind that was not requested has no set and nothing to
                 // record.
@@ -1032,9 +1057,13 @@ pub(crate) fn collect_relation_member_ids(
                     set.set(id);
                 }
             }
+            std::ops::ControlFlow::Continue(())
         },
         host,
     )?;
+    if let Some(e) = refused {
+        return Err(e);
+    }
     Ok((member_node_ids, member_way_ids))
 }
 

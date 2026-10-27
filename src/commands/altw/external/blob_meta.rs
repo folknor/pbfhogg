@@ -22,6 +22,29 @@ pub(super) struct BlobMeta {
     pub has_tags: bool,
 }
 
+impl BlobMeta {
+    /// The blob's indexdata claim, for holding it to the elements a stage
+    /// decodes (`blob_meta::ClaimWalk`). The bbox is not kept here and no
+    /// stage checks it.
+    pub(super) fn claim(&self) -> crate::blob_meta::BlobIndex {
+        crate::blob_meta::BlobIndex {
+            kind: self.kind,
+            min_id: self.min_id,
+            max_id: self.max_id,
+            count: self.count,
+            bbox: None,
+        }
+    }
+}
+
+/// The order requirement the external join holds every blob it decodes to:
+/// it writes blobs in input order under the input's sorted header, and its
+/// stage 2 merge walk needs each node blob ascending.
+pub(super) const EXTERNAL_ORDER: crate::blob_meta::Order = crate::blob_meta::Order::Required(
+    "altw external: refusing an input whose blob contradicts its Sort.Type_then_ID header, \
+     whose order the external join depends on",
+);
+
 /// Scan all OsmData blob headers once and retain only the metadata ALTW
 /// external join actually reuses later. Walks via the pread-only
 /// `HeaderWalker` so blob bodies stay out of the page cache during the
@@ -126,8 +149,10 @@ fn check_range(
     idx: &crate::blob_meta::BlobIndex,
     order: &mut crate::osm_id::OrderWatermark,
 ) -> Result<()> {
+    // Defensive: `BlobIndex::deserialize` already reads an inverted range as
+    // no index, which the walk's partial-index refusal reaches first.
     if idx.max_id < idx.min_id {
-        return Err(crate::Error::invalid_data(format!(
+        return Err(crate::error::new_indexdata_mismatch(format!(
             "altw external: {} blob has reversed indexdata range [min_id={}, max_id={}]",
             idx.kind.as_str(),
             idx.min_id,

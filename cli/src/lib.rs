@@ -1252,6 +1252,13 @@ enum Command {
         uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
+        /// Believe no claim the input makes about itself (the header's
+        /// Sort.Type_then_ID, indexdata, tagdata): decode every blob, rewrite
+        /// any found out of order and reframe any whose indexdata or tagdata
+        /// its payload contradicts. The repair for a file refused as unsorted.
+        /// Needs no indexdata, so --force is not needed alongside it.
+        #[arg(long = "distrust-metadata")]
+        distrust_metadata: bool,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -2498,16 +2505,20 @@ pub fn run() -> process::ExitCode {
                 io,
                 uring,
                 force,
+                distrust_metadata,
                 header,
             } => {
                 let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
-                    direct_reads: io.direct_io,
-                    force: force.force,
+                let opts = pbfhogg::sort::SortOptions {
+                    write: WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                        direct_reads: io.direct_io,
+                        force: force.force,
+                    },
+                    distrust_metadata,
                 };
-                run_sort(&file, output.open(&host)?, &write, &overrides, &host)
+                run_sort(&file, output.open(&host)?, &opts, &overrides, &host)
             }
             Command::Repack {
                 file,
@@ -3767,11 +3778,11 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    write: &WriteOptions,
+    opts: &pbfhogg::sort::SortOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::sort::sort(file, output, write, overrides, host)?;
+    let stats = pbfhogg::sort::sort_with(file, output, opts, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("sort.summary"))?;
     host::note_unverified_claims(stats.passthrough_claimed);
     Ok(())

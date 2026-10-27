@@ -124,36 +124,13 @@ fn reindex_to(
             let tagdata = tags
                 .as_ref()
                 .and_then(crate::blob_meta::TagIndex::serialize);
-            let mut rebuilt = rebuild_header(
+            let out = reframe_preserving(
                 frame.header_bytes(),
+                frame.blob_bytes(),
                 &index.serialize(),
                 tagdata.as_deref(),
                 &mut header_buf,
             )?;
-            if !rebuilt {
-                // Over the limit with the tag index: drop it, as the writer
-                // does. A blob without tagdata claims no key set.
-                rebuilt = rebuild_header(
-                    frame.header_bytes(),
-                    &index.serialize(),
-                    None,
-                    &mut header_buf,
-                )?;
-            }
-            if !rebuilt {
-                return Err(crate::error::new_blob_too_large(
-                    crate::OversizePart::Header,
-                    header_buf.len() as u64,
-                    crate::blob::MAX_BLOB_HEADER_SIZE,
-                ));
-            }
-            let header_len = u32::try_from(header_buf.len())
-                .map_err(|_| Error::internal("a rebuilt BlobHeader fits the size limit"))?;
-            let blob = frame.blob_bytes();
-            let mut out = Vec::with_capacity(4 + header_buf.len() + blob.len());
-            out.extend_from_slice(&header_len.to_be_bytes());
-            out.extend_from_slice(&header_buf);
-            out.extend_from_slice(blob);
             Ok((out, changed))
         })()
         .map_err(|e| frames.locate(id, e))?;
@@ -164,6 +141,42 @@ fn reindex_to(
     }
     writer.flush()?;
     Ok(stats)
+}
+
+/// The frame `[4-byte length][BlobHeader][Blob]` of a blob whose header
+/// `header` keeps every field but `indexdata` and `tagdata`, which become
+/// `index` and `tagdata`, over the unchanged `blob` bytes. The way-members
+/// field and any field this build does not know survive, so a reindexed
+/// blob loses nothing its payload still supports. Over the header-size limit
+/// the tag index is dropped first, as the writer drops it; still over, the
+/// blob is refused rather than stripped of a preserved field. `header_buf`
+/// is scratch.
+pub(crate) fn reframe_preserving(
+    header: &[u8],
+    blob: &[u8],
+    index: &[u8],
+    tagdata: Option<&[u8]>,
+    header_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut rebuilt = rebuild_header(header, index, tagdata, header_buf)?;
+    if !rebuilt {
+        // A blob without tagdata claims no key set.
+        rebuilt = rebuild_header(header, index, None, header_buf)?;
+    }
+    if !rebuilt {
+        return Err(crate::error::new_blob_too_large(
+            crate::OversizePart::Header,
+            header_buf.len() as u64,
+            crate::blob::MAX_BLOB_HEADER_SIZE,
+        ));
+    }
+    let header_len = u32::try_from(header_buf.len())
+        .map_err(|_| Error::internal("a rebuilt BlobHeader fits the size limit"))?;
+    let mut out = Vec::with_capacity(4 + header_buf.len() + blob.len());
+    out.extend_from_slice(&header_len.to_be_bytes());
+    out.extend_from_slice(header_buf);
+    out.extend_from_slice(blob);
+    Ok(out)
 }
 
 /// `header` with every `indexdata` and `tagdata` field replaced by `index`

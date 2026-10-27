@@ -77,8 +77,9 @@ Four consequences follow, and are binding on new code (the fourth added on
    refusing it. This adds no decode and no per-element pass; phases adopt it
    one by one (`KindClaims::Refuse`), and the ones that have not yet still
    believe their claims unchecked. The same holds for the range and count of
-   a blob a run places by its range and decodes anyway (`apply-changes` and
-   the `sort` / `cat --dedupe` sweep): the element loop the run already makes
+   a blob a run places, counts or copies by its claim and decodes anyway
+   (`apply-changes`, `add-locations-to-ways` and the `sort` /
+   `cat --dedupe` sweep): the element loop the run already makes
    tallies the IDs, and a claim that is not exact for them is the same
    refusal without a `KindContradiction`
    ([indexdata-trust.md](../reference/indexdata-trust.md), "Range, count and

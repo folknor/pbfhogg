@@ -34,7 +34,7 @@ use super::{
 };
 use crate::counters::record_max;
 use crate::error::Error;
-use crate::scan::node::{NodeTuple, extract_node_tuples};
+use crate::scan::node::NodeTuple;
 use crate::scratch::RunScratch;
 use crate::tunables::{
     ALTW_STAGE2_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
@@ -483,9 +483,39 @@ pub(super) fn stage2_node_join(
 
                             let t_ex = crate::counters::Stopwatch::start();
                             node_tuples.clear();
-                            extract_node_tuples(
-                                &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
+                            // Every tuple goes through the blob's claim walk
+                            // in the sink: the partition above placed the
+                            // blob by its claimed range, and the merge walk
+                            // below needs its nodes ascending, so a claim
+                            // that is not exact, or a payload out of order,
+                            // is refused before any record is resolved
+                            // against it. A foreign kind is one this
+                            // scanner never reads.
+                            let claim = blob.claim();
+                            let mut walk = crate::blob_meta::ClaimWalk::new(
+                                Some(&claim),
+                                super::blob_meta::EXTERNAL_ORDER,
+                            );
+                            let mut walk_error: Option<Error> = None;
+                            let kinds = crate::scan::node::extract_node_coords(
+                                &node_decompress_buf,
+                                &mut node_group_starts,
+                                |id, lat, lon| {
+                                    if walk_error.is_none()
+                                        && let Err(e) = walk.observe(id)
+                                    {
+                                        walk_error = Some(e);
+                                    }
+                                    node_tuples.push(NodeTuple { id, lat, lon });
+                                },
                             ).map_err(|e| in_input(e.context("stage2 node extract")))?;
+                            kinds
+                                .refuse_under(Some(crate::ElementKind::Node))
+                                .map_err(in_input)?;
+                            if let Some(e) = walk_error {
+                                return Err(in_input(e));
+                            }
+                            walk.finish().map_err(in_input)?;
                             t_ex.record_ms(&c.node_extract_ms);
                             t_ex.record_ns(&c.node_extract_ns);
 
@@ -516,17 +546,11 @@ pub(super) fn stage2_node_join(
                             // ResolvedEntry, matching the existing
                             // missing-ref behaviour.
                             //
-                            // Order inside the blob is believed, from the
-                            // header's sorted claim: nothing checks it in
-                            // release builds (the debug_assert below sees
-                            // only the tuples the walk steps over). A blob
-                            // whose elements are out of order makes the
-                            // walk pass present nodes, which then go out as
-                            // missing locations. A per-blob monotonicity
-                            // pass over `node_tuples` would catch it; it is
-                            // not added, since claims are believed, not
-                            // verified (reference/indexdata-trust.md), and
-                            // `check --ids` verifies order.
+                            // Order inside the blob was checked on
+                            // extraction above (a blob out of order would
+                            // make this walk pass present nodes, which would
+                            // go out as missing locations), so the
+                            // debug_assert below only restates it.
                             let t_walk = crate::counters::Stopwatch::start();
                             let blob_actual_upper: Option<u64> = node_tuples
                                 .last()

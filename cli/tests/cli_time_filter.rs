@@ -591,3 +591,175 @@ fn read_ways_and_relations(path: &Path) -> (Vec<WaySnapshot>, Vec<RelationSnapsh
     }
     (ways, relations)
 }
+
+// ---------------------------------------------------------------------------
+// The sorted claim, checked while reading
+// ---------------------------------------------------------------------------
+
+/// A file declaring `Sort.Type_then_ID` (and `HistoricalInformation` when
+/// `history`) whose node blobs hold `blocks` in order, each node
+/// `(id, version, timestamp)`, with or without indexdata.
+fn write_node_blocks(path: &Path, history: bool, indexed: bool, blocks: &[&[(i64, i32, i64)]]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let mut header = block_builder::HeaderBuilder::new().sorted();
+    if history {
+        header = header.historical();
+    }
+    writer
+        .write_header(&header.build().expect("build header"))
+        .expect("write header");
+    let mut bb = BlockBuilder::new();
+    for block in blocks {
+        for &(id, version, timestamp) in *block {
+            bb.add_node(
+                id,
+                10,
+                10,
+                [],
+                Some(&snapshot_meta(version, timestamp, true)),
+            );
+        }
+        let bytes = bb.take().expect("take").expect("block");
+        if indexed {
+            writer.write_primitive_block(bytes).expect("write block");
+        } else {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
+}
+
+fn assert_time_filter_refuses(input: &Path, needle: &str) -> String {
+    let output = input.with_extension("out.pbf");
+    let out = CliInvoker::new()
+        .arg("time-filter")
+        .arg(input)
+        .arg("-o")
+        .arg(&output)
+        .arg("1000")
+        .assert_failure();
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains(needle),
+        "wanted {needle:?}; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&input.display().to_string()),
+        "the refusal names the input; stderr:\n{stderr}"
+    );
+    assert!(!output.exists(), "a refused run publishes nothing");
+    stderr
+}
+
+/// The history path groups versions by contiguous ID, believing the sorted
+/// header: node 2 coming back after node 1 used to be written twice. It is
+/// refused as unsorted, with the repair named, on indexed and unindexed
+/// input alike (neither path reads indexdata).
+#[test]
+fn history_path_refuses_an_object_out_of_order() {
+    let dir = crate::common::test_scratch();
+    for indexed in [true, false] {
+        let input = dir
+            .path()
+            .join(format!("history-unsorted-{indexed}.osm.pbf"));
+        write_node_blocks(
+            &input,
+            true,
+            indexed,
+            &[&[(2, 1, 100)], &[(1, 1, 100), (2, 2, 200)]],
+        );
+        let stderr = assert_time_filter_refuses(&input, "node 1 follows node 2");
+        assert!(stderr.contains("sort --distrust-metadata"), "{stderr}");
+    }
+}
+
+/// Within one object the history path keeps the last version at or before
+/// the cutoff in input order, so a version descent used to pick the older
+/// version silently, and a repeated version the later of two records.
+#[test]
+fn history_path_refuses_versions_out_of_order() {
+    let dir = crate::common::test_scratch();
+    // Version 0 claims no version, so it cannot be ordered against the 1.
+    for (name, versions) in [
+        ("descending", [2, 1]),
+        ("repeated", [2, 2]),
+        ("unversioned", [0, 1]),
+    ] {
+        let input = dir.path().join(format!("history-{name}.osm.pbf"));
+        let block = [(7, versions[0], 100), (7, versions[1], 200)];
+        write_node_blocks(&input, true, true, &[&block]);
+        assert_time_filter_refuses(&input, "versions must be strictly ascending");
+    }
+}
+
+/// The snapshot path filters each block on its own and carries the sorted
+/// claim into the output: a descent across blocks or inside one is refused
+/// as unsorted, and an object twice in a non-history file (both occurrences
+/// used to be written) is refused as such, whatever the gate keeps.
+#[test]
+fn snapshot_path_refuses_disorder_and_duplicates() {
+    let dir = crate::common::test_scratch();
+    type Blocks<'a> = &'a [&'a [(i64, i32, i64)]];
+    let cases: [(&str, Blocks<'_>, &str); 4] = [
+        (
+            "across",
+            &[&[(2, 1, 100)], &[(1, 1, 100)]],
+            "node 1 follows node 2",
+        ),
+        (
+            "inside",
+            &[&[(2, 1, 100), (1, 1, 100)]],
+            "node 1 follows node 2",
+        ),
+        // Both versions are past the cutoff, so the gate keeps neither.
+        (
+            "dropped",
+            &[&[(3, 1, 5_000)], &[(1, 1, 5_000)]],
+            "node 1 follows node 3",
+        ),
+        (
+            "duplicate",
+            &[&[(1, 1, 100)], &[(1, 2, 200)]],
+            "appears more than once",
+        ),
+    ];
+    for (name, blocks, needle) in cases {
+        let input = dir.path().join(format!("snapshot-{name}.osm.pbf"));
+        write_node_blocks(&input, false, true, blocks);
+        assert_time_filter_refuses(&input, needle);
+    }
+}
+
+/// The passing counterpart: a sorted history input without any indexdata,
+/// several versions per object, filters as the indexed one does.
+#[test]
+fn unindexed_sorted_history_input_still_filters() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unindexed-history.osm.pbf");
+    write_node_blocks(
+        &input,
+        true,
+        false,
+        &[&[(1, 1, 100), (1, 2, 200)], &[(1, 3, 2_000), (2, 1, 100)]],
+    );
+    let output = dir.path().join("out.osm.pbf");
+    run_time_filter(&input, &output, 1000);
+    assert_eq!(
+        read_nodes_with_metadata(&output),
+        vec![
+            NodeSnapshot {
+                id: 1,
+                version: 2,
+                timestamp: 200
+            },
+            NodeSnapshot {
+                id: 2,
+                version: 1,
+                timestamp: 100
+            },
+        ]
+    );
+}

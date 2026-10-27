@@ -170,8 +170,14 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
                 advice.indexdata.unwrap_or("")
             }
         )),
+        // One remedy for every Unsorted: a header without the sorted claim
+        // sorts the same either way, and one whose claim the file
+        // contradicts is copied unchanged by plain `sort`, which believes
+        // the claim and the blobs' indexdata.
         ErrorKind::Unsorted { .. } => Some(format!(
-            "\n\nSort the input first:\n\n  pbfhogg sort {} -o sorted.osm.pbf",
+            "\n\nSort the input first, decoding every blob rather than believing the header's \
+             sort claim and the blobs' indexdata:\n\n  pbfhogg sort --distrust-metadata {} -o \
+             sorted.osm.pbf",
             input_word(error, "input.osm.pbf")
         )),
         ErrorKind::IndexdataMismatch { .. } => {

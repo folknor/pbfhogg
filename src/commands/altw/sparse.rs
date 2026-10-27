@@ -255,12 +255,20 @@ pub(super) fn build_node_index_sparse(
         .map_err(|_| Error::internal("sparse index total_bytes does not fit in usize"))?;
     let writer = SharedSparseWriter::new(&mut mmap, capacity_bytes);
 
-    let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(
-        input,
-        Some(crate::ElementKind::Node),
-        crate::scan::classify::KindClaims::Unchecked,
-        host,
-    )?;
+    // Every node blob is decoded here, so each one's claim is held to what
+    // it holds: no foreign kind (the scanner reads only nodes, so a way or
+    // relation under a node claim is one no pass would see), and the exact
+    // range and count (a passed-through node blob's count is the run's
+    // statistics, and its header is copied into the output). Order is not
+    // checked: the rank-indexed store takes nodes in any order.
+    let (schedule, claims, shared_input) =
+        crate::scan::classify::build_classify_schedule_with_claims(
+            input,
+            Some(crate::ElementKind::Node),
+            host,
+        )?;
+    let schedule_ref = &schedule;
+    let claims_ref = &claims;
 
     // Per-blob rank-span accounting: on sorted inputs each blob's
     // referenced nodes occupy one contiguous rank interval, so
@@ -282,13 +290,19 @@ pub(super) fn build_node_index_sparse(
         &schedule,
         None,
         || -> Scratch { (Vec::new(), Vec::new()) },
-        |_position, decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
+        |position, decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
             tuples.clear();
-            crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+            let kinds = crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+            kinds.refuse_under(schedule_ref[position].claim())?;
+            let mut walk = crate::blob_meta::ClaimWalk::new(
+                claims_ref[position].as_ref(),
+                crate::blob_meta::Order::Free,
+            );
             let mut blob_stored: u64 = 0;
             let mut blob_min_rank: u64 = u64::MAX;
             let mut blob_max_rank: u64 = 0;
             for tup in tuples.iter() {
+                walk.observe(tup.id)?;
                 if tup.id < 0 {
                     continue;
                 }
@@ -303,6 +317,7 @@ pub(super) fn build_node_index_sparse(
                     }
                 }
             }
+            walk.finish()?;
             c.tuples_scanned
                 .fetch_add(tuples.len() as u64, Ordering::Relaxed);
             if blob_stored > 0 {

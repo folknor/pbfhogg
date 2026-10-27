@@ -21,7 +21,11 @@
 //! kinds of data blob have been seen).
 //! It does believe two header declarations: `Sort.Type_then_ID` (required;
 //! the history path's grouping needs each object's versions contiguous) and
-//! `HistoricalInformation` (which picks the path).
+//! `HistoricalInformation` (which picks the path). It checks the first as it
+//! reads, one key compare per element: an element sorting below its
+//! predecessor is `Unsorted`, on both paths. The history path also needs
+//! each object's versions strictly ascending, and the snapshot path each
+//! object once; either broken is `InvalidData`, which `sort` cannot repair.
 
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -66,6 +70,9 @@ impl TimeFilterStats {
 struct PendingGroup {
     kind: ElementKind,
     id: i64,
+    /// The version of the group's latest record, which the next record of
+    /// the same object must exceed.
+    last_version: Option<i32>,
     latest: Option<OwnedElement>,
 }
 
@@ -157,7 +164,13 @@ pub(crate) fn time_filter_to(
     )?;
 
     let stats = if is_history {
-        time_filter_history(reader, &mut writer, cutoff_timestamp, &host.invocation)?
+        time_filter_history(
+            reader,
+            &mut writer,
+            cutoff_timestamp,
+            pin.path(),
+            &host.invocation,
+        )?
     } else {
         // Drop the reader before the snapshot path - the migrated
         // snapshot path opens the input via HeaderWalker through
@@ -196,8 +209,12 @@ fn time_filter_history(
     reader: ElementReader<crate::file_reader::FileReader>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
+    input: &std::path::Path,
     invocation: &crate::host::Invocation,
 ) -> Result<TimeFilterStats> {
+    // The pipelined element callback knows no blob, so an order refusal it
+    // raises is located with the input.
+    let at_input = |e: crate::Error| e.locate(crate::error::Location::in_file(input));
     let mut bb = BlockBuilder::new();
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -226,7 +243,7 @@ fn time_filter_history(
         if flush_error.is_err() {
             return;
         }
-        let (kind, id, timestamp) = match element_identity_and_timestamp(&element) {
+        let (kind, id, timestamp, version) = match element_identity_and_timestamp(&element) {
             Ok(v) => v,
             Err(e) => {
                 flush_error = Err(e);
@@ -235,9 +252,34 @@ fn time_filter_history(
         };
         stats.versions_seen += 1;
 
-        let group_changed = pending
-            .as_ref()
-            .is_some_and(|g| g.kind != kind || g.id != id);
+        // The grouping below believes the sorted header: an object whose
+        // versions are not contiguous, or come back after its group was
+        // flushed, would be written twice. One key compare against the
+        // pending group refuses it, and within a group the versions must
+        // ascend for the last one at or before the cutoff to be the right
+        // one.
+        let group_changed = match pending.as_mut() {
+            None => false,
+            Some(g) => match order_key(kind, id).cmp(&order_key(g.kind, g.id)) {
+                std::cmp::Ordering::Less => {
+                    flush_error = Err(at_input(order_violation(kind, id, order_key(g.kind, g.id))));
+                    return;
+                }
+                std::cmp::Ordering::Equal => {
+                    match (g.last_version, version) {
+                        (Some(previous), Some(next)) if next > previous => {}
+                        (previous, next) => {
+                            flush_error =
+                                Err(at_input(version_violation(kind, id, previous, next)));
+                            return;
+                        }
+                    }
+                    g.last_version = version;
+                    false
+                }
+                std::cmp::Ordering::Greater => true,
+            },
+        };
         if group_changed
             && let Some(group) = pending.take()
             && let Err(e) = flush_group(group, &mut bb, writer, &mut stats)
@@ -250,6 +292,7 @@ fn time_filter_history(
             pending = Some(PendingGroup {
                 kind,
                 id,
+                last_version: version,
                 latest: None,
             });
         }
@@ -259,9 +302,9 @@ fn time_filter_history(
         // `(kind, id)` group arrive in ascending-version order (the
         // same convention PBF history files ship with). The "latest
         // element whose timestamp <= cutoff" is therefore the last one
-        // we see during the forward scan. A malformed history file
-        // with out-of-order versions would violate this, but that is
-        // out of spec.
+        // we see during the forward scan. A history file with versions
+        // out of order, repeated or absent within one object is refused
+        // above.
         if timestamp <= cutoff_timestamp {
             stats.versions_before_cutoff += 1;
             if let Some(group) = pending.as_mut() {
@@ -362,7 +405,12 @@ fn time_filter_snapshot(
         return Ok(stats);
     }
 
-    type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats)>;
+    // A block's first and last input keys, `None` for a block holding no
+    // element, so the drain can hold consecutive blocks to the sorted claim
+    // whatever the gate kept of them.
+    type Bounds = Option<(OrderKey, OrderKey)>;
+    type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats, Bounds)>;
+    let mut previous_last: Option<OrderKey> = None;
 
     // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
     // Vec/HashMap initialisers; no heap reservation until elements are
@@ -378,7 +426,9 @@ fn time_filter_snapshot(
         |block, _state| -> PhaseResult {
             let mut bb = BlockBuilder::new();
             let mut output: Vec<OwnedBlock> = Vec::new();
-            let block_stats = filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output)?;
+            let mut bounds: Bounds = None;
+            let block_stats =
+                filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output, &mut bounds)?;
             flush_local(&mut bb, &mut output)?;
 
             let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
@@ -400,11 +450,25 @@ fn time_filter_snapshot(
                 )?;
                 framed.push(blob.into_vec());
             }
-            Ok((framed, block_stats))
+            Ok((framed, block_stats, bounds))
         },
-        |_position, (framed, block_stats)| {
+        |position, (framed, block_stats, bounds)| {
             // Called in schedule order; a write error ends the pass at once.
             // A failed blob ends it too, located with its input.
+            if let Some((first, last)) = bounds {
+                if let Some(previous) = previous_last {
+                    let (kind, id) = key_identity(first);
+                    let refusal = match first.cmp(&previous) {
+                        std::cmp::Ordering::Less => Some(order_violation(kind, id, previous)),
+                        std::cmp::Ordering::Equal => Some(snapshot_duplicate(kind, id)),
+                        std::cmp::Ordering::Greater => None,
+                    };
+                    if let Some(e) = refusal {
+                        return Err(shared_file.locate_blob(&schedule[position], e));
+                    }
+                }
+                previous_last = Some(last);
+            }
             stats.versions_seen += block_stats.versions_seen;
             stats.versions_before_cutoff += block_stats.versions_before_cutoff;
             stats.elements_written += block_stats.elements_written;
@@ -457,6 +521,7 @@ fn filter_block_snapshot(
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
+    bounds: &mut Option<(OrderKey, OrderKey)>,
 ) -> crate::Result<TimeFilterStats> {
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -471,6 +536,27 @@ fn filter_block_snapshot(
 
     for element in block.elements() {
         stats.versions_seen += 1;
+        // Every input element, before the gate drops any: the output keeps
+        // input order under the input's sorted claim, and keeps each
+        // occurrence of an object.
+        let (kind, id) = match &element {
+            Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
+            Element::Node(n) => (ElementKind::Node, n.id()),
+            Element::Way(w) => (ElementKind::Way, w.id()),
+            Element::Relation(r) => (ElementKind::Relation, r.id()),
+        };
+        let key = order_key(kind, id);
+        match bounds.as_mut() {
+            None => *bounds = Some((key, key)),
+            Some((_, last)) => {
+                match key.cmp(last) {
+                    std::cmp::Ordering::Less => return Err(order_violation(kind, id, *last)),
+                    std::cmp::Ordering::Equal => return Err(snapshot_duplicate(kind, id)),
+                    std::cmp::Ordering::Greater => {}
+                }
+                *last = key;
+            }
+        }
         match &element {
             Element::DenseNode(dn) => {
                 let Some(()) = snapshot_gate(
@@ -670,14 +756,102 @@ fn write_owned_element(
     Ok(())
 }
 
-fn element_identity_and_timestamp(element: &Element<'_>) -> crate::Result<(ElementKind, i64, i64)> {
-    let (kind, id, ts) = match element {
-        Element::DenseNode(dn) => (ElementKind::Node, dn.id(), dense_timestamp(dn)),
-        Element::Node(n) => (ElementKind::Node, n.id(), node_timestamp(n)),
-        Element::Way(w) => (ElementKind::Way, w.id(), way_timestamp(w)),
-        Element::Relation(r) => (ElementKind::Relation, r.id(), relation_timestamp(r)),
+/// One element's identity for the history path: kind, ID, timestamp (which
+/// must be present) and version (`None` when it claims none: absent, or a
+/// sentinel below 1 such as dense `-1`).
+fn element_identity_and_timestamp(
+    element: &Element<'_>,
+) -> crate::Result<(ElementKind, i64, i64, Option<i32>)> {
+    let (kind, id, ts, version) = match element {
+        Element::DenseNode(dn) => (
+            ElementKind::Node,
+            dn.id(),
+            dense_timestamp(dn),
+            dn.info().and_then(crate::DenseNodeInfo::claimed_version),
+        ),
+        Element::Node(n) => (
+            ElementKind::Node,
+            n.id(),
+            node_timestamp(n),
+            n.info().claimed_version(),
+        ),
+        Element::Way(w) => (
+            ElementKind::Way,
+            w.id(),
+            way_timestamp(w),
+            w.info().claimed_version(),
+        ),
+        Element::Relation(r) => (
+            ElementKind::Relation,
+            r.id(),
+            relation_timestamp(r),
+            r.info().claimed_version(),
+        ),
     };
-    Ok((kind, id, require_timestamp(ts, kind.as_str(), id)?))
+    Ok((kind, id, require_timestamp(ts, kind.as_str(), id)?, version))
+}
+
+/// An element's place in `Sort.Type_then_ID` order: its kind, then its ID in
+/// canonical OSM order.
+type OrderKey = (u8, crate::osm_id::OsmIdKey);
+
+fn order_key(kind: ElementKind, id: i64) -> OrderKey {
+    (kind.ordinal(), crate::osm_id::osm_id_key(id))
+}
+
+/// The element a key was made from, for naming it in a refusal.
+fn key_identity(key: OrderKey) -> (ElementKind, i64) {
+    (
+        ElementKind::from_ordinal(key.0).unwrap_or(ElementKind::Node),
+        crate::osm_id::osm_id_from_key(key.1),
+    )
+}
+
+/// `kind id` sorts below `previous`, which the input's `Sort.Type_then_ID`
+/// header promised it would not: the history path's grouping would emit
+/// the object twice, the snapshot path's output would carry the false sort
+/// claim.
+#[cold]
+fn order_violation(kind: ElementKind, id: i64, previous: OrderKey) -> crate::Error {
+    let previous_kind =
+        ElementKind::from_ordinal(previous.0).map_or("unknown", ElementKind::as_str);
+    crate::error::new_unsorted(format!(
+        "time-filter: {kind} {id} follows {previous_kind} {}, out of the Sort.Type_then_ID \
+         order the input's header declares; time-filter groups each object's versions by \
+         that order",
+        crate::osm_id::osm_id_from_key(previous.1)
+    ))
+}
+
+/// The same object appears twice in a snapshot (non-history) input, which
+/// the snapshot path keeps once per occurrence: both would be written.
+#[cold]
+fn snapshot_duplicate(kind: ElementKind, id: i64) -> crate::Error {
+    crate::Error::invalid_data(format!(
+        "time-filter: {kind} {id} appears more than once in an input whose header does not \
+         declare HistoricalInformation; the snapshot path writes every occurrence, so it \
+         cannot pick the version at the cutoff. A history file must declare the feature."
+    ))
+}
+
+/// One object's versions in a history input out of order: the history path
+/// keeps the last version at or before the cutoff in input order, so it
+/// needs them strictly ascending.
+#[cold]
+fn version_violation(
+    kind: ElementKind,
+    id: i64,
+    previous: Option<i32>,
+    next: Option<i32>,
+) -> crate::Error {
+    let show =
+        |v: Option<i32>| v.map_or_else(|| "no version".to_owned(), |v| format!("version {v}"));
+    crate::Error::invalid_data(format!(
+        "time-filter: {kind} {id} has {} after {} in a history input; its versions must be \
+         strictly ascending for the version at the cutoff to be the last one at or before it",
+        show(next),
+        show(previous)
+    ))
 }
 
 // ---------------------------------------------------------------------------

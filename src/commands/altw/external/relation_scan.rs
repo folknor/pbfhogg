@@ -38,6 +38,7 @@ pub(super) fn collect_relation_member_ids_indexed(
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut order = crate::osm_id::OrderWatermark::default();
 
     for meta in blob_meta
         .iter()
@@ -64,12 +65,40 @@ pub(super) fn collect_relation_member_ids_indexed(
             &mut gr_scratch,
         )
         .map_err(locate)?;
-        super::super::relation_member_ids(&block, want_nodes, want_ways, |way, id| {
-            // A kind that was not requested has no set and nothing to record.
+        // Every relation blob is decoded here, so its claim is held to what
+        // it holds: no foreign kind, the exact range and count, and the
+        // header's order, which the join writes under.
+        block
+            .refuse_foreign_kind(Some(ElementKind::Relation))
+            .map_err(locate)?;
+        let claim = meta.claim();
+        let mut walk =
+            crate::blob_meta::ClaimWalk::new(Some(&claim), super::blob_meta::EXTERNAL_ORDER);
+        super::super::relation_member_ids(&block, want_nodes, want_ways, &mut walk, |way, id| {
+            // A kind that was not requested has no set and nothing to
+            // record.
             if let Some(set) = if way { &mut way_ids } else { &mut node_ids } {
                 set.set(id);
             }
-        });
+        })
+        .map_err(locate)?;
+        // Across blobs too, by each blob's decoded first relation: a
+        // mixed-sign range cannot name it, so the metadata scan's range
+        // watermark alone misses a descent onto a 0 or small negative.
+        if let Some(first) = walk.finish().map_err(locate)?
+            && let Err(v) = order.observe_keys(
+                ElementKind::Relation.ordinal(),
+                crate::osm_id::osm_id_key(first),
+                crate::osm_id::blob_osm_last_key(meta.min_id, meta.max_id),
+            )
+        {
+            return Err(locate(crate::error::new_unsorted(format!(
+                "altw external: refusing an input whose blob contradicts its \
+                 Sort.Type_then_ID header - a relation blob starting at relation {} follows \
+                 relation blobs already reaching relation {}",
+                v.first_id, v.previous_id
+            ))));
+        }
     }
 
     Ok(RelationScanOutput {

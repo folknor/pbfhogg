@@ -7,22 +7,19 @@
 
 use crate::Element;
 use crate::PrimitiveBlock;
-use crate::blob_meta::{BlobIndex, IdTally};
-use crate::error::{Error, Result};
-use crate::osm_id::{OsmIdKey, osm_id_key};
+use crate::blob_meta::BlobIndex;
+use crate::error::Result;
 
 use super::diff_ranges::DiffRanges;
 
-/// What one walk of a decoded candidate's elements has seen, checked
-/// against the blob's claim and the header's order claim as it goes.
+/// The walk every decoded candidate's element loops feed: the shared
+/// [`ClaimWalk`](crate::blob_meta::ClaimWalk) under apply-changes' order
+/// requirement.
 ///
 /// Every decoded candidate ends in one complete walk before its item leaves
 /// the worker: a precise-check miss walks every element, and a hit, a forced
 /// rewrite and a refresh-only rewrite go through the rewrite loop, which
 /// does; a way blob the refresh scan finds clean has had every way walked.
-/// Each loop hands each element's ID to [`observe`](Self::observe) (one
-/// key compare against the previous ID, an increment and a branchless min
-/// and max), and the complete one ends in [`finish`](Self::finish).
 ///
 /// - An ID below the previous one in OSM order contradicts the header's
 ///   `Sort.Type_then_ID`: `Unsorted`. The rewrite interleaves inline creates
@@ -30,84 +27,22 @@ use super::diff_ranges::DiffRanges;
 ///   blob `[5, 3]` would write a modified 3 twice, or pass a deleted 3
 ///   through.
 /// - A claim (indexdata) that is not exact for the walk is
-///   `IndexdataMismatch`, also when the walk breaks order on an ID the claim
-///   does not cover. The inline-upsert slice, the drain's gap creates and
-///   cursor, and the output order guard all place the blob by its claim, so
-///   an understated range duplicates a modify or writes a create out of
+///   `IndexdataMismatch`. The inline-upsert slice, the drain's gap creates
+///   and cursor, and the output order guard all place the blob by its claim,
+///   so an understated range duplicates a modify or writes a create out of
 ///   order, and an overstated one hands a neighbour's upsert to this blob as
 ///   well.
-///
-/// An unindexed blob (`--force`) makes no claim and is checked for order
-/// only. The claimed kind is checked separately, once per blob
-/// (`PrimitiveBlock::refuse_foreign_kind`, or the refresh scan's group
-/// fields), so every ID observed is of one kind.
-pub(super) struct BlobWalk<'c> {
-    claim: Option<&'c BlobIndex>,
-    tally: IdTally,
-    /// The first ID observed, valid once `tally` has counted one.
-    first: i64,
-    previous: OsmIdKey,
-}
+pub(super) type BlobWalk<'c> = crate::blob_meta::ClaimWalk<'c>;
 
-impl<'c> BlobWalk<'c> {
-    /// A walk of a blob carrying `claim` (`None` for an unindexed blob).
-    pub(super) fn new(claim: Option<&'c BlobIndex>) -> Self {
-        Self {
-            claim,
-            tally: IdTally::default(),
-            first: 0,
-            previous: osm_id_key(0),
-        }
-    }
-
-    /// The next element's ID, in iteration order.
-    #[inline]
-    pub(super) fn observe(&mut self, id: i64) -> Result<()> {
-        let key = osm_id_key(id);
-        // Key 0 is the least key, so the first element always passes.
-        if key < self.previous {
-            return Err(self.disorder(id));
-        }
-        if self.tally.count() == 0 {
-            self.first = id;
-        }
-        self.previous = key;
-        self.tally.add(id);
-        Ok(())
-    }
-
-    /// The blob's first element in iteration order, once one has been
-    /// observed.
-    pub(super) fn first(&self) -> Option<i64> {
-        (self.tally.count() != 0).then_some(self.first)
-    }
-
-    /// End a complete walk: the claim, when there is one, must be exact.
-    /// Returns the first element's ID, `None` for an unindexed blob with no
-    /// element (an indexed one is refused).
-    pub(super) fn finish(&self) -> Result<Option<i64>> {
-        if let Some(claim) = self.claim {
-            self.tally.refuse_inexact(claim)?;
-        }
-        Ok(self.first())
-    }
-
-    #[cold]
-    fn disorder(&self, id: i64) -> Error {
-        if let Some(claim) = self.claim {
-            let mut seen = self.tally;
-            seen.add(id);
-            if seen.escapes(claim) {
-                return seen.mismatch(claim, false);
-            }
-        }
-        crate::error::new_unsorted(format!(
-            "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
-             header - a base blob holds id {id} after id {}, out of the order its \
-             header declares",
-            crate::osm_id::osm_id_from_key(self.previous)
-        ))
-    }
+/// A walk of a candidate blob carrying `claim` (`None` for an unindexed
+/// blob), holding it to the header's order.
+pub(super) fn blob_walk(claim: Option<&BlobIndex>) -> BlobWalk<'_> {
+    BlobWalk::new(
+        claim,
+        crate::blob_meta::Order::Required(
+            "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID header",
+        ),
+    )
 }
 
 /// Check if any element *actually in the block* has a matching ID in the diff.

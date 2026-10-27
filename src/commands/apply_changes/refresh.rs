@@ -628,7 +628,7 @@ mod tests {
     }
 
     fn detect(block: &[u8], p: &StaleProbe) -> Detection {
-        let mut walk = super::super::classify::BlobWalk::new(None);
+        let mut walk = super::super::classify::blob_walk(None);
         detect_stale_wire(block, p, &mut Vec::new(), &mut Vec::new(), &mut walk).unwrap()
     }
 

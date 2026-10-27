@@ -7,21 +7,20 @@
 
 use std::path::Path;
 
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::write::WriteOptions;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
 use super::super::inject_metrics::{InjectMetrics, PinTally};
 use super::super::{
-    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
-    flush_local, writer_from_header,
+    HeaderOverrides, Result, ensure_node_capacity_local, flush_local, writer_from_header,
 };
 use crate::ElementKind;
 use crate::counters::record_max;
 use crate::error::Error;
 use crate::idset::IdSet;
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 use super::blob_meta::BlobMeta;
 use super::coord_payloads::AbortOnDrop;
@@ -55,6 +54,8 @@ struct BlobDescriptor {
     /// Index of this way blob within `way_slot_starts` (0 for non-way blobs;
     /// only meaningful when `is_way_blob`).
     way_blob_idx: usize,
+    /// The whole indexdata claim, held to what a decoded blob holds.
+    claim: crate::blob_meta::BlobIndex,
 }
 
 crate::counters::counter_set! {
@@ -403,6 +404,7 @@ pub(super) fn stage4_assembly(
             kind: meta.kind,
             count: meta.count,
             way_blob_idx,
+            claim: meta.claim(),
         });
     }
 
@@ -620,6 +622,14 @@ pub(super) fn stage4_assembly(
                             inject_prepass,
                         )
                         .map_err(at_frame)?;
+                        // The output index below is the reframe's count
+                        // and range: a claim it does not match exactly (a
+                        // blob claiming ways that holds none above all) is
+                        // refused rather than re-indexed. Stage 1 refused
+                        // it already; this guards what is written.
+                        crate::blob_meta::IdTally::of(way_count, min_id, max_id)
+                            .refuse_inexact(&desc.claim)
+                            .map_err(at_frame)?;
 
                         let index = crate::blob_meta::BlobIndex {
                             kind: crate::ElementKind::Way,
@@ -666,14 +676,29 @@ pub(super) fn stage4_assembly(
                     // Bytes only to copy it straight back out via `to_vec()`.
                     let block = PrimitiveBlock::from_vec(std::mem::take(decompress_buf))
                         .map_err(at_frame)?;
+                    // A way or relation under the node claim would be
+                    // re-encoded among the nodes with no coordinate source
+                    // and outside the member scan: refused, as the sparse
+                    // backend refuses it. The walk holds the claim and the
+                    // header's order to every node, since stage 2 decodes
+                    // only the node blobs a referenced bucket reaches.
+                    block
+                        .refuse_foreign_kind(Some(desc.kind))
+                        .map_err(at_frame)?;
+                    let mut walk = crate::blob_meta::ClaimWalk::new(
+                        Some(&desc.claim),
+                        super::blob_meta::EXTERNAL_ORDER,
+                    );
                     let mut block_stats = assemble_block(
                         &block,
                         bb,
                         output_blocks,
                         keep_untagged_nodes,
                         relation_member_node_ids,
+                        &mut walk,
                     )
                     .map_err(at_frame)?;
+                    walk.finish().map_err(at_frame)?;
                     block_stats.blobs_decoded = 1;
                     flush_local(bb, output_blocks).map_err(at_frame)?;
                     let elapsed = t2.elapsed_ms();
@@ -785,14 +810,14 @@ fn assemble_block(
     output: &mut Vec<OwnedBlock>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
+    walk: &mut crate::blob_meta::ClaimWalk<'_>,
 ) -> crate::Result<Stats> {
     let mut stats = Stats::default();
-
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
+                walk.observe(dn.id())?;
                 stats.nodes_read += 1;
                 let has_tags = dn.tags().next().is_some();
                 if keep_untagged_nodes
@@ -814,6 +839,7 @@ fn assemble_block(
                 }
             }
             Element::Node(n) => {
+                walk.observe(n.id())?;
                 stats.nodes_read += 1;
                 let has_tags = n.tags().next().is_some();
                 if keep_untagged_nodes
@@ -834,28 +860,14 @@ fn assemble_block(
                     stats.nodes_dropped += 1;
                 }
             }
-            Element::Way(w) => {
-                // `require_indexdata` guarantees every blob has an index,
-                // and sorted PBF confines ways to blobs indexed as Way
-                // (routed through reframe_way_blob_with_locations). Reaching
-                // here means the input violates one of those invariants
-                // (e.g. a way inside a non-Way-indexed blob). The integrated
-                // path produces coord_payloads keyed by way-blob index only,
-                // so there is no coordinate source for an out-of-band way -
-                // error out rather than silently emit (0,0).
-                return Err(Error::invalid_data(format!(
-                    "way {} appeared in a non-way-indexed blob; ALTW external \
-                     index requires sorted + indexed PBF where ways are confined \
-                     to Way-indexed blobs",
-                    w.id(),
-                )));
-            }
-            Element::Relation(r) => {
-                ensure_relation_capacity_local(bb, output)?;
-                relation_members_into(r, &mut members_buf)?;
-                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
-                stats.relations_written += 1;
+            // Only node blobs are decoded here (relation blobs pass through,
+            // way blobs are reframed), and the caller refused a block holding
+            // another kind under the node claim.
+            Element::Way(_) | Element::Relation(_) => {
+                return Err(Error::internal(
+                    "altw external stage 4: a decoded node blob holds a way or relation \
+                     its kind check should have refused",
+                ));
             }
         }
     }

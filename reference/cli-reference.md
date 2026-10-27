@@ -955,16 +955,19 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed on unindexed input with the slower fallback (see [`--force`](#--force)) |
+| `--distrust-metadata` | Believe no claim the input makes about itself: decode every blob in pass 1 as for a header without `Sort.Type_then_ID` (below), and also scan each blob's tag keys, so a blob whose indexdata or tagdata (compared as a key set) its payload contradicts is reframed under scanned ones. Needs no indexdata (`--force` is not needed alongside it) and accepts a partially indexed input. The repair every `Unsorted` refusal names: under a sorted header the default fast path copies an internally unsorted blob unchanged, because it believes the claim and the blob's indexdata |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-An input whose header does not claim `Sort.Type_then_ID` has every blob
-decoded in pass 1 to check its order. An indexed blob whose indexdata that
-scan contradicts is copied under indexdata and tag keys scanned from its
-payload rather than with the false claim, and a `Note:` line counts them.
-Unindexed blobs, and blocks no single index describes, are handled as
-`cat --dedupe` handles them (see [cat](#cat), "Blocks no single index
-describes").
+An input whose header does not claim `Sort.Type_then_ID` (or any input,
+under `--distrust-metadata`) has every blob decoded in pass 1 to check its
+order. An indexed blob whose indexdata that scan contradicts is copied under
+indexdata and tag keys scanned from its payload rather than with the false
+claim, and a `Note:` line counts them; the rebuilt `BlobHeader` keeps every
+other field, the way-members field 5 included, as `cat --reindex` keeps it,
+so the output keeps declaring `WayMembers-v1`. Unindexed blobs, and blocks
+no single index describes, are handled as `cat --dedupe` handles them (see
+[cat](#cat), "Blocks no single index describes").
 
 ### repack
 
@@ -1336,10 +1339,18 @@ Embed node coordinates in ways. Two index strategies:
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
-Node blobs are found by their indexdata kind. `--index-type external` also
-believes each node blob's elements are in order under the sorted header (a
-blob out of order loses present locations), and drops a node blob whole on
-its tagdata and ID range when removing untagged nodes. See
+Blobs are found by their indexdata kind, and every blob a backend decodes is
+held to its claim: a blob holding another kind than it claims, or whose
+claimed ID range or count is not exact for what it holds (a way-claimed blob
+with no way included), fails the run with exit 2 on either backend, pointing
+at `check --index` and `cat --reindex`, and nothing is published. Sparse
+decodes every node and way blob, and the relation blobs unless
+`--keep-untagged-nodes` is given without `--inject-prepass`. `--index-type
+external` also refuses, as unsorted, a decoded blob out of order under the
+sorted header, inside it or behind the blob before; it decodes the node
+blobs its ID buckets reach and the ones it re-encodes, and drops a node blob
+whole, undecoded, on its tagdata and ID range when removing untagged nodes.
+Sparse does not depend on order and joins such a file. See
 [indexdata-trust.md](indexdata-trust.md).
 
 ```
@@ -1375,6 +1386,15 @@ The output's replication timestamp is the earlier of the input's and the
 cutoff; the input's sequence number is kept only when the input's timestamp
 is known and not after the cutoff, since it names the input's replication
 state, which the snapshot no longer is (see [Output header](#output-header)).
+
+The input must declare `Sort.Type_then_ID`, and time-filter holds it to that
+as it reads: an element sorting below the one before it is refused as
+unsorted (exit 2; the advice is `sort --distrust-metadata`). A history input
+(`HistoricalInformation`) must also carry each object's versions strictly
+ascending, and an input without that feature must hold each object once;
+either broken is refused as invalid data, which `sort` cannot repair. No
+indexdata is read, so a wholly unindexed input is filtered as an indexed one
+is.
 
 | Flag | Description |
 |------|-------------|

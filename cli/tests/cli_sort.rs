@@ -1440,3 +1440,171 @@ fn sort_replaces_a_false_claim_under_an_unsorted_header() {
     assert_eq!(c.nodes.len(), 2);
     assert_eq!(c.ways.len(), 1, "the way survives the false claim");
 }
+
+// ---------------------------------------------------------------------------
+// --distrust-metadata
+// ---------------------------------------------------------------------------
+
+/// A declared-sorted, honestly indexed file whose one node blob holds
+/// 2, 1, 3: the file other commands now refuse as unsorted.
+fn write_intra_unsorted_under_sorted_claim(path: &Path) {
+    let node = |id: i64| TestNode {
+        id,
+        lat: 100_000_000 + i32::try_from(id).expect("small id") * 1_000,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    crate::common::write_multi_block_test_pbf(path, &[node(2), node(1), node(3)], &[], &[], 3);
+    assert!(read_header(path).is_sorted(), "fixture must claim sorted");
+}
+
+fn node_ids(path: &Path) -> Vec<i64> {
+    read_all_elements_with_coords(path)
+        .nodes
+        .iter()
+        .map(|n| n.0)
+        .collect()
+}
+
+/// The repair the `Unsorted` advice names. Plain `sort` believes the
+/// header's claim and the blob's indexdata and copies the blob unchanged, so
+/// the old advice reproduced the file; `--distrust-metadata` decodes every
+/// blob, rewrites the one out of order, and the output passes `check --ids`.
+#[test]
+fn sort_distrust_metadata_repairs_disorder_under_a_sorted_claim() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra.osm.pbf");
+    write_intra_unsorted_under_sorted_claim(&input);
+
+    let plain = dir.path().join("plain.osm.pbf");
+    run_sort(&input, &plain);
+    assert_eq!(
+        node_ids(&plain),
+        vec![2, 1, 3],
+        "the trap the advice fell into"
+    );
+
+    let repaired = dir.path().join("repaired.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg("--distrust-metadata")
+        .arg(&input)
+        .arg("-o")
+        .arg(&repaired)
+        .assert_success();
+    out.assert_stderr_contains("internally unsorted");
+    assert_eq!(node_ids(&repaired), vec![1, 2, 3]);
+    assert_sorted_file(&repaired);
+    CliInvoker::new()
+        .arg("check")
+        .arg("--ids")
+        .arg("--index")
+        .arg(&repaired)
+        .assert_success();
+}
+
+/// Tagdata is a claim too: a declared-sorted file whose blobs carry a false
+/// key set is copied unchanged by plain `sort` and fails `check --index`;
+/// under `--distrust-metadata` every blob's key set is scanned and a false
+/// one is replaced. An honest blob keeps its header byte for byte.
+#[test]
+fn sort_distrust_metadata_replaces_false_tagdata() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    crate::common::write_test_pbf_sorted(
+        &honest,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "a")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let lying = dir.path().join("lying.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&lying)
+        .arg("--corrupt-tagdata")
+        .assert_success();
+
+    let plain = dir.path().join("plain.osm.pbf");
+    run_sort(&lying, &plain);
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&plain)
+        .assert_failure();
+
+    let repaired = dir.path().join("repaired.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg("--distrust-metadata")
+        .arg(&lying)
+        .arg("-o")
+        .arg(&repaired)
+        .assert_success();
+    out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&repaired)
+        .assert_success();
+
+    let kept = dir.path().join("kept.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg("--distrust-metadata")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&kept)
+        .assert_success();
+    assert!(
+        !out.stderr_str().contains("payload contradicts"),
+        "{}",
+        out.stderr_str()
+    );
+    let data_frames = |path: &Path| {
+        let bytes = std::fs::read(path).expect("read output");
+        crate::common::adversarial::locate_blobs(&bytes)
+            .iter()
+            .skip(1)
+            .map(|f| bytes[f.frame_start..f.blob_end].to_vec())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        data_frames(&kept),
+        data_frames(&honest),
+        "an honest file's data blobs come through byte for byte"
+    );
+}
+
+/// `--distrust-metadata` reads no indexdata, so an unindexed input needs no
+/// `--force`.
+#[test]
+fn sort_distrust_metadata_needs_no_indexdata() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unindexed.osm.pbf");
+    let node = |id: i64| TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_non_indexed(&input, &[node(2), node(1)], &[], &[]);
+    let output = dir.path().join("out.osm.pbf");
+    CliInvoker::new()
+        .arg("sort")
+        .arg("--distrust-metadata")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+    assert_eq!(node_ids(&output), vec![1, 2]);
+}

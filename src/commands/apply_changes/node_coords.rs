@@ -37,7 +37,7 @@ pub(super) fn extract_node_coords<F: FnMut(i64, i32, i32)>(
     groups: &mut Vec<(usize, usize)>,
     sink: F,
 ) -> crate::error::Result<()> {
-    crate::scan::node::extract_node_coords(decompressed, groups, sink)
+    crate::scan::node::extract_node_coords(decompressed, groups, sink).map(|_kinds| ())
 }
 
 #[cfg(test)]

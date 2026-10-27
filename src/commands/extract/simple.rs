@@ -410,10 +410,11 @@ fn extract_simple_single_pass(
             },
             |position, decompressed, (tuples, group_starts)| {
                 tuples.clear();
-                crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+                let kinds =
+                    crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
                 // The scanner reads only nodes, so ways or relations under a
                 // node claim are ones it would never see.
-                refuse_foreign_kind_raw(decompressed, node_schedule_ref[position].kind)?;
+                refuse_foreign_kind_raw(kinds, node_schedule_ref[position].kind)?;
                 // Classification is the same for every blob, candidate or
                 // not, so verification can never change which nodes are
                 // selected.
@@ -486,7 +487,7 @@ fn extract_simple_single_pass(
             || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
             |position, decompressed, (refs_buf, group_starts)| {
                 let mut matching: Vec<i64> = Vec::new();
-                crate::scan::way::scan_way_refs(
+                let kinds = crate::scan::way::scan_way_refs(
                     decompressed,
                     refs_buf,
                     group_starts,
@@ -498,7 +499,7 @@ fn extract_simple_single_pass(
                 )?;
                 // The scanner reads only ways, so nodes or relations under a
                 // way claim are ones it would never see.
-                refuse_foreign_kind_raw(decompressed, way_schedule_ref[position].kind)?;
+                refuse_foreign_kind_raw(kinds, way_schedule_ref[position].kind)?;
                 Ok(matching)
             },
             |_position, matching_ids: Vec<i64>| {

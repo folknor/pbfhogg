@@ -97,47 +97,22 @@ fn record_way_refs(
     negative_count
 }
 
-/// Whether any worker has already reported an error.
 /// Refuse a blob scheduled as ways whose groups hold another element kind.
-/// Only group field tags are read (a way message is skipped by its length),
-/// no block is built. `claim` is the entry's enforced claim; a claimless
-/// (unindexed) entry may legally hold several kinds and is never refused.
+/// `kinds` is the set the way scanner recorded while it walked the groups.
+/// `claim` is the entry's enforced claim; a claimless (unindexed) entry may
+/// legally hold several kinds and is never refused.
 fn refuse_foreign_kinds(
     claim: Option<crate::ElementKind>,
-    decompressed: &[u8],
-    group_starts: &[(usize, usize)],
+    kinds: crate::element_kind::KindSet,
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, WIRE_LEN};
-
     let Some(claim) = claim else { return Ok(()) };
-    let mut kinds = crate::element_kind::KindSet::default();
-    for &(off, len) in group_starts {
-        let Some(group) = decompressed.get(off..off + len) else {
-            continue;
-        };
-        let mut cursor = Cursor::new(group);
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            if wire_type == WIRE_LEN {
-                let message = cursor.read_len_delimited()?;
-                match field {
-                    1 => kinds.add(crate::ElementKind::Node),
-                    // An empty dense message holds no node.
-                    2 if !message.is_empty() => kinds.add(crate::ElementKind::Node),
-                    3 => kinds.add(crate::ElementKind::Way),
-                    4 => kinds.add(crate::ElementKind::Relation),
-                    _ => {}
-                }
-            } else {
-                cursor.skip_field(wire_type)?;
-            }
-        }
-    }
     match kinds.foreign_to(claim) {
         Some(found) => Err(crate::error::new_kind_contradiction(claim, found)),
         None => Ok(()),
     }
 }
 
+/// Whether any worker has already reported an error.
 fn has_first_err(slot: &Mutex<Option<Error>>) -> bool {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -308,7 +283,7 @@ pub(super) fn run_pass1_5(
                             file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             decompress_buf.clear();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                            crate::scan::way::scan_way_geocode_tagged_refs(
+                            let kinds = crate::scan::way::scan_way_geocode_tagged_refs(
                                 &decompress_buf,
                                 literals_ref,
                                 &mut refs_buf,
@@ -335,7 +310,7 @@ pub(super) fn run_pass1_5(
                             // The scan above reads only way messages, so a
                             // blob claiming ways but holding other kinds
                             // would silently lose them: refuse it.
-                            refuse_foreign_kinds(entry.claim(), &decompress_buf, &group_starts)?;
+                            refuse_foreign_kinds(entry.claim(), kinds)?;
                             compact_overflow_nodes(
                                 &mut overflow_nodes,
                                 &mut overflow_compacted_len,

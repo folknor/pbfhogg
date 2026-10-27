@@ -147,10 +147,9 @@ sweep, diff and derive, geocode, extract and multi-extract, tags-filter,
 tags-count, `inspect --nodes`, getid and getparents. The kind rows of this
 section are DONE for those commands; the range, order and count rows
 (apply-changes, the sweep's pop order, diff `-c`, time-filter) and the altw
-rows are not. Open from 1b: the raw-walker adopters (extract simple and
-multi, geocode Pass 1.5) walk each blob's group tags a second time to
-collect its kinds, one read-and-skip per element; the zero-cost form is for
-the `src/scan` walkers to return the `KindSet` from tags they already read.
+rows are not. The raw-walker adopters (extract simple, geocode Pass 1.5)
+take the `KindSet` the `src/scan` node and way walkers now return from tags
+they already read, so no adopter walks a blob twice.
 
 - **DONE (slice 1a, 2026-10-27): check `--refs` and `--ids` (the admission
   test itself).** Both now stop and fail the file (exit 1) on a decoded

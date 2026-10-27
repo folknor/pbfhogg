@@ -166,45 +166,15 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
 /// never see (`IndexdataMismatch` with a `KindContradiction`). A blob with no
 /// claim is never refused.
 ///
-/// Walks the group field tags with the crate's `KindSet` rule (a dense
-/// message counts only when it carries an ID) and reads no element body, so
-/// the cost is one tag read and skip per element. Run it after the raw
-/// walker has accepted the block, so a framing error is reported as one.
+/// `kinds` is the set the raw walker recorded while it walked the groups
+/// (the crate's `KindSet` rule), so this costs nothing beyond the compare.
 pub(super) fn refuse_foreign_kind_raw(
-    decompressed: &[u8],
+    kinds: crate::element_kind::KindSet,
     claim: Option<crate::ElementKind>,
 ) -> crate::error::Result<()> {
-    use crate::ElementKind;
-    use crate::read::wire::WireDenseNodes;
-
     let Some(claimed) = claim else {
         return Ok(());
     };
-    let mut kinds = crate::element_kind::KindSet::default();
-    let mut top = Cursor::new(decompressed);
-    while let Some((field, wire_type)) = top.read_tag()? {
-        if field != 2 || wire_type != WIRE_LEN {
-            top.skip_field(wire_type)?;
-            continue;
-        }
-        let mut group = Cursor::new(top.read_len_delimited()?);
-        while let Some((gfield, gwire)) = group.read_tag()? {
-            if gwire != WIRE_LEN {
-                group.skip_field(gwire)?;
-                continue;
-            }
-            let data = group.read_len_delimited()?;
-            match gfield {
-                1 => kinds.add(ElementKind::Node),
-                2 if !WireDenseNodes::parse(data)?.id_data.is_empty() => {
-                    kinds.add(ElementKind::Node);
-                }
-                3 => kinds.add(ElementKind::Way),
-                4 => kinds.add(ElementKind::Relation),
-                _ => {}
-            }
-        }
-    }
     match kinds.foreign_to(claimed) {
         Some(found) => Err(crate::error::new_kind_contradiction(claimed, found)),
         None => Ok(()),

@@ -25,6 +25,8 @@
 //!   `Sort.Type_then_ID`. Mixed-type blobs in unsorted PBFs could be mislabeled by
 //!   indexdata, causing nodes in a mislabeled blob to be skipped.
 
+use crate::ElementKind;
+use crate::element_kind::KindSet;
 use crate::error::Result;
 
 /// Compact node coordinate tuple. 16 bytes - id (i64) + lat (i32) + lon (i32).
@@ -175,24 +177,32 @@ fn scan_dense_coords(
 /// Zero heap allocations per block - reads wire format inline, appends to caller's Vec.
 /// The caller owns the Vec and can clear+reuse it across blocks.
 ///
-/// Reads both node encodings, dense first within each group.
+/// Reads both node encodings, dense first within each group. Returns the
+/// element kinds the block holds, as [`extract_node_coords`] does.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn extract_node_tuples(
     decompressed: &[u8],
     out: &mut Vec<NodeTuple>,
     group_starts: &mut Vec<(usize, usize)>,
-) -> Result<()> {
+) -> Result<KindSet> {
     extract_node_coords(decompressed, group_starts, |id, lat, lon| {
         out.push(NodeTuple { id, lat, lon });
     })
 }
 
 /// Shared checked coordinate scanner; caller-owned group scratch is reused.
+///
+/// Returns the kinds the block holds, recorded from the group field tags
+/// this walk reads anyway under the crate's `KindSet` rule: a plain node, a
+/// dense message with at least one ID, a way, a relation. Empty groups, an
+/// empty dense message and changeset groups add nothing. A caller with an
+/// indexdata kind claim compares it with `KindSet::foreign_to`; others may
+/// ignore the set.
 pub(crate) fn extract_node_coords(
     decompressed: &[u8],
     group_starts: &mut Vec<(usize, usize)>,
     mut sink: impl FnMut(i64, i32, i32),
-) -> Result<()> {
+) -> Result<KindSet> {
     use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireGroup, WireNode};
 
     let buffer = decompressed;
@@ -252,6 +262,7 @@ pub(crate) fn extract_node_coords(
         }
     }
 
+    let mut kinds = KindSet::default();
     for &(off, len) in group_starts.iter() {
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
@@ -261,6 +272,15 @@ pub(crate) fn extract_node_coords(
             match (field, wire_type) {
                 (1, WIRE_LEN) => {
                     has_plain = true;
+                    kinds.add(ElementKind::Node);
+                    gcursor.skip_field(wire_type)?;
+                }
+                (3, WIRE_LEN) => {
+                    kinds.add(ElementKind::Way);
+                    gcursor.skip_field(wire_type)?;
+                }
+                (4, WIRE_LEN) => {
+                    kinds.add(ElementKind::Relation);
                     gcursor.skip_field(wire_type)?;
                 }
                 (2, WIRE_LEN) => {
@@ -282,6 +302,9 @@ pub(crate) fn extract_node_coords(
 
         if let Some(dd) = dense_data {
             let dense = WireDenseNodes::parse(dd)?;
+            if !dense.id_data.is_empty() {
+                kinds.add(ElementKind::Node);
+            }
             scan_dense_coords(&dense, granularity, lat_offset, lon_offset, &mut sink)?;
         }
         if has_plain {
@@ -296,13 +319,13 @@ pub(crate) fn extract_node_coords(
         }
     }
 
-    Ok(())
+    Ok(kinds)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{NodeTuple, extract_node_tuples};
+    use super::{ElementKind, KindSet, NodeTuple, extract_node_tuples};
 
     fn varint(mut v: u64, out: &mut Vec<u8>) {
         loop {
@@ -417,6 +440,97 @@ mod tests {
         assert_eq!(scan(&block).unwrap()[0].id, 7);
         scalar(19, i64::MAX, &mut block);
         assert!(scan(&block).is_err());
+    }
+
+    fn kinds_of(block: &[u8]) -> KindSet {
+        extract_node_tuples(block, &mut Vec::new(), &mut Vec::new()).unwrap()
+    }
+
+    fn set(kinds: &[ElementKind]) -> KindSet {
+        let mut set = KindSet::default();
+        for &kind in kinds {
+            set.add(kind);
+        }
+        set
+    }
+
+    fn block_of_groups(groups: &[Vec<u8>]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for group in groups {
+            len_delimited(2, group, &mut block);
+        }
+        block
+    }
+
+    /// The recorded kind set follows the shared `KindSet` rule exactly: a
+    /// plain node, a dense message with an ID, a way and a relation count;
+    /// empty groups, an empty dense message and changeset groups do not.
+    #[test]
+    fn recorded_kinds_follow_the_shared_rule() {
+        let mut node_payload = Vec::new();
+        scalar(1, 14, &mut node_payload);
+        let mut dense_with_ids = Vec::new();
+        packed(1, &[1], &mut dense_with_ids);
+        packed(8, &[0], &mut dense_with_ids);
+        packed(9, &[0], &mut dense_with_ids);
+        let mut dense_empty_arrays = Vec::new();
+        packed(1, &[], &mut dense_empty_arrays);
+        packed(8, &[], &mut dense_empty_arrays);
+        packed(9, &[], &mut dense_empty_arrays);
+
+        let group_with = |field: u32, payload: &[u8]| {
+            let mut group = Vec::new();
+            len_delimited(field, payload, &mut group);
+            group
+        };
+
+        assert_eq!(kinds_of(&[]), KindSet::default());
+        assert_eq!(
+            kinds_of(&block_of_groups(&[Vec::new()])),
+            KindSet::default(),
+            "an empty group adds nothing"
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(2, &[])])),
+            KindSet::default(),
+            "an empty dense message adds nothing"
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(2, &dense_empty_arrays)])),
+            KindSet::default(),
+            "a dense message with empty arrays adds nothing"
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(5, &[0x08, 0x01])])),
+            KindSet::default(),
+            "a changeset group adds nothing"
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(2, &dense_with_ids)])),
+            set(&[ElementKind::Node])
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(1, &node_payload)])),
+            set(&[ElementKind::Node])
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(3, &[0x08, 0x01])])),
+            set(&[ElementKind::Way])
+        );
+        assert_eq!(
+            kinds_of(&block_of_groups(&[group_with(4, &[0x08, 0x01])])),
+            set(&[ElementKind::Relation])
+        );
+
+        // A foreign kind in a node group, and kinds across groups.
+        let mut mixed = group_with(2, &dense_with_ids);
+        len_delimited(3, &[0x08, 0x01], &mut mixed);
+        let kinds = kinds_of(&block_of_groups(&[mixed, group_with(4, &[0x08, 0x01])]));
+        assert_eq!(
+            kinds,
+            set(&[ElementKind::Node, ElementKind::Way, ElementKind::Relation])
+        );
+        assert_eq!(kinds.foreign_to(ElementKind::Node), Some(ElementKind::Way));
     }
 
     /// Baseline: the default framing decodes to the decimicrodegrees the

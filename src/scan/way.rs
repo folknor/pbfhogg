@@ -14,6 +14,8 @@
 //! - **Sorted PBF assumption.** Relies on indexdata `ElementKind::Way` for blob
 //!   filtering. Mixed-type blobs in unsorted PBFs could be mislabeled.
 
+use crate::ElementKind;
+use crate::element_kind::KindSet;
 use crate::error::Result;
 
 /// Classification flags emitted by [`scan_way_geocode_tagged_refs`] per
@@ -106,12 +108,13 @@ pub(crate) fn scan_way_refs(
     refs_buf: &mut Vec<i64>,
     group_starts: &mut Vec<(usize, usize)>,
     mut callback: impl FnMut(i64, &[i64]),
-) -> Result<()> {
+) -> Result<KindSet> {
     use crate::read::wire::{Cursor, WIRE_LEN};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
     group_starts.clear();
+    let mut kinds = KindSet::default();
 
     // Parse PrimitiveBlock top-level: only collect group offsets.
     while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -134,14 +137,54 @@ pub(crate) fn scan_way_refs(
         // PrimitiveGroup field 3 = Way (repeated).
         while let Some((field, wire_type)) = gcursor.read_tag()? {
             if field == 3 && wire_type == WIRE_LEN {
+                kinds.add(ElementKind::Way);
                 let way_data = gcursor.read_len_delimited()?;
                 parse_way_refs(way_data, refs_buf, &mut callback)?;
             } else {
-                gcursor.skip_field(wire_type)?;
+                skip_recording_kind(&mut gcursor, field, wire_type, &mut kinds)?;
             }
         }
     }
 
+    Ok(kinds)
+}
+
+/// Skip one non-way group field, recording the kind it holds under the
+/// crate's `KindSet` rule: a plain node, a dense message with at least one
+/// ID, a relation. Anything else (changeset groups, unknown fields, a
+/// mistyped tag) adds nothing. Reads the dense message only to see whether
+/// it carries an ID, which only a foreign-kind blob reaches.
+fn skip_recording_kind(
+    gcursor: &mut crate::read::wire::Cursor<'_>,
+    field: u32,
+    wire_type: u32,
+    kinds: &mut KindSet,
+) -> Result<()> {
+    use crate::read::wire::{WIRE_LEN, WireDenseNodes};
+
+    if wire_type != WIRE_LEN {
+        gcursor.skip_field(wire_type)?;
+        return Ok(());
+    }
+    match field {
+        1 => {
+            kinds.add(ElementKind::Node);
+            gcursor.skip_field(wire_type)?;
+        }
+        2 => {
+            if !WireDenseNodes::parse(gcursor.read_len_delimited()?)?
+                .id_data
+                .is_empty()
+            {
+                kinds.add(ElementKind::Node);
+            }
+        }
+        4 => {
+            kinds.add(ElementKind::Relation);
+            gcursor.skip_field(wire_type)?;
+        }
+        _ => gcursor.skip_field(wire_type)?,
+    }
     Ok(())
 }
 
@@ -228,12 +271,13 @@ pub(crate) fn scan_way_geocode_tagged_refs(
     refs_buf: &mut Vec<i64>,
     group_starts: &mut Vec<(usize, usize)>,
     mut callback: impl FnMut(i64, WayGeocodeFlags, &[i64]),
-) -> Result<()> {
+) -> Result<KindSet> {
     use crate::read::wire::{Cursor, WIRE_LEN};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
     group_starts.clear();
+    let mut kinds = KindSet::default();
 
     // Parse PrimitiveBlock top-level: string table (field 1) + groups (field 2).
     let mut stringtable_data: Option<&[u8]> = None;
@@ -282,6 +326,7 @@ pub(crate) fn scan_way_geocode_tagged_refs(
         // PrimitiveGroup field 3 = Way (repeated).
         while let Some((field, wire_type)) = gcursor.read_tag()? {
             if field == 3 && wire_type == WIRE_LEN {
+                kinds.add(ElementKind::Way);
                 let way_data = gcursor.read_len_delimited()?;
                 parse_way_tagged_refs(
                     way_data,
@@ -291,12 +336,12 @@ pub(crate) fn scan_way_geocode_tagged_refs(
                     &mut callback,
                 )?;
             } else {
-                gcursor.skip_field(wire_type)?;
+                skip_recording_kind(&mut gcursor, field, wire_type, &mut kinds)?;
             }
         }
     }
 
-    Ok(())
+    Ok(kinds)
 }
 
 /// Scan a StringTable protobuf payload to find the indices of the
@@ -613,6 +658,119 @@ mod tests {
         })
         .unwrap();
         out
+    }
+
+    /// A group of `(field, payload)` length-delimited fields; every payload
+    /// here is under 128 bytes, so each length is one byte.
+    fn group_of(fields: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut group = Vec::new();
+        for &(field, payload) in fields {
+            group.push((field << 3) | 2);
+            group.push(u8::try_from(payload.len()).expect("short payload"));
+            group.extend_from_slice(payload);
+        }
+        group
+    }
+
+    fn block_of(groups: &[Vec<u8>]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for group in groups {
+            block.push(0x12);
+            block.push(u8::try_from(group.len()).expect("short group"));
+            block.extend_from_slice(group);
+        }
+        block
+    }
+
+    fn set(kinds: &[ElementKind]) -> KindSet {
+        let mut set = KindSet::default();
+        for &kind in kinds {
+            set.add(kind);
+        }
+        set
+    }
+
+    /// Both way walkers record the kinds under the shared `KindSet` rule: a
+    /// way, a plain node, a dense message with an ID and a relation count;
+    /// empty groups, an empty dense message and changeset groups do not.
+    #[test]
+    fn recorded_kinds_follow_the_shared_rule() {
+        let way = [0x08, 0x01];
+        let node = [0x08, 0x02];
+        let relation = [0x08, 0x03];
+        let dense_with_ids = [0x0A, 0x01, 0x02]; // DenseNodes.id = [zigzag 1]
+        let dense_empty_ids = [0x0A, 0x00];
+        let changeset = [0x08, 0x01];
+
+        let cases: Vec<(&str, Vec<Vec<u8>>, KindSet)> = vec![
+            ("no groups", vec![], KindSet::default()),
+            ("empty group", vec![group_of(&[])], KindSet::default()),
+            (
+                "empty dense message",
+                vec![group_of(&[(2, &[])])],
+                KindSet::default(),
+            ),
+            (
+                "dense message with an empty id array",
+                vec![group_of(&[(2, &dense_empty_ids)])],
+                KindSet::default(),
+            ),
+            (
+                "changeset group",
+                vec![group_of(&[(5, &changeset)])],
+                KindSet::default(),
+            ),
+            (
+                "ways",
+                vec![group_of(&[(3, &way)])],
+                set(&[ElementKind::Way]),
+            ),
+            (
+                "plain node",
+                vec![group_of(&[(1, &node)])],
+                set(&[ElementKind::Node]),
+            ),
+            (
+                "dense with ids",
+                vec![group_of(&[(2, &dense_with_ids)])],
+                set(&[ElementKind::Node]),
+            ),
+            (
+                "relation",
+                vec![group_of(&[(4, &relation)])],
+                set(&[ElementKind::Relation]),
+            ),
+            (
+                "foreign kinds beside ways and across groups",
+                vec![
+                    group_of(&[(3, &way), (1, &node), (5, &changeset)]),
+                    group_of(&[(4, &relation), (2, &dense_with_ids)]),
+                ],
+                set(&[ElementKind::Node, ElementKind::Way, ElementKind::Relation]),
+            ),
+        ];
+        for (what, groups, want) in cases {
+            let block = block_of(&groups);
+            let got = scan_way_refs(&block, &mut Vec::new(), &mut Vec::new(), |_, _| {})
+                .unwrap_or_else(|err| panic!("{what}: scan_way_refs: {err}"));
+            assert_eq!(got, want, "{what}: scan_way_refs");
+            let got = scan_way_geocode_tagged_refs(
+                &block,
+                &GeocodeTagLiterals::standard(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                |_, _, _| {},
+            )
+            .unwrap_or_else(|err| panic!("{what}: geocode scan: {err}"));
+            assert_eq!(got, want, "{what}: scan_way_geocode_tagged_refs");
+        }
+
+        let foreign = block_of(&[group_of(&[(3, &way), (4, &relation)])]);
+        let kinds = scan_way_refs(&foreign, &mut Vec::new(), &mut Vec::new(), |_, _| {}).unwrap();
+        assert_eq!(
+            kinds.foreign_to(ElementKind::Way),
+            Some(ElementKind::Relation)
+        );
     }
 
     #[test]

@@ -820,6 +820,15 @@ file = "denmark-20260220-seq4704.osm.pbf"
 xxhash = "b16340741bcdf2d5ec94ddc5b2ab8d04"
 seq = 4704
 
+# Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes`
+# (default sparse index, 2026-10-27): every node kept, so apply-changes
+# --locations-on-ways can resolve every OSC-way ref, and `brokkr verify merge
+# --locations-on-ways` can run on the default verify dataset.
+[bygg.datasets.denmark.pbf.altw-keep-untagged]
+file = "denmark-20260220-seq4704-altw-keep-untagged.osm.pbf"
+xxhash = "0b77d9c3dbe89abd98fca3df6b5e002e"
+seq = 4704
+
 [bygg.datasets.denmark.osc.4705]
 file = "denmark-20260221-seq4705.osc.gz"
 xxhash = "ecbe8d21120d127e41ae6b1374d8cf34"

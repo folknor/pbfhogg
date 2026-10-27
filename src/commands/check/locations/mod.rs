@@ -342,7 +342,11 @@ impl LocationsReport {
         })
     }
 
-    /// Write the human-readable summary to `out`.
+    /// Write the human-readable summary to `out`: the counts and the verdict
+    /// first, then the retained violations. Counts lead so that any head of
+    /// the report (a pager, or a harness quoting its first lines) says what
+    /// failed and how much of it before the individual ways, of which there
+    /// can be up to `max_errors`.
     ///
     /// # Errors
     ///
@@ -352,6 +356,16 @@ impl LocationsReport {
         out: &mut W,
         file_name: &str,
     ) -> std::io::Result<()> {
+        self.write_counts(out)?;
+        if self.passed() {
+            writeln!(out, "Inline locations for {file_name}: OK")?;
+        } else {
+            writeln!(
+                out,
+                "Inline locations for {file_name}: FAILED ({} violations)",
+                self.total_violations()
+            )?;
+        }
         for v in &self.violations {
             writeln!(out, "{v}")?;
         }
@@ -363,6 +377,11 @@ impl LocationsReport {
                 self.total_violations() - shown
             )?;
         }
+        Ok(())
+    }
+
+    /// The count lines of [`Self::write_human`].
+    fn write_counts<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
         writeln!(
             out,
             "Elements: {} nodes, {} ways, {} way node refs",
@@ -419,15 +438,7 @@ impl LocationsReport {
                 self.ways_without_locations, self.refs_invalid_inline
             )?;
         }
-        if self.passed() {
-            writeln!(out, "Inline locations for {file_name}: OK")
-        } else {
-            writeln!(
-                out,
-                "Inline locations for {file_name}: FAILED ({} violations)",
-                self.total_violations()
-            )
-        }
+        Ok(())
     }
 }
 

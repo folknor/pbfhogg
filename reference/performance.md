@@ -1060,6 +1060,31 @@ attributable to commits landed between the prior baselines and
 `16e3694` (the ALTW row carries A1's effect against the older
 pre-A1 row in the audit comment).
 
+### check --refs: missing references in ID sets (bygg, 2026-10-27)
+
+`23c53a0b` counts missing references into one `IdSet` per category
+instead of one `i64` per missing occurrence sorted at the end. Valid
+input, `check-refs --dataset planet --bench 1`, interleaved against the
+parent `d353ef87`: 42.0 s (`739861b7`) and 41.9 s (`b3d8343d`) before,
+41.5 s (`692de673`) and 41.6 s (`1b6bad0d`) after - neutral, as expected
+with near-zero missing refs.
+
+The case the change is for, a ways-only file where every way ref is
+missing (`--snapshot ways-only`, a `cat --type way` output). These runs
+exit 1 (the check fails, as it should), which brokkr does not store, so
+the figures come from `brokkr sidecar dirty` right after each run:
+
+| Input | Commit | Wall | Peak anon | Major faults |
+|---|---|---:|---:|---:|
+| europe ways-only | `d353ef87` (parent) | **5m28s** | **25.0 GB** | 3.9M |
+| europe ways-only | `07274615` | **12.0 s** | **2.03 GB** | 0 |
+
+The parent filled its vector in 27 s and then sorted it out of swap for
+about 5 minutes on a 30.5 GiB host; HEAD's peak is the node bitset, the
+missing-node set over the same range and the decode buffers. Denmark
+ways-only runs finish in under a second, too short for the sampler to
+catch each phase's peak, so they are not tabled.
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

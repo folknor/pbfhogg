@@ -208,7 +208,7 @@ CLI commands vs osmium - Denmark (487 MB, commit `6fc1283`):
 | tags-filter highway=primary -R | **0.2s** | 0.56s | **2.8x** |
 | add-locations-to-ways | **9.7s** | 12.1s | **1.2x** |
 
-All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`). See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
+All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
 System: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18. Measured with `brokkr bench`.
 

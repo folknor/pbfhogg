@@ -30,6 +30,11 @@ Picked 2026-07-30, right after the 0.5.0 release.
   see a code it never saw before (2) - harmless if it tests `!= 0`, and
   a behavior change only if it tests `== 1`. What the other side would
   have to ship: nothing, unless its runner special-cases 1.
+  **Answered 2026-10-27: it does read 1 as failure.** A ways-only
+  `brokkr check-refs` (every ref missing, so exit 1) is recorded
+  `FAIL:1` and never reaches `results.db`; only `brokkr sidecar dirty`
+  keeps its numbers. Filed as brokkr#45 (store exit-1 runs of the four
+  commands, keep 2 as failure).
 
   What was done here instead: the split was verified empirically from
   the pbfhogg side rather than by reading brokkr's source, because

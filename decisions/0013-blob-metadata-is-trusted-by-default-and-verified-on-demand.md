@@ -23,7 +23,8 @@ precondition of using the fields:
 - `degrade --corrupt-indexdata`, `--corrupt-indexdata-kind` and
   `--corrupt-tagdata` generate the adversarial corpus both are tested against.
 
-Three consequences follow, and are binding on new code:
+Four consequences follow, and are binding on new code (the fourth added on
+2026-10-27):
 
 1. **`check --index` gets no `--distrust-metadata` flag.** A verifier that
    consulted the thing it is verifying in order to decide what to look at would
@@ -60,6 +61,21 @@ Three consequences follow, and are binding on new code:
    *presence* of a field separately from its parsed value, and must treat
    "present but unusable" as a finding rather than as absence.
 
+4. **A run that decodes a blob anyway checks the claim it relied on.** The
+   cost argument below is about blobs a run skips or copies on their
+   claims. A blob a phase scheduled on its claimed kind and then decodes can
+   be compared with that claim for free: every decode already visits every
+   element, and the block records the kinds it holds. Where the claim chose
+   the blob's phase, a decoded element of another kind is a refusal
+   (`ErrorKind::IndexdataMismatch` with a `KindContradiction`), because the
+   alternative is the phase silently dropping it and the phase that needed
+   it never seeing the blob. In `check`, which answers "is this file right?",
+   the same finding stops the check and fails the file (exit 1) instead of
+   refusing it. This adds no decode and no per-element pass; phases adopt it
+   one by one (`KindClaims::Refuse`), and the ones that have not yet still
+   believe their claims unchecked. It is a foreign-kind test only, not a
+   substitute for `check --index`.
+
 The trust model this decision sets - which claims are believed, what checks
 them in passing, what verifies them and with which gaps, and what a false one
 costs per command - is stated in `reference/indexdata-trust.md`, which also
@@ -72,9 +88,11 @@ The fields exist so a command can classify or reject a blob without
 decompressing it, and that is where essentially all of this crate's performance
 on large files comes from: `apply-changes` passes ~92 % of planet blobs through
 as raw bytes on the strength of their declared ID ranges. Validating them on
-every read would delete exactly the work they exist to avoid - the check costs
-the full decode the hint was purchased to skip, so a always-verify design has
-the same cost as having no metadata at all.
+every read would delete exactly the work they exist to avoid - for a blob
+skipped or copied on its claim, the check costs the full decode the hint was
+purchased to skip, so an always-verify design has the same cost as having no
+metadata at all. That argument does not reach a blob the run decodes anyway:
+there the comparison costs nothing, which is why consequence 4 makes it.
 
 At the same time, the fields are claims a file makes about itself, and several
 consumers act on them destructively: `cat --type` copies a blob through raw on
@@ -90,10 +108,11 @@ two commands and comparing their output.
 
 ## Alternatives considered
 
-- **Validate metadata on every read.** Rejected: it costs the full decode the
-  metadata exists to skip, which is the entire optimization. A file is checked
-  when someone asks whether it is trustworthy, not on every read of a file
-  already known to be.
+- **Validate metadata on every read.** Rejected: for the blobs a run skips or
+  copies, it costs the full decode the metadata exists to skip, which is the
+  entire optimization. A file is checked when someone asks whether it is
+  trustworthy, not on every read of a file already known to be. Blobs a run
+  decodes anyway are the exception consequence 4 takes.
 
 - **Make `--distrust-metadata` a global flag on every command.** Rejected for
   now, and partially self-defeating: the flag is only meaningful where a command
@@ -118,7 +137,7 @@ two commands and comparing their output.
   single-kind, non-empty blob (`cat` re-encodes a block no single index can
   describe into ones that can be indexed), the values `cat` writes are derived
   from the payload regardless of provenance (a blob that already carries
-  indexdata is passed through as it is, so `cat` does not repair a false
-  one), and refusing would punish every downstream consumer to protect
+  indexdata is passed through as it is, so plain `cat` does not repair a
+  false one; `cat --reindex` does), and refusing would punish every downstream consumer to protect
   against a file that lies about itself - which the verifier now catches
   directly.

@@ -230,7 +230,7 @@ no such line, and `build-geocode-index` names `--allow-unindexed` instead.
 
 | Command | Refuses unindexed input on | `--force` refused with |
 |---------|----------------------------|------------------------|
-| cat | `--type` (with or without `--clean`), `--dedupe` | plain `cat`, which adds the indexdata, and `--clean` without `--type`, which decodes every blob exactly once either way. `--type node,way,relation --clean` is the clean pass and does not refuse; `--force` alongside it is accepted and does nothing |
+| cat | `--type` (with or without `--clean`), `--dedupe` | plain `cat`, which adds the indexdata, `--reindex`, which rescans every blob whatever it carries, and `--clean` without `--type`, which decodes every blob exactly once either way. `--type node,way,relation --clean` is the clean pass and does not refuse; `--force` alongside it is accepted and does nothing |
 | sort, repack, getid (with or without `--invert`), inspect tags | every path | - |
 | degrade | the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`) | only header-only flags |
 | tags-filter | PBF input | `--invert-match`, `--distrust-metadata` (neither refuses), OSC input |
@@ -633,6 +633,27 @@ check and are rejected under `--ids` alone; `--agreement` is rejected
 without `--locations`. Violations exit `1`, not `2` - see
 [Exit codes](#exit-codes).
 
+**A false kind claim stops the check (exit 1).** `--refs`, `--ids` and
+`--locations` read each blob in the pass of the kind its indexdata claims
+(`--locations` only for blobs claiming ways), so a blob holding an element
+of another kind is one the pass that needs it never reads. When a pass that
+does decode such a blob meets the foreign element, that check stops: its
+report is the one line `<Check> stopped: blob N at byte offset M claims X
+but holds Y elements; its claimed-kind partition is invalid`, with no counts
+and no other findings (they may already be false: a node hidden in a blob
+claiming relations makes a way's reference to it look missing before the
+relation pass finds the lie), its JSON section is `{"complete": false,
+"passed": false, "kind_contradiction": {"claimed", "found", "blob",
+"offset"}}`, and `check` exits `1`, the same verdict `--index` gives the
+file. Other selected checks still run and print. A `Note:` names `check
+--index` and [`cat --reindex`](#cat), the repair. The test is for a foreign
+kind only, decided on the decoded elements (an empty dense-node message is
+no node): an empty blob under any claim passes it. What no pass decodes is
+not seen: without `--check-relations` the ref check never reads a blob
+claiming relations, and `--ids -t` reads only the selected kinds' blobs;
+`--index` verifies every claim. When a file has two lying blobs, which one
+is named can vary from run to run.
+
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
 The ID check judges monotonicity by canonical OSM order - `0`, then the
@@ -748,8 +769,11 @@ a block from - every blob is validated once with the reader's own
 construction, which checks group and element framing, tag, `Info` and
 `DenseInfo` arrays, way geometry and relation member arrays and string table
 UTF-8, but not what the reader only finds when it resolves strings (a tag's
-string-table index past the end of the table passes); and a blob whose indexdata claims ways while its groups hold another
-kind, since the check reads such a blob only in its way passes.
+string-table index past the end of the table passes). A blob whose
+indexdata claims ways while it holds elements of another kind is not a
+refusal: the check reads such a blob only in its way passes, so it stops
+there and fails the file (exit 1), as described under
+[`check`](#check) above.
 
 **Comparison.** Each coordinate is `offset + granularity * raw` nanodegrees,
 computed in 128-bit arithmetic (a product that overflows `i64` can be brought
@@ -832,10 +856,30 @@ Concatenate PBF files with optional type filtering. Embeds blob-level indexdata 
 With `--dedupe`, merges multiple sorted PBF files with blob-level passthrough and exact-duplicate deduplication.
 
 A blob that already carries indexdata is passed through with it, unchecked,
-so plain `cat` cannot repair false indexdata. `--type` copies a blob raw on
-its indexdata kind and `--dedupe` passes blobs through on their kind and
-range, both believed without a decode. See
+so plain `cat` cannot repair false indexdata; `--reindex` (below) does.
+`--type` copies a blob raw on its indexdata kind and `--dedupe` passes blobs
+through on their kind and range, both believed without a decode. See
 [indexdata-trust.md](indexdata-trust.md).
+
+**`--reindex`: the repair for false indexdata.** Every data blob is
+decompressed and scanned, and its `BlobHeader` is rewritten with every
+`indexdata` (field 2) and `tagdata` (field 4) occurrence replaced by one
+derived from the payload; the compressed payload and every other header
+field (the `WayMembers-v1` field 5 and unknown fields included) are copied
+byte for byte, the file header's `HeaderBlock` is carried through unchanged
+(its frame is written afresh under `--compression`, so a field of the
+header blob's own `BlobHeader` or `Blob` envelope is not kept), and any
+other blob is copied as it is. The summary counts the blobs written
+and how many carried indexdata that was missing or disagreed with the
+payload. A block no single index can describe (no elements, a group carrying
+more than one element field, or kinds mixed across groups) is refused (exit
+2, nothing published) rather than left unindexed, which would make the
+output partially indexed, or re-encoded, which is not lossless; such a file
+is repaired only by a re-encoding mode. A rebuilt header that would reach
+the 64 KiB `BlobHeader` limit is written without its tag index, as the
+writer does, and refused if it still would. It takes exactly one input and
+is refused with `--type`, `--clean`, `--dedupe`, `--force`, `--generator` and
+`--output-header`. It accepts an unindexed and a partially indexed input.
 
 ```
 pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
@@ -848,6 +892,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation). Not valid with `--dedupe`. |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user). Not valid with `--dedupe`. (`-c` used to be its short; `-c` now refuses here, naming `--clean`.) |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither. |
+| `--reindex` | Rewrite every data blob's indexdata and tagdata from its payload, losslessly; one input. See above |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O. Only valid with `--dedupe` - the plain `cat` path has no io_uring writer, and passing it there is an error. |

@@ -468,9 +468,13 @@ fn check_refs_non_indexed_parity() {
         show_ids: false,
     };
     let idx = pbfhogg::check::refs::check_refs(&in_idx, &opts, &crate::common::test_host())
-        .expect("check_refs indexed");
+        .expect("check_refs indexed")
+        .complete()
+        .expect("complete");
     let non = pbfhogg::check::refs::check_refs(&in_non, &opts, &crate::common::test_host())
-        .expect("check_refs non-indexed");
+        .expect("check_refs non-indexed")
+        .complete()
+        .expect("complete");
 
     assert_eq!(idx.node_count, non.node_count, "node_count parity");
     assert_eq!(idx.way_count, non.way_count, "way_count parity");
@@ -588,9 +592,13 @@ fn check_ids_non_indexed_parity() {
         type_filter: None,
     };
     let idx = pbfhogg::check::verify_ids::verify_ids(&in_idx, &opts, &crate::common::test_host())
-        .expect("verify_ids indexed");
+        .expect("verify_ids indexed")
+        .complete()
+        .expect("complete");
     let non = pbfhogg::check::verify_ids::verify_ids(&in_non, &opts, &crate::common::test_host())
-        .expect("verify_ids non-indexed");
+        .expect("verify_ids non-indexed")
+        .complete()
+        .expect("complete");
 
     // `indexed` field deliberately WILL differ - that's its whole point.
     // All other report fields must match.

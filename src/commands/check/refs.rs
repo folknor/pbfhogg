@@ -253,15 +253,24 @@ fn append_capped_missing_refs(
 /// other checks on the same input pins once and hands the pin here, and the
 /// walk opens through it. That walk reads by position, so the input has to be
 /// seekable: a FIFO is not checked.
+///
+/// # Kind claims
+///
+/// Each phase reads the blobs whose indexdata claims its kind, and a decoded
+/// element of another kind in one of them stops the check
+/// ([`CheckOutcome::Stopped`](super::CheckOutcome)): the phase that needed
+/// that element never reads the blob. A blob claiming relations is decoded
+/// only under `check_relations`, so without it a lie there goes unseen;
+/// `check --index` is the verifier of every claim.
 #[hotpath::measure]
 pub fn check_refs<'a>(
     input: impl Into<InputSource<'a>>,
     opts: &CheckRefsOptions,
     host: &crate::host::Host,
-) -> Result<RefCheckResult> {
+) -> Result<super::CheckOutcome<RefCheckResult>> {
     let input = input.into();
     host.invocation
-        .decided(|| check_refs_inner(input, opts, host))
+        .decided(|| super::CheckOutcome::stop_on_contradiction(check_refs_inner(input, opts, host)))
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
@@ -320,7 +329,7 @@ fn check_refs_inner(
     // once. At Europe scale the header walk is ~15 s; three separate
     // `build_classify_schedule` calls would triple that cost.
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        build_classify_schedules_split(input, host)?;
+        build_classify_schedules_split(input, crate::scan::classify::KindClaims::Refuse, host)?;
 
     // Bound indexdata-driven allocation, then insert observed positive IDs
     // above that allocation after each parallel phase joins. A regional

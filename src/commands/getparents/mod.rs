@@ -255,7 +255,10 @@ fn getparents_walker(
                 if keep {
                     // The walk has already refused a payload running past
                     // EOF, so the schedule's preads stay in the file.
-                    schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
+                    schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
+                        &meta,
+                        crate::scan::classify::KindClaims::Unchecked,
+                    )?);
                 } else {
                     blobs_skipped += 1;
                 }

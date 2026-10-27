@@ -437,6 +437,9 @@ pub struct PrimitiveBlock {
     /// 3. `PrimitiveBlock` is not `Clone`, preventing accidental separation.
     /// 4. All public access goes through `&self`, tying the real lifetime to the borrow.
     block: WireBlock<'static>,
+    /// The kinds of the elements the block holds, recorded by the
+    /// construction-time validation pass.
+    kinds: crate::element_kind::KindSet,
 }
 
 impl std::fmt::Debug for PrimitiveBlock {
@@ -459,7 +462,7 @@ impl PrimitiveBlock {
         let data: &[u8] = &bytes;
         let block = WireBlock::from_inline(data, meta);
 
-        validate_groups_strict(&block)?;
+        let kinds = validate_groups_strict(&block)?;
 
         // Validate every stringtable entry once at construction time.
         for index in 0..block.stringtable.len() {
@@ -474,7 +477,23 @@ impl PrimitiveBlock {
         Ok(PrimitiveBlock {
             _buffer: bytes,
             block,
+            kinds,
         })
+    }
+
+    /// Refuse this block when `claim` names a kind and the block holds an
+    /// element of another: the run believed the claim to route the blob, so
+    /// an off-kind element is one that run would silently drop or never see.
+    /// One compare when the block agrees. The caller locates the error at
+    /// the blob.
+    #[inline]
+    pub(crate) fn refuse_foreign_kind(&self, claim: Option<crate::ElementKind>) -> Result<()> {
+        if let Some(claimed) = claim
+            && let Some(found) = self.kinds.foreign_to(claimed)
+        {
+            return Err(crate::error::new_kind_contradiction(claimed, found));
+        }
+        Ok(())
     }
 
     /// Parse a `PrimitiveBlock` from decompressed protobuf bytes, inlining
@@ -882,9 +901,16 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// framing layer and cannot know their position in the file; the enclosing
 /// `BlobReader` stamps the blob's offset on the way out, and the innermost-wins
 /// rule means an absent inner offset never displaces a more precise one.
-fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
+///
+/// Returns the kinds of the elements the block holds
+/// ([`KindSet`](crate::element_kind::KindSet)), recorded in the loops this
+/// pass runs anyway: one bit-or per element, and one per dense group with at
+/// least one ID.
+fn validate_groups_strict(block: &WireBlock<'_>) -> Result<crate::element_kind::KindSet> {
     use super::wire::Cursor;
+    use crate::ElementKind;
 
+    let mut kinds = crate::element_kind::KindSet::default();
     for index in 0..block.group_count() {
         let data = block.group(index);
 
@@ -901,6 +927,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
         //    every packed array it carries - both well-formedness and the
         //    parallel-array invariants the zipping iterators depend on.
         for element in group.nodes() {
+            kinds.add(ElementKind::Node);
             let node = WireNode::parse(element)?;
             validate_info(node.info_data)?;
             validate_tag_arrays(
@@ -910,6 +937,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
             )?;
         }
         for element in group.ways() {
+            kinds.add(ElementKind::Way);
             let way = WireWay::parse(element)?;
             validate_info(way.info_data)?;
             validate_tag_arrays(
@@ -920,6 +948,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
             validate_way_geometry_arrays(&way)?;
         }
         for element in group.relations() {
+            kinds.add(ElementKind::Relation);
             let relation = WireRelation::parse(element)?;
             validate_info(relation.info_data)?;
             validate_tag_arrays(
@@ -946,10 +975,13 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<()> {
             if let Some(info_data) = dense.info_data {
                 validate_dense_info_arrays(info_data, ids)?;
             }
+            if ids > 0 {
+                kinds.add(ElementKind::Node);
+            }
         }
     }
 
-    Ok(())
+    Ok(kinds)
 }
 
 /// Validate an element's packed `keys` / `vals` tag arrays.
@@ -1859,6 +1891,7 @@ mod strict_validation_tests {
         PrimitiveBlock {
             _buffer: bytes,
             block,
+            kinds: crate::element_kind::KindSet::default(),
         }
     }
 

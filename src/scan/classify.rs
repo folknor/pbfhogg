@@ -42,60 +42,137 @@ use crate::read::input::{InputFile, InputSource};
 /// ordering key the tuple carried is the entry's position in its schedule,
 /// which the pools pass to their merge instead of storing it. `data_size`
 /// fits `u32` because the header parse refuses a datasize at or above
-/// `MAX_BLOB_DATASIZE` (32 MiB), and the header length because
-/// `check_header_len` refuses 64 KiB and above.
+/// `MAX_BLOB_DATASIZE` (32 MiB), and the header length fits `u16` because
+/// `check_header_len` refuses 64 KiB and above; both constructors convert
+/// checked all the same. The byte this frees holds the blob's kind claim.
+///
+/// # Kind claims
+///
+/// An entry built with [`KindClaims::Refuse`] carries the kind its blob's
+/// indexdata claims (never the kind the phase wants: an unindexed blob
+/// replicated into every per-kind schedule stays claimless), and every
+/// block-decoding pool refuses the blob, after decoding it, when it holds an
+/// element of another kind ([`PrimitiveBlock::refuse_foreign_kind`]): the
+/// phase that scheduled it on the claim would drop that element, and the
+/// phase that needed it never sees the blob. One compare per blob. An entry
+/// built with [`KindClaims::Unchecked`] carries no claim and nothing is
+/// checked; every `Unchecked` at a call site is a phase that has not yet
+/// adopted the refusal.
+///
+/// [`PrimitiveBlock::refuse_foreign_kind`]: crate::PrimitiveBlock
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledBlob {
     frame_start: u64,
     blob: u64,
     data_size: u32,
-    header_len: u32,
+    header_len: u16,
+    /// `0` for no enforced claim, else `1 +` the claimed kind's ordinal.
+    claim: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<ScheduledBlob>() == 24);
 
+/// Whether a schedule's entries carry their blobs' kind claims for the
+/// decoding pools to enforce. See [`ScheduledBlob`], "Kind claims".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KindClaims {
+    /// Carry each indexed blob's claimed kind; a decoded element of another
+    /// kind is `ErrorKind::IndexdataMismatch` with a `KindContradiction`.
+    Refuse,
+    /// Carry no claim. The phase believes its schedule unchecked.
+    Unchecked,
+}
+
 impl ScheduledBlob {
-    /// The schedule entry for the blob a header walk returned.
-    pub(crate) fn from_meta(meta: &crate::read::header_walker::BlobHeaderMeta) -> Result<Self> {
-        let header_len = meta
-            .data_offset
-            .checked_sub(meta.frame_start + 4)
-            .and_then(|len| u32::try_from(len).ok());
-        let data_size = u32::try_from(meta.data_size).ok();
-        match (header_len, data_size) {
-            (Some(header_len), Some(data_size)) => Ok(Self {
-                frame_start: meta.frame_start,
-                blob: meta.blob_index,
-                data_size,
-                header_len,
-            }),
-            _ => Err(Error::internal(format!(
+    /// The schedule entry for the blob a header walk returned, carrying its
+    /// indexdata kind claim under [`KindClaims::Refuse`].
+    pub(crate) fn from_meta(
+        meta: &crate::read::header_walker::BlobHeaderMeta,
+        claims: KindClaims,
+    ) -> Result<Self> {
+        Self::build(
+            meta.frame_start,
+            meta.blob_index,
+            meta.data_offset,
+            meta.data_size,
+            meta.index.as_ref().map(|i| i.kind),
+            claims,
+        )
+        .ok_or_else(|| {
+            Error::internal(format!(
                 "blob {} at offset {} has a header length or datasize the walker should have \
                  refused",
                 meta.blob_index, meta.frame_start
-            ))),
-        }
+            ))
+        })
     }
 
     /// An entry for a blob known by its frame and payload position but not
     /// its ordinal (a schedule of extract `BlobDesc`s): its failures are
-    /// located with the file and the frame offset only.
-    pub(crate) fn at_frame(frame_start: u64, data_offset: u64, data_size: usize) -> Result<Self> {
-        let header_len = data_offset
-            .checked_sub(frame_start + 4)
-            .and_then(|len| u32::try_from(len).ok());
-        match (header_len, u32::try_from(data_size).ok()) {
-            (Some(header_len), Some(data_size)) => Ok(Self {
-                frame_start,
-                blob: Self::UNKNOWN_ORDINAL,
-                data_size,
-                header_len,
-            }),
-            _ => Err(Error::internal(format!(
+    /// located with the file and the frame offset only. `claim` is the kind
+    /// its indexdata claims, kept under [`KindClaims::Refuse`].
+    pub(crate) fn at_frame(
+        frame_start: u64,
+        data_offset: u64,
+        data_size: usize,
+        claim: Option<crate::ElementKind>,
+        claims: KindClaims,
+    ) -> Result<Self> {
+        Self::build(
+            frame_start,
+            Self::UNKNOWN_ORDINAL,
+            data_offset,
+            data_size,
+            claim,
+            claims,
+        )
+        .ok_or_else(|| {
+            Error::internal(format!(
                 "blob at offset {frame_start} has a header length or datasize the walker \
                  should have refused"
-            ))),
-        }
+            ))
+        })
+    }
+
+    fn build(
+        frame_start: u64,
+        blob: u64,
+        data_offset: u64,
+        data_size: usize,
+        claim: Option<crate::ElementKind>,
+        claims: KindClaims,
+    ) -> Option<Self> {
+        let header_len = data_offset
+            .checked_sub(frame_start.checked_add(4)?)
+            .and_then(|len| u16::try_from(len).ok())?;
+        let data_size = u32::try_from(data_size).ok()?;
+        let claim = match (claims, claim) {
+            (KindClaims::Refuse, Some(kind)) => 1 + kind.ordinal(),
+            _ => 0,
+        };
+        Some(Self {
+            frame_start,
+            blob,
+            data_size,
+            header_len,
+            claim,
+        })
+    }
+
+    /// The kind claim this entry enforces, if any.
+    #[inline]
+    pub(crate) fn claim(&self) -> Option<crate::ElementKind> {
+        self.claim
+            .checked_sub(1)
+            .and_then(crate::ElementKind::from_ordinal)
+    }
+
+    /// Refuse `block`, decoded from this entry's blob, when it contradicts
+    /// the entry's enforced claim. Every block-decoding pool calls this
+    /// before handing the block to its caller.
+    #[inline]
+    fn refuse_foreign_kind(&self, block: &crate::PrimitiveBlock) -> Result<()> {
+        block.refuse_foreign_kind(self.claim())
     }
 
     /// The ordinal of an entry built without one.
@@ -134,6 +211,7 @@ impl ScheduledBlob {
             blob: 0,
             data_size,
             header_len: 0,
+            claim: 0,
         }
     }
 
@@ -351,10 +429,11 @@ pub(crate) fn blob_filter_check(
 pub(crate) fn build_classify_schedule<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
+    claims: KindClaims,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile)> {
     let (schedule, file, _skipped) =
-        build_classify_schedule_blob_filtered(input, kind_filter, None, host)?;
+        build_classify_schedule_blob_filtered(input, kind_filter, None, claims, host)?;
     Ok((schedule, file))
 }
 
@@ -387,15 +466,18 @@ pub(crate) fn build_classify_schedule_blob_filtered<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
+    claims: KindClaims,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
-    schedule_walk(input, kind_filter, blob_filter, false, host)
+    schedule_walk(input, kind_filter, blob_filter, false, claims, host)
 }
 
 /// [`build_classify_schedule_blob_filtered`] exempt from the partial-index
 /// refusal. Only for `cat --clean`: `cat` is the remedy for a partially
 /// indexed file, and its clean pass decodes every scheduled blob and keeps
-/// elements by their actual kind.
+/// elements by their actual kind. For the same reason its entries carry no
+/// kind claim ([`KindClaims::Unchecked`]): the clean pass rewrites every
+/// element under fresh indexdata, so a false claim decides nothing it writes.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule_blob_filtered_accepting_partial<'a>(
     input: impl Into<InputSource<'a>>,
@@ -403,7 +485,14 @@ pub(crate) fn build_classify_schedule_blob_filtered_accepting_partial<'a>(
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
-    schedule_walk(input, kind_filter, blob_filter, true, host)
+    schedule_walk(
+        input,
+        kind_filter,
+        blob_filter,
+        true,
+        KindClaims::Unchecked,
+        host,
+    )
 }
 
 fn schedule_walk<'a>(
@@ -411,6 +500,7 @@ fn schedule_walk<'a>(
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     accept_partial: bool,
+    claims: KindClaims,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     let source = input.into();
@@ -463,7 +553,7 @@ fn schedule_walk<'a>(
         // body running past EOF, located at this blob's frame (see
         // `reference/truncation-handling.md`, shape 4). Every walker-built
         // schedule inherits that, so no builder repeats it.
-        schedule.push(ScheduledBlob::from_meta(&meta)?);
+        schedule.push(ScheduledBlob::from_meta(&meta, claims)?);
     }
     host.invocation.marker("SCHEDULE_SCAN_LOOP_END");
 
@@ -501,6 +591,7 @@ fn schedule_walk<'a>(
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split<'a>(
     input: impl Into<InputSource<'a>>,
+    claims: KindClaims,
     host: &crate::host::Host,
 ) -> Result<(
     Vec<ScheduledBlob>,
@@ -526,7 +617,7 @@ pub(crate) fn build_classify_schedules_split<'a>(
             continue;
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
-        let entry = ScheduledBlob::from_meta(&meta)?;
+        let entry = ScheduledBlob::from_meta(&meta, claims)?;
         match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::ElementKind::Node) => {
                 max_ids[0] = max_ids[0].max(reported_max);
@@ -741,7 +832,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
             gr_scratch: Vec::new(),
             state: worker_init(),
         },
-        |local: &mut DecodeLocal<S>, _position, raw: &[u8]| {
+        |local: &mut DecodeLocal<S>, position, raw: &[u8]| {
             let mut buf =
                 crate::blob::pool_get(Some(&local.pool), raw.len() * DECOMPRESS_EXPANSION_GUESS);
             crate::blob::decompress_blob_raw(raw, &mut buf)?;
@@ -751,6 +842,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                 &mut local.st_scratch,
                 &mut local.gr_scratch,
             )?;
+            schedule[position].refuse_foreign_kind(&block)?;
             classify(&block, &mut local.state)
         },
         merge,
@@ -1010,6 +1102,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
                 )?;
+                entry.refuse_foreign_kind(&block)?;
                 classify(&block, &mut local.state)
             })()
             .map_err(|e| input.locate_blob(entry, e))
@@ -1039,6 +1132,10 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
 /// touches strings or info, so going through `PrimitiveBlock` was
 /// dropping per-blob StringTable parse + `(u32, u32)` scratch
 /// allocations onto the hot path for nothing.
+///
+/// Builds no `PrimitiveBlock`, so it records no kind set and enforces no
+/// entry's kind claim: a raw walker that wants the refusal checks the group
+/// field tags it already reads (as `check --locations` does).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     input: &InputFile,
@@ -1248,6 +1345,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                                 &mut st_scratch,
                                 &mut gr_scratch,
                             )?;
+                            entry.refuse_foreign_kind(&block)?;
                             classify_ref(&block, &mut state)
                         })()
                         .map_err(|e| input.locate_blob(entry, e))?;
@@ -1284,6 +1382,8 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 mod tests {
     use super::{ScheduledBlob, WillneedPrefetch, coalesce_willneed_ranges};
 
+    const UNCHECKED: super::KindClaims = super::KindClaims::Unchecked;
+
     /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
     fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {
         use crate::block_builder::{BlockBuilder, HeaderBuilder};
@@ -1309,6 +1409,149 @@ mod tests {
         path
     }
 
+    /// A node blob, then a way blob whose indexdata claims nodes.
+    fn write_way_blob_claiming_nodes(dir: &std::path::Path) -> std::path::PathBuf {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let path = dir.join("lying.osm.pbf");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::None,
+        );
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut nodes = BlockBuilder::new();
+        nodes.add_node(1, 0, 0, [("k", "v")], None);
+        writer
+            .write_primitive_block(nodes.take().unwrap().unwrap())
+            .unwrap();
+        let mut ways = BlockBuilder::new();
+        ways.add_way(5, [("k", "v")], &[1], None);
+        let mut lying = ways.take_owned().unwrap().unwrap();
+        lying.index.kind = crate::ElementKind::Node;
+        writer.write_primitive_block_owned(lying).unwrap();
+        writer.flush().unwrap();
+        path
+    }
+
+    /// Every block-decoding pool refuses a blob whose decoded elements
+    /// contradict the kind claim its entry carries under `Refuse`, located at
+    /// the blob; under `Unchecked` the same pools decode it as before, and
+    /// the claimed-node schedule both modes build holds the lying blob.
+    #[test]
+    fn the_decoding_pools_refuse_a_contradicted_kind_claim() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = write_way_blob_claiming_nodes(dir.path());
+        let host = crate::host::Host::for_tests();
+        let expected = Some(crate::KindContradiction {
+            claimed: crate::ElementKind::Node,
+            found: crate::ElementKind::Way,
+        });
+
+        for claims in [super::KindClaims::Refuse, UNCHECKED] {
+            let (nodes, ways, _rels, input, _) =
+                super::build_classify_schedules_split(&path, claims, &host).unwrap();
+            assert_eq!((nodes.len(), ways.len()), (2, 0), "{claims:?}");
+            let refuse = claims == super::KindClaims::Refuse;
+            assert_eq!(
+                nodes[1].claim(),
+                refuse.then_some(crate::ElementKind::Node),
+                "{claims:?}"
+            );
+
+            let check = |result: crate::Result<()>, pool: &str| {
+                if refuse {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.kind_contradiction(), expected, "{pool}: {err}");
+                    assert_eq!(err.blob_index(), Some(2), "{pool}: {err}");
+                } else {
+                    result.unwrap();
+                }
+            };
+            let classify = |_: &crate::PrimitiveBlock, _: &mut ()| Ok(());
+            check(
+                super::parallel_classify_phase(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    || (),
+                    classify,
+                    |_, ()| {},
+                    &host,
+                ),
+                "unordered",
+            );
+            check(
+                super::parallel_classify_phase_ordered(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    None,
+                    || (),
+                    classify,
+                    |_, ()| Ok(()),
+                    &host,
+                ),
+                "ordered",
+            );
+            check(
+                super::parallel_classify_accumulate(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    || (),
+                    classify,
+                    |()| {},
+                    &host,
+                ),
+                "accumulate",
+            );
+        }
+    }
+
+    /// An unindexed blob carries no claim even under `Refuse`: it stands in
+    /// every per-kind schedule, and holds every kind it likes.
+    #[test]
+    fn an_unindexed_entry_carries_no_claim() {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("unindexed.osm.pbf");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut ways = BlockBuilder::new();
+        ways.add_way(5, [("k", "v")], &[1], None);
+        writer
+            .write_primitive_block_no_indexdata(ways.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+
+        let host = crate::host::Host::for_tests();
+        let (nodes, ways, rels, input, _) =
+            super::build_classify_schedules_split(&path, super::KindClaims::Refuse, &host).unwrap();
+        for schedule in [&nodes, &ways, &rels] {
+            assert_eq!(schedule.len(), 1);
+            assert_eq!(schedule[0].claim(), None);
+        }
+        super::parallel_classify_phase(
+            &input,
+            &nodes,
+            Some(1),
+            || (),
+            |_, ()| Ok(()),
+            |_, ()| {},
+            &host,
+        )
+        .unwrap();
+    }
+
     /// A merge closure returning `Break` must stop the scan, not merely stop
     /// merging.
     ///
@@ -1324,7 +1567,8 @@ mod tests {
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
         let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
+            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
+                .unwrap();
         assert_eq!(
             schedule.len(),
             BLOBS,
@@ -1398,7 +1642,8 @@ mod tests {
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
         let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
+            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
+                .unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let run = |fail: &(dyn Fn(usize) + Sync)| {
@@ -1488,7 +1733,8 @@ mod tests {
         let blobs = super::POOL_DESCRIPTOR_CHANNEL_DEPTH + 8;
         let path = write_many_blob_pbf(dir.path(), blobs);
         let host = crate::host::Host::for_tests();
-        let (schedule, input) = super::build_classify_schedule(&path, None, &host).unwrap();
+        let (schedule, input) =
+            super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), blobs);
 
         let metrics = super::UnorderedPoolMetrics::new();
@@ -1543,7 +1789,8 @@ mod tests {
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
         let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
+            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
+                .unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let classified = AtomicUsize::new(0);
@@ -1587,7 +1834,8 @@ mod tests {
         const BLOBS: usize = 6;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
         let host = crate::host::Host::for_tests();
-        let (schedule, input) = super::build_classify_schedule(&path, None, &host).unwrap();
+        let (schedule, input) =
+            super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), BLOBS);
         // Fail on the blob holding node 4: schedule position 3, file blob 4
         // (blob 0 is the OSMHeader).

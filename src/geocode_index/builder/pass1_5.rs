@@ -386,7 +386,7 @@ pub(super) fn build_pass2_schedules(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let entry = ScheduledBlob::from_meta(&meta)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
         let Some(idx) = meta.index.as_ref() else {
             unindexed.push(entry);
             continue;

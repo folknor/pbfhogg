@@ -267,8 +267,12 @@ pub fn parse_ids_from_pbf<'a>(
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
-    let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(input, None, host)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        input,
+        None,
+        crate::scan::classify::KindClaims::Unchecked,
+        host,
+    )?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -1035,6 +1039,7 @@ fn getid_with_refs(
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::ElementKind::Way),
+            crate::scan::classify::KindClaims::Unchecked,
             host,
         )?;
 

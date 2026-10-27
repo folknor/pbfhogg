@@ -129,8 +129,13 @@ pub struct Advice {
     pub merge_locations: bool,
 }
 
+/// What `cat --reindex` does for a file with false indexdata, and when it
+/// is the repair. Shared by the error hint and `check`'s stopped note.
+pub(crate) const REINDEX_ADVICE: &str = "rewrites the indexdata from the blobs' payloads, which repairs it when every data block \
+     can be described by one index";
+
 /// `path` as a shell word: bare when it is plain, single-quoted otherwise.
-fn shell_word(path: &std::path::Path) -> String {
+pub(crate) fn shell_word(path: &std::path::Path) -> String {
     let text = path.display().to_string();
     let plain = !text.is_empty()
         && text
@@ -169,10 +174,13 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
             "\n\nSort the input first:\n\n  pbfhogg sort {} -o sorted.osm.pbf",
             input_word(error, "input.osm.pbf")
         )),
-        ErrorKind::IndexdataMismatch { .. } => Some(format!(
-            "; `pbfhogg check --index {}` reports which blobs disagree with their contents",
-            input_word(error, "input.osm.pbf")
-        )),
+        ErrorKind::IndexdataMismatch { .. } => {
+            let input = input_word(error, "input.osm.pbf");
+            Some(format!(
+                "; `pbfhogg check --index {input}` reports which blobs disagree with their \
+                 contents, and `pbfhogg cat --reindex {input} -o reindexed.osm.pbf` {REINDEX_ADVICE}"
+            ))
+        }
         ErrorKind::MissingNodeLocations { .. }
             if advice.merge_locations || advice.ignore_missing_nodes =>
         {

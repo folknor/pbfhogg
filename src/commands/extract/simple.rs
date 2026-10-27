@@ -614,7 +614,15 @@ fn extract_simple_single_pass(
 fn scheduled(descs: &[&BlobDesc]) -> Result<Vec<crate::scan::classify::ScheduledBlob>> {
     descs
         .iter()
-        .map(|d| crate::scan::classify::ScheduledBlob::at_frame(d.frame_offset, d.offset, d.size))
+        .map(|d| {
+            crate::scan::classify::ScheduledBlob::at_frame(
+                d.frame_offset,
+                d.offset,
+                d.size,
+                d.kind,
+                crate::scan::classify::KindClaims::Unchecked,
+            )
+        })
         .collect()
 }
 

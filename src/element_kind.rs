@@ -73,6 +73,56 @@ impl ElementKind {
     }
 }
 
+/// The element kinds a decoded block holds, as a bit set.
+///
+/// A kind is in the set when the block holds at least one element of it: a
+/// plain `Node` message, a dense group with at least one ID, a `Way` or a
+/// `Relation` message. Empty groups, an empty dense message, changeset
+/// groups and unknown fields add nothing. It is the set a foreign-kind test
+/// against a blob's indexdata claim reads ([`KindSet::foreign_to`]), which
+/// is deliberately weaker than `check --index`: an empty block under any
+/// claim holds no foreign kind.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct KindSet(u8);
+
+impl KindSet {
+    const fn bit(kind: ElementKind) -> u8 {
+        1 << kind.ordinal()
+    }
+
+    /// Add `kind` to the set.
+    #[inline]
+    pub(crate) fn add(&mut self, kind: ElementKind) {
+        self.0 |= Self::bit(kind);
+    }
+
+    /// The set holding both sets' kinds.
+    #[must_use]
+    pub(crate) fn union(self, other: KindSet) -> KindSet {
+        KindSet(self.0 | other.0)
+    }
+
+    /// Whether `kind` is in the set.
+    #[must_use]
+    pub(crate) fn has(self, kind: ElementKind) -> bool {
+        self.0 & Self::bit(kind) != 0
+    }
+
+    /// A kind in the set other than `claimed`, if any: the witness that a
+    /// claim of `claimed` is false. Chosen by the fixed node, way, relation
+    /// priority, so the same block always yields the same witness.
+    #[must_use]
+    #[inline]
+    pub(crate) fn foreign_to(self, claimed: ElementKind) -> Option<ElementKind> {
+        if self.0 & !Self::bit(claimed) == 0 {
+            return None;
+        }
+        [ElementKind::Node, ElementKind::Way, ElementKind::Relation]
+            .into_iter()
+            .find(|&kind| kind != claimed && self.has(kind))
+    }
+}
+
 impl std::fmt::Display for ElementKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -129,5 +179,25 @@ mod tests {
         }
         assert!("Node".parse::<ElementKind>().is_err());
         assert!("".parse::<ElementKind>().is_err());
+    }
+
+    #[test]
+    fn a_kind_set_names_a_foreign_kind_by_fixed_priority() {
+        use super::KindSet;
+        let mut set = KindSet::default();
+        for claim in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+            assert_eq!(set.foreign_to(claim), None, "empty set under {claim}");
+        }
+        set.add(ElementKind::Way);
+        assert_eq!(set.foreign_to(ElementKind::Way), None);
+        assert_eq!(set.foreign_to(ElementKind::Node), Some(ElementKind::Way));
+        set.add(ElementKind::Relation);
+        set.add(ElementKind::Node);
+        assert_eq!(
+            set.foreign_to(ElementKind::Relation),
+            Some(ElementKind::Node)
+        );
+        assert_eq!(set.foreign_to(ElementKind::Node), Some(ElementKind::Way));
+        assert!(set.has(ElementKind::Node));
     }
 }

@@ -1212,6 +1212,15 @@ enum Command {
         /// Sorted k-way merge with dedup by (type, id). Requires sorted inputs.
         #[arg(long)]
         dedupe: bool,
+        /// Rewrite every data blob's indexdata and tagdata from its payload,
+        /// keeping the payload and every other header field byte for byte:
+        /// the repair for false indexdata. One input; refuses a block no
+        /// single index can describe
+        #[arg(
+            long,
+            conflicts_with_all = ["clean", "type_filter", "dedupe", "force", "generator", "output_headers"]
+        )]
+        reindex: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -2442,6 +2451,7 @@ pub fn run() -> process::ExitCode {
                 clean,
                 type_filter,
                 dedupe,
+                reindex,
                 compression,
                 io,
                 io_uring,
@@ -2455,7 +2465,19 @@ pub fn run() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force,
                 };
-                if dedupe {
+                if reindex {
+                    let [file] = files.as_slice() else {
+                        return Err(usage(
+                            &["cat"],
+                            "--reindex takes exactly one input: it carries that file's header \
+                             through unchanged",
+                        ));
+                    };
+                    let stats =
+                        pbfhogg::cat::reindex::reindex(file, output.open(&host)?, &write, &host)?;
+                    stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
+                    Ok(())
+                } else if dedupe {
                     run_merge_pbf(&files, output.open(&host)?, &write, &overrides, &host)
                 } else {
                     run_cat(
@@ -3410,7 +3432,7 @@ fn run_check(
             store_budget_bytes: None,
         };
         let report = pbfhogg::check::locations::check_locations(input, &opts, host)?;
-        if !report.passed() {
+        if !report.passed(pbfhogg::check::locations::LocationsReport::passed) {
             failed = true;
         }
         Some(report)
@@ -3426,7 +3448,7 @@ fn run_check(
             type_filter,
         };
         let report = pbfhogg::check::verify_ids::verify_ids(input, &opts, host)?;
-        if !report.passed {
+        if !report.passed(|r| r.passed) {
             failed = true;
         }
         Some(report)
@@ -3460,7 +3482,7 @@ fn run_check(
             show_ids,
         };
         let result = pbfhogg::check::refs::check_refs(input, &opts, host)?;
-        if !result.is_valid() {
+        if !result.passed(pbfhogg::check::refs::RefCheckResult::is_valid) {
             failed = true;
         }
         Some(result)
@@ -3474,14 +3496,22 @@ fn run_check(
     let printed = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut out = output::buffered();
         if json {
+            use pbfhogg::check::CheckOutcome;
             let mut combined = serde_json::Map::new();
             if let Some(ref report) = ids_report {
-                combined.insert("ids".to_string(), report.to_json_value(&file_name));
+                let value = match report {
+                    CheckOutcome::Complete(report) => report.to_json_value(&file_name),
+                    CheckOutcome::Stopped(stopped) => stopped.to_json_value(&file_name),
+                };
+                combined.insert("ids".to_string(), value);
             }
             if let Some(ref report) = index_report {
                 combined.insert("index".to_string(), report.to_json_value(&file_name));
             }
-            if let Some(ref result) = refs_result {
+            if let Some(CheckOutcome::Stopped(stopped)) = &refs_result {
+                combined.insert("refs".to_string(), stopped.to_json_value(&file_name));
+            }
+            if let Some(CheckOutcome::Complete(result)) = &refs_result {
                 let mut refs_obj = serde_json::json!({
                     "node_count": result.node_count,
                     "way_count": result.way_count,
@@ -3510,7 +3540,11 @@ fn run_check(
                 combined.insert("refs".to_string(), refs_obj);
             }
             if let Some(ref report) = locations_report {
-                combined.insert("locations".to_string(), report.to_json_value(&file_name));
+                let value = match report {
+                    CheckOutcome::Complete(report) => report.to_json_value(&file_name),
+                    CheckOutcome::Stopped(stopped) => stopped.to_json_value(&file_name),
+                };
+                combined.insert("locations".to_string(), value);
             }
             writeln!(
                 out,
@@ -3518,8 +3552,14 @@ fn run_check(
                 serde_json::to_string_pretty(&serde_json::Value::Object(combined))?
             )?;
         } else if !quiet {
-            if let Some(ref report) = ids_report {
-                report.write_human(&mut out, &file_name)?;
+            use pbfhogg::check::CheckOutcome;
+            match &ids_report {
+                Some(CheckOutcome::Complete(report)) => report.write_human(&mut out, &file_name)?,
+                Some(CheckOutcome::Stopped(stopped)) => {
+                    writeln!(out, "Verify IDs: {file_name}")?;
+                    writeln!(out, "{}", stopped.describe("ID check"))?;
+                }
+                None => {}
             }
             if let Some(ref report) = index_report {
                 if ids_report.is_some() {
@@ -3533,7 +3573,13 @@ fn run_check(
                     );
                 }
             }
-            if let Some(ref result) = refs_result {
+            if let Some(CheckOutcome::Stopped(stopped)) = &refs_result {
+                if ids_report.is_some() || index_report.is_some() {
+                    writeln!(out, "\n---\n")?;
+                }
+                writeln!(out, "{}", stopped.describe("Reference check"))?;
+            }
+            if let Some(CheckOutcome::Complete(result)) = &refs_result {
                 if show_ids {
                     for mref in &result.missing_refs {
                         writeln!(
@@ -3609,14 +3655,44 @@ fn run_check(
                 if ids_report.is_some() || index_report.is_some() || refs_result.is_some() {
                     writeln!(out, "\n---\n")?;
                 }
-                report.write_human(&mut out, &file_name)?;
-                if report.total_violations() > report.violations.len() as u64 {
-                    host::cli_note(
-                        "cli.check_locations_capped",
-                        format_args!("raise --max-errors to see every violation"),
-                    );
+                match report {
+                    CheckOutcome::Complete(report) => {
+                        report.write_human(&mut out, &file_name)?;
+                        if report.total_violations() > report.violations.len() as u64 {
+                            host::cli_note(
+                                "cli.check_locations_capped",
+                                format_args!("raise --max-errors to see every violation"),
+                            );
+                        }
+                    }
+                    CheckOutcome::Stopped(stopped) => {
+                        writeln!(out, "{}", stopped.describe("Location check"))?;
+                    }
                 }
             }
+        }
+        let stopped = [
+            ids_report
+                .as_ref()
+                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
+            refs_result
+                .as_ref()
+                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
+            locations_report
+                .as_ref()
+                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
+        ];
+        if stopped.contains(&true) {
+            host::cli_note(
+                "cli.check_stopped_on_kind_claim",
+                format_args!(
+                    "`pbfhogg check --index {path}` reports every blob whose indexdata \
+                     disagrees with its contents; `pbfhogg cat --reindex {path} -o \
+                     reindexed.osm.pbf` {repair}",
+                    path = exit_code::shell_word(path),
+                    repair = exit_code::REINDEX_ADVICE,
+                ),
+            );
         }
         out.flush()?;
         Ok(())

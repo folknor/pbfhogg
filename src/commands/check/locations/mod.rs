@@ -653,7 +653,9 @@ fn walk(input: &PinnedInput, host: &crate::host::Host) -> Result<Walk> {
             min_node: i64::MAX,
             max_node: i64::MIN,
         };
-        let entry = ScheduledBlob::from_meta(&meta)?;
+        // Unchecked: this check routes on what its raw scanners decode and
+        // makes its own claim test (`scan::scan_ways`).
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
         if facts.claim == Some(ElementKind::Way) {
             out.claimed_ways.push(entry, facts);
         } else {
@@ -695,10 +697,14 @@ fn route(walk: &Walk) -> (Schedule, Schedule) {
 /// does not declare `LocationsOnWays` (`MissingFeature`) or declares
 /// `HistoricalInformation` (several versions of a node legitimately carry
 /// different coordinates); a partially indexed file; a way referencing a
-/// negative node ID (ADR-0002); a blob whose indexdata claims ways while its
-/// groups hold another kind (`IndexdataMismatch`); and any data blob the
-/// reader refuses to build a block from (every blob is validated once as the
-/// reader validates it).
+/// negative node ID (ADR-0002); and any data blob the reader refuses to
+/// build a block from (every blob is validated once as the reader validates
+/// it).
+///
+/// A blob whose indexdata claims ways while it holds elements of another
+/// kind is not a refusal but a stopped check
+/// ([`CheckOutcome::Stopped`](super::CheckOutcome)): the check reads such a
+/// blob only in its way passes, so the claim is false and the file fails.
 ///
 /// # Input
 ///
@@ -708,10 +714,11 @@ pub fn check_locations<'a>(
     input: impl Into<InputSource<'a>>,
     opts: &CheckLocationsOptions,
     host: &crate::host::Host,
-) -> Result<LocationsReport> {
+) -> Result<super::CheckOutcome<LocationsReport>> {
     let input = input.into();
-    host.invocation
-        .decided(|| check_locations_inner(input, opts, host))
+    host.invocation.decided(|| {
+        super::CheckOutcome::stop_on_contradiction(check_locations_inner(input, opts, host))
+    })
 }
 
 /// What one blob contributes to the up-front pass.

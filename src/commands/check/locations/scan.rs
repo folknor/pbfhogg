@@ -26,10 +26,12 @@
 //!   lockstep and handed out one at a time, so a worker's memory does not grow
 //!   with the length of a way, and a coordinate is only scaled when the
 //!   caller asks for it.
-//! - **Kinds.** The node scanner reports which element kinds the blob's
-//!   groups hold, so the check routes blobs on what it decoded rather than on
-//!   indexdata. The way scanner refuses a blob claiming ways whose groups hold
-//!   anything else: that is the one claim the check acts on before decoding.
+//! - **Kinds.** The node scanner reports which element kinds the blob holds
+//!   (the crate's `KindSet` rule: a dense message counts only with an ID), so
+//!   the check routes blobs on what it decoded rather than on indexdata. The
+//!   way scanner raises a kind contradiction for a blob claiming ways that
+//!   holds elements of another kind: that is the one claim the check acts on
+//!   before decoding, and the check stops on it.
 
 use crate::ElementKind;
 use crate::error::{Error, Result, new_wire_error};
@@ -82,38 +84,9 @@ impl Framing {
     }
 }
 
-/// The element kinds a block's groups hold, as a bit set.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(super) struct Kinds(u8);
-
-impl Kinds {
-    fn bit(kind: ElementKind) -> u8 {
-        match kind {
-            ElementKind::Node => 1,
-            ElementKind::Way => 2,
-            ElementKind::Relation => 4,
-        }
-    }
-
-    fn add(&mut self, kind: ElementKind) {
-        self.0 |= Self::bit(kind);
-    }
-
-    pub(super) fn union(self, other: Kinds) -> Kinds {
-        Kinds(self.0 | other.0)
-    }
-
-    pub(super) fn has(self, kind: ElementKind) -> bool {
-        self.0 & Self::bit(kind) != 0
-    }
-
-    /// The first kind present other than `claimed`, if any.
-    fn other_than(self, claimed: ElementKind) -> Option<ElementKind> {
-        [ElementKind::Node, ElementKind::Way, ElementKind::Relation]
-            .into_iter()
-            .find(|&kind| kind != claimed && self.has(kind))
-    }
-}
+/// The element kinds a block holds: the crate's decoded-kind set, recorded
+/// here by the raw scanners under the same rule.
+pub(super) type Kinds = crate::element_kind::KindSet;
 
 /// Reusable string-table and group-range scratch for [`validate_block`].
 pub(super) type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);
@@ -186,7 +159,11 @@ fn walk_group<'g>(
                 }
                 seen_dense = true;
                 let data = cursor.read_len_delimited()?;
-                kinds.add(ElementKind::Node);
+                // A dense message holds nodes only when it carries an ID, as
+                // the decoder's kind set counts it: an empty one is no node.
+                if !WireDenseNodes::parse(data)?.id_data.is_empty() {
+                    kinds.add(ElementKind::Node);
+                }
                 element(ElementKind::Node, None, data)?;
             }
             (3, WIRE_LEN) => {
@@ -343,7 +320,8 @@ fn next_delta(cursor: &mut Cursor<'_>, acc: &mut i64, err: fn() -> Error) -> Res
 /// `refs`, or the blob is a decode error. Lengths are judged while
 /// streaming, so events before the fault have already been delivered when
 /// the error returns; every caller abandons the run on it. A blob claiming
-/// ways is refused when a group holds anything else.
+/// ways that holds an element of another kind is a kind contradiction,
+/// raised once the whole block is walked.
 pub(super) fn scan_ways(
     block: &[u8],
     claim: Option<ElementKind>,
@@ -352,6 +330,7 @@ pub(super) fn scan_ways(
 ) -> Result<()> {
     let framing = block_top(block, groups)?;
     let mut ordinal: u64 = 0;
+    let mut block_kinds = Kinds::default();
     for &(off, len) in groups.iter() {
         let group = &block[off..off + len];
         let kinds = walk_group(group, |kind, way, _| {
@@ -395,16 +374,19 @@ pub(super) fn scan_ways(
             ordinal += 1;
             Ok(())
         })?;
-        if claim == Some(ElementKind::Way)
-            && let Some(found) = kinds.other_than(ElementKind::Way)
-        {
-            return Err(crate::error::new_indexdata_mismatch(format!(
-                "blob indexdata claims way elements but the blob holds {} \
-                 elements; the location check reads a blob claiming ways only \
-                 in its way passes, so it cannot check this file",
-                found.as_str()
-            )));
-        }
+        block_kinds = block_kinds.union(kinds);
+    }
+    // The location check reads a blob claiming ways only in its way passes,
+    // so another kind in it is one it never reads. Judged on the whole
+    // block's kinds, so the witness follows the fixed kind priority rather
+    // than group order, as every decoding check names it.
+    if claim == Some(ElementKind::Way)
+        && let Some(found) = block_kinds.foreign_to(ElementKind::Way)
+    {
+        return Err(crate::error::new_kind_contradiction(
+            ElementKind::Way,
+            found,
+        ));
     }
     Ok(())
 }
@@ -412,8 +394,7 @@ pub(super) fn scan_ways(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Coord, Framing, Kinds};
-    use crate::ElementKind;
+    use super::{Coord, Framing};
 
     fn framing(granularity: i128, lat_offset: i128, lon_offset: i128) -> Framing {
         Framing {
@@ -471,19 +452,5 @@ mod tests {
     fn e7_truncates_toward_zero() {
         let f = framing(1, 0, 0);
         assert_eq!(f.coord(199, -199), Coord::Valid { lat: 1, lon: -1 });
-    }
-
-    #[test]
-    fn kinds_report_the_first_other_kind() {
-        let mut kinds = Kinds::default();
-        kinds.add(ElementKind::Way);
-        assert_eq!(kinds.other_than(ElementKind::Way), None);
-        kinds.add(ElementKind::Relation);
-        assert_eq!(
-            kinds.other_than(ElementKind::Way),
-            Some(ElementKind::Relation)
-        );
-        assert_eq!(kinds.other_than(ElementKind::Node), Some(ElementKind::Way));
-        assert!(kinds.has(ElementKind::Relation) && !kinds.has(ElementKind::Node));
     }
 }

@@ -53,6 +53,40 @@ fn write_low(
     writer.flush().unwrap();
 }
 
+/// [`write_low`], with each way block carrying one more group holding only
+/// an empty `DenseNodes` message. The writer's index scan counts no element
+/// in it, so each way blob is indexed as ways.
+fn write_low_with_empty_dense_in_way_blob(
+    path: &Path,
+    nodes: &[(i64, i32, i32)],
+    way_blobs: &[Vec<Way>],
+) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays");
+    writer.write_header(&header.build().unwrap()).unwrap();
+    let mut bb = BlockBuilder::new();
+    for &(id, lat, lon) in nodes {
+        bb.add_node(id, lat, lon, std::iter::empty(), None);
+    }
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+    for blob in way_blobs {
+        for (id, refs, coords) in blob {
+            bb.add_way_with_locations(*id, [("highway", "path")], refs, coords, None);
+        }
+        let mut block = bb.take().unwrap().unwrap().to_vec();
+        // PrimitiveBlock field 2 (a group) holding PrimitiveGroup field 2
+        // (DenseNodes) of length zero.
+        block.extend_from_slice(&[0x12, 0x02, 0x12, 0x00]);
+        writer.write_primitive_block(&block).unwrap();
+    }
+    writer.flush().unwrap();
+}
+
 const NODES: [(i64, i32, i32); 3] = [
     (1, 100_000_000, 200_000_000),
     (2, 300_000_000, 400_000_000),
@@ -238,9 +272,11 @@ fn agreement_fails_disagreeing_copies_of_an_absent_node() {
 }
 
 /// A node blob relabelled as a way blob would hide its nodes from a check
-/// that routes on the label; the check refuses it instead of passing.
+/// that routes on the label; the check fails the file (exit 1, a stopped
+/// report naming the blob and the claim it contradicts) instead of passing,
+/// and points at `check --index` and the repair.
 #[test]
-fn a_relabelled_blob_is_refused_not_passed() {
+fn a_relabelled_blob_fails_the_check_not_passes() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let mut ways = honest_ways();
@@ -255,10 +291,51 @@ fn a_relabelled_blob_is_refused_not_passed() {
         .arg("--corrupt-indexdata-kind")
         .assert_success();
     let out = check(&corrupt, &[]);
-    assert_eq!(out.status.code(), Some(EXIT_ERROR), "{}", out.stdout_str());
-    assert!(
-        out.stderr_str().contains("check --index"),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_ANSWER_NEGATIVE),
         "{}",
+        out.stderr_str()
+    );
+    let stdout = out.stdout_str();
+    assert!(
+        stdout.contains("Location check stopped: blob 1 at byte offset")
+            && stdout.contains("claims way elements but holds node elements"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("Refs"),
+        "a stopped check reports no counts: {stdout}"
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("check --index") && stderr.contains("cat --reindex"),
+        "{stderr}"
+    );
+
+    let out = check(&corrupt, &["--json"]);
+    assert_eq!(out.status.code(), Some(EXIT_ANSWER_NEGATIVE));
+    let json: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
+    let locations = &json["locations"];
+    assert_eq!(locations["complete"], false, "{json}");
+    assert_eq!(locations["kind_contradiction"]["claimed"], "way", "{json}");
+    assert_eq!(locations["kind_contradiction"]["found"], "node", "{json}");
+}
+
+/// A way blob carrying an empty dense-node message holds no node: the
+/// location check judges kinds as the decoder does, so the honest file
+/// passes. Its scanner once counted the empty message as a node and failed
+/// a way claim it could not contradict.
+#[test]
+fn an_empty_dense_message_in_a_way_blob_is_no_node() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("empty-dense.osm.pbf");
+    write_low_with_empty_dense_in_way_blob(&path, &NODES, &honest_ways());
+    let out = check(&path, &[]);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        out.stdout_str(),
         out.stderr_str()
     );
 }

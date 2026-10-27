@@ -804,3 +804,55 @@ mod serial {
         );
     }
 }
+
+/// A bare `check` routes blobs by their claimed kind, so on a file whose
+/// kind claims are rotated both of its checks stop at a contradicted claim
+/// and fail the file (exit 1, not the exit 2 of a check that could not
+/// run). Before, each phase dropped the elements of the kind it did not want
+/// and the file passed. Combined with `--index`, the index report of the
+/// same lie is still printed: a stopped check does not end the run.
+#[test]
+fn a_bare_check_fails_a_file_whose_kind_claims_are_false() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    let rotated = degrade_with(
+        dir.path(),
+        &input,
+        "--corrupt-indexdata-kind",
+        "rotated.osm.pbf",
+    );
+
+    let bare = CliInvoker::new().arg("check").arg(&rotated).run();
+    assert_eq!(
+        bare.status.code(),
+        Some(EXIT_ANSWER_NEGATIVE),
+        "{}",
+        bare.stderr_str()
+    );
+    let stdout = bare.stdout_str();
+    assert!(stdout.contains("ID check stopped: blob"), "{stdout}");
+    assert!(stdout.contains("Reference check stopped: blob"), "{stdout}");
+    assert!(
+        stdout.contains("its claimed-kind partition is invalid"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Referential integrity"), "{stdout}");
+    assert!(
+        bare.stderr_str().contains("cat --reindex"),
+        "{}",
+        bare.stderr_str()
+    );
+
+    let both = CliInvoker::new()
+        .args(["check", "--ids", "--index"])
+        .arg(&rotated)
+        .run();
+    assert_eq!(both.status.code(), Some(EXIT_ANSWER_NEGATIVE));
+    let stdout = both.stdout_str();
+    assert!(stdout.contains("ID check stopped"), "{stdout}");
+    assert!(stdout.contains("Blob metadata"), "{stdout}");
+
+    // The honest file the lie was forged from passes the same bare check.
+    CliInvoker::new().arg("check").arg(&input).assert_success();
+}

@@ -782,7 +782,10 @@ fn tags_filter_two_pass(
                 }
                 continue;
             }
-            schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
+            schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
+                &meta,
+                crate::scan::classify::KindClaims::Unchecked,
+            )?);
         }
         if blobs_skipped_by_tag > 0 {
             crate::host::diag!(
@@ -998,7 +1001,10 @@ fn tags_filter_two_pass(
             continue;
         }
 
-        schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
+        schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
+            &meta,
+            crate::scan::classify::KindClaims::Unchecked,
+        )?);
     }
     let input_file = walker.input();
     drop(walker);
@@ -1149,6 +1155,7 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
+        crate::scan::classify::KindClaims::Unchecked,
         host,
     )?;
 
@@ -1274,6 +1281,7 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
+        crate::scan::classify::KindClaims::Unchecked,
         host,
     )?;
 

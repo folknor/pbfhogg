@@ -38,10 +38,45 @@ provenance, the verifiers are the admission test, within the coverage gaps
 this page lists.
 
 Verifying on every read would cost the per-blob decode that the splice and
-passthrough fast paths exist to avoid, so verification is opt-in. The checks
-that already happen as part of work a command does anyway stay (the
-"Checked in passing" column below); no consuming command adds a decode pass
-only to check a claim.
+passthrough fast paths exist to avoid, so verification is opt-in. That cost
+holds only for blobs a run skips or copies on the claim; a blob the run
+decodes anyway can be compared with its claim for free, and where that
+comparison catches a lie that would otherwise publish a wrong answer it is
+made (the "Checked in passing" column below). No consuming command adds a
+decode pass only to check a claim.
+
+## Kind claims refused at decode
+
+Every decode builds its block through one validation pass that already
+visits every element, and that pass records which element kinds the block
+holds (a plain node, a dense group with at least one ID, a way, a relation;
+empty groups, an empty dense message and changeset groups add nothing). A
+phase that scheduled a blob on its claimed kind can therefore refuse the
+blob, after decoding it, when it holds an element of another kind: the phase
+would drop that element, and the phase that needs it never reads the blob.
+The refusal is `ErrorKind::IndexdataMismatch` carrying a
+`KindContradiction { claimed, found }`, located at the blob; the CLI's
+advice names `check --index` and `cat --reindex`. It costs one compare per
+decoded blob and decodes nothing the phase would not.
+
+It is a foreign-kind test, deliberately weaker than `check --index`: an
+empty blob under any claim passes it, and it says nothing of count, range or
+bbox. It sees only the blobs a phase decodes; a blob skipped or copied on its
+claim is not seen.
+
+A phase adopts it where it builds its schedule: the classify schedule
+builders and `ScheduledBlob::from_meta` / `at_frame` take
+`KindClaims::Refuse` or `KindClaims::Unchecked` (an `Unchecked` is a phase
+that believes its claims unchecked), and the pipelined reader takes
+`ElementReader::refusing_kind_claims`. The block-building pools and the
+pipelined decode step make the check; a raw-bytes walker builds no block and
+checks the group fields it reads itself, as `check --locations` does.
+
+Adopted so far: `check --refs`, `check --ids` and (through its own raw
+scanner) `check --locations`, where a contradiction stops the check rather
+than refuses the file: the check fails it, exit 1 (cli-reference.md,
+`check`). Every other per-kind phase in the table below still believes its
+claims unchecked.
 
 A blob that carries no `indexdata` or no `tagdata` makes no claim. Readers
 also treat sidecar bytes they cannot parse (unrecognised length, version or
@@ -53,7 +88,7 @@ consequence 3).
 
 | Claim | Believed by, and what a lie costs | Checked in passing by | Verified by |
 |-------|-----------------------------------|-----------------------|-------------|
-| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, `check --ids` / `--refs`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes, and searches for surviving ways with stale inline coordinates only in blobs claimed as ways, so a way blob labelled with another kind can be passed through with its stale coordinates. `check --locations` reads a blob claiming ways only in its way passes; every other blob it decodes once and routes on what it holds. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind); `check --locations` refuses a blob claiming ways whose groups hold another kind | `check --index` |
+| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes, and searches for surviving ways with stale inline coordinates only in blobs claimed as ways, so a way blob labelled with another kind can be passed through with its stale coordinates. `check --locations` reads a blob claiming ways only in its way passes; every other blob it decodes once and routes on what it holds. `check --ids` / `--refs` read each blob in the phase of its claimed kind and judge type order from the claims; a blob claiming relations is read by `--refs` only under `--check-relations`, and `--ids -t` reads only the selected kinds' blobs, so a lie in a blob no phase reads passes them. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind); `check --ids`, `check --refs` and `check --locations` (a blob claiming ways) stop and fail the file on a decoded element of another kind ("Kind claims refused at decode") | `check --index` |
 | `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff` plans shards from ranges, decides from them which blob pairs overlap, and skips decoding a pair whose claimed range and count match when its compressed bytes are identical (`-c`, `--format osc`). `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range (`check --locations` partitions them by the range it decoded, not the claimed one). `inspect --show` skips on range. | `diff` refuses ranges that break canonical order, and a block holding elements past its claimed `max_id` where the merge meets them (a shard boundary hides what lies past it); `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
 | `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |
@@ -81,7 +116,11 @@ the `extract` raw copy (verified for region membership, not for its header),
 and plain `cat`, which passes an already indexed blob through as-is and
 indexes only blobs that carry no indexdata. A false claim in the input
 therefore reaches the output, where the next pbfhogg run believes it again;
-plain `cat` cannot repair it. A rebuilt index can carry one too: `renumber`
+plain `cat` cannot repair it. `cat --reindex` can: it replaces every data
+blob's indexdata and tagdata with ones scanned from its payload, copies
+every data payload and every other blob-header field byte for byte and the
+file's `HeaderBlock` unchanged (its frame is written afresh), and refuses a
+block no single index describes. A rebuilt index can carry one too: `renumber`
 rewrites every node blob but takes the new index's bbox from the input's
 claim, so a false bbox survives into a fully renumbered output and a later
 `extract` can skip nodes on it.
@@ -118,9 +157,11 @@ take the bound from `IdSet::file_bounded_max_id`.
 - **`check --ids`** checks ID order within each blob and across blobs, per
   kind, and type order across blobs on indexed input. It tests the order
   requirement, not the header's claim: an honestly unsorted file fails it
-  too. Its per-kind schedules come from the indexdata kind, so its verdict
-  leans on the kinds being right, which `check --index` establishes.
-  Combine the two selectors to run both; flag order implies no sequencing.
+  too. Its per-kind schedules come from the indexdata kind; a scheduled blob
+  holding another kind stops it and fails the file, but a lie in a blob no
+  selected phase reads (under `-t`) is not seen, which `check --index`
+  covers. Combine the two selectors to run both; flag order implies no
+  sequencing.
 
 How `check --index` is built, so its verdict means what it says:
 
@@ -202,7 +243,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   the remedy (plain `cat` indexes every blob that lacks indexdata, `--type`
   decodes such a blob and filters its actual elements, `--dedupe`'s first
   pass scans its IDs and tag keys, `--clean` schedules and decodes every
-  blob whatever its indexdata); `check --index`, the verifier, which
+  blob whatever its indexdata, `--reindex` rescans every blob); `check --index`, the verifier, which
   reports the file as a violation (exit 1); and `inspect`'s descriptions
   (the default index-only scan, which falls back to a full decode at the
   first unindexed blob, `--extended` and `--show`). `inspect --nodes` and
@@ -266,7 +307,9 @@ Current behaviour recorded as such, not as a contract to preserve:
 - `check --refs`, `check --ids` and `check --locations` refuse a partially
   indexed file,
   although `check` answers "is this file right?" and `check --index`
-  reports the same file as a violation (exit 1). Combined with `--index`,
+  reports the same file as a violation (exit 1). A false kind claim they
+  meet at decode is not refused but fails the file (exit 1), and other
+  selected checks still run. Combined with `--index`,
   the other check's refusal ends the run: `check --ids --index` stops
   before the index report, and `check --refs --index` computes it and
   then exits on the refusal without printing it.

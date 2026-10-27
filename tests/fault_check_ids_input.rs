@@ -97,7 +97,10 @@ fn run<'a>(
             relations: false,
         }),
     };
-    Ok(verify_ids(input, &opts, host)?.to_json_value("in"))
+    Ok(match verify_ids(input, &opts, host)? {
+        pbfhogg::check::CheckOutcome::Complete(report) => report.to_json_value("in"),
+        pbfhogg::check::CheckOutcome::Stopped(stopped) => stopped.to_json_value("in"),
+    })
 }
 
 /// What the unreplaced run of `route` reports, from the fixture's
@@ -337,7 +340,7 @@ fn every_check_uses_a_caller_pin_as_it_is() {
                 "index" => pbfhogg::check::index::check_index(&pin, &opts, &host)
                     .map(|r| (0, Some(r.blobs))),
                 _ => pbfhogg::check::refs::check_refs(&pin, &refs_opts, &host)
-                    .map(|r| (r.node_count, None)),
+                    .map(|r| (r.complete().expect("complete").node_count, None)),
             };
             let cell = format!("{check}, procfs {procfs}");
             if procfs {

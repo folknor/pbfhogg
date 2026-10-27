@@ -95,7 +95,10 @@ fn opts(agreement: bool, budget: Option<u64>) -> CheckLocationsOptions {
 }
 
 fn run(path: &Path, agreement: bool, budget: Option<u64>) -> LocationsReport {
-    check_locations(path, &opts(agreement, budget), &crate::common::test_host()).unwrap()
+    check_locations(path, &opts(agreement, budget), &crate::common::test_host())
+        .unwrap()
+        .complete()
+        .expect("the location check completes")
 }
 
 /// Node IDs far enough apart to land in different `IdSet` chunks and so
@@ -634,7 +637,10 @@ fn retained_details_are_the_first_in_file_order() {
     for budget in [None, Some(1), Some(50)] {
         let mut o = opts(false, budget);
         o.check.max_errors = 3;
-        let report = check_locations(&path, &o, &crate::common::test_host()).unwrap();
+        let report = check_locations(&path, &o, &crate::common::test_host())
+            .unwrap()
+            .complete()
+            .unwrap();
         assert_eq!(report.refs_mismatched, 40);
         let ways: Vec<i64> = report
             .violations
@@ -667,7 +673,10 @@ fn capped_node_details_are_the_smallest_ids_across_partitions() {
     for budget in [None, Some(1), Some(9)] {
         let mut o = opts(false, budget);
         o.check.max_errors = 2;
-        let report = check_locations(&path, &o, &crate::common::test_host()).unwrap();
+        let report = check_locations(&path, &o, &crate::common::test_host())
+            .unwrap()
+            .complete()
+            .unwrap();
         assert_eq!(report.nodes_conflicting, 4);
         assert_eq!(report.refs_to_conflicting_nodes, 4);
         let kinds: Vec<_> = report.violations.iter().map(|v| v.kind.clone()).collect();
@@ -881,6 +890,53 @@ fn blobs_the_reader_refuses_are_refused() {
                 .expect_err(what);
             assert!(expected(err.kind()), "{what}, {how}: {err}");
         }
+    }
+}
+
+/// A blob claiming ways that holds a relation group and a node group, in
+/// either order, stops the check naming node: the witness follows the fixed
+/// node, way, relation priority every decoding check uses, not group order.
+#[test]
+fn a_way_claim_over_two_foreign_kinds_names_the_same_witness_in_any_order() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_raw(
+        &honest,
+        &[
+            block_with(&[b""], &plain_node_group(false)),
+            block_with(&[b""], &way_group(false)),
+        ],
+    );
+    let bytes = std::fs::read(&honest).unwrap();
+    let mut relation = Vec::new();
+    pb_int(1, 7, &mut relation);
+    let mut relation_group = Vec::new();
+    pb_len(4, &relation, &mut relation_group);
+    let node_group = plain_node_group(false);
+    for (first, second) in [
+        (&relation_group, &node_group),
+        (&node_group, &relation_group),
+    ] {
+        // Frame 2 is the way blob; its indexdata still claims ways.
+        let lying = crate::common::adversarial::mutate_blob_payload(&bytes, 2, |block| {
+            pb_len(2, first, block);
+            pb_len(2, second, block);
+        });
+        let path = dir.path().join("two-foreign.osm.pbf");
+        std::fs::write(&path, lying).unwrap();
+        let outcome = check_locations(&path, &opts(false, None), &crate::common::test_host())
+            .expect("the check runs");
+        let pbfhogg::check::CheckOutcome::Stopped(stopped) = outcome else {
+            panic!("a way claim over nodes and a relation must stop the check");
+        };
+        assert_eq!(
+            stopped.contradiction,
+            pbfhogg::KindContradiction {
+                claimed: pbfhogg::ElementKind::Way,
+                found: pbfhogg::ElementKind::Node,
+            }
+        );
+        assert_eq!(stopped.blob, Some(2));
     }
 }
 

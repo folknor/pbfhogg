@@ -157,9 +157,33 @@ impl Drop for Permit {
 pub(crate) struct PipelineConfig {
     read_ahead: NonZeroUsize,
     decode_ahead: NonZeroUsize,
+    /// Whether each decoded data block is checked against its blob's
+    /// indexdata kind claim. Under [`KindClaims::Refuse`] the reader parses
+    /// every blob's indexdata, and a decoded block holding an element of a
+    /// kind other than the claim is refused inside the decode step, before
+    /// the transform sees it (`IndexdataMismatch` with a `KindContradiction`,
+    /// located at the blob). A blob the filter skips, or a transform declines
+    /// to decode, is not checked: the refusal costs no decode. `Unchecked`
+    /// (the default) checks nothing. Sequential iteration (`for_each`,
+    /// `par_map_reduce`) never runs this engine and is unaffected.
+    ///
+    /// [`KindClaims::Refuse`]: crate::scan::classify::KindClaims::Refuse
+    kind_claims: crate::scan::classify::KindClaims,
 }
 
 impl PipelineConfig {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reached only through `ElementReader::refusing_kind_claims`, the \
+                      pipelined adoption seam no phase uses yet"
+        )
+    )]
+    pub(crate) fn set_kind_claims(&mut self, claims: crate::scan::classify::KindClaims) {
+        self.kind_claims = claims;
+    }
+
     fn depth(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
     }
@@ -178,6 +202,7 @@ impl Default for PipelineConfig {
         Self {
             read_ahead: Self::depth(DEFAULT_READ_AHEAD),
             decode_ahead: Self::depth(DEFAULT_DECODE_AHEAD),
+            kind_claims: crate::scan::classify::KindClaims::Unchecked,
         }
     }
 }
@@ -277,6 +302,8 @@ struct DecodeTask<'scope, X: DecodeTransform> {
     tx: SyncSender<DecodedItem<X::Out>>,
     buffer_pool: Arc<DecompressPool>,
     blob_filter: Option<Arc<BlobFilter>>,
+    /// Refuse a decoded block that contradicts its blob's kind claim.
+    refuse_kinds: bool,
     permit: Permit,
     shutdown: Arc<AtomicBool>,
     /// The run's transform, borrowed from the caller for the whole scope.
@@ -302,6 +329,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         tx,
         buffer_pool,
         blob_filter,
+        refuse_kinds,
         permit,
         shutdown,
         transform,
@@ -331,20 +359,27 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
                 return None;
             }
             let decode = || {
-                ST_SCRATCH.with_borrow_mut(|st| {
-                    GR_SCRATCH.with_borrow_mut(|gr| {
-                        let block =
-                            blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
-                        // Per-thread scratch retention is the iter-5 residual
-                        // alloc bucket. Record current capacity in (u32, u32)
-                        // pairs * 8 bytes for the invocation's peak.
-                        metrics.record_scratch_capacity(
-                            st.capacity().saturating_mul(8),
-                            gr.capacity().saturating_mul(8),
-                        );
-                        block
+                ST_SCRATCH
+                    .with_borrow_mut(|st| {
+                        GR_SCRATCH.with_borrow_mut(|gr| {
+                            let block =
+                                blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
+                            // Per-thread scratch retention is the iter-5 residual
+                            // alloc bucket. Record current capacity in (u32, u32)
+                            // pairs * 8 bytes for the invocation's peak.
+                            metrics.record_scratch_capacity(
+                                st.capacity().saturating_mul(8),
+                                gr.capacity().saturating_mul(8),
+                            );
+                            block
+                        })
                     })
-                })
+                    .and_then(|block| {
+                        if refuse_kinds {
+                            block.refuse_foreign_kind(blob.index().map(|index| index.kind))?;
+                        }
+                        Ok(block)
+                    })
             };
             transform.apply(&blob, decode)
         }));
@@ -499,7 +534,8 @@ where
     let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
-    blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA);
+    let refuse_kinds = pipeline_config.kind_claims == crate::scan::classify::KindClaims::Refuse;
+    blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA || refuse_kinds);
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
     let cancel = blob_reader.cancel_token().clone();
@@ -616,6 +652,7 @@ where
                                     tx: dispatch_tx.clone(),
                                     buffer_pool: Arc::clone(&buffer_pool),
                                     blob_filter: blob_filter.clone(),
+                                    refuse_kinds,
                                     permit,
                                     shutdown: Arc::clone(&shutdown),
                                     transform,
@@ -922,6 +959,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(one, many);
+    }
+
+    /// A node blob, then a way blob whose indexdata claims nodes.
+    fn pbf_with_a_way_blob_claiming_nodes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = PbfWriter::new(&mut bytes, Compression::None);
+            writer
+                .write_header(&HeaderBuilder::new().build().unwrap())
+                .unwrap();
+            let mut nodes = BlockBuilder::new();
+            nodes.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            writer
+                .write_primitive_block(nodes.take().unwrap().unwrap())
+                .unwrap();
+            let mut ways = BlockBuilder::new();
+            ways.add_way(5, std::iter::empty::<(&str, &str)>(), &[1], None);
+            let mut lying = ways.take_owned().unwrap().unwrap();
+            lying.index.kind = crate::ElementKind::Node;
+            writer.write_primitive_block_owned(lying).unwrap();
+            writer.flush().unwrap();
+        }
+        bytes
+    }
+
+    /// The pipelined adoption seam refuses a decoded block that contradicts
+    /// its blob's kind claim, naming the claim and the blob; without it the
+    /// same read delivers the block, and a kind filter that keeps the blob
+    /// (it claims nodes) is what a believing caller would have used.
+    #[test]
+    fn refusing_kind_claims_refuses_a_block_holding_another_kind() {
+        let bytes = pbf_with_a_way_blob_claiming_nodes();
+
+        let unchecked = fused_counts(ElementReader::new(Cursor::new(bytes.clone())).unwrap());
+        assert_eq!(unchecked.unwrap(), [1, 1], "unchecked reads deliver both");
+
+        for filtered in [false, true] {
+            let mut reader = ElementReader::new(Cursor::new(bytes.clone()))
+                .unwrap()
+                .refusing_kind_claims();
+            if filtered {
+                reader = reader.with_blob_filter(BlobFilter::new(true, false, false));
+            }
+            let err = fused_counts(reader).unwrap_err();
+            assert_eq!(
+                err.kind_contradiction(),
+                Some(crate::KindContradiction {
+                    claimed: crate::ElementKind::Node,
+                    found: crate::ElementKind::Way,
+                }),
+                "filtered {filtered}: {err}"
+            );
+            assert_eq!(err.blob_index(), Some(2), "filtered {filtered}: {err}");
+        }
     }
 
     #[test]

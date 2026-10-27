@@ -203,7 +203,7 @@ pub(super) fn try_extract_multi_single_pass(
             continue;
         }
         walker.observe_filter_index(meta.index.as_ref());
-        let entry = ScheduledBlob::from_meta(&meta)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
         // Both decisions below are taken on indexdata claims, never decoded
         // to check: a blob claimed as nodes whose bbox misses every region
         // is skipped unread, and each blob joins the one per-kind schedule

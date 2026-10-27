@@ -888,7 +888,11 @@ fn degrade_decode_path(
         .clone();
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(input, host)?;
+        crate::scan::classify::build_classify_schedules_split(
+            input,
+            crate::scan::classify::KindClaims::Unchecked,
+            host,
+        )?;
     // Use the input size as a preallocation budget for the caller-supplied
     // cap. Compressed input can expand to more elements than bytes; the
     // vectors grow as needed without changing the requested block cap.

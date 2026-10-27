@@ -2604,3 +2604,150 @@ fn passthrough_reencode_refuses_to_drop_a_declared_way_enrichment() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// --reindex: the lossless repair for false indexdata
+// ---------------------------------------------------------------------------
+
+/// The Blob payload of every frame after the leading header, in order.
+fn data_payloads(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read pbf");
+    crate::common::adversarial::locate_blobs(&bytes)
+        .into_iter()
+        .skip(1)
+        .map(|f| bytes[f.blob_start..f.blob_end].to_vec())
+        .collect()
+}
+
+/// Append a length-delimited field 15 holding `keep` to the `BlobHeader` of
+/// frame `frame`: a field pbfhogg does not model, standing in for every
+/// header field `--reindex` must carry through (field 5 included).
+fn with_unknown_header_field(bytes: &[u8], frame: usize) -> Vec<u8> {
+    let target = crate::common::adversarial::locate_blobs(bytes)[frame];
+    let mut header = bytes[target.header_start..target.header_end].to_vec();
+    header.extend_from_slice(&[0x7a, 4]);
+    header.extend_from_slice(b"keep");
+    let mut out = bytes[..target.frame_start].to_vec();
+    out.extend_from_slice(&u32::try_from(header.len()).expect("len").to_be_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&bytes[target.blob_start..]);
+    out
+}
+
+fn run_reindex(input: &Path, output: &Path) -> crate::invoker::CliOutput {
+    CliInvoker::new()
+        .args(["cat", "--reindex"])
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .run()
+}
+
+/// A file whose kind claims are all false (`degrade --corrupt-indexdata-kind`
+/// rotates them) fails `check`; `cat --reindex` rewrites its indexdata from
+/// the payloads, copying every payload byte for byte and every other header
+/// field through, and the result passes `check` and `check --index`.
+#[test]
+fn reindex_repairs_false_kind_claims_losslessly() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [("name", "a")], None);
+    bb.add_node(2, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    bb.add_way(10, [("highway", "path")], &[1, 2], None);
+    let ways = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&honest, true, &[], &[(true, nodes), (true, ways)]);
+
+    let rotated = dir.path().join("rotated.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&rotated)
+        .arg("--corrupt-indexdata-kind")
+        .assert_success();
+    // Frame 2 (the way blob) also carries a header field nobody models.
+    let lying = dir.path().join("lying.osm.pbf");
+    let bytes = std::fs::read(&rotated).expect("read rotated");
+    std::fs::write(&lying, with_unknown_header_field(&bytes, 2)).expect("write lying");
+    let bare = CliInvoker::new().arg("check").arg(&lying).run();
+    assert_eq!(bare.status.code(), Some(1), "{}", bare.stderr_str());
+
+    let output = dir.path().join("reindexed.osm.pbf");
+    let out = run_reindex(&lying, &output);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("Reindexed 2 blobs; 2 carried indexdata");
+    CliInvoker::new()
+        .args(["check", "--index"])
+        .arg(&output)
+        .assert_success();
+    CliInvoker::new().arg("check").arg(&output).assert_success();
+    assert_eq!(data_payloads(&output), data_payloads(&lying));
+    assert_eq!(ordered_elements(&output), ordered_elements(&honest));
+    let out_bytes = std::fs::read(&output).expect("read output");
+    let frame = crate::common::adversarial::locate_blobs(&out_bytes)[2];
+    assert!(
+        out_bytes[frame.header_start..frame.header_end]
+            .windows(6)
+            .any(|w| w == [0x7a, 4, b'k', b'e', b'e', b'p']),
+        "the unknown header field must survive"
+    );
+
+    // Counterpart: an honest file is reindexed with nothing changed.
+    let again = dir.path().join("again.osm.pbf");
+    let out = run_reindex(&honest, &again);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("Reindexed 2 blobs; 0 carried indexdata");
+    assert_eq!(data_payloads(&again), data_payloads(&honest));
+}
+
+/// `--reindex` refuses a block no single index describes rather than give
+/// it no indexdata (a partially indexed output every command refuses) or
+/// re-encode it (not lossless), takes exactly one input, and combines with
+/// none of the re-encoding or filtering modes.
+#[test]
+fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("mixed.osm.pbf");
+    write_raw_block_pbf(&input, false, &[], &unsorted_clean_blocks());
+    let output = dir.path().join("out.osm.pbf");
+    let out = run_reindex(&input, &output);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    out.assert_stderr_contains("cannot be described by one index");
+    assert!(!output.exists());
+
+    let honest = dir.path().join("honest.osm.pbf");
+    crate::common::write_test_pbf_sorted(&honest, &[], &[], &[]);
+    let out = CliInvoker::new()
+        .args(["cat", "--reindex"])
+        .arg(&honest)
+        .arg(&honest)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    out.assert_stderr_contains("exactly one input");
+    for flags in [
+        &["--dedupe"][..],
+        &["--type", "node"],
+        &["--clean", "uid"],
+        &["--generator", "x"],
+    ] {
+        let out = CliInvoker::new()
+            .args(["cat", "--reindex"])
+            .args(flags)
+            .arg(&honest)
+            .arg("-o")
+            .arg(&output)
+            .run();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{flags:?}: {}",
+            out.stderr_str()
+        );
+    }
+}

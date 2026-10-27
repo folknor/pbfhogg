@@ -1,6 +1,7 @@
 //! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
 
 pub mod dedupe;
+pub mod reindex;
 
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,

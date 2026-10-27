@@ -285,8 +285,9 @@ fn node_stats_inner(
 
     host.invocation.marker("NODESTATS_START");
 
+    use crate::scan::classify::{KindClaims::Unchecked, build_classify_schedule as schedule_of};
     let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(&pin, Some(crate::ElementKind::Node), host)?;
+        schedule_of(&pin, Some(crate::ElementKind::Node), Unchecked, host)?;
 
     // `None` keeps the classify pool's own host-derived sizing.
     let thread_override = parallelism.fixed();

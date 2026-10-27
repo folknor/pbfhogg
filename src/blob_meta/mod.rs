@@ -118,7 +118,7 @@ impl BlobBbox {
 ///
 /// Produced by [`try_scan_block_ids_checked`] from decompressed PrimitiveBlock bytes,
 /// or deserialized from BlobHeader `indexdata`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobIndex {
     pub kind: ElementKind,
     pub min_id: i64,

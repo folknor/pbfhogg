@@ -103,6 +103,28 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
+    /// Makes the pipelined iteration methods refuse a decoded data block
+    /// holding an element of a kind other than its blob's indexdata kind
+    /// claim (`ErrorKind::IndexdataMismatch` carrying a `KindContradiction`).
+    /// For a run that believes the claim, typically through a kind
+    /// [`BlobFilter`]: the check is one compare per decoded block and decodes
+    /// nothing it would not. Sequential iteration is unaffected. The
+    /// pipelined adoption seam of `crate::scan::classify::KindClaims`.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the pipelined adoption seam: its first callers are the kind-filtered \
+                      pipelined phases, which adopt it in their own changes"
+        )
+    )]
+    pub(crate) fn refusing_kind_claims(mut self) -> Self {
+        self.pipeline_config
+            .set_kind_claims(crate::scan::classify::KindClaims::Refuse);
+        self
+    }
+
     /// Sets the number of threads in the decode pool used by
     /// [`for_each_pipelined`](Self::for_each_pipelined),
     /// [`for_each_block_pipelined`](Self::for_each_block_pipelined), and

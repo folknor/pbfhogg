@@ -115,6 +115,25 @@ pub(crate) fn new_unsorted(reason: impl Into<Cow<'static, str>>) -> Error {
 pub(crate) fn new_indexdata_mismatch(reason: impl Into<Cow<'static, str>>) -> Error {
     new_error(ErrorKind::IndexdataMismatch {
         reason: reason.into(),
+        contradiction: None,
+    })
+}
+
+/// A blob's indexdata claims `claimed` elements and the decoded blob holds
+/// `found` elements, found by a run that routed the blob on that claim.
+#[cold]
+pub(crate) fn new_kind_contradiction(
+    claimed: crate::ElementKind,
+    found: crate::ElementKind,
+) -> Error {
+    new_error(ErrorKind::IndexdataMismatch {
+        reason: format!(
+            "blob indexdata claims {claimed} elements but the blob holds {found} \
+             elements, which a run routing blobs by their claimed kind drops or \
+             never reads"
+        )
+        .into(),
+        contradiction: Some(KindContradiction { claimed, found }),
     })
 }
 
@@ -586,6 +605,16 @@ impl Error {
     pub fn blob_index(&self) -> Option<u64> {
         self.0.location.as_ref().and_then(|l| l.blob)
     }
+
+    /// The decoded kind contradiction this error reports, when it is an
+    /// [`ErrorKind::IndexdataMismatch`] that carries one.
+    #[inline]
+    pub fn kind_contradiction(&self) -> Option<KindContradiction> {
+        match self.kind() {
+            ErrorKind::IndexdataMismatch { contradiction, .. } => *contradiction,
+            _ => None,
+        }
+    }
 }
 
 /// The specific type of an error.
@@ -630,7 +659,13 @@ pub enum ErrorKind {
     Unsorted { reason: Cow<'static, str> },
     /// A blob's indexdata (the `BlobHeader` element-kind and ID-range
     /// claim) disagrees with what the blob holds. `reason` says how.
-    IndexdataMismatch { reason: Cow<'static, str> },
+    /// `contradiction` is set when the disagreement is a decoded element of
+    /// a kind other than the claimed one, which a run that already decoded
+    /// the blob establishes for free.
+    IndexdataMismatch {
+        reason: Cow<'static, str>,
+        contradiction: Option<KindContradiction>,
+    },
     /// Way node locations could not be resolved, and writing a `(0, 0)`
     /// placeholder for them was not allowed. Nothing was published. `count`
     /// is in the unit `counted` names, which differs by command.
@@ -691,6 +726,18 @@ pub enum ErrorKind {
     /// because it was asked to, every guard dropped (scratch and output
     /// staging removed) and nothing was published.
     Cancelled,
+}
+
+/// The decoded contradiction of a blob's indexdata kind claim, carried by
+/// [`ErrorKind::IndexdataMismatch`]: the blob claims `claimed` elements and
+/// holds at least one `found` element. `found` is one witness, chosen by a
+/// fixed node, way, relation priority, not every foreign kind the blob holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KindContradiction {
+    /// The kind the blob's indexdata claims.
+    pub claimed: crate::ElementKind,
+    /// A kind the decoded blob holds that is not `claimed`.
+    pub found: crate::ElementKind,
 }
 
 /// What the `count` of an [`ErrorKind::MissingNodeLocations`] counts.
@@ -1129,7 +1176,7 @@ impl fmt::Display for Message<'_> {
             // advice to give (the CLI maps each kind to its own).
             ErrorKind::MissingIndexdata { ref reason, .. }
             | ErrorKind::Unsorted { ref reason }
-            | ErrorKind::IndexdataMismatch { ref reason } => f.write_str(reason),
+            | ErrorKind::IndexdataMismatch { ref reason, .. } => f.write_str(reason),
             ErrorKind::MissingNodeLocations { count, counted } => counted.describe(f, count),
             ErrorKind::InputReplaced => write!(
                 f,

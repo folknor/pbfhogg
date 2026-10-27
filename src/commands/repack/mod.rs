@@ -204,7 +204,11 @@ pub(crate) fn repack_to(
     // The fifth result sizes IdSets in check callers; repack only needs the
     // schedules.
     let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
-        crate::scan::classify::build_classify_schedules_split(input, host)?;
+        crate::scan::classify::build_classify_schedules_split(
+            input,
+            crate::scan::classify::KindClaims::Unchecked,
+            host,
+        )?;
 
     host.invocation
         .counter("repack_input_blobs_nodes", node_schedule.len());

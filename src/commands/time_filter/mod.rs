@@ -350,7 +350,12 @@ fn time_filter_snapshot(
     // decoded elements by their actual kind. A partially indexed file is
     // refused by the walk all the same, as by every command-input read
     // (reference/indexdata-trust.md, "Missing and partial indexdata").
-    let (schedule, shared_file) = build_classify_schedule(input, None, host)?;
+    let (schedule, shared_file) = build_classify_schedule(
+        input,
+        None,
+        crate::scan::classify::KindClaims::Unchecked,
+        host,
+    )?;
 
     if schedule.is_empty() {
         host.invocation.marker("TIMEFILTER_SNAPSHOT_END");

@@ -1095,6 +1095,18 @@
 
 ### Added
 
+- **`cat --reindex` repairs false indexdata losslessly.** It rewrites every
+  data blob's indexdata and tag key index from the blob's own payload,
+  copying the compressed payload and every other blob-header field
+  (`WayMembers-v1` included) byte for byte, and the file header's contents
+  unchanged. Plain
+  `cat` keeps an indexed blob's claims and `--clean` re-encodes every block,
+  so neither repairs a false claim without changing anything else. A block
+  no single index can describe is refused rather than re-encoded. One input;
+  not with `--type`, `--clean`, `--dedupe` or a header override. A refusal
+  of false indexdata now names it beside `check --index`. Library:
+  `cat::reindex::reindex`.
+
 - **`check --locations` verifies a LocationsOnWays file.** It compares every
   way's inline node coordinates with the same file's node records (after
   each block's granularity and offsets) and exits 1 on a mismatch, a way
@@ -1368,6 +1380,27 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`check --refs` and `check --ids` fail a file whose blob kind claims are
+  false.** Each check reads a blob in the phase of the kind its indexdata
+  claims, and used to drop the elements of every other kind, so a way blob
+  labelled node or relation went unchecked and a file with dangling way
+  references or duplicate way IDs passed. A phase that decodes a blob holding
+  an element of a kind other than its claim now stops the check: the report
+  is `<Check> stopped: blob N at byte offset M claims X but holds Y
+  elements`, with no counts (findings computed from a broken partition can
+  be false), the JSON section is `"complete": false` with a
+  `kind_contradiction` object, and `check` exits 1, as `check --index` does
+  for the same file; other selected checks still run and print. A blob
+  claiming relations is read only under `--check-relations`, and under
+  `--ids -t` only the selected kinds' blobs are read, so a lie there is
+  still found only by `check --index`. `check --locations`, which refused a
+  way-claimed blob holding another kind (exit 2), now stops the same way
+  (exit 1), and no longer counts an empty dense-node message as a node.
+  Library: `check_refs`, `verify_ids` and `check_locations` return
+  `check::CheckOutcome` (`Complete(report)` or `Stopped(StoppedCheck)`), and
+  `ErrorKind::IndexdataMismatch` gains `contradiction:
+  Option<KindContradiction>` (`Error::kind_contradiction`).
 
 - **`apply-changes --direct-io` reports its index hits.** The summary's
   `Blobs: N passthrough (M index-hit)` read `0 index-hit` under

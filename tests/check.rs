@@ -35,6 +35,8 @@ fn verify_node_ids_with_max_errors(
     };
     pbfhogg::check::verify_ids::verify_ids(path, &opts, &crate::common::test_host())
         .expect("verify_ids")
+        .complete()
+        .expect("verify_ids completes")
 }
 
 fn verify_node_ids(path: &std::path::Path) -> pbfhogg::check::verify_ids::VerifyIdsReport {
@@ -47,6 +49,16 @@ fn run_check_refs(
     show_ids: bool,
     max_errors: usize,
 ) -> pbfhogg::Result<pbfhogg::check::refs::RefCheckResult> {
+    check_refs_outcome(path, check_relations, show_ids, max_errors)
+        .map(|outcome| outcome.complete().expect("check_refs completes"))
+}
+
+fn check_refs_outcome(
+    path: &std::path::Path,
+    check_relations: bool,
+    show_ids: bool,
+    max_errors: usize,
+) -> pbfhogg::Result<pbfhogg::check::CheckOutcome<pbfhogg::check::refs::RefCheckResult>> {
     let opts = pbfhogg::check::refs::CheckRefsOptions {
         check: pbfhogg::check::CheckOptions {
             max_errors,
@@ -356,7 +368,10 @@ fn check_refs_resolves_ids_above_the_allocation() {
             check_relations: true,
             show_ids: true,
         };
-        let report = pbfhogg::check::refs::check_refs(path, &opts, &host).expect("check_refs");
+        let report = pbfhogg::check::refs::check_refs(path, &opts, &host)
+            .expect("check_refs")
+            .complete()
+            .expect("check_refs completes");
         // The high node, way and relation lay above the pre-allocation.
         #[cfg(feature = "test-hooks")]
         assert_eq!(
@@ -411,7 +426,10 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
         type_filter: None,
     };
     let host = crate::common::test_host();
-    let report = pbfhogg::check::verify_ids::verify_ids(&input, &opts, &host).expect("verify_ids");
+    let report = pbfhogg::check::verify_ids::verify_ids(&input, &opts, &host)
+        .expect("verify_ids")
+        .complete()
+        .expect("verify_ids completes");
     // Every copy of the high node lay above the pre-allocation, so the
     // duplicates were found by the serial overflow insertion. Its blobs
     // settle in completion order, which may decide which copy counts as the
@@ -585,4 +603,155 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         counts_only.missing_relation_member_occurrences,
         report.missing_relation_member_occurrences
     );
+}
+
+// ---------------------------------------------------------------------------
+// A blob whose indexdata kind claim its contents contradict
+// ---------------------------------------------------------------------------
+
+/// Frame of the way blob in [`write_relabel_fixture`]'s file: the header,
+/// then one blob per kind.
+const WAY_BLOB: usize = 2;
+
+/// A sorted, indexed file one blob per kind: nodes 1 and 2; ways 10 and 10
+/// again (a duplicate) whose refs include the missing node 99; relation 30.
+/// Honest, it fails both `--refs` (n99) and `--ids` (w10 twice).
+fn write_relabel_fixture(path: &std::path::Path) {
+    let relations = [relation(30, MemberId::Node(1))];
+    write_test_pbf_sorted(
+        path,
+        &[node(1), node(2)],
+        &[way(10, &[1, 99]), way(10, &[2])],
+        &relations,
+    );
+}
+
+/// The fixture with the way blob's indexdata kind byte set to `kind`
+/// (0 node, 2 relation): a lie no producer writes, forged in the header.
+fn relabelled_way_blob(dir: &std::path::Path, kind: u8) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_relabel_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, WAY_BLOB, |index| {
+            assert_eq!(index[1], 1, "frame {WAY_BLOB} is the way blob");
+            index[1] = kind;
+        });
+    let path = dir.join(format!("way-blob-claims-{kind}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+fn assert_stopped<R>(
+    outcome: pbfhogg::check::CheckOutcome<R>,
+    claimed: pbfhogg::ElementKind,
+    what: &str,
+) {
+    let pbfhogg::check::CheckOutcome::Stopped(stopped) = outcome else {
+        panic!("{what}: the check must stop at the contradicted claim");
+    };
+    assert_eq!(
+        stopped.contradiction,
+        pbfhogg::KindContradiction {
+            claimed,
+            found: pbfhogg::ElementKind::Way,
+        },
+        "{what}"
+    );
+    assert_eq!(stopped.blob, Some(WAY_BLOB as u64), "{what}");
+    assert!(stopped.offset.is_some(), "{what}");
+}
+
+fn verify_ids_outcome(
+    path: &std::path::Path,
+    full: bool,
+    type_filter: Option<pbfhogg::TypeFilter>,
+) -> pbfhogg::check::CheckOutcome<pbfhogg::check::verify_ids::VerifyIdsReport> {
+    let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors: 0,
+            direct_io: false,
+        },
+        full,
+        type_filter,
+    };
+    pbfhogg::check::verify_ids::verify_ids(path, &opts, &crate::common::test_host())
+        .expect("verify_ids runs")
+}
+
+/// The honest fixture fails both checks on its contents, so the relabelled
+/// runs below fail for the claim, not for what the honest one already shows.
+#[test]
+fn the_relabel_fixture_fails_both_checks_honestly() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("honest.osm.pbf");
+    write_relabel_fixture(&path);
+    let refs = run_check_refs(&path, false, false, 0).expect("check_refs");
+    assert_eq!(refs.missing_node_refs, 1, "n99");
+    let ids = verify_ids_outcome(&path, true, None)
+        .complete()
+        .expect("verify_ids completes");
+    assert!(!ids.passed, "w10 twice");
+}
+
+/// A way blob labelled node or relation used to be skipped by the way phase
+/// of `check --refs`, which then passed a file with a dangling reference.
+/// Every phase that reads the blob now stops the check on it.
+#[test]
+fn check_refs_stops_on_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    let as_node = relabelled_way_blob(dir.path(), 0);
+    for check_relations in [false, true] {
+        assert_stopped(
+            check_refs_outcome(&as_node, check_relations, false, 0).expect("check_refs runs"),
+            pbfhogg::ElementKind::Node,
+            &format!("claims node, check_relations {check_relations}"),
+        );
+    }
+
+    let as_relation = relabelled_way_blob(dir.path(), 2);
+    assert_stopped(
+        check_refs_outcome(&as_relation, true, false, 0).expect("check_refs runs"),
+        pbfhogg::ElementKind::Relation,
+        "claims relation, check_relations",
+    );
+    // Without `check_relations` no phase decodes a blob claiming relations:
+    // the gap `check --index` covers, pinned so a change to it is deliberate.
+    let unseen = check_refs_outcome(&as_relation, false, false, 0)
+        .expect("check_refs runs")
+        .complete()
+        .expect("the relation-claimed blob is never decoded");
+    assert!(unseen.is_valid());
+    assert_eq!(unseen.way_count, 0);
+}
+
+/// `check --ids` used to examine no way of a way blob labelled node or
+/// relation, passing a duplicate way ID; both modes now stop on it.
+#[test]
+fn check_ids_stops_on_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    for (kind, claimed) in [
+        (0, pbfhogg::ElementKind::Node),
+        (2, pbfhogg::ElementKind::Relation),
+    ] {
+        let path = relabelled_way_blob(dir.path(), kind);
+        for full in [false, true] {
+            assert_stopped(
+                verify_ids_outcome(&path, full, None),
+                claimed,
+                &format!("claims {claimed}, full {full}"),
+            );
+        }
+    }
+    // Under `-t way` only way-claimed blobs are decoded: the lie is unseen.
+    let as_node = relabelled_way_blob(dir.path(), 0);
+    let ways_only = pbfhogg::TypeFilter {
+        nodes: false,
+        ways: true,
+        relations: false,
+    };
+    let unseen = verify_ids_outcome(&as_node, true, Some(ways_only))
+        .complete()
+        .expect("the node-claimed blob is never decoded under -t way");
+    assert_eq!(unseen.way_count, 0);
 }

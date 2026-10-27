@@ -285,6 +285,7 @@ const ROWS: &[Row] = &[
     row("cat", "cat --type relation", cat_type_relation),
     row("cat", "cat --clean", cat_clean),
     row("cat", "cat --dedupe", cat_dedupe),
+    row("cat", "cat --reindex", cat_reindex),
     row("sort", "sort", sort),
     row("repack", "repack", repack),
     row("degrade", "degrade", degrade),
@@ -412,6 +413,10 @@ fn cat_type_all_clean(c: &Ctx, input: &Path) -> Invocation {
 
 fn cat_dedupe(c: &Ctx, input: &Path) -> Invocation {
     cat(c, input).words(&["--dedupe"])
+}
+
+fn cat_reindex(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--reindex"])
 }
 
 fn sort(c: &Ctx, input: &Path) -> Invocation {
@@ -1261,6 +1266,9 @@ const POLICY: &[PolicyRow] = &[
     // The clean pass decodes every blob exactly once whatever its indexdata,
     // so it has no slower path to gate; selecting every kind is that pass.
     falls_back("cat --clean", cat_clean, Says::Nothing),
+    // Rescans every blob whatever it carries, so an unindexed one is no
+    // different.
+    falls_back("cat --reindex", cat_reindex, Says::Nothing),
     falls_back(
         "cat --type node,way,relation --clean",
         cat_type_all_clean,
@@ -1562,6 +1570,8 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("cat --type node", cat_type, Mixed::Accepts),
     ("cat --dedupe", cat_dedupe, Mixed::Accepts),
     ("cat --clean", cat_clean, Mixed::Accepts),
+    // --reindex rescans every blob, the unindexed ones included.
+    ("cat --reindex", cat_reindex, Mixed::Accepts),
     // The unindexed tail is decoded although a kind is unselected, and the
     // schedule walk says so.
     (
@@ -1730,6 +1740,7 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
         Mixed::Accepts,
     ),
     ("cat --clean", cat_clean, &[], Mixed::Accepts),
+    ("cat --reindex", cat_reindex, &[], Mixed::Accepts),
     ("inspect", inspect_full, &[], Mixed::Accepts),
     (
         "check --index",

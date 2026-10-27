@@ -317,14 +317,33 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// The input must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see [`PinnedInput`]); a caller's
 /// pin is used as it is. Where a later open cannot reach the pinned file, an
 /// input replaced mid-run fails with `InputReplaced`.
+///
+/// # Kind claims
+///
+/// Each kind's phase reads the blobs whose indexdata claims that kind, and
+/// type order is judged from those claims, so a decoded element of another
+/// kind in a scheduled blob stops the check
+/// ([`CheckOutcome::Stopped`](super::CheckOutcome)), discarding the type
+/// order and every other finding. Under a `type_filter` only the selected
+/// kinds' blobs are decoded, so a lie in another kind's blob goes unseen;
+/// `check --index` is the verifier of every claim.
 #[hotpath::measure]
 pub fn verify_ids<'a>(
     input: impl Into<InputSource<'a>>,
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
-) -> Result<VerifyIdsReport> {
+) -> Result<super::CheckOutcome<VerifyIdsReport>> {
     let input = input.into();
-    host.invocation.decided(|| {
+    host.invocation
+        .decided(|| super::CheckOutcome::stop_on_contradiction(verify_ids_inner(input, opts, host)))
+}
+
+fn verify_ids_inner(
+    input: InputSource<'_>,
+    opts: &VerifyIdsOptions,
+    host: &crate::host::Host,
+) -> Result<VerifyIdsReport> {
+    {
         // Both engines open the input twice, each through its own open file
         // description: the header and indexdata probe (O_DIRECT when asked),
         // then the schedule walk whose descriptor the classify pool preads.
@@ -339,7 +358,7 @@ pub fn verify_ids<'a>(
             return verify_ids_full_parallel(&pin, opts, host);
         }
         verify_ids_streaming_parallel(&pin, opts, host)
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +422,11 @@ fn verify_ids_streaming_parallel(
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(pin, host)?;
+        crate::scan::classify::build_classify_schedules_split(
+            pin,
+            crate::scan::classify::KindClaims::Refuse,
+            host,
+        )?;
 
     let mut node_count: u64 = 0;
     let mut way_count: u64 = 0;
@@ -668,7 +691,11 @@ fn verify_ids_full_parallel(
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        crate::scan::classify::build_classify_schedules_split(pin, host)?;
+        crate::scan::classify::build_classify_schedules_split(
+            pin,
+            crate::scan::classify::KindClaims::Refuse,
+            host,
+        )?;
 
     // Indexdata only sizes the bounded parallel allocation. Decoded IDs
     // outside it are inserted serially from each phase's merge, so
@@ -1029,7 +1056,16 @@ mod tests {
     fn blobs(frames: &[u64]) -> Vec<ScheduledBlob> {
         frames
             .iter()
-            .map(|&f| ScheduledBlob::at_frame(f, f + 10, 1).expect("valid test frame"))
+            .map(|&f| {
+                ScheduledBlob::at_frame(
+                    f,
+                    f + 10,
+                    1,
+                    None,
+                    crate::scan::classify::KindClaims::Unchecked,
+                )
+                .expect("valid test frame")
+            })
             .collect()
     }
 

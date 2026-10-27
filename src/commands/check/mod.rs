@@ -30,6 +30,114 @@ pub struct CheckOptions {
     pub direct_io: bool,
 }
 
+/// How a check over a file ended: it ran to completion, or it stopped at a
+/// blob whose decoded elements contradict the blob's indexdata kind claim.
+///
+/// `--refs`, `--ids` and `--locations` route blobs by their claimed kind, so
+/// a contradiction invalidates the partition every later finding would be
+/// computed from: a stopped check carries the contradiction and nothing
+/// else, no counts and no earlier findings, which may already be false (a
+/// node hidden in a blob claiming relations makes a way's reference to it
+/// look missing before the relation phase finds the lie). The file fails the
+/// check (exit 1): a false claim is a definite answer to "is this file
+/// right?", the one `check --index` gives for the same file.
+#[derive(Debug)]
+pub enum CheckOutcome<R> {
+    /// The check ran over the whole file; `R` is its report.
+    Complete(R),
+    /// The check stopped at a kind contradiction.
+    Stopped(StoppedCheck),
+}
+
+impl<R> CheckOutcome<R> {
+    /// The complete report, or `None` for a stopped check.
+    pub fn complete(self) -> Option<R> {
+        match self {
+            Self::Complete(report) => Some(report),
+            Self::Stopped(_) => None,
+        }
+    }
+
+    /// Whether the check passed: complete, and `passed` says so of its
+    /// report. A stopped check never passes.
+    pub fn passed(&self, passed: impl FnOnce(&R) -> bool) -> bool {
+        match self {
+            Self::Complete(report) => passed(report),
+            Self::Stopped(_) => false,
+        }
+    }
+
+    /// `result` as an outcome: an error carrying a decoded kind
+    /// contradiction becomes [`CheckOutcome::Stopped`], every other error
+    /// stays an error.
+    pub(crate) fn stop_on_contradiction(result: crate::Result<R>) -> crate::Result<Self> {
+        match result {
+            Ok(report) => Ok(Self::Complete(report)),
+            Err(error) => match StoppedCheck::from_error(&error) {
+                Some(stopped) => Ok(Self::Stopped(stopped)),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+/// Where a check stopped and why: the blob whose decoded elements contradict
+/// its indexdata kind claim.
+#[derive(Debug, Clone)]
+pub struct StoppedCheck {
+    /// The claim and one foreign kind the blob holds.
+    pub contradiction: crate::KindContradiction,
+    /// The input the blob is in, when known.
+    pub path: Option<std::path::PathBuf>,
+    /// 0-based ordinal of the blob in the file, when known.
+    pub blob: Option<u64>,
+    /// Byte offset of the blob's frame, when known.
+    pub offset: Option<u64>,
+}
+
+impl StoppedCheck {
+    fn from_error(error: &crate::Error) -> Option<Self> {
+        Some(Self {
+            contradiction: error.kind_contradiction()?,
+            path: error.source_path().map(std::path::Path::to_path_buf),
+            blob: error.blob_index(),
+            offset: error.byte_offset().map(|offset| offset.0),
+        })
+    }
+
+    /// The one-line reason, prefixed with the check's name (`"Reference
+    /// check"`, `"ID check"`, `"Location check"`).
+    pub fn describe(&self, check: &str) -> String {
+        let mut place = String::new();
+        if let Some(blob) = self.blob {
+            place.push_str(&format!(" {blob}"));
+        }
+        if let Some(offset) = self.offset {
+            place.push_str(&format!(" at byte offset {offset}"));
+        }
+        format!(
+            "{check} stopped: blob{place} claims {} elements but holds {} elements; \
+             its claimed-kind partition is invalid",
+            self.contradiction.claimed, self.contradiction.found
+        )
+    }
+
+    /// The JSON form a stopped check reports in place of its report.
+    pub fn to_json_value(&self, file_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "file": file_name,
+            "complete": false,
+            "passed": false,
+            "kind_contradiction": {
+                "claimed": self.contradiction.claimed.as_str(),
+                "found": self.contradiction.found.as_str(),
+                "blob": self.blob,
+                "offset": self.offset,
+            },
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ID-space allocation floors
 // ---------------------------------------------------------------------------

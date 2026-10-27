@@ -264,7 +264,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         }
         walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
-        let entry = ScheduledBlob::from_meta(&meta)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
         // no passthrough since smart/complete don't use the passthrough
@@ -532,6 +532,7 @@ pub(super) fn extract_smart(
             crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::ElementKind::Way),
+                crate::scan::classify::KindClaims::Unchecked,
                 host,
             )?
         } else {

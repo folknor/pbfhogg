@@ -8,21 +8,6 @@ cost is in `reference/performance.md` "Inline-location refresh".
 
 An entry is removed when resolved. When none remain, delete the file.
 
-## Scanner holds way descriptors until EOF under `--locations-on-ways`
-
-Once a way or relation descriptor enters `pending_post_barrier`
-(`scanner.rs`), the scanner releases the buffer only at EOF (since
-`8efb71bd` it polls the readiness channel per held descriptor, but only to
-record the signal or stop on a closed channel), so publishing the coordinate map does not
-promptly start way work. Sidecar markers on the `16e3694` runs: europe map
-published at 8.5 s, scanner at its EOF barrier wait at 12.5 s; planet 9.6 s
-and 20.2 s. Way work idles that long, and the buffer is unbounded. The
-scanner's own comment says a bounded design needs an explicit barrier
-change (wait at the first non-node descriptor after sending the boundary,
-preserving late-boundary publication and failure shutdown). Anger 10: the
-barrier is the most-tested part of the pipeline. Measure the idle time on
-current code first.
-
 ## Same-way fallback for unresolved refs
 
 On a base without its untagged nodes, an OSC-modified way that keeps a ref

@@ -362,6 +362,33 @@ the barrier comes about 14 s before the scanner's header walk would have
 reached end of input, so a refusal that waited for the walk would have
 come at about 26 s.
 
+### Way work starts at publication (`--locations-on-ways`, commit `0f417a44`)
+
+Since `0f417a44` the scanner blocks for the barrier signal at the first
+way or relation header and dispatches way work as it walks from there;
+before, it held every way and relation descriptor until its header walk
+reached end of input. Planet `altw-keep-untagged` + OSC 4913, bygg,
+interleaved `--bench 1` cells against the parent (`241be923`, built
+through `--commit`), run order parent, change, change, parent, no trim
+between them. The idle gap is read from the sidecar: process user time
+from the drain's `MERGE_DRAIN_BARRIER_END` marker until it climbs back to
+the way-phase rate (about 27 cores).
+
+| Commit | Wall (s) | Barrier end (s) | Idle after it | UUID |
+|---|---:|---:|---|---|
+| `241be923` (parent) | 298.5 | 171.1 | about 1.7 s at under one core, the scanner still walking way headers | `329708d8` |
+| `0f417a44` | 302.8 | 174.8 | one 0.2 s sample at about 5 cores | `bfe11306` |
+| `0f417a44` | 300.7 | 174.1 | one 0.2 s sample at about 3 cores | `67230fed` |
+| `241be923` (parent) | 301.3 | 173.8 | about 0.2 s: this walk reached end of input before the barrier | `b6a8efbc` |
+
+The parent's gap depends on whether its header walk outruns the node tail;
+here it was 1.7 s and 0.2 s (1.3 s and 2.9 s on the `8efb71bd` cells
+above). The change leaves only the merge itself and the worker ramp. The
+walls do not move: medians 299.9 s and 301.8 s, inside the noise, and the
+way phase (barrier end to loop end) is 126.4 to 127.9 s in every cell. The
+scanner waits about 0.5 s for the drain at the first way header
+(`MERGE_SCANNER_BARRIER_WAIT_START` to `_END`), the node tail.
+
 ### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 
 Apply-changes without `--locations-on-ways` is a structurally

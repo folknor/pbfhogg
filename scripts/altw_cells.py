@@ -42,8 +42,13 @@ def main():
             name = r.get("name")
             if name in COUNTERS:
                 counters[name] = r.get("value")
-        phases = {r["name"]: r for r in sidecar(uuid) if r.get("type") == "phase"}
-        write_kb = sum(r.get("disk_write_kb", 0) for r in phases.values())
+        # Every segment, repeated names (the WAIT_* pairs) included: keying
+        # them by name dropped all but the last of each.
+        write_kb = sum(
+            r.get("disk_write_kb", 0) or 0
+            for r in sidecar(uuid)
+            if r.get("type") == "phase"
+        )
         rows.append((uuid, durations, counters, write_kb))
     header = ["cell"] + PHASES + COUNTERS + ["disk_write_GB"]
     print("\t".join(header))

@@ -873,6 +873,13 @@ download_date = "2026-07-11"
 file = "denmark-unsorted-with-indexdata.osm.pbf"
 xxhash = "bc689783cd03289cfb173072dbe1df82"
 
+[bygg.datasets.denmark.snapshot.ways-only]
+download_date = "2026-10-27"
+
+[bygg.datasets.denmark.snapshot.ways-only.pbf.indexed]
+file = "denmark-ways-only-with-indexdata.osm.pbf"
+xxhash = "222152d6a1093e27f40e87bbafbb1bb6"
+
 [bygg.datasets.germany]
 origin = "Geofabrik"
 download_date = "2026-02-24"
@@ -1093,6 +1100,13 @@ xxhash = "a5da91d3c6c8fa46ede081e91b258210"
 [bygg.datasets.europe.osc.4722]
 file = "europe-20260422-seq4722.osc.gz"
 xxhash = "fb78761bbd734dccb7fe2a9e2f23ee6a"
+
+[bygg.datasets.europe.snapshot.ways-only]
+download_date = "2026-10-27"
+
+[bygg.datasets.europe.snapshot.ways-only.pbf.indexed]
+file = "europe-ways-only-with-indexdata.osm.pbf"
+xxhash = "9c043906e8b500be7e73b7b901ad9f7a"
 
 [bygg.datasets.planet]
 origin = "planet.openstreetmap.org"

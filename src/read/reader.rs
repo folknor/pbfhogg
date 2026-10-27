@@ -78,7 +78,7 @@ impl<R: Read + Send> ElementReader<R> {
     /// Stop once `cancel` is tripped: every iteration method then returns
     /// `ErrorKind::Cancelled` at its next blob instead of finishing the file.
     #[must_use]
-    pub fn cancel(mut self, cancel: crate::host::Cancel) -> Self {
+    pub fn cancel(mut self, cancel: crate::host::Invocation) -> Self {
         self.blob_iter = self.blob_iter.cancel(cancel);
         self
     }

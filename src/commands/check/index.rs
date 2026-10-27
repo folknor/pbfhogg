@@ -495,7 +495,8 @@ pub fn check_index<'a>(
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
     let input = input.into();
-    host.cancel.decided(|| check_index_inner(input, opts, host))
+    host.invocation
+        .decided(|| check_index_inner(input, opts, host))
 }
 
 fn check_index_inner(

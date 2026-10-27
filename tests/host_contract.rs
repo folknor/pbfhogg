@@ -402,7 +402,7 @@ fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let host = crate::common::test_host();
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     faults.refuse_output_backend.store(true, Relaxed);
     let output = dir.path().join("refused.pbf");
     let Err(err) = pbfhogg::altw::external::external_join(

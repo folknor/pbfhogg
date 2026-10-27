@@ -278,11 +278,11 @@ impl BlobMeta {
 /// Test hook: whether the framing closure for `seq` should panic (the
 /// fault plan's `framing_panic_at`, see `crate::test_hooks`).
 #[cfg(feature = "test-hooks")]
-fn framing_panics_at(cancel: &crate::host::Cancel, seq: usize) -> bool {
+fn framing_panics_at(cancel: &crate::host::Invocation, seq: usize) -> bool {
     cancel.faults().framing_panics_at(seq)
 }
 #[cfg(not(feature = "test-hooks"))]
-fn framing_panics_at(_cancel: &crate::host::Cancel, _seq: usize) -> bool {
+fn framing_panics_at(_cancel: &crate::host::Invocation, _seq: usize) -> bool {
     false
 }
 
@@ -330,7 +330,7 @@ pub struct PbfWriter<W: Write> {
     /// a long queued splice stops too. `flush`, `Drop` and the teardown they
     /// run (joining the writer thread, draining framing permits) never check
     /// it, so a cancelled writer still shuts down completely.
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 impl PbfWriter<FileWriter> {
@@ -362,7 +362,7 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Cancel::new(),
+                crate::host::Invocation::new(),
             ),
         )
     }
@@ -374,7 +374,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Result<Self> {
         // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
@@ -410,7 +410,7 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Cancel::new(),
+                crate::host::Invocation::new(),
             ),
         )
     }
@@ -423,7 +423,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Result<Self> {
         // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
@@ -473,7 +473,7 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Cancel::new(),
+                crate::host::Invocation::new(),
             ),
         )
     }
@@ -486,7 +486,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Result<Self> {
         use crate::write::uring_writer;
 
@@ -539,7 +539,7 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Cancel::new(),
+                crate::host::Invocation::new(),
             ),
         )
     }
@@ -551,7 +551,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Result<Self> {
         use crate::write::parallel_writer;
 
@@ -586,7 +586,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         finish: Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -607,7 +607,7 @@ impl<W: Write> PbfWriter<W> {
     fn from_pipeline(
         compression: Compression,
         pipeline: WritePipeline,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Self {
         PbfWriter {
             writer: None,
@@ -648,7 +648,7 @@ impl<W: Write> PbfWriter<W> {
             scratch: FrameScratch::new(),
             completion: None,
             output_name: None,
-            cancel: crate::host::Cancel::new(),
+            cancel: crate::host::Invocation::new(),
         }
     }
 
@@ -727,7 +727,7 @@ impl<W: Write> PbfWriter<W> {
 
     /// The token this writer observes, for a stage that feeds it and checks
     /// the same token at its own consumer.
-    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+    pub(crate) fn cancel_token(&self) -> &crate::host::Invocation {
         &self.cancel
     }
 
@@ -1415,7 +1415,7 @@ mod tests {
         PbfWriter::from_pipeline(
             Compression::None,
             WritePipeline::new(tx, handle, SeqTotal::new(), Executor::Ambient),
-            crate::host::Cancel::new(),
+            crate::host::Invocation::new(),
         )
     }
 

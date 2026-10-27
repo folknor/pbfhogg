@@ -265,9 +265,9 @@ pub fn tags_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = tags_filter_to(input, &output, opts, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -1434,7 +1434,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
-        staged.publish(&crate::host::Cancel::new()).unwrap();
+        staged.publish(&crate::host::Invocation::new()).unwrap();
         let mut ids = Vec::new();
         ElementReader::open_in(&output, false, &crate::host::Host::for_tests())
             .unwrap()

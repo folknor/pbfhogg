@@ -1,6 +1,6 @@
 //! The cancellation contract at the library level (ADR-0019).
 //!
-//! A command run under a `Host` whose `Cancel` token is tripped - before the
+//! A command run under a `Host` whose `Invocation` token is tripped - before the
 //! call, or at any checkpoint during it - returns `ErrorKind::Cancelled`,
 //! publishes nothing, and leaves no output staging entry and no run scratch
 //! behind. A publication whose decision was taken before the token tripped
@@ -48,9 +48,9 @@ impl Inputs {
     }
 }
 
-fn host_with(cancel: pbfhogg::host::Cancel) -> pbfhogg::host::Host {
+fn host_with(cancel: pbfhogg::host::Invocation) -> pbfhogg::host::Host {
     pbfhogg::host::Host {
-        cancel,
+        invocation: cancel,
         ..crate::common::test_host()
     }
 }
@@ -264,7 +264,7 @@ fn run_once(
     name: &str,
     command: Command,
     inputs: &Inputs,
-    cancel: pbfhogg::host::Cancel,
+    cancel: pbfhogg::host::Invocation,
 ) -> Result<bool, String> {
     let out = crate::common::test_scratch();
     let scratch = crate::common::test_scratch();
@@ -299,7 +299,7 @@ fn a_tripped_token_stops_every_command_before_it_starts() {
     let inputs = Inputs::new();
     let mut failures = Vec::new();
     for (name, command) in commands() {
-        let cancel = pbfhogg::host::Cancel::new();
+        let cancel = pbfhogg::host::Invocation::new();
         cancel.cancel();
         match run_once(name, command, &inputs, cancel) {
             Ok(true) => {}
@@ -319,7 +319,7 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
     let mut failures = Vec::new();
     for (name, command) in commands() {
         // How many checkpoints an uninterrupted run passes.
-        let counter = pbfhogg::host::Cancel::new();
+        let counter = pbfhogg::host::Invocation::new();
         counter.on_check(|_, _| {});
         if let Err(e) = run_once(name, command, &inputs, counter.clone()) {
             failures.push(e);
@@ -341,7 +341,7 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
                 .collect()
         };
         for k in ks {
-            let cancel = pbfhogg::host::Cancel::new();
+            let cancel = pbfhogg::host::Invocation::new();
             cancel.on_check(move |ordinal, token| {
                 if ordinal == k {
                     token.cancel();
@@ -381,8 +381,8 @@ fn a_decided_publication_completes() {
         .unwrap();
     writer.flush().unwrap();
     drop(writer);
-    let cancel = host.cancel.clone();
-    let tripped = host.cancel.clone();
+    let cancel = host.invocation.clone();
+    let tripped = host.invocation.clone();
     output
         .before_publish(move || tripped.cancel())
         .publish(&cancel)
@@ -398,7 +398,7 @@ fn publication_refuses_once_the_token_is_tripped() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
     let output = crate::common::out(&dest);
-    let cancel = pbfhogg::host::Cancel::new();
+    let cancel = pbfhogg::host::Invocation::new();
     let mut writer = output.writer(&cancel).unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();
@@ -414,13 +414,13 @@ fn publication_refuses_once_the_token_is_tripped() {
 fn a_cancelled_output_writer_cannot_be_published() {
     let dir = crate::common::test_scratch();
     let output = crate::common::out(dir.path().join("out.txt"));
-    let cancel = pbfhogg::host::Cancel::new();
+    let cancel = pbfhogg::host::Invocation::new();
     let writer = output.writer(&cancel).unwrap();
     cancel.cancel();
     let err = writer.finish().expect_err("finish observes the token");
     assert!(err.is_cancelled(), "{err}");
     let err = output
-        .publish(&pbfhogg::host::Cancel::new())
+        .publish(&pbfhogg::host::Invocation::new())
         .expect_err("a failed session is not published");
     assert!(
         matches!(
@@ -441,7 +441,7 @@ fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
     let dest = dir.path().join("out.osc");
     let mut output = crate::common::out(&dest);
     output.inject_fault(pbfhogg::output::PublishFault::DirSync);
-    let cancel = pbfhogg::host::Cancel::new();
+    let cancel = pbfhogg::host::Invocation::new();
     let mut writer = output.writer(&cancel).unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();
@@ -467,7 +467,7 @@ fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
 #[test]
 fn a_token_stops_only_the_runs_that_observe_it() {
     let inputs = Inputs::new();
-    let stopped = pbfhogg::host::Cancel::new();
+    let stopped = pbfhogg::host::Invocation::new();
     stopped.on_check(|ordinal, token| {
         if ordinal == 3 {
             token.cancel();
@@ -475,7 +475,7 @@ fn a_token_stops_only_the_runs_that_observe_it() {
     });
     let (cancelled, completed) = std::thread::scope(|scope| {
         let a = scope.spawn(|| run_once("sort a", sort, &inputs, stopped.clone()));
-        let b = scope.spawn(|| run_once("sort b", sort, &inputs, pbfhogg::host::Cancel::new()));
+        let b = scope.spawn(|| run_once("sort b", sort, &inputs, pbfhogg::host::Invocation::new()));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_eq!(cancelled, Ok(true));

@@ -39,7 +39,7 @@ pub(super) trait ShardedReport {
     fn finish_shard(shard: Self::Shard) -> Result<Self::Done>;
 
     /// Fold every shard of a phase, in shard order, into the final sink.
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Cancel) -> Result<()>;
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()>;
 
     /// Observe a phase's plan (sidecar counters).
     fn on_plan(&mut self, _kind: ElementKind, _shards: &[Shard]) {}
@@ -100,7 +100,7 @@ pub(super) fn run<R: ShardedReport>(
                 kind,
                 skip_equal_blobs,
                 report.inline(),
-                &host.cancel,
+                &host.invocation,
             )?
         } else {
             run_sharded_phase(walked, kind, &shards, skip_equal_blobs, report, host)?
@@ -143,7 +143,7 @@ fn run_sharded_phase<R: ShardedReport>(
                     // sweeps every shard file. Release builds compile this
                     // out entirely.
                     #[cfg(feature = "test-hooks")]
-                    if R::panic_hook(host.cancel.faults())
+                    if R::panic_hook(host.invocation.faults())
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == idx
                     {
@@ -158,7 +158,7 @@ fn run_sharded_phase<R: ShardedReport>(
                         kind,
                         skip_equal_blobs,
                         &mut sink,
-                        &host.cancel,
+                        &host.invocation,
                     )?;
                     Ok((R::finish_shard(sink)?, stats))
                 })
@@ -201,7 +201,7 @@ fn run_sharded_phase<R: ShardedReport>(
     if let Some(e) = first_err {
         return Err(e);
     }
-    report.absorb(done, &host.cancel)?;
+    report.absorb(done, &host.invocation)?;
     Ok(stats)
 }
 
@@ -213,7 +213,7 @@ fn run_shard<S: MergeSink>(
     kind: ElementKind,
     skip_equal_blobs: bool,
     sink: &mut S,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<BlockPairMergeStats> {
     let mut old_side = BlockPairSide::new(
         &old.file,

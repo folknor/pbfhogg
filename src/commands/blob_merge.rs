@@ -410,7 +410,7 @@ impl Walk<'_> {
                 sorted,
                 tagdata: tags.as_ref().and_then(serialize_tags),
             }),
-            None => kind_indexes(&self.decompress_buf, &self.host.cancel).map(Scanned::Kinds),
+            None => kind_indexes(&self.decompress_buf, &self.host.invocation).map(Scanned::Kinds),
         }
     }
 }
@@ -449,7 +449,7 @@ fn serialize_tags(tags: &TagIndex) -> Option<Box<[u8]>> {
 /// The bbox is left out, since these entries are rewritten, never copied.
 /// One cancellation check before the decode: the walk checks between blobs,
 /// and one block is bounded by the blob size limit.
-fn kind_indexes(block: &[u8], cancel: &crate::host::Cancel) -> Result<Vec<BlobIndex>> {
+fn kind_indexes(block: &[u8], cancel: &crate::host::Invocation) -> Result<Vec<BlobIndex>> {
     cancel.check()?;
     let block = crate::PrimitiveBlock::from_vec(block.to_vec())?;
     let mut ranges: [Option<(i64, i64, u64)>; 3] = [None; 3];
@@ -834,7 +834,7 @@ pub(crate) fn write_plan(
             crate::ordered_pool::StreamConfig {
                 window,
                 depth: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
-                cancel: &host.cancel,
+                cancel: &host.invocation,
             },
             |_| Vec::new(),
             |frame_buf: &mut Vec<u8>, k, emitter| {
@@ -844,7 +844,7 @@ pub(crate) fn write_plan(
                     frames: &plan.frames,
                     sources,
                     dedupe,
-                    cancel: &host.cancel,
+                    cancel: &host.invocation,
                     emitter,
                 }
                 .run_kind(run.kind, frame_buf)
@@ -1130,7 +1130,7 @@ struct Sweep<'a, 'e> {
     frames: &'a [Frame],
     sources: &'a [InputFile],
     dedupe: bool,
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
     emitter: &'a crate::ordered_pool::Emitter<'e, OwnedBlock, RunCounts>,
 }
 

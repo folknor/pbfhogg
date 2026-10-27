@@ -36,7 +36,7 @@ output any other way.
   one file, before any of them is staged.
 - **Library entry points take the output by value and are its only
   publisher.** `sort(input, output: Output, ...)` writes through a borrowing
-  engine (`sort_to(input, &output, ...)`) and calls `output.publish(&host.cancel)` as its
+  engine (`sort_to(input, &output, ...)`) and calls `output.publish(&host.invocation)` as its
   last step, after every post-write gate (the altw missing-locations check
   runs before publication). Engines that dispatch to other engines
   (`extract_multi` to `extract_to`, altw to the external join, derive to its
@@ -173,9 +173,9 @@ follows a link), and so is another process creating entries inside a
 directory destination while it is published: the walk before every
 recursive removal narrows that window and does not close it. Nothing makes a
 group visible to readers atomically. A cancelled run (ADR-0019) is a failed
-run here: `publish(&Cancel)` takes the token as an argument and refuses a
+run here: `publish(&Invocation)` takes the token as an argument and refuses a
 tripped one before anything is checked, synced or installed, and once that
-decision is made publication completes; `Output::writer(&Cancel)` (on each
+decision is made publication completes; `Output::writer(&Invocation)` (on each
 buffer flush and in `finish`) and the PBF writer (on each write method, not
 in its end-of-stream `flush`) observe the token, so a run cancelled mid-write
 fails its session. A process killed outright (SIGKILL, the OOM killer, power

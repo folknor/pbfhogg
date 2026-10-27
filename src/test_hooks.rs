@@ -8,7 +8,7 @@
 //!
 //! [`FaultPlan`] holds every token-scoped hook: arming fields and the
 //! observation counters a test reads back. One plan lives inside each
-//! [`Cancel`](crate::host::Cancel) token ([`Cancel::faults`](crate::host::Cancel::faults)),
+//! [`Invocation`](crate::host::Invocation) token ([`Invocation::faults`](crate::host::Invocation::faults)),
 //! because the token is already what an invocation hands to every worker
 //! loop it starts (the read pipeline, the output writers, the diff and derive
 //! shards, altw's stages, the geocode passes). Arming a fault is configuring
@@ -34,7 +34,7 @@
 //!
 //! - [`PublishFault`], re-exported here: faults in output publication, set on
 //!   the output (`Output::inject_fault` and its set and directory siblings).
-//! - `Cancel::on_check` / `Cancel::checks_passed`: the cancellation
+//! - `Invocation::on_check` / `Invocation::checks_passed`: the cancellation
 //!   checkpoint callback (cancellation semantics, not a fault).
 //! - The geocode index reader's lookup counter, on the reader.
 //!

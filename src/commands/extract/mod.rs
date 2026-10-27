@@ -644,7 +644,7 @@ pub fn extract_multi<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     if regions.len() != outputs.len() {
         return Err(Error::invalid_argument(format!(
             "got {} outputs for {} extract regions",
@@ -658,7 +658,7 @@ pub fn extract_multi<'a>(
     let stats = extract_multi_to(
         &pin, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    outputs.publish(&host.cancel)?;
+    outputs.publish(&host.invocation)?;
     Ok(stats)
 }
 
@@ -840,7 +840,7 @@ pub fn extract<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     // Every pass opens the input again, each through its own open file
     // description (the probes, the schedule walks, the header read, the
     // classify descriptors and the write passes), and each is derived from
@@ -853,7 +853,7 @@ pub fn extract<'a>(
     let result = extract_to(
         &pin, &output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

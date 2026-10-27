@@ -322,7 +322,7 @@ pub(super) fn try_extract_multi_single_pass(
         // A test can decline the grid to drive the same config down the
         // linear scan and compare output byte for byte.
         #[cfg(feature = "test-hooks")]
-        let grid = if host.cancel.faults().forces_linear_region_grid() {
+        let grid = if host.invocation.faults().forces_linear_region_grid() {
             None
         } else {
             RegionGrid::build(&region_bboxes)
@@ -833,7 +833,7 @@ where
         frame_buf: Vec::new(),
         writers,
         stats,
-        cancel: &host.cancel,
+        cancel: &host.invocation,
     };
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
@@ -841,7 +841,7 @@ where
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| MultiLocal::new(n),
@@ -970,7 +970,7 @@ struct MultiNodeConsumer<'a> {
     frame_buf: Vec<u8>,
     writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &'a mut [ExtractStats],
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
 }
 
 impl MultiNodeConsumer<'_> {

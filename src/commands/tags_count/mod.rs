@@ -86,7 +86,8 @@ pub fn tags_count<'a>(
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
     let input = input.into();
-    host.cancel.decided(|| tags_count_inner(input, opts, host))
+    host.invocation
+        .decided(|| tags_count_inner(input, opts, host))
 }
 
 fn tags_count_inner(

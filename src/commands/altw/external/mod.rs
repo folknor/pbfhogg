@@ -619,7 +619,7 @@ pub fn external_join(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     // Every stage's open of the input derives from this pin; see
     // `add_locations_to_ways_to`, which pins the same way.
     let pin = PinnedInput::pin(input, host)?;
@@ -636,7 +636,7 @@ pub fn external_join(
         &scratch,
     )?;
     drop(scratch);
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -799,7 +799,7 @@ pub(crate) fn external_join_in(
                         blob_meta_ref_parallel,
                         !keep_untagged_nodes,
                         inject_prepass,
-                        &host.cancel,
+                        &host.invocation,
                     )?;
                     crate::debug::emit_counter(
                         "extjoin_relation_member_collect_ms",
@@ -924,7 +924,7 @@ pub(crate) fn external_join_in(
 
     // Stage boundary: the sidecar loads and the scratch precheck above have
     // no checkpoint of their own.
-    host.cancel.check()?;
+    host.invocation.check()?;
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let s2_faults_before = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
@@ -1042,7 +1042,7 @@ pub(crate) fn external_join_in(
     // as it encodes them; stage 4 workers block on `router.wait_ready`
     // ahead of any input pread so they never hold decompressed state
     // while waiting.
-    host.cancel.check()?;
+    host.invocation.check()?;
     crate::debug::emit_marker("EXTJOIN_STREAMING_START");
     crate::debug::emit_marker("EXTJOIN_STAGE3_START");
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
@@ -1080,7 +1080,7 @@ pub(crate) fn external_join_in(
                 total_slots,
                 &integrated,
                 num_workers,
-                &host.cancel,
+                &host.invocation,
             );
             // Signal the router that no more publishes are coming. Must
             // run whether stage 3 succeeded or errored - otherwise stage

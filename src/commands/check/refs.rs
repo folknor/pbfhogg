@@ -260,7 +260,8 @@ pub fn check_refs<'a>(
     host: &crate::host::Host,
 ) -> Result<RefCheckResult> {
     let input = input.into();
-    host.cancel.decided(|| check_refs_inner(input, opts, host))
+    host.invocation
+        .decided(|| check_refs_inner(input, opts, host))
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]

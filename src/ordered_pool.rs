@@ -601,7 +601,7 @@ impl<T> WorkerShared<'_, T> {
 #[derive(Clone, Copy)]
 pub(crate) struct PoolConfig<'a> {
     pub(crate) window: NonZeroUsize,
-    pub(crate) cancel: &'a crate::host::Cancel,
+    pub(crate) cancel: &'a crate::host::Invocation,
     pub(crate) waits: Waits<'a>,
 }
 
@@ -837,7 +837,7 @@ pub(crate) struct StreamConfig<'a> {
     /// Messages one task's channel holds (its terminal included) before its
     /// worker blocks.
     pub(crate) depth: usize,
-    pub(crate) cancel: &'a crate::host::Cancel,
+    pub(crate) cancel: &'a crate::host::Invocation,
 }
 
 /// A streamed task's way out: its items go to the consumer through it.
@@ -1142,7 +1142,7 @@ mod tests {
     fn run_with(
         n: usize,
         workers: usize,
-        cancel: &crate::host::Cancel,
+        cancel: &crate::host::Invocation,
         work: impl Fn(usize) -> crate::Result<usize> + Sync,
         consumer: &mut impl OrderedConsumer<usize>,
     ) -> crate::Result<()> {
@@ -1171,7 +1171,7 @@ mod tests {
         run_with(
             n,
             workers,
-            &crate::host::Cancel::new(),
+            &crate::host::Invocation::new(),
             work,
             &mut ConsumeFn(|_, v| consume(v)),
         )
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn zero_tasks_still_checks_cancellation() {
-        let cancel = crate::host::Cancel::new();
+        let cancel = crate::host::Invocation::new();
         cancel.cancel();
         let err = run_with(0, 4, &cancel, Ok, &mut ConsumeFn(|_, _| Ok(()))).unwrap_err();
         assert!(matches!(err.kind(), crate::ErrorKind::Cancelled));
@@ -1309,7 +1309,7 @@ mod tests {
             run_with(
                 100,
                 4,
-                &crate::host::Cancel::new(),
+                &crate::host::Invocation::new(),
                 |i| {
                     if i == 10 {
                         Err(Error::internal("decode 10 failed"))
@@ -1373,7 +1373,7 @@ mod tests {
         }
         let edges = within_deadline(|| {
             let mut consumer = Consumer(Vec::new());
-            run_with(40, 1, &crate::host::Cancel::new(), Ok, &mut consumer).unwrap();
+            run_with(40, 1, &crate::host::Invocation::new(), Ok, &mut consumer).unwrap();
             consumer.0
         });
         let window = default_window(1).get();
@@ -1411,7 +1411,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: default_window(3),
-                cancel: &crate::host::Cancel::new(),
+                cancel: &crate::host::Invocation::new(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1460,7 +1460,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: NonZeroUsize::new(window).unwrap(),
-                cancel: &crate::host::Cancel::new(),
+                cancel: &crate::host::Invocation::new(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1738,7 +1738,7 @@ mod tests {
             StreamConfig {
                 window: NonZeroUsize::new(window).unwrap(),
                 depth,
-                cancel: &crate::host::Cancel::new(),
+                cancel: &crate::host::Invocation::new(),
             },
             |_| (),
             |(), task, emitter| work(task, emitter),

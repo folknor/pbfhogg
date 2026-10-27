@@ -510,7 +510,7 @@ mod tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::create_dir(&out_dir).unwrap();
         let output = out_dir.join("result.pbf");
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
+        let host = host::cli_host(pbfhogg::host::Invocation::new());
 
         let explicit = TmpDirArg {
             tmp_dir: Some(tmp.clone()),
@@ -540,7 +540,7 @@ mod tests {
     /// place scratch in the current directory.
     #[test]
     fn a_bare_output_name_or_none_places_scratch_in_the_current_directory() {
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
+        let host = host::cli_host(pbfhogg::host::Invocation::new());
         let default = TmpDirArg { tmp_dir: None };
         for output in [Some(std::path::Path::new("out.pbf")), None] {
             let scratch = ScratchSite::new(&default, output).create(&host).unwrap();
@@ -553,7 +553,7 @@ mod tests {
     fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
         let dir = crate::test_scratch::scratch();
         let missing = dir.path().join("missing");
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
+        let host = host::cli_host(pbfhogg::host::Invocation::new());
         let tmp = TmpDirArg {
             tmp_dir: Some(missing.clone()),
         };

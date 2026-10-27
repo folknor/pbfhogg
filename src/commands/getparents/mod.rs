@@ -70,9 +70,9 @@ pub fn getparents<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = getparents_to(input, &output, ids, opts, write, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -121,10 +121,10 @@ pub fn getparents_with_min_blobs<'a>(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result =
         getparents_with_min_blobs_to(input, &output, ids, opts, write, overrides, min_blobs, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -581,7 +581,7 @@ mod tests {
         )
         .expect("getparents");
         staged
-            .publish(&crate::host::Cancel::new())
+            .publish(&crate::host::Invocation::new())
             .expect("publish");
         assert_eq!(ids(&output), vec![1, 10]);
     }
@@ -614,7 +614,7 @@ mod tests {
             )
             .expect("getparents");
             staged
-                .publish(&crate::host::Cancel::new())
+                .publish(&crate::host::Invocation::new())
                 .expect("publish");
         }
         let walker_ids = ids(&walker);
@@ -793,7 +793,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )?;
         staged
-            .publish(&crate::host::Cancel::new())
+            .publish(&crate::host::Invocation::new())
             .expect("publish");
         Ok(ArmRun {
             bytes: std::fs::read(&output).expect("read output bytes"),
@@ -938,7 +938,7 @@ mod tests {
             )
             .expect("getparents");
             staged
-                .publish(&crate::host::Cancel::new())
+                .publish(&crate::host::Invocation::new())
                 .expect("publish");
             assert_eq!(arm, expected_arm);
             assert_eq!(ids(&output), vec![1, 10]);

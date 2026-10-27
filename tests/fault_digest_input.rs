@@ -72,9 +72,11 @@ fn digest_opens_its_input_once() {
     for &direct in directs {
         let host = crate::common::test_host();
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        host.cancel
-            .faults()
-            .arm_input_replacement(&input, &dir.path().join("unused.osm.pbf"), 2);
+        host.invocation.faults().arm_input_replacement(
+            &input,
+            &dir.path().join("unused.osm.pbf"),
+            2,
+        );
         let digest = match run(&pin, direct, &host) {
             Ok(digest) => digest,
             // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
@@ -87,7 +89,7 @@ fn digest_opens_its_input_once() {
         };
         assert_eq!(digest, expected, "direct {direct}");
         let report = host
-            .cancel
+            .invocation
             .faults()
             .input_replacement()
             .expect("armed replacement");
@@ -111,19 +113,19 @@ fn a_replacement_after_the_open_does_not_reach_the_run() {
         let expected = expected(&input);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
-        host.cancel
+        host.invocation
             .faults()
             .arm_input_replacement(&input, &replacement, 1);
         let result = run(&pin, false, &host);
         let cell = format!("procfs {procfs}");
         let report = host
-            .cancel
+            .invocation
             .faults()
             .input_replacement()
             .expect("armed replacement");
@@ -155,7 +157,7 @@ fn a_caller_pin_is_used_as_it_is() {
         let expected = expected(&input);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);

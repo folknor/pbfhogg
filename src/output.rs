@@ -319,7 +319,7 @@ impl Drop for PublishSpan {
 pub struct OutputWriter {
     inner: Option<io::BufWriter<CancellableFile>>,
     completion: Completion,
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 /// The staging file under an [`OutputWriter`]'s buffer: every write the
@@ -331,7 +331,7 @@ pub struct OutputWriter {
 #[derive(Debug)]
 struct CancellableFile {
     file: fs::File,
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 impl Write for CancellableFile {
@@ -1658,7 +1658,7 @@ impl Output {
     /// that is not compiled in; the staging file cannot be opened or the
     /// header written. The session is failed in each case.
     ///
-    /// The writer observes `host.cancel`: once it is tripped every write
+    /// The writer observes `host.invocation`: once it is tripped every write
     /// method returns `ErrorKind::Cancelled` (failing the session), and the
     /// writer thread stops a queued `copy_file_range` splice between kernel
     /// calls.
@@ -1678,7 +1678,7 @@ impl Output {
         // refusal is the constructor's result, so the failure handling below
         // runs exactly as for a real one.
         #[cfg(feature = "test-hooks")]
-        let refused = host.cancel.faults().output_backend_refusal();
+        let refused = host.invocation.faults().output_backend_refusal();
         #[cfg(not(feature = "test-hooks"))]
         let refused: Option<Error> = None;
         let writer = if let Some(refusal) = refused {
@@ -1695,7 +1695,7 @@ impl Output {
                             host.executor.clone(),
                             host.diagnostics.clone(),
                             finish,
-                            host.cancel.clone(),
+                            host.invocation.clone(),
                         )
                     }
                     #[cfg(not(feature = "linux-io-uring"))]
@@ -1716,7 +1716,7 @@ impl Output {
                             host.executor.clone(),
                             host.diagnostics.clone(),
                             finish,
-                            host.cancel.clone(),
+                            host.invocation.clone(),
                         )
                     }
                     #[cfg(not(feature = "linux-direct-io"))]
@@ -1734,7 +1734,7 @@ impl Output {
                     host.executor.clone(),
                     host.diagnostics.clone(),
                     finish,
-                    host.cancel.clone(),
+                    host.invocation.clone(),
                 ),
                 OutputBackend::Buffered => PbfWriter::to_path_in(
                     path,
@@ -1743,7 +1743,7 @@ impl Output {
                     host.executor.clone(),
                     host.diagnostics.clone(),
                     finish,
-                    host.cancel.clone(),
+                    host.invocation.clone(),
                 ),
             }
         };
@@ -1775,7 +1775,7 @@ impl Output {
     /// # Errors
     /// The output already has a writing session, or the staging file cannot
     /// be opened (the error names the destination).
-    pub fn writer(&self, cancel: &crate::host::Cancel) -> Result<OutputWriter> {
+    pub fn writer(&self, cancel: &crate::host::Invocation) -> Result<OutputWriter> {
         let completion = self.begin_write()?;
         match fs::OpenOptions::new()
             .write(true)
@@ -1842,7 +1842,7 @@ impl Output {
     /// [`Overwrite::Refuse`] a destination that appeared meanwhile is
     /// refused exclusively. [`OutputError::Unsynced`] means the output *was*
     /// published and only the directory sync failed.
-    pub fn publish(mut self, cancel: &crate::host::Cancel) -> Result<()> {
+    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
         let faults = self.faults();
         crate::write::metrics::with_sync_observer(cancel, || {
@@ -1936,7 +1936,7 @@ impl OutputDir {
     /// As [`Output::publish`]; [`OutputError::RollbackIncomplete`] if the
     /// swap failed and the previous directory could not be put back (the
     /// error names where it is kept).
-    pub fn publish(mut self, cancel: &crate::host::Cancel) -> Result<()> {
+    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
         #[cfg(feature = "test-hooks")]
         let faults = self.faults.clone();
@@ -2053,7 +2053,7 @@ impl OutputSet {
     /// # Errors
     /// As [`Output::publish`], plus [`OutputError::RollbackIncomplete`]
     /// naming every member whose previous state could not be restored.
-    pub fn publish(mut self, cancel: &crate::host::Cancel) -> Result<()> {
+    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
         #[cfg(feature = "test-hooks")]
         let faults = self.faults.clone();
@@ -2113,7 +2113,7 @@ mod tests {
 
     /// Write `bytes` through the output's writing session and finish it.
     fn stage(out: &Output, bytes: &[u8]) -> Result<()> {
-        let mut writer = out.writer(&crate::host::Cancel::new())?;
+        let mut writer = out.writer(&crate::host::Invocation::new())?;
         writer.write_all(bytes)?;
         writer.finish()
     }
@@ -2132,7 +2132,7 @@ mod tests {
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         assert!(!dest.exists(), "nothing at the destination before publish");
         stage(&out, b"new").unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -2157,7 +2157,7 @@ mod tests {
         fs::write(&dest, b"old").unwrap();
         let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
         stage(&out, b"new").unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -2194,7 +2194,7 @@ mod tests {
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         stage(&out, b"ours").unwrap();
         fs::write(&dest, b"theirs").unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Exists { .. }));
         assert_eq!(fs::read(&dest).unwrap(), b"theirs");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
@@ -2322,7 +2322,7 @@ mod tests {
         fs::write(dest.join("old.bin"), b"old").unwrap();
         let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
         stage_dir(&out, "new.bin", b"new");
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert!(!dest.join("old.bin").exists());
         assert_eq!(fs::read(dest.join("new.bin")).unwrap(), b"new");
         assert!(others(dir.path(), &["index"]).is_empty());
@@ -2352,7 +2352,7 @@ mod tests {
             OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()).unwrap();
         stage_dir(&out, "new.bin", b"new");
         fs::write(dest.join("marker"), b"").unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(
             err.to_string().contains("marked"),
             "the validator is rerun before the swap: {err}"
@@ -2406,20 +2406,20 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out.osc");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Cancel::new()).unwrap();
+        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         // Bytes are still in the buffer: the output is not publishable.
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         drop(writer);
         assert!(others(dir.path(), &[]).is_empty(), "staging is removed");
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Cancel::new()).unwrap();
+        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         writer.finish().unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"<osmChange/>");
     }
 
@@ -2427,9 +2427,9 @@ mod tests {
     fn an_output_has_one_writing_session() {
         let dir = scratch();
         let out = Output::new(dir.path().join("o"), Overwrite::Refuse, &discard()).unwrap();
-        let first = out.writer(&crate::host::Cancel::new()).unwrap();
+        let first = out.writer(&crate::host::Invocation::new()).unwrap();
         assert!(
-            out.writer(&crate::host::Cancel::new()).is_err(),
+            out.writer(&crate::host::Invocation::new()).is_err(),
             "a second writer would truncate the first"
         );
         assert!(out.begin_write().is_err());
@@ -2445,14 +2445,14 @@ mod tests {
         let dest = dir.path().join("empty");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         fs::write(out.path(), b"behind the session's back").unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         assert!(others(dir.path(), &[]).is_empty());
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         stage(&out, b"").unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"");
 
         let index = dir.path().join("index");
@@ -2460,11 +2460,11 @@ mod tests {
         let writer = out.writer().unwrap();
         fs::write(writer.path().join("f"), b"x").unwrap();
         drop(writer);
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!index.exists());
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(others(dir.path(), &["empty"]).is_empty());
     }
@@ -2494,7 +2494,7 @@ mod tests {
         // write after the end of stream is the error every backend reports.
         writer.flush().unwrap();
         assert!(writer.write_raw(b"late").is_err());
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
 
         // The synchronous path: a framing error before anything was written.
@@ -2511,7 +2511,7 @@ mod tests {
                 .with_completion(completion);
         assert!(writer.write_primitive_block(b"\xff\xff\xff").is_err());
         writer.flush().unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 
@@ -2588,7 +2588,7 @@ mod tests {
         stage_dir(&out, "header", b"new");
         let run = index.join(".pbfhogg-run-1-cd");
         fs::create_dir(&run).unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::HoldsLeftovers { .. }
@@ -2661,7 +2661,7 @@ mod tests {
         // the bare lease stands in for it).
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         let lease = out.begin_write().unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         drop(lease);
         assert!(!dest.exists());
@@ -2676,7 +2676,7 @@ mod tests {
         )
         .unwrap();
         writer.flush().unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert!(dest.exists());
         // Finishing is terminal: a flush that already failed is never
         // certified by a second one.
@@ -2696,7 +2696,7 @@ mod tests {
         .unwrap();
         out.target.session.fail();
         writer.flush().unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 
@@ -2709,7 +2709,7 @@ mod tests {
         let staging = out.path().to_path_buf();
         fs::remove_file(&staging).unwrap();
         fs::write(&staging, b"someone else").unwrap();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -2730,7 +2730,7 @@ mod tests {
         fs::remove_dir(writer.path()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, writer.path()).unwrap();
         writer.finish();
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -2761,7 +2761,7 @@ mod tests {
         let out = out.before_publish(move || {
             assert!(writer.lock().unwrap().write_raw(b"late").is_err());
         });
-        let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
     }
@@ -2774,7 +2774,7 @@ mod tests {
         let dest = dir.path().join("out");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Cancel::new()).unwrap();
+        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
         let (probe_dest, probe_staging, log) =
@@ -2785,7 +2785,7 @@ mod tests {
                 fs::read(&probe_staging).unwrap_or_default(),
             ));
         });
-        out.publish(&crate::host::Cancel::new()).unwrap();
+        out.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(*seen.lock().unwrap(), vec![(false, b"data".to_vec())]);
         assert_eq!(fs::read(&dest).unwrap(), b"data");
     }
@@ -2796,11 +2796,11 @@ mod tests {
     fn a_refused_publication_runs_no_hooks() {
         let dir = scratch();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let _writer = out.writer(&crate::host::Cancel::new()).unwrap();
+        let _writer = out.writer(&crate::host::Invocation::new()).unwrap();
         let ran = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&ran);
         let out = out.before_publish(move || *flag.lock().unwrap() = true);
-        assert!(out.publish(&crate::host::Cancel::new()).is_err());
+        assert!(out.publish(&crate::host::Invocation::new()).is_err());
         assert!(!*ran.lock().unwrap());
     }
 
@@ -2812,7 +2812,7 @@ mod tests {
     fn publication_syncs_through_the_writer_metrics_funnel() {
         use std::sync::atomic::Ordering::Relaxed;
         let dir = scratch();
-        let token = crate::host::Cancel::new();
+        let token = crate::host::Invocation::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
         let mut writer = out.writer(&token).unwrap();
         writer.write_all(b"data").unwrap();
@@ -2875,7 +2875,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::BackupRemoval);
-            out.publish(&crate::host::Cancel::new()).unwrap();
+            out.publish(&crate::host::Invocation::new()).unwrap();
             assert_eq!(fs::read(dest.join("new-file")).unwrap(), b"new");
             let events = sink.0.lock().unwrap();
             assert_eq!(events.len(), 1, "{events:?}");
@@ -2905,7 +2905,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
             let OutputError::Unsynced {
                 kept, kept_synced, ..
             } = output_error(&err)
@@ -2938,7 +2938,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::BackupSync);
-            assert!(out.publish(&crate::host::Cancel::new()).is_err());
+            assert!(out.publish(&crate::host::Invocation::new()).is_err());
             assert_eq!(fs::read(dest.join("old-file")).unwrap(), b"old");
             assert!(!dest.join("new-file").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -2964,7 +2964,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::BeforeInstall);
-            assert!(out.publish(&crate::host::Cancel::new()).is_err());
+            assert!(out.publish(&crate::host::Invocation::new()).is_err());
             assert_eq!(fs::read(&dest).unwrap(), b"user data");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -2976,7 +2976,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
-            out.publish(&crate::host::Cancel::new()).unwrap();
+            out.publish(&crate::host::Invocation::new()).unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
 
@@ -2986,7 +2986,7 @@ mod tests {
             stage(&out, b"ours").unwrap();
             fs::write(&other, b"theirs").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
-            let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Exists { .. }));
             assert_eq!(fs::read(&other).unwrap(), b"theirs");
         }
@@ -3001,7 +3001,7 @@ mod tests {
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
             out.inject_fault(PublishFault::AfterLink);
-            assert!(out.publish(&crate::host::Cancel::new()).is_err());
+            assert!(out.publish(&crate::host::Invocation::new()).is_err());
             assert!(!dest.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -3013,7 +3013,7 @@ mod tests {
             fs::write(dir.path().join("b.osm.pbf"), b"old b").unwrap();
             let (mut set, a, b) = staged_set(dir.path(), Overwrite::Replace);
             set.inject_fault(PublishFault::AfterInstalled(1));
-            assert!(set.publish(&crate::host::Cancel::new()).is_err());
+            assert!(set.publish(&crate::host::Invocation::new()).is_err());
             assert_eq!(fs::read(&a).unwrap(), b"old a");
             assert_eq!(fs::read(&b).unwrap(), b"old b");
             assert!(others(dir.path(), &["a.osm.pbf", "b.osm.pbf"]).is_empty());
@@ -3022,7 +3022,7 @@ mod tests {
             let dir = scratch();
             let (mut set, a, b) = staged_set(dir.path(), Overwrite::Refuse);
             set.inject_fault(PublishFault::AfterInstalled(0));
-            assert!(set.publish(&crate::host::Cancel::new()).is_err());
+            assert!(set.publish(&crate::host::Invocation::new()).is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -3038,7 +3038,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             stage_dir(&out, "new.bin", b"new");
             out.inject_fault(PublishFault::AfterBackup);
-            assert!(out.publish(&crate::host::Cancel::new()).is_err());
+            assert!(out.publish(&crate::host::Invocation::new()).is_err());
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
             assert!(!dest.join("new.bin").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -3056,7 +3056,7 @@ mod tests {
             let (mut set, _, _) = staged_set(dir.path(), Overwrite::Replace);
             set.inject_fault(PublishFault::AfterInstalled(1));
             set.inject_fault(PublishFault::Restore);
-            let err = set.publish(&crate::host::Cancel::new()).unwrap_err();
+            let err = set.publish(&crate::host::Invocation::new()).unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -3088,7 +3088,7 @@ mod tests {
             stage_dir(&out, "new.bin", b"new");
             out.inject_fault(PublishFault::AfterBackup);
             out.inject_fault(PublishFault::Restore);
-            let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::RollbackIncomplete { .. }
@@ -3108,7 +3108,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(&crate::host::Cancel::new()).unwrap_err();
+            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Unsynced { .. }));
             assert!(err.to_string().contains("was published"), "{err}");
             assert_eq!(fs::read(&dest).unwrap(), b"new");

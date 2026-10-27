@@ -6,13 +6,13 @@ Status: Accepted
 ## Decision
 
 A run stops early only because its caller asked, through the
-`pbfhogg::host::Cancel` token in `Host::cancel`, and it stops the way a
+`pbfhogg::host::Invocation` token in `Host::invocation`, and it stops the way a
 failure does: workers wind down, every guard drops (output staging and the
 run's scratch directory are removed), nothing is published, and the call
 returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
 
 - **The library never trips a token and never touches signals** (ADR-0016).
-  `Cancel::cancel` is lock-free and callable from any thread; tripping is
+  `Invocation::cancel` is lock-free and callable from any thread; tripping is
   permanent, so a token belongs to one invocation, or to a group meant to
   stop together.
 - **Checkpoints sit only where the run already passes**: a blob read or
@@ -35,7 +35,7 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   then cancelled reports the failure, and one that was cancelled reports
   `Cancelled`, not a disconnected channel.
 - **The completion decision.** Publication checks the token once, first
-  (`Output::publish(&Cancel)`, and likewise `OutputDir` and `OutputSet`);
+  (`Output::publish(&Invocation)`, and likewise `OutputDir` and `OutputSet`);
   after that the publication completes and its own outcome is authoritative
   (ADR-0017). A read-only command decides at its last checkpoint instead: a
   token tripped by the time its work is done returns `Cancelled`, one tripped
@@ -43,7 +43,7 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   interrupted). Writers built from an `Output` observe the token on every
   call that writes: `Output::pbf_writer`'s `PbfWriter` on each write method
   (its end-of-stream `flush` and the drain of already-queued blobs do not
-  check; publication does), `Output::writer(&Cancel)` on each buffer flush
+  check; publication does), `Output::writer(&Invocation)` on each buffer flush
   and in `OutputWriter::finish`, so a run whose output is its bottleneck
   stops at its next write. The token is an argument, not something an
   output captures, so the decision and the run cannot consult different

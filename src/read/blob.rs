@@ -400,14 +400,14 @@ impl<R: Read + Send> BlobReader<R> {
     /// yields one `ErrorKind::Cancelled` (unlocated: the run was stopped,
     /// nothing in the input is at fault) and ends.
     #[must_use]
-    pub fn cancel(mut self, cancel: crate::host::Cancel) -> Self {
+    pub fn cancel(mut self, cancel: crate::host::Invocation) -> Self {
         self.frames.set_cancel(cancel);
         self
     }
 
     /// The token this reader observes, for engines that run its blobs on
     /// other threads and check it at their own consumer.
-    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+    pub(crate) fn cancel_token(&self) -> &crate::host::Invocation {
         self.frames.cancel_token()
     }
 
@@ -661,7 +661,7 @@ impl BlobReader<FileReader> {
         let source = source.into();
         let mut reader = Self::from_reader(FileReader::open(source, direct)?, source.path())
             .diagnostics(host.diagnostics.clone())
-            .cancel(host.cancel.clone())
+            .cancel(host.invocation.clone())
             .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict);
         reader.frames.refuse_partial_index();
         Ok(reader)

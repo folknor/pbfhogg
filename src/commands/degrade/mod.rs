@@ -409,7 +409,7 @@ pub fn degrade<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = degrade_to(
         input.into(),
         &output,
@@ -419,7 +419,7 @@ pub fn degrade<'a>(
         overrides,
         host,
     )?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

@@ -164,14 +164,14 @@ mod grid_parity {
         // linear scan.
         let linear_host = crate::common::test_host();
         linear_host
-            .cancel
+            .invocation
             .faults()
             .force_linear_region_grid
             .store(true, Ordering::Relaxed);
         let lin_outs = run_config(input, &lin_dir, region, &linear_host);
         assert_eq!(
             linear_host
-                .cancel
+                .invocation
                 .faults()
                 .region_grids_declined
                 .load(Ordering::Relaxed),

@@ -185,7 +185,7 @@ struct S4Consumer<'a> {
     passthrough_blobs: u64,
     passthrough_pread_ms: u64,
     passthrough_bytes: u64,
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
 }
 
 impl S4Consumer<'_> {
@@ -321,7 +321,7 @@ pub(super) fn stage4_assembly(
         ..
     } = *write;
     #[cfg(feature = "test-hooks")]
-    host.cancel.faults().on_altw_stage4_start()?;
+    host.invocation.faults().on_altw_stage4_start()?;
     // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = crate::counters::Stopwatch::start();
@@ -491,7 +491,7 @@ pub(super) fn stage4_assembly(
         passthrough_blobs: 0,
         passthrough_pread_ms: 0,
         passthrough_bytes: 0,
-        cancel: &host.cancel,
+        cancel: &host.invocation,
     };
 
     // Worker errors are located against the input once per worker pool, not
@@ -509,7 +509,7 @@ pub(super) fn stage4_assembly(
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits {
                 recv: Some(crate::ordered_pool::Timer::Ms(&s4_recv_ms)),
                 send: Some(crate::ordered_pool::Timer::Ms(&c.send_ms)),
@@ -561,7 +561,7 @@ pub(super) fn stage4_assembly(
                     // this entirely - they never consume a coord payload.
                     if desc.is_way_blob {
                         #[cfg(feature = "test-hooks")]
-                        host.cancel
+                        host.invocation
                             .faults()
                             .on_altw_stage4_ready_wait(desc.way_blob_idx);
                         let t_wait = crate::counters::Stopwatch::start();

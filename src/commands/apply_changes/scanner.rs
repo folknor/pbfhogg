@@ -289,7 +289,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             &mut max_item_bytes_slowpath,
             approx_cost,
             #[cfg(feature = "test-hooks")]
-            host.cancel.faults(),
+            host.invocation.faults(),
         )?;
 
         seq += 1;
@@ -328,7 +328,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     if !barrier_open && let Some(ref rx) = barrier_rx {
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_START");
         #[cfg(feature = "test-hooks")]
-        host.cancel
+        host.invocation
             .faults()
             .apply_changes_scanner_in_barrier_wait
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -348,7 +348,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             &mut max_item_bytes_slowpath,
             approx_cost,
             #[cfg(feature = "test-hooks")]
-            host.cancel.faults(),
+            host.invocation.faults(),
         )?;
     }
 
@@ -436,7 +436,7 @@ fn send_boundary(
 ) -> Result<()> {
     let node_end_seq = last_node_seq.map_or(0, |seq| seq + 1);
     #[cfg(feature = "test-hooks")]
-    host.cancel
+    host.invocation
         .faults()
         .before_apply_changes_boundary(node_end_seq);
     tx.send(DrainMessage::NodeBoundary { node_end_seq })

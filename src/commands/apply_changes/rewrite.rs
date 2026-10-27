@@ -172,9 +172,9 @@ pub fn merge<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
-    output_pbf.publish(&host.cancel)?;
+    output_pbf.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -282,7 +282,7 @@ pub(crate) fn merge_to<'a>(
         // file: input-reader time (file reads, plus decompression for gzip),
         // not the full parse wall measured by osc_start here. Its owner,
         // TimedRead in osc/xml_parse.rs, documents the attribution.
-        crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.cancel)?;
+        crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.invocation)?;
         overlay
     });
     crate::host::diag!(
@@ -388,7 +388,7 @@ pub(crate) fn merge_to<'a>(
     #[cfg(feature = "test-hooks")]
     let splice = splice
         && !host
-            .cancel
+            .invocation
             .faults()
             .apply_changes_force_owned_route
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -503,7 +503,7 @@ pub(crate) fn merge_to<'a>(
         route: worker_route,
         failure: Arc::clone(&failure),
         #[cfg(feature = "test-hooks")]
-        cancel: host.cancel.clone(),
+        cancel: host.invocation.clone(),
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,

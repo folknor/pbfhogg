@@ -85,7 +85,7 @@ pub fn derive_changes<'a, 'b>(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = derive_changes_to(
         old.into(),
         new.into(),
@@ -98,7 +98,7 @@ pub fn derive_changes<'a, 'b>(
         &scratch,
     )?;
     drop(scratch);
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -118,7 +118,7 @@ pub(crate) fn derive_changes_to(
     host: &crate::host::Host,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     // The name rule every OSC producer shares, applied before any work.
     crate::osc::output_is_gzip(output.destination())?;
     let jobs = super::resolve_shards(parallelism, host);
@@ -369,7 +369,7 @@ impl super::sharded::ShardedReport for OscReport<'_> {
     /// descriptor, so bytes an inline phase left buffered stay ahead of the
     /// appended ones, and fold the counts into the final sink's, which the
     /// OSC assembly frames from.
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Cancel) -> Result<()> {
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()> {
         let mut first_err = None;
         for shard in done {
             // Once per shard, between appends (the appends themselves are
@@ -651,7 +651,7 @@ fn assemble_osc_from_paths(
     // Stage boundary. The assembly itself stops through the output writer,
     // which observes the token at every buffer it writes (the gzip writer
     // thread records that as its failure and every later `write` returns it).
-    host.cancel.check()?;
+    host.invocation.check()?;
 
     // Framing follows the output name, the rule every OSC producer shares
     // (`crate::osc::output_is_gzip`): `.osc.gz` is written as ordered gzip
@@ -663,7 +663,7 @@ fn assemble_osc_from_paths(
     // Output can also be on a different filesystem from host-selected scratch.
     // A statvfs snapshot would not reserve capacity against concurrent writers;
     // propagate actual output write failures rather than promise a preflight.
-    let buf = output.writer(&host.cancel)?;
+    let buf = output.writer(&host.invocation)?;
 
     // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
     // At planet scale (~45 GB of XML across the three temp files) that's
@@ -681,7 +681,7 @@ fn assemble_osc_from_paths(
         crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
     );
     if gzip {
-        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.cancel);
+        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.invocation);
         let gz = write_document(
             gz,
             creates_path,

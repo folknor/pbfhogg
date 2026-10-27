@@ -360,7 +360,7 @@ fn check_refs_resolves_ids_above_the_allocation() {
         // The high node, way and relation lay above the pre-allocation.
         #[cfg(feature = "test-hooks")]
         assert_eq!(
-            host.cancel
+            host.invocation
                 .faults()
                 .check_overflow_ids
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -418,7 +418,7 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     // first, but never how many duplicates there are.
     #[cfg(feature = "test-hooks")]
     assert_eq!(
-        host.cancel
+        host.invocation
             .faults()
             .check_overflow_ids
             .load(std::sync::atomic::Ordering::Relaxed),

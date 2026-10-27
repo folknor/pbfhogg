@@ -241,7 +241,7 @@ struct Pin {
     reopen: Reopen,
     /// Where the fault plan lives (see `crate::test_hooks`).
     #[cfg(feature = "test-hooks")]
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 /// `(st_dev, st_ino)`.
@@ -313,7 +313,7 @@ impl PinnedInput {
     /// a regular file; the error names it.
     pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
         #[cfg(feature = "test-hooks")]
-        let force_path = host.cancel.faults().forces_pin_path_reopen();
+        let force_path = host.invocation.faults().forces_pin_path_reopen();
         #[cfg(not(feature = "test-hooks"))]
         let force_path = false;
         Self::pin_with(path, host, force_path)
@@ -350,7 +350,7 @@ impl PinnedInput {
             identity,
             reopen,
             #[cfg(feature = "test-hooks")]
-            cancel: host.cancel.clone(),
+            cancel: host.invocation.clone(),
         })))
     }
 
@@ -370,7 +370,7 @@ impl PinnedInput {
         Ok(Self(Arc::new(Pin {
             path: Arc::from(path),
             #[cfg(feature = "test-hooks")]
-            cancel: host.cancel.clone(),
+            cancel: host.invocation.clone(),
         })))
     }
 
@@ -815,17 +815,17 @@ mod pin_tests {
         for force_path in [true, false] {
             let (input, replacement) = fixture(dir.path());
             let host = Host::for_tests();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, std::sync::atomic::Ordering::Relaxed);
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, 1);
             let pin = PinnedInput::pin(&input, &host).unwrap();
             assert_eq!(read_all(pin.open().unwrap()), b"original");
             let later = pin.open();
-            let report = host.cancel.faults().input_replacement().unwrap();
+            let report = host.invocation.faults().input_replacement().unwrap();
             assert!(report.fired);
             assert_eq!(report.attempts, 2);
             assert_eq!(report.attempts_after_fired, 1);

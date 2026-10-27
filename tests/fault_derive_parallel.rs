@@ -53,7 +53,7 @@ fn fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch() {
 
     // Arm the middle shard on a fresh token.
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .derive_shard_panic
         .store(1, Ordering::Relaxed);

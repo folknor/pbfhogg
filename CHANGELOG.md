@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **`pbfhogg::host::Cancel` is renamed `Invocation`, and `Host::cancel` is
+  `Host::invocation`.** The token is the one invocation a run belongs to:
+  its cancellation request and, from this release, its instrumentation.
+  `cancel()`, `is_cancelled()` and `check()` are unchanged. A struct literal
+  writes `invocation: Invocation::new()`.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming

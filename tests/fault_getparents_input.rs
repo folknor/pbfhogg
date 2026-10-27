@@ -184,7 +184,7 @@ fn run<'a>(
 /// Whether the run on `host` ran the full-scan arm's pipeline. Read before
 /// anything else uses the token.
 fn ran_full_scan(host: &pbfhogg::host::Host) -> bool {
-    host.cancel
+    host.invocation
         .faults()
         .reorder_filled_high_water
         .load(Ordering::Relaxed)
@@ -230,7 +230,7 @@ fn reference(
     let opens = route.opens();
     let output = dir.join("reference.osm.pbf");
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
     let stats = match run(route, input, &output, &host) {
@@ -247,7 +247,7 @@ fn reference(
         "{route:?}: the run took the other arm"
     );
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -281,14 +281,14 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
             write_input(input, route);
             write_replacement(&replacement);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
             let before = snapshot_dir(dir);
@@ -297,7 +297,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
 
             let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
@@ -439,7 +439,7 @@ fn a_caller_pin_is_used_as_it_is() {
             write_input(&input, route);
             write_replacement(&replacement);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);

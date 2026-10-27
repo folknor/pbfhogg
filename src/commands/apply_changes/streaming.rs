@@ -138,7 +138,7 @@ pub(super) struct StreamingConfig {
     /// at each dequeue (`FaultPlan::on_apply_changes_dequeue`: panic, park or
     /// hold). Only compiled under the `test-hooks` feature.
     #[cfg(feature = "test-hooks")]
-    pub cancel: crate::host::Cancel,
+    pub cancel: crate::host::Invocation,
 }
 
 /// Channels owned by the streaming pool.
@@ -381,7 +381,7 @@ fn worker_loop(
     probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
-    #[cfg(feature = "test-hooks")] cancel: &crate::host::Cancel,
+    #[cfg(feature = "test-hooks")] cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();

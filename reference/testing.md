@@ -313,7 +313,7 @@ exception, not a tier - should not survive across many PRs.
   answer to "what can a test inject". Its `FaultPlan` holds every
   token-scoped hook (arming fields and observation counters, public
   atomics, disarmed as a `MAX` sentinel); one lives in each
-  `host::Cancel` and `Cancel::faults()` reaches it. The token is what
+  `host::Invocation` and `Invocation::faults()` reaches it. The token is what
   an invocation already hands every worker loop it starts (the read
   pipeline, the output writers, the diff and derive shards, altw's
   stages, the geocode passes), so a new hook is a `FaultPlan` field
@@ -330,9 +330,9 @@ exception, not a tier - should not survive across many PRs.
   their owner and are listed in the module docs: `PublishFault` on an
   output, the geocode reader's counter, and the cancellation hooks
   below.
-- **Cancellation hooks.** `Cancel::on_check` (per-instance, `test-hooks`)
+- **Cancellation hooks.** `Invocation::on_check` (per-instance, `test-hooks`)
   runs a callback with each checkpoint's 1-based ordinal and may block;
-  `Cancel::checks_passed` counts them. Library tests trip the token from
+  `Invocation::checks_passed` counts them. Library tests trip the token from
   the callback (`tests/cancel.rs`). The CLI, built with `test-hooks`, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and

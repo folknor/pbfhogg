@@ -216,7 +216,7 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
         let mut w = FileWriter::buffered(&path).unwrap();
-        let token = crate::host::Cancel::new();
+        let token = crate::host::Invocation::new();
         let syncs = || token.faults().sync_calls.load(Relaxed);
 
         const FLUSHES: usize = 64;

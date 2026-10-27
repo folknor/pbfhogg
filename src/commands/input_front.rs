@@ -84,7 +84,7 @@ impl<'a> InputFront<'a> {
             FileReader::open(source, direct_io)?,
             path,
             &host.diagnostics,
-            &host.cancel,
+            &host.invocation,
         );
         super::leading_header_frame(&mut frames, path)?;
         let mut header_payload = Vec::new();

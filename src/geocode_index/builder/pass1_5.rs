@@ -262,7 +262,7 @@ pub(super) fn run_pass1_5(
                             // Per way blob; a cancellation leaves through the
                             // first-error slot like any blob failure (this
                             // pool has no consumer, and no sequence to keep).
-                            host.cancel.check()?;
+                            host.invocation.check()?;
                             read_buf.resize(entry.data_size(), 0);
                             file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             decompress_buf.clear();

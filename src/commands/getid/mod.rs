@@ -409,9 +409,9 @@ pub fn getid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -538,9 +538,9 @@ pub fn removeid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = removeid_to(input, &output, ids, write, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -1576,7 +1576,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
-        staged.publish(&crate::host::Cancel::new()).unwrap();
+        staged.publish(&crate::host::Invocation::new()).unwrap();
         assert_eq!(
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
@@ -1668,7 +1668,7 @@ mod tests {
                 host,
             )
             .unwrap();
-            staged.publish(&crate::host::Cancel::new()).unwrap();
+            staged.publish(&crate::host::Invocation::new()).unwrap();
         }
         let walker_ids = read_ids(&walker, host);
         assert_eq!(walker_ids, read_ids(&full_scan, host));
@@ -1749,7 +1749,7 @@ mod tests {
                 host,
             );
             if result.is_ok() {
-                staged.publish(&host.cancel).unwrap();
+                staged.publish(&host.invocation).unwrap();
             }
             result
         };
@@ -1761,7 +1761,7 @@ mod tests {
             write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
             let reference = dir.path().join("reference.pbf");
             let host = crate::host::Host::for_tests();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, OPENS + 1);
             match run(&reference, &host, direct) {
@@ -1774,7 +1774,7 @@ mod tests {
                 }
                 Err(e) => panic!("direct {direct}: unreplaced run: {e}"),
             }
-            let counted = host.cancel.faults().input_replacement().unwrap();
+            let counted = host.invocation.faults().input_replacement().unwrap();
             assert_eq!(
                 (counted.attempts, counted.verified, counted.fired),
                 (OPENS, OPENS, false),
@@ -1790,20 +1790,20 @@ mod tests {
                     // write different bytes.
                     write_blocks(&replacement, &[1_001, 1_002], Some((1_010, &[1_001])), true);
                     let host = crate::host::Host::for_tests();
-                    host.cancel
+                    host.invocation
                         .faults()
                         .force_pin_path_reopen
                         .store(force_path, Ordering::Relaxed);
                     let procfs = PinnedInput::pin(&input, &host)
                         .unwrap()
                         .reopens_through_procfs();
-                    host.cancel
+                    host.invocation
                         .faults()
                         .arm_input_replacement(&input, &replacement, after);
                     let output = dir.path().join("out.pbf");
                     let result = run(&output, &host, direct);
                     let cell = format!("direct {direct}, after open {after}, procfs {procfs}");
-                    let report = host.cancel.faults().input_replacement().unwrap();
+                    let report = host.invocation.faults().input_replacement().unwrap();
                     assert!(report.fired, "{cell}: {report:?}");
                     if procfs || after == OPENS {
                         result.unwrap_or_else(|e| panic!("{cell}: {e}"));
@@ -1864,7 +1864,7 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .unwrap();
-            staged.publish(&crate::host::Cancel::new()).unwrap();
+            staged.publish(&crate::host::Invocation::new()).unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
                 read_ids(&output, &crate::host::Host::for_tests()),

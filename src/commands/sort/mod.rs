@@ -87,9 +87,9 @@ pub fn sort<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = sort_to(input, &output, opts, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

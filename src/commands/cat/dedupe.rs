@@ -98,9 +98,9 @@ pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -499,7 +499,7 @@ mod tests {
                 &host,
             )
             .expect("pass 2");
-            output.publish(&host.cancel).expect("publish");
+            output.publish(&host.invocation).expect("publish");
             (
                 (stats.nodes, stats.ways, stats.relations),
                 (stats.blobs_rewritten, stats.duplicates_removed),

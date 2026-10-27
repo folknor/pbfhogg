@@ -179,7 +179,7 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   are returned as typed values and reported, never reaped, and backups are
   never touched.
 - [ADR-0019](0019-cancellation-is-a-caller-token-checked-where-the-run-already-passes.md) -
-  A run stops early only through the caller's `Cancel` token, checked where
+  A run stops early only through the caller's `Invocation` token, checked where
   the run already passes (blob dispatch, pool receives, stage boundaries,
   output writes, the publication decision), and ends like a failure:
   nothing published, staging and scratch removed, `Cancelled` returned. The

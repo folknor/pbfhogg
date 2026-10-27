@@ -346,7 +346,7 @@ mod tests {
             &pbfhogg::host::Diagnostics::discard(),
         )
         .expect("fresh output");
-        let cancel = pbfhogg::host::Cancel::new();
+        let cancel = pbfhogg::host::Invocation::new();
         cancel.cancel();
         let cancelled = output
             .publish(&cancel)

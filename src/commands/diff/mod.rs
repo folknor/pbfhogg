@@ -165,7 +165,7 @@ pub fn diff<'a, 'b>(
     host: &crate::host::Host,
     scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let jobs = options.shards(host);
     if jobs > 1 && scratch.is_none() {
         return Err(crate::Error::invalid_argument(
@@ -192,7 +192,7 @@ pub fn diff<'a, 'b>(
     let stats = result?;
     // The completion decision: a cancellation observed by now is reported
     // as one, whatever reached the caller's writer.
-    host.cancel.check()?;
+    host.invocation.check()?;
     Ok(stats)
 }
 
@@ -220,7 +220,7 @@ pub fn diff_stats<'a, 'b>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     // Nothing is printed, so byte-equal blobs may be skipped (see above).
     let options = DiffOptions {
         suppress_common: true,
@@ -239,7 +239,7 @@ pub fn diff_stats<'a, 'b>(
         direct_io,
         host,
     )?;
-    host.cancel.check()?;
+    host.invocation.check()?;
     Ok(stats)
 }
 
@@ -586,7 +586,7 @@ impl<'a, W: Write> sharded::ShardedReport for TextReport<'a, W> {
         Ok((shard.path, shard.sink.stats))
     }
 
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Cancel) -> Result<()> {
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()> {
         match (self.sink.output.as_mut(), self.scratch) {
             (Some(out), Some(scratch)) => {
                 emit_shard_outputs(&mut **out, done, &mut self.sink.stats, scratch, cancel)
@@ -624,7 +624,7 @@ fn emit_shard_outputs(
     outputs: Vec<(Option<crate::scratch::ScratchPath>, DiffStats)>,
     total: &mut DiffStats,
     scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let mut first_err = None;
     for (text_path, stats) in outputs {
@@ -653,7 +653,7 @@ fn append_and_cleanup(
     out: &mut impl Write,
     src: &crate::scratch::ScratchPath,
     scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     // The copy checks the token at every read of the shard file (a shard
     // can hold gigabytes of text, and stdout is not cancellation-aware).

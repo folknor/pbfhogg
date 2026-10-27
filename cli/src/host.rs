@@ -18,14 +18,14 @@ impl ProcessActions for LegacyProcessActions {
 }
 /// The CLI's host. `cancel` is the token the signal waiter trips (see
 /// `signals`).
-pub(crate) fn cli_host(cancel: pbfhogg::host::Cancel) -> Host {
+pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation) -> Host {
     Host {
         diagnostics: pbfhogg::host::Diagnostics::new(Arc::new(StderrSink)),
         process: Arc::new(LegacyProcessActions),
         resources: Arc::new(MachineProbe),
         page_cache: PageCachePolicy::Evict,
         executor: Executor::Ambient,
-        cancel,
+        invocation: cancel,
     }
 }
 

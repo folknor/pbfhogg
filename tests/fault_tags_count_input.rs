@@ -161,7 +161,7 @@ fn reference(
     skippable: impl Fn(&pbfhogg::Error) -> bool,
 ) -> Reference {
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .arm_input_replacement(input, &dir.join("unused.osm.pbf"), OPENS + 1);
     let counts = match run(route, input, &host) {
@@ -173,7 +173,7 @@ fn reference(
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     };
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -194,14 +194,14 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &Counts)
             write_input(input, route);
             write_replacement(&replacement);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
             let before = crate::common::snapshot_dir(dir);
@@ -209,7 +209,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &Counts)
 
             let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
@@ -325,7 +325,7 @@ fn a_caller_pin_is_used_as_it_is() {
         write_input(&input, route);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);

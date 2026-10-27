@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use pbfhogg::ElementReader;
-use pbfhogg::host::Cancel;
+use pbfhogg::host::Invocation;
 
 use crate::common::write_many_block_pbf;
 
@@ -19,7 +19,7 @@ use crate::common::write_many_block_pbf;
 /// parked decode and joining happen on every exit path, a failed assertion
 /// included, so a failure never leaves a worker parked at the gate.
 struct Driver {
-    cancel: Cancel,
+    cancel: Invocation,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -46,7 +46,7 @@ fn admission_high_water_bounded_under_slow_first_decode() {
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 16);
 
-    let cancel = Cancel::new();
+    let cancel = Invocation::new();
     let faults = cancel.faults();
     faults.arm_block_decode(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);

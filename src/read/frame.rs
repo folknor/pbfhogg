@@ -275,7 +275,7 @@ pub(crate) struct Frames<S> {
     next_ordinal: Option<u64>,
     path: Option<Arc<Path>>,
     diagnostics: crate::host::Diagnostics,
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
     /// The current frame's `BlobHeader` bytes, reused across frames.
     header_buf: Vec<u8>,
     pub(crate) fields: HeaderFields,
@@ -300,7 +300,7 @@ impl<S> Frames<S> {
             next_ordinal: matches!(start, None | Some(0)).then_some(0),
             path: None,
             diagnostics: crate::host::Diagnostics::discard(),
-            cancel: crate::host::Cancel::new(),
+            cancel: crate::host::Invocation::new(),
             header_buf: Vec::new(),
             fields,
             pending: None,
@@ -317,7 +317,7 @@ impl<S> Frames<S> {
         let mut frames = Self::new(src, Some(0), HeaderFields::INDEXES);
         frames.path = Some(Arc::from(path));
         frames.diagnostics = host.diagnostics.clone();
-        frames.cancel = host.cancel.clone();
+        frames.cancel = host.invocation.clone();
         frames.refuse_partial_index();
         frames
     }
@@ -363,11 +363,11 @@ impl<S> Frames<S> {
         self.diagnostics = diagnostics;
     }
 
-    pub(crate) fn set_cancel(&mut self, cancel: crate::host::Cancel) {
+    pub(crate) fn set_cancel(&mut self, cancel: crate::host::Invocation) {
         self.cancel = cancel;
     }
 
-    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+    pub(crate) fn cancel_token(&self) -> &crate::host::Invocation {
         &self.cancel
     }
 

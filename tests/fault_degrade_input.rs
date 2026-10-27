@@ -360,7 +360,7 @@ fn decode_reference(
     skippable: impl Fn(&pbfhogg::Error) -> bool,
 ) -> Reference {
     let host = crate::common::test_host();
-    host.cancel.faults().arm_input_replacement(
+    host.invocation.faults().arm_input_replacement(
         input,
         &dir.join("unused.osm.pbf"),
         DECODE_OPENS + 1,
@@ -375,7 +375,7 @@ fn decode_reference(
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     }
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -438,14 +438,14 @@ fn check_decode_replacements(route: Route, dir: &Path, input: &Path, expected: &
                     std::fs::write(&output, SENTINEL).expect("write destination");
                 }
                 let host = crate::common::test_host();
-                host.cancel
+                host.invocation
                     .faults()
                     .force_pin_path_reopen
                     .store(force_path, Ordering::Relaxed);
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
-                host.cancel
+                host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
                 let before = snapshot_dir(dir);
@@ -460,7 +460,7 @@ fn check_decode_replacements(route: Route, dir: &Path, input: &Path, expected: &
                     "{route:?}, replaced after open {after}, procfs {procfs}, existing {existing}"
                 );
                 let report = host
-                    .cancel
+                    .invocation
                     .faults()
                     .input_replacement()
                     .expect("armed replacement");
@@ -588,20 +588,20 @@ fn check_passthrough_route(route: Route) {
         write_input(&input, route);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
-        host.cancel
+        host.invocation
             .faults()
             .arm_input_replacement(&input, &replacement, 1);
         let cell = format!("{route:?}, procfs {procfs}");
         run(route, &pin, out(&output), &host)
             .unwrap_or_else(|e| panic!("{cell}: the run is unaffected by the replacement: {e}"));
         let report = host
-            .cancel
+            .invocation
             .faults()
             .input_replacement()
             .expect("armed replacement");
@@ -654,7 +654,7 @@ fn a_caller_pin_is_used_as_it_is() {
             write_input(&input, route);
             write_replacement(&replacement);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);

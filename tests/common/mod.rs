@@ -1716,7 +1716,7 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         // A fresh token per call: a test that trips one cancels only itself,
         // and one that arms its fault plan (`pbfhogg::test_hooks`) faults
         // only its own run.
-        cancel: pbfhogg::host::Cancel::new(),
+        invocation: pbfhogg::host::Invocation::new(),
     }
 }
 

@@ -691,7 +691,7 @@ fn next_position(
 /// worker has gone.
 fn recv_checked_recording_wait<T>(
     rx: &std::sync::mpsc::Receiver<T>,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
     wait_ns: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<T>> {
     cancel.check()?;
@@ -795,7 +795,7 @@ fn run_unordered_per_blob<L, R: Send>(
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
-    host.cancel.check()?;
+    host.invocation.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
@@ -867,7 +867,7 @@ fn run_unordered_per_blob<L, R: Send>(
         // leave a worker parked in `send`).
         let result_rx = result_rx;
         while let Some((seq, result)) =
-            recv_checked_recording_wait(&result_rx, &host.cancel, &metrics.result_recv_wait_ns)?
+            recv_checked_recording_wait(&result_rx, &host.invocation, &metrics.result_recv_wait_ns)?
         {
             if merge(seq, result?).is_break() {
                 // Dropping the receiver - it falls out of scope when this
@@ -975,7 +975,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window,
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| ClassifyLocal {
@@ -1151,13 +1151,13 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
-    host.cancel.check()?;
+    host.invocation.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
-    let cancel = &host.cancel;
+    let cancel = &host.invocation;
     // Raised by the first worker to fail. The consumer drops its receiver on
     // the first error it sees, but that does not reach the other workers:
     // they only learn of it at their one send, after their whole share of
@@ -1688,8 +1688,8 @@ mod tests {
             Some(1),
             || (),
             |_block, ()| -> crate::Result<()> {
-                cancelled.cancel.cancel();
-                cancelled.cancel.check()
+                cancelled.invocation.cancel();
+                cancelled.invocation.check()
             },
             |_, ()| {},
             &host,

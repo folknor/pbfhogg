@@ -148,7 +148,7 @@ pub fn merge_changes(
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = merge_changes_to(
         inputs,
         &output,
@@ -157,7 +157,7 @@ pub fn merge_changes(
         allow_version_regression,
         host,
     )?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -221,7 +221,7 @@ pub(crate) fn merge_changes_to(
     // producer ends up on a pool worker; this body writes OSC XML and drives
     // no `PbfWriter`, so wrapping all of it puts no producer on a worker.
     // Under `Executor::Ambient` (the CLI) this is a direct call.
-    let cancel = &host.cancel;
+    let cancel = &host.invocation;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
         if simplify {
             let stream = build_simplify_stream(inputs, cancel)?;
@@ -263,7 +263,7 @@ pub(crate) fn merge_changes_to(
 /// observes inputs in sequence order.
 fn build_simplify_stream(
     inputs: &[&Path],
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> crate::Result<ChangeStream> {
     if inputs.len() <= 1 {
         let mut stream = ChangeStream::default();
@@ -312,7 +312,7 @@ fn build_simplify_stream(
 fn parse_one_into_stream(
     path: &Path,
     stream: &mut ChangeStream,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
         crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
@@ -481,7 +481,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
 fn parse_osc_into(
     path: &Path,
     stream: &mut ChangeStream,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(StreamDest { stream });
     // Deliberately use the shared historical per-file decompression counter.
@@ -522,7 +522,7 @@ impl OscWriter<crate::output::OutputWriter> {
     fn from_output(
         output: &crate::output::Output,
         is_gz: bool,
-        cancel: &crate::host::Cancel,
+        cancel: &crate::host::Invocation,
     ) -> Result<Self> {
         let buf = output.writer(cancel)?;
         if is_gz {
@@ -571,7 +571,7 @@ fn write_streaming(
     output: &crate::output::Output,
     is_gz: bool,
     executor: &crate::host::Executor,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<u64> {
     crate::debug::emit_counter(
         "merge_changes_buffered_strategy",
@@ -672,7 +672,7 @@ fn write_streaming(
 fn emit_member(
     path: &Path,
     is_gz: bool,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> crate::Result<(Vec<u8>, u64)> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
@@ -707,7 +707,7 @@ fn emit_members_ordered(
     inputs: &[&Path],
     is_gz: bool,
     window: usize,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
     mut drain: impl FnMut(Vec<u8>, u64) -> crate::Result<()> + Send,
 ) -> crate::Result<()> {
     if inputs.is_empty() {
@@ -815,7 +815,7 @@ fn parse_osc_streaming<W: io::Write>(
     writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     count: &mut u64,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(WriterDest {
         writer,
@@ -897,7 +897,7 @@ fn write_simplified(
     stream: ChangeStream,
     worker_count: usize,
     allow_version_regression: bool,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<usize> {
     cancel.check()?;
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
@@ -1107,7 +1107,7 @@ mod tests {
                     &mut writer,
                     &mut action,
                     &mut count,
-                    &crate::host::Cancel::new(),
+                    &crate::host::Invocation::new(),
                 )?;
                 if let Some(action) = action {
                     writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;

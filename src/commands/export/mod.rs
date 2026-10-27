@@ -151,7 +151,7 @@ pub fn export<W: Write>(
     opts: &ExportOptions,
     host: &crate::host::Host,
 ) -> crate::Result<ExportStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {
         return Err(crate::error::new_missing_feature(
@@ -279,6 +279,6 @@ pub fn export<W: Write>(
     writer.finish()?;
     // The completion decision (the caller publishes, or has streamed to its
     // own writer).
-    host.cancel.check()?;
+    host.invocation.check()?;
     Ok(stats)
 }

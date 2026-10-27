@@ -70,7 +70,7 @@ pub fn inspect<'a>(
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
     let input = input.into();
-    host.cancel.decided(|| inspect_inner(input, opts, host))
+    host.invocation.decided(|| inspect_inner(input, opts, host))
 }
 
 fn inspect_inner(
@@ -146,7 +146,7 @@ pub fn inspect_header<'a>(
     host: &crate::host::Host,
 ) -> Result<InspectHeader> {
     let input = input.into();
-    host.cancel.decided(|| {
+    host.invocation.decided(|| {
         let reader = crate::ElementReader::open_in(input, direct_io, host)?;
         let file_size = reader
             .file_metadata()

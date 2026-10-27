@@ -13,20 +13,21 @@ pub struct Host {
     pub page_cache: PageCachePolicy,
     /// Where the library's own data-parallel work and writer framing run.
     pub executor: Executor,
-    /// The invocation's cancellation token. Every command run under this host
-    /// stops at its next checkpoint once the token is tripped and returns
+    /// The invocation this host runs: its cancellation request, and its
+    /// instrumentation. Every command run under this host stops at its next
+    /// checkpoint once the token is tripped and returns
     /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled). A token is
-    /// sticky: give each independent invocation a fresh one.
-    pub cancel: Cancel,
+    /// sticky and accumulates: give each independent invocation a fresh one.
+    pub invocation: Invocation,
 }
 
-/// A cancellation request for one invocation.
+/// One invocation of the library: the token every part of a run holds.
 ///
-/// Cloning shares the request: every clone observes [`cancel`](Self::cancel)
-/// on any of them. Tripping is permanent, so a token belongs to one
-/// invocation (or a group of invocations meant to stop together); there is no
-/// reset, because workers still unwinding from the last request would race
-/// it.
+/// Cloning shares the invocation: every clone observes
+/// [`cancel`](Self::cancel) on any of them. Tripping is permanent, so a token
+/// belongs to one invocation (or a group of calls meant to stop together,
+/// which are then one invocation in every respect); there is no reset,
+/// because workers still unwinding from the last request would race it.
 ///
 /// The library never trips a token and never installs a signal handler
 /// (ADR-0016): the caller decides what stops a run. The CLI trips its token
@@ -41,10 +42,10 @@ pub struct Host {
 /// down, scratch and staging are removed, nothing is published, and the
 /// call returns [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled).
 #[derive(Clone, Default)]
-pub struct Cancel(Arc<CancelState>);
+pub struct Invocation(Arc<InvocationState>);
 
 #[derive(Default)]
-struct CancelState {
+struct InvocationState {
     tripped: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-hooks")]
     hook: std::sync::OnceLock<CheckHook>,
@@ -60,15 +61,17 @@ struct CancelState {
 /// 1-based ordinal; it may block (a test parks the run there until it is
 /// cancelled).
 #[cfg(feature = "test-hooks")]
-type CheckHook = Box<dyn Fn(u64, &Cancel) + Send + Sync>;
+type CheckHook = Box<dyn Fn(u64, &Invocation) + Send + Sync>;
 
-impl std::fmt::Debug for Cancel {
+impl std::fmt::Debug for Invocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Cancel").field(&self.is_cancelled()).finish()
+        f.debug_tuple("Invocation")
+            .field(&self.is_cancelled())
+            .finish()
     }
 }
 
-impl Cancel {
+impl Invocation {
     /// A fresh, untripped token.
     #[must_use]
     pub fn new() -> Self {
@@ -141,7 +144,7 @@ impl Cancel {
     /// Set once; a second call is ignored.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn on_check(&self, hook: impl Fn(u64, &Cancel) + Send + Sync + 'static) {
+    pub fn on_check(&self, hook: impl Fn(u64, &Invocation) + Send + Sync + 'static) {
         drop(self.0.hook.set(Box::new(hook)));
     }
 
@@ -172,11 +175,11 @@ impl Cancel {
 /// `Read` or `Write` layer retries.
 pub(crate) struct CancellableRead<'a, R> {
     inner: R,
-    cancel: &'a Cancel,
+    cancel: &'a Invocation,
 }
 
 impl<'a, R> CancellableRead<'a, R> {
-    pub(crate) fn new(inner: R, cancel: &'a Cancel) -> Self {
+    pub(crate) fn new(inner: R, cancel: &'a Invocation) -> Self {
         Self { inner, cancel }
     }
 }
@@ -511,7 +514,7 @@ impl Host {
             }),
             page_cache: PageCachePolicy::Keep,
             executor: Executor::Ambient,
-            cancel: Cancel::new(),
+            invocation: Invocation::new(),
         }
     }
 }

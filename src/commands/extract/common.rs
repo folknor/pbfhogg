@@ -328,7 +328,7 @@ where
         frame_read_buf: Vec::new(),
         writer,
         stats,
-        cancel: &host.cancel,
+        cancel: &host.invocation,
     };
 
     let mut workers = vec![(); decode_threads];
@@ -337,7 +337,7 @@ where
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| PreadLocal {
@@ -413,7 +413,7 @@ struct PreadConsumer<'a> {
     frame_read_buf: Vec<u8>,
     writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &'a mut ExtractStats,
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
 }
 
 impl PreadConsumer<'_> {

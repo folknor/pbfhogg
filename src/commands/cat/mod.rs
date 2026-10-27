@@ -98,9 +98,9 @@ pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

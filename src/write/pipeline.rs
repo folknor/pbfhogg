@@ -173,14 +173,14 @@ pub(crate) struct FileOutputSink {
     finish: super::Finish,
     /// Checked between `copy_file_range` calls of a queued splice; observes
     /// the finish's fsyncs for tests (`with_sync_observer`).
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 impl FileOutputSink {
     pub(crate) fn new(
         writer: FileWriter,
         finish: super::Finish,
-        cancel: crate::host::Cancel,
+        cancel: crate::host::Invocation,
     ) -> Self {
         Self {
             writer,

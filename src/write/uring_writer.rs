@@ -551,7 +551,7 @@ pub(crate) fn uring_writer_thread(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
@@ -612,7 +612,7 @@ fn uring_init_and_run(
     init_tx: &SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     // Step 1: Declare the buffer pool. It is allocated in step 3, once the
     // output file has reported its direct I/O alignment, but declared here
@@ -733,7 +733,7 @@ fn uring_init_and_run(
 /// items reap completions without blocking.
 struct UringSink<'a> {
     state: &'a mut UringState,
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
 }
 
 impl UringSink<'_> {

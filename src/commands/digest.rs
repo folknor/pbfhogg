@@ -132,7 +132,8 @@ pub fn digest<'a>(
     host: &crate::host::Host,
 ) -> Result<ContentDigest> {
     let input = input.into();
-    host.cancel.decided(|| digest_inner(input, direct_io, host))
+    host.invocation
+        .decided(|| digest_inner(input, direct_io, host))
 }
 
 fn digest_inner(

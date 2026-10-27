@@ -65,7 +65,7 @@ fn run_failing(host: &pbfhogg::host::Host) -> String {
 }
 
 fn assert_stage3_stopped(host: &pbfhogg::host::Host) {
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     assert!(
         faults.altw_stage3_bucket_held.load(Ordering::SeqCst),
         "stage 3 never claimed the held bucket; the test proved nothing"
@@ -84,7 +84,7 @@ fn assert_stage3_stopped(host: &pbfhogg::host::Host) {
 #[test]
 fn a_stage4_failure_at_start_stops_stage3() {
     let host = crate::common::test_host();
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
         .altw_stage4_fail_at_start
@@ -103,7 +103,7 @@ fn a_stage4_failure_at_start_stops_stage3() {
 #[test]
 fn a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3() {
     let host = crate::common::test_host();
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
         .altw_stage4_fail_consume_at
@@ -123,7 +123,7 @@ fn a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3() {
 #[test]
 fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
     let host = crate::common::test_host();
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
         .altw_stage4_panic_consume_at

@@ -367,7 +367,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
 fn drain_decoded<T, F>(
     decoded_rx: Receiver<DecodedItem<T>>,
     decode_ahead: usize,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
     consume: &mut F,
 ) -> Result<()>
 where

@@ -93,7 +93,7 @@ pub(super) fn insert_overflow_ids(
     host: &crate::host::Host,
 ) {
     #[cfg(feature = "test-hooks")]
-    host.cancel
+    host.invocation
         .faults()
         .check_overflow_ids
         .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);

@@ -124,7 +124,7 @@ mod apply_changes {
             allow_version_regression: false,
         };
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .apply_changes_panic_at_blob_seq
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -379,7 +379,7 @@ mod apply_changes {
         arm: impl FnOnce(&pbfhogg::test_hooks::FaultPlan),
     ) -> (pbfhogg::Result<()>, pbfhogg::host::Host) {
         let host = crate::common::test_host();
-        let faults = host.cancel.faults();
+        let faults = host.invocation.faults();
         faults
             .apply_changes_force_owned_route
             .store(owned, std::sync::atomic::Ordering::SeqCst);
@@ -440,7 +440,7 @@ mod apply_changes {
                             f.apply_changes_late_boundary.store(late, SeqCst);
                         });
                         result.unwrap_or_else(|e| panic!("{label}: {e}"));
-                        let faults = host.cancel.faults();
+                        let faults = host.invocation.faults();
                         assert!(
                             !faults.apply_changes_hook_timed_out.load(SeqCst),
                             "{label}: a hook wait expired"
@@ -600,7 +600,7 @@ mod apply_changes {
         for (owned, expected) in [false, true].into_iter().zip(workers) {
             let output = dir.path().join(format!("owned-{owned}.osm.pbf"));
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .apply_changes_force_owned_route
                 .store(owned, std::sync::atomic::Ordering::SeqCst);
@@ -614,7 +614,7 @@ mod apply_changes {
             )
             .unwrap_or_else(|e| panic!("{label} owned={owned}: {e}"));
             let got = WORKER_COUNTERS.map(|name| {
-                host.cancel
+                host.invocation
                     .faults()
                     .apply_changes_worker_counter(name)
                     .unwrap_or_else(|| panic!("{label} owned={owned}: no counter {name}"))
@@ -933,7 +933,7 @@ mod apply_changes {
         common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
         assert!(
             !host
-                .cancel
+                .invocation
                 .faults()
                 .apply_changes_hook_timed_out
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -965,7 +965,7 @@ mod apply_changes {
                     "panic_at_blob_seq=1 triggered",
                 );
                 assert!(
-                    host.cancel
+                    host.invocation
                         .faults()
                         .apply_changes_scanner_in_barrier_wait
                         .load(SeqCst),
@@ -998,7 +998,7 @@ mod apply_changes {
                     "panic_at_blob_seq=0 triggered",
                 );
                 assert!(
-                    host.cancel
+                    host.invocation
                         .faults()
                         .apply_changes_dispatch_blocked
                         .load(SeqCst),
@@ -1033,7 +1033,7 @@ mod apply_changes {
                     &format!("<modify>{}</modify>", osc_way(100, 2, &[2, 3])),
                 );
                 let host = crate::common::test_host();
-                let faults = host.cancel.faults();
+                let faults = host.invocation.faults();
                 faults.apply_changes_force_owned_route.store(owned, SeqCst);
                 faults.apply_changes_park_at_blob_seq.store(1, SeqCst);
                 let before = common::snapshot_dir(dir.path());
@@ -1056,7 +1056,7 @@ mod apply_changes {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    host.cancel.cancel();
+                    host.invocation.cancel();
                     run.join().expect("merge must not unwind")
                 });
                 let err = result
@@ -1138,14 +1138,14 @@ mod apply_changes {
             let replacement = dir.path().join("replacement.osm.pbf");
             write_multi_block_test_pbf(&replacement, &generate_nodes(60, 1), &[], &[], 7);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, std::sync::atomic::Ordering::Relaxed);
             let procfs = pbfhogg::read::input::PinnedInput::pin(&base, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&base, &replacement, 2);
             let output = dir.path().join(format!("output-{force_path}.osm.pbf"));
@@ -1153,7 +1153,7 @@ mod apply_changes {
             let result = run(&host, &output);
 
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");

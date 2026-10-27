@@ -432,7 +432,7 @@ pub(super) fn write_output_passthrough(
         pt_bytes: 0,
         pt_blobs: 0,
         blobs_dispatched: 0,
-        cancel: &host.cancel,
+        cancel: &host.invocation,
     };
 
     // Cancellation is checked on the consumer, before each wait and on each
@@ -443,7 +443,7 @@ pub(super) fn write_output_passthrough(
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits {
                 recv: Some(crate::ordered_pool::Timer::Ns(&p2_recv_ns)),
                 send: Some(crate::ordered_pool::Timer::Ns(&p2_counters.send_ns)),
@@ -523,7 +523,7 @@ struct Pass2Consumer<'a> {
     pt_bytes: u64,
     pt_blobs: u64,
     blobs_dispatched: u64,
-    cancel: &'a crate::host::Cancel,
+    cancel: &'a crate::host::Invocation,
 }
 
 impl Pass2Consumer<'_> {

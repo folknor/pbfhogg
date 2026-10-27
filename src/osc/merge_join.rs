@@ -837,7 +837,7 @@ fn drain_remaining<S: MergeSink>(
     kind: ElementKind,
     sink: &mut S,
     stats: &mut BlockPairMergeStats,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     while let Some(bs) = side.next_decoded()? {
         cancel.check()?;
@@ -1012,7 +1012,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
     skip_equal_blobs: bool,
     sink: &mut S,
     stats: &mut BlockPairMergeStats,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let window = old.window;
     let mut old_decoded: Option<BlockState> = None;

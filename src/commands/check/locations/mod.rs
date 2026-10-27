@@ -710,7 +710,7 @@ pub fn check_locations<'a>(
     host: &crate::host::Host,
 ) -> Result<LocationsReport> {
     let input = input.into();
-    host.cancel
+    host.invocation
         .decided(|| check_locations_inner(input, opts, host))
 }
 
@@ -830,7 +830,7 @@ fn check_locations_inner(
         cap,
     };
     for k in 0..plan.partitions() {
-        host.cancel.check()?;
+        host.invocation.check()?;
         crate::debug::emit_marker("CHECKLOC_PARTITION_START");
         ctx.run_partition(k, &mut report, &mut details, host)?;
         crate::debug::emit_marker("CHECKLOC_PARTITION_END");

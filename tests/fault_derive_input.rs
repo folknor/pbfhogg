@@ -226,7 +226,7 @@ fn reference(
     let opens = route.opens();
     let dir = inputs.dir.path();
     let host = crate::common::test_host();
-    host.cancel.faults().arm_input_replacement(
+    host.invocation.faults().arm_input_replacement(
         inputs.path(target),
         &dir.join("unused.osm.pbf"),
         opens + 1,
@@ -242,7 +242,7 @@ fn reference(
         Err(e) => panic!("{cell}: unreplaced run: {}", e.report()),
     };
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -298,14 +298,14 @@ fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &st
                     std::fs::remove_file(&output).expect("clear output");
                 }
                 let host = crate::common::test_host();
-                host.cancel
+                host.invocation
                     .faults()
                     .force_pin_path_reopen
                     .store(force_path, Ordering::Relaxed);
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
-                host.cancel
+                host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
                 let result = run_paths(route, inputs, &output, existing, &host);
@@ -316,7 +316,7 @@ fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &st
                     input.display()
                 );
                 let report = host
-                    .cancel
+                    .invocation
                     .faults()
                     .input_replacement()
                     .expect("armed replacement");
@@ -515,12 +515,12 @@ fn a_repeated_input_is_one_pin() {
         };
 
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .arm_input_replacement(input, &replacement, opens + 1);
         let expected =
             same(&host).unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {}", e.report()));
-        let counted = host.cancel.faults().input_replacement().expect("armed");
+        let counted = host.invocation.faults().input_replacement().expect("armed");
         assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
         assert!(
             expected.contains("creates: 0, modifies: 0, deletes: 0"),
@@ -532,19 +532,19 @@ fn a_repeated_input_is_one_pin() {
                 write_input(input, route, Side::Old, false);
                 write_input(&replacement, route, Side::Old, true);
                 let host = crate::common::test_host();
-                host.cancel
+                host.invocation
                     .faults()
                     .force_pin_path_reopen
                     .store(force_path, Ordering::Relaxed);
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
-                host.cancel
+                host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
                 let result = same(&host);
                 let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
-                let report = host.cancel.faults().input_replacement().expect("armed");
+                let report = host.invocation.faults().input_replacement().expect("armed");
                 assert!(report.fired, "{cell}: {report:?}");
                 if procfs {
                     let out = result.unwrap_or_else(|e| panic!("{cell}: {}", e.report()));
@@ -586,7 +586,7 @@ fn a_caller_pin_is_used_as_it_is() {
             write_input(&inputs.old, route, Side::Old, false);
             write_input(&replacement, route, Side::Old, true);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
@@ -656,7 +656,7 @@ fn a_fifo_input_is_refused_before_either_input_is_read() {
         for (old, new) in [(regular, fifo.as_path()), (fifo.as_path(), regular)] {
             let cell = format!("{route:?}, {} against {}", old.display(), new.display());
             let host = crate::common::test_host();
-            host.cancel.faults().arm_input_replacement(
+            host.invocation.faults().arm_input_replacement(
                 regular,
                 &dir.join("unused.osm.pbf"),
                 u64::MAX,
@@ -682,7 +682,7 @@ fn a_fifo_input_is_refused_before_either_input_is_read() {
                 "{cell}: {err}"
             );
             let attempts = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed")

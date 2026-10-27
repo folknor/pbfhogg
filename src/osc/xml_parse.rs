@@ -326,7 +326,7 @@ struct TimedRead<R: io::Read> {
     /// `i64::MAX` (where the emitted counter used to wrap negative) or
     /// `u64::MAX`.
     total: Rc<Cell<u64>>,
-    cancel: crate::host::Cancel,
+    cancel: crate::host::Invocation,
 }
 
 impl<R: io::Read> io::Read for TimedRead<R> {
@@ -355,7 +355,7 @@ pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
 /// decompression, or file reads alone for plain XML).
 pub(crate) fn open_osc_reader(
     path: &Path,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> ParseResult<(OscReader, Rc<Cell<u64>>)> {
     let mut file = crate::read::input::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
@@ -592,7 +592,7 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
 pub(crate) fn parse_osc_path<S: OscSink>(
     path: &Path,
     sink: &mut S,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> ParseResult<()> {
     let (mut reader, decompress_total) = open_osc_reader(path, cancel)?;
     let result = drive_osc(&mut reader, sink, path);

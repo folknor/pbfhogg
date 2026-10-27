@@ -234,7 +234,7 @@ fn reference(
 ) -> Reference {
     let index_dir = dir.join("reference-index");
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .arm_input_replacement(input, &dir.join("unused.osm.pbf"), OPENS + 1);
     match run(route, input, &index_dir, &host) {
@@ -246,7 +246,7 @@ fn reference(
         Err(e) => panic!("{route:?}: unreplaced build: {e}"),
     }
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -291,14 +291,14 @@ fn check_replacements(
             write_fixture(input, &INPUT, route.indexdata);
             write_fixture(&replacement, &REPLACEMENT, route.indexdata);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
             let before = snapshot_dir(dir);
@@ -306,7 +306,7 @@ fn check_replacements(
 
             let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");

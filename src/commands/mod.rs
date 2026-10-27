@@ -487,7 +487,8 @@ pub(crate) fn require_indexdata<'a>(
     host: &crate::host::Host,
 ) -> Result<bool> {
     let source = input.into();
-    let (present, _) = probe_first_data_blob(source, direct_io, &host.diagnostics, &host.cancel)?;
+    let (present, _) =
+        probe_first_data_blob(source, direct_io, &host.diagnostics, &host.invocation)?;
     indexdata_policy(present, source.path(), force, reason, host)
 }
 
@@ -586,7 +587,7 @@ pub fn has_indexdata<'a>(
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
     // A library probe with no run to observe: it is never cancelled.
-    let cancel = crate::host::Cancel::new();
+    let cancel = crate::host::Invocation::new();
     Ok(probe_first_data_blob(input, direct_io, diagnostics, &cancel)?.0)
 }
 
@@ -599,7 +600,7 @@ pub fn has_indexdata_in<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<bool> {
-    Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.cancel)?.0)
+    Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.invocation)?.0)
 }
 
 /// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`
@@ -615,7 +616,7 @@ pub fn has_tagdata(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    let cancel = crate::host::Cancel::new();
+    let cancel = crate::host::Invocation::new();
     Ok(probe_first_data_blob(path, direct_io, diagnostics, &cancel)?.1)
 }
 
@@ -628,7 +629,7 @@ fn probe_first_data_blob<'a>(
     input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<(bool, bool)> {
     let source = input.into();
     let path = source.path();
@@ -653,7 +654,7 @@ pub(crate) fn front_frames(
     reader: FileReader,
     path: &Path,
     diagnostics: &crate::host::Diagnostics,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Frames<FileReader> {
     let mut frames = Frames::new(reader, Some(0), HeaderFields::INDEXES);
     frames.set_path(Some(std::sync::Arc::from(path)));

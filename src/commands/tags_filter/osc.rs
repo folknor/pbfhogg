@@ -168,9 +168,9 @@ pub fn tags_filter_osc(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = tags_filter_osc_to(input, &output, expression_strs, host)?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 
@@ -185,8 +185,8 @@ pub(crate) fn tags_filter_osc_to(
     crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
     crate::debug::emit_marker("TAGSFILTEROSC_START");
-    let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.cancel)?;
-    write_filtered_osc(output, &filtered, &host.cancel)?;
+    let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.invocation)?;
+    write_filtered_osc(output, &filtered, &host.invocation)?;
     crate::debug::emit_marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
@@ -194,7 +194,7 @@ pub(crate) fn tags_filter_osc_to(
 fn parse_and_filter_osc(
     input: &Path,
     expressions: &[Expression],
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<(FilteredOsc, TagsFilterOscStats)> {
     let mut sink = FilterSink {
         filtered: FilteredOsc::new(),
@@ -400,7 +400,7 @@ fn finalize_current(
 fn write_filtered_osc(
     output: &crate::output::Output,
     filtered: &FilteredOsc,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     // Framing follows the output name, the rule every OSC producer shares
     // (`crate::osc::output_is_gzip`); the name was vetted before any work.

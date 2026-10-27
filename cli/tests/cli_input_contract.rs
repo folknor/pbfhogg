@@ -2199,7 +2199,7 @@ mod check_composition {
                 write(&input, 100, 5);
                 write(&replacement, 130, 9);
                 let host = crate::common::test_host();
-                host.cancel
+                host.invocation
                     .faults()
                     .force_pin_path_reopen
                     .store(force_path, std::sync::atomic::Ordering::Relaxed);

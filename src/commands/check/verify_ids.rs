@@ -324,7 +324,7 @@ pub fn verify_ids<'a>(
     host: &crate::host::Host,
 ) -> Result<VerifyIdsReport> {
     let input = input.into();
-    host.cancel.decided(|| {
+    host.invocation.decided(|| {
         // Both engines open the input twice, each through its own open file
         // description: the header and indexdata probe (O_DIRECT when asked),
         // then the schedule walk whose descriptor the classify pool preads.
@@ -956,7 +956,7 @@ fn settle_overflow(overflow: &mut IdSet, r: &mut BlobVerifyResult, host: &crate:
         false
     });
     #[cfg(feature = "test-hooks")]
-    host.cancel
+    host.invocation
         .faults()
         .check_overflow_ids
         .fetch_add(inserted, std::sync::atomic::Ordering::Relaxed);

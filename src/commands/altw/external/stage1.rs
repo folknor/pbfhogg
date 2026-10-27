@@ -302,7 +302,7 @@ pub(super) fn stage1_pass_a(
         &mut shards,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(num_workers),
-            cancel: &host.cancel,
+            cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| Stage1Local {

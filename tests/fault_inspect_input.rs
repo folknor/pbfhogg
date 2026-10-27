@@ -157,7 +157,7 @@ fn reference(
 ) -> Option<Vec<Option<String>>> {
     let opens = route.pinned_opens();
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
     let report = match run_inspect(route, input, &host) {
@@ -168,7 +168,7 @@ fn reference(
         }
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     };
-    let Some(counted) = host.cancel.faults().input_replacement() else {
+    let Some(counted) = host.invocation.faults().input_replacement() else {
         panic!("{route:?}: the replacement was armed");
     };
     assert!(!counted.fired, "{route:?}: {counted:?}");
@@ -189,21 +189,21 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Option
             write_input(input, route.indexed);
             write_replacement(&replacement, route.indexed);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
             let result = run_inspect(route, input, &host);
 
             let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
@@ -324,18 +324,18 @@ fn a_decode_only_run_opens_once_through_a_caller_pin() {
             write_input(&input, indexed);
             write_replacement(&replacement, indexed);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, 1);
             let got = run_inspect(route, &pin, &host)
                 .unwrap_or_else(|e| panic!("{route:?}, force_path {force_path}: {e}"));
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
@@ -367,7 +367,7 @@ fn a_caller_pin_is_used_as_it_is() {
             let expected = expected(route, &input);
             write_replacement(&replacement, indexed);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
@@ -531,7 +531,7 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
     write_input(&input, true);
 
     let host = crate::common::test_host();
-    host.cancel.faults().arm_input_replacement(
+    host.invocation.faults().arm_input_replacement(
         &input,
         &dir.path().join("unused.osm.pbf"),
         NODE_STATS_OPENS + 1,
@@ -545,7 +545,7 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
         Err(e) => panic!("node_stats direct {direct}: unreplaced run: {e}"),
     };
     let counted = host
-        .cancel
+        .invocation
         .faults()
         .input_replacement()
         .expect("armed replacement");
@@ -559,20 +559,20 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
             write_input(&input, true);
             write_replacement(&replacement, true);
             let host = crate::common::test_host();
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = PinnedInput::pin(&input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, after);
             let result = run_node_stats(&input, direct, &host);
             let cell = format!("direct {direct}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
@@ -632,7 +632,7 @@ fn node_stats_uses_a_caller_pin_as_it_is() {
             run_node_stats(&input, false, &crate::common::test_host()).expect("unreplaced run");
         write_replacement(&replacement, true);
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);
@@ -692,18 +692,18 @@ fn inspect_header_takes_the_size_from_its_one_open() {
             "the sizes must differ for the check to mean anything"
         );
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        host.cancel
+        host.invocation
             .faults()
             .arm_input_replacement(&input, &replacement, 1);
         let read = pbfhogg::inspect::inspect_header(&pin, false, &host)
             .unwrap_or_else(|e| panic!("force_path {force_path}: {e}"));
         let report = host
-            .cancel
+            .invocation
             .faults()
             .input_replacement()
             .expect("armed replacement");

@@ -145,14 +145,14 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
             write_input(&input, indexed);
             write_replacement(&replacement);
             let host = host(memory_available);
-            host.cancel
+            host.invocation
                 .faults()
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let procfs = pbfhogg::read::input::PinnedInput::pin(&input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
-            host.cancel
+            host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, after);
             let output = dir.path().join("out.osm.pbf");
@@ -161,7 +161,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
 
             let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
             let report = host
-                .cancel
+                .invocation
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");

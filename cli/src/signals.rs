@@ -1,7 +1,7 @@
 //! SIGINT and SIGTERM: the CLI's interruption policy.
 //!
 //! The library never touches signals or other process state (ADR-0016); it
-//! exposes a [`Cancel`] token. This module is the one caller that trips the
+//! exposes a [`Invocation`] token. This module is the one caller that trips the
 //! CLI's token, and the policy is:
 //!
 //! - **The first SIGINT or SIGTERM** requests cancellation. The run stops at
@@ -28,7 +28,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use pbfhogg::host::Cancel;
+use pbfhogg::host::Invocation;
 
 /// The first signal taken, or 0. Written once, by the waiter, before it
 /// trips the token (`Release` there); read by `run` after an `Acquire`
@@ -48,7 +48,7 @@ static FINISHED: Mutex<bool> = Mutex::new(false);
 /// trips `cancel`. Call first thing in `run`, before any other thread is
 /// spawned: a thread started earlier keeps the default disposition and would
 /// be killed by the signal instead.
-pub(crate) fn install(cancel: Cancel) -> std::io::Result<()> {
+pub(crate) fn install(cancel: Invocation) -> std::io::Result<()> {
     let set = signal_set();
     // SAFETY: `set` is an initialised signal set; a null old-set pointer is
     // allowed.
@@ -82,7 +82,7 @@ fn signal_set() -> libc::sigset_t {
     }
 }
 
-fn wait_loop(set: &libc::sigset_t, cancel: &Cancel) {
+fn wait_loop(set: &libc::sigset_t, cancel: &Invocation) {
     loop {
         let mut signo: libc::c_int = 0;
         // SAFETY: `set` is initialised and `signo` is a valid out pointer.
@@ -129,7 +129,7 @@ fn report_stopping(signo: libc::c_int) {
 }
 
 /// The first signal taken, once the caller has observed the token tripped.
-pub(crate) fn first_signal(cancel: &Cancel) -> Option<libc::c_int> {
+pub(crate) fn first_signal(cancel: &Invocation) -> Option<libc::c_int> {
     if !cancel.is_cancelled() {
         return None;
     }
@@ -163,7 +163,7 @@ pub(crate) fn name(signo: libc::c_int) -> &'static str {
 /// a test can signal it while it is provably mid-run.
 #[cfg(feature = "test-hooks")]
 pub(crate) mod test_hooks {
-    use pbfhogg::host::Cancel;
+    use pbfhogg::host::Invocation;
 
     /// `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
     /// reaching the `k`-th checkpoint: it writes `<ready file>` and polls the
@@ -178,7 +178,7 @@ pub(crate) mod test_hooks {
         clippy::disallowed_methods,
         reason = "test-only hook files, outside every output and scratch API"
     )]
-    pub(crate) fn arm(cancel: &Cancel) {
+    pub(crate) fn arm(cancel: &Invocation) {
         if std::env::var_os("PBFHOGG_TEST_CANCEL_COUNT").is_some() {
             cancel.on_check(|_, _| {});
             return;
@@ -224,7 +224,7 @@ pub(crate) mod test_hooks {
     /// `PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN=1` makes every pin taken in the
     /// run reopen through the path. [`write_replacement_report`] writes what
     /// the replacement observed.
-    pub(crate) fn arm_input_replacement(cancel: &Cancel) {
+    pub(crate) fn arm_input_replacement(cancel: &Invocation) {
         let faults = cancel.faults();
         if std::env::var_os("PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN").is_some_and(|v| v == "1") {
             faults
@@ -255,7 +255,7 @@ pub(crate) mod test_hooks {
         clippy::disallowed_methods,
         reason = "test-only hook file, outside every output and scratch API"
     )]
-    pub(crate) fn write_replacement_report(cancel: &Cancel) {
+    pub(crate) fn write_replacement_report(cancel: &Invocation) {
         let Some(path) = std::env::var_os("PBFHOGG_TEST_REPLACE_REPORT") else {
             return;
         };
@@ -280,7 +280,7 @@ pub(crate) mod test_hooks {
         clippy::disallowed_methods,
         reason = "test-only hook file, outside every output and scratch API"
     )]
-    pub(crate) fn write_count(cancel: &Cancel) {
+    pub(crate) fn write_count(cancel: &Invocation) {
         if let Some(path) = std::env::var_os("PBFHOGG_TEST_CANCEL_COUNT") {
             drop(std::fs::write(path, cancel.checks_passed().to_string()));
         }

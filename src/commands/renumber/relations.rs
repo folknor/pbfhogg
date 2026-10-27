@@ -50,7 +50,7 @@ pub(super) fn relation_r1_collect_ids(
     source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     relation_id_set: &mut IdSet,
-    cancel: &crate::host::Cancel,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let counters = StageCounters::new();
     let mut buffers = BlobBuffers::default();

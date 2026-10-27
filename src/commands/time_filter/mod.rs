@@ -89,7 +89,7 @@ pub fn time_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = time_filter_to(
         input.into(),
         &output,
@@ -98,7 +98,7 @@ pub fn time_filter<'a>(
         overrides,
         host,
     )?;
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

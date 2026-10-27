@@ -369,10 +369,10 @@ pub fn add_locations_to_ways<'a>(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    host.cancel.check()?;
+    host.invocation.check()?;
     let result = add_locations_to_ways_to(input, &output, options, overrides, host, &scratch)?;
     drop(scratch);
-    output.publish(&host.cancel)?;
+    output.publish(&host.invocation)?;
     Ok(result)
 }
 

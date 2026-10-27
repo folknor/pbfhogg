@@ -317,14 +317,14 @@ pub(crate) static WRITER_METRICS: WriterMetrics = WriterMetrics::new();
 ///
 /// Without `test-hooks` this is `f()` and compiles to nothing.
 #[cfg(feature = "test-hooks")]
-pub(crate) fn with_sync_observer<R>(cancel: &crate::host::Cancel, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_sync_observer<R>(cancel: &crate::host::Invocation, f: impl FnOnce() -> R) -> R {
     sync_observer::with(cancel, f)
 }
 
 /// See the `test-hooks` twin.
 #[cfg(not(feature = "test-hooks"))]
 #[inline(always)]
-pub(crate) fn with_sync_observer<R>(_cancel: &crate::host::Cancel, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_sync_observer<R>(_cancel: &crate::host::Invocation, f: impl FnOnce() -> R) -> R {
     f()
 }
 
@@ -332,16 +332,16 @@ pub(crate) fn with_sync_observer<R>(_cancel: &crate::host::Cancel, f: impl FnOnc
 mod sync_observer {
     use std::cell::RefCell;
 
-    use crate::host::Cancel;
+    use crate::host::Invocation;
 
     thread_local! {
         /// The token whose plan counts this thread's fsyncs, if any. An owned
         /// clone, so nothing can dangle.
-        static ACTIVE: RefCell<Option<Cancel>> = const { RefCell::new(None) };
+        static ACTIVE: RefCell<Option<Invocation>> = const { RefCell::new(None) };
     }
 
     /// Puts the previous selection back when the scope ends.
-    struct Restore(Option<Cancel>);
+    struct Restore(Option<Invocation>);
 
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -350,7 +350,7 @@ mod sync_observer {
         }
     }
 
-    pub(super) fn with<R>(cancel: &Cancel, f: impl FnOnce() -> R) -> R {
+    pub(super) fn with<R>(cancel: &Invocation, f: impl FnOnce() -> R) -> R {
         let previous = ACTIVE.with_borrow_mut(|active| active.replace(cancel.clone()));
         let _restore = Restore(previous);
         // No borrow is held while `f` runs.

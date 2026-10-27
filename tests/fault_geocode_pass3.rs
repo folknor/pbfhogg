@@ -32,7 +32,7 @@ mod geocode_pass3 {
         let before = snapshot_dir(dir.path());
 
         let host = crate::common::test_host();
-        host.cancel
+        host.invocation
             .faults()
             .geocode_streets_panic_at_way
             .store(2, Ordering::Relaxed);

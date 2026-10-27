@@ -33,7 +33,7 @@ fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
 
     // Arm bucket 1 (middle-ish of stage-3's slot_bucket_count).
     let host = crate::common::test_host();
-    host.cancel
+    host.invocation
         .faults()
         .altw_stage3_panic_at_bucket
         .store(1, Ordering::Relaxed);

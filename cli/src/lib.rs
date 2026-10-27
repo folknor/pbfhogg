@@ -2374,7 +2374,7 @@ pub fn run() -> process::ExitCode {
     // First, before any thread exists: SIGINT and SIGTERM become a
     // cancellation request (see `signals`). Every thread started from here on
     // inherits the blocked mask.
-    let cancel = pbfhogg::host::Cancel::new();
+    let cancel = pbfhogg::host::Invocation::new();
     if let Err(e) = signals::install(cancel.clone()) {
         host::cli_warning(
             "cli.signals",
@@ -3212,14 +3212,14 @@ pub fn run() -> process::ExitCode {
     pbfhogg::read::emit_read_counters();
     pbfhogg::write::report_writer_degradations(&host.diagnostics);
     #[cfg(feature = "test-hooks")]
-    signals::test_hooks::write_count(&host.cancel);
+    signals::test_hooks::write_count(&host.invocation);
     #[cfg(feature = "test-hooks")]
-    signals::test_hooks::write_replacement_report(&host.cancel);
+    signals::test_hooks::write_replacement_report(&host.invocation);
 
     // From here on the outcome is decided; a "stopping" notice the signal
     // thread has not printed yet would be stale.
     signals::finish();
-    let signal = signals::first_signal(&host.cancel);
+    let signal = signals::first_signal(&host.invocation);
     match result {
         Ok(()) => {
             if let Some(signo) = signal {
@@ -3843,11 +3843,11 @@ fn run_export(
     if let Some(output) = output {
         // The input/output alias refusal already ran in
         // `validate_input_output_aliases`, against the destination.
-        let mut buf = output.writer(&host.cancel)?;
+        let mut buf = output.writer(&host.invocation)?;
         run_export_to(file, &mut buf, options, host)?;
         // The checked flush that lets the output be published.
         buf.finish()?;
-        output.publish(&host.cancel)?;
+        output.publish(&host.invocation)?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
@@ -4019,12 +4019,12 @@ fn run_diff(
         // dispatch made no scratch directory.
         pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
     } else if let Some(output) = output {
-        let mut out = output.writer(&host.cancel)?;
+        let mut out = output.writer(&host.invocation)?;
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
         out.finish()?;
         // A diff that found differences is a completed answer, not a
         // failure: its output is published like any other.
-        output.publish(&host.cancel)?;
+        output.publish(&host.invocation)?;
         stats
     } else {
         // A reader that leaves early stops the diff here, before its verdict
@@ -4438,9 +4438,9 @@ fn run_inspect(
             // Reads frame headers up to the first data blob, checking the
             // token before each; decided before and after like every
             // read-only command.
-            host.cancel.check()?;
+            host.invocation.check()?;
             let has_index = pbfhogg::has_indexdata_in(path, direct_io, host)?;
-            host.cancel.check()?;
+            host.invocation.check()?;
             let mut out = output::buffered();
             let printed = if quiet {
                 Ok(())
@@ -4473,7 +4473,7 @@ fn run_inspect(
             // `file.size` is the size of the file the header was read from.
             // A file without a header is the library's single missing-header
             // error.
-            host.cancel.check()?;
+            host.invocation.check()?;
             let read = pbfhogg::inspect::inspect_header(path, direct_io, host)?;
             let header = &read.header;
             let val = match known {
@@ -4507,7 +4507,7 @@ fn run_inspect(
                 return Err(format!("key {key} has no value in this file").into());
             };
             // The completion decision, as for `--indexed`.
-            host.cancel.check()?;
+            host.invocation.check()?;
             let mut out = output::buffered();
             writeln!(out, "{v}")?;
             out.flush()?;
@@ -4533,7 +4533,7 @@ fn run_inspect(
     // cannot answer one question from each file. Alone, the scan decides for
     // itself (it pins when it may read twice), so a full-decode-only scan
     // still reads a FIFO.
-    host.cancel.check()?;
+    host.invocation.check()?;
     let pin = if indexed || nodes {
         Some(pbfhogg::read::input::PinnedInput::pin(path, host)?)
     } else {
@@ -4571,7 +4571,7 @@ fn run_inspect(
     };
     // The completion decision: the indexdata probe has no checkpoint of its
     // own, so a cancellation during it must not still produce an answer.
-    host.cancel.check()?;
+    host.invocation.check()?;
 
     // Everything is computed; only output remains. `--indexed` makes the
     // exit status an answer, and a reader that left early must not cost it.
@@ -4680,7 +4680,7 @@ fn run_bench_read(
         BenchReadMode::Sequential => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
                 .diagnostics(host.diagnostics.clone())
-                .cancel(host.cancel.clone());
+                .cancel(host.invocation.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -4696,7 +4696,7 @@ fn run_bench_read(
         BenchReadMode::Parallel => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
                 .diagnostics(host.diagnostics.clone())
-                .cancel(host.cancel.clone());
+                .cancel(host.invocation.clone());
             let start = Instant::now();
             let (nodes, ways, rels) = reader.par_map_reduce(
                 |el| match el {
@@ -4715,7 +4715,7 @@ fn run_bench_read(
         BenchReadMode::Pipelined => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
                 .diagnostics(host.diagnostics.clone())
-                .cancel(host.cancel.clone());
+                .cancel(host.invocation.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -4735,7 +4735,7 @@ fn run_bench_read(
             let mut reader = pbfhogg::BlobReader::from_path(path)?
                 .evict_page_cache(true)
                 .diagnostics(host.diagnostics.clone())
-                .cancel(host.cancel.clone());
+                .cancel(host.invocation.clone());
             let source: std::sync::Arc<std::path::Path> = std::sync::Arc::from(path);
             // The leading OsmHeader is required like everywhere else: a
             // zero-byte or header-less file is the one missing-header error,
@@ -4791,7 +4791,7 @@ fn bench_write_loop<W: std::io::Write>(
     // library reader, as bench-read uses: it accepts a partially indexed file.
     let mut reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
         .diagnostics(host.diagnostics.clone())
-        .cancel(host.cancel.clone());
+        .cancel(host.invocation.clone());
     // The leading OsmHeader is required like everywhere else: a zero-byte or
     // header-less file is the one missing-header error, not an empty run.
     // Taken from this pass's own reader rather than a second open, and

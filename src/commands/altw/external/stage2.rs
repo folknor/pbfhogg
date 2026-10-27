@@ -392,7 +392,7 @@ pub(super) fn stage2_node_join(
                         // Cancellation is checked per bucket and per node
                         // blob inside it, and leaves through this worker's
                         // error slot like any bucket failure.
-                        host.cancel.check()?;
+                        host.invocation.check()?;
                         // Load + sort id-bucket records.
                         let t_load = crate::counters::Stopwatch::start();
                         let bkt = prepare_bucket(
@@ -444,7 +444,7 @@ pub(super) fn stage2_node_join(
                         let mut bucket_straddlers: u64 = 0;
 
                         for blob in &mapping_ref[lo_blob..hi_blob] {
-                            host.cancel.check()?;
+                            host.invocation.check()?;
                             // Straddler: blob extends past either bucket
                             // boundary, so it's also touched by an
                             // adjacent worker.

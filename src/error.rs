@@ -72,7 +72,7 @@ pub(crate) fn new_output_error(kind: OutputError) -> Error {
     new_error(ErrorKind::Output(kind))
 }
 
-/// The error a tripped [`Cancel`](crate::host::Cancel) checkpoint returns.
+/// The error a tripped [`Invocation`](crate::host::Invocation) checkpoint returns.
 #[cold]
 pub(crate) fn new_cancelled() -> Error {
     new_error(ErrorKind::Cancelled)
@@ -478,7 +478,7 @@ impl Error {
     }
 
     /// Whether this error is a cancellation: the run stopped because its
-    /// [`Cancel`](crate::host::Cancel) token was tripped, not because
+    /// [`Invocation`](crate::host::Invocation) token was tripped, not because
     /// something failed. Looks through `io::Error` carriers (the writers'
     /// `io::Result` boundaries carry the typed error inside one) and through
     /// context, never through another error's cause: a failure that merely
@@ -686,7 +686,7 @@ pub enum ErrorKind {
     /// An output could not be prepared or published; see
     /// [`crate::output`].
     Output(OutputError),
-    /// The invocation's [`Cancel`](crate::host::Cancel) token was tripped and
+    /// The invocation's [`Invocation`](crate::host::Invocation) token was tripped and
     /// the run stopped at a checkpoint. Not a failure of the run: it stopped
     /// because it was asked to, every guard dropped (scratch and output
     /// staging removed) and nothing was published.

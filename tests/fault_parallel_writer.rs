@@ -80,7 +80,7 @@ fn fault_injection_parallel_writer_pool_panic_surfaces_error_and_joins_pool() {
     let before = common::snapshot_dir(dir.path());
 
     let host = crate::common::test_host();
-    let faults = host.cancel.faults();
+    let faults = host.invocation.faults();
     faults.hold_other_pool_workers.store(true, SeqCst);
     faults.pool_worker_panic.store(0, SeqCst);
 

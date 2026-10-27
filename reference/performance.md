@@ -1071,19 +1071,21 @@ with near-zero missing refs.
 
 The case the change is for, a ways-only file where every way ref is
 missing (`--snapshot ways-only`, a `cat --type way` output). These runs
-exit 1 (the check fails, as it should), which brokkr does not store, so
-the figures come from `brokkr sidecar dirty` right after each run:
+exit 1, the check rightly failing; brokkr stores them since brokkr#45,
+with `meta.exit_code=1`:
 
-| Input | Commit | Wall | Peak anon | Major faults |
-|---|---|---:|---:|---:|
-| europe ways-only | `d353ef87` (parent) | **5m28s** | **25.0 GB** | 3.9M |
-| europe ways-only | `07274615` | **12.0 s** | **2.03 GB** | 0 |
+| Input | Commit | Wall | Peak RSS | UUID |
+|---|---|---:|---:|---|
+| europe ways-only | `d353ef87` (parent) | **300.9 s** | **25.2 GB** | `7cf2fa34` |
+| europe ways-only | `79c14c13` | **15.9 s** | **2.0 GB** | `c8047161` |
 
-The parent filled its vector in 27 s and then sorted it out of swap for
-about 5 minutes on a 30.5 GiB host; HEAD's peak is the node bitset, the
-missing-node set over the same range and the decode buffers. Denmark
-ways-only runs finish in under a second, too short for the sampler to
-catch each phase's peak, so they are not tabled.
+The parent filled its vector in 25 s and then sorted it out of swap for
+about 4.5 minutes on a 30.5 GiB host; the current code's peak is the node
+bitset, the missing-node set over the same range and the decode buffers.
+Its 15.9 s includes a cold 5.6 s schedule walk; an earlier unstored
+warm-cache pair read 12.0 s against 5m28s. Denmark ways-only runs finish
+in under a second, too short for the sampler to catch each phase's peak,
+so they are not tabled.
 
 ## Renumber (external mode)
 

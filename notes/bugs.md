@@ -44,17 +44,3 @@ and it carries forward any coordinate an earlier run left stale. It needs
 its own resolution and accounting (the global `loc_missing` would still
 count those IDs). Not decided whether it is wanted at all, given the docs
 now require `--keep-untagged-nodes`.
-
-## brokkr side
-
-brokkr#43. Since brokkr `ec725cb`, `brokkr verify merge
---locations-on-ways` holds pbfhogg's `-l` output to `check --locations`
-and accepts a handcrafted `--osc` beside `--input`; new OSC downloads are
-named by sequence, not date. It passed on 2026-10-27 on europe
-`altw-keep-untagged` + OSC 4715 (about 35 min) and on denmark
-`altw-keep-untagged` + OSC 4705 (27 s); osmium's own output is reported
-stale (563 refs on 538 nodes on denmark). Open on the brokkr side: `verify
-all` runs plain merges only; the denmark base it needs is now registered.
-The in-tree `cli/tests/cli_apply_changes_osmium.rs` stays:
-it compares coordinates against a computed expected state, which brokkr's
-verify does not.

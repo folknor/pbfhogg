@@ -112,10 +112,13 @@ fn split(id: i64) -> Option<(u64, u32)> {
     Some((id >> ID_SHIFT, (id & OFFSET_MASK) as u32))
 }
 
+/// A zeroed bit array. Allocated with `alloc_zeroed` semantics so a chunk this
+/// large comes from fresh zero pages and is resident only as far as it is
+/// written, rather than being touched end to end up front.
 fn new_dense() -> Box<[AtomicU64]> {
-    std::iter::repeat_with(|| AtomicU64::new(0))
-        .take(WORDS_PER_CHUNK)
-        .collect()
+    let words = Box::<[AtomicU64]>::new_zeroed_slice(WORDS_PER_CHUNK);
+    // SAFETY: an all-zero bit pattern is a valid `AtomicU64` (value 0).
+    unsafe { words.assume_init() }
 }
 
 #[inline]

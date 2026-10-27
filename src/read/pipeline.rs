@@ -172,14 +172,6 @@ pub(crate) struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reached only through `ElementReader::refusing_kind_claims`, the \
-                      pipelined adoption seam no phase uses yet"
-        )
-    )]
     pub(crate) fn set_kind_claims(&mut self, claims: crate::scan::classify::KindClaims) {
         self.kind_claims = claims;
     }

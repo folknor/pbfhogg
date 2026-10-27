@@ -72,11 +72,32 @@ that believes its claims unchecked), and the pipelined reader takes
 pipelined decode step make the check; a raw-bytes walker builds no block and
 checks the group fields it reads itself, as `check --locations` does.
 
-Adopted so far: `check --refs`, `check --ids` and (through its own raw
-scanner) `check --locations`, where a contradiction stops the check rather
-than refuses the file: the check fails it, exit 1 (cli-reference.md,
-`check`). Every other per-kind phase in the table below still believes its
-claims unchecked.
+In `check --refs`, `check --ids` and (through its own raw scanner)
+`check --locations` a contradiction stops the check rather than refuses the
+file: the check fails it, exit 1 (cli-reference.md, `check`). Everywhere
+else it is a refusal, exit 2, with nothing published. Adopted by:
+
+- repack, and degrade's decode path and `--drop-ids` selection;
+- the sort and `cat --dedupe` sweep, for blobs it decodes in an overlap run
+  on a believed claim (an unsorted-header sort indexes blobs from their
+  payloads and so has no claim to refuse);
+- diff and derive (`diff --format osc`), at the one block decode both use;
+- the geocode builder, every pass (Pass 1 through the pipelined reader,
+  Pass 1.5 through its raw way scan, Passes 2a and 2b through the pools), so
+  every kind lie in its input is refused;
+- extract in every strategy and multi-extract, including their raw node and
+  way scans and the raw-copy candidate scan;
+- tags-filter (two-pass and `-R`), tags-count (so `inspect --tags --type`),
+  `inspect --nodes`, getid (include, `removeid`, `--add-referenced`,
+  `--id-osm-file`) and getparents.
+
+Not adopted: `add-locations-to-ways` and `time-filter` (the latter builds no
+per-kind schedule). `tags-filter --distrust-metadata` believes no claim and is
+never refused. A blob a phase skips or copies on its claim without decoding
+it is still believed, which is the residual the table below records; in
+getid's include and streaming paths, which handle every decoded element by
+its real kind, the refusal makes a lie visible rather than changes an
+answer.
 
 A blob that carries no `indexdata` or no `tagdata` makes no claim. Readers
 also treat sidecar bytes they cannot parse (unrecognised length, version or
@@ -88,7 +109,7 @@ consequence 3).
 
 | Claim | Believed by, and what a lie costs | Checked in passing by | Verified by |
 |-------|-----------------------------------|-----------------------|-------------|
-| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes, and searches for surviving ways with stale inline coordinates only in blobs claimed as ways, so a way blob labelled with another kind can be passed through with its stale coordinates. `check --locations` reads a blob claiming ways only in its way passes; every other blob it decodes once and routes on what it holds. `check --ids` / `--refs` read each blob in the phase of its claimed kind and judge type order from the claims; a blob claiming relations is read by `--refs` only under `--check-relations`, and `--ids -t` reads only the selected kinds' blobs, so a lie in a blob no phase reads passes them. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind); `check --ids`, `check --refs` and `check --locations` (a blob claiming ways) stop and fail the file on a decoded element of another kind ("Kind claims refused at decode") | `check --index` |
+| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements; the phase that does read it refuses it where the decode-time refusal is adopted ("Kind claims refused at decode") and drops elements of the unclaimed kind silently where it is not. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes, and searches for surviving ways with stale inline coordinates only in blobs claimed as ways, so a way blob labelled with another kind can be passed through with its stale coordinates. `check --locations` reads a blob claiming ways only in its way passes; every other blob it decodes once and routes on what it holds. `check --ids` / `--refs` read each blob in the phase of its claimed kind and judge type order from the claims; a blob claiming relations is read by `--refs` only under `--check-relations`, and `--ids -t` reads only the selected kinds' blobs, so a lie in a blob no phase reads passes them. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind); `check --ids`, `check --refs` and `check --locations` (a blob claiming ways) stop and fail the file on a decoded element of another kind; every other adopting command refuses it ("Kind claims refused at decode") | `check --index` |
 | `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff` plans shards from ranges, decides from them which blob pairs overlap, and skips decoding a pair whose claimed range and count match when its compressed bytes are identical (`-c`, `--format osc`). `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range (`check --locations` partitions them by the range it decoded, not the claimed one). `inspect --show` skips on range. | `diff` refuses ranges that break canonical order, and a block holding elements past its claimed `max_id` where the merge meets them (a shard boundary hides what lies past it); `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
 | `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |

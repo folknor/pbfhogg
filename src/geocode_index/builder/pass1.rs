@@ -50,6 +50,9 @@ pub(super) fn run_pass1(
         let reader = ElementReader::open_in(input, direct_io, host)?;
         reader
             .with_blob_filter(BlobFilter::only_relations())
+            // The filter believes the claim; a decoded block holding another
+            // kind is a lying claim, refused rather than losing its relations.
+            .refusing_kind_claims()
             .for_each_block_pipelined(|block| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(rel) = element {

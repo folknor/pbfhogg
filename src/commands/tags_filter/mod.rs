@@ -106,6 +106,19 @@ fn trusted_blob_filter(
     blob_filter_from_expressions(expressions)
 }
 
+/// Whether decoding refuses a blob holding a kind its indexdata does not
+/// claim. Every path that decodes a blob on the strength of its claim, and
+/// every path that merely decodes under an indexed file, refuses a lying
+/// claim; `--distrust-metadata` has said the claims are not to be believed,
+/// so it does not turn a false claim into an error.
+fn kind_claims(distrust_metadata: bool) -> crate::scan::classify::KindClaims {
+    if distrust_metadata {
+        crate::scan::classify::KindClaims::Unchecked
+    } else {
+        crate::scan::classify::KindClaims::Refuse
+    }
+}
+
 /// Check if an element's tags match any applicable expression (OR semantics).
 ///
 /// Callers pass exactly one kind. Keep the expression-first traversal: it
@@ -493,6 +506,13 @@ fn tags_filter_single_pass(
     } = *write;
     host.invocation.marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open_in(input, direct_io, host)?;
+    // A decoded block holding a kind its blob's indexdata does not claim is
+    // refused; `--distrust-metadata` does not believe the claims.
+    let reader = if distrust_metadata {
+        reader
+    } else {
+        reader.refusing_kind_claims()
+    };
     // Blob-level filtering can't help in invert mode - we want non-matching blobs.
     let reader = match trusted_blob_filter(expressions, invert, distrust_metadata) {
         Some(filter) => reader.with_blob_filter(filter),
@@ -784,7 +804,7 @@ fn tags_filter_two_pass(
             }
             schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
                 &meta,
-                crate::scan::classify::KindClaims::Unchecked,
+                kind_claims(distrust_metadata),
             )?);
         }
         if blobs_skipped_by_tag > 0 {
@@ -1003,7 +1023,7 @@ fn tags_filter_two_pass(
 
         schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
             &meta,
-            crate::scan::classify::KindClaims::Unchecked,
+            kind_claims(distrust_metadata),
         )?);
     }
     let input_file = walker.input();
@@ -1155,7 +1175,7 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
-        crate::scan::classify::KindClaims::Unchecked,
+        kind_claims(distrust_metadata),
         host,
     )?;
 
@@ -1281,7 +1301,7 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
-        crate::scan::classify::KindClaims::Unchecked,
+        kind_claims(distrust_metadata),
         host,
     )?;
 

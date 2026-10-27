@@ -160,6 +160,71 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
     Ok(true)
 }
 
+/// Refuse a raw-scanned block holding an element of a kind other than the
+/// blob's indexdata claim: the raw classify walkers build no `PrimitiveBlock`
+/// and read only their own kind, so a foreign element is one the run would
+/// never see (`IndexdataMismatch` with a `KindContradiction`). A blob with no
+/// claim is never refused.
+///
+/// Walks the group field tags with the crate's `KindSet` rule (a dense
+/// message counts only when it carries an ID) and reads no element body, so
+/// the cost is one tag read and skip per element. Run it after the raw
+/// walker has accepted the block, so a framing error is reported as one.
+pub(super) fn refuse_foreign_kind_raw(
+    decompressed: &[u8],
+    claim: Option<crate::ElementKind>,
+) -> crate::error::Result<()> {
+    use crate::ElementKind;
+    use crate::read::wire::WireDenseNodes;
+
+    let Some(claimed) = claim else {
+        return Ok(());
+    };
+    let mut kinds = crate::element_kind::KindSet::default();
+    let mut top = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = top.read_tag()? {
+        if field != 2 || wire_type != WIRE_LEN {
+            top.skip_field(wire_type)?;
+            continue;
+        }
+        let mut group = Cursor::new(top.read_len_delimited()?);
+        while let Some((gfield, gwire)) = group.read_tag()? {
+            if gwire != WIRE_LEN {
+                group.skip_field(gwire)?;
+                continue;
+            }
+            let data = group.read_len_delimited()?;
+            match gfield {
+                1 => kinds.add(ElementKind::Node),
+                2 if !WireDenseNodes::parse(data)?.id_data.is_empty() => {
+                    kinds.add(ElementKind::Node);
+                }
+                3 => kinds.add(ElementKind::Way),
+                4 => kinds.add(ElementKind::Relation),
+                _ => {}
+            }
+        }
+    }
+    match kinds.foreign_to(claimed) {
+        Some(found) => Err(crate::error::new_kind_contradiction(claimed, found)),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a block decoded from `blob` when it holds an element of a kind
+/// other than the blob's indexdata claim, located at the blob. For the
+/// sequential sweeps, which decode with `BlobReader` rather than a classify
+/// pool.
+pub(super) fn refuse_blob_foreign_kind(
+    blob: &crate::blob::Blob,
+    block: &PrimitiveBlock,
+    source: Option<&std::sync::Arc<Path>>,
+) -> crate::error::Result<()> {
+    block
+        .refuse_foreign_kind(blob.index().map(|index| index.kind))
+        .map_err(|err| blob.locate_error(source, err))
+}
+
 /// Report the outcome of passthrough verification: counters always, and a
 /// warning when a candidate failed: either its indexdata bbox claimed a
 /// containment its own payload contradicts, or the payload has a shape no

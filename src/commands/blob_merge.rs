@@ -1246,6 +1246,15 @@ impl Sweep<'_, '_> {
             let frame = &self.frames[entry.frame];
             let source = &self.sources[frame.source];
             let block = read_block(source, frame, frame_buf)?;
+            // A believed header claim routed this blob to this kind's sweep;
+            // an element of another kind would be dropped by the extraction.
+            // A scanned entry's kind came from the payload, not a claim, and
+            // a restructured frame is read per kind on purpose.
+            if !entry.index_scanned {
+                block
+                    .refuse_foreign_kind(Some(entry.index.kind))
+                    .map_err(|e| source.locate_at(frame.file_offset, e))?;
+            }
             for element in block.elements() {
                 extract(&element, &mut heap).map_err(|e| source.locate_at(frame.file_offset, e))?;
             }

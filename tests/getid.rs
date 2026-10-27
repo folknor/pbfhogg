@@ -1234,3 +1234,213 @@ fn removeid_multi_blob_passthrough() {
          through without decoding"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Kind-claim refusal
+// ---------------------------------------------------------------------------
+
+/// Frame ordinals of the claim fixture: header, nodes, ways, relations.
+const NODE_BLOB: usize = 1;
+const WAY_BLOB: usize = 2;
+
+/// A sorted, indexed file with one blob per kind: nodes 1 and 2, way 10
+/// over them, relation 30 over the way.
+fn write_claim_fixture(path: &std::path::Path) {
+    let node = |id| TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 100_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    crate::common::write_test_pbf_sorted(
+        path,
+        &[node(1), node(2)],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 30,
+            members: vec![crate::common::TestMember {
+                id: pbfhogg::MemberId::Way(10),
+                role: "",
+            }],
+            tags: vec![],
+            meta: None,
+        }],
+    );
+}
+
+/// The fixture with frame `blob`'s indexdata kind byte set to `kind`
+/// (0 node, 1 way, 2 relation): a lie no producer writes.
+fn forged_claim(dir: &std::path::Path, blob: usize, kind: u8) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_claim_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, blob, |index| {
+        index[1] = kind;
+    });
+    let path = dir.join(format!("blob-{blob}-claims-{kind}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+fn assert_contradiction(
+    err: &pbfhogg::Error,
+    claimed: pbfhogg::ElementKind,
+    found: pbfhogg::ElementKind,
+    blob: usize,
+    what: &str,
+) {
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+        "{what}: {err:?}"
+    );
+    assert_eq!(
+        err.kind_contradiction(),
+        Some(pbfhogg::KindContradiction { claimed, found }),
+        "{what}"
+    );
+    assert_eq!(err.blob_index(), Some(blob as u64), "{what}");
+}
+
+fn run_getid(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    specs: &[&str],
+    opts: &GetidOptions,
+) -> pbfhogg::Result<()> {
+    let id_set = parse_ids(&ids(specs))?;
+    getid(
+        input,
+        crate::common::out(output),
+        &id_set,
+        opts,
+        &WriteOptions::default(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .map(|_| ())
+}
+
+/// A way blob claiming nodes, decoded because a requested node ID falls in
+/// its claimed range, is refused by the include walker. Before the
+/// refusal the way was found by its real kind and written: a lie made
+/// visible, not an answer changed.
+#[test]
+fn getid_include_refuses_a_way_blob_claiming_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claim(dir.path(), WAY_BLOB, 0);
+    let output = dir.path().join("out.osm.pbf");
+    let err = run_getid(&input, &output, &["n10", "w10"], &default_opts())
+        .expect_err("a lying claim must be refused");
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Node,
+        pbfhogg::ElementKind::Way,
+        WAY_BLOB,
+        "include",
+    );
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// `--add-referenced` pass 2 (the pipelined reader) refuses the same lie.
+#[test]
+fn getid_add_referenced_refuses_a_way_blob_claiming_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claim(dir.path(), WAY_BLOB, 0);
+    let output = dir.path().join("out.osm.pbf");
+    let err = run_getid(&input, &output, &["n10", "w10"], &add_ref_opts())
+        .expect_err("a lying claim must be refused");
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Node,
+        pbfhogg::ElementKind::Way,
+        WAY_BLOB,
+        "add-referenced pass 2",
+    );
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// `--add-referenced` pass 1 schedules way blobs on the claim: a node blob
+/// claiming ways is decoded there and refused. Before the refusal the
+/// node blob was scanned as a way blob, found no ways, and the referenced
+/// nodes of way 10 were silently never collected.
+#[test]
+fn getid_add_referenced_pass1_refuses_a_node_blob_claiming_ways() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claim(dir.path(), NODE_BLOB, 1);
+    let output = dir.path().join("out.osm.pbf");
+    let err = run_getid(&input, &output, &["w10"], &add_ref_opts())
+        .expect_err("a lying claim must be refused");
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Way,
+        pbfhogg::ElementKind::Node,
+        NODE_BLOB,
+        "add-referenced pass 1",
+    );
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// Invert mode (`removeid`): the way blob claiming nodes is decoded when a
+/// removed node ID falls in its claimed range, and would be re-encoded
+/// without regard to the way enrichment the output header carries. It is
+/// refused first.
+#[test]
+fn removeid_refuses_a_way_blob_claiming_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claim(dir.path(), WAY_BLOB, 0);
+    let output = dir.path().join("out.osm.pbf");
+    let id_set = parse_ids(&ids(&["n10"])).expect("parse ids");
+    let Err(err) = removeid(
+        &input,
+        crate::common::out(&output),
+        &id_set,
+        &WriteOptions::default(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    ) else {
+        panic!("a lying claim must be refused");
+    };
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Node,
+        pbfhogg::ElementKind::Way,
+        WAY_BLOB,
+        "removeid",
+    );
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// The honest fixture runs every one of those requests.
+#[test]
+fn getid_honest_claims_are_not_refused() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("honest.osm.pbf");
+    write_claim_fixture(&input);
+    for (name, specs, opts) in [
+        ("include", &["n10", "w10"][..], default_opts()),
+        ("add-referenced", &["n10", "w10"][..], add_ref_opts()),
+        ("add-referenced-pass1", &["w10"][..], add_ref_opts()),
+    ] {
+        let output = dir.path().join(format!("{name}.osm.pbf"));
+        run_getid(&input, &output, specs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(output.exists(), "{name}");
+    }
+    let output = dir.path().join("removeid.osm.pbf");
+    let id_set = parse_ids(&ids(&["n10"])).expect("parse ids");
+    removeid(
+        &input,
+        crate::common::out(&output),
+        &id_set,
+        &WriteOptions::default(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("removeid");
+    assert!(output.exists());
+}

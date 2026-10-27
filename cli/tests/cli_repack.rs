@@ -885,3 +885,88 @@ fn repack_strips_coords_when_input_flag_absent() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kind claims
+// ---------------------------------------------------------------------------
+
+/// Frame of the way blob in [`write_repack_fixture`]'s file: the header, three
+/// node blobs, then the way blob.
+const WAY_BLOB: usize = 4;
+
+/// The repack fixture with the way blob's indexdata kind byte set to `kind`
+/// (0 node, 2 relation): a lie no producer writes, forged in the header.
+fn relabelled_way_blob(dir: &Path, kind: u8) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_repack_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, WAY_BLOB, |index| {
+            assert_eq!(index[1], 1, "frame {WAY_BLOB} is the way blob");
+            index[1] = kind;
+        });
+    let path = dir.join(format!("way-blob-claims-{kind}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+/// A way blob whose indexdata claims node or relation used to be decoded by
+/// that kind's phase, which dropped its ways: the output published with the
+/// ways missing and exit 0. The run is now refused and publishes nothing.
+#[test]
+fn repack_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for (kind, claimed) in [(0, "node"), (2, "relation")] {
+        let input = relabelled_way_blob(dir.path(), kind);
+        let output = dir.path().join(format!("out-{kind}.osm.pbf"));
+        let out = CliInvoker::new()
+            .arg("repack")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--elements-per-blob")
+            .arg("10")
+            .assert_failure();
+        out.assert_stderr_contains(&format!(
+            "blob indexdata claims {claimed} elements but the blob holds way elements"
+        ));
+        assert!(!output.exists(), "claims {claimed}: nothing is published");
+    }
+}
+
+/// The passing counterpart: honest claims repack, and a wholly unindexed
+/// input under `--force` (which the schedule replicates into every kind's
+/// phase with no claim) is not refused and keeps every element.
+#[test]
+fn repack_accepts_honest_claims_and_unindexed_force_input() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let (nodes, ways, rels) = write_repack_fixture(&honest);
+
+    let output = dir.path().join("out.osm.pbf");
+    run_repack(&honest, &output, 10);
+    assert_eq!(read_normalized(&output).ways.len(), ways.len());
+
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&unindexed)
+        .arg("--strip-indexdata")
+        .assert_success();
+    let forced = dir.path().join("forced.osm.pbf");
+    CliInvoker::new()
+        .arg("repack")
+        .arg(&unindexed)
+        .arg("-o")
+        .arg(&forced)
+        .arg("--elements-per-blob")
+        .arg("10")
+        .arg("--force")
+        .assert_success();
+    let repacked = read_normalized(&forced);
+    assert_eq!(repacked.nodes.len(), nodes.len());
+    assert_eq!(repacked.ways.len(), ways.len());
+    assert_eq!(repacked.relations.len(), rels.len());
+}

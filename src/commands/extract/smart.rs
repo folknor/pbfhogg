@@ -168,6 +168,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
             blob_reader.set_parse_indexdata(true);
             blob_reader.leading_header()?;
+            let source = blob_reader.source().cloned();
             for blob_result in &mut blob_reader {
                 let blob = blob_result?;
                 if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -180,6 +181,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 }
                 blob.decompress_into(&mut decompress_buf)?;
                 let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+                super::common::refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
                 for element in block.elements_skip_metadata() {
                     match (phase, &element) {
                         (UnsortedPhase::Nodes, Element::DenseNode(dn))
@@ -264,7 +266,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         }
         walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
-        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
         // no passthrough since smart/complete don't use the passthrough
@@ -532,7 +534,7 @@ pub(super) fn extract_smart(
             crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::ElementKind::Way),
-                crate::scan::classify::KindClaims::Unchecked,
+                crate::scan::classify::KindClaims::Refuse,
                 host,
             )?
         } else {

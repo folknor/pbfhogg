@@ -1794,3 +1794,250 @@ fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kind claims
+// ---------------------------------------------------------------------------
+
+/// Indexdata kind bytes (byte 1 of the indexdata).
+const KIND_NODE: u8 = 0;
+const KIND_WAY: u8 = 1;
+const KIND_RELATION: u8 = 2;
+
+/// Frames of the fixture's blobs: the header, then one blob per kind.
+const FRAME_WAYS: usize = 2;
+const FRAME_RELATIONS: usize = 3;
+
+/// One forged claim: the frame, its honest kind byte, the claimed kind byte
+/// and the words the refusal uses for the claim and for what the blob holds.
+struct ForgedClaim {
+    frame: usize,
+    honest: u8,
+    claim: u8,
+    claimed: &'static str,
+    found: &'static str,
+}
+
+/// A way blob claiming nodes (the node phase believes it), a way blob
+/// claiming relations, and a relation blob claiming ways (the way phase
+/// believes it).
+const FORGED_CLAIMS: [ForgedClaim; 3] = [
+    ForgedClaim {
+        frame: FRAME_WAYS,
+        honest: KIND_WAY,
+        claim: KIND_NODE,
+        claimed: "node",
+        found: "way",
+    },
+    ForgedClaim {
+        frame: FRAME_WAYS,
+        honest: KIND_WAY,
+        claim: KIND_RELATION,
+        claimed: "relation",
+        found: "way",
+    },
+    ForgedClaim {
+        frame: FRAME_RELATIONS,
+        honest: KIND_RELATION,
+        claim: KIND_WAY,
+        claimed: "way",
+        found: "relation",
+    },
+];
+
+fn write_kind_fixture(path: &Path, sorted: bool) {
+    if sorted {
+        write_test_pbf_sorted(path, &test_nodes(), &test_ways(), &test_relations());
+    } else {
+        write_test_pbf(path, &test_nodes(), &test_ways(), &test_relations());
+    }
+}
+
+/// The fixture with one blob's indexdata kind byte forged: a lie no
+/// producer writes.
+fn forge_kind_claim(dir: &Path, sorted: bool, forged: &ForgedClaim) -> std::path::PathBuf {
+    let honest = dir.join(format!("honest-{sorted}.osm.pbf"));
+    write_kind_fixture(&honest, sorted);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, forged.frame, |index| {
+            assert_eq!(index[1], forged.honest, "frame {} kind", forged.frame);
+            index[1] = forged.claim;
+        });
+    let path = dir.join(format!(
+        "frame{}-claims-{}-{sorted}.osm.pbf",
+        forged.frame, forged.claim
+    ));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+fn refusal_text(claimed: &str, found: &str) -> String {
+    format!("blob indexdata claims {claimed} elements but the blob holds {found} elements")
+}
+
+fn multi_config(dir: &Path, name: &str) -> std::path::PathBuf {
+    let config = dir.join(format!("{name}.json"));
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"{name}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.display()
+        ),
+    )
+    .expect("write config");
+    config
+}
+
+/// A blob claiming one kind but holding another used to land in a phase
+/// that ignores its real contents (a node-claimed blob holding ways was read
+/// only by node-phase code, so its ways were dropped) and the extract was
+/// published with exit 0. Every strategy, sorted and unsorted, refuses it
+/// and publishes nothing.
+#[test]
+fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for sorted in [true, false] {
+        for forged in &FORGED_CLAIMS {
+            let input = forge_kind_claim(dir.path(), sorted, forged);
+            for (name, strategy) in [
+                ("simple", Strategy::Simple),
+                ("complete", Strategy::CompleteWays),
+                ("smart", Strategy::Smart),
+            ] {
+                let output = dir.path().join(format!(
+                    "out-{name}-{sorted}-{}-{}.osm.pbf",
+                    forged.frame, forged.claim
+                ));
+                let cli = CliInvoker::new()
+                    .arg("extract")
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&output)
+                    .arg("--bbox")
+                    .arg(BBOX_STR);
+                let out = strategy_args(cli, strategy)
+                    .arg("--set-bounds")
+                    .assert_failure();
+                out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
+                assert!(
+                    !output.exists(),
+                    "{name}, sorted {sorted}, frame {} claims {}: nothing is published",
+                    forged.frame,
+                    forged.claim
+                );
+            }
+        }
+    }
+}
+
+/// A way blob given a node blob's indexdata, bbox included, is a raw
+/// passthrough candidate: the node classify phase reads it raw, finds no
+/// node, and used to drop its ways. Single-region and multi-extract both
+/// refuse it.
+#[test]
+fn extract_refuses_a_passthrough_candidate_holding_ways() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let ways = [TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![],
+        meta: None,
+    }];
+    write_test_pbf_sorted(&honest, &inside_nodes(4, 1), &ways, &[]);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let node_index = indexdata_of(&pbf, 1);
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, FRAME_WAYS, |ix| {
+        ix.clone_from(&node_index);
+    });
+    std::fs::write(&input, lying).expect("write lying fixture");
+
+    let output = dir.path().join("single.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--bbox", BBOX_STR, "--simple"])
+        .assert_failure();
+    out.assert_stderr_contains(&refusal_text("node", "way"));
+    assert!(!output.exists(), "nothing is published");
+
+    let config = multi_config(dir.path(), "multi-candidate");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .args(["--simple", "--set-bounds"])
+        .assert_failure();
+    out.assert_stderr_contains(&refusal_text("node", "way"));
+    assert!(
+        !dir.path().join("multi-candidate.osm.pbf").exists(),
+        "nothing is published"
+    );
+}
+
+/// Multi-extract classifies each kind from the blobs claiming it, so every
+/// forged claim is refused before any region output is published.
+#[test]
+fn multi_extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for forged in &FORGED_CLAIMS {
+        let input = forge_kind_claim(dir.path(), true, forged);
+        let name = format!("multi-{}-{}", forged.frame, forged.claim);
+        let config = multi_config(dir.path(), &name);
+        let out = CliInvoker::new()
+            .arg("extract")
+            .arg(&input)
+            .arg("--config")
+            .arg(&config)
+            .args(["--simple", "--set-bounds"])
+            .assert_failure();
+        out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
+        assert!(
+            !dir.path().join(format!("{name}.osm.pbf")).exists(),
+            "frame {} claims {}: nothing is published",
+            forged.frame,
+            forged.claim
+        );
+    }
+}
+
+/// The passing counterpart: honest claims extract under every strategy,
+/// sorted and unsorted, and under multi-extract.
+#[test]
+fn extract_accepts_honest_kind_claims() {
+    let dir = crate::common::test_scratch();
+    for sorted in [true, false] {
+        let input = dir.path().join(format!("honest-{sorted}.osm.pbf"));
+        write_kind_fixture(&input, sorted);
+        for (name, strategy) in [
+            ("simple", Strategy::Simple),
+            ("complete", Strategy::CompleteWays),
+            ("smart", Strategy::Smart),
+        ] {
+            let output = dir.path().join(format!("out-{name}-{sorted}.osm.pbf"));
+            run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), strategy);
+            let elements = read_all_elements(&output);
+            let nodes = node_ids(&elements);
+            assert!(
+                nodes.contains(&1) && nodes.contains(&3),
+                "{name}, sorted {sorted}: {nodes:?}"
+            );
+            assert!(
+                way_ids(&elements).contains(&12),
+                "{name}, sorted {sorted}: the way inside the bbox is extracted"
+            );
+        }
+    }
+
+    let input = dir.path().join("honest-true.osm.pbf");
+    let config = multi_config(dir.path(), "multi-honest");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    let elements = read_all_elements(&dir.path().join("multi-honest.osm.pbf"));
+    assert_eq!(node_ids(&elements), vec![1, 3]);
+    assert!(way_ids(&elements).contains(&12));
+}

@@ -270,7 +270,7 @@ pub fn parse_ids_from_pbf<'a>(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         None,
-        crate::scan::classify::KindClaims::Unchecked,
+        crate::scan::classify::KindClaims::Refuse,
         host,
     )?;
 
@@ -776,6 +776,12 @@ fn filter_by_id_walker(
                     &mut gr_scratch,
                 )
                 .map_err(locate)?;
+                // The blob was routed (or passed over) on its claimed kind; a
+                // block holding another kind is a lying claim, refused before
+                // anything is written for it. An unindexed blob claims nothing.
+                block
+                    .refuse_foreign_kind(meta.index.as_ref().map(|idx| idx.kind))
+                    .map_err(locate)?;
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -959,6 +965,10 @@ fn filter_by_id_streaming(
                     &mut gr_scratch,
                 )
                 .map_err(locate)?;
+                // See `filter_by_id_walker`: a lying kind claim is refused.
+                block
+                    .refuse_foreign_kind(frame.index.as_ref().map(|idx| idx.kind))
+                    .map_err(locate)?;
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -1039,7 +1049,7 @@ fn getid_with_refs(
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::ElementKind::Way),
-            crate::scan::classify::KindClaims::Unchecked,
+            crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
 
@@ -1084,7 +1094,7 @@ fn getid_with_refs(
     // Pass 2: Write matching elements + dependent nodes (transform fused into
     // the decode workers).
     host.invocation.marker("GETID_PASS2_START");
-    let reader = ElementReader::open_in(input, write.direct_reads, host)?;
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?.refusing_kind_claims();
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
     let reader = reader.with_blob_filter(BlobFilter::new(

@@ -98,6 +98,46 @@ fn record_way_refs(
 }
 
 /// Whether any worker has already reported an error.
+/// Refuse a blob scheduled as ways whose groups hold another element kind.
+/// Only group field tags are read (a way message is skipped by its length),
+/// no block is built. `claim` is the entry's enforced claim; a claimless
+/// (unindexed) entry may legally hold several kinds and is never refused.
+fn refuse_foreign_kinds(
+    claim: Option<crate::ElementKind>,
+    decompressed: &[u8],
+    group_starts: &[(usize, usize)],
+) -> Result<()> {
+    use crate::read::wire::{Cursor, WIRE_LEN};
+
+    let Some(claim) = claim else { return Ok(()) };
+    let mut kinds = crate::element_kind::KindSet::default();
+    for &(off, len) in group_starts {
+        let Some(group) = decompressed.get(off..off + len) else {
+            continue;
+        };
+        let mut cursor = Cursor::new(group);
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            if wire_type == WIRE_LEN {
+                let message = cursor.read_len_delimited()?;
+                match field {
+                    1 => kinds.add(crate::ElementKind::Node),
+                    // An empty dense message holds no node.
+                    2 if !message.is_empty() => kinds.add(crate::ElementKind::Node),
+                    3 => kinds.add(crate::ElementKind::Way),
+                    4 => kinds.add(crate::ElementKind::Relation),
+                    _ => {}
+                }
+            } else {
+                cursor.skip_field(wire_type)?;
+            }
+        }
+    }
+    match kinds.foreign_to(claim) {
+        Some(found) => Err(crate::error::new_kind_contradiction(claim, found)),
+        None => Ok(()),
+    }
+}
+
 fn has_first_err(slot: &Mutex<Option<Error>>) -> bool {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -292,6 +332,10 @@ pub(super) fn run_pass1_5(
                                     }
                                 },
                             )?;
+                            // The scan above reads only way messages, so a
+                            // blob claiming ways but holding other kinds
+                            // would silently lose them: refuse it.
+                            refuse_foreign_kinds(entry.claim(), &decompress_buf, &group_starts)?;
                             compact_overflow_nodes(
                                 &mut overflow_nodes,
                                 &mut overflow_compacted_len,
@@ -386,7 +430,7 @@ pub(super) fn build_pass2_schedules(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
         let Some(idx) = meta.index.as_ref() else {
             unindexed.push(entry);
             continue;

@@ -1004,3 +1004,79 @@ fn merge_stats_match_output_counts_after_roundtrip() {
         "relation stats must partition the output relation set"
     );
 }
+
+/// A way blob whose indexdata claims another kind used to be merged in that
+/// kind's phase: the OSC reported its ways created and the old file's ways
+/// deleted. The comparison now refuses with exit 2 (not diff's 1) and
+/// publishes nothing, at every shard count and on either side.
+#[test]
+fn derive_refuses_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest = dir.path().join("honest.osm.pbf");
+    let write = |path: &Path| {
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        let mut writer = PbfWriter::to_path(
+            path,
+            Compression::default(),
+            &header,
+            pbfhogg::host::Executor::Ambient,
+        )
+        .expect("create writer");
+        let mut bb = BlockBuilder::new();
+        for id in 1..=3_i64 {
+            bb.add_node(id, 100_000_000, 200_000_000, [], None);
+        }
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("nodes"))
+            .expect("write");
+        bb.add_way(100, [], &[1, 2], None);
+        bb.add_way(200, [], &[1, 2], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("ways"))
+            .expect("write");
+        writer.flush().expect("flush");
+    };
+    write(&old);
+    write(&honest);
+
+    for jobs in [1_usize, 4] {
+        let osc = dir.path().join(format!("honest-{jobs}.osc.gz"));
+        let out = run_derive(&old, &honest, &osc, false, false, Some(jobs));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "-j {jobs}: honest pair; stderr:\n{}",
+            out.stderr_str()
+        );
+    }
+
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "blob 2 is the way blob");
+        ix[1] = 0;
+    });
+    let lying = dir.path().join("lying.osm.pbf");
+    std::fs::write(&lying, forged).expect("write forged");
+
+    for (a, b, label) in [(&old, &lying, "new side"), (&lying, &old, "old side")] {
+        for jobs in [1_usize, 4] {
+            let osc = dir.path().join(format!("refused-{label}-{jobs}.osc.gz"));
+            let out = run_derive(a, b, &osc, false, false, Some(jobs));
+            let stderr = out.stderr_str();
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{label} -j {jobs}: a refusal exits 2; stderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("indexdata claims"),
+                "{label} -j {jobs}: expected the kind contradiction; got:\n{stderr}"
+            );
+            assert!(!osc.exists(), "{label} -j {jobs}: nothing may be published");
+        }
+    }
+}

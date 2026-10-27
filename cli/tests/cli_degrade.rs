@@ -2359,3 +2359,116 @@ mod tier2 {
         assert!(sum > 0, "10:16 on the unsort fixture must produce dangles");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kind claims
+// ---------------------------------------------------------------------------
+
+/// Frame of the way blob in [`write_degrade_fixture`]'s file: the header,
+/// three node blobs, then the way blob.
+const FIXTURE_WAY_BLOB: usize = 4;
+
+/// The degrade fixture with the way blob's indexdata kind byte set to `kind`
+/// (0 node, 2 relation): a lie no producer writes, forged in the header.
+fn relabelled_way_blob(dir: &Path, kind: u8) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_degrade_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(
+        &bytes,
+        FIXTURE_WAY_BLOB,
+        |index| {
+            assert_eq!(index[1], 1, "frame {FIXTURE_WAY_BLOB} is the way blob");
+            index[1] = kind;
+        },
+    );
+    let path = dir.join(format!("way-blob-claims-{kind}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+/// A way blob claiming another kind used to be decoded by that kind's phase,
+/// dropping its ways from the output with exit 0, and under `--drop-ids` from
+/// the drop selection too. Both decode-path routes now refuse and publish
+/// nothing.
+#[test]
+fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for (kind, claimed) in [(0, "node"), (2, "relation")] {
+        let input = relabelled_way_blob(dir.path(), kind);
+        for (name, flags) in [
+            ("unsort", ["--unsort", "--block-cap", "10"]),
+            ("drop", ["--drop-ids", "5:1", "--strip-locations"]),
+        ] {
+            let output = dir.path().join(format!("out-{kind}-{name}.osm.pbf"));
+            let out = CliInvoker::new()
+                .arg("degrade")
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .args(flags)
+                .assert_failure();
+            out.assert_stderr_contains(&format!(
+                "blob indexdata claims {claimed} elements but the blob holds way elements"
+            ));
+            assert!(
+                !output.exists(),
+                "claims {claimed}, {name}: nothing is published"
+            );
+        }
+    }
+}
+
+/// The passing counterpart: honest claims degrade, the modes that strip or
+/// corrupt indexdata still work on a file whose claims are false (they never
+/// decode), and a wholly unindexed input under `--force` is not refused.
+#[test]
+fn degrade_accepts_honest_claims_and_unindexed_force_input() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_degrade_fixture(&honest);
+    let count = normalized_count(&honest);
+
+    let output = dir.path().join("out.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&output)
+        .args(["--unsort", "--block-cap", "10"])
+        .assert_success();
+    assert_eq!(normalized_count(&output), count);
+
+    // Header-only rewrites do not decode, so a false claim does not stop them.
+    let lying = relabelled_way_blob(dir.path(), 0);
+    for (name, flag) in [
+        ("strip", "--strip-indexdata"),
+        ("corrupt", "--corrupt-indexdata-kind"),
+    ] {
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&lying)
+            .arg("-o")
+            .arg(dir.path().join(format!("hdr-{name}.osm.pbf")))
+            .arg(flag)
+            .assert_success();
+    }
+
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&unindexed)
+        .arg("--strip-indexdata")
+        .assert_success();
+    let forced = dir.path().join("forced.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&unindexed)
+        .arg("-o")
+        .arg(&forced)
+        .args(["--unsort", "--block-cap", "10", "--force"])
+        .assert_success();
+    assert_eq!(normalized_count(&forced), count);
+}

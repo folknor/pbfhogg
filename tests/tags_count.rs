@@ -158,3 +158,99 @@ fn an_unconstrainable_key_matcher_does_not_skip_blobs() {
          every `*=yes` match in them"
     );
 }
+
+/// Frame ordinals of the claim fixture: header, nodes, ways.
+const NODE_BLOB: usize = 1;
+const WAY_BLOB: usize = 2;
+
+/// The fixture with frame `blob`'s indexdata kind byte set to `kind`
+/// (0 node, 1 way): a lie no producer writes. `None` leaves it honest.
+fn claim_fixture(dir: &std::path::Path, forge: Option<(usize, u8)>) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    let node = |id| crate::common::TestNode {
+        id,
+        lat: 0,
+        lon: 0,
+        tags: vec![("amenity", "cafe")],
+        meta: None,
+    };
+    let way = crate::common::TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    };
+    crate::common::write_test_pbf_sorted(&honest, &[node(1), node(2)], &[way], &[]);
+    let Some((blob, kind)) = forge else {
+        return honest;
+    };
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, blob, |index| {
+        index[1] = kind;
+    });
+    let path = dir.join(format!("blob-{blob}-claims-{kind}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+fn assert_contradiction(
+    err: &pbfhogg::Error,
+    claimed: pbfhogg::ElementKind,
+    found: pbfhogg::ElementKind,
+    blob: usize,
+) {
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.kind_contradiction(),
+        Some(pbfhogg::KindContradiction { claimed, found })
+    );
+    assert_eq!(err.blob_index(), Some(blob as u64));
+}
+
+/// A blob decoded under a kind claim that holds another kind is refused,
+/// whether or not a type filter narrowed the schedule; the honest file
+/// counts both kinds. This is also `inspect --tags --type`.
+#[test]
+fn tags_count_refuses_a_blob_holding_another_kind_than_it_claims() {
+    let dir = crate::common::test_scratch();
+    let host = crate::common::test_host();
+
+    let honest = claim_fixture(dir.path(), None);
+    let counts = tags_count(&honest, &default_opts(), &host).expect("honest claims run");
+    assert_eq!(counts.len(), 2, "amenity=cafe and highway=primary");
+
+    // No filter: every blob is scheduled, the way blob claims nodes.
+    let dir2 = crate::common::test_scratch();
+    let forged = claim_fixture(dir2.path(), Some((WAY_BLOB, 0)));
+    let Err(err) = tags_count(&forged, &default_opts(), &host) else {
+        panic!("a lying claim must be refused");
+    };
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Node,
+        pbfhogg::ElementKind::Way,
+        WAY_BLOB,
+    );
+
+    // `--type way`: the node blob claiming ways is scheduled and decoded.
+    let dir3 = crate::common::test_scratch();
+    let forged = claim_fixture(dir3.path(), Some((NODE_BLOB, 1)));
+    let mut opts = default_opts();
+    opts.type_filter = Some(pbfhogg::TypeFilter {
+        nodes: false,
+        ways: true,
+        relations: false,
+    });
+    let Err(err) = tags_count(&forged, &opts, &host) else {
+        panic!("a lying claim must be refused");
+    };
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Way,
+        pbfhogg::ElementKind::Node,
+        NODE_BLOB,
+    );
+}

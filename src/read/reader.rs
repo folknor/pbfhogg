@@ -111,14 +111,6 @@ impl<R: Read + Send> ElementReader<R> {
     /// nothing it would not. Sequential iteration is unaffected. The
     /// pipelined adoption seam of `crate::scan::classify::KindClaims`.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the pipelined adoption seam: its first callers are the kind-filtered \
-                      pipelined phases, which adopt it in their own changes"
-        )
-    )]
     pub(crate) fn refusing_kind_claims(mut self) -> Self {
         self.pipeline_config
             .set_kind_claims(crate::scan::classify::KindClaims::Refuse);

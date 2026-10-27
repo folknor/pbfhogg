@@ -783,6 +783,12 @@ impl<'a> BlockPairSide<'a> {
                 Ok(block) => block,
                 Err(e) => return Err(self.locate(&desc, e)),
             };
+        // The shard planner bucketed this blob by its claimed kind, so an
+        // element of another kind would be merged against the wrong file's
+        // blobs of that kind (spurious created/deleted) or dropped.
+        if let Err(e) = block.refuse_foreign_kind(Some(desc.index.kind)) {
+            return Err(self.locate(&desc, e));
+        }
         let (skip_count, end) = match self.window {
             Some(window) if window.crosses(&desc.index) => clip(&block, window),
             _ => (0, None),

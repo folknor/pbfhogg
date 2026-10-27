@@ -257,7 +257,7 @@ fn getparents_walker(
                     // EOF, so the schedule's preads stay in the file.
                     schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
                         &meta,
-                        crate::scan::classify::KindClaims::Unchecked,
+                        crate::scan::classify::KindClaims::Refuse,
                     )?);
                 } else {
                     blobs_skipped += 1;
@@ -358,9 +358,13 @@ fn getparents_pipelined(
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
-    let reader = ElementReader::open_in(input, write.direct_reads, host)?.with_blob_filter(
-        BlobFilter::new(need_node_blobs, need_way_blobs, need_relation_blobs),
-    );
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?
+        .refusing_kind_claims()
+        .with_blob_filter(BlobFilter::new(
+            need_node_blobs,
+            need_way_blobs,
+            need_relation_blobs,
+        ));
     let header_bytes = super::output_header::build_one(
         reader.header(),
         &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),

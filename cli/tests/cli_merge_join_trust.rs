@@ -768,3 +768,60 @@ fn honestly_sorted_misaligned_blob_boundaries_still_diff_clean() {
         "expected an identical verdict, not merely a zero exit; got:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Kind claims: a blob's claimed kind decides which phase merges it, so a
+// block holding another kind is refused where it is decoded.
+// ---------------------------------------------------------------------------
+
+/// An honest pair and a copy of it whose way blob claims `kind` (0 node,
+/// 2 relation) in its indexdata: `(old, honest_new, forged_new)`. Blob 2 is
+/// the way blob; byte 1 of the indexdata is the kind.
+fn way_blob_claiming(
+    dir: &Path,
+    kind: u8,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let old = dir.join("old.osm.pbf");
+    let honest = dir.join("new.osm.pbf");
+    let layout = [Blob::Nodes(&[1, 2, 3]), Blob::Ways(&[100, 200])];
+    write_blobs(&old, &layout);
+    write_blobs(&honest, &layout);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "blob 2 is the way blob");
+        ix[1] = kind;
+    });
+    let lying = dir.join(format!("claims-{kind}.osm.pbf"));
+    std::fs::write(&lying, forged).expect("write forged");
+    (old, honest, lying)
+}
+
+/// The way blob claiming node was merged in the node phase against the
+/// other file's node blobs, reporting its ways created and the old file's
+/// deleted. It is now refused, at every shard count, in both argument
+/// orders, with and without `-c`.
+#[test]
+fn diff_refuses_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    for kind in [0u8, 2] {
+        let (old, honest, lying) = way_blob_claiming(dir.path(), kind);
+        assert_both_paths(&old, &honest, &[], 0, None);
+        for args in [&[][..], &["-c"][..]] {
+            assert_both_paths(&old, &lying, args, 2, Some("indexdata claims"));
+            assert_both_paths(&lying, &old, args, 2, Some("indexdata claims"));
+        }
+    }
+}
+
+/// Honest claims are untouched by the check, and a real difference still
+/// answers 1, not 2.
+#[test]
+fn diff_accepts_honest_claims_and_still_reports_differences() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    write_blobs(&old, &[Blob::Nodes(&[1, 2, 3]), Blob::Ways(&[100, 200])]);
+    write_blobs(&new, &[Blob::Nodes(&[1, 2, 3, 4]), Blob::Ways(&[100, 200])]);
+    assert_both_paths(&old, &new, &[], 1, None);
+    assert_both_paths(&old, &new, &["-c"], 1, None);
+}

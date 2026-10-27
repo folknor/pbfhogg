@@ -595,6 +595,62 @@ fn node_stats_parallel_classify_parity() {
     // blob's bytes were classified exactly once.
 }
 
+/// `inspect --nodes` schedules node blobs on the claim, so a way blob
+/// claiming nodes is decoded and refused (its ways were skipped by kind
+/// before: the lie is made visible, the node statistics are unchanged).
+/// The honest file runs.
+#[test]
+fn node_stats_refuses_a_way_blob_claiming_nodes() {
+    const WAY_BLOB: usize = 2; // header, nodes, ways
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    crate::common::write_test_pbf_sorted(
+        &honest,
+        &generate_nodes(4, 1),
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+    let run = |path: &std::path::Path| {
+        pbfhogg::inspect::node_stats::node_stats(
+            path,
+            false,
+            false,
+            pbfhogg::Parallelism::from_jobs(1),
+            &crate::common::test_host(),
+        )
+    };
+    assert_eq!(run(&honest).expect("honest claims run").node_count, 4);
+
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, WAY_BLOB, |index| {
+            assert_eq!(index[1], 1, "frame {WAY_BLOB} is the way blob");
+            index[1] = 0;
+        });
+    let forged = dir.path().join("forged.osm.pbf");
+    std::fs::write(&forged, lying).expect("write the forged file");
+    let Err(err) = run(&forged) else {
+        panic!("a lying claim must be refused");
+    };
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.kind_contradiction(),
+        Some(pbfhogg::KindContradiction {
+            claimed: pbfhogg::ElementKind::Node,
+            found: pbfhogg::ElementKind::Way,
+        })
+    );
+    assert_eq!(err.blob_index(), Some(WAY_BLOB as u64));
+}
+
 /// Regression: `show_element` must not early-exit on `idx.min_id > target_id`
 /// unless the header declares `Sort.Type_then_ID`.
 ///

@@ -294,26 +294,22 @@ fn distrust_metadata_holds_through_reference_expansion() {
         .arg("--corrupt-indexdata-kind")
         .assert_success();
 
-    // The default run on the corrupt file must lose the expanded references.
-    // Without this arm the test below would pass just as happily if
+    // The default run on the corrupt file believes the claims, so it must
+    // refuse the relation blob mislabelled as Node rather than lose the
+    // expanded references (it used to publish the relation alone). Without
+    // this arm the test below would pass just as happily if
     // `--corrupt-indexdata-kind` were a no-op - the fixture would simply be
     // honest and the distrust assertion would succeed for the wrong reason.
     let believed = dir.path().join("believed.osm.pbf");
-    run_filter(&corrupt, &believed, &["boundary"], false);
-    let c = read_all_elements(&believed);
-    assert_eq!(
-        relation_ids(&c),
-        vec![100],
-        "pass 1 and pass 2 already decline blob filtering here, so the direct \
-         match survives - it is the expansion that a mislabelled kind breaks"
-    );
-    assert!(
-        way_ids(&c).is_empty() && node_ids(&c).is_empty(),
-        "a relation blob mislabelled as Node empties the closure schedule, so \
-         nothing is pulled in through membership; got ways {:?} nodes {:?}",
-        way_ids(&c),
-        node_ids(&c),
-    );
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&corrupt)
+        .arg("-o")
+        .arg(&believed)
+        .arg("boundary")
+        .assert_failure()
+        .assert_stderr_contains("claims node elements but the blob holds relation elements");
+    assert!(!believed.exists(), "a refused run publishes nothing");
 
     // With --distrust-metadata every scan reads every blob and decides on
     // decoded elements, so the mislabelling changes nothing about the answer.
@@ -1455,4 +1451,106 @@ fn tags_filter_parallel_classify_parity() {
         !way_ids(&c_seq).is_empty(),
         "filter must match at least one way"
     );
+}
+
+/// An indexed file whose way blob (frame 2: header, nodes, ways) has its
+/// indexdata kind forged to node: a lie no producer writes. Way 10 carries
+/// `highway`, so the tag index still admits the blob.
+fn way_blob_claiming_nodes(dir: &Path) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    let node = |id| TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 100_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    crate::common::write_indexed_pbf(
+        &honest,
+        &[node(1), node(2)],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        }],
+        &[],
+    );
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "frame 2 is the way blob");
+        ix[1] = 0;
+    });
+    let path = dir.join("lying.osm.pbf");
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+/// Pass 1 of the two-pass run, `-R`'s pipelined reader, and invert mode
+/// (which skips no blob on the claim) all refuse a blob that claims nodes
+/// and holds ways, and publish nothing. Before, the two-pass and `-R` runs
+/// did not look at the way blob's real kind consistently: a believed claim
+/// scheduled it for a node sweep that ignored its ways.
+#[test]
+fn a_blob_holding_another_kind_than_it_claims_is_refused() {
+    let dir = crate::common::test_scratch();
+    let input = way_blob_claiming_nodes(dir.path());
+
+    for (name, flags) in [
+        ("two-pass", &[][..]),
+        ("omit-referenced", &["-R"][..]),
+        ("invert", &["--invert-match"][..]),
+    ] {
+        let output = dir.path().join(format!("{name}.osm.pbf"));
+        let mut cli = CliInvoker::new()
+            .arg("tags-filter")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output);
+        for flag in flags {
+            cli = cli.arg(*flag);
+        }
+        let out = cli.arg("highway").assert_failure();
+        out.assert_stderr_contains("claims node elements but the blob holds way elements");
+        assert!(!output.exists(), "{name}: a refused run published output");
+    }
+}
+
+/// The honest file runs in every mode, and `--distrust-metadata` does not
+/// believe the forged claim, so it is not refused and finds the way.
+#[test]
+fn distrust_metadata_is_not_refused_for_a_lying_kind_claim() {
+    let dir = crate::common::test_scratch();
+    let forged = way_blob_claiming_nodes(dir.path());
+
+    let output = dir.path().join("distrusted.osm.pbf");
+    CliInvoker::new()
+        .arg("tags-filter")
+        .arg(&forged)
+        .arg("-o")
+        .arg(&output)
+        .arg("--distrust-metadata")
+        .arg("highway")
+        .assert_success();
+    let c = read_all_elements(&output);
+    assert_eq!(way_ids(&c), vec![10]);
+    assert_eq!(node_ids(&c), vec![1, 2], "the way's nodes are collected");
+
+    let honest = dir.path().join("honest.osm.pbf");
+    for (name, flags) in [
+        ("two-pass", &[][..]),
+        ("omit-referenced", &["-R"][..]),
+        ("invert", &["--invert-match"][..]),
+    ] {
+        let output = dir.path().join(format!("honest-{name}.osm.pbf"));
+        let mut cli = CliInvoker::new()
+            .arg("tags-filter")
+            .arg(&honest)
+            .arg("-o")
+            .arg(&output);
+        for flag in flags {
+            cli = cli.arg(*flag);
+        }
+        cli.arg("highway").assert_success();
+    }
 }

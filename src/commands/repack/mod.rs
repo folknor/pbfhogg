@@ -206,7 +206,7 @@ pub(crate) fn repack_to(
     let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
         crate::scan::classify::build_classify_schedules_split(
             input,
-            crate::scan::classify::KindClaims::Unchecked,
+            crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
 
@@ -627,12 +627,13 @@ fn worker_split_blob(
     let cap = cap_nz.get();
     // Trust: the schedule put this blob in this kind's phase because its
     // indexdata names the kind, and only elements of that kind are counted and
-    // re-encoded below. Elements of any other kind in the blob (a mislabelled
-    // indexdata, or a valid multi-kind block indexed by another writer's rule)
-    // are dropped without a count or an error. Checking per element costs on a
-    // measured path, and a per-blob check here cannot tell such a blob from an
-    // unindexed one the schedule builder replicated into every kind's phase,
-    // where a no-match is correct. See reference/pipeline.md "Blob Filtering".
+    // re-encoded below. The schedule is built with `KindClaims::Refuse`, so
+    // the pool that decoded this block has already refused it if it holds an
+    // element of another kind than the blob claims (a mislabelled indexdata,
+    // or a valid multi-kind block indexed by another writer's rule): nothing
+    // is dropped silently. An unindexed blob (`--force`) is replicated into
+    // every kind's phase with no claim stamped, so a no-match there is correct
+    // and is not refused. See reference/pipeline.md "Blob Filtering".
     let total = match kind {
         ElementKind::Node => block
             .elements()

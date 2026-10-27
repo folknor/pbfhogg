@@ -141,6 +141,17 @@ inferred are marked so here.
 
 ### A. Wrong answers on blobs the run already decodes (contradiction free)
 
+Slice 1b (2026-10-27) adopted the decode-time kind refusal at every per-kind
+phase below except altw and time-filter: repack, degrade, the sort and dedupe
+sweep, diff and derive, geocode, extract and multi-extract, tags-filter,
+tags-count, `inspect --nodes`, getid and getparents. The kind rows of this
+section are DONE for those commands; the range, order and count rows
+(apply-changes, the sweep's pop order, diff `-c`, time-filter) and the altw
+rows are not. Open from 1b: the raw-walker adopters (extract simple and
+multi, geocode Pass 1.5) walk each blob's group tags a second time to
+collect its kinds, one read-and-skip per element; the zero-cost form is for
+the `src/scan` walkers to return the `KindSet` from tags they already read.
+
 - **DONE (slice 1a, 2026-10-27): check `--refs` and `--ids` (the admission
   test itself).** Both now stop and fail the file (exit 1) on a decoded
   element of another kind, through the shared `KindClaims::Refuse`

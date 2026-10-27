@@ -4,6 +4,13 @@
 
 ### Breaking
 
+- **`check` library calls return `check::CheckOutcome`.** `check_refs`,
+  `verify_ids` and `check_locations` return `Complete(report)` or, when a
+  blob's kind claim is false, `Stopped(StoppedCheck)` carrying the
+  contradiction instead of a report. `ErrorKind::IndexdataMismatch` gains
+  `contradiction: Option<KindContradiction>` (`Error::kind_contradiction`),
+  set when the mismatch is a kind claim a decoded blob contradicts.
+
 - **`ErrorKind::MissingNodeLocations` says what its count counts.** It
   gains `counted: Unresolved` (re-exported as `pbfhogg::Unresolved`):
   `WayNodeReferences` from add-locations-to-ways, each use of a node in
@@ -1397,10 +1404,22 @@
   still found only by `check --index`. `check --locations`, which refused a
   way-claimed blob holding another kind (exit 2), now stops the same way
   (exit 1), and no longer counts an empty dense-node message as a node.
-  Library: `check_refs`, `verify_ids` and `check_locations` return
-  `check::CheckOutcome` (`Complete(report)` or `Stopped(StoppedCheck)`), and
-  `ErrorKind::IndexdataMismatch` gains `contradiction:
-  Option<KindContradiction>` (`Error::kind_contradiction`).
+
+- **Commands that decode a blob for the kind its indexdata claims refuse a
+  blob that holds another kind.** repack, degrade (decode path, including
+  `--drop-ids`), sort and `cat --dedupe` (blobs rewritten in an overlap
+  run), diff (text, `-c` and `--format osc`), build-geocode-index (every
+  pass), extract (every strategy) and multi-extract, tags-filter (two-pass
+  and `-R`), tags-count and `inspect --tags --type`, `inspect --nodes`,
+  getid (include, `removeid`, `--add-referenced`, `--id-osm-file`) and
+  getparents used to drop or ignore the off-kind elements and exit 0 with a
+  wrong answer. They now fail with `IndexdataMismatch` (exit 2), naming the
+  blob, and publish nothing; the message points at `check --index` and
+  `cat --reindex`. Honest files and `--force` runs on unindexed input are
+  unaffected, as are `sort` under a header that does not claim sorted order
+  (it rescans and replaces false claims) and `tags-filter
+  --distrust-metadata`. A blob skipped on its claim without being decoded is
+  still believed: `check --index` is what finds that.
 
 - **`apply-changes --direct-io` reports its index hits.** The summary's
   `Blobs: N passthrough (M index-hit)` read `0 index-hit` under

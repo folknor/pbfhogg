@@ -3083,3 +3083,123 @@ fn repeated_multiblob_geocode_builds_have_identical_files() {
         std::fs::read_dir(&b).expect("list second build").count()
     );
 }
+
+/// The all-record-kinds fixture with blob `blob`'s indexdata kind byte
+/// forged from `honest_kind` to `to` (0 node, 1 way, 2 relation), a lie no
+/// producer writes. Blob 0 is the header; the fixture's nodes, ways and
+/// relations are one blob each, in that order.
+fn forged_kind_claim(dir: &Path, blob: usize, honest_kind: u8, to: u8) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_all_record_kinds_input(&honest);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, blob, |index| {
+        assert_eq!(
+            index[1], honest_kind,
+            "blob {blob} claims the expected kind"
+        );
+        index[1] = to;
+    });
+    let path = dir.join(format!("blob-{blob}-claims-{to}.osm.pbf"));
+    std::fs::write(&path, lying).expect("write forged");
+    path
+}
+
+/// Build `input` and assert the refusal: an `IndexdataMismatch` carrying
+/// the contradiction, and no index published.
+fn assert_claim_refused(
+    input: std::path::PathBuf,
+    dir: &Path,
+    claimed: pbfhogg::ElementKind,
+    found: pbfhogg::ElementKind,
+) {
+    let index_dir = dir.join("refused-index");
+    let err = build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect_err("a lying kind claim must refuse the build");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+        "expected IndexdataMismatch, got: {err}"
+    );
+    assert_eq!(
+        err.kind_contradiction(),
+        Some(pbfhogg::KindContradiction { claimed, found }),
+        "{err}"
+    );
+    assert!(
+        !index_dir.join("geocode_header.bin").exists(),
+        "a refused build must publish no index"
+    );
+}
+
+/// The honest fixture builds, so the refusals below are about the forged
+/// claim and not the fixture shape.
+#[test]
+fn honest_kind_claims_build_the_all_record_kinds_index() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("honest.osm.pbf");
+    write_all_record_kinds_input(&input);
+    let stats = build_into(input, &dir.path().join("index"), false);
+    assert!(stats.street_ways >= 1);
+}
+
+/// Pass 1 decodes relation-claimed blobs only: a way blob claiming
+/// relations reaches its pipelined reader.
+#[test]
+fn pass_one_refuses_a_way_blob_claiming_relations() {
+    let dir = crate::common::test_scratch();
+    let input = forged_kind_claim(dir.path(), 2, 1, 2);
+    assert_claim_refused(
+        input,
+        dir.path(),
+        pbfhogg::ElementKind::Relation,
+        pbfhogg::ElementKind::Way,
+    );
+}
+
+/// Pass 1 skips a relation blob claiming ways, so the pass 1.5 raw scan
+/// is the one that reads it and must refuse.
+#[test]
+fn pass_one_five_refuses_a_relation_blob_claiming_ways() {
+    let dir = crate::common::test_scratch();
+    let input = forged_kind_claim(dir.path(), 3, 2, 1);
+    assert_claim_refused(
+        input,
+        dir.path(),
+        pbfhogg::ElementKind::Way,
+        pbfhogg::ElementKind::Relation,
+    );
+}
+
+/// Same raw scan, with nodes held by a blob claiming ways.
+#[test]
+fn pass_one_five_refuses_a_node_blob_claiming_ways() {
+    let dir = crate::common::test_scratch();
+    let input = forged_kind_claim(dir.path(), 1, 0, 1);
+    assert_claim_refused(
+        input,
+        dir.path(),
+        pbfhogg::ElementKind::Way,
+        pbfhogg::ElementKind::Node,
+    );
+}
+
+/// A way blob claiming nodes is invisible to passes 1 and 1.5 and is
+/// first decoded by pass 2a, whose pool must refuse it.
+#[test]
+fn pass_two_a_refuses_a_way_blob_claiming_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = forged_kind_claim(dir.path(), 2, 1, 0);
+    assert_claim_refused(
+        input,
+        dir.path(),
+        pbfhogg::ElementKind::Node,
+        pbfhogg::ElementKind::Way,
+    );
+}

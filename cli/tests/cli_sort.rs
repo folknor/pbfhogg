@@ -1268,3 +1268,95 @@ fn sort_refuses_non_leading_header_frames() {
         assert!(out.stderr_str().contains("a second OSMHeader blob"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// A believed kind claim the blob's contents contradict
+// ---------------------------------------------------------------------------
+
+/// Frames: the header, a node blob (ids 1 and 20), a way blob (id 10).
+/// The honest file is in order; `sorted` stamps `Sort.Type_then_ID`.
+fn write_claim_fixture(path: &Path, sorted: bool) {
+    let mut hb = block_builder::HeaderBuilder::new();
+    if sorted {
+        hb = hb.sorted();
+    }
+    let header = hb.build().expect("build header");
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(path).expect("create file"),
+        Compression::default(),
+    );
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [], None);
+    bb.add_node(20, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block");
+    writer.write_primitive_block(nodes).expect("write nodes");
+    bb.add_way(10, [("highway", "path")], &[1, 20], None);
+    let ways = bb.take().expect("take").expect("block");
+    writer.write_primitive_block(ways).expect("write ways");
+    writer.flush().expect("flush");
+}
+
+/// The fixture with the way blob (frame 2) claiming nodes: its claimed id
+/// range 10..10 sits inside the node blob's 1..20, so a run that believes
+/// the claim puts both in one overlap run and decodes the way blob as nodes.
+fn write_way_blob_claiming_nodes(path: &Path, sorted: bool) {
+    let honest = path.with_extension("honest");
+    write_claim_fixture(&honest, sorted);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |index| {
+        assert_eq!(index[1], 1, "frame 2 is the way blob");
+        index[1] = 0;
+    });
+    std::fs::write(path, lying).expect("write forged file");
+}
+
+/// Under a header claiming sorted, `sort` believes the way blob's forged
+/// node claim, routes it into the node overlap run, and the run used to
+/// drop the way and publish a file without it. It must refuse and publish
+/// nothing.
+#[test]
+fn sort_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("lying.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_way_blob_claiming_nodes(&input, true);
+
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .run();
+    assert!(!out.status.success(), "sort published a wrong answer");
+    out.assert_stderr_contains("claims node elements but the blob holds way elements");
+    assert!(!output.exists(), "a refused sort published output");
+}
+
+/// The counterpart: the same file honest sorts and keeps the way.
+#[test]
+fn sort_keeps_the_way_when_the_claim_is_honest() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("honest.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_claim_fixture(&input, true);
+    run_sort(&input, &output);
+    let c = read_all_elements_with_coords(&output);
+    assert_eq!(c.nodes.len(), 2);
+    assert_eq!(c.ways.len(), 1);
+}
+
+/// Without the sorted claim sort scans every payload and replaces a false
+/// indexdata claim, so the forged file is repaired, never refused.
+#[test]
+fn sort_replaces_a_false_claim_under_an_unsorted_header() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("lying.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_way_blob_claiming_nodes(&input, false);
+    run_sort(&input, &output);
+    let c = read_all_elements_with_coords(&output);
+    assert_eq!(c.nodes.len(), 2);
+    assert_eq!(c.ways.len(), 1, "the way survives the false claim");
+}

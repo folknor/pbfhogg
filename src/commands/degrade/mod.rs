@@ -890,7 +890,7 @@ fn degrade_decode_path(
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(
             input,
-            crate::scan::classify::KindClaims::Unchecked,
+            crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
     // Use the input size as a preallocation budget for the caller-supplied
@@ -1293,9 +1293,12 @@ fn worker_decode_kind(
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
-    // Trust: elements of a kind other than the one this blob's indexdata
-    // claimed are dropped silently (see the same note in repack's
-    // worker_split_blob and reference/pipeline.md "Blob Filtering").
+    // Trust: the schedules (drop selection included) are built with
+    // `KindClaims::Refuse`, so the pool that decoded this block has already
+    // refused it if it holds an element of a kind other than the one its
+    // indexdata claimed; nothing is dropped silently. An unindexed blob
+    // (`--force`) carries no claim and is not refused (see the same note in
+    // repack's worker_split_blob and reference/pipeline.md "Blob Filtering").
     // `element_matches_kind` already discriminates by `kind`, so the count is
     // identical for every kind - no per-kind match needed.
     let total = block

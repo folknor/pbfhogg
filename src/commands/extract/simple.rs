@@ -15,7 +15,8 @@ use crate::idset::IdSet;
 use super::common::{
     BboxInt, BlobDesc, ExtractPass2IdSets, Passthrough, build_blob_schedule_with_passthrough,
     dense_only_payload, extract_block_pass2, merge_extract_stats, pread_execute,
-    relation_has_matched_member, spatial_blob_filter, warn_passthrough_demotions,
+    refuse_blob_foreign_kind, refuse_foreign_kind_raw, relation_has_matched_member,
+    spatial_blob_filter, warn_passthrough_demotions,
 };
 use super::{ExtractStats, Region};
 
@@ -179,6 +180,7 @@ fn extract_simple_two_pass(
         let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader.leading_header()?;
+        let source = blob_reader.source().cloned();
 
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
@@ -195,6 +197,7 @@ fn extract_simple_two_pass(
             }
             blob.decompress_into(&mut decompress_buf)?;
             let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+            refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
             classify_block_simple(
                 &block,
                 phase,
@@ -408,6 +411,9 @@ fn extract_simple_single_pass(
             |position, decompressed, (tuples, group_starts)| {
                 tuples.clear();
                 crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+                // The scanner reads only nodes, so ways or relations under a
+                // node claim are ones it would never see.
+                refuse_foreign_kind_raw(decompressed, node_schedule_ref[position].kind)?;
                 // Classification is the same for every blob, candidate or
                 // not, so verification can never change which nodes are
                 // selected.
@@ -472,12 +478,13 @@ fn extract_simple_single_pass(
         let classify_schedule = scheduled(&way_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
         let bbox_ids_ref = &bbox_node_ids;
+        let way_schedule_ref = &way_schedule;
         crate::scan::classify::parallel_scan_blobs_raw(
             &classify_input,
             &classify_schedule,
             None,
             || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-            |_position, decompressed, (refs_buf, group_starts)| {
+            |position, decompressed, (refs_buf, group_starts)| {
                 let mut matching: Vec<i64> = Vec::new();
                 crate::scan::way::scan_way_refs(
                     decompressed,
@@ -489,6 +496,9 @@ fn extract_simple_single_pass(
                         }
                     },
                 )?;
+                // The scanner reads only ways, so nodes or relations under a
+                // way claim are ones it would never see.
+                refuse_foreign_kind_raw(decompressed, way_schedule_ref[position].kind)?;
                 Ok(matching)
             },
             |_position, matching_ids: Vec<i64>| {
@@ -620,7 +630,7 @@ fn scheduled(descs: &[&BlobDesc]) -> Result<Vec<crate::scan::classify::Scheduled
                 d.offset,
                 d.size,
                 d.kind,
-                crate::scan::classify::KindClaims::Unchecked,
+                crate::scan::classify::KindClaims::Refuse,
             )
         })
         .collect()

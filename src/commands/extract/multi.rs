@@ -203,7 +203,7 @@ pub(super) fn try_extract_multi_single_pass(
             continue;
         }
         walker.observe_filter_index(meta.index.as_ref());
-        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Unchecked)?;
+        let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
         // Both decisions below are taken on indexdata claims, never decoded
         // to check: a blob claimed as nodes whose bbox misses every region
         // is skipped unread, and each blob joins the one per-kind schedule
@@ -417,11 +417,14 @@ pub(super) fn try_extract_multi_single_pass(
             &candidate_schedule,
             None,
             worker_init,
-            |_position, bytes, (columns, scratch)| {
+            |position, bytes, (columns, scratch)| {
                 let eligible = dense_only_payload(bytes)?;
                 // What the decode path would do with this blob; a block it
                 // rejects must not be copied raw.
                 let block = PrimitiveBlock::from_vec(bytes.to_vec())?;
+                // A candidate is scheduled as nodes, and the classifier below
+                // reads only nodes.
+                block.refuse_foreign_kind(candidate_schedule[position].claim())?;
                 let region_ids = classify_columns(&block, columns, scratch)?;
                 // Occurrence counts, not set sizes: a duplicate id counts
                 // every time it is copied.

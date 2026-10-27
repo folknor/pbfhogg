@@ -1506,6 +1506,63 @@ fn cat_dedupe_counts_decoded_overlap_runs_as_observed() {
     );
 }
 
+/// Frames: the header, a node blob (ids 1 and 20), a way blob (id 10), under
+/// a sorted header. With `forge`, the way blob claims nodes, so its claimed
+/// range sits inside the node blob's and `--dedupe` decodes it in a node
+/// overlap run.
+fn write_dedupe_claim_fixture(dir: &Path, forge: bool) -> std::path::PathBuf {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let honest = dir.join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [], None);
+    bb.add_node(20, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    bb.add_way(10, [("highway", "path")], &[1, 20], None);
+    let ways = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&honest, true, &[], &[(true, nodes), (true, ways)]);
+    if !forge {
+        return honest;
+    }
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "frame 2 is the way blob");
+        ix[1] = 0;
+    });
+    let path = dir.join("lying.osm.pbf");
+    std::fs::write(&path, lying).expect("write forged file");
+    path
+}
+
+/// A way blob whose believed claim says nodes, decoded by the dedupe sweep
+/// in a node run, used to lose its way and exit 0. It is refused, and
+/// nothing is published.
+#[test]
+fn cat_dedupe_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
+    let dir = crate::common::test_scratch();
+    let input = write_dedupe_claim_fixture(dir.path(), true);
+    let output = dir.path().join("out.osm.pbf");
+
+    let out = run_dedupe(&[&input], &output);
+    assert!(!out.status.success(), "dedupe published a wrong answer");
+    out.assert_stderr_contains("claims node elements but the blob holds way elements");
+    assert!(!output.exists(), "a refused dedupe published output");
+}
+
+/// The counterpart: the honest file dedupes and keeps the way.
+#[test]
+fn cat_dedupe_keeps_the_way_when_the_claim_is_honest() {
+    let dir = crate::common::test_scratch();
+    let input = write_dedupe_claim_fixture(dir.path(), false);
+    let output = dir.path().join("out.osm.pbf");
+
+    let out = run_dedupe(&[&input], &output);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    let c = read_all_elements_with_coords(&output);
+    assert_eq!(c.nodes.len(), 2);
+    assert_eq!(c.ways.len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Platform tier
 // ---------------------------------------------------------------------------

@@ -156,7 +156,7 @@ fn tags_count_inner(
             &pin,
             kind_filter,
             blob_filter.as_ref(),
-            crate::scan::classify::KindClaims::Unchecked,
+            crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
     if blobs_skipped_by_tag > 0 {

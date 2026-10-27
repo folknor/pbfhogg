@@ -67,7 +67,7 @@ use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::writer::{Compression, frame_blob_pipelined, reframe_raw_with_index};
 
-use super::classify::block_overlaps_diff;
+use super::classify::{BlobWalk, block_overlaps_diff};
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
@@ -562,23 +562,32 @@ fn handle_candidate(
     decompress_blob_raw(&read_buf[body.clone()], decompress_buf)?;
     t_decompress.record_ns(&counters.decompress_ns);
 
+    // The blob's indexdata claim, `None` for an unindexed blob. Every
+    // decoded candidate checks it on the one complete walk of its elements
+    // it makes anyway, and its order against the header's sort claim
+    // (`classify::BlobWalk`), before its item leaves this worker.
+    let claim = desc.index;
+
     if refresh_scan {
         counters
             .loc_refresh_blobs_scanned
             .fetch_add(1, Ordering::Relaxed);
         let t_scan = crate::counters::Stopwatch::start();
+        let mut walk = BlobWalk::new(claim.as_ref());
         let detection = detect_stale_wire(
             decompress_buf,
             probe,
             node_groups_scratch,
             &mut refresh_scratch.hits,
+            &mut walk,
         )?;
         t_scan.record_ns(&counters.refresh_scan_ns);
         if !detection.stale {
+            let first = walk.finish()?;
             counters
                 .loc_deleted_node_refs
                 .fetch_add(detection.deleted_refs, Ordering::Relaxed);
-            return pass_through_indexed(desc, drain_tx, counters, read_buf, route);
+            return pass_through_indexed(desc, drain_tx, counters, read_buf, route, first);
         }
         refresh_only = true;
     }
@@ -590,8 +599,9 @@ fn handle_candidate(
     // with them rather than copied: a raw copy would leave it unindexed
     // beside the indexed blobs the rewrites produce, a partially indexed
     // output that every command but cat (diff, sort, apply-changes itself)
-    // refuses. Indexed blobs skip this; their claims are believed
-    // (reference/indexdata-trust.md).
+    // refuses. Indexed blobs skip this; their claims are checked by the walk
+    // instead (reference/indexdata-trust.md, "Range, count and order claims
+    // refused at decode").
     let scanned = if desc.index.is_none() {
         Some(crate::blob_meta::scan_block_ids_and_tags(decompress_buf)?)
     } else {
@@ -626,6 +636,9 @@ fn handle_candidate(
     let raw = std::mem::take(decompress_buf);
     let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)?;
     t_parse.record_ns(&counters.parse_ns);
+    // The drain places the blob by its claimed kind, so an element of
+    // another kind would be written out of type order or dropped.
+    block.refuse_foreign_kind(claim.map(|c| c.kind))?;
 
     // What an unindexed blob's payload makes of it, decided before either
     // output branch below so an overlapping blob cannot bypass it.
@@ -648,8 +661,19 @@ fn handle_candidate(
     };
 
     let t_precise = crate::counters::Stopwatch::start();
-    let overlaps = block_overlaps_diff(&block, ranges);
+    let mut walk = BlobWalk::new(claim.as_ref());
+    let overlaps = block_overlaps_diff(&block, ranges, &mut walk)?;
+    if !overlaps {
+        // A miss visited every element: the walk is complete.
+        walk.finish()?;
+    }
     t_precise.record_ns(&counters.precise_ns);
+    // The first element, which the precise check visits before any early
+    // return. An indexed blob with none was refused by `finish` (a miss);
+    // an unindexed one with none was omitted above.
+    let first = walk
+        .first()
+        .ok_or_else(|| Error::internal("streaming: a decoded candidate without an element"))?;
 
     // Sync per-worker coords into the shared slot before emitting the
     // DrainItem. This guarantees the drain's barrier merge (which fires
@@ -690,7 +714,13 @@ fn handle_candidate(
             ));
         }
     };
-    let inline_upserts = upsert_slice(ranges, effective_kind, effective_min_id, effective_max_id);
+    let inline_upserts = upsert_slice(
+        ranges,
+        effective_kind,
+        first,
+        effective_min_id,
+        effective_max_id,
+    );
     // A blob no single index describes cannot be copied with one, so it is
     // re-encoded even when the diff leaves it alone: `BlockBuilder` writes
     // indexed single-kind blocks.
@@ -756,6 +786,7 @@ fn handle_candidate(
                     frame_bytes,
                     kind: effective_kind,
                     id_range: (effective_min_id, effective_max_id),
+                    observed_first: Some(first),
                     count: index.count,
                     verbatim: false,
                 },
@@ -763,7 +794,7 @@ fn handle_candidate(
         }
         // An indexed blob, which leaves as it came: spliced, or on the owned
         // route shipped from the frame read above.
-        return pass_through_indexed(desc, drain_tx, counters, read_buf, route);
+        return pass_through_indexed(desc, drain_tx, counters, read_buf, route, Some(first));
     }
     if refresh_only {
         counters
@@ -789,6 +820,10 @@ fn handle_candidate(
     let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = crate::counters::Stopwatch::start();
+    // The rewrite's own walk: on a precise-check hit the walk above stopped
+    // at the hit, so this is the complete one, ended before any block is
+    // framed or sent.
+    let mut rewrite_walk = BlobWalk::new(claim.as_ref());
     let output = rewrite_block_parallel(
         &block,
         diff,
@@ -798,7 +833,9 @@ fn handle_candidate(
         loc,
         probe,
         refresh_scratch,
+        &mut rewrite_walk,
     )?;
+    rewrite_walk.finish()?;
     t_rewrite.record_ns(&counters.rewrite_ns);
     counters
         .loc_refreshed_ways
@@ -844,6 +881,7 @@ fn handle_candidate(
             framed_chunks,
             kind: effective_kind,
             id_range: (effective_min_id, effective_max_id),
+            observed_first: first,
             stats: output.stats,
         },
     )
@@ -921,7 +959,8 @@ fn handle_owned_passthrough(
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     pread_into(file, read_buf, desc.frame_start, desc.frame_len, counters)?;
-    pass_through_indexed(desc, drain_tx, counters, read_buf, Route::Owned)
+    // Read but never decoded: no observed first element.
+    pass_through_indexed(desc, drain_tx, counters, read_buf, Route::Owned, None)
 }
 
 /// Pass an indexed blob through unchanged. On the splice route the drain
@@ -929,17 +968,20 @@ fn handle_owned_passthrough(
 /// that whole frame, which moves into a verbatim `OwnedBytes` without
 /// another read, leaving `read_buf` empty for the next pread. Either way
 /// the drain credits the blob's indexdata `count` to `base_<kind>` (a zero
-/// would make the per-kind totals drift, gap #7), believed like every claim
-/// here (reference/indexdata-trust.md), and counts it as an index hit.
+/// would make the per-kind totals drift, gap #7), and counts it as an index
+/// hit. `observed_first` is the first element of a blob a worker decoded,
+/// whose claim, `count` included, its walk has verified; `None` for one
+/// never decoded, whose claim is believed (reference/indexdata-trust.md).
 fn pass_through_indexed(
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
     route: Route<()>,
+    observed_first: Option<i64>,
 ) -> Result<()> {
     if route.is_splice() {
-        let item = desc.take_copy_range().ok_or_else(|| {
+        let item = desc.take_copy_range(observed_first).ok_or_else(|| {
             Error::internal("streaming: a blob without indexdata reached the splice")
         })?;
         return send_drain(drain_tx, item);
@@ -964,6 +1006,7 @@ fn pass_through_indexed(
             frame_bytes: std::mem::take(read_buf),
             kind: desc.kind,
             id_range,
+            observed_first,
             count: index.count,
             verbatim: true,
         },
@@ -984,11 +1027,28 @@ fn pread_into(
     Ok(file.read_exact_at(buf, offset)?)
 }
 
-/// Compute the inline-upsert slice for one blob: upserts whose OSM ID
-/// key falls in `[blob_osm_first(min,max), blob_osm_last(min,max)]`.
-fn upsert_slice(ranges: &DiffRanges, kind: ElementKind, min_id: i64, max_id: i64) -> &[i64] {
+/// Compute the inline-upsert slice for one decoded blob: upserts whose OSM
+/// ID key falls in `[key(first), blob_osm_last_key(min, max)]`, `first`
+/// being the blob's first element.
+///
+/// Not the range's conservative first key: for a mixed-sign range that is
+/// key 0, which reaches back over the previous blob's span, so blobs
+/// `[-1]` and `[-2, 1]` (holding -2 and 1) would both take an upsert of -1
+/// and write it twice. From the first element on, the slices of
+/// consecutive blobs are disjoint once the drain's order guard has held
+/// (equality is one ID held twice by the base, each copy replaced where it
+/// stands). Upserts between the previous blob and `first` are the drain's
+/// gap creates, bounded by the same first element
+/// (`descriptor::Placement::gap_bound`).
+fn upsert_slice(
+    ranges: &DiffRanges,
+    kind: ElementKind,
+    first: i64,
+    min_id: i64,
+    max_id: i64,
+) -> &[i64] {
     let upserts = ranges.upserts(kind);
-    let first = crate::osm_id::blob_osm_first_key(min_id, max_id);
+    let first = crate::osm_id::osm_id_key(first);
     let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
     let start = upserts.partition_point(|&id| crate::osm_id::osm_id_key(id) < first);
     let end = upserts[start..].partition_point(|&id| crate::osm_id::osm_id_key(id) <= last) + start;

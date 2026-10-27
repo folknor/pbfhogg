@@ -22,11 +22,13 @@ use crate::ElementKind;
 
 mod scan;
 mod tag_index;
+mod tally;
 
 pub(crate) use scan::{
     try_scan_block_ids_and_tags, try_scan_block_ids_checked, try_scan_block_tags,
 };
 pub(crate) use tag_index::{TagIndex, encode_tag_index};
+pub(crate) use tally::IdTally;
 
 /// The `N` bytes of `data` at `at`, or `None` when they run past its end.
 /// The fixed-width field read for the indexdata decoders: no slice-to-array

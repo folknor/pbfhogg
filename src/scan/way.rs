@@ -154,7 +154,7 @@ pub(crate) fn scan_way_refs(
 /// ID, a relation. Anything else (changeset groups, unknown fields, a
 /// mistyped tag) adds nothing. Reads the dense message only to see whether
 /// it carries an ID, which only a foreign-kind blob reaches.
-fn skip_recording_kind(
+pub(crate) fn skip_recording_kind(
     gcursor: &mut crate::read::wire::Cursor<'_>,
     field: u32,
     wire_type: u32,

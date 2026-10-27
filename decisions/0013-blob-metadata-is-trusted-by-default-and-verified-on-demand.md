@@ -1,6 +1,9 @@
 # ADR-0013: Blob sidecar metadata is trusted by default and verified on demand
 
 Date: 2026-08-20
+Amended: 2026-10-27 - consequence 4 covers the range and count of a blob
+`apply-changes` or the `sort` / `cat --dedupe` sweep decodes, not only the
+kind.
 Status: Accepted
 
 ## Decision
@@ -73,8 +76,14 @@ Four consequences follow, and are binding on new code (the fourth added on
    the same finding stops the check and fails the file (exit 1) instead of
    refusing it. This adds no decode and no per-element pass; phases adopt it
    one by one (`KindClaims::Refuse`), and the ones that have not yet still
-   believe their claims unchecked. It is a foreign-kind test only, not a
-   substitute for `check --index`.
+   believe their claims unchecked. The same holds for the range and count of
+   a blob a run places by its range and decodes anyway (`apply-changes` and
+   the `sort` / `cat --dedupe` sweep): the element loop the run already makes
+   tallies the IDs, and a claim that is not exact for them is the same
+   refusal without a `KindContradiction`
+   ([indexdata-trust.md](../reference/indexdata-trust.md), "Range, count and
+   order claims refused at decode"). Neither is a substitute for
+   `check --index`: a blob no phase decodes is still believed.
 
 The trust model this decision sets - which claims are believed, what checks
 them in passing, what verifies them and with which gaps, and what a false one

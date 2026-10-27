@@ -130,6 +130,10 @@ pub(super) enum DrainItem {
         frame_len: usize,
         kind: ElementKind,
         id_range: (i64, i64),
+        /// The decoded blob's first element (see [`Placement::first`]):
+        /// `Some` for a worker's false positive or clean refresh scan, `None`
+        /// for the scanner's splice of a blob no one decoded.
+        observed_first: Option<i64>,
         /// Indexdata for the output blob. Preserved byte-for-byte from
         /// the input BlobHeader indexdata field.
         index: BlobIndex,
@@ -154,6 +158,9 @@ pub(super) enum DrainItem {
         frame_bytes: Vec<u8>,
         kind: ElementKind,
         id_range: (i64, i64),
+        /// The decoded blob's first element, `None` for an owned-route
+        /// passthrough read but never decoded (see [`Placement::first`]).
+        observed_first: Option<i64>,
         count: u64,
         /// The bytes are the input blob's own indexed frame, unchanged: the
         /// drain counts the blob as an index hit, as it counts a
@@ -170,7 +177,12 @@ pub(super) enum DrainItem {
         seq: u64,
         framed_chunks: Vec<Vec<u8>>,
         kind: ElementKind,
+        /// The input blob's range, verified exact by the rewrite's walk (or
+        /// derived from an unindexed payload), not the output blocks'.
         id_range: (i64, i64),
+        /// The input blob's first element, whether or not the rewrite kept
+        /// it (see [`Placement::first`]).
+        observed_first: i64,
         stats: super::stats::MergeStats,
     },
     /// An unindexed input blob (`--force`) whose payload holds no element.
@@ -211,12 +223,14 @@ impl BlobDescriptor {
     /// scanner's fast-path. Returns `None` when the descriptor lacks
     /// indexdata (only indexed blobs can take the splice fast-path).
     pub(super) fn into_drain_copy_range(mut self) -> Option<DrainItem> {
-        self.take_copy_range()
+        self.take_copy_range(None)
     }
 
     /// Convert an indexed descriptor into a [`DrainItem::CopyRange`]: the
     /// drain splices the raw frame via `copy_file_range`, header included,
     /// and credits the index's `count` to the run's statistics.
+    /// `observed_first` is the decoded blob's first element, `None` when no
+    /// one decoded it.
     ///
     /// `None` when the descriptor carries no indexdata. Copying such a frame
     /// would put an unindexed blob in the output beside the indexed ones the
@@ -226,7 +240,7 @@ impl BlobDescriptor {
     ///
     /// Moves the tagdata into the item, retaining the descriptor for error
     /// diagnostics without cloning its allocation.
-    pub(super) fn take_copy_range(&mut self) -> Option<DrainItem> {
+    pub(super) fn take_copy_range(&mut self, observed_first: Option<i64>) -> Option<DrainItem> {
         let index = self.index?;
         let id_range = self.id_range.unwrap_or((index.min_id, index.max_id));
         Some(DrainItem::CopyRange {
@@ -235,9 +249,51 @@ impl BlobDescriptor {
             frame_len: self.frame_len,
             kind: self.kind,
             id_range,
+            observed_first,
             index,
             tagdata: self.tagdata.take(),
         })
+    }
+}
+
+/// Where a blob sits in the output's type and ID order, for the drain's
+/// type transitions, gap creates, upsert cursor and order guard.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Placement {
+    pub(super) kind: ElementKind,
+    /// The blob's numeric `(min_id, max_id)`: its claim, verified exact
+    /// when the blob was decoded. Its OSM-order last key is the blob's last
+    /// element for every sign layout (positives sort last and the maximum
+    /// is present; an all-negative range ends at its minimum).
+    pub(super) id_range: (i64, i64),
+    /// The blob's first element in OSM order, known when a worker decoded
+    /// it. The range alone cannot name it for a mixed-sign range (`[-5, 1]`
+    /// may or may not hold 0 and -1), so without it the drain falls back on
+    /// conservative bounds that disagree with each other: 0 for gap creates
+    /// and the inline slice, the minimum for the order guard. Those let a
+    /// neighbour's upsert be written twice and hide an element sorting
+    /// before the previous blob's last; the observed first does neither.
+    pub(super) first: Option<i64>,
+}
+
+impl Placement {
+    /// The bound gap creates are emitted below: the observed first element,
+    /// else the range's conservative OSM-order first ID.
+    pub(super) fn gap_bound(&self) -> i64 {
+        let (min_id, max_id) = self.id_range;
+        self.first
+            .unwrap_or_else(|| crate::osm_id::blob_osm_first_id(min_id, max_id))
+    }
+
+    /// The first key the order guard checks: the observed first element,
+    /// else the smallest key the range proves present
+    /// (`osm_id::blob_osm_present_first_key`).
+    pub(super) fn order_first_key(&self) -> crate::osm_id::OsmIdKey {
+        let (min_id, max_id) = self.id_range;
+        self.first.map_or_else(
+            || crate::osm_id::blob_osm_present_first_key(min_id, max_id),
+            crate::osm_id::osm_id_key,
+        )
     }
 }
 
@@ -254,13 +310,37 @@ impl DrainItem {
 
     /// Where this blob sits in the output's type and ID order: its element
     /// kind (Node → Way → Relation boundaries drive flushes of pending
-    /// upserts) and its OSM ID range (gap creates before it, the order
-    /// watermark). `None` for [`DrainItem::Omitted`], which writes nothing.
-    pub(super) fn placement(&self) -> Option<(ElementKind, (i64, i64))> {
+    /// upserts), its OSM ID range and, when decoded, its first element (gap
+    /// creates before it, the order watermark). `None` for
+    /// [`DrainItem::Omitted`], which writes nothing.
+    pub(super) fn placement(&self) -> Option<Placement> {
         match self {
-            DrainItem::CopyRange { kind, id_range, .. }
-            | DrainItem::OwnedBytes { kind, id_range, .. }
-            | DrainItem::Rewritten { kind, id_range, .. } => Some((*kind, *id_range)),
+            DrainItem::CopyRange {
+                kind,
+                id_range,
+                observed_first,
+                ..
+            }
+            | DrainItem::OwnedBytes {
+                kind,
+                id_range,
+                observed_first,
+                ..
+            } => Some(Placement {
+                kind: *kind,
+                id_range: *id_range,
+                first: *observed_first,
+            }),
+            DrainItem::Rewritten {
+                kind,
+                id_range,
+                observed_first,
+                ..
+            } => Some(Placement {
+                kind: *kind,
+                id_range: *id_range,
+                first: Some(*observed_first),
+            }),
             DrainItem::Omitted { .. } => None,
         }
     }

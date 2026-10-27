@@ -11,6 +11,7 @@ use crate::{Element, PrimitiveBlock};
 use crate::commands::{ensure_node_capacity_local, ensure_relation_capacity_local, flush_local};
 
 use super::Result;
+use super::classify::BlobWalk;
 use super::element_writes::{
     BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation,
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
@@ -79,6 +80,10 @@ fn emit_create_local(
 /// write. Under `LocMode::Required` a surviving base way's inline
 /// coordinates are refreshed against `probe` (see `refresh.rs`); `probe` is
 /// empty without `--locations-on-ways`.
+///
+/// Every base element is observed by `walk`, a fresh one, so the block's
+/// order and claim are checked over all of it; the caller ends the walk once
+/// this returns. Nothing written here has left the worker by then.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -90,6 +95,7 @@ pub(super) fn rewrite_block_parallel(
     loc: LocMode<'_>,
     probe: &StaleProbe,
     scratch: &mut RefreshScratch,
+    walk: &mut BlobWalk<'_>,
 ) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
@@ -105,15 +111,16 @@ pub(super) fn rewrite_block_parallel(
             Element::Way(w) => w.id(),
             Element::Relation(r) => r.id(),
         };
+        walk.observe(elem_id)?;
 
         // Emit creates (upsert IDs not in base block) before this element.
         // The `osm_id_cmp` here is coherent with the `osm_id_key` bounds used
         // to slice `inline_upserts` in `streaming::upsert_slice` ONLY if the
-        // base block iterates in canonical OSM order. Apply-changes enforces
-        // this via the unconditional `is_sorted()` precondition in
-        // `rewrite.rs::build_header_bytes`; any future caller that bypasses
-        // the sort gate must re-establish the invariant or the cursor may
-        // skip past upserts and drop creates.
+        // base block iterates in canonical OSM order. The header's
+        // `is_sorted()` precondition (`rewrite.rs::build_header_bytes`)
+        // claims it and `walk` refuses the block where it is false; any
+        // future caller that bypasses both must re-establish the invariant
+        // or the cursor may skip past upserts and drop creates.
         while upsert_cursor < inline_upserts.len()
             && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt()
         {

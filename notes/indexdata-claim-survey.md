@@ -145,9 +145,9 @@ Slice 1b (2026-10-27) adopted the decode-time kind refusal at every per-kind
 phase below except altw and time-filter: repack, degrade, the sort and dedupe
 sweep, diff and derive, geocode, extract and multi-extract, tags-filter,
 tags-count, `inspect --nodes`, getid and getparents. The kind rows of this
-section are DONE for those commands; the range, order and count rows
-(apply-changes, the sweep's pop order, diff `-c`, time-filter) and the altw
-rows are not. The raw-walker adopters (extract simple, geocode Pass 1.5)
+section are DONE for those commands; slice 2 did the apply-changes and sweep
+rows (kind, range, count and order, below); diff `-c`, time-filter and the
+altw rows are not done. The raw-walker adopters (extract simple, geocode Pass 1.5)
 take the `KindSet` the `src/scan` node and way walkers now return from tags
 they already read, so no adopter walks a blob twice.
 
@@ -173,6 +173,23 @@ they already read, so no adopter walks a blob twice.
   geocode every kind is decoded by the pass of its claim, so a decode-time
   kind check there catches every kind lie; elsewhere it catches a lie only
   when some phase decodes the claimed kind.
+- **DONE (slice 2, 2026-10-27): apply-changes candidate path, its intra-blob
+  order, and the sort / dedupe sweep order.** Every blob an apply-changes
+  worker decodes (candidates, and `-l` refresh-searched way blobs) refuses a
+  kind, range or count claim not exact for its complete walk
+  (`IndexdataMismatch`) and intra-blob disorder (`Unsorted`); the sweep
+  refuses an inexact range or count on every believed run entry. The spar
+  overturned two leads below: overstated ranges are wrong answers too (an
+  equal boundary hands a neighbour's modify to both blobs), so exactness,
+  not containment, is the rule; and carrying actual ranges to the drain is
+  not needed once claims are exact, but each decoded blob's actual first
+  element is, because a mixed-sign range cannot name it (honest blobs
+  `[-1]`, `[-2, 1]` wrote a modify of -1 twice, now fixed; a `[-5, 1]` blob
+  starting at -1 after one ending at -3 passed the drain guard, now
+  refused). No last-written check in the sweep: exact claims make its
+  output monotone by construction, and a last-written check could not see a
+  run written past a following passthrough. The rows below are the original
+  findings.
 - **apply-changes candidate path** (`handle_candidate`): an understated range
   on a decoded blob writes a create out of order under the sorted stamp
   (false-positive passthrough) or emits a modify twice (rewrite path).
@@ -264,3 +281,12 @@ bound; altw external `check_range` and `assemble_block`.
   indexdata does not parse (inferred).
 - A false sort claim is carried into extract's output header
   (`OutputFacts::carry`, inferred).
+- The CLI's advice for `ErrorKind::Unsorted` is `pbfhogg sort`, but on a
+  file whose header claims sorted while a blob is internally out of order
+  (what apply-changes now refuses) `sort` takes its header-only fast path
+  and copies that blob through unchanged, so the advice reproduces the
+  file. The remedy that works needs the claim gone first (slice 2 finding,
+  not fixed).
+- `Derived::Reencode` (an unindexed `--force` blob with several element
+  fields in one group) has no mixed-sign test of its first-element
+  placement; the path takes its first element from the same walk.

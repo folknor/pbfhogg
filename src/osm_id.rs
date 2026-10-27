@@ -166,8 +166,26 @@ impl OrderWatermark {
         min_id: i64,
         max_id: i64,
     ) -> Result<(), OrderViolation> {
-        let first = blob_osm_present_first_key(min_id, max_id);
-        let mut last = blob_osm_last_key(min_id, max_id).max(first);
+        self.observe_keys(
+            kind,
+            blob_osm_present_first_key(min_id, max_id),
+            blob_osm_last_key(min_id, max_id),
+        )
+    }
+
+    /// [`observe`](Self::observe) for a blob whose first key is known
+    /// rather than inferred from its range: a decoded blob's first element.
+    /// A mixed-sign range cannot name its first key (it may or may not hold
+    /// 0 and small negatives), and the present-first bound `observe` uses
+    /// for it misses an element sorting before the previous blob's last;
+    /// the decoded first key does not.
+    pub(crate) fn observe_keys(
+        &mut self,
+        kind: u8,
+        first: OsmIdKey,
+        last: OsmIdKey,
+    ) -> Result<(), OrderViolation> {
+        let mut last = last.max(first);
         if let Some((previous_kind, previous_last)) = self.last {
             if kind < previous_kind || (kind == previous_kind && first < previous_last) {
                 return Err(OrderViolation {
@@ -237,6 +255,26 @@ mod tests {
         let mut guard = OrderWatermark::default();
         assert_eq!(guard.observe(0, 1, 10), Ok(()));
         assert_eq!(guard.observe(0, -100, 20), Err(violation(0, 10, -100)));
+    }
+
+    /// A decoded first key sees what the present-first bound of a
+    /// mixed-sign range cannot: [-3, -2] then a blob [-5, 1] whose first
+    /// element is -1, which sorts before -3.
+    #[test]
+    fn watermark_on_a_decoded_first_key_sees_hidden_mixed_sign_disorder() {
+        let mut guard = OrderWatermark::default();
+        assert_eq!(guard.observe(0, -3, -2), Ok(()));
+        assert_eq!(
+            guard.observe_keys(0, osm_id_key(-1), blob_osm_last_key(-5, 1)),
+            Err(violation(0, -3, -1))
+        );
+        let mut by_range = OrderWatermark::default();
+        assert_eq!(by_range.observe(0, -3, -2), Ok(()));
+        assert_eq!(
+            by_range.observe(0, -5, 1),
+            Ok(()),
+            "the range alone cannot prove this disorder"
+        );
     }
 
     /// Distinct IDs must never share a key, including at the extremes where

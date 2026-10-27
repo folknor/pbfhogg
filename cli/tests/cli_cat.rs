@@ -1549,6 +1549,36 @@ fn cat_dedupe_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
     assert!(!output.exists(), "a refused dedupe published output");
 }
 
+/// The dedupe sweep is sort's: a decoded overlap blob whose believed range
+/// does not describe it is refused rather than merged out of order.
+#[test]
+fn cat_dedupe_refuses_a_decoded_overlap_blob_its_claimed_range_misdescribes() {
+    for (blobs, frame, min_id, max_id) in crate::cli_sort::FORGED_SWEEP_RANGES {
+        let dir = crate::common::test_scratch();
+        let honest = dir.path().join("honest.osm.pbf");
+        let input = dir.path().join("lying.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        crate::cli_sort::write_sorted_node_blobs(&honest, blobs);
+        let bytes = std::fs::read(&honest).expect("read fixture");
+        let lying =
+            crate::common::adversarial::forge_indexdata_range(&bytes, frame, min_id, max_id, None);
+        std::fs::write(&input, lying).expect("write forged file");
+
+        let out = run_dedupe(&[&input], &output);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{blobs:?}: dedupe must fail, not publish a wrong answer"
+        );
+        out.assert_stderr_contains("but the decoded blob holds");
+        out.assert_stderr_contains("check --index");
+        assert!(
+            !output.exists(),
+            "{blobs:?}: a refused dedupe published output"
+        );
+    }
+}
+
 /// The counterpart: the honest file dedupes and keeps the way.
 #[test]
 fn cat_dedupe_keeps_the_way_when_the_claim_is_honest() {

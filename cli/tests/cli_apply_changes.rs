@@ -3112,6 +3112,372 @@ fn merge_runs_at_one_worker() {
 }
 
 // ---------------------------------------------------------------------------
+// Claims a decoded candidate contradicts
+// ---------------------------------------------------------------------------
+
+/// A sorted, indexed, node-only base with one blob per entry of `blobs`,
+/// each holding its IDs in the order given (so a blob can be internally out
+/// of order under the sorted header). Frame 0 is the header, blob `i` is
+/// frame `i + 1`.
+fn write_node_blobs(path: &Path, blobs: &[&[i64]]) {
+    write_node_blobs_indexed(path, blobs, true);
+}
+
+/// [`write_node_blobs`], with indexdata on every blob or on none.
+fn write_node_blobs_indexed(path: &Path, blobs: &[&[i64]], indexed: bool) {
+    let file = File::create(path).expect("create base");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for ids in blobs {
+        for &id in *ids {
+            let coord = i32::try_from(id.rem_euclid(1000)).unwrap() * 1000;
+            bb.add_node(id, coord, coord, std::iter::empty(), None);
+        }
+        let block = bb.take().expect("take").expect("block");
+        if indexed {
+            writer.write_primitive_block(block).expect("write block");
+        } else {
+            writer
+                .write_primitive_block_no_indexdata(block)
+                .expect("write block");
+        }
+    }
+    writer.flush().expect("flush base");
+}
+
+/// `path` rewritten with frame `frame` claiming `min_id..=max_id` (and
+/// `count`, when given).
+fn forge_range(path: &Path, frame: usize, min_id: i64, max_id: i64, count: Option<u64>) {
+    let bytes = std::fs::read(path).expect("read base");
+    let forged =
+        crate::common::adversarial::forge_indexdata_range(&bytes, frame, min_id, max_id, count);
+    std::fs::write(path, forged).expect("write forged base");
+}
+
+fn node_osc(path: &Path, body: &str) {
+    write_osc(
+        path,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n{body}\n</osmChange>"
+        ),
+    );
+}
+
+/// The run failed (exit 2), said `needle`, and published nothing.
+fn assert_refused(out: &CliOutput, output: &Path, needle: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "apply-changes must fail, not publish a wrong answer; stderr:\n{}",
+        out.stderr_str()
+    );
+    out.assert_stderr_contains(needle);
+    assert!(!output.exists(), "a refused apply-changes published output");
+}
+
+/// An `IndexdataMismatch`: its message, and the advice the CLI gives only
+/// for that kind.
+fn assert_claim_refused(out: &CliOutput, output: &Path) {
+    assert_refused(out, output, "blob indexdata claims");
+    out.assert_stderr_contains("check --index");
+}
+
+/// An `Unsorted` refusal of the header's sort claim, with the CLI's advice
+/// for that kind.
+fn assert_order_refused(out: &CliOutput, output: &Path, needle: &str) {
+    assert_refused(out, output, needle);
+    out.assert_stderr_contains("Sort the input first");
+}
+
+const ORDER_REFUSAL: &str = "out of the order its header declares";
+
+/// A blob whose claimed range stops short of what it holds: node 25 sits
+/// past the claimed 10..=20. The diff modifies 15 (so the blob is decoded
+/// and rewritten) and 25, which the rewrite writes at its element and the
+/// drain then wrote again as a gap create before the next blob. Refused.
+#[test]
+fn merge_refuses_a_decoded_blob_holding_ids_past_its_claimed_range() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15, 25], &[40, 50]]);
+    forge_range(&base, 1, 10, 20, None);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="15" lat="1.0" lon="1.0" version="2"/>
+  <node id="25" lat="2.0" lon="2.0" version="2"/>
+</modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// An overstated range: blob A claims 5..=40 holding 10 and 20, blob B
+/// holds 40 and 50. A's inline slice took the modify of 40 too and wrote it
+/// as a trailing create, and B modified its own 40: written twice. The
+/// drain's order guard lets the shared bound 40 through, so only the
+/// decoded claim can refuse it.
+#[test]
+fn merge_refuses_a_decoded_blob_whose_claimed_range_overstates_it() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 20], &[40, 50]]);
+    forge_range(&base, 1, 5, 40, None);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="20" lat="1.0" lon="1.0" version="2"/>
+  <node id="40" lat="2.0" lon="2.0" version="2"/>
+</modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// A false count on a blob the precise check passes through: the claim
+/// would be copied forward and credited to the base statistics. The diff
+/// deletes an ID the blob's range covers but it does not hold, so the blob
+/// is decoded, every element walked, and nothing edited.
+#[test]
+fn merge_refuses_a_false_count_on_a_decoded_passthrough() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15], &[40, 50]]);
+    forge_range(&base, 1, 10, 15, Some(7));
+    node_osc(&osc, r#"<delete><node id="12" version="2"/></delete>"#);
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// A blob internally out of order under the sorted header, its range
+/// honest. A modify of 3 was written twice (as an early create before 5 and
+/// at its element), and a delete of 3 was missed by the precise check's
+/// forward cursor, so the blob passed through with 3 in it. Both refused.
+#[test]
+fn merge_refuses_a_decoded_blob_out_of_header_order() {
+    for (label, change) in [
+        (
+            "modify",
+            r#"<modify><node id="3" lat="1.0" lon="1.0" version="2"/></modify>"#,
+        ),
+        ("delete", r#"<delete><node id="3" version="2"/></delete>"#),
+    ] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs(&base, &[&[5, 3], &[40]]);
+        node_osc(&osc, change);
+        let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+        eprintln!("case: {label}");
+        assert_order_refused(&out, &output, ORDER_REFUSAL);
+    }
+}
+
+/// An ID outside the claimed range met before the walk breaks order is a
+/// false claim, not disorder: `[10, 30, 20]` claiming 10..=20.
+#[test]
+fn merge_refuses_an_escaping_id_before_disorder_as_a_false_claim() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 30, 20], &[40]]);
+    forge_range(&base, 1, 10, 20, None);
+    node_osc(
+        &osc,
+        r#"<modify><node id="20" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+    out.assert_stderr_contains("first elements include 3 node elements with ids 10..=30");
+}
+
+/// A way blob claiming nodes, its claimed range past the node blob's so
+/// the drain's order guard passes it. The diff creates node 30, so the
+/// blob is decoded; its way was written in node position and the create
+/// consumed as a modification of the way, dropped. Refused.
+#[test]
+fn merge_refuses_a_decoded_blob_holding_another_kind_than_claimed() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    {
+        let file = File::create(&base).expect("create base");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 10, 10, std::iter::empty(), None);
+        bb.add_node(2, 20, 20, std::iter::empty(), None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("block"))
+            .expect("nodes");
+        bb.add_way(30, [("highway", "path")], &[1, 2], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("block"))
+            .expect("ways");
+        writer.flush().expect("flush");
+    }
+    let bytes = std::fs::read(&base).expect("read base");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "frame 2 is the way blob");
+        ix[1] = 0;
+    });
+    std::fs::write(&base, lying).expect("write forged base");
+    node_osc(
+        &osc,
+        r#"<create><node id="30" lat="3.0" lon="3.0" version="1"/></create>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_refused(
+        &out,
+        &output,
+        "claims node elements but the blob holds way elements",
+    );
+    out.assert_stderr_contains("check --index");
+}
+
+/// Under --locations-on-ways a way blob whose claimed range misses the
+/// diff is searched for stale ways without a parse and passed through
+/// when clean. Here it holds way 25 past its claimed 20..=22, and the diff
+/// modifies way 25: the base 25 was passed through and the OSC 25 written
+/// as well. The search walks every way, so the claim is refused.
+#[test]
+fn merge_locations_on_ways_refuses_a_searched_way_blob_past_its_claimed_range() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 2])],
+            vec![honest_way(20, &[1, 2]), honest_way(25, &[2, 4])],
+        ],
+    );
+    forge_range(&base, 3, 20, 22, None);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.2345678" lon="61.8765432" version="2"/>
+    <way id="25" version="2"><nd ref="2"/><nd ref="1"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert_claim_refused(&out, &output);
+}
+
+/// Honest mixed-sign blobs `[-1]` and `[-2, 1]` (canonical order -1, -2,
+/// 1), the diff modifying -1. The second blob's range cannot name its
+/// first element, so its inline slice used to start at key 0, which reaches
+/// back over -1: the modify was written by both blobs. It is written once.
+#[test]
+fn merge_writes_an_upsert_once_beside_a_mixed_sign_blob() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[-1], &[-2, 1]]);
+    node_osc(
+        &osc,
+        r#"<modify><node id="-1" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    run_apply_ok(&base, &osc, &output);
+    assert_eq!(node_ids(&read_all_elements(&output)), vec![-1, -2, 1]);
+}
+
+/// A create between a blob and a mixed-sign blob's first element: `[-1]`
+/// then `[-3, 1]` (canonical -1, -3, 1), the diff creating -2. The second
+/// blob's slice starts at its first element, -3, so -2 is the drain's gap
+/// create, bounded by that same element, and lands between them. Indexed,
+/// and unindexed under `--force`, where the scanner knows no range at all.
+#[test]
+fn merge_gap_creates_up_to_a_mixed_sign_blob_first_element() {
+    for indexed in [true, false] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs_indexed(&base, &[&[-1], &[-3, 1]], indexed);
+        node_osc(
+            &osc,
+            r#"<create><node id="-2" lat="1.0" lon="1.0" version="1"/></create>"#,
+        );
+        run_apply_ok(&base, &osc, &output);
+        assert_eq!(
+            node_ids(&read_all_elements(&output)),
+            vec![-1, -2, -3, 1],
+            "indexed: {indexed}"
+        );
+    }
+}
+
+/// Disorder across blobs that only the decoded first element shows: `[-2,
+/// -3]` then a blob claiming `[-5, 1]` whose first element is -1, which
+/// sorts before -3. Each blob is internally in order and its range exact,
+/// and the range's smallest present key (-5) follows -3, so the drain's
+/// guard on ranges passed it. The diff modifies 1 so the second blob is
+/// decoded; its observed first element is refused.
+#[test]
+fn merge_refuses_disorder_a_mixed_sign_range_hides() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[-2, -3], &[-1, -5, 1]]);
+    node_osc(
+        &osc,
+        r#"<modify><node id="1" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_order_refused(&out, &output, "the base is not in the order its header");
+}
+
+/// The honest counterparts of the refusals above merge as before.
+#[test]
+fn merge_keeps_honest_claims_on_decoded_blobs() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15, 25], &[40, 50]]);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="15" lat="1.0" lon="1.0" version="2"/>
+  <node id="25" lat="2.0" lon="2.0" version="2"/>
+</modify>
+<create><node id="30" lat="3.0" lon="3.0" version="1"/></create>
+<delete><node id="12" version="2"/></delete>"#,
+    );
+    run_apply_ok(&base, &osc, &output);
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        vec![10, 15, 25, 30, 40, 50]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Platform tier
 // ---------------------------------------------------------------------------
 

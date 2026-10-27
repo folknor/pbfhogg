@@ -1207,6 +1207,20 @@ pairs; the phase splits (`584ca62b` vs `fcf76ae8`, `13be238e` vs `81d53a8b`)
 put the difference in the way phase, about 0.2 s of 11 to 14 s at the same
 cores, with the schedule walk and the node phase identical.
 
+The adoption by every other per-kind phase (`431d3130`) and the raw
+walkers returning the kinds they read (`43e20723`) were measured where they
+add work per element, the raw-walker adopters; elsewhere the check is one
+compare per decoded block. Interleaved `--bench 1` cells against
+`6bb0ad09`, two pairs each, bygg, untrimmed:
+
+| Cell | New `43e20723` | Parent `6bb0ad09` | UUIDs (new, parent, parent, new) |
+|---|---:|---:|---|
+| extract simple planet, Europe bbox | 119.1, 120.6 s | 118.6, 122.1 s | `7341cc2c`, `0f7da82d`, `0111601a`, `9a2799ee` |
+| build-geocode-index planet | 316.7, 315.2 s | 321.1, 321.2 s | `02bd5b17`, `c6f71f3e`, `838241cf`, `471766ed` |
+
+Both inside the noise band (extract medians 119.9 against 120.4 s, geocode
+316.0 against 321.2 s).
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

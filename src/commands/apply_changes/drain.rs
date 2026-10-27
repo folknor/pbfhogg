@@ -411,7 +411,8 @@ pub(super) fn run_drain(
             // one-element span. `upserts` is sorted with `osm_id_cmp`, so a
             // run of trailing creates never trips the guard on its own; a
             // create ordered before base output already emitted does.
-            check_output_order(&mut state, kind, id, id)?;
+            let key = crate::osm_id::osm_id_key(id);
+            check_output_order(&mut state, kind, key, key)?;
             emit_create_for_output(id, kind, cfg.diff, &mut state.bb, writer, &mut stats, loc)?;
             let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
             *cursor += 1;
@@ -501,21 +502,26 @@ impl DrainState {
 /// previous end bound is sufficient too, since accepted bounds cannot move
 /// backwards. The shared watermark expresses this invariant directly.
 ///
-/// The bound compared is the OSM-order first id the blob's range proves
-/// present (`osm_id::blob_osm_present_first_key`), so negative IDs (0, -1,
-/// -2, ..., 1, 2, ...) order the way `osm_id_cmp` orders them everywhere
-/// else and a valid mixed-sign blob after a negative one passes. Equality is
-/// allowed through: a shared boundary ID between two blobs is a duplicate-ID
-/// problem, not an ordering one, and is not this guard's business.
+/// The first bound compared is the blob's first element where a worker
+/// decoded it, else the OSM-order first id its range proves present
+/// (`descriptor::Placement::order_first_key`), so negative IDs (0, -1, -2,
+/// ..., 1, 2, ...) order the way `osm_id_cmp` orders them everywhere else,
+/// a valid mixed-sign blob after a negative one passes, and a decoded
+/// mixed-sign blob whose first element sorts before the previous blob's
+/// last is refused although its range alone cannot show it. The last bound
+/// is the range's last key, which is the blob's last element: a decoded
+/// blob's range has been verified exact. Equality is allowed through: a
+/// shared boundary ID between two blobs is a duplicate-ID problem, not an
+/// ordering one, and is not this guard's business.
 fn check_output_order(
     state: &mut DrainState,
     kind: ElementKind,
-    min_id: i64,
-    max_id: i64,
+    first: crate::osm_id::OsmIdKey,
+    last: crate::osm_id::OsmIdKey,
 ) -> Result<()> {
     if let Err(v) = state
         .order_watermark
-        .observe(kind.ordinal(), min_id, max_id)
+        .observe_keys(kind.ordinal(), first, last)
     {
         return Err(crate::error::new_unsorted(format!(
             "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
@@ -617,9 +623,11 @@ fn process_item(
 
     // An omitted blob writes nothing and has no kind, so it must not look
     // like a type transition or move the gap-create and order state.
-    let Some((item_kind, (min_id, max_id))) = item.placement() else {
+    let Some(placement) = item.placement() else {
         return Ok(());
     };
+    let item_kind = placement.kind;
+    let (min_id, max_id) = placement.id_range;
 
     // Before the coordinate map is published only node items can reach the
     // drain: the scanner dispatches no way or relation descriptor until it
@@ -654,9 +662,21 @@ fn process_item(
     // upsert of `item_kind` as a gap-create. Neither gap creates nor the
     // sortedness guard run on it; the dispatch below still writes the blob.
     if min_id <= max_id {
-        check_output_order(state, item_kind, min_id, max_id)?;
-        let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
-        handle_gap_creates(item_kind, osm_first, cfg, state, writer, stats, counters)?;
+        check_output_order(
+            state,
+            item_kind,
+            placement.order_first_key(),
+            crate::osm_id::blob_osm_last_key(min_id, max_id),
+        )?;
+        handle_gap_creates(
+            item_kind,
+            placement.gap_bound(),
+            cfg,
+            state,
+            writer,
+            stats,
+            counters,
+        )?;
     }
 
     dispatch_variant(item, cfg, state, writer, stats, counters)
@@ -680,6 +700,7 @@ fn dispatch_variant(
             frame_len,
             kind,
             id_range: _,
+            observed_first: _,
             index,
             tagdata: _,
         } => {
@@ -712,12 +733,15 @@ fn dispatch_variant(
             // (plus the 4-byte prefix), so this sample fits u32.
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
-            // A spliced blob is never decoded, so its element count is the
-            // indexdata `count` claim, folded into the observed `base_*`
-            // totals: a false claim moves the headline with nothing to show
-            // it. Deliberate: claims are believed, not verified, and
-            // counting here would cost the decode the splice exists to skip
-            // (reference/indexdata-trust.md). `check --index` verifies.
+            // The element count is the indexdata `count` claim, folded into
+            // the observed `base_*` totals. A worker's copy (a decoded false
+            // positive or clean refresh scan, `observed_first` set) has had
+            // that claim verified exact by its walk. The scanner's splice is
+            // never decoded, so a false claim there moves the headline with
+            // nothing to show it. Deliberate: claims are believed, not
+            // verified, and counting here would cost the decode the splice
+            // exists to skip (reference/indexdata-trust.md). `check --index`
+            // verifies.
             match kind {
                 ElementKind::Node => stats.base_nodes += index.count,
                 ElementKind::Way => stats.base_ways += index.count,
@@ -729,6 +753,7 @@ fn dispatch_variant(
             frame_bytes,
             kind,
             id_range: _,
+            observed_first: _,
             count,
             verbatim,
         } => {
@@ -768,6 +793,7 @@ fn dispatch_variant(
             framed_chunks,
             kind,
             id_range,
+            observed_first: _,
             stats: per_blob_stats,
         } => {
             flush_copy_range(state, cfg, writer, counters)?;

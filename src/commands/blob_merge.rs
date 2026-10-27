@@ -36,8 +36,8 @@ use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
 use crate::blob_meta::{
-    BboxClaim, BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
-    try_scan_block_tags,
+    BboxClaim, BlobIndex, IdTally, TagIndex, try_scan_block_ids_and_tags,
+    try_scan_block_ids_checked, try_scan_block_tags,
 };
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
@@ -648,6 +648,16 @@ impl Plan {
     }
 }
 
+/// An element's ID, whatever its kind.
+fn element_id(element: &Element<'_>) -> i64 {
+    match element {
+        Element::DenseNode(dn) => dn.id(),
+        Element::Node(n) => n.id(),
+        Element::Way(w) => w.id(),
+        Element::Relation(r) => r.id(),
+    }
+}
+
 fn type_order(kind: ElementKind) -> u8 {
     match kind {
         ElementKind::Node => 0,
@@ -671,9 +681,15 @@ fn type_order(kind: ElementKind) -> u8 {
 /// Extending the run while `next.first_key <= run_max` closes that: once a blob
 /// joins a run, every later blob whose first key falls inside the run's widest
 /// reach so far joins too. Components stay kind-bounded - the downstream
-/// sweep is kind-gated and silently drops off-kind elements handed to it
-/// (the `cat --dedupe` regression where `merge_pbf([A, A])` lost its ways
-/// and relations).
+/// sweep is kind-gated and drops off-kind elements handed to it (the
+/// `cat --dedupe` regression where `merge_pbf([A, A])` lost its ways and
+/// relations); it refuses a believed claim they contradict, and a
+/// restructured frame relies on the drop to give each entry its own kind.
+///
+/// The ranges compared here are claims for an entry pass 1 did not scan.
+/// The sweep refuses an entry whose decoded IDs its claim does not describe
+/// exactly, so every element of a run lies within the run's claimed reach
+/// and every passthrough after it starts above that reach.
 ///
 /// Each component is its own run, swept on its own: the next component of a
 /// kind starts above this one's widest reach, so no element and no equal
@@ -1246,17 +1262,34 @@ impl Sweep<'_, '_> {
             let frame = &self.frames[entry.frame];
             let source = &self.sources[frame.source];
             let block = read_block(source, frame, frame_buf)?;
-            // A believed header claim routed this blob to this kind's sweep;
-            // an element of another kind would be dropped by the extraction.
-            // A scanned entry's kind came from the payload, not a claim, and
-            // a restructured frame is read per kind on purpose.
-            if !entry.index_scanned {
+            // A believed header claim routed this blob to this kind's sweep
+            // and placed it in the run: an element of another kind would be
+            // dropped by the extraction, and an ID outside the claimed range
+            // breaks the order the pops before each blob rely on (one below
+            // the claimed minimum is pushed after larger IDs were written,
+            // one above the claimed maximum after the run is written past a
+            // following passthrough's first ID). So the claim must be exact
+            // for what the push loop sees, checked before the next blob's
+            // pops write anything. A scanned entry's index came from the
+            // payload, not a claim, and a restructured frame is read per kind
+            // on purpose.
+            let believed = !entry.index_scanned;
+            if believed {
                 block
                     .refuse_foreign_kind(Some(entry.index.kind))
                     .map_err(|e| source.locate_at(frame.file_offset, e))?;
             }
+            let mut tally = IdTally::default();
             for element in block.elements() {
+                if believed {
+                    tally.add(element_id(&element));
+                }
                 extract(&element, &mut heap).map_err(|e| source.locate_at(frame.file_offset, e))?;
+            }
+            if believed {
+                tally
+                    .refuse_inexact(&entry.index)
+                    .map_err(|e| source.locate_at(frame.file_offset, e))?;
             }
         }
         while !heap.is_empty() {

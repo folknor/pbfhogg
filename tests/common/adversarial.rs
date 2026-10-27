@@ -148,6 +148,27 @@ pub fn mutate_blob_header_indexdata(
     )
 }
 
+/// A copy of `pbf` whose frame `blob_idx` claims the ID range
+/// `min_id..=max_id` (and, with `count`, that element count) in its
+/// indexdata, everything else in the claim and the frame unchanged. For
+/// forging a well-formed false range on an honestly indexed blob.
+pub fn forge_indexdata_range(
+    pbf: &[u8],
+    blob_idx: usize,
+    min_id: i64,
+    max_id: i64,
+    count: Option<u64>,
+) -> Vec<u8> {
+    mutate_blob_header_indexdata(pbf, blob_idx, |ix| {
+        assert!(ix.len() >= 26, "frame {blob_idx} carries no indexdata");
+        ix[2..10].copy_from_slice(&min_id.to_le_bytes());
+        ix[10..18].copy_from_slice(&max_id.to_le_bytes());
+        if let Some(count) = count {
+            ix[18..26].copy_from_slice(&count.to_le_bytes());
+        }
+    })
+}
+
 /// Mutate the decompressed OSMData/OSMHeader payload of frame `blob_idx`.
 ///
 /// The closure receives the raw protobuf bytes of the inner message

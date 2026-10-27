@@ -1347,6 +1347,86 @@ fn sort_keeps_the_way_when_the_claim_is_honest() {
     assert_eq!(c.ways.len(), 1);
 }
 
+/// A sorted, indexed, node-only file with one blob per entry of `blobs`,
+/// its IDs in the order given. Blob `i` is frame `i + 1`.
+pub(crate) fn write_sorted_node_blobs(path: &Path, blobs: &[&[i64]]) {
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(path).expect("create file"),
+        Compression::default(),
+    );
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for ids in blobs {
+        for &id in *ids {
+            let coord = i32::try_from(id.rem_euclid(1000)).expect("small id") * 1000;
+            bb.add_node(id, coord, coord, [], None);
+        }
+        let block = bb.take().expect("take").expect("block");
+        writer.write_primitive_block(block).expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// Two forged ranges the sweep places by under the sorted claim, as
+/// `(blobs, frame, claimed min, claimed max)`: blob B (3 and 8) claiming
+/// 8..=8, so it joins A's run after A's 1 and 5 were written below 8 and
+/// its 3 came out after 5; and blob A (1 and 30) claiming 1..=10, so the
+/// run's 30 was written before the passthrough blob holding 20.
+pub(crate) const FORGED_SWEEP_RANGES: [(&[&[i64]], usize, i64, i64); 2] = [
+    (&[&[1, 5, 9], &[3, 8]], 2, 8, 8),
+    (&[&[1, 30], &[2], &[20]], 1, 1, 10),
+];
+
+/// `sort` under the sorted claim believes each blob's range to order its
+/// overlap runs; a decoded run blob whose elements its range does not
+/// describe used to come out of the sweep out of order, exit 0. Refused,
+/// nothing published.
+#[test]
+fn sort_refuses_a_decoded_overlap_blob_its_claimed_range_misdescribes() {
+    for (blobs, frame, min_id, max_id) in FORGED_SWEEP_RANGES {
+        let dir = crate::common::test_scratch();
+        let honest = dir.path().join("honest.osm.pbf");
+        let input = dir.path().join("lying.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        write_sorted_node_blobs(&honest, blobs);
+        let bytes = std::fs::read(&honest).expect("read fixture");
+        let lying =
+            crate::common::adversarial::forge_indexdata_range(&bytes, frame, min_id, max_id, None);
+        std::fs::write(&input, lying).expect("write forged file");
+
+        let out = CliInvoker::new()
+            .arg("sort")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--force")
+            .run();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{blobs:?}: sort must fail, not publish a wrong answer"
+        );
+        out.assert_stderr_contains("but the decoded blob holds");
+        out.assert_stderr_contains("check --index");
+        assert!(
+            !output.exists(),
+            "{blobs:?}: a refused sort published output"
+        );
+
+        // The honest file sorts.
+        run_sort(&honest, &output);
+        let mut expected: Vec<i64> = blobs.iter().flat_map(|b| b.iter().copied()).collect();
+        expected.sort_unstable();
+        let c = read_all_elements_with_coords(&output);
+        let ids: Vec<i64> = c.nodes.iter().map(|n| n.0).collect();
+        assert_eq!(ids, expected, "{blobs:?}");
+    }
+}
+
 /// Without the sorted claim sort scans every payload and replaces a false
 /// indexdata claim, so the forged file is repaired, never refused.
 #[test]

@@ -1421,6 +1421,35 @@
   --distrust-metadata`. A blob skipped on its claim without being decoded is
   still believed: `check --index` is what finds that.
 
+- **`apply-changes` refuses a false claim on any blob it decodes.** A base
+  blob whose indexdata range or count is not exact for its elements, or
+  that holds another kind than it claims, used to be placed by the claim:
+  an understated range wrote a modify twice or a create out of order under
+  the sorted stamp, an overstated one wrote a neighbour's modify twice, and
+  a false count went into the base statistics and the output. A blob whose
+  elements are out of order under the header's sort claim wrote a modify
+  twice or passed a deleted element through. These now fail (exit 2) and
+  publish nothing: `IndexdataMismatch` for the claim, pointing at
+  `check --index` and `cat --reindex`, and `Unsorted` for the order. That
+  covers every blob the diff's ranges reach and, under
+  `--locations-on-ways`, every way blob searched for stale coordinates. A
+  blob whose claimed range misses the diff is still copied on the claim.
+
+- **`apply-changes` writes an upsert once beside a blob spanning negative
+  and positive IDs.** With base blobs `[-1]` and `[-2, 1]`, a modify of -1
+  was written by both. Upserts and gap creates are now placed by each
+  decoded blob's first element, and a blob whose first element sorts before
+  the previous blob's last is refused as unsorted where its range alone
+  hid it.
+
+- **`sort` and `cat --dedupe` refuse a false range on a blob they merge.**
+  Under a header claiming sorted order an indexed blob's range decides
+  which blobs are merged together and which are copied through; a blob
+  merged in an overlap run whose range or count is not exact for its
+  elements used to be written out of order, exit 0. It now fails with
+  `IndexdataMismatch` (exit 2) and publishes nothing. Blobs copied through
+  without decoding are still believed.
+
 - **`apply-changes --direct-io` reports its index hits.** The summary's
   `Blobs: N passthrough (M index-hit)` read `0 index-hit` under
   `--direct-io` (library: `MergeStats::blobs_index_hit`), however many blobs

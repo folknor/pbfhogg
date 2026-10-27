@@ -433,11 +433,20 @@ pub(super) struct Detection {
 /// before it is rewritten. The framing fields may follow the groups and the
 /// last occurrence wins, as in the block parser, so groups are collected
 /// before any way is evaluated.
+///
+/// The blob is one its claim says holds ways and nothing the diff touches,
+/// and a clean one leaves under that claim, so the walk checks it: every
+/// way's ID goes to `walk`, and a group field of another kind (by the
+/// shared kind rule, `scan::way::skip_recording_kind`) refuses the blob.
+/// A clean return has walked every way, and the caller ends the walk; a
+/// stale one stops at the first stale way, and the rewrite that follows
+/// parses the blob and checks it whole.
 pub(super) fn detect_stale_wire(
     decompressed: &[u8],
     probe: &StaleProbe,
     groups: &mut Vec<(usize, usize)>,
     hits: &mut Vec<(usize, (i32, i32))>,
+    walk: &mut super::classify::BlobWalk<'_>,
 ) -> Result<Detection> {
     groups.clear();
     let mut framing = CoordFraming::DEFAULT;
@@ -462,11 +471,13 @@ pub(super) fn detect_stale_wire(
     }
 
     let mut detection = Detection::default();
+    let mut kinds = crate::element_kind::KindSet::default();
     for &(offset, len) in groups.iter() {
         let mut group = Cursor::new(&decompressed[offset..offset + len]);
         while let Some((field, wire_type)) = group.read_tag()? {
             if field == 3 && wire_type == WIRE_LEN {
                 let way = WireWay::parse(group.read_len_delimited()?)?;
+                walk.observe(way.id)?;
                 let eval = evaluate_way(
                     way.refs_data,
                     way.lat_data,
@@ -481,7 +492,13 @@ pub(super) fn detect_stale_wire(
                 }
                 detection.deleted_refs += eval.deleted_refs;
             } else {
-                group.skip_field(wire_type)?;
+                crate::scan::way::skip_recording_kind(&mut group, field, wire_type, &mut kinds)?;
+                if let Some(found) = kinds.foreign_to(crate::ElementKind::Way) {
+                    return Err(crate::error::new_kind_contradiction(
+                        crate::ElementKind::Way,
+                        found,
+                    ));
+                }
             }
         }
     }
@@ -611,7 +628,8 @@ mod tests {
     }
 
     fn detect(block: &[u8], p: &StaleProbe) -> Detection {
-        detect_stale_wire(block, p, &mut Vec::new(), &mut Vec::new()).unwrap()
+        let mut walk = super::super::classify::BlobWalk::new(None);
+        detect_stale_wire(block, p, &mut Vec::new(), &mut Vec::new(), &mut walk).unwrap()
     }
 
     /// Way 2, in the second group, refs node 7 at raw (3, 1). Under

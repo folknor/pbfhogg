@@ -89,7 +89,9 @@ else it is a refusal, exit 2, with nothing published. Adopted by:
   way scans and the raw-copy candidate scan;
 - tags-filter (two-pass and `-R`), tags-count (so `inspect --tags --type`),
   `inspect --nodes`, getid (include, `removeid`, `--add-referenced`,
-  `--id-osm-file`) and getparents.
+  `--id-osm-file`) and getparents;
+- `apply-changes`, for every blob a worker decodes (below), including the
+  way blobs `--locations-on-ways` searches without a parse.
 
 Not adopted: `add-locations-to-ways` and `time-filter` (the latter builds no
 per-kind schedule). `tags-filter --distrust-metadata` believes no claim and is
@@ -105,23 +107,71 @@ kind byte, an inverted range, a repeated field) as absent and decode the
 blob; a verifier must not, and `check --index` reports them (ADR-0013,
 consequence 3).
 
+## Range, count and order claims refused at decode
+
+Two engines place a blob by its claimed range and decode some blobs anyway,
+so they check the claim on the element loop they already run: an increment
+and a branchless min and max per element (`blob_meta::IdTally`), and in
+`apply-changes` one key compare with the previous element. At the end of the
+blob's complete walk the claim must be exact, `count`, `min_id` and `max_id`
+equal to what the walk saw (the `check --index` rule for those fields), or the
+run fails with `ErrorKind::IndexdataMismatch` (no `KindContradiction`),
+located at the blob, before anything the blob produced leaves the worker.
+A decoded blob with a claim and no element is refused too: no index describes
+one. Overstated ranges are refused, not only understated ones: an overstated
+range hands a neighbour's upsert to the blob as well.
+
+- **`apply-changes`**, every blob a worker decodes: each precise-check
+  candidate (a miss walks every element; a hit, a forced rewrite and a
+  refresh-only rewrite go through the rewrite loop, which does) and every way
+  blob `--locations-on-ways` searches without a parse (a clean search has
+  walked every way). An ID below its predecessor in canonical OSM order
+  contradicts the header's `Sort.Type_then_ID` and is `ErrorKind::Unsorted`
+  (the CLI advises `sort`), unless an ID the walk has met already lies
+  outside the claimed range, which makes it the false claim. Each decoded
+  blob's first element travels to the drain, which places the blob by it:
+  the inline upserts the blob writes start there, the gap creates before it
+  stop there, and the output order guard compares it with what was written
+  before. A mixed-sign range cannot name its first element, and the range's
+  stand-ins disagreed: blobs `[-1]` and `[-2, 1]` both wrote an upsert of
+  -1, and a blob `[-5, 1]` whose first element is -1 passed the guard after
+  one ending at -3. Both were wrong answers on honest-range input; the
+  first is fixed and the second refused. A blob a worker reads without
+  decoding (`--direct-io` passthrough) and the scanner's splice are placed
+  by the range alone, as before.
+- **`sort` and `cat --dedupe`**, every entry of an overlap run whose claim
+  is believed (an indexed blob under a header claiming sorted): the push
+  loop tallies the entry, and its claim must be exact before the pops for
+  the next entry write anything. Runs and passthroughs are planned on the
+  claims, so a claimed minimum above an element let the sweep write it after
+  larger IDs, and a claimed maximum below one let a run write past the next
+  passthrough's first ID. Order inside an entry is not checked: the sweep's
+  heap reorders it. An entry indexed from its payload (an unsorted-header
+  sort, a blob without indexdata, a restructured block) makes no claim.
+
+What stays believed: every blob neither engine decodes, which the table
+below records (the splice and passthrough fast paths, the sorted fast path's
+non-overlapping blobs, and their copied headers).
+
 ## Claims: who believes, what checks, what a lie costs
 
 | Claim | Believed by, and what a lie costs | Checked in passing by | Verified by |
 |-------|-----------------------------------|-----------------------|-------------|
 | kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements; the phase that does read it refuses it where the decode-time refusal is adopted ("Kind claims refused at decode") and drops elements of the unclaimed kind silently where it is not. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes, and searches for surviving ways with stale inline coordinates only in blobs claimed as ways, so a way blob labelled with another kind can be passed through with its stale coordinates. `check --locations` reads a blob claiming ways only in its way passes; every other blob it decodes once and routes on what it holds. `check --ids` / `--refs` read each blob in the phase of its claimed kind and judge type order from the claims; a blob claiming relations is read by `--refs` only under `--check-relations`, and `--ids -t` reads only the selected kinds' blobs, so a lie in a blob no phase reads passes them. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind); `check --ids`, `check --refs` and `check --locations` (a blob claiming ways) stop and fail the file on a decoded element of another kind; every other adopting command refuses it ("Kind claims refused at decode") | `check --index` |
-| `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff` plans shards from ranges, decides from them which blob pairs overlap, and skips decoding a pair whose claimed range and count match when its compressed bytes are identical (`-c`, `--format osc`). `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range (`check --locations` partitions them by the range it decoded, not the claimed one). `inspect --show` skips on range. | `diff` refuses ranges that break canonical order, and a block holding elements past its claimed `max_id` where the merge meets them (a shard boundary hides what lies past it); `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
-| `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
+| `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff` plans shards from ranges, decides from them which blob pairs overlap, and skips decoding a pair whose claimed range and count match when its compressed bytes are identical (`-c`, `--format osc`). `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range (`check --locations` partitions them by the range it decoded, not the claimed one). `inspect --show` skips on range. | `apply-changes` (every blob a worker decodes) and the `sort` / `cat --dedupe` sweep (every believed overlap-run entry) refuse a range that is not exact ("Range, count and order claims refused at decode"); `diff` refuses ranges that break canonical order, and a block holding elements past its claimed `max_id` where the merge meets them (a shard boundary hides what lies past it); `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
+| `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees); `apply-changes` and the `sort` / `cat --dedupe` sweep, on the blobs they decode, as for the range, so a passed-through blob `apply-changes` decoded is credited a verified count | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |
 | tagdata | `tags-filter` and `tags-count` skip a blob whose key set lacks every required key: a key set omitting a key its elements carry drops matches. `add-locations-to-ways --index-type external`, removing untagged nodes, drops a whole node blob whose key set is empty and whose claimed range holds no retained relation member, so a false empty key set deletes tagged nodes and a false range hides members. | - | `check --index` (missing and surplus keys, and tagdata on a blob no index can describe) |
-| `Sort.Type_then_ID` | Every command that requires sorted input reads the flag alone. `sort` takes its header-only fast path exactly when the header claims sorted and the blob has readable indexdata, and copies non-overlapping blobs raw, so an internally unsorted blob under the claim passes through under the sorted stamp ([CORRECTNESS.md](../CORRECTNESS.md), "`sort`: intra-blob disorder"). `add-locations-to-ways --index-type external` merge-walks each node blob's decoded tuples against ID-sorted records, so a node blob whose elements are out of order (honest range, payload `[2, 1]`) turns present nodes into missing locations. `diff` trusts order inside a blob and inside a range spanning negative and positive IDs. | `renumber` and `digest` check order while reading; `sort` and `cat --dedupe` (one shared pass 1) check intra-blob order on every blob outside the header-only fast path | `check --ids`, partly (below) |
+| `Sort.Type_then_ID` | Every command that requires sorted input reads the flag alone. `sort` takes its header-only fast path exactly when the header claims sorted and the blob has readable indexdata, and copies non-overlapping blobs raw, so an internally unsorted blob under the claim passes through under the sorted stamp ([CORRECTNESS.md](../CORRECTNESS.md), "`sort`: intra-blob disorder"). `add-locations-to-ways --index-type external` merge-walks each node blob's decoded tuples against ID-sorted records, so a node blob whose elements are out of order (honest range, payload `[2, 1]`) turns present nodes into missing locations. `diff` trusts order inside a blob and inside a range spanning negative and positive IDs. | `renumber` and `digest` check order while reading; `sort` and `cat --dedupe` (one shared pass 1) check intra-blob order on every blob outside the header-only fast path; `apply-changes` refuses disorder inside every blob a worker decodes, and a decoded blob whose first element sorts before what it has written (its output order guard checks claimed ranges for the rest) | `check --ids`, partly (below) |
 
 The worst of these, stated plainly:
 
 - `apply-changes` splicing a blob whose range is understated: the blob is
   copied unchanged past a modify or delete aimed at one of its elements,
   and a create whose ID falls in the blob's real span can be written out of
-  order under the sorted stamp.
+  order under the sorted stamp. The splice is decided on the claim alone;
+  a blob whose claimed range meets the diff is decoded and its claim
+  refused when false.
 - `add-locations-to-ways --index-type external` dropping present node
   locations when a node blob's elements are out of order under a sorted
   header.

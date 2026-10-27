@@ -420,6 +420,77 @@ overlap runs, so the believed sweep runs on valid input only for
 `cat --dedupe`, and an unsorted-header `sort` sweeps scanned entries, which
 the tally skips.
 
+### Claim checks in add-locations-to-ways and time-filter (bygg, 2026-10-27, commits `5587582a` to `2d4e3404`)
+
+Slice 3 holds every blob add-locations-to-ways decodes to its claim and
+time-filter to the sort claim. All cells `--bench 1`, interleaved against
+the parent `d0aea1d2` (built through `--commit`), bygg, untrimmed. Worker
+counters are summed worker elapsed seconds, not CPU; span CPU is user
+core-seconds summed over every sidecar segment of the span
+(`scripts/sidecar_span_totals.py`; `scripts/altw_cells.py` tabulates the
+counters).
+
+**External, planet: the first commits cost CPU, removed before the final
+one.** On `5587582a` stage 2's node extraction, where the shared
+`ClaimWalk` ran per tuple, took 101.8 and 102.4 worker-seconds against
+85.9 and 86.4 (`1bac7795`, `98b44690`, `2fc0c5da`, `e1b62c8a`), and on
+`a4ffa7b3` stage 4's node re-encode, the same walk per node, took 720.8 and
+727.3 against 608.2 and 633.7 (`7cbfa307`, `d13ba24d`, `7be2bd68`,
+`a228bdb2`), the same sign in every pair. Both now use `AscendingTally`
+(one raw compare, a store and a count per ID, decisive because external's
+node claims are non-negative).
+
+**Final code, planet external, settling sequence.** Earlier final-code
+cells were confounded: a parent cell came first after each idle gap (a
+rebuild, the test suite), and pass A, which writes 147 GB of id shards,
+was 100 to 110 s on those cells and 150 to 200 s on cells run back to
+back, with the same bytes written and less CPU. The sequence below was
+agreed to settle it: one conditioning run (`56d0a576`, parent), then
+parent and change alternating back to back with builds done beforehand.
+
+| Cell, run order | Wall (s) | Pass A (s) | Stage 2 (s) | Streaming (s) | Streaming user core-s | Stage 2 extract (worker-s) | Stage 4 node re-encode (worker-s) |
+|---|---|---|---|---|---|---|---|
+| `43a495ea` parent | 571.8 | 173.3 | 206.6 | 183.6 | 2630.0 | 86.5 | 626.5 |
+| `439cc375` change | 581.7 | 174.6 | 206.4 | 192.6 | 2636.6 | 89.1 | 643.1 |
+| `20efc913` parent | 579.0 | 170.9 | 213.8 | 186.1 | 2717.1 | 86.2 | 634.9 |
+| `56736441` change | 622.7 | 180.6 | 223.0 | 211.0 | 2656.3 | 89.0 | 629.4 |
+| `cc799657` parent | 594.3 | 186.5 | 214.3 | 185.3 | 2626.2 | 86.3 | 618.9 |
+| `50823a3d` change | 564.9 | 168.1 | 206.6 | 182.1 | 2749.2 | 91.6 | 626.5 |
+
+Wall medians 579.0 (parent) against 581.7 s (change), +0.5 %, inside the
+noise. Pass A, stage 2 and streaming medians move by +0.8 %, -3.4 % and
++3.9 %, and their user CPU by -2 %, +0.3 % and +0.9 %. The one cost the
+data resolves is stage 2's node extraction, 86.3 to 89.1 worker-seconds
+(+3.2 %, every change cell above every parent), about half a second of
+wall at its 6 workers. Stage 4's node re-encode moves +0.5 % on the
+medians, unresolved. The slow change cell `56736441` is slow in streaming
+(211.0 s against 186.1 s for the parent before it) with 2.2 % less user
+CPU, the same bytes read and written, and read and write throughput about
+11 % lower; stage 3 reads, the coordinate-payload preads and stage 4's
+preads rise 13 to 20 %: an I/O slowdown, not check CPU. Not explained:
+stage 1's way scan, which now runs a `ClaimWalk` per way, is lower on the
+change in every cell (median 58.2 against 50.9 worker-seconds).
+
+**Sparse, north-america** (auto routes it to sparse here: store estimate
+18.98 GB against an 80 % share of a 27.46 GB budget). Run order parent,
+change, change, parent: walls 94.9 (cold page cache: its auto estimate walk
+took 33 s), 61.1, 53.7 and 67.9 s (`9c85e66a`, `9943a40e`, `ebab1c11`,
+`23b988fc`). Pass 1, which now tallies every node tuple, used 75.5, 75.2,
+78.3 and 73.8 user core-seconds and took 10.7, 9.6, 9.6 and 10.8 s: CPU
+level, and a wall 1.1 s lower on both change cells that the figures do not
+explain (its kernel time is 1 to 3 core-seconds lower). Pass 2 used 501,
+498, 495 and 486 user core-seconds; its walls (42.3, 41.9, 36.6, 49.8 s)
+follow the store's page-cache residency, not CPU.
+
+**time-filter, planet** (snapshot path, one key compare per element):
+175.9, 174.9, 178.2 and 175.4 s, run order parent, change, change, parent
+(`1cadc624`, `9bcc192d`, `13aaad48`, `176d004e`), medians +0.5 %.
+
+**diff `-c`**, which now counts single-sided runs from the decoded block:
+planet does not fit brokkr's 16 MiB stdout capture, so germany with OSC
+4705 stands in: 3.2, 3.1, 3.1 and 3.1 s (`d0e29e64`, `bd8e6362`,
+`f4204986`, `9bcdff49`).
+
 ### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 
 Apply-changes without `--locations-on-ways` is a structurally

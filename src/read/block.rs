@@ -598,6 +598,14 @@ impl PrimitiveBlock {
     /// For unsorted files where groups contain different types, returns
     /// [`Mixed`](BlockType::Mixed).
     ///
+    /// `Mixed` also stands for a group this classifier cannot name: a
+    /// changeset group (field 5), an unknown field or an unexpected wire type.
+    /// Dense plus plain node groups are `Mixed` too though they hold one kind.
+    /// So `Mixed` is "look at the elements", never evidence of several kinds,
+    /// and this is not a kind test: callers either walk a `Mixed` block anyway
+    /// (extract simple), reject it (digest), or fall back to the kinds of the
+    /// elements present (the diff merge).
+    ///
     /// Empty groups carry no elements and are neutral: an empty group beside
     /// a way group is a way block, not a mixed one. A block whose groups are
     /// all empty (or that has none) is [`Empty`](BlockType::Empty). Counting

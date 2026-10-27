@@ -80,7 +80,11 @@ fn show_element_inner<W: Write>(
                 // Sorted PBFs: once past the target, no later blob can
                 // contain it. Unsorted PBFs: must keep scanning - a
                 // later blob can carry a smaller `min_id`.
-                if is_sorted && idx.min_id > target_id {
+                // The numeric compare is canonical order only for a
+                // non-negative target: negative IDs sort between 0 and the
+                // positives by absolute value (ADR-0002), so a later blob
+                // can hold a numerically smaller ID.
+                if is_sorted && target_id >= 0 && idx.min_id > target_id {
                     return Ok(false);
                 }
                 continue;

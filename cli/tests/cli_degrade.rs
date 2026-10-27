@@ -2472,3 +2472,34 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
         .assert_success();
     assert_eq!(normalized_count(&forced), count);
 }
+
+/// `--corrupt-indexdata` and `--corrupt-indexdata-kind` rewrite a readable
+/// indexdata. A blob with none gives them nothing to corrupt, so the run is
+/// refused rather than writing the blob back honest under a flag that reads as
+/// applied.
+#[test]
+fn degrade_corrupt_indexdata_refuses_a_blob_with_no_indexdata() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_degrade_fixture(&honest);
+
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&unindexed)
+        .arg("--strip-indexdata")
+        .assert_success();
+
+    for flag in ["--corrupt-indexdata", "--corrupt-indexdata-kind"] {
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&unindexed)
+            .arg("-o")
+            .arg(dir.path().join("out.osm.pbf"))
+            .arg(flag)
+            .arg("--force")
+            .assert_failure();
+    }
+}

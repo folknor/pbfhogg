@@ -372,6 +372,12 @@ fn resolve_thread_count(threads: Option<usize>, resources: &dyn crate::host::Res
 /// materialisation) or a `HeaderWalker` `BlobHeaderMeta` (which already
 /// parses `index` up-front and holds raw `tagdata` bytes).
 ///
+/// It applies the kind and tag-key rules only and ignores `filter.node_bbox`,
+/// though `BlobFilter::uses_index` counts a bbox as index-backed. That is
+/// harmless today: only extract builds a bbox filter, and it consults
+/// `wants_index` itself; its callers here (`tags_filter`, `tags_count`) never
+/// set one. A caller that passes a bbox filter must apply the bbox itself.
+///
 /// Lives here rather than in `tags_filter` because the tag index is a
 /// schedule-building concern: `tags_count` reaches the same blobs through
 /// [`build_classify_schedule_blob_filtered`] and must apply the identical rule,

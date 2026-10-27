@@ -1398,6 +1398,12 @@
 
 ### Fixed
 
+- **`degrade --corrupt-indexdata` and `--corrupt-indexdata-kind` refuse a
+  blob they cannot corrupt.** A blob with no indexdata, or indexdata that
+  does not parse, used to be written back unchanged, so the run exited 0
+  with an honest blob where the adversarial file promised a false one. The
+  run now fails, naming the blob.
+
 - **`check --refs` and `check --ids` fail a file whose blob kind claims are
   false.** Each check reads a blob in the phase of the kind its indexdata
   claims, and used to drop the elements of every other kind, so a way blob

@@ -231,6 +231,23 @@ The worst of these, stated plainly:
   labelled way or relation, so its coordinates are missing from the index.
 - `cat --type` leaking or losing a mislabelled blob's elements.
 
+Believed and unchecked, with no wrong answer worth a refusal:
+
+- `BlobIndex::deserialize` bounds neither `count` nor the ID range by
+  kind: a way index with negative IDs, or an absurd count, parses. Nothing
+  sizes an allocation from it unclamped, and negative IDs are invalid input
+  (ADR-0002). An index whose bytes do not parse at all counts as absent
+  (above).
+- `BlobFilter` with a node bbox is index-backed (`uses_index`), but the
+  classify-phase filter check (`blob_filter_check`) applies only the kind
+  and tag-key rules. Only extract builds a bbox filter, and it applies the
+  bbox itself, so no command skips or keeps a blob wrongly because of it.
+- `inspect --show` exits early on a sorted header once a blob's `min_id`
+  passes the target. For a non-negative target that is sound; a negative
+  target never exits early.
+- `degrade --corrupt-indexdata` and `--corrupt-indexdata-kind` refuse a
+  blob whose indexdata does not parse, since there is nothing to corrupt.
+
 ## Raw copies carry claims forward
 
 A blob copied raw keeps its `BlobHeader`, claims included: the `apply-changes`
@@ -247,6 +264,18 @@ block no single index describes. A rebuilt index can carry one too: `renumber`
 rewrites every node blob but takes the new index's bbox from the input's
 claim, so a false bbox survives into a fully renumbered output and a later
 `extract` can skip nodes on it.
+
+A false `Sort.Type_then_ID` claim is carried the same way. A command whose
+output header takes `Order::AsInput` (`OutputFacts::carry`: sparse
+`add-locations-to-ways`, `extract`, `tags-filter`, `getid`, `getparents`,
+`repack`, plain `cat`) does not depend on order, so it neither checks nor
+repairs it, and a single sorted-claiming input whose elements are out of
+order yields an output header that repeats the claim. The next command that
+depends on order is the one that checks (`apply-changes`, external
+`add-locations-to-ways`, `time-filter`, `renumber`, `sort --distrust-metadata`
+as the remedy). `block_type()` is not a kind test: it returns `Mixed` for a
+changeset or unknown group as well as for mixed kinds, and no caller treats it
+as evidence of a kind.
 
 ## Allocation from claims
 
@@ -423,7 +452,12 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   outside the decimicrodegree range) is copied under indexdata and tag
   keys scanned from its payload, with a `Note:`. Under the sorted claim an
   indexed blob is not scanned, so its indexdata is believed and copied, as
-  everywhere else on this page.
+  everywhere else on this page. Tag keys are the exception under the
+  unsorted header too: its scan reads them only for a blob with no
+  indexdata, so a blob whose indexdata holds is copied under its carried
+  tagdata unverified (a per-element cost the scan does not otherwise pay).
+  `--distrust-metadata` compares the key set and reframes a blob it
+  contradicts.
 
 Current behaviour recorded as such, not as a contract to preserve:
 
@@ -444,5 +478,5 @@ Current behaviour recorded as such, not as a contract to preserve:
 - `inspect --indexed` reports the first-blob probe, so it says yes for a
   partially indexed file whose first data blob is indexed, and no for one
   whose first data blob is not.
-- Only `tags-filter` and `inspect` have `--distrust-metadata`; every other
-  command believes the claims with no way to decline them.
+- Only `tags-filter`, `inspect` and `sort` have `--distrust-metadata`; every
+  other command believes the claims with no way to decline them.

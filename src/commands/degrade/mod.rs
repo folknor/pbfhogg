@@ -641,6 +641,21 @@ fn degrade_passthrough(
                 // and carries WayMembers-v1 and any unknown header fields
                 // through unchanged.
                 let corrupt_index = corrupted_index(frame.index, flags);
+                // A blob with no readable indexdata (absent, or bytes the
+                // reader treats as absent) has nothing to corrupt: refuse
+                // rather than write it back honest while the flag reads as
+                // applied.
+                if corrupt_index.is_none()
+                    && (flags.corrupt_indexdata || flags.corrupt_indexdata_kind)
+                {
+                    return Err(frames.locate(
+                        frame.id,
+                        Error::invalid_data(
+                            "corrupt_indexdata and corrupt_indexdata_kind rewrite a \
+                             readable indexdata, and this blob has none",
+                        ),
+                    ));
+                }
                 let reframed = reframe_raw(
                     frame.header_bytes(),
                     frame.blob_bytes(),

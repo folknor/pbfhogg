@@ -314,6 +314,11 @@ impl BlobIndex {
     /// form, an unknown element kind, or an inverted ID range (`min_id >
     /// max_id`). An inverted range cannot describe any set of elements, and
     /// every range-based skip would act on it in the skipping direction.
+    ///
+    /// It does not bound `count` or the ID range by kind: a way or relation
+    /// index with negative IDs, or a count no blob could hold, parses. Both
+    /// are invalid input (ADR-0002) and the readers size nothing from `count`
+    /// unclamped; `check --index` reports a claim its payload contradicts.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         let version = *data.first()?;
         let declared = version_size(version)?;

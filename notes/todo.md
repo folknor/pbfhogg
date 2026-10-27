@@ -719,6 +719,14 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   `run_tags_count` still carry `#[allow(clippy::too_many_arguments)]` with 8-10
   parameters of mixed types. Low urgency.
 
+- [ ] **No test for the mixed-sign first element of `Derived::Reencode`.** An
+  unindexed `--force` blob with several element fields in one group is
+  re-encoded in `apply-changes`, and the drain places the blob by its decoded
+  first element. The path takes that element from the same walk as everything
+  else, so it is believed correct, but unlike the indexed paths no test pins a
+  blob whose first element is negative and whose range is mixed-sign
+  (indexdata campaign, 2026-10-28).
+
 ### Read path
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**

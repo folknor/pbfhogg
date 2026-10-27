@@ -36,11 +36,6 @@ pub struct RefCheckResult {
     /// Missing reference occurrences retained for display when `show_ids` is
     /// true. Limited by the shared `max_errors` value unless it is zero.
     pub missing_refs: Vec<MissingRef>,
-    /// Negative element IDs that cannot be entered into the tracking set.
-    /// Positive IDs above the bounded parallel allocation are inserted after
-    /// workers join and are fully covered by reference checking.
-    /// Indexed by kind: nodes, ways, relations.
-    pub untrackable_ids: [u64; 3],
 }
 
 impl RefCheckResult {
@@ -50,14 +45,6 @@ impl RefCheckResult {
             && self.missing_way_refs == 0
             && self.missing_node_members == 0
             && self.missing_relation_members == 0
-    }
-
-    /// Total number of element IDs that could not be tracked, across kinds.
-    ///
-    /// Non-zero means the missing-reference counts above are an upper bound
-    /// rather than an exact answer.
-    pub fn total_untrackable(&self) -> u64 {
-        self.untrackable_ids[0] + self.untrackable_ids[1] + self.untrackable_ids[2]
     }
 
     /// Total number of missing references.
@@ -74,25 +61,29 @@ impl RefCheckResult {
 #[derive(Default)]
 struct WayBlobResult {
     way_count: u64,
-    /// Negative way IDs (see `untrackable_ids`).
-    untrackable_way_ids: u64,
     overflow_ids: Vec<i64>,
     way_refs_checked: u64,
+    /// Missing node refs in this blob, counted before `missing_node_refs`
+    /// is deduplicated.
+    missing_node_ref_occurrences: u64,
+    /// The distinct missing node IDs, sorted (`sort_dedup`).
     missing_node_refs: Vec<i64>,
     /// Populated only when `show_ids` is true.
     missing_refs: Vec<MissingRef>,
 }
 
-/// Per-relation-blob classify result.
+/// Per-relation-blob classify result. The two missing-ID vectors are sorted
+/// and deduplicated like `WayBlobResult::missing_node_refs`, their
+/// occurrences counted first.
 #[derive(Default)]
 struct RelBlobResult {
     relation_count: u64,
-    /// Negative relation IDs.
-    untrackable_relation_ids: u64,
     overflow_ids: Vec<i64>,
     rel_node_members_checked: u64,
     rel_way_members_checked: u64,
     rel_rel_members_deferred: u64,
+    missing_node_member_occurrences: u64,
+    missing_way_ref_occurrences: u64,
     missing_node_members: Vec<i64>,
     missing_way_refs: Vec<i64>,
     deferred_relation_refs: Vec<i64>,
@@ -113,6 +104,44 @@ pub struct CheckRefsOptions {
     pub check_relations: bool,
     /// Retain missing reference IDs up to `check.max_errors`, or all if zero.
     pub show_ids: bool,
+}
+
+/// Sort and deduplicate one blob's missing IDs in the worker, so the serial
+/// merge inserts each distinct ID once and in order.
+fn sort_dedup(ids: &mut Vec<i64>) {
+    ids.sort_unstable();
+    ids.dedup();
+}
+
+/// A negative element ID the check would have to track. Negative IDs are
+/// invalid input (ADR-0002) and the tracking sets cannot hold them, so a
+/// check that went on would report every reference to the element as
+/// missing.
+#[cold]
+fn negative_id_error(kind: &str, id: i64) -> crate::Error {
+    crate::Error::invalid_data(format!(
+        "{kind} {id} has a negative ID; the reference check does not check \
+         negative IDs, which no production PBF carries"
+    ))
+}
+
+/// A checked reference to a negative ID (see [`negative_id_error`]).
+#[cold]
+fn negative_ref_error(from: char, from_id: i64, to: char, to_id: i64) -> crate::Error {
+    crate::Error::invalid_data(format!(
+        "{from}{from_id} references negative ID {to}{to_id}; the reference \
+         check does not check negative IDs, which no production PBF carries"
+    ))
+}
+
+/// A relation member of a type the check cannot resolve against any of its
+/// sets. Passing it unchecked would certify a reference nobody looked at.
+#[cold]
+fn unknown_member_error(rid: i64, raw_type: i32, id: i64) -> crate::Error {
+    crate::Error::invalid_data(format!(
+        "r{rid} has member {id} of unsupported member type {raw_type}; the \
+         reference check resolves only node, way and relation members"
+    ))
 }
 
 fn should_store_missing_ref(current_len: usize, max_errors: usize) -> bool {
@@ -144,6 +173,12 @@ fn append_capped_missing_refs(
 /// relation IDs for relation-to-relation members (deferred to post-pass to
 /// handle forward references, then deduplicated).
 ///
+/// # Errors
+///
+/// `InvalidData` for a negative ID the check would compare and for a
+/// relation member of an unknown type (see "Negative IDs" below), besides
+/// the read and decode errors of any scan.
+///
 /// # Architecture
 ///
 /// Three-phase parallel scan following the renumber_external pattern.
@@ -165,18 +200,34 @@ fn append_capped_missing_refs(
 /// Uses [`IdSet`] for all three ID sets, each pre-allocated as a bitset over
 /// the ID range `check::id_alloc_bound` chooses (at least the live-OSM range
 /// for the kind, whatever the file's size) and grown after each phase by the
-/// IDs above it. The node set is about 1.6 GB, ways about 175 MB and
-/// relations about 3 MB.
+/// IDs above it, which the phase's merge collects into a side set as results
+/// arrive. The node set is about 1.6 GB, ways about 175 MB and relations
+/// about 3 MB.
 ///
-/// `max_errors` caps retained display details, not working memory. The three
-/// missing-ID vectors retain occurrences until sort/dedup computes exact
-/// unique counts. Deferred relation IDs must survive until all relation IDs
-/// are known; their parallel source vector preserves detail attribution.
-/// Hostile inputs can therefore make this storage grow with reference count.
-/// Truncating these vectors would silently undercount or miss forward refs.
-/// A hard memory bound needs external sorting/spilling or another exact
-/// aggregation design, with scratch ownership and measured throughput; do
-/// not substitute a cap or a hot-loop set insertion for that design.
+/// Missing node and way references go into one `IdSet` per reported
+/// category, so their cost follows the range of missing IDs, not the number
+/// of missing references: a ways-only planet, every ref missing, costs about
+/// one node-range bitset. Workers keep the `Vec` push in their hot loop and
+/// sort and deduplicate each blob's misses; the serial merge inserts them
+/// (the push-then-drain shape `reference/performance-history.md` records,
+/// never a set insertion per element). A file with no missing references
+/// allocates nothing for them.
+///
+/// Two stores still grow with occurrences. Relation-to-relation members are
+/// deferred until every relation ID is known, one `i64` each (plus their
+/// source under `show_ids`); a valid file holds few, but nothing bounds
+/// them. And `max_errors` caps retained display details only when non-zero:
+/// `max_errors == 0` keeps one detail per missing occurrence.
+///
+/// # Negative IDs
+///
+/// Negative IDs are invalid input (ADR-0002) and the tracking sets cannot
+/// hold them, so a negative ID the check would compare is refused: a node,
+/// a way under `check_relations` (the only mode that tracks way IDs), a
+/// relation, and every checked reference. The refusals sit where a set
+/// lookup or insertion has already failed, except for relation members,
+/// which are deferred unlooked-up and take one sign compare. A member of an
+/// unknown type is refused too, since no set can resolve it.
 ///
 /// # Why this is NOT an ID-only consumer
 ///
@@ -242,12 +293,19 @@ fn check_refs_inner(
         missing_relation_members: 0,
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
-        untrackable_ids: [0; 3],
     };
 
-    let mut missing_node_refs_vec: Vec<i64> = Vec::new();
-    let mut missing_way_refs_vec: Vec<i64> = Vec::new();
-    let mut missing_node_members_vec: Vec<i64> = Vec::new();
+    // One set per reported category - `total_missing` sums the categories,
+    // so a node missing from a way and from a relation counts in both. The
+    // merge inserts each blob's distinct missing IDs, so memory follows the
+    // missing ID range rather than the reference count: a ways-only file,
+    // where every ref is missing, used to retain 8 bytes per reference.
+    let mut missing_nodes_in_ways = IdSet::new();
+    let mut missing_ways_in_relations = IdSet::new();
+    let mut missing_nodes_in_relations = IdSet::new();
+    let mut missing_node_refs_occurrences: u64 = 0;
+    let mut missing_way_refs_occurrences: u64 = 0;
+    let mut missing_node_members_occurrences: u64 = 0;
     let mut deferred_relation_refs: Vec<i64> = Vec::new();
     let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
     let mut missing_refs: Vec<MissingRef> = Vec::new();
@@ -296,7 +354,10 @@ fn check_refs_inner(
     // ------------------------------------------------------------------
     // Phase 1 - node scan. Workers populate `node_ids` via `set_atomic`.
     // ------------------------------------------------------------------
-    let mut overflow_ids = Vec::new();
+    // Each phase inserts IDs above its pre-allocation into a side set from
+    // its serial merge and moves it into the phase's own set after the join
+    // (see `check::insert_overflow_ids`).
+    let mut overflow = IdSet::new();
     crate::debug::emit_marker("CHECKREFS_NODES_START");
     {
         let node_ids_ref = &node_ids;
@@ -305,9 +366,8 @@ fn check_refs_inner(
             &node_schedule,
             None,
             || (),
-            |block, &mut ()| -> crate::Result<(u64, u64, Vec<i64>)> {
+            |block, &mut ()| -> crate::Result<(u64, Vec<i64>)> {
                 let mut count: u64 = 0;
-                let mut untrackable: u64 = 0;
                 let mut overflow = Vec::new();
                 for el in block.elements_skip_metadata() {
                     let id = match el {
@@ -317,24 +377,22 @@ fn check_refs_inner(
                     };
                     if !node_ids_ref.set_atomic_checked(id) {
                         if id < 0 {
-                            untrackable += 1;
-                        } else {
-                            overflow.push(id);
+                            return Err(negative_id_error("node", id));
                         }
+                        overflow.push(id);
                     }
                     count += 1;
                 }
-                Ok((count, untrackable, overflow))
+                Ok((count, overflow))
             },
-            |_seq, (count, untrackable, overflow)| {
-                overflow_ids.extend(overflow);
+            |_seq, (count, overflow_ids)| {
+                super::insert_overflow_ids(&mut overflow, overflow_ids, host);
                 result.node_count += count;
-                result.untrackable_ids[0] += untrackable;
             },
             host,
         )?;
     }
-    super::insert_overflow_ids(&mut node_ids, &mut overflow_ids, host);
+    node_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
     crate::debug::emit_marker("CHECKREFS_NODES_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.
@@ -359,17 +417,22 @@ fn check_refs_inner(
                 for el in block.elements_skip_metadata() {
                     if let Element::Way(w) = el {
                         let wid = w.id();
+                        // Way IDs are tracked only for the relation phase;
+                        // without it no comparison reads them, so a negative
+                        // one is refused only here.
                         if check_relations && !way_ids_ref.set_atomic_checked(wid) {
                             if wid < 0 {
-                                r.untrackable_way_ids += 1;
-                            } else {
-                                r.overflow_ids.push(wid);
+                                return Err(negative_id_error("way", wid));
                             }
+                            r.overflow_ids.push(wid);
                         }
                         r.way_count += 1;
                         for nref in w.refs() {
                             r.way_refs_checked += 1;
                             if !node_ids_ref.get(nref) {
+                                if nref < 0 {
+                                    return Err(negative_ref_error('w', wid, 'n', nref));
+                                }
                                 r.missing_node_refs.push(nref);
                                 if show_ids
                                     && should_store_missing_ref(r.missing_refs.len(), max_errors)
@@ -385,14 +448,18 @@ fn check_refs_inner(
                         }
                     }
                 }
+                r.missing_node_ref_occurrences = r.missing_node_refs.len() as u64;
+                sort_dedup(&mut r.missing_node_refs);
                 Ok(r)
             },
             |_seq, r| {
-                overflow_ids.extend(r.overflow_ids);
+                super::insert_overflow_ids(&mut overflow, r.overflow_ids, host);
                 result.way_count += r.way_count;
-                result.untrackable_ids[1] += r.untrackable_way_ids;
                 way_refs_checked += r.way_refs_checked;
-                missing_node_refs_vec.extend(r.missing_node_refs);
+                missing_node_refs_occurrences += r.missing_node_ref_occurrences;
+                for id in r.missing_node_refs {
+                    missing_nodes_in_ways.set(id);
+                }
                 if show_ids {
                     append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
                 }
@@ -400,7 +467,7 @@ fn check_refs_inner(
             host,
         )?;
     }
-    super::insert_overflow_ids(&mut way_ids, &mut overflow_ids, host);
+    way_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
     crate::debug::emit_marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.
@@ -434,10 +501,9 @@ fn check_refs_inner(
                             let rid = rel.id();
                             if !relation_ids_ref.set_atomic_checked(rid) {
                                 if rid < 0 {
-                                    r.untrackable_relation_ids += 1;
-                                } else {
-                                    r.overflow_ids.push(rid);
+                                    return Err(negative_id_error("relation", rid));
                                 }
+                                r.overflow_ids.push(rid);
                             }
                             r.relation_count += 1;
                             for mem in rel.members() {
@@ -445,6 +511,9 @@ fn check_refs_inner(
                                     MemberId::Node(id) => {
                                         r.rel_node_members_checked += 1;
                                         if !node_ids_ref.get(id) {
+                                            if id < 0 {
+                                                return Err(negative_ref_error('r', rid, 'n', id));
+                                            }
                                             r.missing_node_members.push(id);
                                             if show_ids
                                                 && should_store_missing_ref(
@@ -464,6 +533,9 @@ fn check_refs_inner(
                                     MemberId::Way(id) => {
                                         r.rel_way_members_checked += 1;
                                         if !way_ids_ref.get(id) {
+                                            if id < 0 {
+                                                return Err(negative_ref_error('r', rid, 'w', id));
+                                            }
                                             r.missing_way_refs.push(id);
                                             if show_ids
                                                 && should_store_missing_ref(
@@ -481,31 +553,49 @@ fn check_refs_inner(
                                         }
                                     }
                                     MemberId::Relation(id) => {
+                                        // Deferred without a lookup, so the
+                                        // sign is checked here rather than in
+                                        // a failed `get`.
+                                        if id < 0 {
+                                            return Err(negative_ref_error('r', rid, 'r', id));
+                                        }
                                         r.rel_rel_members_deferred += 1;
                                         r.deferred_relation_refs.push(id);
                                         if show_ids {
                                             r.deferred_relation_ref_sources.push(rid);
                                         }
                                     }
-                                    // Unknown member types from newer PBF producers -
-                                    // skip for ref-checking since we don't know what
-                                    // collection to check against.
-                                    MemberId::Unknown(_, _) => {}
+                                    // A member type this check has no set to
+                                    // resolve against (a newer producer's, or
+                                    // a corrupt one). Skipping it would pass
+                                    // a reference nobody checked.
+                                    MemberId::Unknown(raw_type, id) => {
+                                        return Err(unknown_member_error(rid, raw_type, id));
+                                    }
                                 }
                             }
                         }
                     }
+                    r.missing_node_member_occurrences = r.missing_node_members.len() as u64;
+                    r.missing_way_ref_occurrences = r.missing_way_refs.len() as u64;
+                    sort_dedup(&mut r.missing_node_members);
+                    sort_dedup(&mut r.missing_way_refs);
                     Ok(r)
                 },
                 |_seq, r| {
-                    overflow_ids.extend(r.overflow_ids);
+                    super::insert_overflow_ids(&mut overflow, r.overflow_ids, host);
                     result.relation_count += r.relation_count;
-                    result.untrackable_ids[2] += r.untrackable_relation_ids;
                     rel_node_members_checked += r.rel_node_members_checked;
                     rel_way_members_checked += r.rel_way_members_checked;
                     rel_rel_members_deferred += r.rel_rel_members_deferred;
-                    missing_node_members_vec.extend(r.missing_node_members);
-                    missing_way_refs_vec.extend(r.missing_way_refs);
+                    missing_node_members_occurrences += r.missing_node_member_occurrences;
+                    missing_way_refs_occurrences += r.missing_way_ref_occurrences;
+                    for id in r.missing_node_members {
+                        missing_nodes_in_relations.set(id);
+                    }
+                    for id in r.missing_way_refs {
+                        missing_ways_in_relations.set(id);
+                    }
                     deferred_relation_refs.extend(r.deferred_relation_refs);
                     if show_ids {
                         deferred_relation_ref_sources.extend(r.deferred_relation_ref_sources);
@@ -515,41 +605,32 @@ fn check_refs_inner(
                 host,
             )?;
         }
-        super::insert_overflow_ids(&mut relation_ids, &mut overflow_ids, host);
+        relation_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
         crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
         // Brokkr stores named counters generically and reports changes in sidecar
         // comparisons; this sample is inert unless the CLI initialized the FIFO.
         crate::debug::emit_mallinfo2("checkrefs_after_relations");
     }
 
-    // Occurrence counts = pre-dedup vec lengths.
-    let missing_node_refs_occurrences = missing_node_refs_vec.len() as u64;
-    let missing_way_refs_occurrences = missing_way_refs_vec.len() as u64;
-    let missing_node_members_occurrences = missing_node_members_vec.len() as u64;
-
-    // Dedup the per-kind missing-ref vecs to get the unique-missing counts.
+    // Unique-missing counts are the sets' cardinalities. The timer keeps its
+    // `missing_dedup` name from the sort-and-dedup it replaced.
     let t_dedup = Stopwatch::start();
-    let unique_len = |v: &mut Vec<i64>| -> u64 {
-        v.sort_unstable();
-        v.dedup();
-        v.len() as u64
-    };
-    result.missing_node_refs = unique_len(&mut missing_node_refs_vec);
-    result.missing_way_refs = unique_len(&mut missing_way_refs_vec);
-    result.missing_node_members = unique_len(&mut missing_node_members_vec);
+    result.missing_node_refs = missing_nodes_in_ways.len();
+    result.missing_way_refs = missing_ways_in_relations.len();
+    result.missing_node_members = missing_nodes_in_relations.len();
     let missing_dedup_ms = t_dedup.elapsed_ms();
 
     // Resolve deferred relation refs against the complete relation_ids set.
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
     let t_deferred = Stopwatch::start();
     if check_relations {
-        let mut missing_relation_members_vec: Vec<i64> = Vec::new();
+        let mut missing_relation_members = IdSet::new();
         let mut occurrences: u64 = 0;
         // `deferred_relation_ref_sources` is parallel to
         // `deferred_relation_refs` when `show_ids` is set, and empty otherwise.
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
             if !relation_ids.get(id) {
-                missing_relation_members_vec.push(id);
+                missing_relation_members.set(id);
                 occurrences += 1;
                 if show_ids && should_store_missing_ref(missing_refs.len(), max_errors) {
                     missing_refs.push(MissingRef {
@@ -561,7 +642,7 @@ fn check_refs_inner(
                 }
             }
         }
-        result.missing_relation_members = unique_len(&mut missing_relation_members_vec);
+        result.missing_relation_members = missing_relation_members.len();
         result.missing_relation_member_occurrences = occurrences;
     }
     let deferred_resolve_ms = t_deferred.elapsed_ms();
@@ -585,12 +666,6 @@ fn check_refs_inner(
     crate::debug::emit_counter(
         "checkrefs_missing_relation_members",
         result.missing_relation_members,
-    );
-    crate::debug::emit_counter("checkrefs_untrackable_node_ids", result.untrackable_ids[0]);
-    crate::debug::emit_counter("checkrefs_untrackable_way_ids", result.untrackable_ids[1]);
-    crate::debug::emit_counter(
-        "checkrefs_untrackable_relation_ids",
-        result.untrackable_ids[2],
     );
 
     // One-shot post-pass timers, sampled where each step ended.

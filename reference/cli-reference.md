@@ -810,14 +810,18 @@ percent of its nodes and fits one partition; with `--agreement` it needs as
 many as a complete one. The `partitions` and `blob_decodes` fields of the
 JSON report are these cost figures; they follow the host, not the file.
 
-The ref check reports element IDs it could not track - negative IDs; a
+The ref check refuses (exit 2) a file holding a negative ID it would compare
+(ADR-0002): a node, a way under `--check-relations` (the only mode that
+tracks way IDs), a relation, or any checked reference. Under
+`--check-relations` it also
+refuses a relation member of an unknown type, which no set can resolve. A
 positive ID above the range it sized from the file's own indexdata is still
-tracked, inserted after the parallel phase - as a separate
-`Untrackable element IDs` line and as `untrackable_node_ids` /
-`untrackable_way_ids` / `untrackable_relation_ids` under `--json`. References
-to such an element are counted as missing, so a non-zero count means the
-missing-reference numbers are an upper bound. `--ids --full` reports the same
-situation as an `id_out_of_range` violation.
+tracked, inserted from each phase's merge. `--ids --full` reports a negative
+ID as an `id_out_of_range` violation instead. Missing references are counted
+into one ID set per category, so their memory follows the range of the
+missing IDs rather than the number of references. Retained `--show-ids`
+details (all of them under `--max-errors 0`) and the deferred
+relation-to-relation members still cost memory per occurrence.
 
 ---
 

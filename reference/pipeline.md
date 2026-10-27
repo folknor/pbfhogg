@@ -488,7 +488,7 @@ Consequences:
   so the backend-parity canary keeps covering them (decision 2 of the
   same note, ratified alongside).
 - Daily write volume roughly doubles at planet: apply-changes rewrites
-  ~92% of blobs (~90 GB output) and altw writes the full enriched file
+  most blobs (86% by count in `3ad57fc5`; ~90 GB output) and altw writes the full enriched file
   again. Wall stays comfortable (~17-18 min for the whole loop); NVMe
   endurance is the number to watch if the host changes.
 
@@ -672,7 +672,9 @@ passthrough-dominated on small extracts and rewrite-dominated at planet:
 
 - Denmark (465 MB, ~300K changes): ~92% passthrough, ~8% rewrite
 - Germany (4.5 GB, ~146K changes): ~82% passthrough, ~18% rewrite
-- Planet (~90 GB, daily diff): ~8% passthrough, ~92% rewrite (most blobs touched)
+- Planet (~90 GB, daily diff): most blobs touched; 43,670 of 50,816
+  rewritten (86%) in the recorded run `3ad57fc5` (commit `16e3694`,
+  plantasjen)
 
 The planet ratio is why the daily loop's write volume is effectively one
 full file per step: passthrough saves little there.

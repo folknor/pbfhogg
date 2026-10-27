@@ -420,6 +420,15 @@ any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
   skipped it would pass a stale coordinate unseen. Negative node
   records are still counted and their coordinates domain-checked.
   osmium has no equivalent check.
+- `check --refs` - **hard reject** of a negative ID the check would
+  compare: a node, a way under `--check-relations` (way IDs are
+  tracked only there), a relation, and every checked way ref and
+  relation member (`src/commands/check/refs.rs`). Its tracking sets
+  are `IdSet`s, so before the reject a negative element was counted
+  as untrackable and every reference to it reported as missing.
+  osmium's `check-refs` keeps a second `IdSetDense` for negatives and
+  checks them. Under `--check-relations` a relation member of an
+  unknown type is refused as well, where osmium skips it.
 - `add-locations-to-ways` (both backends) - **silent**, by
   inheritance from `IdSet`, for negative relation-member refs.
   Relation-member node IDs are collected into an `IdSet` that decides

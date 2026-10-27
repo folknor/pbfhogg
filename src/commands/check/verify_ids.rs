@@ -78,7 +78,8 @@ pub enum IdViolation {
         after: &'static str,
     },
     /// A negative element ID cannot be tracked for duplicates. Positive IDs
-    /// above the bounded parallel allocation are inserted after workers join.
+    /// above the bounded parallel allocation are tracked in a side set filled
+    /// from the phase's serial merge.
     IdOutOfRange { elem_type: &'static str, id: i64 },
 }
 
@@ -307,7 +308,8 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// `--full` mode: an `IdSet` per kind selected by `type_filter`, its bitset
 /// pre-allocated over the range `check::id_alloc_bound` chooses (at least the
 /// live-OSM range for the kind) for the workers' atomic setters; an ID above
-/// it is inserted serially after the phase. The node set is about 1.6 GB;
+/// it goes into a side set from the phase's serial merge, moved into the
+/// kind's set after the phase. The node set is about 1.6 GB;
 /// total full-mode RSS at planet was about 1.8 GB.
 ///
 /// # Input
@@ -617,9 +619,10 @@ struct BlobVerifyResult {
     /// distinct duplicate occurrences count separately, matching the
     /// pre-swap RoaringTreemap::insert-returns-false semantics).
     duplicate_ids: Vec<i64>,
-    /// IDs outside the parallel allocation. Positive IDs are inserted during
-    /// the serial merge for exact duplicate detection; negatives are reported
-    /// as `IdOutOfRange` violations.
+    /// IDs outside the parallel allocation. `settle_overflow` drains the
+    /// positive ones into the phase's overflow set as the result arrives, for
+    /// exact duplicate detection; the negatives left are reported as
+    /// `IdOutOfRange` violations.
     out_of_range_ids: Vec<i64>,
 }
 
@@ -668,7 +671,7 @@ fn verify_ids_full_parallel(
         crate::scan::classify::build_classify_schedules_split(pin, host)?;
 
     // Indexdata only sizes the bounded parallel allocation. Decoded IDs
-    // outside it are retained and inserted serially after each phase, so
+    // outside it are inserted serially from each phase's merge, so
     // regional files with sparse global IDs need no moving ID ceiling. The
     // size is the pinned file's, the one both opens read.
     let file_len = pin.metadata()?.len();
@@ -833,6 +836,7 @@ fn verify_single_kind_parallel(
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
     let extract_ref = &extract_id;
     let atomic_ids = &*id_set;
+    let mut overflow = IdSet::new();
 
     crate::scan::classify::parallel_classify_phase(
         shared_file,
@@ -871,11 +875,13 @@ fn verify_single_kind_parallel(
             }
             Ok(r)
         },
-        |seq, r| {
+        |seq, mut r| {
+            settle_overflow(&mut overflow, &mut r, host);
             per_blob[seq] = Some(r);
         },
         host,
     )?;
+    id_set.merge(overflow);
 
     // Serial merge in schedule (= file) order.
     let mut count: u64 = 0;
@@ -914,11 +920,9 @@ fn verify_single_kind_parallel(
             }
         }
         for id in r.out_of_range_ids {
-            if let Some(violation) = overflow_violation(id_set, elem_type, id, host) {
-                total_violations += 1;
-                if should_store_violation(violations.len(), max_errors_remaining) {
-                    violations.push(violation);
-                }
+            total_violations += 1;
+            if should_store_violation(violations.len(), max_errors_remaining) {
+                violations.push(IdViolation::IdOutOfRange { elem_type, id });
             }
         }
         if r.last_id.is_some() {
@@ -929,26 +933,35 @@ fn verify_single_kind_parallel(
     Ok((count, violations, total_violations))
 }
 
-/// An ID a phase's pre-allocation could not hold: a negative one is out of
-/// range; a positive one is inserted now, and is a duplicate if already
-/// present. Test builds count the insertion on the run's token.
-fn overflow_violation(
-    id_set: &mut IdSet,
-    elem_type: &'static str,
-    id: i64,
-    host: &crate::host::Host,
-) -> Option<IdViolation> {
-    if id < 0 {
-        return Some(IdViolation::IdOutOfRange { elem_type, id });
-    }
+/// Settle the IDs one blob found outside the phase's pre-allocation, from the
+/// phase's serial merge as its result arrives. A positive one goes into
+/// `overflow`, the side set the workers never see (see
+/// `check::insert_overflow_ids` for why it is not retained until the phase
+/// ends), and moves to `duplicate_ids` if already there; a negative one stays
+/// in `out_of_range_ids` for the ordered merge to report. Results arrive in
+/// completion order, so which blob a duplicate is attributed to depends on
+/// it, as it already does for duplicates the atomic setters find; the totals
+/// do not. Test builds count the insertions on the run's token.
+fn settle_overflow(overflow: &mut IdSet, r: &mut BlobVerifyResult, host: &crate::host::Host) {
+    let mut inserted: u64 = 0;
+    let duplicates = &mut r.duplicate_ids;
+    r.out_of_range_ids.retain(|&id| {
+        if id < 0 {
+            return true;
+        }
+        inserted += 1;
+        if !overflow.set_if_new(id) {
+            duplicates.push(id);
+        }
+        false
+    });
     #[cfg(feature = "test-hooks")]
     host.cancel
         .faults()
         .check_overflow_ids
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(inserted, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "test-hooks"))]
-    let _ = host;
-    (!id_set.set_if_new(id)).then_some(IdViolation::Duplicate { elem_type, id })
+    let _ = (host, inserted);
 }
 
 /// Verify that schedules appear in canonical file order: all node blobs

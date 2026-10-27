@@ -22,21 +22,6 @@ preserving late-boundary publication and failure shutdown). Anger 10: the
 barrier is the most-tested part of the pipeline. Measure the idle time on
 current code first.
 
-## `check` overflow IDs cost 8 bytes per element
-
-`check --refs` and `check --ids --full` collect every positive ID above the
-bitset allocation into an overflow `Vec` (per phase in `refs.rs`, per blob
-until the serial merge in `verify_ids.rs`) and insert them serially. A
-compressible file holding billions of distinct IDs above the 14B floor can
-cost tens of GB. A sizing change letting small files reserve less was
-tried and reverted on 2026-10-26 because it moved this exposure below the
-floor. A reviewer's proposed fix: the merge callbacks already run serially
-on the consumer thread, so insert overflow IDs there into a separate
-`IdSet` the workers never see and merge it after the phase (`set` then
-`merge_from` for refs; `set_if_new` with duplicate counting for
-verify_ids). Overflow memory then follows the ID range, not the element
-count, and the small-file saving becomes safe. Unmeasured.
-
 ## The missing-node guard fires after the whole run
 
 `apply-changes --locations-on-ways` knows its unresolved count at the
@@ -59,16 +44,6 @@ and it carries forward any coordinate an earlier run left stale. It needs
 its own resolution and accounting (the global `loc_missing` would still
 count those IDs). Not decided whether it is wanted at all, given the docs
 now require `--keep-untagged-nodes`.
-
-## Performance-doc figures that do not match their runs
-
-- `reference/pipeline.md` says the plain planet merge rewrites about 92%
-  of blobs; the recorded plain-merge planet runs (`3ad57fc5`, `fda9f7a6`)
-  rewrote 86% (43,670 of 50,816).
-- `reference/performance.md` says those runs changed about 85 MB of
-  output; their `bytes_rewritten` is 174 to 343 GB.
-- `reference/performance.md`'s add-locations-to-ways section still
-  describes the removed dense mmap index.
 
 ## brokkr side
 

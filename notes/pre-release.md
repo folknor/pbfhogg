@@ -163,6 +163,17 @@ v2). The CLI surface redesign is deferred past 0.6.0.
   framed output blobs (`8da26b23`); diff and derive runs now feed
   `DECOMPRESS_POOL_METRICS` (`126cbce2`). (`merge_header_read_ms` widening at
   `a3f1a1bc` was ruled to need no entry; the comment at its timer says it.)
+- **`check --refs` missing sets: the planet cell is owed.** The commit that
+  counts missing refs into per-category `IdSet`s (and refuses negative IDs
+  and unknown member types) keeps the hot loop's `Vec` push and drains in
+  the merge, so a planet with near-zero missing refs should not move;
+  confirm with matched `brokkr check --refs --dataset planet` cells against
+  its parent, and a ways-only cell (`cat --type way` output) for the memory
+  claim. The second relation pass was dropped in the spar: it would re-read
+  the relation section on every valid run to save a vector that is small
+  on valid files. The small-file sizing change reverted on 2026-10-26 is
+  safe to retry since overflow IDs moved into a side set, if anyone wants
+  the memory back.
 - **brokkr and `cat --clean --force`**: since `8da26b23`, `--clean --force`
   without `--type` is refused by clap. Unchecked whether any brokkr cell
   passes that combination; check before the cat `--clean` cells.

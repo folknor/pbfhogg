@@ -340,8 +340,9 @@ is `CopyRange` passthrough.
 | `--compression zstd:1` | 269.7 s (4m30s) | `3ad57fc5` |
 
 zlib:6 is the outlier at 1.7× zstd:1 wall - the rewritten blobs
-re-compress on the writer thread, and at planet's ~85 MB of changed
-output zlib's serial deflate becomes the bottleneck. zstd:1 narrowly
+re-compress on the writer thread, and with most of planet's blobs
+rewritten (43,670 of 50,816 by count in `3ad57fc5`) zlib's serial
+deflate becomes the bottleneck. zstd:1 narrowly
 beats `none` (parallel-compressed bytes leave the writer faster than
 uncompressed bytes through the same pipe). For OSC-only daily-diff
 pipelines that don't need osmium-interop output, zstd:1 is the right
@@ -349,8 +350,11 @@ default.
 
 ## Add-locations-to-ways
 
-Dense mmap index: 16B slots × 8 bytes = 128 GB virtual address space.
-Only touched slots consume physical memory.
+The Europe and Planet figures directly below are historical: commit
+`69a127f` ran the dense mmap index (16-byte slots, 128 GB of virtual
+address space, only touched slots resident), which has since been
+removed. The index types that exist now are compared in "Dense vs Sparse
+vs External index" and the sections after it.
 
 Commit `69a127f`, plantasjen (30 GB RAM, 8 GB swap).
 

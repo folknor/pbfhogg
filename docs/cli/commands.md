@@ -476,13 +476,17 @@ printed - at most `--max-errors` of them, but every one with
 available, not the file. `--direct-io` has no effect on this check (its
 parallel readers read unaligned blob ranges) and says so when given.
 
-The ref check reports element IDs it could not track (negative IDs; a positive
-ID above the range sized from the file's own indexdata is still tracked) on their
-own
-`Untrackable element IDs` line, and as `untrackable_node_ids` /
-`untrackable_way_ids` / `untrackable_relation_ids` under `--json`. References to
-such an element are counted as missing, so a non-zero count means the
-missing-reference numbers are an upper bound.
+The ref check refuses (exit 2) a file with a negative ID it would compare: a
+node, a way when relations are checked, a relation, or any reference it checks.
+With relations checked it also refuses a relation member of an unknown type,
+which it has nothing to resolve against. A positive ID above the range sized
+from the file's own indexdata is still tracked. Missing references are counted
+once per distinct ID in each category, so a file in which most references
+dangle (a ways-only file) costs about one bit set over the missing IDs' range,
+not memory per reference. Two things still cost memory per occurrence: the
+details `--show-ids` retains, every one with `--max-errors 0`, and
+relation-to-relation members, which are held until every relation has been
+read.
 
 ---
 

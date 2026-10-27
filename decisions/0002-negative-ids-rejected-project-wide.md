@@ -27,6 +27,11 @@ negative ref could not be compared, and a check that skipped it would
 pass a stale coordinate unseen; it refuses the input instead. Negative
 node records it is not asked to compare are still counted and
 domain-checked.
+Amended: 2026-10-27 - `check --refs` recorded as a hard-reject site for
+every negative ID it compares (node, way under `--check-relations`,
+relation, way ref, relation member). Its sets are `IdSet`s, so it used
+to count a negative element as untrackable and report each reference to
+it as missing; the untrackable counts are gone with the reject.
 Status: Accepted
 
 ## Decision
@@ -52,6 +57,11 @@ invariant. Enforcement is layered by site:
 - **Hard reject of negative way refs** in `check --locations`
   (amended 2026-10-26): a verifier cannot certify a comparison it
   skipped.
+- **Hard reject of compared negative IDs** in `check --refs` (amended
+  2026-10-27), for the same reason. The rejects sit where a set lookup
+  or insertion has already failed, so valid input pays nothing, except
+  relation-to-relation members, which are deferred without a lookup
+  and take one sign compare each.
 - **Routing, not enforcement**, for the shard planners in `diff` and
   `derive-changes` (amended 2026-10-22). Their threshold compares are
   raw `i64`, which order negative IDs wrongly, so the shard planner

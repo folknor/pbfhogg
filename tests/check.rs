@@ -117,90 +117,6 @@ fn check_ids_zero_max_errors_retains_all_violation_details() {
     assert_eq!(limited.violations.len(), 1);
 }
 
-/// A node the tracking `IdSet` cannot represent - a negative (JOSM
-/// editor-local) ID - is never recorded as present, so the way that references
-/// it is reported as having a missing ref. That over-report is deliberate, but
-/// it has to be *labelled*: `verify_ids` reports the same situation as
-/// `IdOutOfRange`, and `check --refs` silently dropped the
-/// `set_atomic_checked` bool, leaving the reader unable to tell it from a
-/// genuinely dangling reference.
-#[test]
-fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
-    let dir = crate::common::test_scratch();
-
-    let untrackable = dir.path().join("negative.osm.pbf");
-    write_test_pbf_sorted(
-        &untrackable,
-        &[TestNode {
-            id: -5,
-            lat: 0,
-            lon: 0,
-            tags: vec![],
-            meta: None,
-        }],
-        &[TestWay {
-            id: 10,
-            refs: vec![-5],
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
-    );
-
-    let report = run_check_refs(&untrackable, true, false, 0).expect("check_refs on negative IDs");
-    assert_eq!(report.node_count, 1);
-    assert_eq!(
-        report.untrackable_ids[0], 1,
-        "node -5 cannot be entered into the IdSet and the report must say so"
-    );
-    assert_eq!(
-        report.total_untrackable(),
-        1,
-        "the way's own ID is positive and trackable"
-    );
-    assert_eq!(
-        report.missing_node_refs, 1,
-        "w10's ref to n-5 is over-reported as missing - that is what the \
-         untrackable counter exists to explain"
-    );
-
-    // Passing counterpart: the same shape with a trackable ID reports the
-    // same missing ref and no untrackable IDs, so a test that always saw
-    // zero untrackable IDs could not tell the two fixtures apart.
-    let trackable = dir.path().join("positive.osm.pbf");
-    write_test_pbf_sorted(
-        &trackable,
-        &[TestNode {
-            id: 5,
-            lat: 0,
-            lon: 0,
-            tags: vec![],
-            meta: None,
-        }],
-        &[TestWay {
-            id: 10,
-            refs: vec![6],
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
-    );
-    let report = run_check_refs(&trackable, true, false, 0).expect("check_refs on positive IDs");
-    assert_eq!(report.missing_node_refs, 1, "n6 is genuinely absent");
-    assert_eq!(
-        report.total_untrackable(),
-        0,
-        "every ID in this fixture is representable, so nothing is untrackable"
-    );
-}
-
-/// IDs above what a small file pre-allocates: its kind's floor
-/// (`*_ID_FLOOR` in `src/tunables.rs`), rounded up to the 2^25-ID chunk
-/// `IdSet` allocates whole.
-const HIGH_NODE: i64 = 15_000_000_000;
-const HIGH_WAY: i64 = 2_500_000_000;
-const HIGH_RELATION: i64 = 40_000_000;
-
 fn node(id: i64) -> TestNode {
     TestNode {
         id,
@@ -210,6 +126,168 @@ fn node(id: i64) -> TestNode {
         meta: None,
     }
 }
+
+fn way(id: i64, refs: &[i64]) -> TestWay {
+    TestWay {
+        id,
+        refs: refs.to_vec(),
+        tags: vec![],
+        meta: None,
+    }
+}
+
+fn relation(id: i64, member: MemberId) -> TestRelation {
+    TestRelation {
+        id,
+        members: vec![TestMember {
+            id: member,
+            role: "",
+        }],
+        tags: vec![],
+        meta: None,
+    }
+}
+
+/// Expect `check --refs` to refuse `path` as invalid data, naming `needle`.
+fn assert_refs_refused(path: &std::path::Path, check_relations: bool, needle: &str) {
+    let Err(e) = run_check_refs(path, check_relations, false, 0) else {
+        panic!("{}: check_refs must refuse it", path.display());
+    };
+    assert!(
+        matches!(e.kind(), pbfhogg::ErrorKind::InvalidData { .. }),
+        "{}: the refusal must be InvalidData, got: {e:?}",
+        path.display()
+    );
+    let message = e.to_string();
+    assert!(
+        message.contains(needle),
+        "{}: the refusal must name {needle}, got: {message}",
+        path.display()
+    );
+}
+
+/// Negative IDs are invalid input (ADR-0002) and the tracking sets cannot
+/// hold them, so `check --refs` refuses one wherever it would compare it,
+/// instead of reporting every reference to it as missing. Each fixture has
+/// one negative ID and is otherwise consistent, so a refusal can only come
+/// from that ID.
+#[test]
+fn check_refs_refuses_the_negative_ids_it_compares() {
+    let dir = crate::common::test_scratch();
+    let write = |name: &str, nodes: &[TestNode], ways: &[TestWay], rels: &[TestRelation]| {
+        let path = dir.path().join(name);
+        write_test_pbf_sorted(&path, nodes, ways, rels);
+        path
+    };
+
+    // An element ID the check tracks.
+    let neg_node = write(
+        "neg-node.osm.pbf",
+        &[node(-5), node(1)],
+        &[way(10, &[1])],
+        &[],
+    );
+    assert_refs_refused(&neg_node, false, "node -5");
+    let neg_way = write("neg-way.osm.pbf", &[node(1)], &[way(-10, &[1])], &[]);
+    assert_refs_refused(&neg_way, true, "way -10");
+    let neg_rel = write(
+        "neg-rel.osm.pbf",
+        &[node(1)],
+        &[],
+        &[relation(-3, MemberId::Node(1))],
+    );
+    assert_refs_refused(&neg_rel, true, "relation -3");
+
+    // A checked reference, on each path: a way ref and node and way members
+    // fail a lookup first, a relation member is deferred without one.
+    let neg_ref = write("neg-ref.osm.pbf", &[node(1)], &[way(10, &[1, -5])], &[]);
+    assert_refs_refused(&neg_ref, false, "w10 references negative ID n-5");
+    for (name, member, needle) in [
+        (
+            "neg-node-member.osm.pbf",
+            MemberId::Node(-5),
+            "r3 references negative ID n-5",
+        ),
+        (
+            "neg-way-member.osm.pbf",
+            MemberId::Way(-6),
+            "r3 references negative ID w-6",
+        ),
+        (
+            "neg-rel-member.osm.pbf",
+            MemberId::Relation(-7),
+            "r3 references negative ID r-7",
+        ),
+    ] {
+        let path = write(name, &[node(1)], &[way(10, &[1])], &[relation(3, member)]);
+        assert_refs_refused(&path, true, needle);
+    }
+
+    // Passing counterpart: a negative way ID with relations off feeds no
+    // comparison, so it is not refused, and the file is otherwise valid.
+    let report = run_check_refs(&neg_way, false, false, 0).expect("way IDs are not tracked");
+    assert!(report.is_valid());
+    assert_eq!(report.way_count, 1);
+}
+
+/// A relation member of a type no set can resolve is refused rather than
+/// skipped, which would certify a reference nobody checked.
+#[test]
+fn check_refs_refuses_an_unknown_member_type() {
+    use crate::common::adversarial;
+
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("unknown-member.osm.pbf");
+    // The writers refuse an unknown member type, so write a node member and
+    // turn its type into 7 on the wire. The relation blob is the last frame.
+    write_test_pbf_sorted(&path, &[node(1)], &[], &[relation(3, MemberId::Node(99))]);
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let last = adversarial::locate_blobs(&bytes).len() - 1;
+    let mutated = adversarial::set_relation_last_member_type(&bytes, last, 0, 7);
+    std::fs::write(&path, mutated).expect("write fixture");
+    assert_refs_refused(&path, true, "r3 has member 99 of unsupported member type 7");
+
+    // Without relations the member is never looked at.
+    let report = run_check_refs(&path, false, false, 0).expect("relations are not scanned");
+    assert!(report.is_valid());
+}
+
+/// The unique-missing counts come from one set per category: a node missing
+/// from several ways counts once, a node missing from a way and from a
+/// relation counts in both categories, and the counts span blobs.
+#[test]
+fn check_refs_counts_unique_missing_ids_per_category_across_blobs() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("missing.osm.pbf");
+    let ways = [way(10, &[5, 6, 5]), way(11, &[6, 7]), way(12, &[1])];
+    let rels = [
+        relation(3, MemberId::Node(5)),
+        relation(4, MemberId::Node(5)),
+        relation(5, MemberId::Way(20)),
+    ];
+    crate::common::write_multi_block_test_pbf(&path, &[node(1)], &ways, &rels, 1);
+
+    let report = run_check_refs(&path, true, true, 0).expect("check_refs");
+    assert_eq!(report.missing_node_refs, 3, "n5, n6 and n7, each once");
+    assert_eq!(
+        report.missing_node_members, 1,
+        "n5 again, in its own category"
+    );
+    assert_eq!(report.missing_way_refs, 1);
+    assert_eq!(report.total_missing(), 5);
+    assert_eq!(
+        report.missing_refs.len(),
+        8,
+        "every occurrence keeps its detail: five way refs, three members"
+    );
+}
+
+/// IDs above what a small file pre-allocates: its kind's floor
+/// (`*_ID_FLOOR` in `src/tunables.rs`), rounded up to the 2^25-ID chunk
+/// `IdSet` allocates whole.
+const HIGH_NODE: i64 = 15_000_000_000;
+const HIGH_WAY: i64 = 2_500_000_000;
+const HIGH_RELATION: i64 = 40_000_000;
 
 /// IDs above a small file's pre-allocation (its floor; an indexed file's
 /// claim cannot raise it past the file's size) take the serial overflow
@@ -304,7 +382,6 @@ fn check_refs_resolves_ids_above_the_allocation() {
             (report.node_count, report.way_count, report.relation_count),
             (2, 2, 2)
         );
-        assert_eq!(report.total_untrackable(), 0);
     }
 
     // Passing counterpart: drop the high node and its references go missing,
@@ -322,7 +399,7 @@ fn check_refs_resolves_ids_above_the_allocation() {
 fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("dup.osm.pbf");
-    let nodes = [node(1), node(HIGH_NODE), node(HIGH_NODE)];
+    let nodes = [node(1), node(HIGH_NODE), node(HIGH_NODE), node(HIGH_NODE)];
     crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
 
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
@@ -335,23 +412,33 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     };
     let host = crate::common::test_host();
     let report = pbfhogg::check::verify_ids::verify_ids(&input, &opts, &host).expect("verify_ids");
-    // Both copies of the high node lay above the pre-allocation, so the
-    // duplicate was found by the serial overflow insertion.
+    // Every copy of the high node lay above the pre-allocation, so the
+    // duplicates were found by the serial overflow insertion. Its blobs
+    // settle in completion order, which may decide which copy counts as the
+    // first, but never how many duplicates there are.
     #[cfg(feature = "test-hooks")]
     assert_eq!(
         host.cancel
             .faults()
             .check_overflow_ids
             .load(std::sync::atomic::Ordering::Relaxed),
-        2
+        3
     );
     assert!(!report.passed);
-    assert!(
-        report.violations.iter().any(|v| matches!(
-            v,
-            pbfhogg::check::verify_ids::IdViolation::Duplicate { id, .. } if *id == HIGH_NODE
-        )),
-        "{} violations, none a duplicate of {HIGH_NODE}",
+    let duplicates = report
+        .violations
+        .iter()
+        .filter(|v| {
+            matches!(
+                v,
+                pbfhogg::check::verify_ids::IdViolation::Duplicate { id, .. } if *id == HIGH_NODE
+            )
+        })
+        .count();
+    assert_eq!(
+        duplicates,
+        2,
+        "three copies of {HIGH_NODE} are two duplicates, of {} violations",
         report.violations.len()
     );
 }

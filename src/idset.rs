@@ -286,7 +286,6 @@ impl Chunk {
         }
     }
 
-    #[cfg(test)]
     fn count(&self) -> u64 {
         match self {
             Chunk::Dense(words) => words
@@ -1002,15 +1001,27 @@ impl IdSet {
         }
     }
 
-    /// Total number of set IDs without a rank index (walks every chunk).
-    #[cfg(test)]
-    fn count_slow(&self) -> u64 {
+    /// Number of set IDs. Walks every allocated chunk (a popcount over each
+    /// bit array), so it costs in proportion to the allocation, not the
+    /// members; a set that will be ranked anyway has the count for free in
+    /// [`RankedIdSet::total_count`].
+    pub fn len(&self) -> u64 {
         self.chunks
             .iter()
             .flatten()
             .chain(self.overflow.values())
             .map(Chunk::count)
             .sum()
+    }
+
+    /// True if no ID is set. Unlike [`Self::has_any`], an allocated chunk
+    /// with no members (a `pre_allocate`d range) does not count.
+    pub fn is_empty(&self) -> bool {
+        self.chunks
+            .iter()
+            .flatten()
+            .chain(self.overflow.values())
+            .all(|chunk| chunk.offsets().next().is_none())
     }
 }
 
@@ -1450,6 +1461,29 @@ mod tests {
         assert!(s.has_any());
     }
 
+    /// `len` and `is_empty` count members, not allocation: a pre-allocated
+    /// range is allocated (`has_any`) but empty. Covers a bit-array chunk, an
+    /// array chunk and an overflow-map chunk above the direct directory.
+    #[test]
+    fn len_and_is_empty_count_members_not_chunks() {
+        let mut s = IdSet::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+
+        s.pre_allocate(3 << ID_SHIFT);
+        assert!(s.has_any(), "pre_allocate allocates chunks");
+        assert!(s.is_empty(), "but sets no member");
+        assert_eq!(s.len(), 0);
+
+        let overflow_id = i64::try_from(DIRECT_CHUNKS << ID_SHIFT).expect("fits") + 5;
+        let array_id = 10_i64 << ID_SHIFT;
+        for id in [7, 7, 1 << ID_SHIFT, array_id, overflow_id] {
+            s.set(id);
+            assert!(!s.is_empty());
+        }
+        assert_eq!(s.len(), 4, "the repeated 7 counts once");
+    }
+
     #[test]
     fn rank_if_set_parity_with_get_rank() {
         let mut s = IdSet::new();
@@ -1558,7 +1592,8 @@ mod tests {
             reference.iter().copied().collect::<Vec<_>>(),
             "iter order and contents"
         );
-        assert_eq!(s.count_slow(), reference.len() as u64);
+        assert_eq!(s.len(), reference.len() as u64);
+        assert_eq!(s.is_empty(), reference.is_empty());
         let s = s.into_ranked();
         assert_eq!(s.total_count(), reference.len() as u64);
 

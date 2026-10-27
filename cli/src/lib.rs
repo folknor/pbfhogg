@@ -3490,9 +3490,6 @@ fn run_check(
                     "missing_node_members": result.missing_node_members,
                     "missing_relation_members": result.missing_relation_members,
                     "missing_relation_member_occurrences": result.missing_relation_member_occurrences,
-                    "untrackable_node_ids": result.untrackable_ids[0],
-                    "untrackable_way_ids": result.untrackable_ids[1],
-                    "untrackable_relation_ids": result.untrackable_ids[2],
                     "passed": result.is_valid(),
                 });
                 if show_ids {
@@ -3596,19 +3593,6 @@ fn run_check(
                             )?;
                         }
                     }
-                }
-                // An untrackable ID is not itself a missing reference, but every
-                // reference to one is counted as missing above. Say so, or the
-                // over-report reads as a genuinely dangling ref.
-                if result.total_untrackable() > 0 {
-                    writeln!(
-                        out,
-                        "Untrackable element IDs: {} nodes, {} ways, {} relations \
-                     - references to these are counted as missing",
-                        result.untrackable_ids[0],
-                        result.untrackable_ids[1],
-                        result.untrackable_ids[2],
-                    )?;
                 }
                 if result.is_valid() {
                     writeln!(out, "Referential integrity: OK")?;

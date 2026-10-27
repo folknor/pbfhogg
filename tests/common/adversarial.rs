@@ -248,6 +248,33 @@ pub fn truncate_to(pbf: &[u8], len: usize) -> Vec<u8> {
     pbf[..len.min(pbf.len())].to_vec()
 }
 
+/// Overwrite the last member type of relation `relation_idx` (PrimitiveBlock
+/// -> PrimitiveGroup -> Relation -> packed field 10) with `raw_type`, in
+/// place. The writers refuse to encode a type outside `Relation.MemberType`
+/// (node, way, relation), so this is how a fixture gets the unknown member
+/// type a newer or broken producer could write. Both values are one-byte
+/// varints, so the field length is unchanged.
+///
+/// Panics if `blob_idx` is out of range, the relation is missing or has no
+/// members, or either type is not a one-byte varint.
+pub fn set_relation_last_member_type(
+    pbf: &[u8],
+    blob_idx: usize,
+    relation_idx: usize,
+    raw_type: u8,
+) -> Vec<u8> {
+    assert!(raw_type < 0x80, "raw_type must be a one-byte varint");
+    mutate_blob_payload(pbf, blob_idx, |payload| {
+        let off = find_relation_field_last_byte_offset(payload, relation_idx, 10)
+            .expect("relation_idx out of range or target relation has no member types");
+        assert!(
+            payload[off] < 0x80 && (off == 0 || payload[off - 1] < 0x80),
+            "the last member type is not a one-byte varint; fixture is not as expected",
+        );
+        payload[off] = raw_type;
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers (varint, protobuf scan, blob (de)compression).
 // ---------------------------------------------------------------------------
@@ -257,13 +284,23 @@ pub fn truncate_to(pbf: &[u8], len: usize) -> Vec<u8> {
 /// content within `payload`. Returns None on any structural mismatch
 /// (target not found, missing memids, or empty memids).
 fn find_relation_memids_last_byte_offset(payload: &[u8], target_rel_idx: usize) -> Option<usize> {
+    find_relation_field_last_byte_offset(payload, target_rel_idx, 9)
+}
+
+/// Offset of the last byte of length-delimited `field` in relation
+/// `target_rel_idx`.
+fn find_relation_field_last_byte_offset(
+    payload: &[u8],
+    target_rel_idx: usize,
+    field: u64,
+) -> Option<usize> {
     let mut rel_count = 0_usize;
     let mut pos = 0;
     while pos < payload.len() {
         let (tag, np) = read_varint(&payload[pos..])?;
-        let (field, wire) = (tag >> 3, tag & 7);
+        let (block_field, wire) = (tag >> 3, tag & 7);
         pos += np;
-        if field == 2 && wire == 2 {
+        if block_field == 2 && wire == 2 {
             // PrimitiveGroup
             let (group_len_u64, gn) = read_varint(&payload[pos..])?;
             let group_start = pos + gn;
@@ -271,12 +308,13 @@ fn find_relation_memids_last_byte_offset(payload: &[u8], target_rel_idx: usize) 
             if group_end > payload.len() {
                 return None;
             }
-            if let Some(off) = scan_group_for_memids(
+            if let Some(off) = scan_group_for_relation_field(
                 payload,
                 group_start,
                 group_end,
                 &mut rel_count,
                 target_rel_idx,
+                field,
             ) {
                 return Some(off);
             }
@@ -288,12 +326,13 @@ fn find_relation_memids_last_byte_offset(payload: &[u8], target_rel_idx: usize) 
     None
 }
 
-fn scan_group_for_memids(
+fn scan_group_for_relation_field(
     payload: &[u8],
     group_start: usize,
     group_end: usize,
     rel_count: &mut usize,
     target_rel_idx: usize,
+    field: u64,
 ) -> Option<usize> {
     let mut gpos = group_start;
     while gpos < group_end {
@@ -309,7 +348,7 @@ fn scan_group_for_memids(
                 return None;
             }
             if *rel_count == target_rel_idx {
-                return scan_relation_for_memids(payload, rel_start, rel_end);
+                return scan_relation_for_field(payload, rel_start, rel_end, field);
             }
             *rel_count += 1;
             gpos = rel_end;
@@ -320,20 +359,25 @@ fn scan_group_for_memids(
     None
 }
 
-fn scan_relation_for_memids(payload: &[u8], rel_start: usize, rel_end: usize) -> Option<usize> {
+fn scan_relation_for_field(
+    payload: &[u8],
+    rel_start: usize,
+    rel_end: usize,
+    field: u64,
+) -> Option<usize> {
     let mut rpos = rel_start;
     while rpos < rel_end {
         let (rtag, rn) = read_varint(&payload[rpos..])?;
         let (rfield, rwire) = (rtag >> 3, rtag & 7);
         rpos += rn;
-        if rfield == 9 && rwire == 2 {
-            let (memids_len_u64, mn) = read_varint(&payload[rpos..])?;
-            let memids_start = rpos + mn;
-            let memids_end = memids_start.checked_add(usize::try_from(memids_len_u64).ok()?)?;
-            if memids_end > rel_end || memids_end == memids_start {
+        if rfield == field && rwire == 2 {
+            let (field_len_u64, mn) = read_varint(&payload[rpos..])?;
+            let field_start = rpos + mn;
+            let field_end = field_start.checked_add(usize::try_from(field_len_u64).ok()?)?;
+            if field_end > rel_end || field_end == field_start {
                 return None;
             }
-            return Some(memids_end - 1);
+            return Some(field_end - 1);
         }
         skip_field(payload, &mut rpos, rwire)?;
     }

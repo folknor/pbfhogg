@@ -67,18 +67,29 @@ use crate::tunables::CHECK_IDS_PER_BYTE;
 /// renumber and the geocode builder via `IdSet::file_bounded_max_id`.
 ///
 /// This is an allocation bound, not an input validity bound. Both callers
-/// collect observed positive IDs refused by atomic setters and insert them
-/// with `IdSet::set` (or `set_if_new`) after workers join. Only those decoded
-/// IDs can allocate sparse overflow chunks; unverified indexdata cannot.
+/// insert observed positive IDs refused by atomic setters into a side set
+/// from the phase's serial merge (`IdSet::set`, or `set_if_new`), and merge
+/// it in after workers join. Only those decoded IDs can allocate sparse
+/// overflow chunks; unverified indexdata cannot.
 pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i64 {
     crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
 }
 
-/// Insert the positive IDs a parallel phase found above its pre-allocation
-/// (`ids`, drained) into `set`. Test builds count them on the run's token.
+/// Insert the positive IDs one blob found above its phase's pre-allocation
+/// into `overflow`, a set the phase's workers never see, which the caller
+/// merges into the phase's own set once the workers join.
+///
+/// Called from the phase's merge, which runs serially on the consumer thread,
+/// so overflow costs set memory - bounded by the distinct IDs, one bit each
+/// in a populated chunk - instead of 8 bytes per element retained until the
+/// phase ends. A compressible file can carry billions of elements above the
+/// allocation; collecting them in a `Vec` first cost tens of GB. The
+/// pre-allocation is contiguous bit-array chunks, so every ID here lands in a
+/// chunk the phase's set lacks and the merge moves chunks without copying.
+/// Test builds count the IDs on the run's token.
 pub(super) fn insert_overflow_ids(
-    set: &mut crate::idset::IdSet,
-    ids: &mut Vec<i64>,
+    overflow: &mut crate::idset::IdSet,
+    ids: Vec<i64>,
     host: &crate::host::Host,
 ) {
     #[cfg(feature = "test-hooks")]
@@ -88,8 +99,8 @@ pub(super) fn insert_overflow_ids(
         .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "test-hooks"))]
     let _ = host;
-    for id in ids.drain(..) {
-        set.set(id);
+    for id in ids {
+        overflow.set(id);
     }
 }
 

@@ -4,6 +4,21 @@
 
 ### Breaking
 
+- **`check --refs` refuses negative IDs and unknown member types.** A
+  negative ID it would compare (a node, a way under `--check-relations`, a
+  relation, a way ref or relation member) fails the run with exit 2 naming
+  it, as `check --locations` does, instead of being counted as untrackable
+  with every reference to it reported missing. Under `--check-relations` a
+  relation member of an unknown type is refused rather than skipped
+  unchecked. The `Untrackable element IDs` line and the
+  `untrackable_node_ids` / `untrackable_way_ids` /
+  `untrackable_relation_ids` JSON fields are gone. Library:
+  `RefCheckResult::untrackable_ids` and `total_untrackable` are removed.
+  Separately, missing references are now counted per distinct ID as they
+  arrive, so a file in which most references dangle (a ways-only planet,
+  formerly about 80 GB of per-reference bookkeeping) costs about one bit
+  set over the missing IDs, unless `--show-ids --max-errors 0` asks for
+  every occurrence.
 - **A malformed attribute in OSC XML is refused, not dropped.** A relation
   member `role` that is not well-formed (for example an unquoted value) used
   to read as absent, so `merge-changes` and `tags-filter --input-kind osc`

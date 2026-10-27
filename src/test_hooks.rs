@@ -169,19 +169,57 @@ pub struct FaultPlan {
     /// Boundaries the drain received after it had already processed every
     /// seq below them, so a late-boundary test can prove its case ran.
     pub apply_changes_late_boundaries_seen: AtomicU64,
-    /// Set by the scanner as it starts waiting for the barrier signal.
+    /// Set by the scanner as it starts waiting for the barrier signal (at
+    /// the first way or relation descriptor, or at end of input).
     pub apply_changes_scanner_in_barrier_wait: AtomicBool,
-    /// Hold the scanner (bounded) at each barrier poll on a held way or
-    /// relation descriptor until the drain has returned, so a drain exit
-    /// (the missing-node refusal) provably lands while the walk is short of
-    /// end of input.
-    pub apply_changes_scanner_waits_for_drain_exit: AtomicBool,
+    /// Set by the scanner when it finds the barrier channel closed (in its
+    /// wait at the first way or relation, or at a poll) and stops walking
+    /// before end of input.
+    pub apply_changes_scanner_stopped_before_eof: AtomicBool,
+    /// Set by the scanner when its header walk reaches end of input.
+    pub apply_changes_scanner_reached_eof: AtomicBool,
+    /// OsmData headers the scanner has walked, counted as each is read.
+    pub apply_changes_scanner_headers_walked: AtomicU64,
+    /// `apply_changes_scanner_headers_walked` when the scanner's barrier
+    /// wait at a way or relation ended (`u64::MAX` if it never did): the
+    /// node headers plus the one non-node header that triggered the wait,
+    /// so nothing past it is walked or buffered before publication.
+    pub apply_changes_headers_walked_at_release: AtomicU64,
+    /// Set by the scanner when it dispatches a way or relation descriptor.
+    pub apply_changes_non_node_dispatched: AtomicBool,
+    /// Hold the scanner (bounded), once its barrier wait has ended, before
+    /// it reads the next header, until the drain has begun processing an
+    /// item past the node phase: only a scanner that dispatches way work as
+    /// it walks, rather than at end of input, gets past this.
+    pub apply_changes_hold_walk_until_drain_past_nodes: AtomicBool,
+    /// Seq of a dispatched descriptor after which the scanner's barrier
+    /// poll is held (bounded) until the drain has returned, so the poll
+    /// provably finds the channel closed.
+    pub apply_changes_poll_waits_for_drain_exit_after_seq: AtomicU64,
     /// Set by `merge` once the drain has returned (its barrier sender
     /// dropped with it).
     pub apply_changes_drain_returned: AtomicBool,
-    /// Set by the scanner when a barrier poll finds the channel closed and
-    /// it stops walking before end of input.
-    pub apply_changes_scanner_stopped_before_eof: AtomicBool,
+    /// Hold the drain (bounded) just before it merges the coordinate slots
+    /// at the barrier until either the scanner is in its barrier wait with
+    /// fewer headers walked than `apply_changes_mark_candidate_seq` + 1 (it
+    /// has not reached that descriptor), or a worker has finished the
+    /// candidate at that seq (its coordinates flushed into its slot): a
+    /// scanner that dispatched a late node before publication then has it
+    /// in the merge.
+    pub apply_changes_merge_waits_for_scanner_or_candidate: AtomicBool,
+    /// The candidate seq whose completion `apply_changes_candidate_marked`
+    /// records.
+    pub apply_changes_mark_candidate_seq: AtomicU64,
+    /// Set by a worker once it has finished the candidate at
+    /// `apply_changes_mark_candidate_seq`.
+    pub apply_changes_candidate_marked: AtomicBool,
+    /// Hold the drain (bounded) after it has published the map and before
+    /// it sends the signal, until the scanner is in its barrier wait, then
+    /// record in `apply_changes_non_node_dispatched_before_signal` whether
+    /// a way or relation descriptor had already been dispatched.
+    pub apply_changes_signal_waits_for_scanner_wait: AtomicBool,
+    /// See `apply_changes_signal_waits_for_scanner_wait`.
+    pub apply_changes_non_node_dispatched_before_signal: AtomicBool,
     /// The drain publishes a producer failure just before deciding the
     /// missing-node refusal, as if one landed after its per-receive check.
     pub apply_changes_fail_at_refusal: AtomicBool,
@@ -193,15 +231,6 @@ pub struct FaultPlan {
     pub apply_changes_drain_past_nodes: AtomicBool,
     /// Set by the drain once it has sent the barrier signal.
     pub apply_changes_barrier_signalled: AtomicBool,
-    /// Hold the scanner (bounded), at a node polled after the boundary was
-    /// sent, until the drain has signalled, so that poll takes the signal.
-    pub apply_changes_node_poll_waits_for_signal: AtomicBool,
-    /// Set by the scanner when the poll after a dispatched node took the
-    /// barrier signal.
-    pub apply_changes_node_poll_took_signal: AtomicBool,
-    /// Set by the scanner as it reaches that held node poll; the drain
-    /// holds its signal until then.
-    pub apply_changes_scanner_at_node_poll: AtomicBool,
     /// Run with the owned route (workers pread passthroughs, no splice)
     /// whatever the output backend supports.
     pub apply_changes_force_owned_route: AtomicBool,
@@ -340,16 +369,23 @@ impl FaultPlan {
             apply_changes_drain_next_seq: AtomicU64::new(0),
             apply_changes_late_boundaries_seen: AtomicU64::new(0),
             apply_changes_scanner_in_barrier_wait: AtomicBool::new(false),
-            apply_changes_scanner_waits_for_drain_exit: AtomicBool::new(false),
-            apply_changes_drain_returned: AtomicBool::new(false),
             apply_changes_scanner_stopped_before_eof: AtomicBool::new(false),
+            apply_changes_scanner_reached_eof: AtomicBool::new(false),
+            apply_changes_scanner_headers_walked: AtomicU64::new(0),
+            apply_changes_headers_walked_at_release: AtomicU64::new(u64::MAX),
+            apply_changes_non_node_dispatched: AtomicBool::new(false),
+            apply_changes_hold_walk_until_drain_past_nodes: AtomicBool::new(false),
+            apply_changes_poll_waits_for_drain_exit_after_seq: AtomicU64::new(u64::MAX),
+            apply_changes_drain_returned: AtomicBool::new(false),
+            apply_changes_merge_waits_for_scanner_or_candidate: AtomicBool::new(false),
+            apply_changes_mark_candidate_seq: AtomicU64::new(u64::MAX),
+            apply_changes_candidate_marked: AtomicBool::new(false),
+            apply_changes_signal_waits_for_scanner_wait: AtomicBool::new(false),
+            apply_changes_non_node_dispatched_before_signal: AtomicBool::new(false),
             apply_changes_fail_at_refusal: AtomicBool::new(false),
             apply_changes_cancel_at_refusal: AtomicBool::new(false),
             apply_changes_drain_past_nodes: AtomicBool::new(false),
             apply_changes_barrier_signalled: AtomicBool::new(false),
-            apply_changes_node_poll_waits_for_signal: AtomicBool::new(false),
-            apply_changes_node_poll_took_signal: AtomicBool::new(false),
-            apply_changes_scanner_at_node_poll: AtomicBool::new(false),
             apply_changes_force_owned_route: AtomicBool::new(false),
             apply_changes_hook_timed_out: AtomicBool::new(false),
             apply_changes_worker_counters: Mutex::new(Vec::new()),
@@ -677,12 +713,28 @@ impl FaultPlan {
         }
     }
 
-    /// Called by the scanner before it polls the barrier channel on a held
-    /// way or relation descriptor (after the boundary is delivered).
-    pub(crate) fn before_apply_changes_barrier_poll(&self) {
+    /// Called by the scanner, once its barrier wait has ended, before each
+    /// header it reads: under `apply_changes_hold_walk_until_drain_past_nodes`,
+    /// holds the first such read (bounded) until the drain has begun
+    /// processing an item past the node phase.
+    pub(crate) fn before_apply_changes_walk_after_release(&self) {
         if self
-            .apply_changes_scanner_waits_for_drain_exit
-            .load(Ordering::SeqCst)
+            .apply_changes_hold_walk_until_drain_past_nodes
+            .swap(false, Ordering::SeqCst)
+        {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
+                self.apply_changes_drain_past_nodes.load(Ordering::SeqCst)
+            });
+        }
+    }
+
+    /// Called by the scanner before its barrier poll after dispatching the
+    /// descriptor at `seq`.
+    pub(crate) fn before_apply_changes_poll(&self, seq: u64) {
+        if seq
+            == self
+                .apply_changes_poll_waits_for_drain_exit_after_seq
+                .load(Ordering::SeqCst)
         {
             self.wait_until(&self.apply_changes_hook_timed_out, || {
                 self.apply_changes_drain_returned.load(Ordering::SeqCst)
@@ -690,35 +742,58 @@ impl FaultPlan {
         }
     }
 
-    /// Called by the scanner before it polls the barrier channel after a
-    /// dispatched node; `boundary_sent` says whether the boundary is out.
-    pub(crate) fn before_apply_changes_node_poll(&self, boundary_sent: bool) {
-        if boundary_sent
-            && self
-                .apply_changes_node_poll_waits_for_signal
-                .load(Ordering::SeqCst)
+    /// Called by the drain just before it merges the coordinate slots at
+    /// the barrier.
+    pub(crate) fn before_apply_changes_coord_merge(&self) {
+        if self
+            .apply_changes_merge_waits_for_scanner_or_candidate
+            .load(Ordering::SeqCst)
         {
-            self.apply_changes_scanner_at_node_poll
-                .store(true, Ordering::SeqCst);
+            let mark = self.apply_changes_mark_candidate_seq.load(Ordering::SeqCst);
             self.wait_until(&self.apply_changes_hook_timed_out, || {
-                self.apply_changes_barrier_signalled.load(Ordering::SeqCst)
+                // Waiting without having walked the marked descriptor, or
+                // the marked candidate done: whichever the scanner's shape
+                // allows.
+                (self
+                    .apply_changes_scanner_in_barrier_wait
+                    .load(Ordering::SeqCst)
+                    && self
+                        .apply_changes_scanner_headers_walked
+                        .load(Ordering::SeqCst)
+                        <= mark)
+                    || self.apply_changes_candidate_marked.load(Ordering::SeqCst)
             });
         }
     }
 
-    /// Called by the drain just before it sends the barrier signal: under
-    /// `apply_changes_node_poll_waits_for_signal`, holds it (bounded) until
-    /// the scanner is at the late node's poll, so no earlier poll can take
-    /// the signal first.
+    /// Called by a streaming worker once it has finished candidate `seq`
+    /// (coordinates flushed and its item sent).
+    pub(crate) fn on_apply_changes_candidate_done(&self, seq: u64) {
+        if seq == self.apply_changes_mark_candidate_seq.load(Ordering::SeqCst) {
+            self.apply_changes_candidate_marked
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Called by the drain after it has published the map and just before
+    /// it sends the barrier signal: under
+    /// `apply_changes_signal_waits_for_scanner_wait`, holds it (bounded)
+    /// until the scanner is in its barrier wait and records whether any way
+    /// or relation descriptor was dispatched before the signal.
     pub(crate) fn before_apply_changes_barrier_send(&self) {
         if self
-            .apply_changes_node_poll_waits_for_signal
+            .apply_changes_signal_waits_for_scanner_wait
             .load(Ordering::SeqCst)
         {
             self.wait_until(&self.apply_changes_hook_timed_out, || {
-                self.apply_changes_scanner_at_node_poll
+                self.apply_changes_scanner_in_barrier_wait
                     .load(Ordering::SeqCst)
             });
+            self.apply_changes_non_node_dispatched_before_signal.store(
+                self.apply_changes_non_node_dispatched
+                    .load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
         }
     }
 

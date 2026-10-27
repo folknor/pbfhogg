@@ -579,9 +579,12 @@ Standing stances, from the handoff and the 2026-10-26 rulings:
 - **apply-changes `-l` barrier**: the node boundary is a
   `DrainMessage::NodeBoundary` on the drain channel (exclusive end; zero
   means no nodes). The 25 ms `DRAIN_RECV_TIMEOUT` only wakes the drain to
-  notice a published failure or cancellation. On unsorted input a node
-  after a way misses publication and is refused by the output-order guard,
-  not hung. Fault-plan hooks cover every barrier ordering
+  notice a published failure or cancellation. The scanner blocks for the
+  signal at the first way or relation header and dispatches way work as it
+  walks from there; nothing is buffered. On unsorted input a node after a
+  way is only walked after publication, never reaches the map, and is
+  refused by the output-order guard (or the missing-node refusal, if it
+  held a needed coordinate), not hung. Fault-plan hooks cover every barrier ordering
   (`tests/fault_apply_changes.rs`).
 - **Premises drift.** Several drain entries were wrong when checked against
   the code; read the code before building on any claim here.

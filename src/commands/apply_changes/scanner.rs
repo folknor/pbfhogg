@@ -16,14 +16,25 @@
 //! ## Node→way barrier under `--locations-on-ways`
 //!
 //! Workers extract coords from node blobs opportunistically during the
-//! node phase. The drain merges per-worker coord maps into `Arc<loc_map>`
-//! at the node→way boundary and signals the scanner via the barrier
-//! channel. Once its walk is done and the signal is in, the scanner
-//! dispatches the buffered way/relation descriptors; a drain that closes
-//! the channel instead (it refused the run at the barrier, or failed) ends
-//! the walk at the next poll. Barrier ownership is **scanner-side** (not drain-side) so
-//! that no way worker can start classify concurrent with a still-in-flight
-//! node worker.
+//! node phase. At the first way or relation descriptor the scanner sends
+//! the drain its node boundary and blocks until the drain has merged the
+//! per-worker coord maps into `Arc<loc_map>`, published it and signalled
+//! back over the barrier channel; it then dispatches that descriptor and
+//! every later one as it walks, so way work starts at publication and
+//! nothing is buffered. A drain that closes the channel instead (it refused
+//! the run at the barrier, or failed) ends the walk there. Barrier
+//! ownership is **scanner-side** (not drain-side) so that no way descriptor
+//! reaches a worker before every node blob before it has been processed and
+//! its coordinates merged into the published map. (A worker may still be
+//! returning from sending its last node item, and a late node, below, can
+//! run beside way workers; neither adds to the map.)
+//!
+//! A node descriptor walked after the boundary (a base whose header claims
+//! sorted order but has a node blob after a way) is only ever walked after
+//! publication, so it never contributes to the map: either the drain's
+//! missing-node refusal has already failed the run at the barrier, or the
+//! drain's output-order guard refuses the node when it reaches it, since
+//! its seq follows the way or relation item that triggered the boundary.
 
 use std::sync::mpsc;
 
@@ -58,9 +69,9 @@ pub(super) struct ScannerConfig<'a> {
     pub base: &'a PinnedInput,
     pub ranges: &'a DiffRanges,
     /// True when `--locations-on-ways` is active. Enables the node→way
-    /// barrier: scanner buffers way/relation descriptors after the first
-    /// way descriptor is seen, waits on `barrier_rx` for the drain's
-    /// signal that `Arc<loc_map>` is published, then drains the buffer.
+    /// barrier: at the first way or relation descriptor the scanner waits
+    /// on `barrier_rx` for the drain's signal that `Arc<loc_map>` is
+    /// published, then dispatches it and every later descriptor.
     pub locations_on_ways: bool,
     /// Under `--locations-on-ways`, the OSC creates or modifies a node, so
     /// any way may hold a stale inline coordinate: every indexed way
@@ -117,31 +128,16 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // with the run, whose output is never published.
     let mut walker = HeaderWalker::open(base, host)?;
     let mut seq: u64 = 0;
-    // Intentionally unbounded under --locations-on-ways: the non-node
-    // branch below appends, polls barrier_rx only to record the signal or
-    // notice a closed channel, and continues. On a sorted base it therefore
-    // retains every way/relation descriptor until EOF, even if the drain
-    // published the map earlier. This is metadata,
-    // not blob bodies, but each entry can retain its own tagdata allocation;
-    // neither bounded output channel nor drain reorder telemetry bounds it.
-    //
-    // A local vector cap is not a safe independent change: returning early
-    // rejects otherwise valid large inputs, while waiting or releasing the
-    // tail changes scanner/barrier scheduling. A bounded design should wait
-    // at the first non-node descriptor after sending the node boundary, with
-    // the drain's publication on a late boundary and producer-failure
-    // shutdown preserved and validated. That needs an explicit barrier
-    // change; do not disguise it as a channel-capacity or telemetry
-    // adjustment here.
-    let mut pending_post_barrier: Vec<ScannerEmit<'_>> = Vec::new();
-    // Under --locations-on-ways every way and relation descriptor is held
-    // in `pending_post_barrier` until the walk ends, whenever the drain's
-    // signal arrives: receiving it only records it here, so a descriptor
-    // walked after the signal can never be dispatched ahead of one held
-    // before it. The channel is polled once per dispatched node and per
-    // held descriptor, and a closed one ends the walk at once: the drain
-    // has returned an error (the missing-node refusal at the barrier among
-    // them), and walking on to EOF would only delay that error.
+    // Under --locations-on-ways the scanner waits for the drain's signal at
+    // the first way or relation descriptor (or at EOF when there is none),
+    // so nothing past the node phase is dispatched before the map is
+    // published, and nothing is held either: the descriptor that triggered
+    // the wait is dispatched as soon as it ends, and every later one as it
+    // is walked. Before the boundary is sent the drain cannot signal (it
+    // needs the boundary to know the node phase is complete), and after
+    // the wait it has no second signal to send, so the per-descriptor poll
+    // below only watches for a closed channel: the drain has returned an
+    // error, and walking on would only delay it.
     let mut barrier_signalled = false;
     let mut max_item_bytes_fastpath: usize = 0;
     let mut max_item_bytes_slowpath: usize = 0;
@@ -151,11 +147,29 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     let mut last_node_seq: Option<u64> = None;
     let mut boundary_sent = false;
 
-    while let Some(meta) = walker.next_header()? {
+    loop {
+        // Test-only: once the barrier has released the walk, hold here
+        // before reading the next header until the drain has begun
+        // processing an item past the node phase, so a test can prove way
+        // work starts before the walk ends.
+        #[cfg(feature = "test-hooks")]
+        if barrier_signalled {
+            host.invocation
+                .faults()
+                .before_apply_changes_walk_after_release();
+        }
+        let Some(meta) = walker.next_header()? else {
+            break;
+        };
         // Skip OsmHeader - merge() reads it separately during setup.
         if meta.blob_type != BlobKind::OsmData {
             continue;
         }
+        #[cfg(feature = "test-hooks")]
+        host.invocation
+            .faults()
+            .apply_changes_scanner_headers_walked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Derive element kind and id_range from indexdata when present.
         // Under --force (no indexdata), route unconditionally to the
@@ -268,37 +282,49 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Track the largest descriptor estimate, not channel occupancy.
         let approx_cost = scanner_emit_cost(&item);
 
-        // Node→way barrier. Under --locations-on-ways, way/relation
-        // descriptors are buffered once seen until the drain signals
-        // loc_map ready. Node descriptors always emit immediately.
+        // Node→way barrier. Under --locations-on-ways, the first way or
+        // relation descriptor sends the drain its node boundary (how many
+        // node outputs to expect before it merges CoordSlots) and waits for
+        // the signal that loc_map is published; it and every later
+        // descriptor are then dispatched directly. Every node descriptor
+        // before it is already dispatched, which is all the drain needs to
+        // reach the barrier.
         if let Some(rx) = barrier_rx.as_ref()
+            && !barrier_signalled
             && matches!(kind, ElementKind::Way | ElementKind::Relation)
         {
-            // First non-Node descriptor: tell the drain how many Node
-            // outputs to expect before it merges CoordSlots and signals
-            // back. Send happens before the buffer push so the drain
-            // can pre-receive even while workers are still processing
-            // queued Node candidates.
-            if !boundary_sent && let Some(tx) = boundary_tx.as_ref() {
+            if let Some(tx) = boundary_tx.as_ref() {
                 send_boundary(tx, last_node_seq, host)?;
                 boundary_sent = true;
             }
-            pending_post_barrier.push(item);
-            seq += 1;
-            // Test-only: hold here, after the boundary is delivered, until
-            // the drain has returned, so a refusal provably lands while the
-            // walk is short of EOF.
+            wait_for_barrier(rx, false, host)?;
+            barrier_signalled = true;
             #[cfg(feature = "test-hooks")]
-            host.invocation.faults().before_apply_changes_barrier_poll();
-            poll_barrier(rx, &mut barrier_signalled, host)?;
-            continue;
+            {
+                let faults = host.invocation.faults();
+                faults.apply_changes_headers_walked_at_release.store(
+                    faults
+                        .apply_changes_scanner_headers_walked
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
         }
 
         // Track the seq of every dispatched Node descriptor (including
         // those routed through the worker pool and those emitted on the
         // splice fast-path) so we can report `last_node_seq` to the drain.
+        // It is read only for the one boundary; a late node walked after
+        // it updates it to no effect.
         if matches!(kind, ElementKind::Node) {
             last_node_seq = Some(seq);
+        }
+        #[cfg(feature = "test-hooks")]
+        if !matches!(kind, ElementKind::Node) {
+            host.invocation
+                .faults()
+                .apply_changes_non_node_dispatched
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         dispatch_item(
@@ -313,75 +339,39 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 
         seq += 1;
 
-        // Having just emitted a node, peek at the barrier channel without
-        // blocking. On sorted input the signal cannot be here yet (the
-        // boundary is sent at the first way or relation), but a drain that
-        // has already failed is.
+        // Having just dispatched, peek at the barrier channel without
+        // blocking: a drain that has already failed has closed it.
         if let Some(rx) = barrier_rx.as_ref() {
-            // Test-only: on a node walked after the boundary (dishonest
-            // order), hold until the drain has signalled, so this poll is
-            // the one that takes the signal.
+            // Test-only: hold this poll until the drain has returned, so it
+            // provably finds the channel closed.
             #[cfg(feature = "test-hooks")]
-            let signalled_before = barrier_signalled;
-            #[cfg(feature = "test-hooks")]
-            host.invocation
-                .faults()
-                .before_apply_changes_node_poll(boundary_sent);
-            poll_barrier(rx, &mut barrier_signalled, host)?;
-            #[cfg(feature = "test-hooks")]
-            if barrier_signalled && !signalled_before {
-                host.invocation
-                    .faults()
-                    .apply_changes_node_poll_took_signal
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+            host.invocation.faults().before_apply_changes_poll(seq - 1);
+            poll_barrier(rx, barrier_signalled, host)?;
         }
     }
 
+    #[cfg(feature = "test-hooks")]
+    host.invocation
+        .faults()
+        .apply_changes_scanner_reached_eof
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
     // End of input. If --locations-on-ways and we never sent the node
     // boundary (i.e., the file had no Way/Relation blobs at all), send it
-    // now so the drain can publish `loc_map` for the trailing-creates path.
-    // The drain signals back via barrier_rx.
+    // now and wait for the signal, so the drain publishes `loc_map` for the
+    // trailing-creates path before the scanner exits.
+    //
+    // The boundary travels on the drain channel, so the drain sees it even
+    // when it has already processed every node item, and publishes on that
+    // receive; that is what unblocks this wait.
     if locations_on_ways
         && !boundary_sent
         && let Some(tx) = boundary_tx.as_ref()
     {
         send_boundary(tx, last_node_seq, host)?;
     }
-
-    // End of input. Under --locations-on-ways, wait for the drain's signal
-    // now unless a poll already took it (all node descriptors are emitted;
-    // the drain can finish node-kind processing and publish loc_map).
-    //
-    // At EOF with zero way/relation blobs this blocks on barrier_rx
-    // unconditionally. The boundary travels on the drain channel, so the
-    // drain sees it even when it has already processed every node item,
-    // and publishes on that receive; that is what unblocks this wait.
-    if !barrier_signalled && let Some(ref rx) = barrier_rx {
-        host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_START");
-        #[cfg(feature = "test-hooks")]
-        host.invocation
-            .faults()
-            .apply_changes_scanner_in_barrier_wait
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        rx.recv().map_err(|_| {
-            crate::Error::internal("drain closed barrier channel before signalling loc_map ready")
-        })?;
-        host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_END");
-    }
-
-    // Drain the pending buffer in seq order.
-    for item in pending_post_barrier.drain(..) {
-        let approx_cost = scanner_emit_cost(&item);
-        dispatch_item(
-            &channels,
-            item,
-            &mut max_item_bytes_fastpath,
-            &mut max_item_bytes_slowpath,
-            approx_cost,
-            #[cfg(feature = "test-hooks")]
-            host.invocation.faults(),
-        )?;
+    if !barrier_signalled && let Some(rx) = barrier_rx.as_ref() {
+        wait_for_barrier(rx, true, host)?;
     }
 
     host.invocation.marker("MERGE_SCANNER_END");
@@ -458,20 +448,21 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
     }
 }
 
-/// Poll the drain's barrier signal without blocking. A signal is recorded in
-/// `signalled` (never acted on: held descriptors go out after the walk). A
-/// closed channel means the drain has returned an error, so the walk stops
-/// with an error of its own, which `merge` ranks below the drain's.
+/// Poll the barrier channel without blocking, for a closed channel only: the
+/// drain has returned an error, so the walk stops with an error of its own,
+/// which `merge` ranks below the drain's. The one signal is taken by
+/// [`wait_for_barrier`], and none can arrive before the boundary is sent
+/// (the drain needs it to know the node phase is complete), so a signal
+/// here is a protocol break.
 fn poll_barrier(
     rx: &mpsc::Receiver<()>,
-    signalled: &mut bool,
+    signalled: bool,
     #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Host,
 ) -> Result<()> {
     match rx.try_recv() {
-        Ok(()) => {
-            *signalled = true;
-            Ok(())
-        }
+        Ok(()) => Err(crate::Error::internal(
+            "scanner: barrier signal outside the barrier wait",
+        )),
         Err(mpsc::TryRecvError::Empty) => Ok(()),
         Err(mpsc::TryRecvError::Disconnected) => {
             #[cfg(feature = "test-hooks")]
@@ -479,13 +470,46 @@ fn poll_barrier(
                 .faults()
                 .apply_changes_scanner_stopped_before_eof
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Err(crate::Error::internal(if *signalled {
+            Err(crate::Error::internal(if signalled {
                 "drain stopped after the node-to-way barrier"
             } else {
                 "drain closed barrier channel before signalling loc_map ready"
             }))
         }
     }
+}
+
+/// Block until the drain signals that `loc_map` is published, after the
+/// node boundary has been sent: at the first way or relation descriptor, or
+/// at end of input (`at_eof`) when there is none. A closed channel means the
+/// drain has returned an error (the missing-node refusal at the barrier, a
+/// producer failure, a cancellation), so the walk stops with an error of
+/// its own, which `merge` ranks below the drain's.
+fn wait_for_barrier(
+    rx: &mpsc::Receiver<()>,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] at_eof: bool,
+    host: &crate::host::Host,
+) -> Result<()> {
+    host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_START");
+    #[cfg(feature = "test-hooks")]
+    host.invocation
+        .faults()
+        .apply_changes_scanner_in_barrier_wait
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    if rx.recv().is_err() {
+        #[cfg(feature = "test-hooks")]
+        if !at_eof {
+            host.invocation
+                .faults()
+                .apply_changes_scanner_stopped_before_eof
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        return Err(crate::Error::internal(
+            "drain closed barrier channel before signalling loc_map ready",
+        ));
+    }
+    host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_END");
+    Ok(())
 }
 
 /// Send the boundary for the node descriptors dispatched so far: one past

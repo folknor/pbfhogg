@@ -449,6 +449,8 @@ fn worker_loop(
                     &cancel.metrics().writer,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
+                #[cfg(feature = "test-hooks")]
+                cancel.faults().on_apply_changes_candidate_done(desc.seq);
             }
             ScannedBlob::Passthrough(mut desc) => {
                 // Only seen here under --direct-io output (scanner routes
@@ -465,12 +467,15 @@ fn worker_loop(
         }
     }
 
-    // Nothing may be left to flush here. The candidate channel closes only
-    // after the scanner has released its ways, which needs the barrier, so
-    // the drain has already merged every slot: coordinates flushed now would
+    // Nothing may be left to flush here. A successful scanner closes the
+    // candidate channel only after it has taken the barrier signal, so the
+    // drain has already merged every slot: coordinates flushed now would
     // never reach the published map. Every node candidate flushes before it
     // sends its item, so a leftover means that rule broke, and it fails the
-    // run rather than silently losing coordinates.
+    // run rather than silently losing coordinates. (A late node on a base
+    // that lies about its order flushes into a slot after the merge; the
+    // drain's order guard refuses it, so those coordinates are never
+    // needed.)
     if locations_on_ways && !local_coords.is_empty() {
         return Err(Error::internal(format!(
             "streaming: {} node coordinates were extracted but never flushed \

@@ -36,15 +36,16 @@
 //! once the scanner's [`DrainMessage::NodeBoundary`] has arrived and every
 //! seq below it is processed, the drain merges per-worker [`CoordSlots`]
 //! into the published `Arc<loc_map>` and signals the scanner over
-//! `barrier_tx` (so it can release its buffered way/relation descriptors).
-//! No way or relation item can arrive before that. The missing-node
+//! `barrier_tx`; the scanner, waiting at its first way or relation
+//! descriptor, then dispatches way and relation work as it walks. No way or
+//! relation item can arrive before that. The missing-node
 //! refusal is taken there too, before publication: the merged map is final,
 //! so an OSC way reference it cannot resolve fails the run at the barrier
 //! rather than after the way phase.
 //!
-//! One pipeline run serves both phases: the scanner keeps walking the way
-//! and relation headers while node items are still being processed, and
-//! holds those descriptors back instead of starting a second run. Splitting
+//! One pipeline run serves both phases: the scanner stops at the first way
+//! or relation header while node items are still being processed, and
+//! resumes its walk at the signal instead of starting a second run. Splitting
 //! the node phase into its own run was considered and not taken: it would
 //! change worker lifetime and scheduling on this measured path, and the
 //! barrier's correctness does not need it.
@@ -322,9 +323,9 @@ pub(super) fn run_drain(
         // phase is complete on sorted input (a node after a way on unsorted
         // input falls past the boundary and is refused later by the
         // output-order guard). Checking after the contiguous run rather than
-        // inside it is safe because, before publication, the scanner holds
-        // back every way and relation descriptor, so the run holds only node
-        // items (`process_item` refuses any other). It fires whichever comes
+        // inside it is safe because, before publication, the scanner has
+        // dispatched no way or relation descriptor, so the run holds only
+        // node items (`process_item` refuses any other). It fires whichever comes
         // last, the final node item or the boundary itself: when the
         // boundary arrives after the drain has already processed every node
         // item, this check publishes on that receive, which is the case the
@@ -621,8 +622,8 @@ fn process_item(
     };
 
     // Before the coordinate map is published only node items can reach the
-    // drain: the scanner holds back every way and relation descriptor until
-    // the barrier signal, on both routes. A way or relation here would be
+    // drain: the scanner dispatches no way or relation descriptor until it
+    // has the barrier signal, on both routes. A way or relation here would be
     // written with no map to resolve against, so the protocol is broken.
     if cfg.locations_on_ways && !state.barrier_done && item_kind != ElementKind::Node {
         return Err(Error::internal(format!(
@@ -855,6 +856,9 @@ fn barrier_publish_loc_map(
         .as_ref()
         .ok_or_else(|| Error::internal("drain: locations_on_ways true but loc_map_out is None"))?;
 
+    #[cfg(feature = "test-hooks")]
+    invocation.faults().before_apply_changes_coord_merge();
+
     // Seed with OSC pre-seeded coords (from
     // `NodeLocationIndex::build_from_diff`'s `locations`) before
     // extending with per-worker accumulators. Take ownership via the
@@ -891,8 +895,9 @@ fn barrier_publish_loc_map(
     // The missing-node refusal, at the earliest point the count is known:
     // every node item is processed, nothing resolves after this merge, and
     // no way has been written. Leaving through the drain's error exit drops
-    // the barrier sender unsignalled, so the scanner stops at its next
-    // barrier poll (or its EOF wait), the workers are released, and `merge`
+    // the barrier sender unsignalled, so the scanner stops in its barrier
+    // wait (at the first way or relation, or at EOF), the workers are
+    // released, and `merge`
     // publishes nothing. A producer failure already published, or a
     // cancellation already requested, outranks the refusal: both are
     // checked here, at the decision, since the drain's own checks ran
@@ -947,9 +952,9 @@ fn barrier_publish_loc_map(
         #[cfg(feature = "test-hooks")]
         invocation.faults().before_apply_changes_barrier_send();
         // A scanner that succeeds always receives this before exiting, small
-        // inputs included: if it has not already picked it up between node
-        // descriptors, it blocks on it after its walk. A
-        // closed receiver therefore means the scanner exited or unwound
+        // inputs included: it blocks on it at its first way or relation
+        // descriptor, or at end of input when there is none. A closed
+        // receiver therefore means the scanner exited or unwound
         // early, and that cause is reported through the failure slot, so the
         // send error itself carries nothing to report.
         if let Err(e) = barrier_tx.send(()) {

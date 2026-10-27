@@ -1393,9 +1393,15 @@ Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blob
 
 Which blobs are unmodified is decided from each blob's indexdata ID range,
 and a passed-through blob's element count in the statistics is its indexdata
-claim; neither is checked, so a base whose indexdata understates a blob's
-range gets that blob copied past a change aimed at it. See
-[indexdata-trust.md](indexdata-trust.md).
+claim. A blob whose claimed range misses the diff is copied without being
+decoded, so a base whose indexdata understates that range gets the blob
+copied past a change aimed at it. Every blob the run does decode (the ones
+whose claimed range meets the diff, and under `--locations-on-ways` the way
+blobs it searches) must hold exactly the kind, range and count its indexdata
+claims and be in the order the header's sort claim promises; otherwise the
+run fails (exit 2) and publishes nothing. See
+[indexdata-trust.md](indexdata-trust.md), "Range, count and order claims
+refused at decode".
 
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the

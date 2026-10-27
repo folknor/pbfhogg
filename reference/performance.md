@@ -389,6 +389,37 @@ way phase (barrier end to loop end) is 126.4 to 127.9 s in every cell. The
 scanner waits about 0.5 s for the drain at the first way header
 (`MERGE_SCANNER_BARRIER_WAIT_START` to `_END`), the node tail.
 
+### Claims checked on decoded blobs (bygg, 2026-10-27, commit `ac482666`)
+
+Since `ac482666` every blob an apply-changes worker decodes is walked
+against its claim (count, numeric min and max, OSM-key order) on the loops
+that already visit each element, and the `sort` / `cat --dedupe` sweep
+tallies each believed overlap-run entry while pushing it. Interleaved
+`--bench 1` cells against the parent `43e20723` (built through `--commit`),
+run order parent, change, change, parent, bygg, untrimmed:
+
+| Cell | Parent `43e20723` (s) | New `ac482666` (s) | UUIDs, in run order |
+|---|---|---|---|
+| apply-changes planet, OSC 4913 | 232.9, 236.6 | 234.2, 235.8 | `1ba4bce2`, `6d2dce1e`, `5c8a398d`, `6982b7fc` |
+| apply-changes `-l`, `altw-keep-untagged`, OSC 4913 | 303.2, 307.1 | 306.7, 306.2 | `5ddfaca1`, `b6e2d94c`, `df4f9c49`, `8604ba5e` |
+| cat --dedupe japan with itself | 14.1, 10.2 | 10.6, 10.3 | `1547090b`, `cf5cc441`, `d62b4f9b`, `c43029dc` |
+
+Medians move by +0.1 % (plain, 234.8 to 235.0 s), +0.4 % (`-l`, 305.2 to
+306.5 s) and +2 % on the two warm dedupe cells (10.2 to 10.45 s; the first
+parent cell ran cold after the planet cells and is not comparable), inside
+the noise band. The worker counters locate the cost where the walk runs:
+`merge_streaming_precise_ns` rises from 70.0 and 70.6 to 84.5 and 84.5
+core-seconds on the plain merge, and from 118.7 to 140.5 and 142.0 under
+`-l`, where every node blob is a candidate and its precise check walks every
+node; about 0.5 s and 0.8 s of wall at 29 cores. Rewrite, decompress and
+parse time are unchanged, and blob counts are identical. The dedupe cell is
+the worst case for the sweep's tally: every one of its 86,070 blobs is
+rewritten through the sweep on a believed claim. `sort` was not measured
+separately: under a header claiming sorted order an honest file has no
+overlap runs, so the believed sweep runs on valid input only for
+`cat --dedupe`, and an unsorted-header `sort` sweeps scanned entries, which
+the tally skips.
+
 ### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 
 Apply-changes without `--locations-on-ways` is a structurally

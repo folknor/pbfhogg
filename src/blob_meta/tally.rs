@@ -215,6 +215,87 @@ impl<'c> ClaimWalk<'c> {
     }
 }
 
+/// The cheapest walk that decides a non-negative claim under required
+/// order: one raw compare and store per ID, plus a count.
+///
+/// For a claim whose `min_id` is not negative, an ID sequence that ascends
+/// as `i64` (equal IDs allowed) and starts at `min_id` holds no negative ID,
+/// so it is in canonical OSM order, and its count, minimum and maximum are
+/// its length, first and last. [`holds`](Self::holds) is then exactly the
+/// verdict a [`ClaimWalk`] under [`Order::Required`] reaches, at a fraction
+/// of its per-element cost (no key conversion, no min and max). A caller
+/// whose claim may be negative uses [`ClaimWalk`]; one whose verdict is
+/// false replays the IDs through a `ClaimWalk`, cold, for the exact
+/// refusal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AscendingTally {
+    count: u64,
+    first: i64,
+    last: i64,
+    descended: bool,
+}
+
+impl Default for AscendingTally {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            first: 0,
+            last: i64::MIN,
+            descended: false,
+        }
+    }
+}
+
+impl AscendingTally {
+    /// The next ID, in iteration order.
+    #[inline]
+    pub(crate) fn add(&mut self, id: i64) {
+        self.descended |= id < self.last;
+        if self.count == 0 {
+            self.first = id;
+        }
+        self.last = id;
+        self.count += 1;
+    }
+
+    /// Whether the IDs added are in order and `claim` is exact for them.
+    /// Only meaningful for a claim whose `min_id` is not negative.
+    pub(crate) fn holds(&self, claim: &BlobIndex) -> bool {
+        debug_assert!(
+            claim.min_id >= 0,
+            "AscendingTally decides non-negative claims only"
+        );
+        !self.descended
+            && self.count != 0
+            && self.count == claim.count
+            && self.first == claim.min_id
+            && self.last == claim.max_id
+    }
+}
+
+/// The refusal for IDs an [`AscendingTally`] found not to hold `claim`: the
+/// same IDs replayed through a [`ClaimWalk`] under `order`, which names the
+/// false claim or the disorder by its precedence. Cold.
+#[cold]
+pub(crate) fn replay_refusal(
+    claim: &BlobIndex,
+    order: Order,
+    ids: impl IntoIterator<Item = i64>,
+) -> Error {
+    let mut walk = ClaimWalk::new(Some(claim), order);
+    for id in ids {
+        if let Err(e) = walk.observe(id) {
+            return e;
+        }
+    }
+    match walk.finish() {
+        Err(e) => e,
+        Ok(_) => {
+            Error::internal("a blob failed the ascending claim check but passed the claim walk")
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -306,5 +387,50 @@ mod tests {
         assert_eq!(walk(&[], None, required).unwrap(), None);
         // A claim over no element is refused.
         assert!(walk(&[], Some(&claim(0, 0, 0)), Order::Free).is_err());
+    }
+
+    /// On every non-negative claim the ascending tally reaches the required
+    /// walk's verdict: in order and exact, or not. Negative IDs under such a
+    /// claim, descents, equal IDs, wrong counts and empty blobs included.
+    #[test]
+    fn the_ascending_tally_agrees_with_the_required_walk() {
+        let required = Order::Required("test");
+        let claims = [
+            claim(0, 3, 3),
+            claim(1, 3, 3),
+            claim(1, 3, 4),
+            claim(2, 2, 1),
+        ];
+        let runs: [&[i64]; 9] = [
+            &[1, 2, 3],
+            &[0, 1, 3],
+            &[1, 1, 3],
+            &[2, 1, 3],
+            &[1, -2, 3],
+            &[-1, 2, 3],
+            &[2],
+            &[],
+            &[1, 2, 3, 3],
+        ];
+        for c in &claims {
+            for ids in runs {
+                let mut t = AscendingTally::default();
+                for &id in ids {
+                    t.add(id);
+                }
+                assert_eq!(
+                    t.holds(c),
+                    walk(ids, Some(c), required).is_ok(),
+                    "{ids:?} under {c:?}"
+                );
+                if !t.holds(c) {
+                    let e = replay_refusal(c, required, ids.iter().copied());
+                    assert!(
+                        !matches!(e.kind(), crate::ErrorKind::Internal { .. }),
+                        "{ids:?} under {c:?}: {e}"
+                    );
+                }
+            }
+        }
     }
 }

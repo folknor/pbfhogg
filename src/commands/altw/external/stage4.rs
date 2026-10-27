@@ -679,26 +679,38 @@ pub(super) fn stage4_assembly(
                     // A way or relation under the node claim would be
                     // re-encoded among the nodes with no coordinate source
                     // and outside the member scan: refused, as the sparse
-                    // backend refuses it. The walk holds the claim and the
+                    // backend refuses it. The tally holds the claim and the
                     // header's order to every node, since stage 2 decodes
-                    // only the node blobs a referenced bucket reaches.
+                    // only the node blobs a referenced bucket reaches; node
+                    // claims are non-negative here (the metadata scan
+                    // refused any other), so one raw compare per node
+                    // decides it, and a false verdict replays the nodes,
+                    // cold, for the exact refusal.
                     block
                         .refuse_foreign_kind(Some(desc.kind))
                         .map_err(at_frame)?;
-                    let mut walk = crate::blob_meta::ClaimWalk::new(
-                        Some(&desc.claim),
-                        super::blob_meta::EXTERNAL_ORDER,
-                    );
+                    let mut tally = crate::blob_meta::AscendingTally::default();
                     let mut block_stats = assemble_block(
                         &block,
                         bb,
                         output_blocks,
                         keep_untagged_nodes,
                         relation_member_node_ids,
-                        &mut walk,
+                        &mut tally,
                     )
                     .map_err(at_frame)?;
-                    walk.finish().map_err(at_frame)?;
+                    if !tally.holds(&desc.claim) {
+                        return Err(at_frame(crate::blob_meta::replay_refusal(
+                            &desc.claim,
+                            super::blob_meta::EXTERNAL_ORDER,
+                            block.elements_skip_metadata().map(|e| match e {
+                                Element::DenseNode(n) => n.id(),
+                                Element::Node(n) => n.id(),
+                                Element::Way(w) => w.id(),
+                                Element::Relation(r) => r.id(),
+                            }),
+                        )));
+                    }
                     block_stats.blobs_decoded = 1;
                     flush_local(bb, output_blocks).map_err(at_frame)?;
                     let elapsed = t2.elapsed_ms();
@@ -810,14 +822,14 @@ fn assemble_block(
     output: &mut Vec<OwnedBlock>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
-    walk: &mut crate::blob_meta::ClaimWalk<'_>,
+    tally: &mut crate::blob_meta::AscendingTally,
 ) -> crate::Result<Stats> {
     let mut stats = Stats::default();
 
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                walk.observe(dn.id())?;
+                tally.add(dn.id());
                 stats.nodes_read += 1;
                 let has_tags = dn.tags().next().is_some();
                 if keep_untagged_nodes
@@ -839,7 +851,7 @@ fn assemble_block(
                 }
             }
             Element::Node(n) => {
-                walk.observe(n.id())?;
+                tally.add(n.id());
                 stats.nodes_read += 1;
                 let has_tags = n.tags().next().is_some();
                 if keep_untagged_nodes

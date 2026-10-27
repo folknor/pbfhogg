@@ -1186,6 +1186,27 @@ suite gets. Even a small real extract spreads its IDs over the whole ID
 history and writes most pages of most chunks, so extracts do not shrink
 either.
 
+### Kind claims checked at decode (bygg, 2026-10-27, commit `7ecb8a43`)
+
+Every block now records the element kinds it holds in its construction
+validation pass, the classify pools compare them with a scheduled blob's
+claimed kind under `KindClaims::Refuse` (adopted by `check --refs` and
+`check --ids`), and the pipelined reader carries the setting unused.
+Matched `--bench 1` cells against the parent `e8ae74f3`, alternating parent
+then new, three pairs each, bygg, untrimmed:
+
+| Cell | New `7ecb8a43` | Parent `e8ae74f3` | UUIDs (parent, new) per pair |
+|---|---:|---:|---|
+| check-refs planet | 41.9, 41.5, 41.5 s | 41.8, 41.2, 41.3 s | `9a095693` `efbdc9ab`, `584ca62b` `fcf76ae8`, `8bfaed50` `7cb61453` |
+| check-ids planet | 38.1, 38.1, 38.2 s | 37.8, 37.9, 38.0 s | `3d84b122` `418b6270`, `13be238e` `81d53a8b`, `7e1ec65b` `519d0c43` |
+| tags-filter -R planet (pipelined, `w/highway=primary`) | 30.5, 30.5, 30.4 s | 30.4, 30.4, 30.4 s | `70a58d33` `0e6b810d`, `d6694f01` `b7ae4e70`, `794d7302` `cb88fee3` |
+
+Medians move by 0.5 % (check-refs), 0.5 % (check-ids) and 0.3 %
+(tags-filter), inside the noise band. The checks' sign is consistent across
+pairs; the phase splits (`584ca62b` vs `fcf76ae8`, `13be238e` vs `81d53a8b`)
+put the difference in the way phase, about 0.2 s of 11 to 14 s at the same
+cores, with the schedule walk and the node phase identical.
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

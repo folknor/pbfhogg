@@ -29,10 +29,11 @@ driven the library the way an embedding caller would, so every behaviour that
 only exists under library use is unverified:
 
 - several calls in one process, one after another and concurrently: whether
-  their outputs match the CLI's, whether process-global state leaks between
-  them (the metric statics below), how the marker FIFO behaves;
+  their outputs match the CLI's, whether any process-global state still leaks
+  between them, and that each call's counters (`Invocation::for_each_counter`)
+  and instrumentation stream (its own `debug::InstrumentSink`) are its own;
 - a caller-supplied `Host`: `Resources` figures instead of the machine probe,
-  the page-cache policy, the executor, a caller tripping `Cancel`;
+  the page-cache policy, the executor, a caller tripping its `Invocation`;
 - a process whose soft fd limit nobody raised (the CLI raises it; the
   library may not, ADR-0016): cat's admission refusal below, and altw
   external stage 1's fd allowance, which has the same shape (bz `pbfhogg#11`
@@ -45,42 +46,6 @@ in one process (sequential and concurrent), with a brokkr subcommand that runs
 it, records walls and stalls per call, and compares its outputs with the CLI's.
 Nothing about it is designed; brokkr's source has not been readable from the
 sandboxes this work ran in, so the brokkr half needs a host where it is.
-
-### Instrumentation is per invocation, not per process
-
-Ruled 2026-10-26 (moved here from `notes/todo.md`). The stall counter sets are
-process-global statics that are never reset: today `PIPELINE_METRICS`,
-`DECOMPRESS_POOL_METRICS` (`read/pipeline_metrics.rs`),
-`UNORDERED_POOL_METRICS` (`scan/classify.rs`), `ORDERED_POOL_METRICS`
-(`ordered_pool.rs`) and `WRITER_METRICS` (`write/metrics.rs`). Two library
-calls in one process, concurrent or one after the other, mix their totals and
-cannot be attributed to a call, which contradicts ADR-0016. `8384fa29` kept
-them global on the ground that each production command does at most one
-pipelined read; that holds per CLI process and fails for a library caller.
-
-It also rejected per-run instances because brokkr's `--stalls` takes the
-maximum per counter name and assumes totals only grow, so per-pass sets would
-report only the largest pass. The ruled fix keeps those semantics: one metric
-set per invocation, accumulating across every pass of that invocation and
-emitted as before, so a CLI run reports the same totals. Cost is threading the
-set through every pool; nothing on normal input.
-
-Open design questions, not yet ruled on:
-
-- **Where the set lives.** A `Host` field, or a per-call token like `Cancel`.
-  `Host` is `Clone` and its clones share `Arc`s, so a `Host` field is shared
-  by every call made with clones of one host unless the caller builds a fresh
-  one per call. `Cancel` is already a `Host` field and already carries
-  per-invocation state (the test-hooks `FaultPlan` rides it, reaching every
-  worker loop), but a token may be deliberately shared by a group of calls
-  meant to stop together, which would merge their metrics.
-- **Whether library callers can read their own call's stalls**, or the set
-  only feeds the FIFO emission as today.
-- **How the process-wide marker FIFO handles concurrent calls.** It is
-  caller-armed and process-wide by design (`debug::initialize_marker_fifo`);
-  concurrent calls interleave markers and counters under the same names.
-  Options include tagging per call, documenting one instrumented call at a
-  time, or leaving it to the harness.
 
 ### cat's descriptor admission for library callers
 
@@ -161,7 +126,10 @@ v2). The CLI surface redesign is deferred past 0.6.0.
   unindexed blobs re-encoded on `apply-changes --force` (`f703b02b`); cat's
   `blobs_decoded` and the "Decoded N blobs" summary count input blobs, not
   framed output blobs (`8da26b23`); diff and derive runs now feed
-  `DECOMPRESS_POOL_METRICS` (`126cbce2`). (`merge_header_read_ms` widening at
+  the `pipeline_decompress_pool_*` counters (`126cbce2`); `publish_sync_calls`
+  / `publish_sync_ns` are a tally of the publication's own syncs rather than a
+  delta of the run's `writer_sync_all_*` (same values for a CLI run, which
+  never publishes concurrently). (`merge_header_read_ms` widening at
   `a3f1a1bc` was ruled to need no entry; the comment at its timer says it.)
 - **`check` small-file sizing.** The change reverted on 2026-10-26
   (letting a small file pre-allocate less than the per-kind floor) is safe

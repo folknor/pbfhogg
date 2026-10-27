@@ -162,8 +162,8 @@ impl WriterMetrics {
     /// `sync_all_calls` pair, which used to be bumped by hand at each site
     /// and drifted apart. Only [`sync_recorded`](Self::sync_recorded) calls
     /// it.
-    fn record_sync_all(&self, start: Stopwatch) {
-        start.record_ns(&self.sync_all_ns);
+    fn record_sync_all(&self, elapsed_ns: u64) {
+        self.sync_all_ns.fetch_add(elapsed_ns, Relaxed);
         self.sync_all_calls.fetch_add(1, Relaxed);
     }
 
@@ -176,12 +176,20 @@ impl WriterMetrics {
     /// syscall rather than trusted to its caller, and a failed `fsync` is
     /// counted like a successful one.
     pub(crate) fn sync_recorded(&self, file: &std::fs::File) -> std::io::Result<()> {
+        self.sync_timed(file).0
+    }
+
+    /// [`sync_recorded`](Self::sync_recorded), also returning the elapsed
+    /// nanoseconds it recorded, so a caller that keeps a tally of its own
+    /// (publication's `publish_sync_*`) adds exactly the same sample.
+    pub(crate) fn sync_timed(&self, file: &std::fs::File) -> (std::io::Result<()>, u64) {
         let start = Stopwatch::start();
         // The funnel itself.
         #[allow(clippy::disallowed_methods)]
         let result = file.sync_all();
-        self.record_sync_all(start);
-        result
+        let elapsed_ns = start.elapsed_ns();
+        self.record_sync_all(elapsed_ns);
+        (result, elapsed_ns)
     }
 
     /// Record time spent blocked in a writer-thread `recv`.
@@ -310,7 +318,7 @@ mod tests {
         let metrics = super::WriterMetrics::new();
         let start = crate::counters::Stopwatch::start();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        metrics.record_sync_all(start);
+        metrics.record_sync_all(start.elapsed_ns());
         assert_eq!(
             metrics.sync_all_calls.load(Relaxed),
             1,

@@ -130,7 +130,6 @@ pub(super) fn try_extract_multi_single_pass(
     // shape is not known to transfer to N concurrent outputs.
     let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
     for (region, output) in regions.iter().zip(outputs.iter()) {
-        let display_path = output.destination();
         let bbox = region.bbox();
         let header_bytes = super::super::output_header::build_one(
             &header,
@@ -139,10 +138,8 @@ pub(super) fn try_extract_multi_single_pass(
             host,
         )?
         .bytes;
-        let completion = output.begin_write()?;
-        let mut w = PbfWriter::to_staged_file(output.path(), compression, &host.invocation)
-            .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?
-            .with_completion(completion);
+        // The session and the writer under the run's one token.
+        let mut w = output.sync_pbf_writer(compression, &host.invocation)?;
         // The writer names its output in any error it returns.
         w.write_header(&header_bytes)?;
         writers.push(w);

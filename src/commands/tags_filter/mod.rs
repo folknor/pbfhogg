@@ -1335,6 +1335,14 @@ fn collect_way_node_dependencies(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// One host for this module's tests, so a run and the publication of
+    /// its output share an invocation (publication refuses another). Never
+    /// cancelled and never armed.
+    fn run_host() -> &'static crate::host::Host {
+        static HOST: std::sync::OnceLock<crate::host::Host> = std::sync::OnceLock::new();
+        HOST.get_or_init(crate::host::Host::for_tests)
+    }
     use super::*;
     use crate::ElementKind;
     use crate::owned::TypeFilter;
@@ -1438,19 +1446,19 @@ mod tests {
         )
         .unwrap();
         tags_filter_single_pass(
-            &PinnedInput::pin(&input, &crate::host::Host::for_tests()).unwrap(),
+            &PinnedInput::pin(&input, run_host()).unwrap(),
             &staged,
             &expressions,
             false,
             false,
             &WriteOptions::default(),
             &HeaderOverrides::default(),
-            &crate::host::Host::for_tests(),
+            run_host(),
         )
         .unwrap();
-        staged.publish(&crate::host::Invocation::new()).unwrap();
+        staged.publish(&run_host().invocation).unwrap();
         let mut ids = Vec::new();
-        ElementReader::open_in(&output, false, &crate::host::Host::for_tests())
+        ElementReader::open_in(&output, false, run_host())
             .unwrap()
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),

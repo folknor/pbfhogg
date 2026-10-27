@@ -1572,17 +1572,18 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
+        let host = crate::host::Host::for_tests();
         getid_with_refs(
-            &PinnedInput::pin(&input, &crate::host::Host::for_tests()).unwrap(),
+            &PinnedInput::pin(&input, &host).unwrap(),
             &staged,
             &ids,
             &opts,
             &WriteOptions::default(),
             &HeaderOverrides::default(),
-            &crate::host::Host::for_tests(),
+            &host,
         )
         .unwrap();
-        staged.publish(&crate::host::Invocation::new()).unwrap();
+        staged.publish(&host.invocation).unwrap();
         assert_eq!(
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
@@ -1674,7 +1675,7 @@ mod tests {
                 host,
             )
             .unwrap();
-            staged.publish(&crate::host::Invocation::new()).unwrap();
+            staged.publish(&host.invocation).unwrap();
         }
         let walker_ids = read_ids(&walker, host);
         assert_eq!(walker_ids, read_ids(&full_scan, host));
@@ -1859,6 +1860,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap();
+            let host = crate::host::Host::for_tests();
             let (arm, _) = getid_dispatched(
                 &input,
                 &staged,
@@ -1867,10 +1869,10 @@ mod tests {
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 min_blobs,
-                &crate::host::Host::for_tests(),
+                &host,
             )
             .unwrap();
-            staged.publish(&crate::host::Invocation::new()).unwrap();
+            staged.publish(&host.invocation).unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
                 read_ids(&output, &crate::host::Host::for_tests()),

@@ -46,8 +46,15 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   check; publication does), `Output::writer(&Invocation)` on each buffer flush
   and in `OutputWriter::finish`, so a run whose output is its bottleneck
   stops at its next write. The token is an argument, not something an
-  output captures, so the decision and the run cannot consult different
-  tokens by accident.
+  output captures at construction, so the decision and the run cannot
+  consult different tokens by accident: outputs are built before a run's
+  per-call token need exist, and the command entry points pass the token
+  their work ran under to both the writer and publication. The writing
+  session records the invocation it was opened under, and publication
+  refuses (invalid argument, after the cancellation check and before any
+  hook or sync) an output written under another, so a caller driving an
+  output by hand with two tokens fails loudly instead of splitting the
+  run's cancellation and instrumentation.
 - **The CLI's policy.** SIGINT and SIGTERM are blocked before any thread
   starts and taken by one `sigwait` thread, so no signal handler ever runs.
   The first signal trips the token; the run ends with exit status

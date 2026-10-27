@@ -52,8 +52,10 @@ output any other way.
 - **One writing session per output, and publication needs it finished.**
   The session is `Reserved -> Writing -> Finished`, with `Failed` terminal and
   never overwritten by a later success. `Output::pbf_writer`,
-  `Output::writer` and `OutputDir::writer` each open it (a second session is
-  refused, so two writers cannot truncate each other). A PBF writer holds a
+  `Output::writer` and `OutputDir::writer` each open it under the run's
+  invocation (a second session is refused, so two writers cannot truncate
+  each other), and `publish` refuses a session opened under an invocation
+  other than its own (ADR-0019). A PBF writer holds a
   lease that its first fully successful end-of-stream `flush` finishes; any
   error any of its write methods returns, from wherever in the method (a
   scan, a permit, framing, the write, a send that recovered the writer
@@ -122,8 +124,10 @@ output any other way.
   `PbfWriter::to_path*` writers, `bench-write`'s among them, still sync
   inside their timed `flush`);
   publication emits its own share as `publish_sync_calls` /
-  `publish_sync_ns`, deltas over the span just before `PUBLISH_END`, so a
-  run where both totals agree had every sync in publication; and every file
+  `publish_sync_ns` just before `PUBLISH_END`, a tally of exactly the syncs
+  that publication attempted (failures and rollback syncs included, one
+  tally per group), so a run where both totals agree had every sync in
+  publication; and every file
   output holds one extra descriptor (the reservation's) from construction
   until publication or drop, which matters only to an `extract --config`
   with very many regions under a tight descriptor limit.

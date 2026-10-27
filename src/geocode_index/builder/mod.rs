@@ -211,7 +211,7 @@ fn build_geocode_index_to(
     // build never truncates the files an already-open Reader has mapped,
     // and the previous index survives every failure. The writer is finished
     // only once the build returned with every file it wrote closed.
-    let writer = output.0.writer()?;
+    let writer = output.0.writer(&host.invocation)?;
     // Every failure of the build names the index it was building; a file
     // the failure is about is named beneath this.
     let stats = build_generation(config, writer.path(), host, &scratch).map_err(|e| {

@@ -204,15 +204,45 @@ enum Session {
 ///
 /// It also carries the destination's path: the one owner of the output's
 /// identity, so every writer filling it names the same file in an error.
+///
+/// And it records the invocation the session was opened under, set with the
+/// `Reserved -> Writing` transition under the same lock, so publication can
+/// refuse an output written under one invocation and published under
+/// another (ADR-0019 keeps the token an argument; this makes passing two
+/// different ones loud).
 #[derive(Clone, Debug)]
-pub(crate) struct Completion(Arc<Mutex<Session>>, Arc<Path>);
+pub(crate) struct Completion(Arc<Mutex<SessionState>>, Arc<Path>);
+
+#[derive(Debug)]
+struct SessionState {
+    session: Session,
+    /// The invocation the writing session was opened under; `None` while
+    /// `Reserved`.
+    invocation: Option<crate::host::Invocation>,
+}
 
 impl Completion {
     fn new(destination: &Path) -> Self {
         Self(
-            Arc::new(Mutex::new(Session::Reserved)),
+            Arc::new(Mutex::new(SessionState {
+                session: Session::Reserved,
+                invocation: None,
+            })),
             Arc::from(destination),
         )
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the writing session was opened under `invocation`. An output
+    /// with no session was opened under none.
+    fn written_under(&self, invocation: &crate::host::Invocation) -> bool {
+        self.lock()
+            .invocation
+            .as_ref()
+            .is_some_and(|opened| opened.same_invocation(invocation))
     }
 
     /// The path the caller named for this output.
@@ -221,14 +251,16 @@ impl Completion {
     }
 
     fn state(&self) -> Session {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.lock().session
     }
 
-    /// `Reserved -> Writing`; a second session on one output is an error.
-    fn begin(&self, destination: &Path) -> Result<()> {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if *state == Session::Reserved {
-            *state = Session::Writing;
+    /// `Reserved -> Writing` under `invocation`; a second session on one
+    /// output is an error.
+    fn begin(&self, destination: &Path, invocation: &crate::host::Invocation) -> Result<()> {
+        let mut state = self.lock();
+        if state.session == Session::Reserved {
+            state.session = Session::Writing;
+            state.invocation = Some(invocation.clone());
             Ok(())
         } else {
             Err(Error::internal(format!(
@@ -240,15 +272,15 @@ impl Completion {
 
     /// `Writing -> Finished`. Does nothing in any other state.
     pub(crate) fn finish(&self) {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if *state == Session::Writing {
-            *state = Session::Finished;
+        let mut state = self.lock();
+        if state.session == Session::Writing {
+            state.session = Session::Finished;
         }
     }
 
     /// Fail the session for good.
     pub(crate) fn fail(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Session::Failed;
+        self.lock().session = Session::Failed;
     }
 }
 
@@ -263,51 +295,62 @@ impl std::fmt::Debug for Hook {
     }
 }
 
+/// One publication's syncs: every `fsync` it attempts (staged files and
+/// trees, backup durability, rollback, the final parent directories, kept
+/// backups after an unsynced commit, failures included) goes through
+/// [`sync`](Self::sync), which records it in the invocation's
+/// `writer_sync_all_*` and in this publication's own tally from the one
+/// measurement. One tally for a whole group, whose parent syncs are shared.
+struct PublishSync<'a> {
+    metrics: &'a WriterMetrics,
+    calls: std::cell::Cell<u64>,
+    ns: std::cell::Cell<u64>,
+}
+
+impl<'a> PublishSync<'a> {
+    fn new(invocation: &'a crate::host::Invocation) -> Self {
+        Self {
+            metrics: &invocation.metrics().writer,
+            calls: std::cell::Cell::new(0),
+            ns: std::cell::Cell::new(0),
+        }
+    }
+
+    fn sync(&self, file: &fs::File) -> io::Result<()> {
+        let (result, elapsed_ns) = self.metrics.sync_timed(file);
+        self.calls.set(self.calls.get().saturating_add(1));
+        self.ns.set(self.ns.get().saturating_add(elapsed_ns));
+        result
+    }
+}
+
 /// Emits `PUBLISH_START` now and `PUBLISH_END` when dropped, so the pair
 /// closes on every return. Just before `PUBLISH_END` it emits the
-/// publication's own share of the writer-metrics sync counters,
-/// `publish_sync_calls` and `publish_sync_ns`: deltas over this one span
-/// (repeated publications emit repeated values), so a reader can tell the
-/// syncs publication did from any a writer did. Markers and counters are
-/// best effort: the sidecar drops one when its pipe is full.
+/// publication's own syncs, `publish_sync_calls` and `publish_sync_ns`, from
+/// its [`PublishSync`] tally (repeated publications emit repeated values),
+/// so a reader can tell the syncs publication did from any a writer did,
+/// exact even while another publication of the same invocation runs. Two
+/// concurrent publications of one invocation still emit under the same
+/// names, so a stream reader cannot tell their values apart. Markers and
+/// counters are best effort: the sidecar drops one when its pipe is full.
 struct PublishSpan<'a> {
     invocation: &'a crate::host::Invocation,
-    metrics: &'a WriterMetrics,
-    sync_calls: u64,
-    sync_ns: u64,
+    sync: &'a PublishSync<'a>,
 }
 
 impl<'a> PublishSpan<'a> {
-    fn start(invocation: &'a crate::host::Invocation) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-        let metrics = &invocation.metrics().writer;
-        let span = Self {
-            invocation,
-            metrics,
-            sync_calls: metrics.sync_all_calls.load(Relaxed),
-            sync_ns: metrics.sync_all_ns.load(Relaxed),
-        };
+    fn start(invocation: &'a crate::host::Invocation, sync: &'a PublishSync<'a>) -> Self {
         invocation.marker("PUBLISH_START");
-        span
+        Self { invocation, sync }
     }
 }
 
 impl Drop for PublishSpan<'_> {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        // Both read before either is emitted.
-        let calls = self
-            .metrics
-            .sync_all_calls
-            .load(Relaxed)
-            .saturating_sub(self.sync_calls);
-        let ns = self
-            .metrics
-            .sync_all_ns
-            .load(Relaxed)
-            .saturating_sub(self.sync_ns);
-        self.invocation.counter("publish_sync_calls", calls);
-        self.invocation.counter("publish_sync_ns", ns);
+        self.invocation
+            .counter("publish_sync_calls", self.sync.calls.get());
+        self.invocation
+            .counter("publish_sync_ns", self.sync.ns.get());
         self.invocation.marker("PUBLISH_END");
     }
 }
@@ -945,6 +988,21 @@ impl Target {
 
     /// The session is finished, and the staging entry is still the file that
     /// was reserved (so what gets synced is what gets installed).
+    /// The writing session was opened under `invocation` (ADR-0019: the
+    /// publication's token is the run's). Checked after [`Self::check_ready`],
+    /// so an output nobody wrote stays `Unfinished`.
+    fn check_invocation(&self, invocation: &crate::host::Invocation) -> Result<()> {
+        if self.session.written_under(invocation) {
+            Ok(())
+        } else {
+            Err(Error::invalid_argument(format!(
+                "output {} was written under a different invocation than the one publishing \
+                 it; pass the token the run used",
+                self.dest.display()
+            )))
+        }
+    }
+
     fn check_ready(&self) -> Result<()> {
         if self.session.state() != Session::Finished {
             return Err(new_output_error(OutputError::Unfinished {
@@ -979,10 +1037,10 @@ impl Target {
     }
 
     /// `fsync` the staged file or tree through the writer-metrics funnel.
-    fn sync_staged(&self, metrics: &WriterMetrics) -> Result<()> {
+    fn sync_staged(&self, sync: &PublishSync<'_>) -> Result<()> {
         let result = match &self.handle {
-            Some(handle) => metrics.sync_recorded(handle),
-            None => sync_tree(&self.write, metrics),
+            Some(handle) => sync.sync(handle),
+            None => sync_tree(&self.write, sync),
         };
         result.map_err(|e| {
             Error::from(e).context(format!(
@@ -1010,7 +1068,7 @@ impl Target {
         &mut self,
         use_backup: bool,
         faults: &Faults,
-        metrics: &WriterMetrics,
+        metrics: &PublishSync<'_>,
     ) -> Result<()> {
         let identity = self.identity();
         match self.overwrite {
@@ -1093,7 +1151,7 @@ impl Target {
         identity: Option<Identity>,
         use_backup: bool,
         faults: &Faults,
-        metrics: &WriterMetrics,
+        metrics: &PublishSync<'_>,
     ) -> Result<()> {
         let present = match fs::symlink_metadata(&self.dest) {
             Ok(_) => true,
@@ -1445,12 +1503,15 @@ fn publish_all(
     faults: &Faults,
     invocation: &crate::host::Invocation,
 ) -> Result<()> {
-    let metrics = &invocation.metrics().writer;
-    // Every member is ready before anything runs, so a refusal leaves the
-    // hooks unrun and every destination untouched.
+    // Every member is ready, and was written under the publishing
+    // invocation, before anything runs, so a refusal leaves the hooks unrun
+    // and every destination untouched.
     for target in targets.iter() {
         target.check_ready()?;
+        target.check_invocation(invocation)?;
     }
+    let sync = PublishSync::new(invocation);
+    let metrics = &sync;
     // The caller's timers stop here: the work is done, and what follows is
     // durability and publication.
     for target in targets.iter_mut() {
@@ -1458,7 +1519,7 @@ fn publish_all(
             hook();
         }
     }
-    let _span = PublishSpan::start(invocation);
+    let _span = PublishSpan::start(invocation, &sync);
     for target in targets.iter() {
         // Again after the hooks: a hook is caller code and may have failed
         // a session (a write after the end of stream, say). A failure on
@@ -1575,26 +1636,26 @@ fn distinct_parents(targets: &[Target]) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path, metrics: &WriterMetrics) -> io::Result<()> {
-    metrics.sync_recorded(&fs::File::open(dir)?)
+fn sync_dir(dir: &Path, sync: &PublishSync<'_>) -> io::Result<()> {
+    sync.sync(&fs::File::open(dir)?)
 }
 
 /// Sync every regular file under `dir`, then every directory, the root
 /// last.
-fn sync_tree(dir: &Path, metrics: &WriterMetrics) -> io::Result<()> {
+fn sync_tree(dir: &Path, metrics: &PublishSync<'_>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_dir() {
             sync_tree(&entry.path(), metrics)?;
         } else if kind.is_file() {
-            metrics.sync_recorded(&fs::File::open(entry.path())?)?;
+            metrics.sync(&fs::File::open(entry.path())?)?;
         }
     }
     sync_dir(dir, metrics)
 }
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path, _metrics: &WriterMetrics) -> io::Result<()> {
+fn sync_dir(_dir: &Path, _sync: &PublishSync<'_>) -> io::Result<()> {
     Ok(())
 }
 
@@ -1692,7 +1753,7 @@ impl Output {
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
         use crate::write::OutputBackend;
         use crate::write::writer::PbfWriter;
-        let completion = self.begin_write()?;
+        let completion = self.begin_write(&host.invocation)?;
         let path = self.path();
         let finish = crate::write::Finish::Deferred;
         // A test can make every backend refuse as a platform would; the
@@ -1797,7 +1858,7 @@ impl Output {
     /// The output already has a writing session, or the staging file cannot
     /// be opened (the error names the destination).
     pub fn writer(&self, cancel: &crate::host::Invocation) -> Result<OutputWriter> {
-        let completion = self.begin_write()?;
+        let completion = self.begin_write(cancel)?;
         match fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -1821,13 +1882,35 @@ impl Output {
         }
     }
 
-    /// Start the output's writing session for a writer that opens
-    /// [`path`](Self::path) itself (the PBF backends). The returned lease is
-    /// finished by that writer's successful end of stream; until then, and
-    /// after any failure, publication refuses the output.
-    pub(crate) fn begin_write(&self) -> Result<Completion> {
-        self.target.session.begin(&self.target.dest)?;
+    /// Start the output's writing session, under `invocation`, for a writer
+    /// that opens [`path`](Self::path) itself (the PBF backends). The returned
+    /// lease is finished by that writer's successful end of stream; until
+    /// then, and after any failure, publication refuses the output, and it
+    /// refuses publication under any other invocation.
+    fn begin_write(&self, invocation: &crate::host::Invocation) -> Result<Completion> {
+        self.target.session.begin(&self.target.dest, invocation)?;
         Ok(self.target.session.clone())
+    }
+
+    /// Open the output's single writing session as a synchronous
+    /// [`PbfWriter`](crate::write::writer::PbfWriter) over the staging file
+    /// (256 KiB buffered, compressing on the caller), under `invocation`. As
+    /// [`pbf_writer`](Self::pbf_writer), the writer does not `fsync`;
+    /// publication does. The session and the writer share the one token.
+    pub(crate) fn sync_pbf_writer(
+        &self,
+        compression: crate::write::compression::Compression,
+        invocation: &crate::host::Invocation,
+    ) -> Result<crate::write::writer::PbfWriter<std::io::BufWriter<fs::File>>> {
+        let completion = self.begin_write(invocation)?;
+        match crate::write::writer::PbfWriter::to_staged_file(self.path(), compression, invocation)
+        {
+            Ok(writer) => Ok(writer.with_completion(completion)),
+            Err(e) => {
+                completion.fail();
+                Err(e.context(format!("failed to create {}", self.target.dest.display())))
+            }
+        }
     }
 
     /// Run `hook` when publication starts, before anything is synced or
@@ -1856,7 +1939,11 @@ impl Output {
     /// taken publication runs to completion whatever happens to the token,
     /// and its result - success, [`OutputError::Unsynced`], a refusal - is
     /// authoritative. Publication observes only the token passed here; the
-    /// command entry points pass the token their work ran under.
+    /// command entry points pass the token their work ran under, and an
+    /// output whose writing session was opened under a different invocation
+    /// is refused (invalid argument) before any hook runs or anything is
+    /// synced. A tripped token is reported as `Cancelled` first, whatever
+    /// session it is passed with.
     ///
     /// # Errors
     /// The destination rules are re-applied first; under
@@ -1931,12 +2018,14 @@ impl OutputDir {
     }
 
     /// Open the output's single writing session: the staging directory to
-    /// fill, and the [`DirWriter::finish`] that lets it be published.
+    /// fill, and the [`DirWriter::finish`] that lets it be published. The
+    /// session is opened under `invocation`, and publication refuses it
+    /// under any other.
     ///
     /// # Errors
     /// The output already has a writing session.
-    pub fn writer(&self) -> Result<DirWriter> {
-        self.target.session.begin(&self.target.dest)?;
+    pub fn writer(&self, invocation: &crate::host::Invocation) -> Result<DirWriter> {
+        self.target.session.begin(&self.target.dest, invocation)?;
         Ok(DirWriter {
             path: self.target.write.clone(),
             completion: self.target.session.clone(),
@@ -2128,16 +2217,53 @@ mod tests {
         Diagnostics::discard()
     }
 
+    /// The one token these tests write and publish under: publication
+    /// refuses an output written under another invocation. Never tripped; a
+    /// test that cancels uses a token of its own.
+    fn run_host() -> crate::host::Host {
+        crate::host::Host {
+            invocation: run_token().clone(),
+            ..crate::host::Host::for_tests()
+        }
+    }
+
+    fn run_token() -> &'static crate::host::Invocation {
+        static TOKEN: std::sync::OnceLock<crate::host::Invocation> = std::sync::OnceLock::new();
+        TOKEN.get_or_init(crate::host::Invocation::new)
+    }
+
+    /// Publication under an invocation other than the session's is refused
+    /// before any hook runs or anything is synced, and the staging entry is
+    /// removed with the output.
+    #[test]
+    fn publication_under_another_invocation_is_refused() {
+        let dir = scratch();
+        let ran = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&ran);
+        let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard())
+            .unwrap()
+            .before_publish(move || *flag.lock().unwrap() = true);
+        stage(&out, b"data").unwrap();
+        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
+            "{err}"
+        );
+        assert!(!*ran.lock().unwrap(), "no hook may run");
+        assert!(!dir.path().join("out").exists());
+        assert_eq!(others(dir.path(), &[]), Vec::<String>::new());
+    }
+
     /// Write `bytes` through the output's writing session and finish it.
     fn stage(out: &Output, bytes: &[u8]) -> Result<()> {
-        let mut writer = out.writer(&crate::host::Invocation::new())?;
+        let mut writer = out.writer(run_token())?;
         writer.write_all(bytes)?;
         writer.finish()
     }
 
     /// Write one file into a directory output's session and finish it.
     fn stage_dir(out: &OutputDir, name: &str, bytes: &[u8]) {
-        let writer = out.writer().unwrap();
+        let writer = out.writer(run_token()).unwrap();
         fs::write(writer.path().join(name), bytes).unwrap();
         writer.finish();
     }
@@ -2149,7 +2275,7 @@ mod tests {
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         assert!(!dest.exists(), "nothing at the destination before publish");
         stage(&out, b"new").unwrap();
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -2174,7 +2300,7 @@ mod tests {
         fs::write(&dest, b"old").unwrap();
         let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
         stage(&out, b"new").unwrap();
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -2211,7 +2337,7 @@ mod tests {
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         stage(&out, b"ours").unwrap();
         fs::write(&dest, b"theirs").unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Exists { .. }));
         assert_eq!(fs::read(&dest).unwrap(), b"theirs");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
@@ -2339,7 +2465,7 @@ mod tests {
         fs::write(dest.join("old.bin"), b"old").unwrap();
         let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
         stage_dir(&out, "new.bin", b"new");
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert!(!dest.join("old.bin").exists());
         assert_eq!(fs::read(dest.join("new.bin")).unwrap(), b"new");
         assert!(others(dir.path(), &["index"]).is_empty());
@@ -2369,7 +2495,7 @@ mod tests {
             OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()).unwrap();
         stage_dir(&out, "new.bin", b"new");
         fs::write(dest.join("marker"), b"").unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(
             err.to_string().contains("marked"),
             "the validator is rerun before the swap: {err}"
@@ -2423,20 +2549,20 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out.osc");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
+        let mut writer = out.writer(run_token()).unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         // Bytes are still in the buffer: the output is not publishable.
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         drop(writer);
         assert!(others(dir.path(), &[]).is_empty(), "staging is removed");
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
+        let mut writer = out.writer(run_token()).unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         writer.finish().unwrap();
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"<osmChange/>");
     }
 
@@ -2444,12 +2570,12 @@ mod tests {
     fn an_output_has_one_writing_session() {
         let dir = scratch();
         let out = Output::new(dir.path().join("o"), Overwrite::Refuse, &discard()).unwrap();
-        let first = out.writer(&crate::host::Invocation::new()).unwrap();
+        let first = out.writer(run_token()).unwrap();
         assert!(
-            out.writer(&crate::host::Invocation::new()).is_err(),
+            out.writer(run_token()).is_err(),
             "a second writer would truncate the first"
         );
-        assert!(out.begin_write().is_err());
+        assert!(out.begin_write(run_token()).is_err());
         drop(first);
     }
 
@@ -2462,26 +2588,26 @@ mod tests {
         let dest = dir.path().join("empty");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         fs::write(out.path(), b"behind the session's back").unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         assert!(others(dir.path(), &[]).is_empty());
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         stage(&out, b"").unwrap();
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"");
 
         let index = dir.path().join("index");
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let writer = out.writer().unwrap();
+        let writer = out.writer(run_token()).unwrap();
         fs::write(writer.path().join("f"), b"x").unwrap();
         drop(writer);
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!index.exists());
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(others(dir.path(), &["empty"]).is_empty());
     }
@@ -2491,7 +2617,7 @@ mod tests {
     #[test]
     fn a_failed_write_fails_the_session() {
         let dir = scratch();
-        let host = crate::host::Host::for_tests();
+        let host = run_host();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let out = Output::new(
             dir.path().join("out.osm.pbf"),
@@ -2511,7 +2637,7 @@ mod tests {
         // write after the end of stream is the error every backend reports.
         writer.flush().unwrap();
         assert!(writer.write_raw(b"late").is_err());
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
 
         // The synchronous path: a framing error before anything was written.
@@ -2521,17 +2647,17 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let completion = out.begin_write().unwrap();
+        let completion = out.begin_write(run_token()).unwrap();
         let mut writer = crate::write::writer::PbfWriter::to_staged_file(
             out.path(),
             Default::default(),
-            &crate::host::Invocation::new(),
+            run_token(),
         )
         .unwrap()
         .with_completion(completion);
         assert!(writer.write_primitive_block(b"\xff\xff\xff").is_err());
         writer.flush().unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 
@@ -2608,7 +2734,7 @@ mod tests {
         stage_dir(&out, "header", b"new");
         let run = index.join(".pbfhogg-run-1-cd");
         fs::create_dir(&run).unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::HoldsLeftovers { .. }
@@ -2631,7 +2757,7 @@ mod tests {
             &diagnostics,
         )
         .unwrap();
-        let writer = out.writer().unwrap();
+        let writer = out.writer(run_token()).unwrap();
         let inner = writer.path().join(".pbfhogg-backup-1-0.x");
         fs::create_dir(&inner).unwrap();
         drop(writer);
@@ -2673,15 +2799,15 @@ mod tests {
     fn a_pbf_writer_that_was_not_flushed_blocks_publication() {
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
-        let host = crate::host::Host::for_tests();
+        let host = run_host();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
 
         // A writer was started and has not reached a successful flush (a
         // `PbfWriter` dropped unflushed would trip its own test assertion, so
         // the bare lease stands in for it).
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let lease = out.begin_write().unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let lease = out.begin_write(run_token()).unwrap();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         drop(lease);
         assert!(!dest.exists());
@@ -2696,7 +2822,7 @@ mod tests {
         )
         .unwrap();
         writer.flush().unwrap();
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert!(dest.exists());
         // Finishing is terminal: a flush that already failed is never
         // certified by a second one.
@@ -2716,7 +2842,7 @@ mod tests {
         .unwrap();
         out.target.session.fail();
         writer.flush().unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 
@@ -2729,7 +2855,7 @@ mod tests {
         let staging = out.path().to_path_buf();
         fs::remove_file(&staging).unwrap();
         fs::write(&staging, b"someone else").unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -2746,11 +2872,11 @@ mod tests {
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         let out = OutputDir::new(&dest, Overwrite::Refuse, None, &discard()).unwrap();
-        let writer = out.writer().unwrap();
+        let writer = out.writer(run_token()).unwrap();
         fs::remove_dir(writer.path()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, writer.path()).unwrap();
         writer.finish();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -2765,7 +2891,7 @@ mod tests {
     fn a_session_failed_by_a_hook_is_not_published() {
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
-        let host = crate::host::Host::for_tests();
+        let host = run_host();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
         let mut writer = out
@@ -2781,7 +2907,7 @@ mod tests {
         let out = out.before_publish(move || {
             assert!(writer.lock().unwrap().write_raw(b"late").is_err());
         });
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+        let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
     }
@@ -2794,7 +2920,7 @@ mod tests {
         let dest = dir.path().join("out");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Invocation::new()).unwrap();
+        let mut writer = out.writer(run_token()).unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
         let (probe_dest, probe_staging, log) =
@@ -2805,7 +2931,7 @@ mod tests {
                 fs::read(&probe_staging).unwrap_or_default(),
             ));
         });
-        out.publish(&crate::host::Invocation::new()).unwrap();
+        out.publish(run_token()).unwrap();
         assert_eq!(*seen.lock().unwrap(), vec![(false, b"data".to_vec())]);
         assert_eq!(fs::read(&dest).unwrap(), b"data");
     }
@@ -2816,11 +2942,11 @@ mod tests {
     fn a_refused_publication_runs_no_hooks() {
         let dir = scratch();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let _writer = out.writer(&crate::host::Invocation::new()).unwrap();
+        let _writer = out.writer(run_token()).unwrap();
         let ran = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&ran);
         let out = out.before_publish(move || *flag.lock().unwrap() = true);
-        assert!(out.publish(&crate::host::Invocation::new()).is_err());
+        assert!(out.publish(run_token()).is_err());
         assert!(!*ran.lock().unwrap());
     }
 
@@ -2895,7 +3021,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::BackupRemoval);
-            out.publish(&crate::host::Invocation::new()).unwrap();
+            out.publish(run_token()).unwrap();
             assert_eq!(fs::read(dest.join("new-file")).unwrap(), b"new");
             let events = sink.0.lock().unwrap();
             assert_eq!(events.len(), 1, "{events:?}");
@@ -2925,7 +3051,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+            let err = out.publish(run_token()).unwrap_err();
             let OutputError::Unsynced {
                 kept, kept_synced, ..
             } = output_error(&err)
@@ -2958,7 +3084,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             stage_dir(&out, "new-file", b"new");
             out.inject_fault(PublishFault::BackupSync);
-            assert!(out.publish(&crate::host::Invocation::new()).is_err());
+            assert!(out.publish(run_token()).is_err());
             assert_eq!(fs::read(dest.join("old-file")).unwrap(), b"old");
             assert!(!dest.join("new-file").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -2984,7 +3110,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::BeforeInstall);
-            assert!(out.publish(&crate::host::Invocation::new()).is_err());
+            assert!(out.publish(run_token()).is_err());
             assert_eq!(fs::read(&dest).unwrap(), b"user data");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -2996,7 +3122,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
-            out.publish(&crate::host::Invocation::new()).unwrap();
+            out.publish(run_token()).unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
 
@@ -3006,7 +3132,7 @@ mod tests {
             stage(&out, b"ours").unwrap();
             fs::write(&other, b"theirs").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
-            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+            let err = out.publish(run_token()).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Exists { .. }));
             assert_eq!(fs::read(&other).unwrap(), b"theirs");
         }
@@ -3021,7 +3147,7 @@ mod tests {
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::ForceLinkFallback);
             out.inject_fault(PublishFault::AfterLink);
-            assert!(out.publish(&crate::host::Invocation::new()).is_err());
+            assert!(out.publish(run_token()).is_err());
             assert!(!dest.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -3033,7 +3159,7 @@ mod tests {
             fs::write(dir.path().join("b.osm.pbf"), b"old b").unwrap();
             let (mut set, a, b) = staged_set(dir.path(), Overwrite::Replace);
             set.inject_fault(PublishFault::AfterInstalled(1));
-            assert!(set.publish(&crate::host::Invocation::new()).is_err());
+            assert!(set.publish(run_token()).is_err());
             assert_eq!(fs::read(&a).unwrap(), b"old a");
             assert_eq!(fs::read(&b).unwrap(), b"old b");
             assert!(others(dir.path(), &["a.osm.pbf", "b.osm.pbf"]).is_empty());
@@ -3042,7 +3168,7 @@ mod tests {
             let dir = scratch();
             let (mut set, a, b) = staged_set(dir.path(), Overwrite::Refuse);
             set.inject_fault(PublishFault::AfterInstalled(0));
-            assert!(set.publish(&crate::host::Invocation::new()).is_err());
+            assert!(set.publish(run_token()).is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -3058,7 +3184,7 @@ mod tests {
             let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             stage_dir(&out, "new.bin", b"new");
             out.inject_fault(PublishFault::AfterBackup);
-            assert!(out.publish(&crate::host::Invocation::new()).is_err());
+            assert!(out.publish(run_token()).is_err());
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
             assert!(!dest.join("new.bin").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -3076,7 +3202,7 @@ mod tests {
             let (mut set, _, _) = staged_set(dir.path(), Overwrite::Replace);
             set.inject_fault(PublishFault::AfterInstalled(1));
             set.inject_fault(PublishFault::Restore);
-            let err = set.publish(&crate::host::Invocation::new()).unwrap_err();
+            let err = set.publish(run_token()).unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -3108,7 +3234,7 @@ mod tests {
             stage_dir(&out, "new.bin", b"new");
             out.inject_fault(PublishFault::AfterBackup);
             out.inject_fault(PublishFault::Restore);
-            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+            let err = out.publish(run_token()).unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::RollbackIncomplete { .. }
@@ -3128,7 +3254,7 @@ mod tests {
             let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             stage(&out, b"new").unwrap();
             out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+            let err = out.publish(run_token()).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Unsynced { .. }));
             assert!(err.to_string().contains("was published"), "{err}");
             assert_eq!(fs::read(&dest).unwrap(), b"new");

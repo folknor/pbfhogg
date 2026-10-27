@@ -224,6 +224,11 @@ impl Invocation {
         Ok(value)
     }
 
+    /// Whether `other` is this invocation (a clone of the same token).
+    pub(crate) fn same_invocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// The invocation's metric sets, for the recording sites.
     #[inline]
     pub(crate) fn metrics(&self) -> &crate::counters::InvocationMetrics {

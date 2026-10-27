@@ -485,6 +485,14 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
+
+    /// One host for this module's tests, so a run and the publication of
+    /// its output share an invocation (publication refuses another). Never
+    /// cancelled and never armed.
+    fn run_host() -> &'static crate::host::Host {
+        static HOST: std::sync::OnceLock<crate::host::Host> = std::sync::OnceLock::new();
+        HOST.get_or_init(crate::host::Host::for_tests)
+    }
     use super::{
         FULL_SCAN_ARM_MIN_BLOBS, GetparentsOptions, ScanArm, getparents_dispatched,
         getparents_with_arm,
@@ -497,8 +505,7 @@ mod tests {
 
     /// `path` pinned, for driving an arm directly.
     fn pinned(path: &std::path::Path) -> crate::read::input::PinnedInput {
-        crate::read::input::PinnedInput::pin(path, &crate::host::Host::for_tests())
-            .expect("pin input")
+        crate::read::input::PinnedInput::pin(path, run_host()).expect("pin input")
     }
 
     /// Write a node block, then optionally a way block, which can be written
@@ -544,7 +551,7 @@ mod tests {
 
     fn ids(path: &std::path::Path) -> Vec<i64> {
         let mut ids = Vec::new();
-        ElementReader::open_in(path, false, &crate::host::Host::for_tests())
+        ElementReader::open_in(path, false, run_host())
             .expect("read output")
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),
@@ -579,12 +586,10 @@ mod tests {
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             ScanArm::FullScan,
-            &crate::host::Host::for_tests(),
+            run_host(),
         )
         .expect("getparents");
-        staged
-            .publish(&crate::host::Invocation::new())
-            .expect("publish");
+        staged.publish(&run_host().invocation).expect("publish");
         assert_eq!(ids(&output), vec![1, 10]);
     }
 
@@ -612,12 +617,10 @@ mod tests {
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 arm,
-                &crate::host::Host::for_tests(),
+                run_host(),
             )
             .expect("getparents");
-            staged
-                .publish(&crate::host::Invocation::new())
-                .expect("publish");
+            staged.publish(&run_host().invocation).expect("publish");
         }
         let walker_ids = ids(&walker);
         assert_eq!(walker_ids, ids(&pipelined));
@@ -737,7 +740,7 @@ mod tests {
     /// The output's elements as (kind, id), in file order.
     fn ordered(path: &std::path::Path) -> Vec<(char, i64)> {
         let mut out = Vec::new();
-        ElementReader::open_in(path, false, &crate::host::Host::for_tests())
+        ElementReader::open_in(path, false, run_host())
             .expect("read output")
             .for_each(|element| match element {
                 Element::DenseNode(node) => out.push(('n', node.id())),
@@ -792,11 +795,9 @@ mod tests {
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             arm,
-            &crate::host::Host::for_tests(),
+            run_host(),
         )?;
-        staged
-            .publish(&crate::host::Invocation::new())
-            .expect("publish");
+        staged.publish(&run_host().invocation).expect("publish");
         Ok(ArmRun {
             bytes: std::fs::read(&output).expect("read output bytes"),
             elements: ordered(&output),
@@ -936,12 +937,10 @@ mod tests {
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 min_blobs,
-                &crate::host::Host::for_tests(),
+                run_host(),
             )
             .expect("getparents");
-            staged
-                .publish(&crate::host::Invocation::new())
-                .expect("publish");
+            staged.publish(&run_host().invocation).expect("publish");
             assert_eq!(arm, expected_arm);
             assert_eq!(ids(&output), vec![1, 10]);
         }

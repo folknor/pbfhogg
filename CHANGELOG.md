@@ -33,6 +33,13 @@
   functions are gone; `debug::MarkerFifo::open` is the sidecar sink, with
   the same wire format and clock. A sink that panics is switched off for
   the rest of its run. The CLI's stream is unchanged.
+- **An output is published under the invocation it was written under.**
+  `Output::publish`, `OutputDir::publish` and `OutputSet::publish` refuse,
+  as an invalid argument and before any hook runs, an output whose writing
+  session was opened under a different `Invocation`; `OutputDir::writer`
+  takes the invocation. `publish_sync_calls` / `publish_sync_ns` now count
+  exactly the publication's own syncs rather than a delta of the run's
+  totals.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming

@@ -1392,7 +1392,9 @@ modifies is written from scratch: OSC coordinates for the nodes the OSC
 carries, the base's node records for the rest, and none of the old version's
 inline coordinates. A reference found in neither, or to a node the OSC
 deletes, fails the run with nothing published (`--ignore-missing-nodes`
-writes `(0, 0)` instead). Only coordinates that
+writes `(0, 0)` instead). The run fails as soon as the base's nodes have been
+read, before any way is written, and the error counts the distinct nodes it
+could not resolve. Only coordinates that
 differ count as refreshed: a tag-only node edit refreshes nothing where the
 inline coordinate already agrees, and costs a way blob no rewrite.
 

@@ -975,6 +975,8 @@ declares it too.
   base's node records; its old inline coordinates are not used. The run fails,
   publishing nothing, if a node is in neither the OSC nor the base or is
   deleted by the OSC (`--ignore-missing-nodes` writes `(0, 0)` there instead).
+  It fails as soon as the base's nodes have been read, before any way is
+  written, and the error counts the distinct nodes it could not resolve.
 
 **Prepare the base with `add-locations-to-ways --keep-untagged-nodes`.** A
 default `add-locations-to-ways` output drops untagged nodes, so it can fail on

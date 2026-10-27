@@ -163,7 +163,11 @@ fn build_header_bytes(
 /// [`InputSource::pin`](crate::read::input::InputSource::pin)): a path is
 /// pinned here, a caller's [`PinnedInput`] is used as it is. Where a later
 /// open cannot reach the pinned file, a base replaced mid-run fails with
-/// `InputReplaced`.
+/// `InputReplaced`. Under `locations_on_ways` without
+/// `ignore_missing_nodes`, a node that a created or modified way references
+/// and neither the OSC nor the base supplies fails the run with
+/// `MissingNodeLocations` once the base's node blobs are read, before any
+/// way is written.
 pub fn merge<'a>(
     base_pbf: impl Into<InputSource<'a>>,
     osc_file: &Path,
@@ -519,6 +523,8 @@ pub(crate) fn merge_to<'a>(
         barrier_tx: barrier_tx_opt,
         loc_map_out: loc_map_handle,
         seeded_locations: seeded_locations.map(|l| SeededLocations::new(Some(l))),
+        loc_nodes_needed: loc_stats_pre.0,
+        ignore_missing_nodes,
         failure: Arc::clone(&failure),
     };
     let drain_channels = DrainChannels { drain_rx };
@@ -555,6 +561,13 @@ pub(crate) fn merge_to<'a>(
         });
 
         let drain_stats = drain::run_drain(drain_cfg, drain_channels, &mut writer, &drain_counters);
+        // Test-only: the drain has returned, so its config and channels,
+        // the barrier sender included, are dropped by now.
+        #[cfg(feature = "test-hooks")]
+        host.invocation
+            .faults()
+            .apply_changes_drain_returned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let scanner_join = scanner_handle.join();
         let workers_join = workers_handle.join();
@@ -589,7 +602,8 @@ pub(crate) fn merge_to<'a>(
         // replaces an id already seen - so a base PBF carrying two records
         // for one required node would inflate the count and let it cover a
         // genuinely absent id, silently reinstating the (0,0) fallback that
-        // the guard below exists to refuse.
+        // the drain's barrier refusal exists to refuse. Reaching here with a
+        // nonzero `loc_missing` means `ignore_missing_nodes` let it through.
         let resolved = drain_counters
             .barrier_loc_map_size
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -604,12 +618,6 @@ pub(crate) fn merge_to<'a>(
         final_stats.loc_refreshed_ways = load(&worker_counters.loc_refreshed_ways);
         final_stats.loc_refreshed_refs = load(&worker_counters.loc_refreshed_refs);
         final_stats.loc_deleted_node_refs = load(&worker_counters.loc_deleted_node_refs);
-    }
-
-    if locations_on_ways && final_stats.loc_missing != 0 && !ignore_missing_nodes {
-        return Err(crate::error::new_missing_node_locations(
-            final_stats.loc_missing,
-        ));
     }
 
     // No summary here: the caller renders the returned stats, as for every

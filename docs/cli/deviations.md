@@ -47,7 +47,9 @@ cannot resolve keeps the location its OSC `<nd>` carried, normally none:
 libosmium's undefined location, which decodes to `2147483647` on each axis.
 There is no warning and no option to fail.
 
-**pbfhogg behavior:** The command fails and does not publish its output. A
+**pbfhogg behavior:** The command fails and does not publish its output. It
+fails once the base's nodes have been read, before any way is written, and
+the error counts the distinct unresolved nodes. A
 reference from an OSC way to a node the OSC deletes counts as unresolved too.
 `--ignore-missing-nodes` writes every unresolved reference as `(0, 0)` and
 publishes the output; that is pbfhogg's own placeholder, not osmium's output.

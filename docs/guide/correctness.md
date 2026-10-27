@@ -221,8 +221,10 @@ writer meant.
 **Related:** unresolvable way node references are now a hard error rather than a
 silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the placeholders.
 That filler is still `(0, 0)`, but it is opt-in, counted, and gated by a
-post-write check, so it is a deliberate output rather than an ambiguous
-sentinel. See [Deviations](/cli/deviations).
+check that refuses before anything is published (add-locations-to-ways
+after its write, counting references; apply-changes at its node-to-way
+barrier, counting distinct nodes), so it is a deliberate output rather than
+an ambiguous sentinel. See [Deviations](/cli/deviations).
 
 ## Blob sidecar metadata: `indexdata` and `tagdata` are a trust boundary
 

@@ -5,7 +5,10 @@
 //! barrier under deterministic orderings: a node boundary held until after
 //! the last node item, a worker panic while the scanner is in its barrier
 //! wait or blocked dispatching, and a cancellation during the barrier wait,
-//! on both output routes. A drain-side output failure releasing blocked
+//! on both output routes; and the missing-node refusal taken at that
+//! barrier, at each of those orderings, with the scanner stopped short of
+//! end of input, and ranked below a failure or cancellation landing at the
+//! decision. A drain-side output failure releasing blocked
 //! producers is `fault_parallel_writer.rs`'s.
 //!
 //! Companion: `fault_parallel_writer.rs` covers apply-changes'
@@ -888,12 +891,13 @@ mod apply_changes {
         }
     }
 
-    /// Run the ordinary shape with `nodes` single-node blobs, armed by
-    /// `arm`, and require it to fail with `expect` in its message, publish
-    /// nothing and leave no scratch.
+    /// Run the ordinary shape with `nodes` single-node blobs and way 101
+    /// modified onto `refs`, armed by `arm`, and require it to fail with
+    /// `expect` in its message, publish nothing and leave no scratch.
     fn assert_barrier_failure(
         label: &str,
         nodes: i64,
+        refs: &[i64],
         jobs: usize,
         owned: bool,
         arm: impl FnOnce(&pbfhogg::test_hooks::FaultPlan),
@@ -910,10 +914,7 @@ mod apply_changes {
             &[(100, vec![1, 2]), (101, vec![3, 4])],
             &[],
         );
-        write_osc_body(
-            &osc,
-            &format!("<modify>{}</modify>", osc_way(101, 2, &[1, 4])),
-        );
+        write_osc_body(&osc, &format!("<modify>{}</modify>", osc_way(101, 2, refs)));
         let before = common::snapshot_dir(dir.path());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_low(&base, &osc, &output, jobs, owned, arm)
@@ -945,32 +946,37 @@ mod apply_changes {
     /// A worker that panics while the scanner is parked in its barrier wait
     /// (the node phase can never complete, since that worker's item never
     /// arrives) fails the run with the panic's own message instead of
-    /// hanging scanner, drain and the other workers.
+    /// hanging scanner, drain and the other workers. With a missing node in
+    /// the change too, the panic still wins: the barrier where the refusal
+    /// would be taken is never reached.
     #[test]
     fn a_worker_panic_during_the_barrier_wait_fails_the_run() {
         use std::sync::atomic::Ordering::SeqCst;
         for &jobs in JOBS {
             for owned in [false, true] {
-                let label = format!("jobs={jobs} owned={owned}");
-                let host = assert_barrier_failure(
-                    &label,
-                    8,
-                    jobs,
-                    owned,
-                    |f| {
-                        f.apply_changes_panic_at_blob_seq.store(1, SeqCst);
-                        f.apply_changes_panic_waits_for_barrier_wait
-                            .store(true, SeqCst);
-                    },
-                    "panic_at_blob_seq=1 triggered",
-                );
-                assert!(
-                    host.invocation
-                        .faults()
-                        .apply_changes_scanner_in_barrier_wait
-                        .load(SeqCst),
-                    "{label}: the scanner must have reached its barrier wait"
-                );
+                for refs in [&[1, 4][..], &[1, 999]] {
+                    let label = format!("jobs={jobs} owned={owned} refs={refs:?}");
+                    let host = assert_barrier_failure(
+                        &label,
+                        8,
+                        refs,
+                        jobs,
+                        owned,
+                        |f| {
+                            f.apply_changes_panic_at_blob_seq.store(1, SeqCst);
+                            f.apply_changes_panic_waits_for_barrier_wait
+                                .store(true, SeqCst);
+                        },
+                        "panic_at_blob_seq=1 triggered",
+                    );
+                    assert!(
+                        host.invocation
+                            .faults()
+                            .apply_changes_scanner_in_barrier_wait
+                            .load(SeqCst),
+                        "{label}: the scanner must have reached its barrier wait"
+                    );
+                }
             }
         }
     }
@@ -988,6 +994,7 @@ mod apply_changes {
                 let host = assert_barrier_failure(
                     &label,
                     120,
+                    &[1, 4],
                     jobs,
                     owned,
                     |f| {
@@ -1010,54 +1017,512 @@ mod apply_changes {
 
     /// Cancelling while the scanner waits for the barrier (one worker parked
     /// on a node blob, so the barrier cannot fire) returns `Cancelled`,
-    /// publishes nothing and joins every thread.
+    /// publishes nothing and joins every thread, a change with a missing
+    /// node included (the refusal is never reached).
     #[test]
     fn cancelling_during_the_barrier_wait_stops_the_run() {
         use std::sync::atomic::Ordering::SeqCst;
         for &jobs in JOBS {
             for owned in [false, true] {
+                for refs in [&[2, 3][..], &[2, 999]] {
+                    let label = format!("jobs={jobs} owned={owned} refs={refs:?}");
+                    let dir = crate::common::test_scratch();
+                    let base = dir.path().join("base.osm.pbf");
+                    let osc = dir.path().join("diff.osc.gz");
+                    let output = dir.path().join("output.osm.pbf");
+                    write_low_base(
+                        &base,
+                        &(1..=8).collect::<Vec<_>>(),
+                        1,
+                        &[(100, vec![1, 2])],
+                        &[],
+                    );
+                    write_osc_body(&osc, &format!("<modify>{}</modify>", osc_way(100, 2, refs)));
+                    let host = crate::common::test_host();
+                    let faults = host.invocation.faults();
+                    faults.apply_changes_force_owned_route.store(owned, SeqCst);
+                    faults.apply_changes_park_at_blob_seq.store(1, SeqCst);
+                    let before = common::snapshot_dir(dir.path());
+                    let result = std::thread::scope(|scope| {
+                        let run = scope.spawn(|| {
+                            merge(
+                                &base,
+                                &osc,
+                                common::out(&output),
+                                &low_options(jobs),
+                                &pbfhogg::HeaderOverrides::default(),
+                                &host,
+                            )
+                        });
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst) {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "{label}: the scanner never reached its barrier wait"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        host.invocation.cancel();
+                        run.join().expect("merge must not unwind")
+                    });
+                    let err = result
+                        .err()
+                        .unwrap_or_else(|| panic!("{label}: merge must fail"));
+                    assert!(
+                        matches!(err.kind(), pbfhogg::ErrorKind::Cancelled),
+                        "{label}: expected Cancelled, got: {err:?}"
+                    );
+                    assert!(
+                        !output.exists(),
+                        "{label}: a cancelled run must publish nothing"
+                    );
+                    common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+                    assert!(
+                        !faults.apply_changes_hook_timed_out.load(SeqCst),
+                        "{label}: the parked worker must see the cancellation"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The missing-node refusal at the barrier
+    // ---------------------------------------------------------------------
+
+    /// A change whose ways reference nodes neither file supplies, with the
+    /// distinct count the refusal must report and the number of node blobs
+    /// in its base (the only blobs a refusal at the barrier lets a worker
+    /// see).
+    struct RefusalShape {
+        name: &'static str,
+        write: fn(&Path, &Path),
+        missing: u64,
+        node_blobs: u64,
+    }
+
+    const REFUSAL_SHAPES: &[RefusalShape] = &[
+        // Nodes, ways and a relation. Two missing IDs, 999 used twice:
+        // the count is distinct nodes, not references.
+        RefusalShape {
+            name: "ordinary",
+            write: |base, osc| {
+                write_low_base(
+                    base,
+                    &(1..=12).collect::<Vec<_>>(),
+                    2,
+                    &[
+                        (100, vec![1, 2]),
+                        (101, vec![3, 4]),
+                        (102, vec![5, 6]),
+                        (103, vec![7, 8]),
+                    ],
+                    &[(500, 100)],
+                );
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<modify>{}{}</modify><create>{}</create>",
+                        osc_node(1, 2),
+                        osc_way(101, 2, &[1, 999, 5, 999]),
+                        osc_way(200, 1, &[6, 998, 7]),
+                    ),
+                );
+            },
+            missing: 2,
+            node_blobs: 6,
+        },
+        // A node the change deletes, though the base holds it.
+        RefusalShape {
+            name: "deleted",
+            write: |base, osc| {
+                write_low_base(
+                    base,
+                    &(1..=6).collect::<Vec<_>>(),
+                    2,
+                    &[(100, vec![1, 2]), (101, vec![3, 4])],
+                    &[],
+                );
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<delete><node id=\"5\" version=\"2\"/></delete><modify>{}</modify>",
+                        osc_way(101, 2, &[3, 5]),
+                    ),
+                );
+            },
+            missing: 1,
+            node_blobs: 3,
+        },
+        // No base blobs: the boundary is the empty one, at end of input.
+        RefusalShape {
+            name: "empty",
+            write: |base, osc| {
+                write_low_base(base, &[], 1, &[], &[]);
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<create>{}{}</create>",
+                        osc_node(1, 1),
+                        osc_way(10, 1, &[1, 2, 2]),
+                    ),
+                );
+            },
+            missing: 1,
+            node_blobs: 0,
+        },
+        // Nodes only: the boundary is sent at end of input and the scanner
+        // is in its barrier wait when the drain refuses.
+        RefusalShape {
+            name: "node-only",
+            write: |base, osc| {
+                write_low_base(base, &(1..=6).collect::<Vec<_>>(), 2, &[], &[]);
+                write_osc_body(
+                    osc,
+                    &format!("<create>{}</create>", osc_way(10, 1, &[2, 7, 7, 8])),
+                );
+            },
+            missing: 2,
+            node_blobs: 3,
+        },
+        // Ways only: the empty boundary, sent at the first way.
+        RefusalShape {
+            name: "way-only",
+            write: |base, osc| {
+                write_low_base(base, &[], 1, &[(100, vec![1, 2]), (101, vec![3, 4])], &[]);
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<create>{}</create><modify>{}</modify>",
+                        osc_node(1, 1),
+                        osc_way(101, 2, &[1, 3]),
+                    ),
+                );
+            },
+            missing: 1,
+            node_blobs: 0,
+        },
+    ];
+
+    /// Require `result` to be the barrier refusal for `missing` distinct
+    /// nodes.
+    fn assert_refusal(label: &str, result: pbfhogg::Result<()>, missing: u64) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{label}: merge must refuse"));
+        assert!(
+            matches!(
+                err.kind(),
+                pbfhogg::ErrorKind::MissingNodeLocations {
+                    count,
+                    counted: pbfhogg::Unresolved::ChangedWayNodes,
+                } if *count == missing
+            ),
+            "{label}: expected the refusal for {missing} distinct nodes, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "could not be resolved for {missing} distinct nodes"
+            )),
+            "{label}: the message must say what it counts: {err}"
+        );
+    }
+
+    /// Every refusal shape, at every worker count, on both routes, with the
+    /// boundary on time and held past the last node item: the run refuses
+    /// with the distinct count, publishes nothing, leaves no scratch, and
+    /// refuses at the barrier: the map is never published, the drain
+    /// handles nothing past the node phase (no way or relation item, no
+    /// trailing create), and the workers process exactly the node blobs.
+    #[test]
+    fn missing_nodes_are_refused_at_the_barrier_however_it_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for shape in REFUSAL_SHAPES {
+            let dir = crate::common::test_scratch();
+            let base = dir.path().join("base.osm.pbf");
+            let osc = dir.path().join("diff.osc.gz");
+            let output = dir.path().join("output.osm.pbf");
+            (shape.write)(&base, &osc);
+            let before = common::snapshot_dir(dir.path());
+            for &jobs in JOBS {
+                for owned in [false, true] {
+                    for late in [false, true] {
+                        let label = format!("{} jobs={jobs} owned={owned} late={late}", shape.name);
+                        let (result, host) = run_low(&base, &osc, &output, jobs, owned, |f| {
+                            f.apply_changes_late_boundary.store(late, SeqCst);
+                        });
+                        assert_refusal(&label, result, shape.missing);
+                        assert!(
+                            !output.exists(),
+                            "{label}: a refused run must publish nothing"
+                        );
+                        common::assert_scratch_unchanged(
+                            &before,
+                            &common::snapshot_dir(dir.path()),
+                        );
+                        let faults = host.invocation.faults();
+                        assert!(
+                            !faults.apply_changes_hook_timed_out.load(SeqCst),
+                            "{label}: a hook wait expired"
+                        );
+                        if late {
+                            assert_eq!(
+                                faults.apply_changes_late_boundaries_seen.load(SeqCst),
+                                1,
+                                "{label}: the boundary must arrive after the last node item"
+                            );
+                        }
+                        assert_eq!(
+                            faults.apply_changes_worker_counter("merge_streaming_blobs_processed"),
+                            Some(shape.node_blobs),
+                            "{label}: no way or relation blob may reach a worker"
+                        );
+                        assert!(
+                            !faults.apply_changes_drain_past_nodes.load(SeqCst),
+                            "{label}: the drain must refuse before writing any way, \
+                             relation or trailing create"
+                        );
+                        assert!(
+                            !faults.apply_changes_barrier_signalled.load(SeqCst),
+                            "{label}: the refusal must come before the barrier signal is sent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ignore_missing_nodes` keeps its meaning: the same change publishes,
+    /// every unresolved reference written as `(0, 0)`, and the stats count
+    /// the distinct missing nodes.
+    #[test]
+    fn ignored_missing_nodes_still_publish_placeholders() {
+        let shape = &REFUSAL_SHAPES[0];
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        (shape.write)(&base, &osc);
+        for owned in [false, true] {
+            let host = crate::common::test_host();
+            host.invocation
+                .faults()
+                .apply_changes_force_owned_route
+                .store(owned, std::sync::atomic::Ordering::SeqCst);
+            let stats = merge(
+                &base,
+                &osc,
+                common::out(&output),
+                &MergeOptions {
+                    ignore_missing_nodes: true,
+                    ..low_options(2)
+                },
+                &pbfhogg::HeaderOverrides::default(),
+                &host,
+            )
+            .unwrap_or_else(|e| panic!("owned={owned}: {e}"));
+            assert_eq!(stats.loc_missing, shape.missing, "owned={owned}");
+            let ways = way_locations(&output);
+            let way = |id: i64| {
+                ways.iter()
+                    .find(|(w, _)| *w == id)
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| panic!("owned={owned}: way {id} missing"))
+            };
+            assert_eq!(
+                way(101),
+                vec![coord(1), (0, 0), coord(5), (0, 0)],
+                "owned={owned}"
+            );
+            assert_eq!(way(200), vec![coord(6), (0, 0), coord(7)], "owned={owned}");
+            std::fs::remove_file(&output).expect("remove output");
+        }
+    }
+
+    /// A base whose header claims sorted order but holds node, way, node,
+    /// way blobs: the scanner sends the boundary at the first way, walks the
+    /// late node after it, and is held at that node's barrier poll until the
+    /// drain has signalled, while the drain holds its signal until the
+    /// scanner is there, so that poll (not the first way's) takes it.
+    /// The scanner must record it, keep the second way held, skip its
+    /// end-of-input wait (a signal taken and not recorded would leave it
+    /// waiting there for good) and release both ways, after which the
+    /// drain's order guard refuses the late node.
+    #[test]
+    fn a_signal_taken_after_a_late_node_still_releases_the_held_ways() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        {
+            let file = File::create(&base).expect("create base");
+            let mut writer = PbfWriter::new(file, Compression::default());
+            let header = block_builder::HeaderBuilder::new()
+                .sorted()
+                .optional_feature("LocationsOnWays")
+                .build()
+                .expect("build header");
+            writer.write_header(&header).expect("write header");
+            let mut bb = BlockBuilder::new();
+            let mut flush = |bb: &mut BlockBuilder| {
+                let bytes = bb.take().expect("take").expect("non-empty block");
+                writer.write_primitive_block(bytes).expect("write block");
+            };
+            for id in [1, 2] {
+                let (lat, lon) = coord(id);
+                bb.add_node(id, lat, lon, std::iter::empty(), None);
+            }
+            flush(&mut bb);
+            bb.add_way_with_locations(
+                10,
+                [("highway", "road")],
+                &[1, 2],
+                &[coord(1), coord(2)],
+                None,
+            );
+            flush(&mut bb);
+            let (lat, lon) = coord(5);
+            bb.add_node(5, lat, lon, std::iter::empty(), None);
+            flush(&mut bb);
+            bb.add_way_with_locations(
+                11,
+                [("highway", "road")],
+                &[1, 5],
+                &[coord(1), coord(5)],
+                None,
+            );
+            flush(&mut bb);
+            writer.flush().expect("flush base");
+        }
+        write_osc_body(
+            &osc,
+            &format!("<modify>{}</modify>", osc_way(10, 2, &[2, 1])),
+        );
+        let before = common::snapshot_dir(dir.path());
+        for &jobs in JOBS {
+            for owned in [false, true] {
                 let label = format!("jobs={jobs} owned={owned}");
+                let (result, host) = run_low(&base, &osc, &output, jobs, owned, |f| {
+                    f.apply_changes_node_poll_waits_for_signal
+                        .store(true, SeqCst);
+                });
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: the late node must be refused"));
+                assert!(
+                    matches!(err.kind(), pbfhogg::ErrorKind::Unsorted { .. }),
+                    "{label}: expected the order guard, got: {err:?}"
+                );
+                let faults = host.invocation.faults();
+                assert!(
+                    !faults.apply_changes_hook_timed_out.load(SeqCst),
+                    "{label}: the drain never signalled while the scanner was held"
+                );
+                assert!(
+                    faults.apply_changes_node_poll_took_signal.load(SeqCst),
+                    "{label}: the poll after the late node must take the signal"
+                );
+                assert!(
+                    !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst),
+                    "{label}: a recorded signal must skip the end-of-input wait"
+                );
+                assert!(
+                    faults.apply_changes_drain_past_nodes.load(SeqCst),
+                    "{label}: the held ways must be released to the drain"
+                );
+                assert!(
+                    !output.exists(),
+                    "{label}: a refused run must publish nothing"
+                );
+                common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+            }
+        }
+    }
+
+    /// A refusal while the scanner is still walking held way and relation
+    /// headers stops the walk at its next barrier poll instead of at end of
+    /// input: the scanner is held at its first poll until the drain has
+    /// returned, and must leave through the closed channel, never reaching
+    /// its end-of-input wait.
+    #[test]
+    fn a_refusal_stops_the_scanner_before_end_of_input() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        let ways: Vec<(i64, Vec<i64>)> = (0..8).map(|i| (100 + i, vec![1 + i, 2 + i])).collect();
+        write_low_base(
+            &base,
+            &(1..=10).collect::<Vec<_>>(),
+            2,
+            &ways,
+            &[(500, 100)],
+        );
+        write_osc_body(
+            &osc,
+            &format!("<modify>{}</modify>", osc_way(103, 2, &[4, 999])),
+        );
+        let before = common::snapshot_dir(dir.path());
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned}");
+                let (result, host) = run_low(&base, &osc, &output, jobs, owned, |f| {
+                    f.apply_changes_scanner_waits_for_drain_exit
+                        .store(true, SeqCst);
+                });
+                assert_refusal(&label, result, 1);
+                assert!(
+                    !output.exists(),
+                    "{label}: a refused run must publish nothing"
+                );
+                common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+                let faults = host.invocation.faults();
+                assert!(
+                    !faults.apply_changes_hook_timed_out.load(SeqCst),
+                    "{label}: the drain never returned while the scanner was held"
+                );
+                assert!(
+                    faults.apply_changes_scanner_stopped_before_eof.load(SeqCst),
+                    "{label}: the scanner must stop at the closed barrier channel"
+                );
+                assert!(
+                    !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst),
+                    "{label}: the scanner must not walk on to its end-of-input wait"
+                );
+            }
+        }
+    }
+
+    /// A producer failure published, or a cancellation requested, after the
+    /// drain's per-receive checks but before the refusal is decided
+    /// outranks the refusal.
+    #[test]
+    fn a_failure_or_cancellation_at_the_refusal_outranks_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned} failure");
+                assert_barrier_failure(
+                    &label,
+                    8,
+                    &[1, 999],
+                    jobs,
+                    owned,
+                    |f| f.apply_changes_fail_at_refusal.store(true, SeqCst),
+                    "producer failure at the barrier refusal",
+                );
+                let label = format!("jobs={jobs} owned={owned} cancel");
                 let dir = crate::common::test_scratch();
                 let base = dir.path().join("base.osm.pbf");
                 let osc = dir.path().join("diff.osc.gz");
                 let output = dir.path().join("output.osm.pbf");
-                write_low_base(
-                    &base,
-                    &(1..=8).collect::<Vec<_>>(),
-                    1,
-                    &[(100, vec![1, 2])],
-                    &[],
-                );
-                write_osc_body(
-                    &osc,
-                    &format!("<modify>{}</modify>", osc_way(100, 2, &[2, 3])),
-                );
-                let host = crate::common::test_host();
-                let faults = host.invocation.faults();
-                faults.apply_changes_force_owned_route.store(owned, SeqCst);
-                faults.apply_changes_park_at_blob_seq.store(1, SeqCst);
+                (REFUSAL_SHAPES[0].write)(&base, &osc);
                 let before = common::snapshot_dir(dir.path());
-                let result = std::thread::scope(|scope| {
-                    let run = scope.spawn(|| {
-                        merge(
-                            &base,
-                            &osc,
-                            common::out(&output),
-                            &low_options(jobs),
-                            &pbfhogg::HeaderOverrides::default(),
-                            &host,
-                        )
-                    });
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst) {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "{label}: the scanner never reached its barrier wait"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    host.invocation.cancel();
-                    run.join().expect("merge must not unwind")
+                let (result, _) = run_low(&base, &osc, &output, jobs, owned, |f| {
+                    f.apply_changes_cancel_at_refusal.store(true, SeqCst);
                 });
                 let err = result
                     .err()
@@ -1071,10 +1536,6 @@ mod apply_changes {
                     "{label}: a cancelled run must publish nothing"
                 );
                 common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
-                assert!(
-                    !faults.apply_changes_hook_timed_out.load(SeqCst),
-                    "{label}: the parked worker must see the cancellation"
-                );
             }
         }
     }

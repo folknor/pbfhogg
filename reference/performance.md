@@ -1087,6 +1087,41 @@ warm-cache pair read 12.0 s against 5m28s. Denmark ways-only runs finish
 in under a second, too short for the sampler to catch each phase's peak,
 so they are not tabled.
 
+### IdSet dense chunks allocated zeroed (bygg, 2026-10-27, commit `03e3792d`)
+
+`new_dense` (the only place a dense chunk is created: insert promotion,
+`promote`, union and `pre_allocate` all go through it; `clone_chunk` copies
+real data and still writes every word) now uses `new_zeroed_slice`, so a
+pre-allocated chunk is untouched zero pages instead of 4 MiB written up
+front. Matched `--bench 1` cells against the parent `13100499`, alternating,
+two pairs each, bygg, no `fstrim` (not permitted in that session):
+
+| Cell | New `03e3792d` | Parent `13100499` | UUIDs (new, parent, new, parent) |
+|---|---:|---:|---|
+| check-refs planet | 41.9 s, 41.7 s | 42.1 s, 41.7 s | `c60fdbbd`, `e7f92dcc`, `e9198203`, `6365d8a4` |
+| renumber planet | 143.2 s, 143.9 s | 165.5 s, 142.6 s | `28d1e4d7`, `a59a205b`, `92fa012b`, `4830e019` |
+| build-geocode-index planet | 317.3 s, 318.3 s | 313.8 s, 313.2 s | `54449345`, `84c8d437`, `25966c74`, `fabf1b04` |
+| check-refs malta | 101 ms | 101 ms | `66460942`, `8c78c1c2` |
+
+All neutral. The parent's 165.5 s renumber is a single outlier (its pair
+partner and the next parent cell read 142.6 s). Geocode is 1.3 % slower in
+total with no phase moving more than the noise (compare `25966c74` against
+`fabf1b04`). check-refs planet compare (`e9198203` vs `6365d8a4`): scan,
+nodes and ways phases identical in duration, cores and peak RSS (about
+2.1 GB sampled), as expected since planet writes every page anyway. Malta
+sampled only a start and an end row, so no RSS comparison exists.
+
+Release builds gain nothing: `check --refs tests/test.osm.pbf` peaks at
+7012 kB on `03e3792d` and 7052 kB on the parent (zsh `time` `%M`), so the
+optimizer was already lowering the parent's `collect()` of zeros to a
+zeroed allocation, and the floor pre-allocation was never resident there.
+The 1.2 GB seen for a three-node `check --refs` came from a debug test
+build, which keeps the word-by-word write. The change makes the zero pages
+explicit rather than an optimization, which is what the debug-built test
+suite gets. Even a small real extract spreads its IDs over the whole ID
+history and writes most pages of most chunks, so extracts do not shrink
+either.
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

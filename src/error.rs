@@ -126,8 +126,8 @@ pub(crate) fn new_input_replaced(path: &Path) -> Error {
 }
 
 #[cold]
-pub(crate) fn new_missing_node_locations(count: u64) -> Error {
-    new_error(ErrorKind::MissingNodeLocations { count })
+pub(crate) fn new_missing_node_locations(count: u64, counted: Unresolved) -> Error {
+    new_error(ErrorKind::MissingNodeLocations { count, counted })
 }
 
 #[cold]
@@ -631,10 +631,10 @@ pub enum ErrorKind {
     /// A blob's indexdata (the `BlobHeader` element-kind and ID-range
     /// claim) disagrees with what the blob holds. `reason` says how.
     IndexdataMismatch { reason: Cow<'static, str> },
-    /// `count` way node references could not be resolved to a location,
-    /// and writing a `(0, 0)` placeholder for them was not allowed. Nothing
-    /// was published.
-    MissingNodeLocations { count: u64 },
+    /// Way node locations could not be resolved, and writing a `(0, 0)`
+    /// placeholder for them was not allowed. Nothing was published. `count`
+    /// is in the unit `counted` names, which differs by command.
+    MissingNodeLocations { count: u64, counted: Unresolved },
     /// A command opens its input more than once, and a later open found a
     /// different file at the input's path than the one the run pinned at its
     /// start (the path was renamed over or replaced). The run stops rather
@@ -691,6 +691,47 @@ pub enum ErrorKind {
     /// because it was asked to, every guard dropped (scratch and output
     /// staging removed) and nothing was published.
     Cancelled,
+}
+
+/// What the `count` of an [`ErrorKind::MissingNodeLocations`] counts.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unresolved {
+    /// Way node references, each use of a node in each way counted once
+    /// (add-locations-to-ways): the vertices that would be `(0, 0)`.
+    WayNodeReferences,
+    /// Distinct node IDs referenced by the ways a change creates or
+    /// modifies (apply-changes with locations on ways), a node the change
+    /// deletes included. Surviving base ways are not resolved, so their
+    /// references are not counted.
+    ChangedWayNodes,
+}
+
+impl Unresolved {
+    /// The [`ErrorKind::MissingNodeLocations`] message for this unit.
+    fn describe(self, f: &mut fmt::Formatter, count: u64) -> fmt::Result {
+        match self {
+            Unresolved::WayNodeReferences => write!(
+                f,
+                "{count} way node references (each use of a node in each way counted) \
+                 could not be resolved to a node location. Those vertices can only be \
+                 written as (0, 0), which is a real coordinate off the coast of Ghana and \
+                 cannot be told apart from genuine data by any reader, so no output was \
+                 published. Supply an input that holds those nodes, or allow the \
+                 placeholder coordinates"
+            ),
+            Unresolved::ChangedWayNodes => write!(
+                f,
+                "locations could not be resolved for {count} distinct nodes referenced by \
+                 ways the change creates or modifies (a node the change deletes counts as \
+                 unresolved). Their references can only be written as (0, 0), which is a \
+                 real coordinate off the coast of Ghana and cannot be told apart from \
+                 genuine data by any reader, so no output was published. Supply a base \
+                 that holds those nodes, or a change that does not delete nodes its ways \
+                 still use, or allow the placeholder coordinates"
+            ),
+        }
+    }
 }
 
 /// Which part of a blob being written is over its format limit
@@ -1089,14 +1130,7 @@ impl fmt::Display for Message<'_> {
             ErrorKind::MissingIndexdata { ref reason, .. }
             | ErrorKind::Unsorted { ref reason }
             | ErrorKind::IndexdataMismatch { ref reason } => f.write_str(reason),
-            ErrorKind::MissingNodeLocations { count } => write!(
-                f,
-                "{count} way node references could not be resolved to a node location. \
-                 Those vertices can only be written as (0, 0), which is a real coordinate \
-                 off the coast of Ghana and cannot be told apart from genuine data by any \
-                 reader, so no output was written. Supply a complete input, or allow the \
-                 placeholder coordinates"
-            ),
+            ErrorKind::MissingNodeLocations { count, counted } => counted.describe(f, count),
             ErrorKind::InputReplaced => write!(
                 f,
                 "the input was replaced while the run was reading it: a later open found a \

@@ -1472,7 +1472,7 @@ fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
         },
     );
     assert_eq!(rejected.status.code(), Some(2));
-    rejected.assert_stderr_contains("1 way node references could not be resolved");
+    rejected.assert_stderr_contains("could not be resolved for 1 distinct nodes");
     rejected.assert_stderr_contains("--keep-untagged-nodes");
     rejected.assert_stderr_contains("--ignore-missing-nodes");
     assert!(
@@ -1554,7 +1554,7 @@ fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
         "the duplicate record must not pay for node 999. stderr:\n{}",
         rejected.stderr_str()
     );
-    rejected.assert_stderr_contains("1 way node references could not be resolved");
+    rejected.assert_stderr_contains("could not be resolved for 1 distinct nodes");
     assert!(!output.exists(), "failed merge must leave no output");
 }
 
@@ -1882,7 +1882,7 @@ fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
 
     let out = run_apply_changes(&base, &osc, &output, low_opts());
     assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
-    out.assert_stderr_contains("1 way node references could not be resolved");
+    out.assert_stderr_contains("could not be resolved for 1 distinct nodes");
     // The library names no flag; the CLI adds the switch that allows it.
     out.assert_stderr_contains("--ignore-missing-nodes");
     assert!(!output.exists(), "failed merge must leave no output");

@@ -4,6 +4,13 @@
 
 ### Breaking
 
+- **`ErrorKind::MissingNodeLocations` says what its count counts.** It
+  gains `counted: Unresolved` (re-exported as `pbfhogg::Unresolved`):
+  `WayNodeReferences` from add-locations-to-ways, each use of a node in
+  each way counted, and `ChangedWayNodes` from apply-changes
+  `--locations-on-ways`, distinct nodes referenced by the ways the change
+  creates or modifies. The messages say so; apply-changes' used to call its
+  distinct-node count "way node references".
 - **`pbfhogg::host::Cancel` is renamed `Invocation`, and `Host::cancel` is
   `Host::invocation`.** The token is the one invocation a run belongs to:
   its cancellation request and, from this release, its instrumentation.
@@ -2971,6 +2978,13 @@
 
 ### Changed
 
+- **`apply-changes --locations-on-ways` refuses missing nodes as soon as it
+  knows.** A change whose ways reference nodes neither the change nor the
+  base supplies used to fail only after the whole output had been written
+  (on planet, the full run); it now fails once the base's nodes have been
+  read, before any way blob is read or written, still publishing nothing.
+  A valid run gains no per-element work and no wait.
+  `--ignore-missing-nodes` is unchanged.
 - **`diff -q` and `diff::diff_stats` skip byte-equal blobs.** A count-only
   run now takes the same shortcut as `diff -c`: a pair of blobs with
   identical claims and compressed bytes is not decoded, so `-q` is faster on

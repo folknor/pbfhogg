@@ -71,7 +71,9 @@ default framing. There is no warning and no option to fail. A reference to a
 node the change deletes may be resolved from the delete's own `lat`/`lon` or
 from the base's record of the node.
 
-**pbfhogg behavior:** The command fails and does not publish its output. A
+**pbfhogg behavior:** The command fails and does not publish its output. It
+fails once the base's nodes have been read, before any way is written, and
+the error counts the distinct unresolved nodes. A
 reference from an OSC way to a node the OSC deletes counts as unresolved too.
 `--ignore-missing-nodes` writes every unresolved reference as `(0, 0)` and
 publishes the output; that is pbfhogg's own placeholder, not osmium's output.

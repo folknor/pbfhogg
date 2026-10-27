@@ -37,7 +37,10 @@
 //! seq below it is processed, the drain merges per-worker [`CoordSlots`]
 //! into the published `Arc<loc_map>` and signals the scanner over
 //! `barrier_tx` (so it can release its buffered way/relation descriptors).
-//! No way or relation item can arrive before that.
+//! No way or relation item can arrive before that. The missing-node
+//! refusal is taken there too, before publication: the merged map is final,
+//! so an OSC way reference it cannot resolve fails the run at the barrier
+//! rather than after the way phase.
 //!
 //! One pipeline run serves both phases: the scanner keeps walking the way
 //! and relation headers while node items are still being processed, and
@@ -125,6 +128,14 @@ pub(super) struct DrainConfig<'a> {
     /// barrier. Drain calls `set` once with the merged map. `None` when
     /// `locations_on_ways == false`.
     pub loc_map_out: Option<LocMapHandle>,
+    /// Under `--locations-on-ways`, the distinct node IDs the OSC's ways
+    /// reference (`NodeLocationIndex::total_referenced`). The merged map at
+    /// the barrier holds only such IDs, so its size against this is the
+    /// run's unresolved count, final at the barrier: nothing resolves later.
+    pub loc_nodes_needed: u64,
+    /// Publish a map with unresolved references (they are written as
+    /// `(0, 0)`) instead of refusing at the barrier.
+    pub ignore_missing_nodes: bool,
     /// First producer failure (scanner or worker pool, errors and caught
     /// panics alike). Polled every loop iteration and once
     /// after the drain channel disconnects; a published failure is
@@ -368,6 +379,11 @@ pub(super) fn run_drain(
     // `rewrite.rs` so the cursor walk after end-of-stream emits creates
     // for any kinds whose blobs we never saw (or saw and finished).
     cancel.marker("MERGE_TRAILING_CREATES_START");
+    #[cfg(feature = "test-hooks")]
+    cancel
+        .faults()
+        .apply_changes_drain_past_nodes
+        .store(true, Ordering::SeqCst);
     let types_to_flush = match state.last_type {
         None | Some(ElementKind::Node) => {
             &[ElementKind::Node, ElementKind::Way, ElementKind::Relation][..]
@@ -614,6 +630,14 @@ fn process_item(
             item_kind.as_str()
         )));
     }
+    #[cfg(feature = "test-hooks")]
+    if item_kind != ElementKind::Node {
+        writer
+            .cancel_token()
+            .faults()
+            .apply_changes_drain_past_nodes
+            .store(true, Ordering::SeqCst);
+    }
 
     if let Some(prev) = state.last_type
         && prev != item_kind
@@ -810,7 +834,8 @@ fn flush_copy_range(
 }
 
 /// Merge per-worker `CoordSlots` into the published `Arc<FxHashMap>`,
-/// then signal the scanner over `barrier_tx`. Called exactly once under
+/// then signal the scanner over `barrier_tx`, or refuse the run when the
+/// map leaves OSC way references unresolved. Called exactly once under
 /// `--locations-on-ways`, from the barrier check in `run_drain`, once every
 /// seq below the scanner's node boundary is processed.
 fn barrier_publish_loc_map(
@@ -863,6 +888,49 @@ fn barrier_publish_loc_map(
         .barrier_loc_map_size
         .store(merged.len() as u64, Ordering::Relaxed);
 
+    // The missing-node refusal, at the earliest point the count is known:
+    // every node item is processed, nothing resolves after this merge, and
+    // no way has been written. Leaving through the drain's error exit drops
+    // the barrier sender unsignalled, so the scanner stops at its next
+    // barrier poll (or its EOF wait), the workers are released, and `merge`
+    // publishes nothing. A producer failure already published, or a
+    // cancellation already requested, outranks the refusal: both are
+    // checked here, at the decision, since the drain's own checks ran
+    // before this receive's advance and merge.
+    let missing = cfg.loc_nodes_needed.saturating_sub(merged.len() as u64);
+    if missing != 0 && !cfg.ignore_missing_nodes {
+        // Test-only: a producer failure or a cancellation landing after the
+        // drain's per-receive checks, which the checks below must rank.
+        #[cfg(feature = "test-hooks")]
+        {
+            let faults = invocation.faults();
+            if faults
+                .apply_changes_fail_at_refusal
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                cfg.failure.publish(Error::internal(
+                    "test-hooks: producer failure at the barrier refusal",
+                ));
+            }
+            if faults
+                .apply_changes_cancel_at_refusal
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                invocation.cancel();
+            }
+        }
+        if let Some(e) = cfg.failure.take() {
+            return Err(e);
+        }
+        invocation.check()?;
+        invocation.counter("merge_loc_missing", missing);
+        invocation.marker("MERGE_DRAIN_BARRIER_REFUSED");
+        return Err(crate::error::new_missing_node_locations(
+            missing,
+            crate::error::Unresolved::ChangedWayNodes,
+        ));
+    }
+
     let arc = Arc::new(merged);
     // OnceLock::set fails only if already set; under our own protocol
     // the drain calls this exactly once, so a set failure is a bug,
@@ -876,6 +944,8 @@ fn barrier_publish_loc_map(
     state.barrier_done = true;
 
     if let Some(barrier_tx) = cfg.barrier_tx.as_ref() {
+        #[cfg(feature = "test-hooks")]
+        invocation.faults().before_apply_changes_barrier_send();
         // A scanner that succeeds always receives this before exiting, small
         // inputs included: if it has not already picked it up between node
         // descriptors, it blocks on it after its walk. A
@@ -885,6 +955,11 @@ fn barrier_publish_loc_map(
         if let Err(e) = barrier_tx.send(()) {
             let _: mpsc::SendError<()> = e;
         }
+        #[cfg(feature = "test-hooks")]
+        invocation
+            .faults()
+            .apply_changes_barrier_signalled
+            .store(true, Ordering::SeqCst);
     }
 
     invocation.marker("MERGE_DRAIN_BARRIER_END");

@@ -443,6 +443,73 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
     assert!(output.exists(), "an accepted run must publish its output");
 }
 
+/// add-locations-to-ways counts unresolved references, not nodes: one absent
+/// node used three times across two ways is three, on both index types,
+/// and the refusal says so.
+#[test]
+fn altw_refusal_counts_each_unresolved_reference() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![("name", "present")],
+        meta: None,
+    }];
+    let ways = vec![
+        TestWay {
+            id: 10,
+            refs: vec![1, 999, 999],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 11,
+            refs: vec![999, 1],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &ways, &[]);
+    for index_type in [
+        pbfhogg::altw::IndexType::Sparse,
+        pbfhogg::altw::IndexType::External,
+    ] {
+        let mut opts = altw_options();
+        opts.index_type = index_type;
+        // External takes indexed input only and refuses `force`.
+        opts.write.force = matches!(index_type, pbfhogg::altw::IndexType::Sparse);
+        let Err(err) = pbfhogg::altw::add_locations_to_ways(
+            &input,
+            crate::common::out(&output),
+            &opts,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+            crate::common::scratch_in(dir.path()),
+        ) else {
+            panic!("{index_type:?}: an unresolvable way ref must fail the default policy");
+        };
+        assert!(
+            matches!(
+                err.kind(),
+                pbfhogg::ErrorKind::MissingNodeLocations {
+                    count: 3,
+                    counted: pbfhogg::Unresolved::WayNodeReferences,
+                }
+            ),
+            "{index_type:?}: expected three unresolved references, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("3 way node references (each use of a node in each way counted)"),
+            "{index_type:?}: the message must say what it counts: {err}"
+        );
+        assert!(!output.exists(), "{index_type:?}: nothing may be published");
+    }
+}
+
 /// The overwrite half: a library caller pointing at an existing file must
 /// get that file back byte-identical when the run is refused, not a
 /// truncated or replaced one. Opening the destination for write would have

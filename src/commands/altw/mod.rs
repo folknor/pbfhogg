@@ -557,8 +557,11 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
     if stats.missing_locations == 0 || ignore_missing_nodes {
         return Ok(());
     }
+    // Every backend counts per reference: each unresolved position in each
+    // way, so a node used twice counts twice.
     Err(crate::error::new_missing_node_locations(
         stats.missing_locations,
+        crate::error::Unresolved::WayNodeReferences,
     ))
 }
 

@@ -303,6 +303,27 @@ impl SharedSlotBuckets {
     }
 }
 
+/// The refusal for a node blob whose extracted tuples the fast check in
+/// [`stage2_node_join`] did not find exact and ascending: the shared claim
+/// walk over the same tuples, which names the false claim or the disorder
+/// by the walk's precedence. Cold: only a lying blob reaches it.
+#[cold]
+fn stage2_claim_refusal(blob: &NodeBlobInfo, tuples: &[NodeTuple]) -> Error {
+    let claim = blob.claim();
+    let mut walk = crate::blob_meta::ClaimWalk::new(Some(&claim), super::blob_meta::EXTERNAL_ORDER);
+    for tuple in tuples {
+        if let Err(e) = walk.observe(tuple.id) {
+            return e;
+        }
+    }
+    match walk.finish() {
+        Err(e) => e,
+        Ok(_) => Error::internal(
+            "altw external stage 2: a node blob failed the fast claim check but passed the walk",
+        ),
+    }
+}
+
 /// Parallel stage 2: N workers each claim id buckets via atomic
 /// dispatch, load + sort the bucket's IdRecords, find the contiguous
 /// run of node blobs whose `[min_id, max_id]` intersects the bucket's
@@ -491,31 +512,36 @@ pub(super) fn stage2_node_join(
                             // is refused before any record is resolved
                             // against it. A foreign kind is one this
                             // scanner never reads.
-                            let claim = blob.claim();
-                            let mut walk = crate::blob_meta::ClaimWalk::new(
-                                Some(&claim),
-                                super::blob_meta::EXTERNAL_ORDER,
-                            );
-                            let mut walk_error: Option<Error> = None;
+                            //
+                            // One raw compare per tuple: the claimed range is
+                            // non-negative (the metadata scan refused any
+                            // other), so a tuple sequence that ascends as
+                            // i64 and starts at the claimed minimum is in
+                            // canonical order and holds no negative ID, and
+                            // then its count, minimum and maximum are its
+                            // length, first and last. Anything else takes the
+                            // shared walk, cold, for the exact refusal.
+                            let mut descended = false;
+                            let mut previous = i64::MIN;
                             let kinds = crate::scan::node::extract_node_coords(
                                 &node_decompress_buf,
                                 &mut node_group_starts,
                                 |id, lat, lon| {
-                                    if walk_error.is_none()
-                                        && let Err(e) = walk.observe(id)
-                                    {
-                                        walk_error = Some(e);
-                                    }
+                                    descended |= id < previous;
+                                    previous = id;
                                     node_tuples.push(NodeTuple { id, lat, lon });
                                 },
                             ).map_err(|e| in_input(e.context("stage2 node extract")))?;
                             kinds
                                 .refuse_under(Some(crate::ElementKind::Node))
                                 .map_err(in_input)?;
-                            if let Some(e) = walk_error {
-                                return Err(in_input(e));
+                            let exact = !descended
+                                && node_tuples.len() as u64 == blob.count
+                                && node_tuples.first().is_some_and(|t| t.id == blob.min_id)
+                                && previous == blob.max_id;
+                            if !exact {
+                                return Err(in_input(stage2_claim_refusal(blob, &node_tuples)));
                             }
-                            walk.finish().map_err(in_input)?;
                             t_ex.record_ms(&c.node_extract_ms);
                             t_ex.record_ns(&c.node_extract_ns);
 

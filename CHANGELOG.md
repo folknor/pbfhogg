@@ -2983,6 +2983,7 @@
   base supplies used to fail only after the whole output had been written
   (on planet, the full run); it now fails once the base's nodes have been
   read, before any way blob is read or written, still publishing nothing.
+  On a planet base without its untagged nodes that is 15 s instead of 96 s.
   A valid run gains no per-element work and no wait.
   `--ignore-missing-nodes` is unchanged.
 - **`diff -q` and `diff::diff_stats` skip byte-equal blobs.** A count-only

@@ -325,6 +325,43 @@ same interleaving: `8f8ef92a` 52.5 s and 25.0 s, `81f3fbe4` 50.7 s and
 26.4 s (UUIDs `49d6c2b4`, `2c21e88c`, `040ad80b`, `08bc51e8`); first pair
 cold, second warm. No regression outside the noise.
 
+### Missing-node refusal at the barrier (`--locations-on-ways`, commit `8efb71bd`)
+
+Since `8efb71bd` the missing-node refusal is taken at the node-to-way
+barrier, and the scanner polls the barrier channel on every held way and
+relation header, so a refusal ends its header walk at once. Planet
+`altw-keep-untagged` + OSC 4913, bygg, interleaved `--bench 1` cells
+against the parent (`03e3792d`, built through `--commit`), no trim
+between them:
+
+| Commit | Walls (s), in run order | Barrier at (s) | UUIDs |
+|---|---|---|---|
+| `03e3792d` (parent) | 299.0, 302.9 | 170.9, 172.8 | `8cb121ef`, `d6178654` |
+| `8efb71bd` | 302.7, 300.5 | 173.3, 172.6 | `6b404055`, `c57d4058` |
+
+Run order was parent, change, change, parent. Medians 301.0 s and 301.6 s,
+inside the noise; the way phase (barrier to loop end) is 126 to 128 s in
+every cell. On the change's cells there is no
+`MERGE_SCANNER_BARRIER_WAIT` span: the scanner, still walking way headers
+when the drain signalled, took the signal at a poll and skipped its
+end-of-input wait. It still releases the held descriptors only at end of
+input, as before.
+
+The refusal itself, plain `altw` (untagged nodes dropped, so 4,237,222
+of the 6,803,426 nodes the OSC's ways need are missing), one run each,
+refused runs are not stored in results.db (brokkr history ids 53910 and
+53912, sidecar via `brokkr sidecar dirty` at the time):
+
+| Commit | Refused at (wall) | Barrier at | Scanner end-of-input wait at |
+|---|---:|---:|---:|
+| `03e3792d` (parent) | 96 s, after the full way phase | 12.5 s | 26.4 s |
+| `8efb71bd` | 15.0 s (refusal marker at 14.2 s) | 14.2 s | not reached |
+
+The parent's numbers show why the scanner poll matters here: on this base
+the barrier comes about 14 s before the scanner's header walk would have
+reached end of input, so a refusal that waited for the walk would have
+come at about 26 s.
+
 ### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 
 Apply-changes without `--locations-on-ways` is a structurally

@@ -165,8 +165,10 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
 /// containment its own payload contradicts, or the payload has a shape no
 /// raw copy can be proved safe for (see [`dense_only_payload`]).
 pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &crate::host::Host) {
-    crate::debug::emit_counter("extract_passthrough_verified_blobs", verified);
-    crate::debug::emit_counter("extract_passthrough_demoted_blobs", demoted);
+    host.invocation
+        .counter("extract_passthrough_verified_blobs", verified);
+    host.invocation
+        .counter("extract_passthrough_demoted_blobs", demoted);
     if demoted > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -200,7 +202,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
     extract_bbox: Option<&crate::BlobBbox>,
     host: &crate::host::Host,
 ) -> Result<Vec<BlobDesc>> {
-    crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
+    host.invocation.marker("EXTRACT_SCHEDULE_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -242,10 +244,11 @@ pub(super) fn build_blob_schedule_with_passthrough(
             },
         });
     }
-    crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
+    host.invocation.marker("EXTRACT_SCHEDULE_SCAN_END");
 
-    crate::debug::emit_counter("extract_schedule_blobs", schedule.len());
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("extract_schedule_blobs", schedule.len());
+    host.invocation.counter(
         "extract_passthrough_candidate_blobs",
         passthrough_candidates,
     );
@@ -476,14 +479,14 @@ where
         + Sync,
 {
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; these samples are inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("MI_PRE_BLOB_SCHEDULE");
-    crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
+    // comparisons; these samples are inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "MI_PRE_BLOB_SCHEDULE");
+    host.invocation.marker("PREAD_WRITE_BLOB_SCHEDULE_START");
     let schedule = build_blob_schedule(input, host)?;
-    crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
+    host.invocation.marker("PREAD_WRITE_BLOB_SCHEDULE_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("MI_POST_BLOB_SCHEDULE");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "MI_POST_BLOB_SCHEDULE");
     pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn, host)
 }
 
@@ -506,15 +509,15 @@ where
         + Send
         + Sync,
 {
-    crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
+    host.invocation.marker("PREAD_WRITE_EXECUTE_START");
     pread_execute(input, schedule, writer, stats, block_fn, host)?;
-    crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
+    host.invocation.marker("PREAD_WRITE_EXECUTE_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("MI_POST_EXECUTE");
-    crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "MI_POST_EXECUTE");
+    host.invocation.marker("PREAD_WRITE_FLUSH_START");
     writer.flush()?;
-    crate::debug::emit_marker("PREAD_WRITE_FLUSH_END");
+    host.invocation.marker("PREAD_WRITE_FLUSH_END");
     Ok(())
 }
 

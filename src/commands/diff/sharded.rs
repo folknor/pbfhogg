@@ -42,7 +42,13 @@ pub(super) trait ShardedReport {
     fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()>;
 
     /// Observe a phase's plan (sidecar counters).
-    fn on_plan(&mut self, _kind: ElementKind, _shards: &[Shard]) {}
+    fn on_plan(
+        &mut self,
+        _kind: ElementKind,
+        _shards: &[Shard],
+        _invocation: &crate::host::Invocation,
+    ) {
+    }
 
     /// The fault plan's shard-panic hook for this command.
     #[cfg(feature = "test-hooks")]
@@ -95,9 +101,9 @@ pub(super) fn run<R: ShardedReport>(
         if old_descs.is_empty() && new_descs.is_empty() {
             continue;
         }
-        crate::debug::emit_marker(phase.start_marker);
+        host.invocation.marker(phase.start_marker);
         let shards = plan_shards(old_descs, new_descs, jobs, walked.has_negative);
-        report.on_plan(kind, &shards);
+        report.on_plan(kind, &shards, &host.invocation);
         let stats = if let [shard] = shards.as_slice() {
             run_shard(
                 *shard,
@@ -112,7 +118,7 @@ pub(super) fn run<R: ShardedReport>(
             run_sharded_phase(walked, kind, &shards, skip_equal_blobs, report, host)?
         };
         total.add(&stats);
-        crate::debug::emit_marker(phase.end_marker);
+        host.invocation.marker(phase.end_marker);
     }
     Ok(total)
 }

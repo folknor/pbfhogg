@@ -184,10 +184,10 @@ pub(crate) fn tags_filter_osc_to(
 ) -> Result<TagsFilterOscStats> {
     crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
-    crate::debug::emit_marker("TAGSFILTEROSC_START");
+    host.invocation.marker("TAGSFILTEROSC_START");
     let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.invocation)?;
     write_filtered_osc(output, &filtered, &host.invocation)?;
-    crate::debug::emit_marker("TAGSFILTEROSC_END");
+    host.invocation.marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
 

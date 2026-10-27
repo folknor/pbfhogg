@@ -267,7 +267,7 @@ pub(super) fn run_workers(
         }
     }
 
-    crate::debug::emit_marker("MERGE_STREAMING_START");
+    cancel.marker("MERGE_STREAMING_START");
 
     // One plain description of the pinned base for the whole pool, kept
     // separate from the scanner walker's FADV_RANDOM one and the drain's
@@ -345,10 +345,10 @@ pub(super) fn run_workers(
     // once every worker's clone is also dropped.
     drop(drain_tx);
 
-    crate::debug::emit_marker("MERGE_STREAMING_END");
-    counters.emit_all();
+    cancel.marker("MERGE_STREAMING_END");
+    counters.emit_all(&cancel);
     // Test-only: the same counters, kept on the run's token, so a test can
-    // assert on them without the process-wide sidecar FIFO.
+    // assert on them without an instrumentation sink.
     #[cfg(feature = "test-hooks")]
     {
         let mut recorded = Vec::new();

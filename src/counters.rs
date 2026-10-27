@@ -2,7 +2,7 @@
 //!
 //! The shared pieces below; counter code uses them rather than hand-rolling
 //! its own. Plain values (stats fields, schedule lengths, local tallies) need
-//! none of them: `crate::debug::emit_counter` takes unsigned integers directly
+//! none of them: `Invocation::counter` takes unsigned integers directly
 //! and saturates, so they are passed without an `as i64` cast (a source check
 //! in `scripts/check_source_invariants.py` refuses one inside its arguments).
 //!
@@ -46,8 +46,9 @@ use std::time::Instant;
 /// a `const fn new()`, `Default`, and two methods: `for_each(|name, value|)`
 /// (crate-visible, read-only), which visits every counter in declaration
 /// order with its emitted name and its value (loaded, then divided by the
-/// optional divisor), and the **private** `emit_all()`, which publishes that
-/// visit through `crate::debug::emit_counter` (saturating at `i64::MAX`).
+/// optional divisor), and the **private** `emit_all(invocation)`, which
+/// publishes that visit through the invocation's sink (saturating at
+/// `i64::MAX`).
 /// A private inherent method is reachable only from the module that invokes
 /// the macro and its children, so a set whose emission is restricted to one
 /// route (the end-of-invocation emitters) keeps that route as its only way
@@ -110,9 +111,12 @@ macro_rules! counter_set {
                 )?)*
             }
 
-            /// Emit every counter, in declaration order.
-            fn emit_all(&self) {
-                self.for_each(|name, value| $crate::debug::emit_counter(name, value));
+            /// Emit every counter to `invocation`'s sink, in declaration
+            /// order.
+            fn emit_all(&self, invocation: &$crate::host::Invocation) {
+                if invocation.instrumented() {
+                    self.for_each(|name, value| invocation.counter(name, value));
+                }
             }
         }
 
@@ -363,6 +367,8 @@ pub(crate) struct StallGauge {
     start_marker: &'static str,
     end_marker: &'static str,
     depth: std::sync::Mutex<u64>,
+    /// The invocation whose sink receives the span.
+    invocation: crate::host::Invocation,
 }
 
 /// RAII exit for [`StallGauge::track`]; decrements depth on drop so
@@ -370,11 +376,16 @@ pub(crate) struct StallGauge {
 pub(crate) struct StallGuard<'a>(&'a StallGauge);
 
 impl StallGauge {
-    pub(crate) fn new(start_marker: &'static str, end_marker: &'static str) -> Self {
+    pub(crate) fn new(
+        start_marker: &'static str,
+        end_marker: &'static str,
+        invocation: &crate::host::Invocation,
+    ) -> Self {
         Self {
             start_marker,
             end_marker,
             depth: std::sync::Mutex::new(0),
+            invocation: invocation.clone(),
         }
     }
 
@@ -385,7 +396,7 @@ impl StallGauge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *depth == 0 {
-            crate::debug::emit_marker(self.start_marker);
+            self.invocation.marker(self.start_marker);
         }
         *depth += 1;
         StallGuard(self)
@@ -401,7 +412,7 @@ impl Drop for StallGuard<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *depth = depth.saturating_sub(1);
         if *depth == 0 {
-            crate::debug::emit_marker(self.0.end_marker);
+            self.0.invocation.marker(self.0.end_marker);
         }
     }
 }

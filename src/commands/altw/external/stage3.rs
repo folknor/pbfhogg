@@ -384,7 +384,7 @@ pub(super) fn stage3_slot_reorder(
         return Err(e);
     }
 
-    counters.emit_all();
+    counters.emit_all(cancel);
 
     Ok(())
 }
@@ -534,7 +534,12 @@ mod tests {
             Arc::new(worker_file),
             Arc::from(worker_path.as_path()),
         );
-        let router = ConcurrentBlobLocationRouter::new(&per_way_rcs, vec![worker]).expect("router");
+        let router = ConcurrentBlobLocationRouter::new(
+            &per_way_rcs,
+            vec![worker],
+            &crate::host::Invocation::new(),
+        )
+        .expect("router");
         let way_slot_starts = [0];
         let integrated = IntegratedInputs {
             way_slot_starts: &way_slot_starts,

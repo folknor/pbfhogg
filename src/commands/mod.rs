@@ -562,7 +562,8 @@ pub(crate) fn dispatch_scan_arm<'a>(
         return Ok(ScanArm::Walker);
     }
     let estimate = estimate_blob_count(input, host)?;
-    crate::debug::emit_counter("walk_estimated_blobs", estimate.osmdata_blobs);
+    host.invocation
+        .counter("walk_estimated_blobs", estimate.osmdata_blobs);
     Ok(choose_scan_arm_at(&estimate, min_blobs))
 }
 

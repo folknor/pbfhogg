@@ -324,7 +324,7 @@ pub(crate) fn tags_filter_to<'a>(
     }
 
     if let Some(n) = opts.parallelism.fixed() {
-        crate::debug::emit_counter("tagsfilter_worker_count", n);
+        host.invocation.counter("tagsfilter_worker_count", n);
     }
 
     if opts.omit_referenced {
@@ -338,9 +338,12 @@ pub(crate) fn tags_filter_to<'a>(
             overrides,
             host,
         )?;
-        crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched);
-        crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched);
-        crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched);
+        host.invocation
+            .counter("tagsfilter_matched_nodes", result.nodes_matched);
+        host.invocation
+            .counter("tagsfilter_matched_ways", result.ways_matched);
+        host.invocation
+            .counter("tagsfilter_matched_relations", result.relations_matched);
         Ok(result)
     } else {
         let result = tags_filter_two_pass(
@@ -355,16 +358,21 @@ pub(crate) fn tags_filter_to<'a>(
             overrides,
             host,
         )?;
-        crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched);
-        crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched);
-        crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched);
-        crate::debug::emit_counter("tagsfilter_nodes_from_ways", result.nodes_from_ways);
-        crate::debug::emit_counter(
+        host.invocation
+            .counter("tagsfilter_matched_nodes", result.nodes_matched);
+        host.invocation
+            .counter("tagsfilter_matched_ways", result.ways_matched);
+        host.invocation
+            .counter("tagsfilter_matched_relations", result.relations_matched);
+        host.invocation
+            .counter("tagsfilter_nodes_from_ways", result.nodes_from_ways);
+        host.invocation.counter(
             "tagsfilter_nodes_from_relations",
             result.nodes_from_relations,
         );
-        crate::debug::emit_counter("tagsfilter_ways_from_relations", result.ways_from_relations);
-        crate::debug::emit_counter(
+        host.invocation
+            .counter("tagsfilter_ways_from_relations", result.ways_from_relations);
+        host.invocation.counter(
             "tagsfilter_relations_from_relations",
             result.relations_from_relations,
         );
@@ -483,7 +491,7 @@ fn tags_filter_single_pass(
         direct_reads: direct_io,
         ..
     } = *write;
-    crate::debug::emit_marker("TAGSFILTER_SCAN_START");
+    host.invocation.marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open_in(input, direct_io, host)?;
     // Blob-level filtering can't help in invert mode - we want non-matching blobs.
     let reader = match trusted_blob_filter(expressions, invert, distrust_metadata) {
@@ -530,7 +538,7 @@ fn tags_filter_single_pass(
     )?;
 
     writer.flush()?;
-    crate::debug::emit_marker("TAGSFILTER_SCAN_END");
+    host.invocation.marker("TAGSFILTER_SCAN_END");
     Ok(stats)
 }
 
@@ -711,7 +719,7 @@ fn tags_filter_two_pass(
     };
 
     // --- Pass 1: Collect match results and way dependencies ---
-    crate::debug::emit_marker("TAGSFILTER_PASS1_START");
+    host.invocation.marker("TAGSFILTER_PASS1_START");
     //
     // IdSet: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
     // No sort/dedup step needed between passes (bitset deduplicates inherently).
@@ -743,7 +751,8 @@ fn tags_filter_two_pass(
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
         // to skip on the tag-index filter anyway. The walk refuses a
         // partially indexed file (see `tags_filter_to`).
-        crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
+        host.invocation
+            .marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
         let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
         let _ = walker
             .next_header()?
@@ -783,10 +792,12 @@ fn tags_filter_two_pass(
                 "{blobs_skipped_by_tag} blobs skipped by tag index"
             );
         }
-        crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
+        host.invocation
+            .marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
 
-        crate::debug::emit_counter("tagsfilter_single_pass_schedule_blobs", schedule.len());
-        crate::debug::emit_counter(
+        host.invocation
+            .counter("tagsfilter_single_pass_schedule_blobs", schedule.len());
+        host.invocation.counter(
             "tagsfilter_single_pass_tagidx_skipped_blobs",
             blobs_skipped_by_tag,
         );
@@ -880,12 +891,12 @@ fn tags_filter_two_pass(
         )?;
     }
 
-    crate::debug::emit_marker("TAGSFILTER_PASS1_END");
+    host.invocation.marker("TAGSFILTER_PASS1_END");
 
     // Expand relation-member closure (skip if no relations matched):
     // - matched relation -> include member nodes/ways/relations
     // - member relations recurse transitively (cycle-safe via set membership)
-    crate::debug::emit_marker("TAGSFILTER_CLOSURE_START");
+    host.invocation.marker("TAGSFILTER_CLOSURE_START");
     if has_included_relation {
         let closure = collect_relation_member_closure(
             input,
@@ -900,10 +911,10 @@ fn tags_filter_two_pass(
         has_included_way |= closure.has_way;
         has_included_relation |= closure.has_relation;
     }
-    crate::debug::emit_marker("TAGSFILTER_CLOSURE_END");
+    host.invocation.marker("TAGSFILTER_CLOSURE_END");
 
     // Any included way (direct match or pulled from relation members) contributes node deps.
-    crate::debug::emit_marker("TAGSFILTER_WAYDEPS_START");
+    host.invocation.marker("TAGSFILTER_WAYDEPS_START");
     collect_way_node_dependencies(
         input,
         direct_io,
@@ -914,12 +925,12 @@ fn tags_filter_two_pass(
         jobs,
         host,
     )?;
-    crate::debug::emit_marker("TAGSFILTER_WAYDEPS_END");
+    host.invocation.marker("TAGSFILTER_WAYDEPS_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
     // Every scheduled blob is decoded and its included elements re-encoded by
     // parallel workers; there is no raw passthrough (see the pin below).
-    crate::debug::emit_marker("TAGSFILTER_PASS2_START");
+    host.invocation.marker("TAGSFILTER_PASS2_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader.leading_header()?;
@@ -951,7 +962,8 @@ fn tags_filter_two_pass(
         ))
     };
 
-    crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
+    host.invocation
+        .marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -990,10 +1002,12 @@ fn tags_filter_two_pass(
     }
     let input_file = walker.input();
     drop(walker);
-    crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
+    host.invocation.marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
 
-    crate::debug::emit_counter("tagsfilter_pass2_schedule_blobs", schedule.len());
-    crate::debug::emit_counter("tagsfilter_pass2_skipped_blobs", blobs_skipped);
+    host.invocation
+        .counter("tagsfilter_pass2_schedule_blobs", schedule.len());
+    host.invocation
+        .counter("tagsfilter_pass2_skipped_blobs", blobs_skipped);
 
     if blobs_skipped > 0 {
         crate::host::diag!(
@@ -1092,7 +1106,7 @@ fn tags_filter_two_pass(
     }
 
     writer.flush()?;
-    crate::debug::emit_marker("TAGSFILTER_PASS2_END");
+    host.invocation.marker("TAGSFILTER_PASS2_END");
     Ok(stats)
 }
 

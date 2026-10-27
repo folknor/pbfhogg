@@ -480,7 +480,9 @@ impl<P: Positional> HeaderWalker<P> {
             "reader.filter_without_indexdata",
             "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"
         );
-        crate::debug::emit_counter("schedule_filter_without_indexdata", 1);
+        self.frames
+            .cancel_token()
+            .counter("schedule_filter_without_indexdata", 1);
     }
 
     /// The path this walker was opened from. Workers that decode blobs the

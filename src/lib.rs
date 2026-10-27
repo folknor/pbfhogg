@@ -176,9 +176,9 @@ pub(crate) mod coord_pack;
 // Sidecar counter machinery: declared counter sets, the shared max update and
 // the shared stopwatch for timed counters.
 pub(crate) mod counters;
-// Public because the separate `pbfhogg-cli` crate arms the sidecar marker
-// FIFO through `debug::initialize_marker_fifo`; the library never reads
-// `BROKKR_MARKER_FIFO` itself.
+// Public for `InstrumentSink`, the caller's side of a run's instrumentation,
+// and `MarkerFifo`, the sidecar sink the separate `pbfhogg-cli` crate opens;
+// the library never reads `BROKKR_MARKER_FIFO` itself.
 pub mod debug;
 // The one owner of `O_DIRECT` opens and of the alignment direct I/O keeps.
 pub(crate) mod direct_io;

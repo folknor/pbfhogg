@@ -422,6 +422,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         executor,
         cancel,
     } = p;
+    let invocation: &crate::host::Invocation = cancel;
     let (street_ways, street_nodes, addr_points, interp_nodes) =
         (*street_ways, *street_nodes, *addr_points, *interp_nodes);
     let street_way_count = *street_way_count;
@@ -469,7 +470,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     let first_missing_interp = AtomicUsize::new(usize::MAX);
 
     // Streets (fused fine + coarse)
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_START");
+    invocation.marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
     while chunk_start < street_way_count {
         cancel.check()?;
@@ -548,11 +549,11 @@ pub(super) fn bucketed_cell_assignment_fused(
         }
         chunk_start = chunk_end;
     }
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_END");
+    invocation.marker("GEOCODE_PASS3_STAGEA_STREETS_END");
 
     // Addr points: single cell per point, no cover_segment. Derive fine
     // and coarse via CellID.parent() chain from the same LatLng.
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_START");
+    invocation.marker("GEOCODE_PASS3_STAGEA_ADDR_START");
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
@@ -603,10 +604,10 @@ pub(super) fn bucketed_cell_assignment_fused(
         }
         chunk_start = chunk_end;
     }
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_END");
+    invocation.marker("GEOCODE_PASS3_STAGEA_ADDR_END");
 
     // Interpolation (fused fine + coarse, same shape as streets)
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
+    invocation.marker("GEOCODE_PASS3_STAGEA_INTERP_START");
     let mut interp_chunk_start = 0usize;
     while interp_chunk_start < interp_ways.len() {
         cancel.check()?;
@@ -661,7 +662,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         }
         interp_chunk_start = interp_chunk_end;
     }
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
+    invocation.marker("GEOCODE_PASS3_STAGEA_INTERP_END");
 
     // Flush and drop both sets of bucket writers
     for (b, writer) in fine_writers.iter_mut().enumerate() {
@@ -685,7 +686,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     // as soon as the tree is consumed so the bucket files are freed
     // before the second tree's Stage B runs (disk pressure at planet
     // scale).
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_START");
+    invocation.marker("GEOCODE_PASS3_STAGEB_FINE_START");
     let fine_count = run_stage_b(
         output_dir,
         &fine_bucket_dir,
@@ -697,9 +698,9 @@ pub(super) fn bucketed_cell_assignment_fused(
         cancel,
     )?;
     scratch.remove_tree(&fine_bucket_dir);
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
+    invocation.marker("GEOCODE_PASS3_STAGEB_FINE_END");
 
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_START");
+    invocation.marker("GEOCODE_PASS3_STAGEB_COARSE_START");
     let coarse_count = run_stage_b(
         output_dir,
         &coarse_bucket_dir,
@@ -711,7 +712,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         cancel,
     )?;
     scratch.remove_tree(&coarse_bucket_dir);
-    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
+    invocation.marker("GEOCODE_PASS3_STAGEB_COARSE_END");
 
     Ok((fine_count, coarse_count))
 }

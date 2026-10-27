@@ -154,11 +154,11 @@ fn digest_inner(
         .locate(Location::in_file(path)));
     }
 
-    crate::debug::emit_marker("DIGEST_SCAN_START");
+    host.invocation.marker("DIGEST_SCAN_START");
     let mut state = DigestState::new(Arc::from(path));
     reader.for_each_fused_blob(DigestTransform, |summary| state.absorb(summary))?;
     let digest = state.finish();
-    crate::debug::emit_marker("DIGEST_SCAN_END");
+    host.invocation.marker("DIGEST_SCAN_END");
     Ok(digest)
 }
 

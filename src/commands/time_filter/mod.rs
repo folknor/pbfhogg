@@ -157,7 +157,7 @@ pub(crate) fn time_filter_to(
     )?;
 
     let stats = if is_history {
-        time_filter_history(reader, &mut writer, cutoff_timestamp)?
+        time_filter_history(reader, &mut writer, cutoff_timestamp, &host.invocation)?
     } else {
         // Drop the reader before the snapshot path - the migrated
         // snapshot path opens the input via HeaderWalker through
@@ -168,18 +168,22 @@ pub(crate) fn time_filter_to(
     };
 
     writer.flush()?;
-    crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen);
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("timefilter_versions_seen", stats.versions_seen);
+    host.invocation.counter(
         "timefilter_versions_before_cutoff",
         stats.versions_before_cutoff,
     );
-    crate::debug::emit_counter("timefilter_elements_written", stats.elements_written);
-    crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted);
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("timefilter_elements_written", stats.elements_written);
+    host.invocation
+        .counter("timefilter_dropped_deleted", stats.dropped_deleted);
+    host.invocation.counter(
         "timefilter_dropped_no_snapshot_version",
         stats.dropped_no_snapshot_version,
     );
-    crate::debug::emit_counter("timefilter_is_history_path", is_history);
+    host.invocation
+        .counter("timefilter_is_history_path", is_history);
     Ok(stats)
 }
 
@@ -192,6 +196,7 @@ fn time_filter_history(
     reader: ElementReader<crate::file_reader::FileReader>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
+    invocation: &crate::host::Invocation,
 ) -> Result<TimeFilterStats> {
     let mut bb = BlockBuilder::new();
     let mut stats = TimeFilterStats {
@@ -204,7 +209,7 @@ fn time_filter_history(
     let mut pending: Option<PendingGroup> = None;
     let mut flush_error: Result<()> = Ok(());
 
-    crate::debug::emit_marker("TIMEFILTER_HISTORY_START");
+    invocation.marker("TIMEFILTER_HISTORY_START");
     // Parallel decode via the 3-stage pipelined reader (IO -> rayon decode ->
     // reorder). Element order across blocks is preserved by the reorder
     // stage, which is load-bearing: the pending-group state machine below
@@ -275,7 +280,7 @@ fn time_filter_history(
     if let Some(block) = bb.take_owned()? {
         writer.write_primitive_block_owned(block)?;
     }
-    crate::debug::emit_marker("TIMEFILTER_HISTORY_END");
+    invocation.marker("TIMEFILTER_HISTORY_END");
     Ok(stats)
 }
 
@@ -335,10 +340,10 @@ fn time_filter_snapshot(
         dropped_no_snapshot_version: 0,
     };
 
-    crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
+    host.invocation.marker("TIMEFILTER_SNAPSHOT_START");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; these samples are inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
+    // comparisons; these samples are inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "timefilter_snapshot_start_mallinfo");
 
     // No kind or blob filter: every OsmData blob is scheduled whatever its
     // indexdata says or lacks, and `filter_block_snapshot` works on the
@@ -348,7 +353,7 @@ fn time_filter_snapshot(
     let (schedule, shared_file) = build_classify_schedule(input, None, host)?;
 
     if schedule.is_empty() {
-        crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
+        host.invocation.marker("TIMEFILTER_SNAPSHOT_END");
         return Ok(stats);
     }
 
@@ -409,9 +414,9 @@ fn time_filter_snapshot(
     )?;
 
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("timefilter_snapshot_end_mallinfo");
-    crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "timefilter_snapshot_end_mallinfo");
+    host.invocation.marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
 }
 

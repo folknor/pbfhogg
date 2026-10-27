@@ -9,8 +9,8 @@ cannot be textlint rules:
   emits nothing at all would satisfy, so the call itself is required here.
 - `probe_lock` in src/scratch.rs must open the lock read-write and must never
   create it. The property is scoped to one function body.
-- No `as i64` cast inside the arguments of an `emit_counter(...)` call.
-  `debug::emit_counter` takes unsigned integers directly and saturates them
+- No `as i64` cast inside the arguments of a `.counter(...)` call.
+  `Invocation::counter` takes unsigned integers directly and saturates them
   at `i64::MAX`, where a cast wraps; rustfmt puts long arguments on their own
   line, so the call has to be read whole. A user-supplied u64 whose bit
   pattern is the meaning (degrade's drop seed) uses `cast_signed()`. The scan
@@ -100,12 +100,12 @@ def blank_comments_and_literals(src):
     return "".join(out)
 
 
-EMIT_CALL = re.compile(r"\bemit_counter\s*\(")
+EMIT_CALL = re.compile(r"\.\s*counter\s*\(")
 AS_I64 = re.compile(r"\bas\s+(?:r#)?i64\b")
 
 
 def counter_casts(src):
-    """(line, argument text) for every emit_counter call casting `as i64`."""
+    """(line, argument text) for every `.counter(` call casting `as i64`."""
     code = blank_comments_and_literals(src)
     found = []
     for m in EMIT_CALL.finditer(code):
@@ -124,20 +124,20 @@ def counter_casts(src):
 
 SELF_TEST = [
     # (source, expected number of flagged calls)
-    ('emit_counter("a", n as i64);', 1),
-    ('emit_counter(\n    "a",\n    n as i64,\n);', 1),
-    ('emit_counter ("a", (n) as\n i64);', 1),
-    ('emit_counter("a", n as r#i64);', 1),
-    ('emit_counter("a", n);', 0),
-    ('emit_counter("a", n); // emit_counter("b", m as i64)', 0),
-    ('/* emit_counter("b", m as i64) /* nested */ still */ emit_counter("a", n);', 0),
-    ('emit_counter("a (", n); let x = m as i64;', 0),
-    ('emit_counter(r#"a ) "# , n); let x = m as i64;', 0),
-    ("emit_counter('(', n); let x = m as i64;", 0),
-    ("fn f<'a>(x: &'a str) { emit_counter(x, n as i64); }", 1),
-    ('emit_counter("a", count!(as "text" i64));', 0),
-    ('emit_counter("a", v.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)));', 0),
-    ('let s = "emit_counter(\\"a\\", n as i64)";', 0),
+    ('inv.counter("a", n as i64);', 1),
+    ('inv.counter(\n    "a",\n    n as i64,\n);', 1),
+    ('inv.counter ("a", (n) as\n i64);', 1),
+    ('inv.counter("a", n as r#i64);', 1),
+    ('inv.counter("a", n);', 0),
+    ('inv.counter("a", n); // inv.counter("b", m as i64)', 0),
+    ('/* inv.counter("b", m as i64) /* nested */ still */ inv.counter("a", n);', 0),
+    ('inv.counter("a (", n); let x = m as i64;', 0),
+    ('inv.counter(r#"a ) "# , n); let x = m as i64;', 0),
+    ("inv.counter('(', n); let x = m as i64;", 0),
+    ("fn f<'a>(x: &'a str) { inv.counter(x, n as i64); }", 1),
+    ('inv.counter("a", count!(as "text" i64));', 0),
+    ('inv.counter("a", v.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)));', 0),
+    ('let s = "inv.counter(\\"a\\", n as i64)";', 0),
 ]
 
 for source, expected in SELF_TEST:
@@ -152,8 +152,8 @@ for pattern in ("src/**/*.rs", "cli/src/**/*.rs"):
     for path in sorted(root.glob(pattern)):
         for line, args in counter_casts(path.read_text()):
             errors.append(
-                f"{path.relative_to(root)}:{line}: emit_counter argument casts "
-                f"`as i64` ({args}); pass the unsigned value, emit_counter saturates it"
+                f"{path.relative_to(root)}:{line}: counter argument casts "
+                f"`as i64` ({args}); pass the unsigned value, Invocation::counter saturates it"
             )
 
 

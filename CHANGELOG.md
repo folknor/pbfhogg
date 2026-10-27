@@ -24,6 +24,15 @@
   `PbfWriter::new_in` open under a caller's host or token. A writer built by
   a tokenless constructor counts into its own, `PbfWriter::invocation`.
   `FileWriter` is a struct; its variants are no longer public.
+- **Instrumentation goes to the invocation's sink.** Every phase marker and
+  counter sample a run emits goes to its `Invocation`'s
+  `debug::InstrumentSink` (`Invocation::with_sink`), so concurrent library
+  calls no longer interleave on one process-wide stream. The library holds
+  no FIFO state: `debug::initialize_marker_fifo` and the free
+  `emit_marker` / `emit_counter` / `emit_mallinfo2` / `read_page_faults`
+  functions are gone; `debug::MarkerFifo::open` is the sidecar sink, with
+  the same wire format and clock. A sink that panics is switched off for
+  the rest of its run. The CLI's stream is unchanged.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming

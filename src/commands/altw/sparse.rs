@@ -234,9 +234,11 @@ pub(super) fn build_node_index_sparse(
 ) -> Result<SparseArrayIndex> {
     let t_rank = crate::counters::Stopwatch::start();
     let referenced = referenced.into_ranked();
-    crate::debug::emit_counter("altw_pass1_rank_index_ms", t_rank.elapsed_ms());
+    host.invocation
+        .counter("altw_pass1_rank_index_ms", t_rank.elapsed_ms());
     let total_bytes = referenced.total_count().saturating_mul(8);
-    crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes);
+    host.invocation
+        .counter("altw_pass1_store_bytes", total_bytes);
 
     // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
     // mmap both reject a zero length, so back the store with one unused slot.
@@ -313,9 +315,9 @@ pub(super) fn build_node_index_sparse(
         host,
     )?;
 
-    counters.emit_all();
+    counters.emit_all(&host.invocation);
 
-    advise_random_store(&mmap);
+    advise_random_store(&mmap, &host.invocation);
 
     Ok(SparseArrayIndex {
         referenced,
@@ -354,14 +356,14 @@ crate::counters::counter_set! {
 /// ordering, and the matched europe pair confirmed the opposite sign here:
 /// pass-2 disk read -57 %, pass-2 work -11.3 % (2026-07-16, `25cb0df`;
 /// reference/performance.md).
-fn advise_random_store(mmap: &memmap2::MmapMut) {
+fn advise_random_store(mmap: &memmap2::MmapMut, invocation: &crate::host::Invocation) {
     #[cfg(unix)]
     {
         let advised = mmap.advise(memmap2::Advice::Random).is_ok();
-        crate::debug::emit_counter("altw_pass1_madvise_random", i64::from(advised));
+        invocation.counter("altw_pass1_madvise_random", i64::from(advised));
     }
     #[cfg(not(unix))]
-    let _ = mmap;
+    let _ = (mmap, invocation);
 }
 
 #[cfg(test)]

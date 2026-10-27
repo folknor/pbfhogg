@@ -283,7 +283,7 @@ fn node_stats_inner(
         host,
     )?;
 
-    crate::debug::emit_marker("NODESTATS_START");
+    host.invocation.marker("NODESTATS_START");
 
     let (schedule, shared_file) =
         crate::scan::classify::build_classify_schedule(&pin, Some(crate::ElementKind::Node), host)?;
@@ -370,7 +370,7 @@ fn node_stats_inner(
         global.max_lon = 0;
     }
 
-    crate::debug::emit_marker("NODESTATS_END");
+    host.invocation.marker("NODESTATS_END");
     Ok(NodeStatsReport {
         node_count: global.node_count,
         min_lat: global.min_lat,

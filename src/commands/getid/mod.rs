@@ -515,9 +515,12 @@ fn getid_dispatched<'a>(
         )?;
         (Some(arm), stats)
     };
-    crate::debug::emit_counter("getid_nodes_written", result.nodes_written);
-    crate::debug::emit_counter("getid_ways_written", result.ways_written);
-    crate::debug::emit_counter("getid_relations_written", result.relations_written);
+    host.invocation
+        .counter("getid_nodes_written", result.nodes_written);
+    host.invocation
+        .counter("getid_ways_written", result.ways_written);
+    host.invocation
+        .counter("getid_relations_written", result.relations_written);
     Ok((arm, result))
 }
 
@@ -653,7 +656,7 @@ fn filter_by_id_walker(
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
 
-    crate::debug::emit_marker("GETID_SCAN_START");
+    host.invocation.marker("GETID_SCAN_START");
 
     // Single pread-based pass over blob headers. Data bodies are only
     // read (via pread) when the blob matters: OsmHeader (once, to emit
@@ -815,7 +818,8 @@ fn filter_by_id_walker(
     }
 
     let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
-    crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
+    host.invocation
+        .counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -833,7 +837,7 @@ fn filter_by_id_walker(
         );
     }
     writer.flush()?;
-    crate::debug::emit_marker("GETID_SCAN_END");
+    host.invocation.marker("GETID_SCAN_END");
     Ok(stats)
 }
 
@@ -862,7 +866,7 @@ fn filter_by_id_streaming(
     use crate::file_reader::FileReader;
     use crate::read::frame::Frames;
 
-    crate::debug::emit_marker("GETID_SCAN_START");
+    host.invocation.marker("GETID_SCAN_START");
 
     let blob_filter = BlobFilter::new(
         ids.node_ids.has_any(),
@@ -981,7 +985,8 @@ fn filter_by_id_streaming(
     }
 
     let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
-    crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
+    host.invocation
+        .counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -991,7 +996,7 @@ fn filter_by_id_streaming(
         );
     }
     writer.flush()?;
-    crate::debug::emit_marker("GETID_SCAN_END");
+    host.invocation.marker("GETID_SCAN_END");
     Ok(stats)
 }
 
@@ -1019,7 +1024,7 @@ fn getid_with_refs(
 
     // Pass 1: Collect ref node IDs from matching ways. Uses IdSet for O(1)
     // lookups in pass 2 instead of BTreeSet's O(log n).
-    crate::debug::emit_marker("GETID_PASS1_START");
+    host.invocation.marker("GETID_PASS1_START");
     let mut dep_node_ids = crate::idset::IdSet::new();
     let mut has_dep_nodes = false;
 
@@ -1062,17 +1067,18 @@ fn getid_with_refs(
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
     let strip_tags = opts.remove_tags && has_dep_nodes;
-    crate::debug::emit_marker("GETID_PASS1_END");
+    host.invocation.marker("GETID_PASS1_END");
     // Cheap one-time iteration; gives the dep-set size before pass 2
     // starts so the counter survives a SIGKILL during pass 2.
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("getid_dep_node_ids", dep_node_ids.iter().count());
+        host.invocation
+            .counter("getid_dep_node_ids", dep_node_ids.iter().count());
     }
 
     // Pass 2: Write matching elements + dependent nodes (transform fused into
     // the decode workers).
-    crate::debug::emit_marker("GETID_PASS2_START");
+    host.invocation.marker("GETID_PASS2_START");
     let reader = ElementReader::open_in(input, write.direct_reads, host)?;
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
@@ -1131,7 +1137,7 @@ fn getid_with_refs(
     )?;
 
     writer.flush()?;
-    crate::debug::emit_marker("GETID_PASS2_END");
+    host.invocation.marker("GETID_PASS2_END");
     Ok(stats)
 }
 

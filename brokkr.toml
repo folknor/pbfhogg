@@ -1430,17 +1430,17 @@ message = "the OSC gzip writer keeps its own parallel_gzip_* counters and proves
 # `emit_once` latch then turns the real end-of-invocation call into a no-op.
 # Only the end-of-invocation hook (`pbfhogg::write::emit_writer_counters`,
 # called once from the CLI's exit path) may emit. `emit` is private to
-# write/metrics.rs, so the argument-less `emit_once()` is the one spelling
-# to cover, inline (`metrics.writer.emit_once()`) or rustfmt-wrapped (a line
-# beginning with `.emit_once()`); the pattern matches both, and not
-# `Diagnostics::emit_once`, which takes arguments. Owners are
+# write/metrics.rs, so `emit_once(invocation)` is the one spelling to
+# cover, inline (`metrics.writer.emit_once(..)`) or rustfmt-wrapped (a line
+# beginning with `.emit_once(`); the pattern matches both. host.rs is
+# excluded for `Diagnostics::emit_once`, a different method. Owners are
 # write/metrics.rs (defines emit and emit_once), write/mod.rs (the hook) and
 # cli/src/lib.rs (the exit path that calls it).
 [[textlint]]
 name = "writer-counters-emitted-only-from-the-exit-hook"
-pattern = '\.\s*emit_once\s*\(\s*\)'
+pattern = '\.\s*emit_once\s*\('
 paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["src/write/metrics.rs", "src/write/mod.rs"]
+exclude = ["src/write/metrics.rs", "src/write/mod.rs", "src/host.rs"]
 region = "code"
 test_code = "skip"
 must_scan = [
@@ -1511,7 +1511,7 @@ must_scan = [
 message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
 
 # Presence of the CLI exit-path hook calls, the function-scoped probe_lock
-# open flags, and no `as i64` cast inside an emit_counter call's arguments
+# open flags, and no `as i64` cast inside a `.counter(` call's arguments
 # (which rustfmt wraps across lines): none fits a one-line forbid rule.
 [[script_check]]
 name = "source-invariants"

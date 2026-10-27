@@ -112,7 +112,7 @@ pub(super) fn relation_r1_collect_ids(
         .map_err(|e| task.locate(source, e))?;
     }
 
-    counters.emit(Phase::R1);
+    counters.emit(Phase::R1, cancel);
     Ok(())
 }
 

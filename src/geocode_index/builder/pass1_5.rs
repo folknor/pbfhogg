@@ -145,7 +145,8 @@ fn publish_negative_node_refs(
 /// the bounded ID sample.
 fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &crate::host::Host) {
     let negative_count = count.load(Ordering::Relaxed);
-    crate::debug::emit_counter("geocode_negative_node_refs", negative_count);
+    host.invocation
+        .counter("geocode_negative_node_refs", negative_count);
     if negative_count > 0 {
         let sample = sample
             .into_inner()
@@ -192,7 +193,7 @@ pub(super) fn run_pass1_5(
     // against the raw string table, then for each Way parse only id,
     // keys, vals, and refs - no StringTable UTF-8 validation, no
     // group_ranges allocation, no full PrimitiveBlock materialisation.
-    crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_START");
+    host.invocation.marker("GEOCODE_PASS1_5_SCAN_START");
     {
         let referenced_ref = &referenced_nodes;
         let literals = crate::scan::way::GeocodeTagLiterals::standard();
@@ -331,7 +332,7 @@ pub(super) fn run_pass1_5(
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
     }
-    crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_END");
+    host.invocation.marker("GEOCODE_PASS1_5_SCAN_END");
     Ok(referenced_nodes)
 }
 
@@ -467,9 +468,11 @@ pub(super) fn build_pass2_schedules(
     into_file_order(&mut node_schedule);
     into_file_order(&mut way_schedule);
 
-    crate::debug::emit_counter("pass2_node_blobs", node_schedule.len());
-    crate::debug::emit_counter("pass2_way_blobs", way_schedule.len());
-    crate::debug::emit_counter("pass2_max_node_id", max_node_id);
+    host.invocation
+        .counter("pass2_node_blobs", node_schedule.len());
+    host.invocation
+        .counter("pass2_way_blobs", way_schedule.len());
+    host.invocation.counter("pass2_max_node_id", max_node_id);
 
     Ok((node_schedule, way_schedule, max_node_id, shared_file))
 }

@@ -69,7 +69,7 @@ pub(super) fn try_extract_multi_single_pass(
                     "Multi-extract single-pass probe could not read the first blob: {}",
                     e.report()
                 );
-                crate::debug::emit_counter("multi_extract_probe_read_error", 1);
+                host.invocation.counter("multi_extract_probe_read_error", 1);
                 return Ok(None);
             }
             None => return Ok(None),
@@ -77,7 +77,7 @@ pub(super) fn try_extract_multi_single_pass(
     };
 
     let n = regions.len();
-    crate::debug::emit_marker("MULTI_EXTRACT_START");
+    host.invocation.marker("MULTI_EXTRACT_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -190,7 +190,7 @@ pub(super) fn try_extract_multi_single_pass(
     // starts at the beginning and consumes the leading frame without
     // re-judging it; the walker would accept a data blob there, so it is
     // not a second missing-header check.
-    crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
+    host.invocation.marker("MULTI_SCHEDULE_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -262,7 +262,7 @@ pub(super) fn try_extract_multi_single_pass(
             relation_schedule.push(entry);
         }
     }
-    crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_END");
+    host.invocation.marker("MULTI_SCHEDULE_SCAN_END");
 
     // DO NOT add per-region partial raw passthrough here (decode once,
     // write raw to contained regions, route elements to non-contained
@@ -338,13 +338,13 @@ pub(super) fn try_extract_multi_single_pass(
                 "extract.multi.grid_fallback",
                 "Multi-extract region grid declined {n} regions (coverage over budget or an empty interior); classifying nodes against every region"
             );
-            crate::debug::emit_counter("multi_extract_grid_fallback", 1);
+            host.invocation.counter("multi_extract_grid_fallback", 1);
         }
         grid
     } else {
         None
     };
-    crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
+    host.invocation.marker("MULTI_NODE_CLASSIFY_START");
     // Observed node count per node-schedule position, for passthrough
     // candidates that verified. See `Passthrough`.
     let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
@@ -485,7 +485,7 @@ pub(super) fn try_extract_multi_single_pass(
             host,
         )?;
     }
-    crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
+    host.invocation.marker("MULTI_NODE_CLASSIFY_END");
 
     // Settle every candidate: verified ones pass through counted by what
     // classify observed, the rest are decoded like any other blob.
@@ -508,7 +508,7 @@ pub(super) fn try_extract_multi_single_pass(
     warn_passthrough_demotions(verified_blobs, demoted_blobs, host);
 
     // Phase 1 write: parallel decode with raw passthrough for fully-contained node blobs.
-    crate::debug::emit_marker("MULTI_NODE_WRITE_START");
+    host.invocation.marker("MULTI_NODE_WRITE_START");
     multi_extract_pread_write_nodes(
         &shared_file,
         &node_schedule,
@@ -564,7 +564,7 @@ pub(super) fn try_extract_multi_single_pass(
         &mut stats,
         host,
     )?;
-    crate::debug::emit_marker("MULTI_NODE_WRITE_END");
+    host.invocation.marker("MULTI_NODE_WRITE_END");
 
     // Phase 2: Parallel way classification → N matched_way_ids.
     //
@@ -574,7 +574,7 @@ pub(super) fn try_extract_multi_single_pass(
     // phase above (see `|| vec![Vec::<i64>::new(); n]` there). Pre-
     // instrumentation Japan 5-region bench showed this phase at 892 ms
     // with the prior `|| ()` + per-block `vec![Vec::new(); n]` allocation.
-    crate::debug::emit_marker("MULTI_WAY_CLASSIFY_START");
+    host.invocation.marker("MULTI_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
@@ -618,10 +618,10 @@ pub(super) fn try_extract_multi_single_pass(
         },
         host,
     )?;
-    crate::debug::emit_marker("MULTI_WAY_CLASSIFY_END");
+    host.invocation.marker("MULTI_WAY_CLASSIFY_END");
 
     // Phase 2 write: parallel decode, write matching ways to N writers.
-    crate::debug::emit_marker("MULTI_WAY_WRITE_START");
+    host.invocation.marker("MULTI_WAY_WRITE_START");
     multi_extract_pread_write(
         &shared_file,
         &way_schedule,
@@ -653,10 +653,10 @@ pub(super) fn try_extract_multi_single_pass(
         |s| &mut s.ways_written,
         host,
     )?;
-    crate::debug::emit_marker("MULTI_WAY_WRITE_END");
+    host.invocation.marker("MULTI_WAY_WRITE_END");
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
-    crate::debug::emit_marker("MULTI_REL_CLASSIFY_START");
+    host.invocation.marker("MULTI_REL_CLASSIFY_START");
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
@@ -681,10 +681,10 @@ pub(super) fn try_extract_multi_single_pass(
         },
         host,
     )?;
-    crate::debug::emit_marker("MULTI_REL_CLASSIFY_END");
+    host.invocation.marker("MULTI_REL_CLASSIFY_END");
 
     // Phase 3 write: parallel decode, write matching relations to N writers.
-    crate::debug::emit_marker("MULTI_REL_WRITE_START");
+    host.invocation.marker("MULTI_REL_WRITE_START");
     multi_extract_pread_write(
         &shared_file,
         &relation_schedule,
@@ -716,7 +716,7 @@ pub(super) fn try_extract_multi_single_pass(
         |s| &mut s.relations_written,
         host,
     )?;
-    crate::debug::emit_marker("MULTI_REL_WRITE_END");
+    host.invocation.marker("MULTI_REL_WRITE_END");
 
     // Flush all writers (workers already flushed their BlockBuilders per blob).
     for (writer, output) in writers.iter_mut().zip(outputs.iter()) {
@@ -730,17 +730,23 @@ pub(super) fn try_extract_multi_single_pass(
     // `extract()` wrapper at the bottom of `pub fn extract` - the single-pass
     // path bypasses that wrapper, so without this block `brokkr sidecar
     // --counters` is empty for multi-extract runs.
-    crate::debug::emit_counter("multi_extract_region_count", n);
-    crate::debug::emit_counter("multi_extract_node_blobs", node_schedule.len());
-    crate::debug::emit_counter("multi_extract_way_blobs", way_schedule.len());
-    crate::debug::emit_counter("multi_extract_relation_blobs", relation_schedule.len());
+    host.invocation.counter("multi_extract_region_count", n);
+    host.invocation
+        .counter("multi_extract_node_blobs", node_schedule.len());
+    host.invocation
+        .counter("multi_extract_way_blobs", way_schedule.len());
+    host.invocation
+        .counter("multi_extract_relation_blobs", relation_schedule.len());
     let total_nodes: u64 = stats.iter().map(|s| s.nodes_in_bbox).sum();
     let total_ways: u64 = stats.iter().map(|s| s.ways_written).sum();
     let total_relations: u64 = stats.iter().map(|s| s.relations_written).sum();
-    crate::debug::emit_counter("multi_extract_nodes_written", total_nodes);
-    crate::debug::emit_counter("multi_extract_ways_written", total_ways);
-    crate::debug::emit_counter("multi_extract_relations_written", total_relations);
-    crate::debug::emit_marker("MULTI_EXTRACT_END");
+    host.invocation
+        .counter("multi_extract_nodes_written", total_nodes);
+    host.invocation
+        .counter("multi_extract_ways_written", total_ways);
+    host.invocation
+        .counter("multi_extract_relations_written", total_relations);
+    host.invocation.marker("MULTI_EXTRACT_END");
 
     Ok(Some(stats))
 }

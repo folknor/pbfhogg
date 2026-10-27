@@ -275,6 +275,121 @@ fn counters_are_per_invocation() {
     );
 }
 
+/// A sink that records what its invocation emitted.
+#[derive(Default)]
+struct RecordingSink {
+    markers: std::sync::Mutex<Vec<String>>,
+    counters: std::sync::Mutex<Vec<(String, i64)>>,
+}
+impl pbfhogg::debug::InstrumentSink for RecordingSink {
+    fn marker(&self, name: &str) {
+        self.markers.lock().expect("sink").push(name.to_owned());
+    }
+    fn counter(&self, name: &str, value: i64) {
+        self.counters
+            .lock()
+            .expect("sink")
+            .push((name.to_owned(), value));
+    }
+}
+
+/// Run cat over a fresh input of `count` nodes under `invocation`, then the
+/// end-of-invocation emitters, as the CLI does; returns the output size.
+fn instrumented_cat(count: i64, invocation: pbfhogg::host::Invocation) -> u64 {
+    let dir = crate::common::test_scratch();
+    let raw = dir.path().join("raw.pbf");
+    let nodes: Vec<_> = (1..=count)
+        .map(|id| crate::common::TestNode {
+            id,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    crate::common::write_multi_block_test_pbf(&raw, &nodes, &[], &[], 1);
+    let mut host = crate::common::test_host();
+    host.invocation = invocation;
+    let out = dir.path().join("indexed.pbf");
+    pbfhogg::cat::cat(
+        &[&raw],
+        crate::common::out(&out),
+        None,
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &host,
+    )
+    .expect("cat");
+    pbfhogg::write::emit_writer_counters(&host.invocation);
+    pbfhogg::read::emit_read_counters(&host.invocation);
+    std::fs::metadata(&out).expect("output").len()
+}
+
+/// Each invocation's markers and counters reach its own sink and no other:
+/// two concurrent runs, each sink sees its run's markers and its run's
+/// `writer_bytes_written`.
+#[test]
+fn instrumentation_reaches_only_the_invocations_own_sink() {
+    let results: Vec<(Arc<RecordingSink>, u64)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = [3_i64, 40]
+            .into_iter()
+            .map(|count| {
+                scope.spawn(move || {
+                    let sink = Arc::new(RecordingSink::default());
+                    let invocation = pbfhogg::host::Invocation::with_sink(
+                        Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
+                    );
+                    let size = instrumented_cat(count, invocation);
+                    (sink, size)
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().expect("run"))
+            .collect()
+    });
+    for (sink, size) in &results {
+        let markers = sink.markers.lock().expect("sink");
+        assert_eq!(
+            markers.iter().filter(|m| *m == "CAT_SCAN_START").count(),
+            1,
+            "{markers:?}"
+        );
+        let counters = sink.counters.lock().expect("sink");
+        let written: Vec<i64> = counters
+            .iter()
+            .filter(|(name, _)| name == "writer_bytes_written")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(written, [i64::try_from(*size).expect("size")]);
+    }
+}
+
+/// A sink that panics is switched off, and the run it observes completes.
+#[test]
+fn a_panicking_sink_does_not_fail_the_run() {
+    struct Panicking(std::sync::atomic::AtomicUsize);
+    impl pbfhogg::debug::InstrumentSink for Panicking {
+        fn marker(&self, _name: &str) {
+            self.0.fetch_add(1, Relaxed);
+            panic!("sink failure");
+        }
+        fn counter(&self, _name: &str, _value: i64) {
+            self.0.fetch_add(1, Relaxed);
+            panic!("sink failure");
+        }
+    }
+    let sink = Arc::new(Panicking(AtomicUsize::new(0)));
+    let invocation = pbfhogg::host::Invocation::with_sink(
+        Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    assert!(invocation.instrumented());
+    assert!(instrumented_cat(5, invocation.clone()) > 0);
+    assert!(!invocation.instrumented(), "the sink must be latched off");
+    assert_eq!(sink.0.load(Relaxed), 1, "no call after the first panic");
+}
+
 #[test]
 fn unrecognised_indexdata_warning_is_per_handle() {
     let sink = Arc::new(Recording::default());

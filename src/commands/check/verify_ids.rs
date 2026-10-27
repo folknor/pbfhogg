@@ -387,7 +387,7 @@ fn verify_ids_streaming_parallel(
 ) -> Result<VerifyIdsReport> {
     use crate::Element;
 
-    crate::debug::emit_marker("VERIFYIDS_SCAN_START");
+    host.invocation.marker("VERIFYIDS_SCAN_START");
 
     // Same arena cap as `--full`. The streaming workers do no per-element
     // allocation (just reads + push to a small per-blob within_violations
@@ -426,7 +426,7 @@ fn verify_ids_streaming_parallel(
     }
 
     if type_filter.nodes {
-        crate::debug::emit_marker("VERIFYIDS_NODES_START");
+        host.invocation.marker("VERIFYIDS_NODES_START");
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &node_schedule,
@@ -442,11 +442,11 @@ fn verify_ids_streaming_parallel(
         node_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_NODES_END");
+        host.invocation.marker("VERIFYIDS_NODES_END");
     }
 
     if type_filter.ways {
-        crate::debug::emit_marker("VERIFYIDS_WAYS_START");
+        host.invocation.marker("VERIFYIDS_WAYS_START");
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &way_schedule,
@@ -461,11 +461,11 @@ fn verify_ids_streaming_parallel(
         way_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_WAYS_END");
+        host.invocation.marker("VERIFYIDS_WAYS_END");
     }
 
     if type_filter.relations {
-        crate::debug::emit_marker("VERIFYIDS_RELATIONS_START");
+        host.invocation.marker("VERIFYIDS_RELATIONS_START");
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &rel_schedule,
@@ -480,10 +480,10 @@ fn verify_ids_streaming_parallel(
         relation_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_RELATIONS_END");
+        host.invocation.marker("VERIFYIDS_RELATIONS_END");
     }
 
-    crate::debug::emit_marker("VERIFYIDS_SCAN_END");
+    host.invocation.marker("VERIFYIDS_SCAN_END");
 
     Ok(VerifyIdsReport {
         header_sorted,
@@ -653,7 +653,7 @@ fn verify_ids_full_parallel(
 ) -> Result<VerifyIdsReport> {
     use crate::Element;
 
-    crate::debug::emit_marker("VERIFYIDS_SCAN_START");
+    host.invocation.marker("VERIFYIDS_SCAN_START");
 
     // Pread worker pool; same motivation as check_refs step #2.
     host.process.cross_thread_alloc_pool();
@@ -735,7 +735,7 @@ fn verify_ids_full_parallel(
 
     // Phase 1 - nodes
     if type_filter.nodes {
-        crate::debug::emit_marker("VERIFYIDS_NODES_START");
+        host.invocation.marker("VERIFYIDS_NODES_START");
         let node_ids_ref = &mut node_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
@@ -753,12 +753,12 @@ fn verify_ids_full_parallel(
         node_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_NODES_END");
+        host.invocation.marker("VERIFYIDS_NODES_END");
     }
 
     // Phase 2 - ways
     if type_filter.ways {
-        crate::debug::emit_marker("VERIFYIDS_WAYS_START");
+        host.invocation.marker("VERIFYIDS_WAYS_START");
         let way_ids_ref = &mut way_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
@@ -775,12 +775,12 @@ fn verify_ids_full_parallel(
         way_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_WAYS_END");
+        host.invocation.marker("VERIFYIDS_WAYS_END");
     }
 
     // Phase 3 - relations
     if type_filter.relations {
-        crate::debug::emit_marker("VERIFYIDS_RELATIONS_START");
+        host.invocation.marker("VERIFYIDS_RELATIONS_START");
         let relation_ids_ref = &mut relation_ids;
         let (count, phase_violations, phase_total) = verify_single_kind_parallel(
             &shared_file,
@@ -797,10 +797,10 @@ fn verify_ids_full_parallel(
         relation_count = count;
         total_violations += phase_total;
         violations.extend(phase_violations);
-        crate::debug::emit_marker("VERIFYIDS_RELATIONS_END");
+        host.invocation.marker("VERIFYIDS_RELATIONS_END");
     }
 
-    crate::debug::emit_marker("VERIFYIDS_SCAN_END");
+    host.invocation.marker("VERIFYIDS_SCAN_END");
 
     Ok(VerifyIdsReport {
         header_sorted,

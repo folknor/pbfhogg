@@ -42,16 +42,16 @@ pub(super) fn extract_complete_ways(
     };
 
     // --- Pass 1: Collect matches ---
-    crate::debug::emit_marker("COMPLETE_PASS1_START");
+    host.invocation.marker("COMPLETE_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
     let mut result =
         collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
-    crate::debug::emit_marker("COMPLETE_PASS1_END");
+    host.invocation.marker("COMPLETE_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
-    crate::debug::emit_marker("COMPLETE_PASS2_START");
-    crate::debug::emit_marker("COMPLETE_PASS2_SETUP_START");
+    host.invocation.marker("COMPLETE_PASS2_START");
+    host.invocation.marker("COMPLETE_PASS2_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader.leading_header()?;
@@ -80,8 +80,8 @@ pub(super) fn extract_complete_ways(
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    crate::debug::emit_marker("COMPLETE_PASS2_SETUP_END");
-    crate::debug::emit_marker("COMPLETE_PASS2_WRITE_START");
+    host.invocation.marker("COMPLETE_PASS2_SETUP_END");
+    host.invocation.marker("COMPLETE_PASS2_WRITE_START");
     // Reuse PASS1's pre-built blob schedule if available, falling back to
     // build_blob_schedule for the unsorted-fallback path. Avoids the second
     // post-PASS1 header scan and its cold-arena-page residency cascade.
@@ -107,8 +107,8 @@ pub(super) fn extract_complete_ways(
             host,
         )?;
     }
-    crate::debug::emit_marker("COMPLETE_PASS2_WRITE_END");
+    host.invocation.marker("COMPLETE_PASS2_WRITE_END");
 
-    crate::debug::emit_marker("COMPLETE_PASS2_END");
+    host.invocation.marker("COMPLETE_PASS2_END");
     Ok(stats)
 }

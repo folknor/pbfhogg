@@ -27,12 +27,12 @@ pub(crate) mod wire_schema;
 /// every decompression pool of the invocation (classify workers,
 /// command-specific readers, altw passthrough), not only the pipelined
 /// reader, which is why no per-pipeline path emits them. Counter names and
-/// FIFO framing are unchanged. Inert without an armed marker FIFO.
+/// FIFO framing are unchanged. Inert without a sink on the invocation.
 pub fn emit_read_counters(invocation: &crate::host::Invocation) {
     use std::sync::atomic::Ordering::Relaxed;
     let metrics = invocation.metrics();
     if metrics.read_emitted.swap(true, Relaxed) {
         return;
     }
-    pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress);
+    pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress, invocation);
 }

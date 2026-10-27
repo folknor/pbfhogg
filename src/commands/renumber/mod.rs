@@ -193,8 +193,8 @@ macro_rules! stage_counters {
 
             /// Emit every counter under its name for `stage`, in declaration
             /// order.
-            fn emit(&self, stage: Phase) {
-                self.for_each(stage, |name, value| crate::debug::emit_counter(name, value));
+            fn emit(&self, stage: Phase, invocation: &crate::host::Invocation) {
+                self.for_each(stage, |name, value| invocation.counter(name, value));
             }
         }
     };
@@ -481,15 +481,16 @@ pub(crate) fn renumber_external_to<'a>(
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
     let file_len = pin.metadata()?.len();
 
-    crate::debug::emit_marker("RENUMBER_EXT_START");
+    host.invocation.marker("RENUMBER_EXT_START");
 
     // ---- Blob schedule scan ----
     let t_sched = Stopwatch::start();
     let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(&pin, host)?;
-    crate::debug::emit_counter("renumber_ext_schedule_ms", t_sched.elapsed_ms());
+    host.invocation
+        .counter("renumber_ext_schedule_ms", t_sched.elapsed_ms());
 
     // ---- Pass 1: parallel node rewrite ----
-    crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
+    host.invocation.marker("RENUMBER_EXT_PASS1_START");
     let pass1_total_nodes: u64 = pass1_schedule
         .iter()
         .fold(0_u64, |acc, t| acc.saturating_add(t.element_count));
@@ -534,8 +535,9 @@ pub(crate) fn renumber_external_to<'a>(
             node_id_set.set(id);
         }
     }
-    crate::debug::emit_counter("renumber_ext_node_overflow_ids", overflow_ids);
-    crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
+    host.invocation
+        .counter("renumber_ext_node_overflow_ids", overflow_ids);
+    host.invocation.marker("RENUMBER_EXT_PASS1_END");
 
     // ---- Build rank index ----
     // Stage boundaries are checkpoints: the rank builds between the parallel
@@ -543,14 +545,16 @@ pub(crate) fn renumber_external_to<'a>(
     host.invocation.check()?;
     let t_rank = Stopwatch::start();
     let node_id_set = node_id_set.into_ranked();
-    crate::debug::emit_counter("renumber_ext_node_rank_ms", t_rank.elapsed_ms());
-    crate::debug::emit_counter("renumber_ext_node_map_entries", node_id_set.total_count());
+    host.invocation
+        .counter("renumber_ext_node_rank_ms", t_rank.elapsed_ms());
+    host.invocation
+        .counter("renumber_ext_node_map_entries", node_id_set.total_count());
     set_matches_written("node", node_id_set.total_count(), pass1.nodes_written)?;
     let nodes = IdSpace::new("node", &node_id_set, opts.start_node_id);
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     host.invocation.check()?;
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
+    host.invocation.marker("RENUMBER_EXT_STAGE2D_START");
     let mut way_id_sets: Vec<crate::idset::IdSet> = (0..RENUMBER_STAGE2D_WORKERS)
         .map(|_| crate::idset::IdSet::new())
         .collect();
@@ -563,10 +567,10 @@ pub(crate) fn renumber_external_to<'a>(
         &nodes,
         opts.start_way_id,
     )?;
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
+    host.invocation.marker("RENUMBER_EXT_STAGE2D_END");
 
     // ---- R1: collect relation IDs into IdSet ----
-    crate::debug::emit_marker("RENUMBER_EXT_R1_START");
+    host.invocation.marker("RENUMBER_EXT_R1_START");
     let t_way_merge = Stopwatch::start();
     let mut way_id_set = crate::idset::IdSet::new();
     for other in way_id_sets {
@@ -574,8 +578,10 @@ pub(crate) fn renumber_external_to<'a>(
     }
     host.invocation.check()?;
     let way_id_set = way_id_set.into_ranked();
-    crate::debug::emit_counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed_ms());
-    crate::debug::emit_counter("renumber_ext_way_map_entries", way_id_set.total_count());
+    host.invocation
+        .counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed_ms());
+    host.invocation
+        .counter("renumber_ext_way_map_entries", way_id_set.total_count());
     set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;
 
     let mut relation_id_set = crate::idset::IdSet::new();
@@ -588,17 +594,19 @@ pub(crate) fn renumber_external_to<'a>(
     )?;
     let t_rel_rank = Stopwatch::start();
     let relation_id_set = relation_id_set.into_ranked();
-    crate::debug::emit_counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed_ms());
+    host.invocation
+        .counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed_ms());
     let relation_count = relation_id_set.total_count();
-    crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_count);
+    host.invocation
+        .counter("renumber_ext_relation_map_entries", relation_count);
     // Relation IDs are `start + rank`; the largest rank is count - 1.
     if relation_count > 0 {
         positional_last_fits(opts.start_relation_id, relation_count, "relation")?;
     }
-    crate::debug::emit_marker("RENUMBER_EXT_R1_END");
+    host.invocation.marker("RENUMBER_EXT_R1_END");
 
     // ---- R2d: parallel wire-format rewrite of relations ----
-    crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
+    host.invocation.marker("RENUMBER_EXT_R2D_START");
     let r2d = relation_r2d_assembly(
         &shared_file,
         &source,
@@ -615,11 +623,11 @@ pub(crate) fn renumber_external_to<'a>(
     // numbering: a relation R1 collected but R2d did not write would leave
     // refs to it resolving as live while it is absent from the output.
     set_matches_written("relation", relation_count, r2d.relations_written)?;
-    crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
+    host.invocation.marker("RENUMBER_EXT_R2D_END");
 
     writer.flush()?;
 
-    crate::debug::emit_marker("RENUMBER_EXT_END");
+    host.invocation.marker("RENUMBER_EXT_END");
 
     Ok(RenumberStats {
         nodes_written: pass1.nodes_written,

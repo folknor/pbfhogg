@@ -42,6 +42,21 @@ pub struct Host {
 /// one ends the run through the same path a failure takes: workers wind
 /// down, scratch and staging are removed, nothing is published, and the
 /// call returns [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled).
+///
+/// # Instrumentation
+///
+/// The invocation is also the unit of instrumentation. Every engine counter
+/// a run records lands in its invocation
+/// ([`for_each_counter`](Self::for_each_counter)), and every phase marker and
+/// counter sample it emits goes to the invocation's
+/// [`InstrumentSink`](crate::debug::InstrumentSink), chosen at construction:
+/// [`new`](Self::new) has none, and the run emits nothing;
+/// [`with_sink`](Self::with_sink) delivers every marker and counter of the
+/// run there. The CLI hands its one invocation a
+/// [`MarkerFifo`](crate::debug::MarkerFifo), the sidecar profiler's FIFO.
+/// Two invocations are two streams; a caller that wants several runs on one
+/// stream gives each its own sink forwarding to a shared collector, so it can
+/// tell them apart.
 #[derive(Clone, Default)]
 pub struct Invocation(Arc<InvocationState>);
 
@@ -62,6 +77,10 @@ struct InvocationState {
     /// Every engine-level metric set of the invocation. Each set is on cache
     /// lines of its own (`counters::Padded`), apart from `tripped`.
     metrics: crate::counters::InvocationMetrics,
+    /// Where the run's markers and counter samples go, if anywhere.
+    sink: Option<Arc<dyn crate::debug::InstrumentSink>>,
+    /// Set once the sink has panicked: later emissions skip it.
+    sink_failed: std::sync::atomic::AtomicBool,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -79,10 +98,81 @@ impl std::fmt::Debug for Invocation {
 }
 
 impl Invocation {
-    /// A fresh, untripped token.
+    /// A fresh, untripped token with no instrumentation sink: the run's
+    /// counters are still recorded (and readable), but nothing is emitted.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh, untripped token whose run delivers every phase marker and
+    /// counter sample to `sink` (see [`InstrumentSink`](crate::debug::InstrumentSink)
+    /// for its contract).
+    #[must_use]
+    pub fn with_sink(sink: Arc<dyn crate::debug::InstrumentSink>) -> Self {
+        Self(Arc::new(InvocationState {
+            sink: Some(sink),
+            ..InvocationState::default()
+        }))
+    }
+
+    /// Whether this invocation has a working sink. Emission sites whose value
+    /// costs something to compute (an allocator query, a `/proc` sample) ask
+    /// first.
+    #[inline]
+    #[must_use]
+    pub fn instrumented(&self) -> bool {
+        self.0.sink.is_some()
+            && !self
+                .0
+                .sink_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Emit the phase marker `name` to the sink, if there is one.
+    #[inline]
+    pub(crate) fn marker(&self, name: &str) {
+        if self.0.sink.is_some() {
+            self.deliver(|sink| sink.marker(name));
+        }
+    }
+
+    /// Emit counter `name` with `value` to the sink, if there is one. The
+    /// wire value is an `i64`: signed values are sent exactly, unsigned ones
+    /// saturate at `i64::MAX` rather than wrap, so callers pass them as they
+    /// are instead of casting.
+    #[inline]
+    pub(crate) fn counter(&self, name: &str, value: impl crate::debug::CounterValue) {
+        if self.0.sink.is_some() {
+            let value = value.to_counter();
+            self.deliver(|sink| sink.counter(name, value));
+        }
+    }
+
+    /// Run `emit` against the sink with its unwinding contained: a sink that
+    /// panics is latched off for the rest of the invocation and the run
+    /// carries on, because instrumentation is observational and may neither
+    /// change a published result nor turn an unwind into an abort. The
+    /// caught payload is forgotten, not dropped: its destructor is caller
+    /// code too and could panic again. An emission already past the latch
+    /// when another thread's panics may still complete; later ones are
+    /// skipped. Panics that do not unwind (`panic = "abort"`, a panicking
+    /// panic hook) cannot be contained.
+    #[cold]
+    #[inline(never)]
+    fn deliver(&self, emit: impl FnOnce(&dyn crate::debug::InstrumentSink)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(sink) = self.0.sink.as_deref() else {
+            return;
+        };
+        if self.0.sink_failed.load(Relaxed) {
+            return;
+        }
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(sink)))
+        {
+            self.0.sink_failed.store(true, Relaxed);
+            std::mem::forget(payload);
+        }
     }
 
     /// Request cancellation. Every run observing this token (or a clone)

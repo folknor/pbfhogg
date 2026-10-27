@@ -45,6 +45,7 @@ impl UnindexedFilterNote {
         &mut self,
         blob_result: &crate::error::Result<crate::blob::Blob>,
         diagnostics: &crate::host::Diagnostics,
+        invocation: &crate::host::Invocation,
     ) {
         if !self.pending {
             return;
@@ -63,7 +64,7 @@ impl UnindexedFilterNote {
                 "reader.filter_without_indexdata",
                 "Input has no indexdata on its first data blob; blob type and spatial filters cannot skip unindexed blobs"
             );
-            crate::debug::emit_counter("pipeline_filter_without_indexdata", 1);
+            invocation.counter("pipeline_filter_without_indexdata", 1);
         }
     }
 }
@@ -515,12 +516,12 @@ where
         sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
 
     // Declared before the scope so it drops after the scope has joined.
-    let _emit = EmitOnDrop(metrics);
+    let _emit = EmitOnDrop(metrics, invocation);
     let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
-                unindexed.observe(&blob_result, &diagnostics);
+                unindexed.observe(&blob_result, &diagnostics, invocation);
                 let t_send = crate::counters::Stopwatch::start();
                 let send_result = raw_tx.send((seq, blob_result));
                 t_send.record_ns(&metrics.raw_send_wait_ns);
@@ -661,11 +662,11 @@ where
 /// scope has joined its stages, whether the run returned or unwound. The same
 /// mechanism as the ordered pool engine's and the unordered classify pools'
 /// guards.
-struct EmitOnDrop<'a>(&'a PipelineMetrics);
+struct EmitOnDrop<'a>(&'a PipelineMetrics, &'a crate::host::Invocation);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.emit();
+        self.0.emit(self.1);
     }
 }
 

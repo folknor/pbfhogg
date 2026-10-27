@@ -57,7 +57,7 @@ pub(super) fn scan_blob_metadata(
     parse_tagdata: bool,
     host: &crate::host::Host,
 ) -> Result<Vec<BlobMeta>> {
-    crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
+    host.invocation.marker("ALTW_BLOB_META_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -111,11 +111,12 @@ pub(super) fn scan_blob_metadata(
             has_tags,
         });
     }
-    crate::debug::emit_marker("ALTW_BLOB_META_SCAN_END");
+    host.invocation.marker("ALTW_BLOB_META_SCAN_END");
 
-    crate::debug::emit_counter("altw_meta_node_blobs", node_blobs);
-    crate::debug::emit_counter("altw_meta_way_blobs", way_blobs);
-    crate::debug::emit_counter("altw_meta_relation_blobs", relation_blobs);
+    host.invocation.counter("altw_meta_node_blobs", node_blobs);
+    host.invocation.counter("altw_meta_way_blobs", way_blobs);
+    host.invocation
+        .counter("altw_meta_relation_blobs", relation_blobs);
     Ok(metas)
 }
 

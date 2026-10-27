@@ -393,7 +393,7 @@ fn build_generation(
     // Pass 1: Relations - collect admin boundary metadata + way member IDs
     // (Runs first so we know which way IDs to collect in pass 3.)
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_PASS1_START");
+    host.invocation.marker("GEOCODE_PASS1_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -425,7 +425,7 @@ fn build_generation(
     // page-cache working set follows the referenced subset rather than every
     // node in the file. Same pattern as ALTW pass 0.
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_PASS1_END");
+    host.invocation.marker("GEOCODE_PASS1_END");
     // Every pass boundary is a checkpoint; the passes check their own blob
     // reads, results and chunks in between.
     host.invocation.check()?;
@@ -439,12 +439,12 @@ fn build_generation(
     // Pass 2a's `build_classify_schedule(Node)` call. Consolidated walker
     // saves ~26 s at Europe / ~80 s at planet (2026-04-18 bench `bf8f2038`).
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_SCHEDULES_START");
+    host.invocation.marker("GEOCODE_SCHEDULES_START");
     let (node_schedule, way_schedule, max_node_id, shared_file) =
         pass1_5::build_pass2_schedules(&input, host)?;
-    crate::debug::emit_marker("GEOCODE_SCHEDULES_END");
+    host.invocation.marker("GEOCODE_SCHEDULES_END");
 
-    crate::debug::emit_marker("GEOCODE_PASS1_5_START");
+    host.invocation.marker("GEOCODE_PASS1_5_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -459,7 +459,7 @@ fn build_generation(
         &needed_admin_ways,
         host,
     )?;
-    crate::debug::emit_marker("GEOCODE_PASS1_5_END");
+    host.invocation.marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
     // Pass 2: Nodes + Ways (fused single scan)
@@ -469,7 +469,7 @@ fn build_generation(
     // the dense coordinate index for referenced nodes + address points), then
     // ways (streets, buildings, interpolation, admin geometry).
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_PASS2_START");
+    host.invocation.marker("GEOCODE_PASS2_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -484,7 +484,7 @@ fn build_generation(
     // footprint is in reference/performance.md; externalizing them needs a
     // coordinated streaming and external-merge design because later passes
     // consume each collection.
-    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
+    host.invocation.marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
         street_way_count,
@@ -510,7 +510,7 @@ fn build_generation(
     drop(shared_file);
     // Pass 2 was the input's last reader.
     drop(input);
-    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
+    host.invocation.marker("GEOCODE_PASS2_SCAN_END");
     host.invocation.check()?;
 
     // Ring assembly + simplification.
@@ -523,13 +523,14 @@ fn build_generation(
     // polygon in a hot loop. If a stop ever proves too slow, the fix is to
     // chunk the pass and check per chunk, with a matched A/B showing the
     // untripped check costs nothing.
-    crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
+    host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let (admin_polygons, dropped_admin) =
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
     let missing_admin_geometry = admin::missing_admin_way_geometry(&admin_relations, &way_geom);
     let dropped_admin_relations = dropped_admin.total;
-    crate::debug::emit_counter("geocode_admin_relation_drops", dropped_admin_relations);
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("geocode_admin_relation_drops", dropped_admin_relations);
+    host.invocation.counter(
         "geocode_admin_way_member_refs_without_geometry",
         missing_admin_geometry.member_refs,
     );
@@ -576,7 +577,7 @@ fn build_generation(
             dropped_admin.over_budget
         );
     }
-    crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
+    host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
     host.invocation.check()?;
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
     // boundaries extract with no addressable content) and an
@@ -600,7 +601,7 @@ fn build_generation(
     // -----------------------------------------------------------------------
     // Interpolation endpoint resolution (reads from mmap'd addr_points.bin)
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
+    host.invocation.marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
     strings.validate()?;
     checked_count(interp_ways.len(), "interpolation ways")?;
     let resolved = interp::resolve_interpolation_endpoints_mmap(
@@ -610,6 +611,7 @@ fn build_generation(
         &strings,
         config.street_level,
         &host.executor,
+        &host.invocation,
     );
     let mut unresolved_interpolation_count = 0_u64;
     let mut unresolved_interpolation_ids = Vec::new();
@@ -619,7 +621,7 @@ fn build_generation(
             sample_id(&mut unresolved_interpolation_ids, way.way_id);
         }
     }
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "geocode_unresolved_interpolation_ways",
         unresolved_interpolation_count,
     );
@@ -639,11 +641,11 @@ fn build_generation(
         "  {resolved}/{} interpolation ways resolved",
         interp_ways.len()
     );
-    crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
+    host.invocation.marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
     host.invocation.check()?;
 
     // Write interp_ways.bin now (after resolution has set start/end numbers)
-    crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
+    host.invocation.marker("GEOCODE_PASS2_WRITE_START");
     {
         let mut iw_out = create_data_file(&output_dir.join(FILE_INTERP_WAYS))?;
         for iw in &interp_ways {
@@ -669,12 +671,12 @@ fn build_generation(
     }
     admin::write_admin_data(output_dir, &admin_polygons)?;
     write_data_file(&output_dir.join(FILE_STRINGS), &strings.data)?;
-    crate::debug::emit_marker("GEOCODE_PASS2_WRITE_END");
+    host.invocation.marker("GEOCODE_PASS2_WRITE_END");
 
     // -----------------------------------------------------------------------
-    crate::debug::emit_marker("GEOCODE_PASS2_END");
+    host.invocation.marker("GEOCODE_PASS2_END");
     host.invocation.check()?;
-    crate::debug::emit_marker("GEOCODE_PASS3_START");
+    host.invocation.marker("GEOCODE_PASS3_START");
     // Pass 3: Bucketed S2 cell assignment + write cell index files
     //
     // Instead of accumulating all cell entries in RAM, where they grow with
@@ -695,10 +697,10 @@ fn build_generation(
     let interp_way_count = interp_ways.len();
 
     // Admin cells are small enough to stay in memory
-    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_START");
+    host.invocation.marker("GEOCODE_PASS3_ADMIN_CELLS_START");
     let admin_cell_entries =
         pass3::assign_admin_cells(&admin_polygons, config.admin_level, &host.executor);
-    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_END");
+    host.invocation.marker("GEOCODE_PASS3_ADMIN_CELLS_END");
     host.invocation.check()?;
 
     // Fused fine + coarse cell assignment (plan item #4). Single Stage A
@@ -706,7 +708,7 @@ fn build_generation(
     // cells on the fly via S2 parent + per-segment dedup, eliminating
     // the duplicate `cover_segment` pass that ran separately at coarse
     // level. Two Stage B invocations follow - one per bucket tree.
-    crate::debug::emit_marker("GEOCODE_PASS3_CELLS_START");
+    host.invocation.marker("GEOCODE_PASS3_CELLS_START");
     let (fine_count, coarse_count) =
         pass3::bucketed_cell_assignment_fused(&pass3::FusedCellAssignmentParams {
             output_dir,
@@ -731,10 +733,10 @@ fn build_generation(
             executor: &host.executor,
             cancel: &host.invocation,
         })?;
-    crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
-    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
+    host.invocation.marker("GEOCODE_PASS3_CELLS_END");
+    host.invocation.marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(output_dir, &mut { admin_cell_entries })?;
-    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");
+    host.invocation.marker("GEOCODE_PASS3_ADMIN_INDEX_END");
     host.invocation.check()?;
 
     crate::host::diag!(
@@ -816,7 +818,7 @@ fn build_generation(
             SmokeOutcome::SkippedNoAddressPoints
         }
     };
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "geocode_smoke_test_no_match",
         matches!(smoke_test, SmokeOutcome::NoMatch { .. }),
     );
@@ -922,7 +924,7 @@ fn build_generation(
             strings.unique_count()
         );
     }
-    crate::debug::emit_marker("GEOCODE_PASS3_END");
+    host.invocation.marker("GEOCODE_PASS3_END");
 
     Ok(stats)
 }

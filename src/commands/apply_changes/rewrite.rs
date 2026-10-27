@@ -350,7 +350,8 @@ pub(crate) fn merge_to<'a>(
     });
     if locations_on_ways {
         let probe_bytes = probe.heap_bytes();
-        crate::debug::emit_counter("merge_loc_refresh_probe_bytes", probe_bytes);
+        host.invocation
+            .counter("merge_loc_refresh_probe_bytes", probe_bytes);
         #[allow(clippy::cast_precision_loss)]
         let probe_mb = probe_bytes as f64 / (1024.0 * 1024.0);
         crate::host::diag!(
@@ -422,7 +423,7 @@ pub(crate) fn merge_to<'a>(
             APPLY_CHANGES_WORKERS_FALLBACK,
         )
     });
-    crate::debug::emit_counter("merge_worker_count", worker_count);
+    host.invocation.counter("merge_worker_count", worker_count);
 
     // Channels.
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainMessage>(DRAIN_CHANNEL_CAPACITY);
@@ -522,7 +523,7 @@ pub(crate) fn merge_to<'a>(
     };
     let drain_channels = DrainChannels { drain_rx };
 
-    crate::debug::emit_marker("MERGE_LOOP_START");
+    host.invocation.marker("MERGE_LOOP_START");
     let pipeline_start = crate::counters::Stopwatch::start();
 
     // Drain runs in this (the merge() caller's) thread because it owns
@@ -574,7 +575,7 @@ pub(crate) fn merge_to<'a>(
     })?;
 
     let pipeline_ms = pipeline_start.elapsed_ms();
-    crate::debug::emit_marker("MERGE_LOOP_END");
+    host.invocation.marker("MERGE_LOOP_END");
 
     let mut final_stats = stats;
     final_stats.diff_heap_bytes = diff_heap_bytes;
@@ -615,43 +616,63 @@ pub(crate) fn merge_to<'a>(
     // other command. Writing it here too printed it twice on the CLI.
 
     // Surface phase counters that callers expect from the legacy shape.
-    crate::debug::emit_counter("merge_osc_parse_ms", osc_parse_ms);
-    crate::debug::emit_counter("merge_diffranges_ms", diffranges_ms);
-    crate::debug::emit_counter("merge_header_read_ms", header_read_ms);
-    crate::debug::emit_counter("merge_writer_setup_ms", writer_setup_ms);
-    crate::debug::emit_counter("merge_pipeline_ms", pipeline_ms);
+    host.invocation.counter("merge_osc_parse_ms", osc_parse_ms);
+    host.invocation
+        .counter("merge_diffranges_ms", diffranges_ms);
+    host.invocation
+        .counter("merge_header_read_ms", header_read_ms);
+    host.invocation
+        .counter("merge_writer_setup_ms", writer_setup_ms);
+    host.invocation.counter("merge_pipeline_ms", pipeline_ms);
 
-    crate::debug::emit_counter("merge_blobs_passthrough", final_stats.blobs_passthrough);
-    crate::debug::emit_counter("merge_blobs_rewritten", final_stats.blobs_rewritten);
-    crate::debug::emit_counter("merge_blobs_index_hit", final_stats.blobs_index_hit);
-    crate::debug::emit_counter("merge_total_elements", final_stats.total_elements());
-    crate::debug::emit_counter("merge_deleted", final_stats.deleted);
-    crate::debug::emit_counter("merge_diff_nodes", final_stats.diff_nodes);
-    crate::debug::emit_counter("merge_diff_ways", final_stats.diff_ways);
-    crate::debug::emit_counter("merge_diff_relations", final_stats.diff_relations);
-    crate::debug::emit_counter("merge_bytes_passthrough", final_stats.bytes_passthrough);
-    crate::debug::emit_counter("merge_bytes_rewritten", final_stats.bytes_rewritten);
-    crate::debug::emit_counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes);
+    host.invocation
+        .counter("merge_blobs_passthrough", final_stats.blobs_passthrough);
+    host.invocation
+        .counter("merge_blobs_rewritten", final_stats.blobs_rewritten);
+    host.invocation
+        .counter("merge_blobs_index_hit", final_stats.blobs_index_hit);
+    host.invocation
+        .counter("merge_total_elements", final_stats.total_elements());
+    host.invocation
+        .counter("merge_deleted", final_stats.deleted);
+    host.invocation
+        .counter("merge_diff_nodes", final_stats.diff_nodes);
+    host.invocation
+        .counter("merge_diff_ways", final_stats.diff_ways);
+    host.invocation
+        .counter("merge_diff_relations", final_stats.diff_relations);
+    host.invocation
+        .counter("merge_bytes_passthrough", final_stats.bytes_passthrough);
+    host.invocation
+        .counter("merge_bytes_rewritten", final_stats.bytes_rewritten);
+    host.invocation
+        .counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes);
     if locations_on_ways {
-        crate::debug::emit_counter("merge_loc_needed", final_stats.loc_nodes_needed);
-        crate::debug::emit_counter("merge_loc_from_diff", final_stats.loc_nodes_from_diff);
-        crate::debug::emit_counter("merge_loc_from_base", final_stats.loc_nodes_from_base);
-        crate::debug::emit_counter("merge_loc_missing", final_stats.loc_missing);
-        crate::debug::emit_counter(
+        host.invocation
+            .counter("merge_loc_needed", final_stats.loc_nodes_needed);
+        host.invocation
+            .counter("merge_loc_from_diff", final_stats.loc_nodes_from_diff);
+        host.invocation
+            .counter("merge_loc_from_base", final_stats.loc_nodes_from_base);
+        host.invocation
+            .counter("merge_loc_missing", final_stats.loc_missing);
+        host.invocation.counter(
             "merge_loc_node_blobs_scanned",
             final_stats.loc_node_blobs_scanned,
         );
-        crate::debug::emit_counter(
+        host.invocation.counter(
             "merge_loc_refresh_blobs_scanned",
             final_stats.loc_refresh_blobs_scanned,
         );
-        crate::debug::emit_counter(
+        host.invocation.counter(
             "merge_loc_refresh_only_blobs",
             final_stats.loc_refresh_only_blobs,
         );
-        crate::debug::emit_counter("merge_loc_refreshed_ways", final_stats.loc_refreshed_ways);
-        crate::debug::emit_counter("merge_loc_refreshed_refs", final_stats.loc_refreshed_refs);
-        crate::debug::emit_counter(
+        host.invocation
+            .counter("merge_loc_refreshed_ways", final_stats.loc_refreshed_ways);
+        host.invocation
+            .counter("merge_loc_refreshed_refs", final_stats.loc_refreshed_refs);
+        host.invocation.counter(
             "merge_loc_deleted_node_refs",
             final_stats.loc_deleted_node_refs,
         );

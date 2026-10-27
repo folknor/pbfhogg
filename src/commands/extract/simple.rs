@@ -143,7 +143,7 @@ fn extract_simple_two_pass(
         direct_reads: direct_io,
         ..
     } = *write;
-    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_START");
+    host.invocation.marker("SIMPLE_UNSORTED_PASS1_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -206,9 +206,9 @@ fn extract_simple_two_pass(
             );
         }
     }
-    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_END");
+    host.invocation.marker("SIMPLE_UNSORTED_PASS1_END");
 
-    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_START");
+    host.invocation.marker("SIMPLE_UNSORTED_PASS2_START");
     let all_way_node_ids = IdSet::new();
 
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
@@ -253,7 +253,7 @@ fn extract_simple_two_pass(
     }
 
     writer.flush()?;
-    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_END");
+    host.invocation.marker("SIMPLE_UNSORTED_PASS2_END");
     Ok(stats)
 }
 
@@ -289,7 +289,7 @@ fn extract_simple_single_pass(
         direct_reads: direct_io,
         ..
     } = *write;
-    crate::debug::emit_marker("EXTRACT_SCAN_START");
+    host.invocation.marker("EXTRACT_SCAN_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -384,7 +384,7 @@ fn extract_simple_single_pass(
     // Workers pread node blobs, decompress, scan with node-only scanner,
     // check bbox (pure function), send matching IDs to consumer.
     // Consumer merges into bbox_node_ids. No shared mutable state in workers.
-    crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_START");
+    host.invocation.marker("SIMPLE_NODE_CLASSIFY_START");
     let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
     {
         let classify_schedule = scheduled(&node_schedule)?;
@@ -433,9 +433,9 @@ fn extract_simple_single_pass(
             host,
         )?;
     }
-    crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
+    host.invocation.marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
-    crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
+    host.invocation.marker("SIMPLE_NODE_WRITE_START");
     let node_descs = settle_passthrough_candidates(&node_schedule, &verified_nodes, host);
     {
         let ids = ExtractPass2IdSets {
@@ -465,9 +465,9 @@ fn extract_simple_single_pass(
         )?;
     }
 
-    crate::debug::emit_marker("SIMPLE_NODE_WRITE_END");
+    host.invocation.marker("SIMPLE_NODE_WRITE_END");
     // --- Phase 2: Classify ways (scanner) + write ways (pread-from-workers) ---
-    crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_START");
+    host.invocation.marker("SIMPLE_WAY_CLASSIFY_START");
     {
         let classify_schedule = scheduled(&way_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
@@ -499,9 +499,9 @@ fn extract_simple_single_pass(
             host,
         )?;
     }
-    crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_END");
+    host.invocation.marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
-    crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
+    host.invocation.marker("SIMPLE_WAY_WRITE_START");
     let way_descs: Vec<BlobDesc> = way_schedule
         .iter()
         .map(|d| BlobDesc {
@@ -537,9 +537,9 @@ fn extract_simple_single_pass(
         )?;
     }
 
-    crate::debug::emit_marker("SIMPLE_WAY_WRITE_END");
+    host.invocation.marker("SIMPLE_WAY_WRITE_END");
     // --- Phase 3: Classify relations + write (pread-from-workers) ---
-    crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
+    host.invocation.marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
         let rel_classify_schedule = scheduled(&relation_schedule)?;
@@ -565,8 +565,8 @@ fn extract_simple_single_pass(
             host,
         )?;
     }
-    crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
-    crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
+    host.invocation.marker("SIMPLE_REL_CLASSIFY_END");
+    host.invocation.marker("SIMPLE_REL_WRITE_START");
     let rel_descs: Vec<BlobDesc> = relation_schedule
         .iter()
         .map(|d| BlobDesc {
@@ -602,9 +602,9 @@ fn extract_simple_single_pass(
         )?;
     }
 
-    crate::debug::emit_marker("SIMPLE_REL_WRITE_END");
+    host.invocation.marker("SIMPLE_REL_WRITE_END");
     writer.flush()?;
-    crate::debug::emit_marker("EXTRACT_SCAN_END");
+    host.invocation.marker("EXTRACT_SCAN_END");
     Ok(stats)
 }
 

@@ -191,11 +191,11 @@ crate::counters::counter_set! {
 
 /// Emits a metrics set when dropped: after the run's scope has joined its
 /// workers, whether the run returned or unwound.
-struct EmitOnDrop<'a>(&'a OrderedPoolMetrics);
+struct EmitOnDrop<'a>(&'a OrderedPoolMetrics, &'a crate::host::Invocation);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.emit_all();
+        self.0.emit_all(self.1);
     }
 }
 
@@ -671,7 +671,7 @@ where
     let queue_depth = AtomicUsize::new(0);
     // Declared before the scope, so it drops after the scope has joined the
     // workers, on a return or an unwind alike.
-    let _emit = EmitOnDrop(metrics);
+    let _emit = EmitOnDrop(metrics, cancel);
 
     std::thread::scope(|scope| -> crate::Result<()> {
         // A local of this closure, so every return drops it before the scope
@@ -1014,7 +1014,7 @@ where
     let abandoned = AtomicBool::new(false);
     // Declared before the scope, so it drops after the scope has joined the
     // workers, on a return or an unwind alike.
-    let _emit = EmitOnDrop(metrics);
+    let _emit = EmitOnDrop(metrics, cancel);
 
     std::thread::scope(|scope| -> crate::Result<()> {
         // Every channel end below is a local of this closure, so any return

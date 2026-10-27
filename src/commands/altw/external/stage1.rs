@@ -211,8 +211,11 @@ fn shard_error(
 }
 
 /// Build the way-blob schedule from the shared blob metadata scan.
-pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
-    crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_START");
+pub(super) fn build_way_schedule(
+    blob_meta: &[BlobMeta],
+    invocation: &crate::host::Invocation,
+) -> Vec<WayBlobTask> {
+    invocation.marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = crate::counters::Stopwatch::start();
     let mut schedule: Vec<WayBlobTask> = Vec::new();
     let mut seq: u32 = 0;
@@ -227,9 +230,9 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
         });
         seq += 1;
     }
-    crate::debug::emit_counter("s1_way_schedule_blobs", schedule.len());
-    crate::debug::emit_counter("s1_way_schedule_build_ms", t0.elapsed_ms());
-    crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_END");
+    invocation.counter("s1_way_schedule_blobs", schedule.len());
+    invocation.counter("s1_way_schedule_build_ms", t0.elapsed_ms());
+    invocation.marker("EXTJOIN_S1_WAY_SCHEDULE_END");
     schedule
 }
 
@@ -260,7 +263,7 @@ pub(super) fn stage1_pass_a(
     let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
     let input = input.path();
 
-    crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
+    host.invocation.marker("EXTJOIN_S1_PASS_A_START");
 
     let counters = PassACounters::new();
     let counters_ref = &counters;
@@ -467,8 +470,8 @@ pub(super) fn stage1_pass_a(
     flush_result?;
     let total_refs = consumer.finish()?;
 
-    counters.emit_all();
-    crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
+    counters.emit_all(&host.invocation);
+    host.invocation.marker("EXTJOIN_S1_PASS_A_END");
 
     let mut id_bucket_counts: Vec<u64> = vec![0; NUM_BUCKETS];
     for shard in &shards {
@@ -491,8 +494,11 @@ pub(super) fn stage1_pass_a(
 /// `blob_meta::scan_blob_metadata` refused the input otherwise; that scan
 /// is the trust boundary, so nothing is re-checked here.
 #[hotpath::measure]
-pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Vec<NodeBlobInfo> {
-    crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
+pub(super) fn build_node_blob_mapping(
+    blob_meta: &[BlobMeta],
+    invocation: &crate::host::Invocation,
+) -> Vec<NodeBlobInfo> {
+    invocation.marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = crate::counters::Stopwatch::start();
 
     let mut mapping: Vec<NodeBlobInfo> = Vec::new();
@@ -509,9 +515,9 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Vec<NodeBlobInf
         });
     }
 
-    crate::debug::emit_counter("s1_node_map_blobs", mapping.len());
-    crate::debug::emit_counter("s1_node_map_build_ms", t0.elapsed_ms());
-    crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_END");
+    invocation.counter("s1_node_map_blobs", mapping.len());
+    invocation.counter("s1_node_map_build_ms", t0.elapsed_ms());
+    invocation.marker("EXTJOIN_S1_NODE_MAP_END");
     mapping
 }
 
@@ -536,7 +542,7 @@ pub(super) fn stage1_way_pass(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<Stage1Output> {
-    let schedule = build_way_schedule(blob_meta);
+    let schedule = build_way_schedule(blob_meta, &host.invocation);
 
     // Cap num_workers against the file descriptor allowance. Pass A
     // below holds `num_workers * NUM_BUCKETS` id-shard files open
@@ -596,11 +602,12 @@ pub(super) fn stage1_way_pass(
         );
     }
     if let Some(probe) = fd_budget.probe {
-        crate::debug::emit_counter("extjoin_nofile_soft_cap", probe.soft_limit);
+        host.invocation
+            .counter("extjoin_nofile_soft_cap", probe.soft_limit);
     }
-    crate::debug::emit_counter("extjoin_fd_available", available);
-    crate::debug::emit_counter("extjoin_cpu_cap_workers", cpu_cap);
-    crate::debug::emit_counter("extjoin_fd_cap_workers", fd_cap);
+    host.invocation.counter("extjoin_fd_available", available);
+    host.invocation.counter("extjoin_cpu_cap_workers", cpu_cap);
+    host.invocation.counter("extjoin_fd_cap_workers", fd_cap);
 
     let (total_refs, id_bucket_counts) = stage1_pass_a(
         input,
@@ -615,7 +622,7 @@ pub(super) fn stage1_way_pass(
     )?;
 
     // Build the per-blob mapping (header-only walk - no decompression).
-    let node_blob_mapping = build_node_blob_mapping(blob_meta);
+    let node_blob_mapping = build_node_blob_mapping(blob_meta, &host.invocation);
 
     Ok(Stage1Output {
         total_slots: total_refs,

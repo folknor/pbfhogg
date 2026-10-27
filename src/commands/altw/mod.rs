@@ -462,30 +462,31 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // nodes need coordinate lookups, so only these get indexed. The store
     // therefore follows the referenced-node working set rather than every
     // node in the input; see `reference/performance.md` for measurements.
-    crate::debug::emit_marker("ALTW_PASS0_START");
+    host.invocation.marker("ALTW_PASS0_START");
     let (referenced, shared) = collect_way_referenced_node_ids(
         input,
         options.write.direct_reads,
         options.inject_prepass,
         host,
     )?;
-    crate::debug::emit_marker("ALTW_PASS0_END");
+    host.invocation.marker("ALTW_PASS0_END");
     // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
     // the index build so the counter survives SIGKILL during pass 1.
-    crate::debug::emit_counter("altw_referenced_node_ids", referenced.iter().count());
-    crate::debug::emit_counter("altw_index_kind", 1);
+    host.invocation
+        .counter("altw_referenced_node_ids", referenced.iter().count());
+    host.invocation.counter("altw_index_kind", 1);
 
-    crate::debug::emit_marker("ALTW_PASS1_START");
+    host.invocation.marker("ALTW_PASS1_START");
     let index =
         build_node_index_sparse(input, options.write.direct_reads, scratch, referenced, host)?;
     #[cfg(test)]
     let index = NodeIndex::Sparse(index);
-    crate::debug::emit_marker("ALTW_PASS1_END");
+    host.invocation.marker("ALTW_PASS1_END");
 
     let relation_scan = if options.keep_untagged_nodes && !options.inject_prepass {
         (None, None)
     } else {
-        crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_START");
+        host.invocation.marker("ALTW_REL_MEMBER_SCAN_START");
         let ids = collect_relation_member_ids(
             input,
             options.write.direct_reads,
@@ -493,14 +494,14 @@ pub(crate) fn add_locations_to_ways_to<'a>(
             options.inject_prepass,
             host,
         )?;
-        crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_END");
-        crate::debug::emit_counter(
+        host.invocation.marker("ALTW_REL_MEMBER_SCAN_END");
+        host.invocation.counter(
             "altw_relation_member_node_ids",
             ids.0.as_ref().map_or(0, |set| set.iter().count()),
         );
         ids
     };
-    crate::debug::emit_marker("ALTW_PASS2_START");
+    host.invocation.marker("ALTW_PASS2_START");
     let inject_metrics = inject_metrics::InjectMetrics::default();
     let stats = write_output_checked(
         input,
@@ -517,14 +518,14 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         overrides,
         host,
     )?;
-    crate::debug::emit_marker("ALTW_PASS2_END");
-    emit_stats_counters(&stats);
+    host.invocation.marker("ALTW_PASS2_END");
+    emit_stats_counters(&stats, &host.invocation);
     if options.inject_prepass {
         let member_ways = relation_scan
             .1
             .as_ref()
             .map_or(0, |set| set.iter().count() as u64);
-        inject_metrics.emit(member_ways);
+        inject_metrics.emit(member_ways, &host.invocation);
     }
     enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
     Ok(stats)
@@ -596,17 +597,17 @@ fn auto_select_backend(
     // Both backends can run: route on scale. The walk reads headers the
     // selected backend will also need, so it can warm those pages for the
     // following pass rather than adding another cold header walk.
-    crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_START");
+    host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_START");
     let store = estimate_sparse_store_bytes(input, host)?;
-    crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_END");
+    host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_END");
     let budget = page_cache_budget_bytes(host);
     let chosen = route_sorted_indexed(store, budget);
 
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "altw_auto_store_estimate_bytes",
         store.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
     );
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "altw_auto_cache_budget_bytes",
         budget.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
     );
@@ -768,9 +769,9 @@ pub(super) mod inject_metrics {
 
         /// Emit the four injected-prepass counters. `member_ways` is the
         /// size of the relation member-way IdSet, computed by the caller.
-        pub(super) fn emit(&self, member_ways: u64) {
-            crate::debug::emit_counter("altw_member_ways", member_ways);
-            self.emit_all();
+        pub(super) fn emit(&self, member_ways: u64, invocation: &crate::host::Invocation) {
+            invocation.counter("altw_member_ways", member_ways);
+            self.emit_all(invocation);
         }
 
         #[cfg(test)]
@@ -841,15 +842,15 @@ pub(super) mod inject_metrics {
     }
 }
 
-fn emit_stats_counters(stats: &Stats) {
-    crate::debug::emit_counter("altw_nodes_read", stats.nodes_read);
-    crate::debug::emit_counter("altw_nodes_written", stats.nodes_written);
-    crate::debug::emit_counter("altw_nodes_dropped", stats.nodes_dropped);
-    crate::debug::emit_counter("altw_ways_written", stats.ways_written);
-    crate::debug::emit_counter("altw_relations_written", stats.relations_written);
-    crate::debug::emit_counter("altw_missing_locations", stats.missing_locations);
-    crate::debug::emit_counter("altw_blobs_passthrough", stats.blobs_passthrough);
-    crate::debug::emit_counter("altw_blobs_decoded", stats.blobs_decoded);
+fn emit_stats_counters(stats: &Stats, invocation: &crate::host::Invocation) {
+    invocation.counter("altw_nodes_read", stats.nodes_read);
+    invocation.counter("altw_nodes_written", stats.nodes_written);
+    invocation.counter("altw_nodes_dropped", stats.nodes_dropped);
+    invocation.counter("altw_ways_written", stats.ways_written);
+    invocation.counter("altw_relations_written", stats.relations_written);
+    invocation.counter("altw_missing_locations", stats.missing_locations);
+    invocation.counter("altw_blobs_passthrough", stats.blobs_passthrough);
+    invocation.counter("altw_blobs_decoded", stats.blobs_decoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -957,10 +958,13 @@ fn collect_way_referenced_node_ids(
         },
         host,
     )?;
-    crate::debug::emit_counter("altw_pass0_union_ms", union_ns / 1_000_000);
-    crate::debug::emit_counter("altw_pass0_refs_total", union_refs_total);
+    host.invocation
+        .counter("altw_pass0_union_ms", union_ns / 1_000_000);
+    host.invocation
+        .counter("altw_pass0_refs_total", union_refs_total);
     if let Some(shared_set) = &shared {
-        crate::debug::emit_counter("altw_pass0_shared_node_ids", shared_set.iter().count());
+        host.invocation
+            .counter("altw_pass0_shared_node_ids", shared_set.iter().count());
     }
     Ok((referenced, shared))
 }
@@ -1142,12 +1146,12 @@ fn write_output_decode_all(
             stats.merge(&block_stats);
             decoded_blocks += 1;
             if decoded_blocks.is_multiple_of(64) {
-                crate::debug::emit_counter("altw_pass2_blocks", decoded_blocks);
+                host.invocation.counter("altw_pass2_blocks", decoded_blocks);
             }
             Ok(())
         },
     )?;
-    crate::debug::emit_counter("altw_pass2_blocks", decoded_blocks);
+    host.invocation.counter("altw_pass2_blocks", decoded_blocks);
 
     writer.flush()?;
     Ok(stats)

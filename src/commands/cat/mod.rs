@@ -154,7 +154,7 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
         }
     }
 
-    crate::debug::emit_marker("CAT_SCAN_START");
+    host.invocation.marker("CAT_SCAN_START");
     let result = match (type_filter, clean.any()) {
         (None, false) => cat_passthrough(files, output, write, overrides, host),
         (None, true) => cat_filtered(
@@ -171,10 +171,13 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
         }
         (Some(filter), true) => cat_filtered(files, output, filter, clean, write, overrides, host),
     }?;
-    crate::debug::emit_marker("CAT_SCAN_END");
-    crate::debug::emit_counter("cat_blobs_passthrough", result.blobs_passthrough);
-    crate::debug::emit_counter("cat_blobs_decoded", result.blobs_decoded);
-    crate::debug::emit_counter("cat_elements_written", result.elements_written);
+    host.invocation.marker("CAT_SCAN_END");
+    host.invocation
+        .counter("cat_blobs_passthrough", result.blobs_passthrough);
+    host.invocation
+        .counter("cat_blobs_decoded", result.blobs_decoded);
+    host.invocation
+        .counter("cat_elements_written", result.elements_written);
     Ok(result)
 }
 
@@ -974,7 +977,7 @@ fn cat_filtered(
         // The ordered pass of one input, kind phases nested inside (see
         // `KindPhase`). Closed before an error propagates, so the pair holds
         // on a failing run too.
-        crate::debug::emit_marker("CAT_FILTERED_START");
+        host.invocation.marker("CAT_FILTERED_START");
         let pass = run_filtered_pass(
             &shared_file,
             &schedule,
@@ -984,7 +987,7 @@ fn cat_filtered(
             &mut writer,
             host,
         );
-        crate::debug::emit_marker("CAT_FILTERED_END");
+        host.invocation.marker("CAT_FILTERED_END");
         let (b, e) = pass?;
         blobs_decoded += b;
         elements += e;
@@ -1069,7 +1072,7 @@ fn run_filtered_pass(
             // Called in schedule order; a write error ends the pass at once.
             blobs_decoded += 1;
             for (kind, blob) in framed {
-                phase.enter(kind);
+                phase.enter(kind, &host.invocation);
                 writer.write_raw_owned(blob)?;
             }
             total_elements += count;
@@ -1077,7 +1080,7 @@ fn run_filtered_pass(
         },
         host,
     );
-    phase.close();
+    phase.close(&host.invocation);
     pass?;
 
     Ok((blobs_decoded, total_elements))
@@ -1107,18 +1110,18 @@ fn run_filtered_pass(
 struct KindPhase(Option<ElementKind>);
 
 impl KindPhase {
-    fn enter(&mut self, kind: ElementKind) {
+    fn enter(&mut self, kind: ElementKind, invocation: &crate::host::Invocation) {
         if self.0.is_some_and(|open| kind <= open) {
             return;
         }
-        self.close();
-        crate::debug::emit_marker(Self::marker(kind, true));
+        self.close(invocation);
+        invocation.marker(Self::marker(kind, true));
         self.0 = Some(kind);
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, invocation: &crate::host::Invocation) {
         if let Some(open) = self.0.take() {
-            crate::debug::emit_marker(Self::marker(open, false));
+            invocation.marker(Self::marker(open, false));
         }
     }
 

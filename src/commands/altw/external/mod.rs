@@ -738,13 +738,16 @@ pub(crate) fn external_join_in(
     let ref_count_sidecar = scratch.file("way-ref-counts")?;
     let per_way_refcount_sidecar = scratch.file("per-way-refcounts")?;
 
-    crate::debug::emit_marker("EXTJOIN_META_SCAN_START");
+    host.invocation.marker("EXTJOIN_META_SCAN_START");
     let t_meta = crate::counters::Stopwatch::start();
     let blob_meta = blob_meta::scan_blob_metadata(input, !keep_untagged_nodes, host)?;
-    crate::debug::emit_counter("extjoin_meta_scan_ms", t_meta.elapsed_ms());
-    crate::debug::emit_counter("extjoin_meta_blobs", blob_meta.len());
-    crate::debug::emit_counter("extjoin_meta_tag_scan_enabled", !keep_untagged_nodes);
-    crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
+    host.invocation
+        .counter("extjoin_meta_scan_ms", t_meta.elapsed_ms());
+    host.invocation
+        .counter("extjoin_meta_blobs", blob_meta.len());
+    host.invocation
+        .counter("extjoin_meta_tag_scan_enabled", !keep_untagged_nodes);
+    host.invocation.marker("EXTJOIN_META_SCAN_END");
 
     // Build the BucketLayout for IdRecord emission. Width is derived
     // from the largest node-blob max_id in indexdata, not the
@@ -752,8 +755,10 @@ pub(crate) fn external_join_in(
     // and exact for any real input.
     let max_node_id = max_node_id_from_blob_meta(&blob_meta);
     let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
-    crate::debug::emit_counter("extjoin_bucket_max_node_id", max_node_id);
-    crate::debug::emit_counter("extjoin_bucket_width", bucket_layout.bucket_width);
+    host.invocation
+        .counter("extjoin_bucket_max_node_id", max_node_id);
+    host.invocation
+        .counter("extjoin_bucket_width", bucket_layout.bucket_width);
 
     // Stage 1: produces total_slots, id_bucket_counts, num_shard_workers
     // and the per-node-blob mapping (see `Stage1Output`).
@@ -764,8 +769,8 @@ pub(crate) fn external_join_in(
     // (`File: Sync` on Unix) with no locking, each through its own open
     // derived from the pin. Running it here avoids the former serial gap
     // between stage 2 and stage 4.
-    crate::debug::emit_marker("EXTJOIN_STAGE1_START");
-    let s1_faults_before = crate::debug::read_page_faults();
+    host.invocation.marker("EXTJOIN_STAGE1_START");
+    let s1_faults_before = crate::debug::read_page_faults(&host.invocation);
 
     let input_ref_parallel: &PinnedInput = input;
     let blob_meta_ref_parallel = &blob_meta;
@@ -791,7 +796,7 @@ pub(crate) fn external_join_in(
             let rel_handle = if keep_untagged_nodes && !inject_prepass {
                 None
             } else {
-                crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
+                host.invocation.marker("EXTJOIN_RELATION_SCAN_START");
                 Some(scope.spawn(move || {
                     let t_relscan = crate::counters::Stopwatch::start();
                     let ids = relation_scan::collect_relation_member_ids_indexed(
@@ -801,11 +806,9 @@ pub(crate) fn external_join_in(
                         inject_prepass,
                         &host.invocation,
                     )?;
-                    crate::debug::emit_counter(
-                        "extjoin_relation_member_collect_ms",
-                        t_relscan.elapsed_ms(),
-                    );
-                    crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
+                    host.invocation
+                        .counter("extjoin_relation_member_collect_ms", t_relscan.elapsed_ms());
+                    host.invocation.marker("EXTJOIN_RELATION_SCAN_END");
                     Ok::<_, crate::Error>(ids)
                 }))
             };
@@ -833,7 +836,7 @@ pub(crate) fn external_join_in(
         },
     )?;
 
-    let s1_faults_after = crate::debug::read_page_faults();
+    let s1_faults_after = crate::debug::read_page_faults(&host.invocation);
     let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
     // Partition-balance diagnostics (max/min-per-shard convention, cf.
     // derivepar_*_shard_max/min): min is taken over nonempty buckets so
@@ -857,17 +860,23 @@ pub(crate) fn external_join_in(
         .iter()
         .filter(|&&c| c > 0)
         .count();
-    crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots);
-    crate::debug::emit_counter("extjoin_total_id_records", total_id_records);
-    crate::debug::emit_counter("extjoin_id_bucket_max_records", id_bucket_max_records);
-    crate::debug::emit_counter("extjoin_id_bucket_min_records", id_bucket_min_records);
-    crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty);
+    host.invocation
+        .counter("extjoin_total_slots", stage1_out.total_slots);
+    host.invocation
+        .counter("extjoin_total_id_records", total_id_records);
+    host.invocation
+        .counter("extjoin_id_bucket_max_records", id_bucket_max_records);
+    host.invocation
+        .counter("extjoin_id_bucket_min_records", id_bucket_min_records);
+    host.invocation
+        .counter("extjoin_id_buckets_nonempty", id_buckets_nonempty);
     crate::debug::emit_page_fault_deltas(
+        &host.invocation,
         ("s1_minflt_delta", "s1_majflt_delta"),
         s1_faults_before,
         s1_faults_after,
     );
-    crate::debug::emit_marker("EXTJOIN_STAGE1_END");
+    host.invocation.marker("EXTJOIN_STAGE1_END");
 
     let total_slots = stage1_out.total_slots;
     let id_bucket_counts = stage1_out.id_bucket_counts;
@@ -914,19 +923,30 @@ pub(crate) fn external_join_in(
     .min(ALTW_STAGE3_WORKERS_CAP);
     // Stage 1's exact ref count is the first point at which stage 2-4
     // scratch can be sized without an extra input pass; see `space`.
-    space::precheck(scratch.path(), total_slots, slot_bucket_count, num_workers)?;
+    space::precheck(
+        scratch.path(),
+        total_slots,
+        slot_bucket_count,
+        num_workers,
+        &host.invocation,
+    )?;
     let total_id_shard_files = num_shard_workers * NUM_BUCKETS;
-    crate::debug::emit_counter("extjoin_id_bucket_count", NUM_BUCKETS);
-    crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count);
-    crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots);
-    crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers);
-    crate::debug::emit_counter("extjoin_total_id_shard_files", total_id_shard_files);
+    host.invocation
+        .counter("extjoin_id_bucket_count", NUM_BUCKETS);
+    host.invocation
+        .counter("extjoin_slot_bucket_count", slot_bucket_count);
+    host.invocation
+        .counter("extjoin_max_blob_slots", max_blob_slots);
+    host.invocation
+        .counter("extjoin_num_shard_workers", num_shard_workers);
+    host.invocation
+        .counter("extjoin_total_id_shard_files", total_id_shard_files);
 
     // Stage boundary: the sidecar loads and the scratch precheck above have
     // no checkpoint of their own.
     host.invocation.check()?;
-    crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-    let s2_faults_before = crate::debug::read_page_faults();
+    host.invocation.marker("EXTJOIN_STAGE2_START");
+    let s2_faults_before = crate::debug::read_page_faults(&host.invocation);
     let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
     let input_pbf = crate::read::input::InputFile::open(input)?;
     let resolved_count = stage2_node_join(
@@ -944,7 +964,7 @@ pub(crate) fn external_join_in(
         host,
     )?;
     slot_buckets.finish(&host.invocation)?;
-    let s2_faults_after = crate::debug::read_page_faults();
+    let s2_faults_after = crate::debug::read_page_faults(&host.invocation);
     // Reclaim id-shard scratch before the heavier stage 3/4 streaming
     // handoff allocates its own temporary space.
     for worker_id in 0..num_shard_workers {
@@ -952,13 +972,15 @@ pub(crate) fn external_join_in(
             scratch.remove(&radix::id_shard_path(scratch, worker_id, bucket_idx)?);
         }
     }
-    crate::debug::emit_counter("extjoin_resolved_count", resolved_count);
+    host.invocation
+        .counter("extjoin_resolved_count", resolved_count);
     crate::debug::emit_page_fault_deltas(
+        &host.invocation,
         ("s2_minflt_delta", "s2_majflt_delta"),
         s2_faults_before,
         s2_faults_after,
     );
-    crate::debug::emit_marker("EXTJOIN_STAGE2_END");
+    host.invocation.marker("EXTJOIN_STAGE2_END");
 
     // Free the per-blob mapping - it was a stage 2 input only.
     drop(node_blob_mapping);
@@ -968,7 +990,7 @@ pub(crate) fn external_join_in(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
-    crate::debug::emit_counter("s3_worker_count", num_workers);
+    host.invocation.counter("s3_worker_count", num_workers);
 
     // Worker tmp files opened once here with read + write, wrapped in
     // Arc<File> so stage 3 can `write_all_at` and stage 4 can
@@ -1015,9 +1037,12 @@ pub(crate) fn external_join_in(
             .min()
             .unwrap_or(0);
         let nonempty = slot_entry_counts.iter().filter(|&&c| c > 0).count();
-        crate::debug::emit_counter("extjoin_slot_bucket_max_entries", max_entries);
-        crate::debug::emit_counter("extjoin_slot_bucket_min_entries", min_entries);
-        crate::debug::emit_counter("extjoin_slot_buckets_nonempty", nonempty);
+        host.invocation
+            .counter("extjoin_slot_bucket_max_entries", max_entries);
+        host.invocation
+            .counter("extjoin_slot_bucket_min_entries", min_entries);
+        host.invocation
+            .counter("extjoin_slot_buckets_nonempty", nonempty);
     }
     let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
         .map(|i| radix::slot_bucket_path(scratch, i).map(|p| p.to_path_buf()))
@@ -1030,8 +1055,11 @@ pub(crate) fn external_join_in(
     // The streaming router: pre-populates `Empty` entries for zero-ref
     // way blobs so stage 4 never waits on a blob that stage 3 would
     // never publish.
-    let router =
-        coord_payloads::ConcurrentBlobLocationRouter::new(&per_way_rcs, worker_files.clone())?;
+    let router = coord_payloads::ConcurrentBlobLocationRouter::new(
+        &per_way_rcs,
+        worker_files.clone(),
+        &host.invocation,
+    )?;
 
     // (#9 layer 2: relation scan already ran in parallel with stage 1
     // above; `relation_member_node_ids` is already bound. No serial
@@ -1043,10 +1071,10 @@ pub(crate) fn external_join_in(
     // ahead of any input pread so they never hold decompressed state
     // while waiting.
     host.invocation.check()?;
-    crate::debug::emit_marker("EXTJOIN_STREAMING_START");
-    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-    crate::debug::emit_marker("EXTJOIN_STAGE4_START");
-    let s3_faults_before = crate::debug::read_page_faults();
+    host.invocation.marker("EXTJOIN_STREAMING_START");
+    host.invocation.marker("EXTJOIN_STAGE3_START");
+    host.invocation.marker("EXTJOIN_STAGE4_START");
+    let s3_faults_before = crate::debug::read_page_faults(&host.invocation);
 
     let router_ref = &router;
     let per_way_rcs_ref = &per_way_rcs;
@@ -1137,18 +1165,19 @@ pub(crate) fn external_join_in(
         s4_res
     })?;
 
-    let s3_faults_after = crate::debug::read_page_faults();
+    let s3_faults_after = crate::debug::read_page_faults(&host.invocation);
     for i in 0..slot_bucket_count {
         scratch.remove(&radix::slot_bucket_path(scratch, i)?);
     }
     crate::debug::emit_page_fault_deltas(
+        &host.invocation,
         ("s3_minflt_delta", "s3_majflt_delta"),
         s3_faults_before,
         s3_faults_after,
     );
-    crate::debug::emit_marker("EXTJOIN_STAGE4_END");
-    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
-    crate::debug::emit_marker("EXTJOIN_STREAMING_END");
+    host.invocation.marker("EXTJOIN_STAGE4_END");
+    host.invocation.marker("EXTJOIN_STAGE3_END");
+    host.invocation.marker("EXTJOIN_STREAMING_END");
 
     // Emit router statistics for the streaming stage 3 path.
     {
@@ -1156,12 +1185,17 @@ pub(crate) fn external_join_in(
             .stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::debug::emit_counter("s3_router_num_worker", s.num_worker);
-        crate::debug::emit_counter("s3_router_num_straddlers", s.num_straddlers);
-        crate::debug::emit_counter("s3_router_num_empty", s.num_empty);
-        crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes);
-        crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes);
-        crate::debug::emit_counter("s3_straddler_encode_ms", s.straddler_encode_ns / 1_000_000);
+        host.invocation
+            .counter("s3_router_num_worker", s.num_worker);
+        host.invocation
+            .counter("s3_router_num_straddlers", s.num_straddlers);
+        host.invocation.counter("s3_router_num_empty", s.num_empty);
+        host.invocation
+            .counter("s3_router_worker_bytes", s.worker_bytes);
+        host.invocation
+            .counter("s3_router_straddler_bytes", s.straddler_bytes);
+        host.invocation
+            .counter("s3_straddler_encode_ms", s.straddler_encode_ns / 1_000_000);
         crate::host::diag!(
             host.diagnostics,
             Developer,
@@ -1187,7 +1221,7 @@ pub(crate) fn external_join_in(
 
     if inject_prepass {
         let member_ways = member_way_ids_ref.map_or(0, |set| set.iter().count() as u64);
-        inject_metrics.emit(member_ways);
+        inject_metrics.emit(member_ways, &host.invocation);
     }
 
     Ok(stats)

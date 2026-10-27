@@ -206,10 +206,13 @@ pub(crate) fn repack_to(
     let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
         crate::scan::classify::build_classify_schedules_split(input, host)?;
 
-    crate::debug::emit_counter("repack_input_blobs_nodes", node_schedule.len());
-    crate::debug::emit_counter("repack_input_blobs_ways", way_schedule.len());
-    crate::debug::emit_counter("repack_input_blobs_relations", rel_schedule.len());
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("repack_input_blobs_nodes", node_schedule.len());
+    host.invocation
+        .counter("repack_input_blobs_ways", way_schedule.len());
+    host.invocation
+        .counter("repack_input_blobs_relations", rel_schedule.len());
+    host.invocation.counter(
         "repack_input_blobs_total",
         node_schedule.len() + way_schedule.len() + rel_schedule.len(),
     );
@@ -228,7 +231,7 @@ pub(crate) fn repack_to(
     let mut total_central_blobs: u64 = 0;
     let mut any_cap_fired: bool = false;
 
-    crate::debug::emit_marker("REPACK_NODES_START");
+    host.invocation.marker("REPACK_NODES_START");
     let node_stats = run_kind_phase(
         &shared_file,
         &node_schedule,
@@ -240,8 +243,8 @@ pub(crate) fn repack_to(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("REPACK_NODES_END");
-    emit_phase_counters(ElementKind::Node, &node_stats);
+    host.invocation.marker("REPACK_NODES_END");
+    emit_phase_counters(ElementKind::Node, &node_stats, &host.invocation);
     blobs_written += node_stats.blobs;
     elements_written += node_stats.elements;
     total_coalesces += node_stats.coalesces;
@@ -249,7 +252,7 @@ pub(crate) fn repack_to(
     total_central_blobs += node_stats.central_blobs;
     any_cap_fired |= node_stats.cap_fired;
 
-    crate::debug::emit_marker("REPACK_WAYS_START");
+    host.invocation.marker("REPACK_WAYS_START");
     let way_stats = run_kind_phase(
         &shared_file,
         &way_schedule,
@@ -261,8 +264,8 @@ pub(crate) fn repack_to(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("REPACK_WAYS_END");
-    emit_phase_counters(ElementKind::Way, &way_stats);
+    host.invocation.marker("REPACK_WAYS_END");
+    emit_phase_counters(ElementKind::Way, &way_stats, &host.invocation);
     blobs_written += way_stats.blobs;
     elements_written += way_stats.elements;
     total_coalesces += way_stats.coalesces;
@@ -270,7 +273,7 @@ pub(crate) fn repack_to(
     total_central_blobs += way_stats.central_blobs;
     any_cap_fired |= way_stats.cap_fired;
 
-    crate::debug::emit_marker("REPACK_RELATIONS_START");
+    host.invocation.marker("REPACK_RELATIONS_START");
     let rel_stats = run_kind_phase(
         &shared_file,
         &rel_schedule,
@@ -282,8 +285,8 @@ pub(crate) fn repack_to(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("REPACK_RELATIONS_END");
-    emit_phase_counters(ElementKind::Relation, &rel_stats);
+    host.invocation.marker("REPACK_RELATIONS_END");
+    emit_phase_counters(ElementKind::Relation, &rel_stats, &host.invocation);
     blobs_written += rel_stats.blobs;
     elements_written += rel_stats.elements;
     total_coalesces += rel_stats.coalesces;
@@ -291,17 +294,23 @@ pub(crate) fn repack_to(
     total_central_blobs += rel_stats.central_blobs;
     any_cap_fired |= rel_stats.cap_fired;
 
-    crate::debug::emit_marker("REPACK_FLUSH_START");
+    host.invocation.marker("REPACK_FLUSH_START");
     writer.flush()?;
-    crate::debug::emit_marker("REPACK_FLUSH_END");
+    host.invocation.marker("REPACK_FLUSH_END");
 
-    crate::debug::emit_counter("repack_blobs_written", blobs_written);
-    crate::debug::emit_counter("repack_elements_written", elements_written);
-    crate::debug::emit_counter("repack_input_blobs_coalesced", total_coalesces);
-    crate::debug::emit_counter("repack_worker_full_blobs", total_worker_full_blobs);
-    crate::debug::emit_counter("repack_central_blobs", total_central_blobs);
-    crate::debug::emit_counter("repack_cap_fired", any_cap_fired);
-    crate::debug::emit_counter("repack_elements_per_blob", elements_per_blob);
+    host.invocation
+        .counter("repack_blobs_written", blobs_written);
+    host.invocation
+        .counter("repack_elements_written", elements_written);
+    host.invocation
+        .counter("repack_input_blobs_coalesced", total_coalesces);
+    host.invocation
+        .counter("repack_worker_full_blobs", total_worker_full_blobs);
+    host.invocation
+        .counter("repack_central_blobs", total_central_blobs);
+    host.invocation.counter("repack_cap_fired", any_cap_fired);
+    host.invocation
+        .counter("repack_elements_per_blob", elements_per_blob);
 
     // Detect the silent-identity surprise: cap exceeds every kind's total
     // element count, so no kind has ever flushed (in workers or in the
@@ -377,14 +386,14 @@ fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
 }
 
 /// Emit per-kind sidecar counters for one `run_kind_phase` result.
-fn emit_phase_counters(kind: ElementKind, s: &PhaseStats) {
+fn emit_phase_counters(kind: ElementKind, s: &PhaseStats, invocation: &crate::host::Invocation) {
     let [blobs, elements, coalesces, worker_full, central, cap_fired] = phase_counter_names(kind);
-    crate::debug::emit_counter(blobs, s.blobs);
-    crate::debug::emit_counter(elements, s.elements);
-    crate::debug::emit_counter(coalesces, s.coalesces);
-    crate::debug::emit_counter(worker_full, s.worker_full_blobs);
-    crate::debug::emit_counter(central, s.central_blobs);
-    crate::debug::emit_counter(cap_fired, s.cap_fired);
+    invocation.counter(blobs, s.blobs);
+    invocation.counter(elements, s.elements);
+    invocation.counter(coalesces, s.coalesces);
+    invocation.counter(worker_full, s.worker_full_blobs);
+    invocation.counter(central, s.central_blobs);
+    invocation.counter(cap_fired, s.cap_fired);
 }
 
 /// Run one per-kind phase: pread workers decode + split (full blocks

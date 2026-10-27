@@ -761,8 +761,8 @@ pub(super) fn stage2_node_join(
         return Err(e);
     }
 
-    counters.emit_all();
-    crate::debug::emit_counter("s2_num_workers", num_workers);
+    counters.emit_all(&host.invocation);
+    host.invocation.counter("s2_num_workers", num_workers);
 
     let resolved_count = resolved_total.load(std::sync::atomic::Ordering::Relaxed);
     Ok(resolved_count)

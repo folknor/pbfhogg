@@ -146,22 +146,23 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     strings: &StringPool,
     street_level: u8,
     executor: &crate::host::Executor,
+    invocation: &crate::host::Invocation,
 ) -> u32 {
     if interp_ways.is_empty() || addr_points.is_empty() {
         return 0;
     }
 
-    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
+    invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
     let csr = build_cell_addr_csr(addr_points, street_level, executor);
-    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
-    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
+    invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
+    invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
     let resolved = executor.install(|| {
         interp_ways
             .par_iter_mut()
             .map(|way| resolve_one_way(way, interp_nodes, addr_points, strings, &csr, street_level))
             .sum()
     });
-    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
+    invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
     resolved
 }
 

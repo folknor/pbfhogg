@@ -44,12 +44,13 @@ pub(super) fn precheck(
     total_slots: u64,
     slot_buckets: usize,
     payload_files: usize,
+    invocation: &crate::host::Invocation,
 ) -> Result<()> {
-    crate::debug::emit_marker("EXTJOIN_SPACE_PLAN_START");
+    invocation.marker("EXTJOIN_SPACE_PLAN_START");
     let bytes = remaining_scratch_bytes(total_slots, slot_buckets, payload_files)?;
-    crate::debug::emit_counter("extjoin_scratch_needed_bytes", bytes);
+    invocation.counter("extjoin_scratch_needed_bytes", bytes);
     check_free_space(scratch, bytes)?;
-    crate::debug::emit_marker("EXTJOIN_SPACE_PLAN_END");
+    invocation.marker("EXTJOIN_SPACE_PLAN_END");
     Ok(())
 }
 

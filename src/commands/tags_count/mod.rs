@@ -133,7 +133,7 @@ fn tags_count_inner(
     // kind; a two-kind filter still has to visit both kinds' blobs.
     let kind_filter = tf.single_kind();
 
-    crate::debug::emit_marker("TAGSCOUNT_START");
+    host.invocation.marker("TAGSCOUNT_START");
 
     // Apply the same blob-level tag index `tags-filter` uses.
     //
@@ -227,7 +227,7 @@ fn tags_count_inner(
             .then_with(|| b.count.cmp(&a.count)),
     });
 
-    crate::debug::emit_marker("TAGSCOUNT_END");
+    host.invocation.marker("TAGSCOUNT_END");
     Ok(results)
 }
 

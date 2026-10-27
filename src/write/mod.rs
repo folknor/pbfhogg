@@ -50,7 +50,7 @@ pub(crate) mod metrics;
 /// The counters are the invocation's totals rather than per-writer numbers;
 /// `write::metrics` says why.
 pub fn emit_writer_counters(invocation: &crate::host::Invocation) {
-    invocation.metrics().writer.emit_once();
+    invocation.metrics().writer.emit_once(invocation);
 }
 
 /// Report, once each, the ways the writers' output or speed fell short of

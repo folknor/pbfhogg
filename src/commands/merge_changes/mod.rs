@@ -189,15 +189,17 @@ pub(crate) fn merge_changes_to(
         )
     });
 
-    crate::debug::emit_marker("MERGECHANGES_START");
-    crate::debug::emit_counter("merge_changes_files", inputs.len());
-    crate::debug::emit_counter("merge_changes_worker_count", worker_count);
+    host.invocation.marker("MERGECHANGES_START");
+    host.invocation.counter("merge_changes_files", inputs.len());
+    host.invocation
+        .counter("merge_changes_worker_count", worker_count);
     let total_bytes_in: u64 = inputs
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
-    crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in);
+    host.invocation
+        .counter("merge_changes_total_bytes_in", total_bytes_in);
 
     // Build a scoped rayon pool when the caller fixed the parallelism.
     // Pool controls par_iter and par_chunks thread count for both the
@@ -241,11 +243,13 @@ pub(crate) fn merge_changes_to(
         }
     })?;
 
-    crate::debug::emit_counter("merge_changes_changes_out", changes_out);
+    host.invocation
+        .counter("merge_changes_changes_out", changes_out);
     if let Ok(meta) = std::fs::metadata(output.path()) {
-        crate::debug::emit_counter("merge_changes_total_bytes_out", meta.len());
+        host.invocation
+            .counter("merge_changes_total_bytes_out", meta.len());
     }
-    crate::debug::emit_marker("MERGECHANGES_END");
+    host.invocation.marker("MERGECHANGES_END");
 
     Ok(MergeChangesStats {
         files: inputs.len(),
@@ -275,11 +279,11 @@ fn build_simplify_stream(
 
     for path in inputs {
         if let Ok(meta) = std::fs::metadata(path) {
-            crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
+            cancel.counter("merge_changes_input_bytes", meta.len());
         }
     }
 
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
+    cancel.marker("MERGECHANGES_PARALLEL_PARSE_START");
     let streams: crate::Result<Vec<ChangeStream>> = inputs
         .par_iter()
         .map(|path| -> crate::Result<ChangeStream> {
@@ -289,7 +293,7 @@ fn build_simplify_stream(
         })
         .collect();
     let streams = streams?;
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_END");
+    cancel.marker("MERGECHANGES_PARALLEL_PARSE_END");
 
     let mut combined = ChangeStream::default();
     let total_changes: usize = streams.iter().map(|s| s.changes.len()).sum();
@@ -297,7 +301,7 @@ fn build_simplify_stream(
     for s in streams {
         let len_before = combined.changes.len();
         combined.changes.extend(s.changes);
-        crate::debug::emit_counter(
+        cancel.counter(
             "merge_changes_changes_per_osc",
             combined.changes.len() - len_before,
         );
@@ -315,13 +319,13 @@ fn parse_one_into_stream(
     cancel: &crate::host::Invocation,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
-        crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
+        cancel.counter("merge_changes_input_bytes", meta.len());
     }
     let len_before = stream.changes.len();
-    crate::debug::emit_marker("MERGECHANGES_PARSE_START");
+    cancel.marker("MERGECHANGES_PARSE_START");
     let result = parse_osc_into(path, stream, cancel);
-    crate::debug::emit_marker("MERGECHANGES_PARSE_END");
-    crate::debug::emit_counter(
+    cancel.marker("MERGECHANGES_PARSE_END");
+    cancel.counter(
         "merge_changes_changes_per_osc",
         stream.changes.len() - len_before,
     );
@@ -573,7 +577,7 @@ fn write_streaming(
     executor: &crate::host::Executor,
     cancel: &crate::host::Invocation,
 ) -> Result<u64> {
-    crate::debug::emit_counter(
+    cancel.counter(
         "merge_changes_buffered_strategy",
         i64::from(inputs.len() > 1),
     );
@@ -583,35 +587,35 @@ fn write_streaming(
         // buffer-and-drain cost. Avoids the regression a forced
         // buffer-and-drain would inflict at single-OSC scale (drain pass
         // is pure overhead when there is no parse to overlap with).
-        crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
+        cancel.marker("MERGECHANGES_WRITE_OPEN_START");
         let mut writer = OscWriter::from_output(output, is_gz, cancel)?;
 
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
         let mut root = BytesStart::new("osmChange");
         root.push_attribute(("version", "0.6"));
         writer.write_event(Event::Start(root))?;
-        crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
+        cancel.marker("MERGECHANGES_WRITE_OPEN_END");
 
         let mut open_action: Option<Action> = None;
         let mut count = 0u64;
         for path in inputs {
             if let Ok(meta) = std::fs::metadata(path) {
-                crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
+                cancel.counter("merge_changes_input_bytes", meta.len());
             }
             let count_before = count;
-            crate::debug::emit_marker("MERGECHANGES_PARSE_START");
+            cancel.marker("MERGECHANGES_PARSE_START");
             parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
-            crate::debug::emit_marker("MERGECHANGES_PARSE_END");
-            crate::debug::emit_counter("merge_changes_changes_per_osc", count - count_before);
+            cancel.marker("MERGECHANGES_PARSE_END");
+            cancel.counter("merge_changes_changes_per_osc", count - count_before);
         }
 
         if let Some(prev) = open_action {
             writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
         }
         writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
-        crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
+        cancel.marker("MERGECHANGES_WRITE_FINISH_START");
         writer.finish()?;
-        crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
+        cancel.marker("MERGECHANGES_WRITE_FINISH_END");
         return Ok(count);
     }
 
@@ -631,7 +635,7 @@ fn write_streaming(
     // that 223 s across the same N rayon workers already doing parse.
     for path in inputs {
         if let Ok(meta) = std::fs::metadata(path) {
-            crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
+            cancel.counter("merge_changes_input_bytes", meta.len());
         }
     }
 
@@ -649,20 +653,20 @@ fn write_streaming(
     out.write_all(&prelude)?;
     let mut count = 0u64;
     // The per-member drain overlaps this span; DRAIN below is the postlude.
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
+    cancel.marker("MERGECHANGES_PARALLEL_EMIT_START");
     emit_members_ordered(executor, inputs, is_gz, window, cancel, |bytes, n| {
         out.write_all(&bytes)?;
         count += n;
-        crate::debug::emit_counter("merge_changes_changes_per_osc", n);
+        cancel.counter("merge_changes_changes_per_osc", n);
         Ok(())
     })?;
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
-    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+    cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
+    cancel.marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
     out.finish()?;
-    crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
-    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
-    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
+    cancel.marker("MERGECHANGES_DRAIN_END");
+    cancel.marker("MERGECHANGES_WRITE_FINISH_START");
+    cancel.marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(count)
 }
@@ -900,8 +904,8 @@ fn write_simplified(
     cancel: &crate::host::Invocation,
 ) -> Result<usize> {
     cancel.check()?;
-    crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
-    crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len());
+    cancel.marker("MERGECHANGES_SIMPLIFY_START");
+    cancel.counter("merge_changes_changes_in", stream.changes.len());
     // Each object's last change, beside the highest version ever claimed
     // for it. The floor is only maintained while the gate is on; with
     // `--allow-version-regression` the dedupe is purely positional.
@@ -944,7 +948,7 @@ fn write_simplified(
             Action::Delete => deletes.push(change),
         }
     }
-    crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
+    cancel.marker("MERGECHANGES_SIMPLIFY_END");
     // Stage boundary: the in-memory dedupe above has no checkpoint of its
     // own (it is one pass over the parsed changes).
     cancel.check()?;
@@ -964,7 +968,7 @@ fn write_simplified(
     // `quick_xml::Writer` + zlib ceiling that bottlenecked the
     // streaming path's abandoned parallel-parse-only stage. Same
     // mechanism, same fix.
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
+    cancel.marker("MERGECHANGES_PARALLEL_EMIT_START");
     let mut all_chunks: Vec<Vec<u8>> = Vec::new();
     for (action, group) in [
         (Action::Create, &creates),
@@ -993,9 +997,9 @@ fn write_simplified(
         all_chunks.extend(chunks?);
         cancel.check()?;
     }
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
+    cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
 
-    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+    cancel.marker("MERGECHANGES_DRAIN_START");
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
     let mut out = output.writer(cancel)?;
@@ -1005,9 +1009,9 @@ fn write_simplified(
     }
     out.write_all(&postlude)?;
     out.finish()?;
-    crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
-    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
-    crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
+    cancel.marker("MERGECHANGES_DRAIN_END");
+    cancel.marker("MERGECHANGES_WRITE_FINISH_START");
+    cancel.marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(total_out)
 }

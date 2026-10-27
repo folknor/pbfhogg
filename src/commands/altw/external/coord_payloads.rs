@@ -147,6 +147,7 @@ impl ConcurrentBlobLocationRouter {
     pub(super) fn new(
         per_way_rcs: &PerWayRcs,
         worker_files: Vec<crate::read::input::InputFile>,
+        invocation: &crate::host::Invocation,
     ) -> Result<Self> {
         let num_way_blobs = per_way_rcs.num_blobs();
         let mut slots: Vec<std::sync::Mutex<Option<BlobLocation>>> =
@@ -178,6 +179,7 @@ impl ConcurrentBlobLocationRouter {
             wait_gauge: crate::counters::StallGauge::new(
                 "WAIT_S4_ROUTER_START",
                 "WAIT_S4_ROUTER_END",
+                invocation,
             ),
             stats: std::sync::Mutex::new(stats),
         })
@@ -1073,7 +1075,9 @@ mod tests {
         // including completion and abort, which may be the final event.
         for event in 0..4 {
             let pwr = make_per_way_rcs(&[&[1]]);
-            let router = ConcurrentBlobLocationRouter::new(&pwr, vec![]).expect("router");
+            let router =
+                ConcurrentBlobLocationRouter::new(&pwr, vec![], &crate::host::Invocation::new())
+                    .expect("router");
             let gate = router.notify_mu.lock().expect("gate");
             std::thread::scope(|scope| {
                 let (sent, received) = std::sync::mpsc::channel();

@@ -137,7 +137,7 @@ where
             Ok(())
         }),
     )?;
-    counters.emit(stage);
+    counters.emit(stage, &cancel);
     Ok(totals)
 }
 

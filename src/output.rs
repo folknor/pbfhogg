@@ -271,20 +271,23 @@ impl std::fmt::Debug for Hook {
 /// syncs publication did from any a writer did. Markers and counters are
 /// best effort: the sidecar drops one when its pipe is full.
 struct PublishSpan<'a> {
+    invocation: &'a crate::host::Invocation,
     metrics: &'a WriterMetrics,
     sync_calls: u64,
     sync_ns: u64,
 }
 
 impl<'a> PublishSpan<'a> {
-    fn start(metrics: &'a WriterMetrics) -> Self {
+    fn start(invocation: &'a crate::host::Invocation) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &invocation.metrics().writer;
         let span = Self {
+            invocation,
             metrics,
             sync_calls: metrics.sync_all_calls.load(Relaxed),
             sync_ns: metrics.sync_all_ns.load(Relaxed),
         };
-        crate::debug::emit_marker("PUBLISH_START");
+        invocation.marker("PUBLISH_START");
         span
     }
 }
@@ -303,9 +306,9 @@ impl Drop for PublishSpan<'_> {
             .sync_all_ns
             .load(Relaxed)
             .saturating_sub(self.sync_ns);
-        crate::debug::emit_counter("publish_sync_calls", calls);
-        crate::debug::emit_counter("publish_sync_ns", ns);
-        crate::debug::emit_marker("PUBLISH_END");
+        self.invocation.counter("publish_sync_calls", calls);
+        self.invocation.counter("publish_sync_ns", ns);
+        self.invocation.marker("PUBLISH_END");
     }
 }
 
@@ -1435,8 +1438,14 @@ impl Drop for Target {
 
 /// Install every member, rolling back on the first failure, then commit and
 /// sync. The one publication routine behind every shape. Every sync records
-/// into `metrics`, the publishing invocation's writer set.
-fn publish_all(targets: &mut [Target], faults: &Faults, metrics: &WriterMetrics) -> Result<()> {
+/// into the publishing invocation's writer set, and the span's markers go to
+/// its sink.
+fn publish_all(
+    targets: &mut [Target],
+    faults: &Faults,
+    invocation: &crate::host::Invocation,
+) -> Result<()> {
+    let metrics = &invocation.metrics().writer;
     // Every member is ready before anything runs, so a refusal leaves the
     // hooks unrun and every destination untouched.
     for target in targets.iter() {
@@ -1449,7 +1458,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults, metrics: &WriterMetrics)
             hook();
         }
     }
-    let _span = PublishSpan::start(metrics);
+    let _span = PublishSpan::start(invocation);
     for target in targets.iter() {
         // Again after the hooks: a hook is caller code and may have failed
         // a session (a write after the end of stream, say). A failure on
@@ -1857,11 +1866,7 @@ impl Output {
     pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
         let faults = self.faults();
-        publish_all(
-            std::slice::from_mut(&mut self.target),
-            &faults,
-            &cancel.metrics().writer,
-        )
+        publish_all(std::slice::from_mut(&mut self.target), &faults, cancel)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -1956,11 +1961,7 @@ impl OutputDir {
         let faults = self.faults.clone();
         #[cfg(not(feature = "test-hooks"))]
         let faults = Faults;
-        publish_all(
-            std::slice::from_mut(&mut self.target),
-            &faults,
-            &cancel.metrics().writer,
-        )
+        publish_all(std::slice::from_mut(&mut self.target), &faults, cancel)
     }
 
     /// Test hook: inject a publication fault.
@@ -2079,7 +2080,7 @@ impl OutputSet {
         for member in self.members.drain(..) {
             targets.push(member.into_target());
         }
-        publish_all(&mut targets, &faults, &cancel.metrics().writer)
+        publish_all(&mut targets, &faults, cancel)
     }
 
     /// Test hook: inject a publication fault.

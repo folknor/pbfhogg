@@ -323,7 +323,7 @@ pub(super) fn stage4_assembly(
     #[cfg(feature = "test-hooks")]
     host.invocation.faults().on_altw_stage4_start()?;
     // Build the blob schedule from the shared metadata scan.
-    crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
+    host.invocation.marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = crate::counters::Stopwatch::start();
 
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
@@ -414,7 +414,7 @@ pub(super) fn stage4_assembly(
             way_sidecar_idx,
         )));
     }
-    crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
+    host.invocation.marker("EXTJOIN_S4_SCHEDULE_END");
 
     // Open shared file for worker pread, a description of the pinned input.
     let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
@@ -442,7 +442,8 @@ pub(super) fn stage4_assembly(
     // off a cliff. The streaming overlap's readiness wait is
     // effectively zero-cost (s4_readiness_wait_max_ms=0 on Europe), so
     // stage 4 is still CPU/writer-bound. Keep uncapped.
-    crate::debug::emit_counter("s4_decode_thread_count", decode_threads);
+    host.invocation
+        .counter("s4_decode_thread_count", decode_threads);
 
     // Split schedule: passthrough-eligible blobs (relations always; node
     // blobs when keep_untagged_nodes=true) are copied by the consumer
@@ -471,7 +472,11 @@ pub(super) fn stage4_assembly(
     // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters,
     // not these spans. Entered only after a failed try_send,
     // so unblocked sends never touch the gauge lock.
-    let s4_send_stall = crate::counters::StallGauge::new("WAIT_S4_SEND_START", "WAIT_S4_SEND_END");
+    let s4_send_stall = crate::counters::StallGauge::new(
+        "WAIT_S4_SEND_START",
+        "WAIT_S4_SEND_END",
+        &host.invocation,
+    );
     // The consumer's receive wait, in whole milliseconds per sample as it
     // always was.
     let s4_recv_ms = std::sync::atomic::AtomicU64::new(0);
@@ -732,30 +737,41 @@ pub(super) fn stage4_assembly(
         })?
         .len();
 
-    worker_counters.emit_all();
-    crate::debug::emit_counter("s4_bytes_written", s4_bytes_written);
-    crate::debug::emit_counter("s4_write_calls", s4_write_calls);
-    crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs);
-    crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms);
-    crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes);
-    crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms);
-    crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms);
-    crate::debug::emit_counter("s4_flush_ms", s4_flush_ms);
-    crate::debug::emit_counter("s4_decode_threads", decode_threads);
-    crate::debug::emit_counter("s4_output_bytes", s4_output_bytes);
-    crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs);
-    crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total);
-    crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex);
-    crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags);
-    crate::debug::emit_counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags);
-    crate::debug::emit_counter(
+    worker_counters.emit_all(&host.invocation);
+    host.invocation
+        .counter("s4_bytes_written", s4_bytes_written);
+    host.invocation.counter("s4_write_calls", s4_write_calls);
+    host.invocation
+        .counter("s4_passthrough_blobs", s4_passthrough_blobs);
+    host.invocation
+        .counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms);
+    host.invocation
+        .counter("s4_passthrough_bytes", s4_passthrough_bytes);
+    host.invocation.counter("s4_consumer_recv_ms", s4_recv_ms);
+    host.invocation.counter("s4_consumer_write_ms", s4_write_ms);
+    host.invocation.counter("s4_flush_ms", s4_flush_ms);
+    host.invocation.counter("s4_decode_threads", decode_threads);
+    host.invocation.counter("s4_output_bytes", s4_output_bytes);
+    host.invocation
+        .counter("extjoin_skipped_node_blobs", skipped_node_blobs);
+    host.invocation
+        .counter("s4_node_blobs_total", s4_node_blobs_total);
+    host.invocation
+        .counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex);
+    host.invocation
+        .counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags);
+    host.invocation
+        .counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags);
+    host.invocation.counter(
         "s4_node_blobs_kept_by_members",
         s4_node_blobs_kept_by_members,
     );
-    crate::debug::emit_counter("s4_way_blobs", s4_way_blobs);
-    crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs);
-    crate::debug::emit_counter("s4_schedule_scan_ms", t_schedule.elapsed_ms());
-    way_reframe_counters.emit();
+    host.invocation.counter("s4_way_blobs", s4_way_blobs);
+    host.invocation
+        .counter("s4_relation_blobs", s4_relation_blobs);
+    host.invocation
+        .counter("s4_schedule_scan_ms", t_schedule.elapsed_ms());
+    way_reframe_counters.emit(&host.invocation);
 
     Ok(total_stats)
 }
@@ -878,13 +894,13 @@ crate::counters::counter_set! {
 impl WayReframeCounters {
     /// Emit the set, then the derived average, which is present only when
     /// at least one way was reframed.
-    fn emit(&self) {
+    fn emit(&self, invocation: &crate::host::Invocation) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.emit_all();
+        self.emit_all(invocation);
         let total_refs = self.refs_total.load(Relaxed);
         let total_ways = self.ways_total.load(Relaxed);
         if let Some(avg) = total_refs.checked_div(total_ways) {
-            crate::debug::emit_counter("s4_way_avg_refs_per_way", avg);
+            invocation.counter("s4_way_avg_refs_per_way", avg);
         }
     }
 }

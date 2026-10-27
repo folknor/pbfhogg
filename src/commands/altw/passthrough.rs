@@ -120,7 +120,7 @@ fn build_schedule(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
-    crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_START");
+    host.invocation.marker("ALTW_PASS2_SCHEDULE_WALK_START");
     let mut walker = HeaderWalker::open(input, host)?;
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
@@ -170,7 +170,7 @@ fn build_schedule(
     let header_bytes =
         header_bytes.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
-    crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_END");
+    host.invocation.marker("ALTW_PASS2_SCHEDULE_WALK_END");
     Ok((schedule, header_bytes, shared_file))
 }
 
@@ -381,9 +381,10 @@ pub(super) fn write_output_passthrough(
                 None => {}
             }
         }
-        crate::debug::emit_counter("altw_pass2_way_blobs", way_blobs);
-        crate::debug::emit_counter("altw_pass2_node_blobs", node_blobs);
-        crate::debug::emit_counter("altw_pass2_relation_blobs", relation_blobs);
+        host.invocation.counter("altw_pass2_way_blobs", way_blobs);
+        host.invocation.counter("altw_pass2_node_blobs", node_blobs);
+        host.invocation
+            .counter("altw_pass2_relation_blobs", relation_blobs);
     }
 
     // Decode items go to the workers of the ordered pool, which runs over
@@ -396,12 +397,14 @@ pub(super) fn write_output_passthrough(
         .filter(|(_, d)| !d.is_passthrough)
         .map(|(i, _)| i)
         .collect();
-    crate::debug::emit_counter("altw_pass2_decode_items", decode_at.len());
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("altw_pass2_decode_items", decode_at.len());
+    host.invocation.counter(
         "altw_pass2_passthrough_items",
         schedule.len() - decode_at.len(),
     );
-    crate::debug::emit_counter("altw_pass2_decode_threads", decode_threads);
+    host.invocation
+        .counter("altw_pass2_decode_threads", decode_threads);
     let decode_at = &decode_at;
     let schedule = &schedule;
 
@@ -412,7 +415,11 @@ pub(super) fn write_output_passthrough(
     // --durations` can pair the markers; `--stalls` reads `*_wait_ns`
     // counters, not these spans; entered only after a failed try_send).
     let p2_counters = Pass2Counters::default();
-    let p2_send_stall = crate::counters::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
+    let p2_send_stall = crate::counters::StallGauge::new(
+        "WAIT_P2_SEND_START",
+        "WAIT_P2_SEND_END",
+        &host.invocation,
+    );
     let p2_counters_ref = &p2_counters;
     // The input's identity, captured once; each worker borrows it.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
@@ -495,16 +502,21 @@ pub(super) fn write_output_passthrough(
 
     writer.flush()?;
 
-    p2_counters.emit_all();
-    crate::debug::emit_counter("altw_pass2_consumer_recv_ms", p2_recv_ns / 1_000_000);
-    crate::debug::emit_counter("altw_pass2_consumer_write_ms", p2_write_ns / 1_000_000);
-    crate::debug::emit_counter(
+    p2_counters.emit_all(&host.invocation);
+    host.invocation
+        .counter("altw_pass2_consumer_recv_ms", p2_recv_ns / 1_000_000);
+    host.invocation
+        .counter("altw_pass2_consumer_write_ms", p2_write_ns / 1_000_000);
+    host.invocation.counter(
         "altw_pass2_passthrough_pread_ms",
         p2_pt_pread_ns / 1_000_000,
     );
-    crate::debug::emit_counter("altw_pass2_passthrough_bytes", p2_pt_bytes);
-    crate::debug::emit_counter("altw_pass2_passthrough_blobs", p2_pt_blobs);
-    crate::debug::emit_counter("altw_pass2_blobs_dispatched", blobs_dispatched);
+    host.invocation
+        .counter("altw_pass2_passthrough_bytes", p2_pt_bytes);
+    host.invocation
+        .counter("altw_pass2_passthrough_blobs", p2_pt_blobs);
+    host.invocation
+        .counter("altw_pass2_blobs_dispatched", blobs_dispatched);
     Ok(total_stats)
 }
 
@@ -591,7 +603,8 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Con
         // extra signal.
         self.blobs_dispatched += 1;
         if self.blobs_dispatched.is_multiple_of(64) {
-            crate::debug::emit_counter("altw_pass2_blobs_dispatched", self.blobs_dispatched);
+            self.cancel
+                .counter("altw_pass2_blobs_dispatched", self.blobs_dispatched);
         }
         Ok(())
     }

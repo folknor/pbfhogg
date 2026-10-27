@@ -184,7 +184,7 @@ pub(super) fn run_drain(
     writer: &mut PbfWriter<FileWriter>,
     counters: &DrainCounters,
 ) -> Result<MergeStats> {
-    crate::debug::emit_marker("MERGE_DRAIN_START");
+    writer.cancel_token().marker("MERGE_DRAIN_START");
 
     let DrainChannels { drain_rx } = channels;
 
@@ -322,7 +322,7 @@ pub(super) fn run_drain(
             && !state.barrier_done
             && node_end_seq.is_some_and(|end| state.next_seq >= end)
         {
-            barrier_publish_loc_map(&cfg, &mut state, counters)?;
+            barrier_publish_loc_map(&cfg, &mut state, counters, &cancel)?;
         }
 
         // Exit as soon as all senders have closed. If the buffer is
@@ -367,7 +367,7 @@ pub(super) fn run_drain(
     // Trailing creates: port `types_to_flush` match verbatim from
     // `rewrite.rs` so the cursor walk after end-of-stream emits creates
     // for any kinds whose blobs we never saw (or saw and finished).
-    crate::debug::emit_marker("MERGE_TRAILING_CREATES_START");
+    cancel.marker("MERGE_TRAILING_CREATES_START");
     let types_to_flush = match state.last_type {
         None | Some(ElementKind::Node) => {
             &[ElementKind::Node, ElementKind::Way, ElementKind::Relation][..]
@@ -404,12 +404,12 @@ pub(super) fn run_drain(
         }
         flush_block(&mut state.bb, writer)?;
     }
-    crate::debug::emit_marker("MERGE_TRAILING_CREATES_END");
+    cancel.marker("MERGE_TRAILING_CREATES_END");
 
     writer.flush()?;
 
-    crate::debug::emit_marker("MERGE_DRAIN_END");
-    counters.emit_all();
+    cancel.marker("MERGE_DRAIN_END");
+    counters.emit_all(&cancel);
 
     Ok(stats)
 }
@@ -817,8 +817,9 @@ fn barrier_publish_loc_map(
     cfg: &DrainConfig<'_>,
     state: &mut DrainState,
     counters: &DrainCounters,
+    invocation: &crate::host::Invocation,
 ) -> Result<()> {
-    crate::debug::emit_marker("MERGE_DRAIN_BARRIER_START");
+    invocation.marker("MERGE_DRAIN_BARRIER_START");
 
     let slots = cfg
         .coord_slots
@@ -886,6 +887,6 @@ fn barrier_publish_loc_map(
         }
     }
 
-    crate::debug::emit_marker("MERGE_DRAIN_BARRIER_END");
+    invocation.marker("MERGE_DRAIN_BARRIER_END");
     Ok(())
 }

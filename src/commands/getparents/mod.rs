@@ -221,7 +221,7 @@ fn getparents_walker(
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
 
-    crate::debug::emit_marker("GETPARENTS_SCHEDULE_START");
+    host.invocation.marker("GETPARENTS_SCHEDULE_START");
     let mut walker = HeaderWalker::open(input, host)?;
     let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
@@ -264,7 +264,7 @@ fn getparents_walker(
         }
     }
 
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "walk_actual_osmdata_blobs",
         u64::try_from(schedule.len())
             .unwrap_or(u64::MAX)
@@ -276,9 +276,11 @@ fn getparents_walker(
 
     let header = header_block.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
-    crate::debug::emit_counter("getparents_schedule_blobs", schedule.len());
-    crate::debug::emit_counter("getparents_blobs_skipped", blobs_skipped);
-    crate::debug::emit_marker("GETPARENTS_SCHEDULE_END");
+    host.invocation
+        .counter("getparents_schedule_blobs", schedule.len());
+    host.invocation
+        .counter("getparents_blobs_skipped", blobs_skipped);
+    host.invocation.marker("GETPARENTS_SCHEDULE_END");
 
     let header_bytes = super::output_header::build_one(
         &header,
@@ -301,7 +303,7 @@ fn getparents_walker(
         relations_written: 0,
     };
 
-    crate::debug::emit_marker("GETPARENTS_DECODE_START");
+    host.invocation.marker("GETPARENTS_DECODE_START");
     type ClassifyResult = crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))>;
 
     // Results arrive in schedule order through the ordered pool, whose window
@@ -339,7 +341,7 @@ fn getparents_walker(
     )?;
 
     writer.flush()?;
-    crate::debug::emit_marker("GETPARENTS_DECODE_END");
+    host.invocation.marker("GETPARENTS_DECODE_END");
     Ok(stats)
 }
 
@@ -376,7 +378,7 @@ fn getparents_pipelined(
         relations_written: 0,
     };
 
-    crate::debug::emit_marker("GETPARENTS_DECODE_START");
+    host.invocation.marker("GETPARENTS_DECODE_START");
     reader.for_each_fused_block(
         |block| {
             let mut bb = BlockBuilder::new();
@@ -396,7 +398,7 @@ fn getparents_pipelined(
         },
     )?;
     writer.flush()?;
-    crate::debug::emit_marker("GETPARENTS_DECODE_END");
+    host.invocation.marker("GETPARENTS_DECODE_END");
     Ok(stats)
 }
 

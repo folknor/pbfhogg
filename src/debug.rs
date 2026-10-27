@@ -1,34 +1,94 @@
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+//! Instrumentation: where a run's phase markers and counter samples go.
+//!
+//! Every marker and counter the library emits is emitted under the
+//! [`Invocation`](crate::host::Invocation) of the run that produced it, to
+//! that invocation's [`InstrumentSink`], if it has one. The library holds no
+//! instrumentation state of its own (ADR-0016): the sink, and whatever
+//! process resource it writes to, belongs to the caller. [`MarkerFifo`] is the
+//! sink the sidecar profiler reads, which the CLI hands its invocation.
 
 use crate::tunables::PIPE_BUF;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
-
-type MarkerState = (std::fs::File, std::time::Instant, u64);
-static STATE: std::sync::OnceLock<MarkerState> = std::sync::OnceLock::new();
-
-/// Initialize instrumentation from a path supplied by the caller.
+/// Receives one invocation's phase markers and counter samples.
 ///
-/// The caller reads its environment and reports an error through its own
-/// diagnostics. A failed open leaves initialization retryable.
-pub fn initialize_marker_fifo(path: &std::path::Path) -> std::io::Result<()> {
-    let file = open_marker_fifo(path)?;
-    let state = (
-        file,
-        std::time::Instant::now(),
-        // Procfs recovers the true process epoch on Linux. If that probe is
-        // unavailable, zero age plus `Instant` still supplies a monotonic FIFO
-        // timestamp and preserves the marker wire format.
-        crate::process::micros_since_process_start().unwrap_or(0),
-    );
-    STATE.set(state).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "marker FIFO already initialized",
-        )
-    })?;
-    ARMED.store(true, Relaxed);
-    Ok(())
+/// Called synchronously on whatever thread emits, from many threads at
+/// once, including during unwinding (the end-of-run emitters run from
+/// destructors) and while the emitting code holds a lock that orders its
+/// samples (so a sink sees one category's totals in increasing order). So a
+/// sink must be prompt and non-blocking, and must not run library work under
+/// the same invocation (re-entering the library from a callback can
+/// deadlock on those locks). A panic in a callback is contained: the
+/// invocation stops calling that sink and the run carries on. A sink's own
+/// destructor runs when the last clone of its invocation drops, and must not
+/// panic.
+///
+/// Calls carry no invocation identity: a caller that funnels several
+/// invocations into one collector gives each its own sink that tags what it
+/// forwards. Markers are point-in-time names; counters are `(name, value)`
+/// samples whose meaning is the name's (most are running totals that only
+/// grow, some are per-span deltas emitted repeatedly). Within one thread
+/// calls arrive in emission order; across threads nothing is ordered.
+///
+/// Some values are observations of the whole process taken at a phase
+/// boundary of this invocation (the `*_mallinfo_*` allocator fields, the
+/// page-fault deltas): a concurrent invocation's work shows in them too.
+pub trait InstrumentSink: Send + Sync {
+    /// A named phase marker.
+    fn marker(&self, name: &str);
+    /// A counter sample.
+    fn counter(&self, name: &str, value: i64);
+}
+
+/// The sidecar profiler's FIFO as an [`InstrumentSink`]: one line per event,
+/// `<timestamp_us> <name>` for a marker and `<timestamp_us> @<name>=<value>`
+/// for a counter.
+///
+/// Timestamps are monotonic microseconds since process start (on Linux the
+/// epoch is recovered from `/proc/self/stat`, so it covers dynamic-loader
+/// and pre-`main` time too; elsewhere it is the moment the FIFO was opened),
+/// anchored once at [`open`](Self::open), so every invocation sharing one
+/// `MarkerFifo` shares its clock. The FIFO is opened `O_NONBLOCK` and each
+/// line is one `write` of at most `PIPE_BUF` bytes, which a FIFO delivers
+/// whole or not at all: a full FIFO drops the line, never a part of it.
+pub struct MarkerFifo {
+    file: std::fs::File,
+    anchor: std::time::Instant,
+    age_at_anchor: u64,
+}
+
+impl MarkerFifo {
+    /// Open the FIFO at `path`, supplied by the caller (the CLI reads it from
+    /// its environment). The bare `io::Error` goes back to the caller, which
+    /// names it.
+    ///
+    /// # Errors
+    ///
+    /// The open failure; off Unix, always `Unsupported`.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = open_marker_fifo(path)?;
+        Ok(Self {
+            file,
+            anchor: std::time::Instant::now(),
+            // Procfs recovers the true process epoch on Linux. If that probe
+            // is unavailable, zero age plus `Instant` still supplies a
+            // monotonic FIFO timestamp and preserves the wire format.
+            age_at_anchor: crate::process::micros_since_process_start().unwrap_or(0),
+        })
+    }
+
+    fn now_us(&self) -> u128 {
+        u128::from(self.age_at_anchor) + self.anchor.elapsed().as_micros()
+    }
+}
+
+impl InstrumentSink for MarkerFifo {
+    fn marker(&self, name: &str) {
+        Line::marker(self.now_us(), name).emit(&self.file);
+    }
+
+    fn counter(&self, name: &str, value: i64) {
+        Line::counter(self.now_us(), name, value).emit(&self.file);
+    }
 }
 
 /// The sidecar FIFO is the caller's instrumentation channel, not an input or
@@ -51,47 +111,13 @@ fn open_marker_fifo(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     ))
 }
 
-/// No-op unless `initialize_marker_fifo` has succeeded.
-///
-/// Emit a named phase marker to the sidecar profiler (if active).
-///
-/// The marker is timestamped with monotonic microseconds since process start
-/// (on Linux the epoch is recovered from `/proc/self/stat`, so it covers
-/// dynamic-loader and pre-`main` time too; elsewhere it is the first FIFO
-/// use) and written to the FIFO at the caller-supplied path. Before
-/// initialization this is a no-op. If the FIFO buffer is full,
-/// the marker is silently dropped (O_NONBLOCK) - never partially written.
-pub fn emit_marker(name: &str) {
-    write_fifo(|f, us| {
-        let line = Line::marker(us, name);
-        line.emit(f);
-    });
-}
-
-/// Emit a named counter value to the sidecar profiler (if active).
-///
-/// Counters carry application-level data (element counts, resolved counts,
-/// skipped blobs) through the same FIFO as phase markers. The `@` prefix
-/// distinguishes counters from markers in the protocol.
-///
-/// Format: `<timestamp_us> @<name>=<value>\n`
-///
-/// The wire value is an `i64`. Signed values are sent exactly; unsigned ones
-/// (counts, byte totals, durations) saturate at `i64::MAX` rather than wrap,
-/// so callers pass them as they are instead of casting.
-pub fn emit_counter(name: &str, value: impl CounterValue) {
-    write_fifo(|f, us| {
-        let line = Line::counter(us, name, value.to_counter());
-        line.emit(f);
-    });
-}
-
 mod sealed {
     pub trait Sealed {}
 }
 
-/// A value [`emit_counter`] accepts: the signed integers it sends exactly,
-/// the unsigned ones it saturates at `i64::MAX`, and `bool` as 0 or 1.
+/// A value [`Invocation`](crate::host::Invocation)'s counter emission
+/// accepts: the signed integers it sends exactly, the unsigned ones it
+/// saturates at `i64::MAX`, and `bool` as 0 or 1.
 pub trait CounterValue: sealed::Sealed {
     /// The value on the wire.
     fn to_counter(self) -> i64;
@@ -124,7 +150,7 @@ macro_rules! saturating_counter_value {
 saturating_counter_value!(u64, usize);
 
 /// Snapshot glibc allocator state via `mallinfo2()` and emit the key fields
-/// as counters with `<prefix>_<field>` names.
+/// as counters of `invocation` with `<prefix>_<field>` names.
 ///
 /// DIAGNOSTIC (2026-04-11 round 3): used to distinguish brk arena growth
 /// (`arena`) from mmap-backed heap chunks (`hblkhd`) at marker boundaries
@@ -138,33 +164,36 @@ saturating_counter_value!(u64, usize);
 /// - `<prefix>_fordblks`  - bytes free in normal blocks (free-list)
 /// - `<prefix>_keepcost`  - top-most releasable block in arena
 ///
-/// Brokkr stores application counters by their supplied names and reports
-/// added, missing, or changed counters in comparisons. This function does no
-/// allocator query unless the caller initialized the marker FIFO.
+/// The allocator is the process's: these are process observations taken at
+/// one of this invocation's phase boundaries. Brokkr stores application
+/// counters by their supplied names and reports added, missing, or changed
+/// counters in comparisons. This function does no allocator query unless the
+/// invocation is instrumented.
 ///
 /// On non-glibc platforms this is a no-op.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn emit_mallinfo2(prefix: &str) {
-    if !ARMED.load(Relaxed) {
+pub(crate) fn emit_mallinfo2(invocation: &crate::host::Invocation, prefix: &str) {
+    if !invocation.instrumented() {
         return;
     }
     // SAFETY: mallinfo2 is a glibc function safe to call from any thread.
     let info = unsafe { libc::mallinfo2() };
-    emit_counter(&format!("{prefix}_arena"), info.arena);
-    emit_counter(&format!("{prefix}_hblks"), info.hblks);
-    emit_counter(&format!("{prefix}_hblkhd"), info.hblkhd);
-    emit_counter(&format!("{prefix}_uordblks"), info.uordblks);
-    emit_counter(&format!("{prefix}_fordblks"), info.fordblks);
-    emit_counter(&format!("{prefix}_keepcost"), info.keepcost);
+    invocation.counter(&format!("{prefix}_arena"), info.arena);
+    invocation.counter(&format!("{prefix}_hblks"), info.hblks);
+    invocation.counter(&format!("{prefix}_hblkhd"), info.hblkhd);
+    invocation.counter(&format!("{prefix}_uordblks"), info.uordblks);
+    invocation.counter(&format!("{prefix}_fordblks"), info.fordblks);
+    invocation.counter(&format!("{prefix}_keepcost"), info.keepcost);
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn emit_mallinfo2(_prefix: &str) {}
+pub(crate) fn emit_mallinfo2(_invocation: &crate::host::Invocation, _prefix: &str) {}
 
-/// Read cumulative (minor, major) page faults for the active sidecar run;
-/// `None` when no sidecar is armed or the procfs sample is unavailable.
-pub fn read_page_faults() -> Option<(u64, u64)> {
-    if !ARMED.load(Relaxed) {
+/// Read the process's cumulative (minor, major) page faults for an
+/// instrumented invocation; `None` when it is not instrumented or the procfs
+/// sample is unavailable.
+pub(crate) fn read_page_faults(invocation: &crate::host::Invocation) -> Option<(u64, u64)> {
+    if !invocation.instrumented() {
         return None;
     }
     crate::process::read_page_faults()
@@ -184,16 +213,18 @@ pub(crate) fn page_fault_deltas(
     ))
 }
 
-/// Publish a stage's fault deltas under the two counter names, or nothing
-/// when either sample is missing.
+/// Publish a stage's fault deltas under the two counter names of
+/// `invocation`, or nothing when either sample is missing. The faults are the
+/// process's, between two of this invocation's phase boundaries.
 pub(crate) fn emit_page_fault_deltas(
+    invocation: &crate::host::Invocation,
     names: (&str, &str),
     before: Option<(u64, u64)>,
     after: Option<(u64, u64)>,
 ) {
     if let Some((minor, major)) = page_fault_deltas(before, after) {
-        emit_counter(names.0, minor);
-        emit_counter(names.1, major);
+        invocation.counter(names.0, minor);
+        invocation.counter(names.1, major);
     }
 }
 
@@ -264,17 +295,6 @@ impl std::fmt::Write for Line {
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
         Ok(())
-    }
-}
-
-/// Shared FIFO write logic for markers and counters.
-fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
-    if !ARMED.load(Relaxed) {
-        return;
-    }
-    if let Some((file, anchor, age_at_anchor)) = STATE.get() {
-        let us = u128::from(*age_at_anchor) + anchor.elapsed().as_micros();
-        f(file, us);
     }
 }
 

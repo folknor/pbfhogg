@@ -2374,7 +2374,9 @@ pub fn run() -> process::ExitCode {
     // First, before any thread exists: SIGINT and SIGTERM become a
     // cancellation request (see `signals`). Every thread started from here on
     // inherits the blocked mask.
-    let cancel = pbfhogg::host::Invocation::new();
+    // The FIFO open starts no thread; the token must exist, with its sink,
+    // before the signal waiter takes a clone of it.
+    let cancel = host::cli_invocation();
     if let Err(e) = signals::install(cancel.clone()) {
         host::cli_warning(
             "cli.signals",
@@ -2388,7 +2390,6 @@ pub fn run() -> process::ExitCode {
     signals::test_hooks::arm(&cancel);
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::arm_input_replacement(&cancel);
-    host::init_marker_fifo();
     let host = host::cli_host(cancel);
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])

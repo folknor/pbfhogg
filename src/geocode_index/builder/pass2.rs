@@ -440,9 +440,9 @@ pub(super) fn run_pass2(
     // index by rank. Writes are sequential (sorted PBF → monotonic ranks). Reads
     // during way processing have good locality (contiguous pages, not scattered).
     // Planet: ~16 GB contiguous vs ~83 GB scattered page cache.
-    crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_START");
+    host.invocation.marker("GEOCODE_PASS2_RANK_INDEX_START");
     let referenced_nodes = referenced_nodes.into_ranked();
-    crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_END");
+    host.invocation.marker("GEOCODE_PASS2_RANK_INDEX_END");
     let referenced_count = referenced_nodes.total_count();
     crate::host::diag!(
         host.diagnostics,
@@ -484,7 +484,7 @@ pub(super) fn run_pass2(
     // See module docs. Coord writes land in `coord_slots` directly from
     // workers; pending addr points flow to main-thread merge for string
     // interning + `addr_points.bin` write.
-    crate::debug::emit_marker("GEOCODE_PASS2A_START");
+    host.invocation.marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
         crate::scan::classify::parallel_classify_phase_ordered(
@@ -603,7 +603,7 @@ pub(super) fn run_pass2(
             host,
         )?;
     }
-    crate::debug::emit_marker("GEOCODE_PASS2A_END");
+    host.invocation.marker("GEOCODE_PASS2A_END");
 
     // ---------------- Phase 2b: parallel way scan ----------------
     //
@@ -619,7 +619,7 @@ pub(super) fn run_pass2(
     let mut missing_node_ref_count = 0_u64;
     let mut missing_ref_way_ids = Vec::new();
 
-    crate::debug::emit_marker("GEOCODE_PASS2B_START");
+    host.invocation.marker("GEOCODE_PASS2B_START");
     {
         let referenced_ref = &referenced_nodes;
         let needed_admin_ways_ref = &needed_admin_ways;
@@ -747,9 +747,9 @@ pub(super) fn run_pass2(
             host,
         )?;
     }
-    crate::debug::emit_marker("GEOCODE_PASS2B_END");
+    host.invocation.marker("GEOCODE_PASS2B_END");
 
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "geocode_way_refs_without_coordinates",
         missing_node_ref_count,
     );
@@ -763,7 +763,7 @@ pub(super) fn run_pass2(
         );
     }
 
-    crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_START");
+    host.invocation.marker("GEOCODE_PASS2_FLUSH_MMAP_START");
     // Flush and drop writers before mmap
     street_ways_out.flush()?;
     street_nodes_out.flush()?;
@@ -793,7 +793,7 @@ pub(super) fn run_pass2(
     let street_nodes = Records::map(&output_dir.join(FILE_STREET_NODES))?;
     let addr_points = Records::map(&output_dir.join(FILE_ADDR_POINTS))?;
     let interp_nodes = Records::map(&output_dir.join(FILE_INTERP_NODES))?;
-    crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_END");
+    host.invocation.marker("GEOCODE_PASS2_FLUSH_MMAP_END");
 
     Ok(Pass2Output {
         addr_point_count,

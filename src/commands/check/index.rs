@@ -519,7 +519,7 @@ fn check_index_inner(
     // The first indexable blob with no indexdata, for the partial-index verdict.
     let mut first_unindexed: Option<(u64, u64)> = None;
 
-    crate::debug::emit_marker("CHECK_INDEX_START");
+    host.invocation.marker("CHECK_INDEX_START");
     let mut first = true;
     while let Some(frame) = frames.next_raw()? {
         // The header comes first or the file is not a PBF: a zero-byte or
@@ -589,7 +589,7 @@ fn check_index_inner(
     if first {
         return Err(crate::error::new_missing_header(path));
     }
-    crate::debug::emit_marker("CHECK_INDEX_END");
+    host.invocation.marker("CHECK_INDEX_END");
 
     if let Some((blob_ordinal, file_offset)) = first_unindexed
         && report.blobs_with_index > 0

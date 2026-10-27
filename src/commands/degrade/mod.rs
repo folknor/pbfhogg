@@ -491,28 +491,39 @@ pub(crate) fn degrade_to(
         ));
     }
 
-    crate::debug::emit_counter("degrade_unsort", flags.unsort);
-    crate::debug::emit_counter("degrade_unsort_intra", flags.unsort_intra);
-    crate::debug::emit_counter("degrade_strip_locations", flags.strip_locations);
-    crate::debug::emit_counter("degrade_strip_indexdata", flags.strip_indexdata);
-    crate::debug::emit_counter("degrade_strip_tagdata", flags.strip_tagdata);
-    crate::debug::emit_counter("degrade_corrupt_tagdata", flags.corrupt_tagdata);
-    crate::debug::emit_counter("degrade_corrupt_indexdata", flags.corrupt_indexdata);
-    crate::debug::emit_counter(
+    host.invocation.counter("degrade_unsort", flags.unsort);
+    host.invocation
+        .counter("degrade_unsort_intra", flags.unsort_intra);
+    host.invocation
+        .counter("degrade_strip_locations", flags.strip_locations);
+    host.invocation
+        .counter("degrade_strip_indexdata", flags.strip_indexdata);
+    host.invocation
+        .counter("degrade_strip_tagdata", flags.strip_tagdata);
+    host.invocation
+        .counter("degrade_corrupt_tagdata", flags.corrupt_tagdata);
+    host.invocation
+        .counter("degrade_corrupt_indexdata", flags.corrupt_indexdata);
+    host.invocation.counter(
         "degrade_corrupt_indexdata_kind",
         flags.corrupt_indexdata_kind,
     );
-    crate::debug::emit_counter("degrade_strip_bbox", flags.strip_bbox);
-    crate::debug::emit_counter("degrade_drop_ids", flags.drop_ids.is_some());
+    host.invocation
+        .counter("degrade_strip_bbox", flags.strip_bbox);
+    host.invocation
+        .counter("degrade_drop_ids", flags.drop_ids.is_some());
     if let Some(spec) = flags.drop_ids {
         // Both are user-supplied u64s and have always been emitted as their
         // bit pattern reinterpreted as i64 (a value from 2^63 up arrives
         // negative), so they keep that rather than the saturation
         // `emit_counter` applies to an unsigned count.
-        crate::debug::emit_counter("degrade_drop_n", spec.n.cast_signed());
-        crate::debug::emit_counter("degrade_drop_seed", spec.seed.cast_signed());
+        host.invocation
+            .counter("degrade_drop_n", spec.n.cast_signed());
+        host.invocation
+            .counter("degrade_drop_seed", spec.seed.cast_signed());
     }
-    crate::debug::emit_counter("degrade_block_cap", block_cap.get());
+    host.invocation
+        .counter("degrade_block_cap", block_cap.get());
 
     let stats = if flags.needs_decode() {
         degrade_decode_path(input, output, flags, block_cap, write, overrides, host)?
@@ -520,9 +531,12 @@ pub(crate) fn degrade_to(
         degrade_passthrough(input, output, flags, write, overrides, host)?
     };
 
-    crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written);
-    crate::debug::emit_counter("degrade_elements_written", stats.elements_written);
-    crate::debug::emit_counter("degrade_dropped_elements", stats.dropped);
+    host.invocation
+        .counter("degrade_blobs_written", stats.blobs_written);
+    host.invocation
+        .counter("degrade_elements_written", stats.elements_written);
+    host.invocation
+        .counter("degrade_dropped_elements", stats.dropped);
 
     Ok(stats)
 }
@@ -615,7 +629,7 @@ fn degrade_passthrough(
 
     let mut blobs_written: u64 = 0;
 
-    crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
+    host.invocation.marker("DEGRADE_PASSTHROUGH_START");
     while let Some(frame) = frames.next_raw()? {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
@@ -642,11 +656,11 @@ fn degrade_passthrough(
             _ => {}
         }
     }
-    crate::debug::emit_marker("DEGRADE_PASSTHROUGH_END");
+    host.invocation.marker("DEGRADE_PASSTHROUGH_END");
 
-    crate::debug::emit_marker("DEGRADE_FLUSH_START");
+    host.invocation.marker("DEGRADE_FLUSH_START");
     writer.flush()?;
-    crate::debug::emit_marker("DEGRADE_FLUSH_END");
+    host.invocation.marker("DEGRADE_FLUSH_END");
 
     Ok(DegradeStats {
         blobs_written,
@@ -884,7 +898,7 @@ fn degrade_decode_path(
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
     let drop_sets = if let Some(spec) = flags.drop_ids {
-        crate::debug::emit_marker("DEGRADE_DROP_SELECT_START");
+        host.invocation.marker("DEGRADE_DROP_SELECT_START");
         let sets = select_drop_sets(
             &shared_file,
             &node_schedule,
@@ -893,7 +907,7 @@ fn degrade_decode_path(
             spec,
             host,
         )?;
-        crate::debug::emit_marker("DEGRADE_DROP_SELECT_END");
+        host.invocation.marker("DEGRADE_DROP_SELECT_END");
         Some(sets)
     } else {
         None
@@ -925,7 +939,7 @@ fn degrade_decode_path(
     let mut elements_written: u64 = 0;
     let mut unsort_fired = [false; 3];
 
-    crate::debug::emit_marker("DEGRADE_NODES_START");
+    host.invocation.marker("DEGRADE_NODES_START");
     let s = run_kind_phase(
         &shared_file,
         &node_schedule,
@@ -940,12 +954,12 @@ fn degrade_decode_path(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("DEGRADE_NODES_END");
+    host.invocation.marker("DEGRADE_NODES_END");
     blobs_written += s.blobs;
     elements_written += s.elements;
     unsort_fired[0] = s.unsort_fired;
 
-    crate::debug::emit_marker("DEGRADE_WAYS_START");
+    host.invocation.marker("DEGRADE_WAYS_START");
     let s = run_kind_phase(
         &shared_file,
         &way_schedule,
@@ -960,12 +974,12 @@ fn degrade_decode_path(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("DEGRADE_WAYS_END");
+    host.invocation.marker("DEGRADE_WAYS_END");
     blobs_written += s.blobs;
     elements_written += s.elements;
     unsort_fired[1] = s.unsort_fired;
 
-    crate::debug::emit_marker("DEGRADE_RELATIONS_START");
+    host.invocation.marker("DEGRADE_RELATIONS_START");
     let s = run_kind_phase(
         &shared_file,
         &rel_schedule,
@@ -980,20 +994,23 @@ fn degrade_decode_path(
         &mut writer,
         host,
     )?;
-    crate::debug::emit_marker("DEGRADE_RELATIONS_END");
+    host.invocation.marker("DEGRADE_RELATIONS_END");
     blobs_written += s.blobs;
     elements_written += s.elements;
     unsort_fired[2] = s.unsort_fired;
 
-    crate::debug::emit_marker("DEGRADE_FLUSH_START");
+    host.invocation.marker("DEGRADE_FLUSH_START");
     writer.flush()?;
-    crate::debug::emit_marker("DEGRADE_FLUSH_END");
+    host.invocation.marker("DEGRADE_FLUSH_END");
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("degrade_unsort_fired_nodes", i64::from(unsort_fired[0]));
-        crate::debug::emit_counter("degrade_unsort_fired_ways", i64::from(unsort_fired[1]));
-        crate::debug::emit_counter("degrade_unsort_fired_relations", i64::from(unsort_fired[2]));
+        host.invocation
+            .counter("degrade_unsort_fired_nodes", i64::from(unsort_fired[0]));
+        host.invocation
+            .counter("degrade_unsort_fired_ways", i64::from(unsort_fired[1]));
+        host.invocation
+            .counter("degrade_unsort_fired_relations", i64::from(unsort_fired[2]));
     }
 
     Ok(DegradeStats {

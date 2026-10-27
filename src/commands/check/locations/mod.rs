@@ -784,16 +784,16 @@ fn check_locations_inner(
     };
 
     let shards = KeyShards::new();
-    crate::debug::emit_marker("CHECKLOC_NODES_START");
+    host.invocation.marker("CHECKLOC_NODES_START");
     prepass(&mut walk, &shards, cap, &mut report, &mut details, host)?;
-    crate::debug::emit_marker("CHECKLOC_NODES_END");
+    host.invocation.marker("CHECKLOC_NODES_END");
     let (nodes, ways) = route(&walk);
 
     if opts.agreement {
-        crate::debug::emit_marker("CHECKLOC_REFS_START");
+        host.invocation.marker("CHECKLOC_REFS_START");
         key_refs(&walk.file, &ways, &shards, host)?;
         report.blob_decodes += ways.len();
-        crate::debug::emit_marker("CHECKLOC_REFS_END");
+        host.invocation.marker("CHECKLOC_REFS_END");
     }
 
     let keys = shards.into_set();
@@ -805,8 +805,9 @@ fn check_locations_inner(
     if opts.agreement {
         report.nodes_absent = Some(0);
     }
-    crate::debug::emit_counter("checkloc_keys", keys.total_count());
-    crate::debug::emit_counter("checkloc_partitions", report.partitions);
+    host.invocation.counter("checkloc_keys", keys.total_count());
+    host.invocation
+        .counter("checkloc_partitions", report.partitions);
     if plan.partitions() > CHECK_LOCATIONS_PARTITION_WARN {
         crate::host::diag!(
             host.diagnostics,
@@ -831,15 +832,18 @@ fn check_locations_inner(
     };
     for k in 0..plan.partitions() {
         host.invocation.check()?;
-        crate::debug::emit_marker("CHECKLOC_PARTITION_START");
+        host.invocation.marker("CHECKLOC_PARTITION_START");
         ctx.run_partition(k, &mut report, &mut details, host)?;
-        crate::debug::emit_marker("CHECKLOC_PARTITION_END");
+        host.invocation.marker("CHECKLOC_PARTITION_END");
     }
 
     report.violations = details.finish();
-    crate::debug::emit_counter("checkloc_blob_decodes", report.blob_decodes);
-    crate::debug::emit_counter("checkloc_refs_mismatched", report.refs_mismatched);
-    crate::debug::emit_counter("checkloc_refs_without_node", report.refs_without_node);
+    host.invocation
+        .counter("checkloc_blob_decodes", report.blob_decodes);
+    host.invocation
+        .counter("checkloc_refs_mismatched", report.refs_mismatched);
+    host.invocation
+        .counter("checkloc_refs_without_node", report.refs_without_node);
     Ok(report)
 }
 

@@ -278,7 +278,7 @@ fn check_refs_inner(
     // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
     // when the flag is given.
 
-    crate::debug::emit_marker("CHECKREFS_SCAN_START");
+    host.invocation.marker("CHECKREFS_SCAN_START");
 
     // Pread worker pool allocates decoded blocks; the main thread frees
     // them after the merge.
@@ -359,7 +359,7 @@ fn check_refs_inner(
     // its serial merge and moves it into the phase's own set after the join
     // (see `check::insert_overflow_ids`).
     let mut overflow = IdSet::new();
-    crate::debug::emit_marker("CHECKREFS_NODES_START");
+    host.invocation.marker("CHECKREFS_NODES_START");
     {
         let node_ids_ref = &node_ids;
         parallel_classify_phase(
@@ -394,17 +394,17 @@ fn check_refs_inner(
         )?;
     }
     node_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
-    crate::debug::emit_marker("CHECKREFS_NODES_END");
+    host.invocation.marker("CHECKREFS_NODES_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("checkrefs_after_nodes");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_nodes");
 
     // ------------------------------------------------------------------
     // Phase 2 - way scan. Workers read `node_ids` (via `get`, no atomic
     // needed now that phase 1 joined), optionally write `way_ids`, and
     // collect per-blob missing-ref vecs.
     // ------------------------------------------------------------------
-    crate::debug::emit_marker("CHECKREFS_WAYS_START");
+    host.invocation.marker("CHECKREFS_WAYS_START");
     {
         let node_ids_ref = &node_ids;
         let way_ids_ref = &way_ids;
@@ -469,10 +469,10 @@ fn check_refs_inner(
         )?;
     }
     way_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
-    crate::debug::emit_marker("CHECKREFS_WAYS_END");
+    host.invocation.marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("checkrefs_after_ways");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_ways");
 
     // ------------------------------------------------------------------
     // Phase 3 - relation scan (only when `check_relations`). Workers read
@@ -485,7 +485,7 @@ fn check_refs_inner(
         0
     };
     if check_relations {
-        crate::debug::emit_marker("CHECKREFS_RELATIONS_START");
+        host.invocation.marker("CHECKREFS_RELATIONS_START");
         {
             let node_ids_ref = &node_ids;
             let way_ids_ref = &way_ids;
@@ -607,10 +607,10 @@ fn check_refs_inner(
             )?;
         }
         relation_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
-        crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
+        host.invocation.marker("CHECKREFS_RELATIONS_END");
         // Brokkr stores named counters generically and reports changes in sidecar
-        // comparisons; this sample is inert unless the CLI initialized the FIFO.
-        crate::debug::emit_mallinfo2("checkrefs_after_relations");
+        // comparisons; this sample is inert unless the invocation has a sink.
+        crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_relations");
     }
 
     // Unique-missing counts are the sets' cardinalities. The timer keeps its
@@ -622,7 +622,7 @@ fn check_refs_inner(
     let missing_dedup_ms = t_dedup.elapsed_ms();
 
     // Resolve deferred relation refs against the complete relation_ids set.
-    crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
+    host.invocation.marker("CHECKREFS_DEFERRED_RESOLVE_START");
     let t_deferred = Stopwatch::start();
     if check_relations {
         let mut missing_relation_members = IdSet::new();
@@ -647,55 +647,65 @@ fn check_refs_inner(
         result.missing_relation_member_occurrences = occurrences;
     }
     let deferred_resolve_ms = t_deferred.elapsed_ms();
-    crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_END");
+    host.invocation.marker("CHECKREFS_DEFERRED_RESOLVE_END");
 
     result.missing_refs = missing_refs;
 
-    crate::debug::emit_marker("CHECKREFS_SCAN_END");
+    host.invocation.marker("CHECKREFS_SCAN_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("checkrefs_final");
-    crate::debug::emit_counter("checkrefs_node_count", result.node_count);
-    crate::debug::emit_counter("checkrefs_way_count", result.way_count);
-    crate::debug::emit_counter("checkrefs_relation_count", result.relation_count);
-    crate::debug::emit_counter("checkrefs_missing_node_refs", result.missing_node_refs);
-    crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs);
-    crate::debug::emit_counter(
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_final");
+    host.invocation
+        .counter("checkrefs_node_count", result.node_count);
+    host.invocation
+        .counter("checkrefs_way_count", result.way_count);
+    host.invocation
+        .counter("checkrefs_relation_count", result.relation_count);
+    host.invocation
+        .counter("checkrefs_missing_node_refs", result.missing_node_refs);
+    host.invocation
+        .counter("checkrefs_missing_way_refs", result.missing_way_refs);
+    host.invocation.counter(
         "checkrefs_missing_node_members",
         result.missing_node_members,
     );
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "checkrefs_missing_relation_members",
         result.missing_relation_members,
     );
 
     // One-shot post-pass timers, sampled where each step ended.
-    crate::debug::emit_counter("checkrefs_missing_dedup_ms", missing_dedup_ms);
-    crate::debug::emit_counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms);
+    host.invocation
+        .counter("checkrefs_missing_dedup_ms", missing_dedup_ms);
+    host.invocation
+        .counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms);
 
     // Structural counters.
-    crate::debug::emit_counter("checkrefs_node_blobs", node_blobs);
-    crate::debug::emit_counter("checkrefs_way_blobs", way_blobs);
-    crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs);
-    crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked);
-    crate::debug::emit_counter(
+    host.invocation.counter("checkrefs_node_blobs", node_blobs);
+    host.invocation.counter("checkrefs_way_blobs", way_blobs);
+    host.invocation
+        .counter("checkrefs_relation_blobs", relation_blobs);
+    host.invocation
+        .counter("checkrefs_way_refs_checked", way_refs_checked);
+    host.invocation.counter(
         "checkrefs_rel_node_members_checked",
         rel_node_members_checked,
     );
-    crate::debug::emit_counter("checkrefs_rel_way_members_checked", rel_way_members_checked);
-    crate::debug::emit_counter(
+    host.invocation
+        .counter("checkrefs_rel_way_members_checked", rel_way_members_checked);
+    host.invocation.counter(
         "checkrefs_rel_rel_members_deferred",
         rel_rel_members_deferred,
     );
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "checkrefs_missing_node_refs_occurrences",
         missing_node_refs_occurrences,
     );
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "checkrefs_missing_way_refs_occurrences",
         missing_way_refs_occurrences,
     );
-    crate::debug::emit_counter(
+    host.invocation.counter(
         "checkrefs_missing_node_members_occurrences",
         missing_node_members_occurrences,
     );

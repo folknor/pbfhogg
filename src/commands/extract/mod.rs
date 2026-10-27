@@ -703,7 +703,8 @@ fn extract_multi_to(
             "extract.multi.sequential_fallback",
             "Multi-extract single-pass probe declined the input; using one full pass per region"
         );
-        crate::debug::emit_counter("multi_extract_sequential_fallback", 1);
+        host.invocation
+            .counter("multi_extract_sequential_fallback", 1);
     }
 
     // Sequential fallback: one extract at a time, each into its borrowed
@@ -892,12 +893,18 @@ pub(crate) fn extract_to(
             input, output, region, set_bounds, clean, write, overrides, host,
         ),
     }?;
-    crate::debug::emit_counter("extract_nodes_in_bbox", result.nodes_in_bbox);
-    crate::debug::emit_counter("extract_nodes_from_ways", result.nodes_from_ways);
-    crate::debug::emit_counter("extract_nodes_from_relations", result.nodes_from_relations);
-    crate::debug::emit_counter("extract_ways_written", result.ways_written);
-    crate::debug::emit_counter("extract_ways_from_relations", result.ways_from_relations);
-    crate::debug::emit_counter("extract_relations_written", result.relations_written);
+    host.invocation
+        .counter("extract_nodes_in_bbox", result.nodes_in_bbox);
+    host.invocation
+        .counter("extract_nodes_from_ways", result.nodes_from_ways);
+    host.invocation
+        .counter("extract_nodes_from_relations", result.nodes_from_relations);
+    host.invocation
+        .counter("extract_ways_written", result.ways_written);
+    host.invocation
+        .counter("extract_ways_from_relations", result.ways_from_relations);
+    host.invocation
+        .counter("extract_relations_written", result.relations_written);
     Ok(result)
 }
 

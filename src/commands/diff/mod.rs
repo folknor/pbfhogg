@@ -308,10 +308,10 @@ fn compare<W: Write>(
             "diff.sequential_fallback",
             "Using sequential comparison: missing indexdata"
         );
-        crate::debug::emit_counter("diff_sequential_fallback", 1);
+        host.invocation.counter("diff_sequential_fallback", 1);
     }
 
-    crate::debug::emit_marker("DIFF_SCAN_START");
+    host.invocation.marker("DIFF_SCAN_START");
 
     // Path selection depends on the inputs and the shard count only, never on
     // whether text is wanted: a count-only run shards exactly as a text run.
@@ -326,16 +326,16 @@ fn compare<W: Write>(
     } else {
         diff_element_stream(old, new, output, options, direct_io, &filter, host)?
     };
-    Ok(finish_scan(stats))
+    Ok(finish_scan(stats, &host.invocation))
 }
 
 /// Close the scan: the end marker and the result counters, on every path.
-fn finish_scan(stats: DiffStats) -> DiffStats {
-    crate::debug::emit_marker("DIFF_SCAN_END");
-    crate::debug::emit_counter("diff_common", stats.common);
-    crate::debug::emit_counter("diff_created", stats.created);
-    crate::debug::emit_counter("diff_modified", stats.modified);
-    crate::debug::emit_counter("diff_deleted", stats.deleted);
+fn finish_scan(stats: DiffStats, invocation: &crate::host::Invocation) -> DiffStats {
+    invocation.marker("DIFF_SCAN_END");
+    invocation.counter("diff_common", stats.common);
+    invocation.counter("diff_created", stats.created);
+    invocation.counter("diff_modified", stats.modified);
+    invocation.counter("diff_deleted", stats.deleted);
     stats
 }
 
@@ -375,7 +375,7 @@ fn diff_block_pair<W: Write>(
             "diff.negative_id_fallback",
             "Using a single shard: negative IDs cannot use ID-range shards"
         );
-        crate::debug::emit_counter("diff_negative_id_fallback", 1);
+        host.invocation.counter("diff_negative_id_fallback", 1);
     }
 
     // Scratch shard files live in the run's scratch directory, which the
@@ -429,7 +429,7 @@ fn diff_block_pair<W: Write>(
         &mut report,
         host,
     )?;
-    emit_merge_stats_counters(&merge_stats);
+    emit_merge_stats_counters(&merge_stats, &host.invocation);
     Ok(report.sink.stats)
 }
 
@@ -675,24 +675,27 @@ fn append_and_cleanup(
 /// phases. Shadow-only - no code-path change. Shared by the text diff and
 /// derive (`--format osc`), which both drive the block-pair merge and
 /// report the same shadow view.
-fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
-    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal);
-    crate::debug::emit_counter(
+fn emit_merge_stats_counters(
+    s: &crate::osc::merge_join::BlockPairMergeStats,
+    invocation: &crate::host::Invocation,
+) {
+    invocation.counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal);
+    invocation.counter(
         "mergejoin_shadow_elements_byte_equal",
         s.elements_byte_equal,
     );
-    crate::debug::emit_counter(
+    invocation.counter(
         "mergejoin_shadow_pairs_overlapping_decoded",
         s.pairs_overlapping_decoded,
     );
-    crate::debug::emit_counter(
+    invocation.counter(
         "mergejoin_shadow_elements_overlapping_decoded",
         s.elements_overlapping_decoded,
     );
-    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only);
-    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only);
-    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only);
-    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only);
+    invocation.counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only);
+    invocation.counter("mergejoin_shadow_elements_old_only", s.elements_old_only);
+    invocation.counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only);
+    invocation.counter("mergejoin_shadow_elements_new_only", s.elements_new_only);
 }
 
 /// Fallback diff path for inputs without indexdata: the element-level
@@ -738,9 +741,9 @@ fn diff_element_stream<W: Write>(
     ];
     for (kind, enabled, start, end) in phases {
         if enabled {
-            crate::debug::emit_marker(start);
+            host.invocation.marker(start);
             stream_merge_phase(&mut old_src, &mut new_src, kind, &mut sink)?;
-            crate::debug::emit_marker(end);
+            host.invocation.marker(end);
         } else {
             skip_kind(&mut old_src, &mut new_src, kind)?;
         }

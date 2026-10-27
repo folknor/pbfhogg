@@ -415,7 +415,7 @@ fn schedule_walk<'a>(
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     let source = input.into();
     let input = source.path();
-    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
+    host.invocation.marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?;
     if accept_partial {
         walker = walker.accepting_partial_index();
@@ -428,9 +428,9 @@ fn schedule_walk<'a>(
     // that opens with an OSMData blob would have that blob dropped unread.
     // Subsequent non-OsmData blobs are filtered below.
     consume_leading_header(&mut walker, input)?;
-    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
+    host.invocation.marker("SCHEDULE_SCANNER_OPEN_END");
 
-    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
+    host.invocation.marker("SCHEDULE_SCAN_LOOP_START");
     let mut schedule: Vec<ScheduledBlob> = Vec::new();
     let mut blobs_skipped_by_tag: u64 = 0;
     while let Some(meta) = walker.next_header()? {
@@ -465,15 +465,16 @@ fn schedule_walk<'a>(
         // schedule inherits that, so no builder repeats it.
         schedule.push(ScheduledBlob::from_meta(&meta)?);
     }
-    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
+    host.invocation.marker("SCHEDULE_SCAN_LOOP_END");
 
-    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
+    host.invocation.marker("SCHEDULE_SCANNER_DROP_START");
     let shared_file = walker.input();
     drop(walker);
-    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
+    host.invocation.marker("SCHEDULE_SCANNER_DROP_END");
 
-    crate::debug::emit_counter("schedule_blobs", schedule.len());
-    crate::debug::emit_counter("schedule_tagidx_skipped_blobs", blobs_skipped_by_tag);
+    host.invocation.counter("schedule_blobs", schedule.len());
+    host.invocation
+        .counter("schedule_tagidx_skipped_blobs", blobs_skipped_by_tag);
     Ok((schedule, shared_file, blobs_skipped_by_tag))
 }
 
@@ -510,12 +511,12 @@ pub(crate) fn build_classify_schedules_split<'a>(
 )> {
     let source = input.into();
     let input = source.path();
-    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
+    host.invocation.marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?;
     consume_leading_header(&mut walker, input)?;
-    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
+    host.invocation.marker("SCHEDULE_SCANNER_OPEN_END");
 
-    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
+    host.invocation.marker("SCHEDULE_SCAN_LOOP_START");
     let mut nodes: Vec<ScheduledBlob> = Vec::new();
     let mut ways: Vec<ScheduledBlob> = Vec::new();
     let mut rels: Vec<ScheduledBlob> = Vec::new();
@@ -549,16 +550,17 @@ pub(crate) fn build_classify_schedules_split<'a>(
             }
         }
     }
-    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
+    host.invocation.marker("SCHEDULE_SCAN_LOOP_END");
 
-    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
+    host.invocation.marker("SCHEDULE_SCANNER_DROP_START");
     let shared_file = walker.input();
     drop(walker);
-    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
+    host.invocation.marker("SCHEDULE_SCANNER_DROP_END");
 
-    crate::debug::emit_counter("schedule_node_blobs", nodes.len());
-    crate::debug::emit_counter("schedule_way_blobs", ways.len());
-    crate::debug::emit_counter("schedule_relation_blobs", rels.len());
+    host.invocation.counter("schedule_node_blobs", nodes.len());
+    host.invocation.counter("schedule_way_blobs", ways.len());
+    host.invocation
+        .counter("schedule_relation_blobs", rels.len());
     Ok((nodes, ways, rels, shared_file, max_ids))
 }
 
@@ -818,7 +820,7 @@ fn run_unordered_per_blob<L, R: Send>(
 
     // Declared before the scope, so it emits after the scope has joined the
     // workers, on a return or an unwind alike.
-    let _emit = EmitOnDrop(metrics);
+    let _emit = EmitOnDrop(metrics, &host.invocation);
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
@@ -890,11 +892,11 @@ fn run_unordered_per_blob<L, R: Send>(
 
 /// Emits an unordered metrics set when dropped: after a run's scope has
 /// joined its threads, whether the run returned or unwound.
-struct EmitOnDrop<'a>(&'a UnorderedPoolMetrics);
+struct EmitOnDrop<'a>(&'a UnorderedPoolMetrics, &'a crate::host::Invocation);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.emit_all();
+        self.0.emit_all(self.1);
     }
 }
 
@@ -1184,7 +1186,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 
     // Emits after the scope has joined, so every thread's waits are in; on
     // a failure or an unwind too.
-    let _emit = EmitOnDrop(metrics);
+    let _emit = EmitOnDrop(metrics, &host.invocation);
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {

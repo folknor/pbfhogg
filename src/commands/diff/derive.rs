@@ -148,7 +148,8 @@ pub(crate) fn derive_changes_to(
             "derive_changes.sequential_fallback",
             "Using sequential comparison: {reason}"
         );
-        crate::debug::emit_counter("derive_changes_sequential_fallback", 1);
+        host.invocation
+            .counter("derive_changes_sequential_fallback", 1);
     }
 
     // No compressed-input multiplier can predict changed XML bytes: tag
@@ -157,7 +158,7 @@ pub(crate) fn derive_changes_to(
     // measured path. Keep write errors authoritative instead of refusing a
     // potentially empty diff against an invented scratch-space requirement.
 
-    crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
+    host.invocation.marker("DERIVECHANGES_SCAN_START");
 
     let mut sink = ChangeSink::new(scratch, "", increment_version, timestamp)?;
 
@@ -169,22 +170,25 @@ pub(crate) fn derive_changes_to(
         }
         sink.flush()?;
 
-        crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
+        host.invocation.marker("DERIVECHANGES_SCAN_END");
 
         let stats = sink.stats();
 
-        crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
+        host.invocation.marker("DERIVECHANGES_WRITE_START");
         assemble_osc(output, &sink, host)?;
-        crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
+        host.invocation.marker("DERIVECHANGES_WRITE_END");
         Ok(stats)
     })();
     // Remove fragments before returning, on errors and during unwinding too.
     drop(sink);
     let stats = result?;
 
-    crate::debug::emit_counter("derivechanges_creates", stats.creates);
-    crate::debug::emit_counter("derivechanges_modifies", stats.modifies);
-    crate::debug::emit_counter("derivechanges_deletes", stats.deletes);
+    host.invocation
+        .counter("derivechanges_creates", stats.creates);
+    host.invocation
+        .counter("derivechanges_modifies", stats.modifies);
+    host.invocation
+        .counter("derivechanges_deletes", stats.deletes);
 
     Ok(stats)
 }
@@ -413,7 +417,12 @@ impl super::sharded::ShardedReport for OscReport<'_> {
         first_err.map_or(Ok(()), Err)
     }
 
-    fn on_plan(&mut self, kind: ElementKind, shards: &[super::shard::Shard]) {
+    fn on_plan(
+        &mut self,
+        kind: ElementKind,
+        shards: &[super::shard::Shard],
+        invocation: &crate::host::Invocation,
+    ) {
         let [shards_name, max_name, min_name] = match kind {
             ElementKind::Node => [
                 "derivepar_node_shards",
@@ -431,10 +440,10 @@ impl super::sharded::ShardedReport for OscReport<'_> {
                 "derivepar_rel_shard_min_blobs",
             ],
         };
-        crate::debug::emit_counter(shards_name, shards.len());
+        invocation.counter(shards_name, shards.len());
         let blobs = shards.iter().map(super::shard::Shard::blobs);
-        crate::debug::emit_counter(max_name, blobs.clone().max().unwrap_or(0));
-        crate::debug::emit_counter(min_name, blobs.min().unwrap_or(0));
+        invocation.counter(max_name, blobs.clone().max().unwrap_or(0));
+        invocation.counter(min_name, blobs.min().unwrap_or(0));
     }
 
     #[cfg(feature = "test-hooks")]
@@ -534,7 +543,8 @@ fn derive_changes_block_pair(
             "derive_changes.negative_id_fallback",
             "Using a single shard: negative IDs cannot use ID-range shards"
         );
-        crate::debug::emit_counter("derive_changes_negative_id_fallback", 1);
+        host.invocation
+            .counter("derive_changes_negative_id_fallback", 1);
     }
     // Scratch peaks include the final action fragments plus the current
     // kind's shard fragments. Appending temporarily duplicates the source
@@ -562,7 +572,7 @@ fn derive_changes_block_pair(
     ];
     let mut report = OscReport { sink, scratch };
     let merge_stats = super::sharded::run(&walked, &phases, jobs, true, &mut report, host)?;
-    super::emit_merge_stats_counters(&merge_stats);
+    super::emit_merge_stats_counters(&merge_stats, &host.invocation);
     Ok(())
 }
 
@@ -600,9 +610,9 @@ fn derive_changes_element_stream(
         ),
     ];
     for (kind, start, end) in phases {
-        crate::debug::emit_marker(start);
+        host.invocation.marker(start);
         stream_merge_phase(&mut old_src, &mut new_src, kind, &mut *sink)?;
-        crate::debug::emit_marker(end);
+        host.invocation.marker(end);
     }
 
     Ok(())

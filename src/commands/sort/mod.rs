@@ -134,22 +134,22 @@ pub(crate) fn sort_to<'a>(
             "sort.unindexed_fallback",
             "sorting without indexdata; every blob must be decompressed to scan element IDs"
         );
-        crate::debug::emit_counter("sort_unindexed_fallback", 1);
+        host.invocation.counter("sort_unindexed_fallback", 1);
     }
 
     if let Ok(meta) = pin.metadata() {
-        crate::debug::emit_counter("sort_total_bytes_in", meta.len());
+        host.invocation.counter("sort_total_bytes_in", meta.len());
     }
 
     // Pass 1: Build blob index
-    crate::debug::emit_marker("SORT_PASS1_START");
+    host.invocation.marker("SORT_PASS1_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
         "sort.pass1",
         "Pass 1: indexing blobs..."
     );
-    crate::debug::emit_marker("SORT_INDEX_BUILD_START");
+    host.invocation.marker("SORT_INDEX_BUILD_START");
     // Any input order is accepted (sorting it is the point). The walk
     // refuses a partially indexed input, as every command-input walk does;
     // a wholly unindexed one takes the payload scan.
@@ -162,7 +162,7 @@ pub(crate) fn sort_to<'a>(
         direct_io,
         host,
     )?;
-    crate::debug::emit_marker("SORT_INDEX_BUILD_END");
+    host.invocation.marker("SORT_INDEX_BUILD_END");
     let blobs_total = indexed.frames.len() as u64 + indexed.omitted;
     crate::host::diag!(
         host.diagnostics,
@@ -170,18 +170,19 @@ pub(crate) fn sort_to<'a>(
         "sort.indexed",
         "  {blobs_total} OSMData blobs indexed"
     );
-    crate::debug::emit_counter("sort_blobs_total", blobs_total);
+    host.invocation.counter("sort_blobs_total", blobs_total);
 
-    crate::debug::emit_marker("SORT_OVERLAP_DETECT_START");
+    host.invocation.marker("SORT_OVERLAP_DETECT_START");
     let plan = blob_merge::plan(indexed);
-    crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
+    host.invocation.marker("SORT_OVERLAP_DETECT_END");
     // `sort_blobs_overlap` counts blobs whose range overlaps a same-kind
     // neighbour; blobs rewritten only for intra-blob disorder are counted
     // apart, so the two attributions stay disjoint.
     let overlap_count = plan.overlapping;
     let intra_unsorted_blobs = plan.intra_unsorted;
-    crate::debug::emit_counter("sort_blobs_overlap", overlap_count);
-    crate::debug::emit_counter("sort_blobs_intra_unsorted", intra_unsorted_blobs);
+    host.invocation.counter("sort_blobs_overlap", overlap_count);
+    host.invocation
+        .counter("sort_blobs_intra_unsorted", intra_unsorted_blobs);
     if overlap_count > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -198,9 +199,11 @@ pub(crate) fn sort_to<'a>(
             "  {intra_unsorted_blobs} blobs internally unsorted (decode + re-encode)"
         );
     }
-    crate::debug::emit_counter("sort_blobs_restructured", plan.restructured);
-    crate::debug::emit_counter("sort_blobs_omitted", plan.omitted);
-    crate::debug::emit_counter("sort_false_indexdata_replaced", plan.false_claims_replaced);
+    host.invocation
+        .counter("sort_blobs_restructured", plan.restructured);
+    host.invocation.counter("sort_blobs_omitted", plan.omitted);
+    host.invocation
+        .counter("sort_false_indexdata_replaced", plan.false_claims_replaced);
     if plan.restructured > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -233,17 +236,17 @@ pub(crate) fn sort_to<'a>(
         );
     }
 
-    crate::debug::emit_marker("SORT_PASS1_END");
+    host.invocation.marker("SORT_PASS1_END");
 
     // Pass 2: Write in sorted order
-    crate::debug::emit_marker("SORT_PASS2_START");
+    host.invocation.marker("SORT_PASS2_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
         "sort.pass2",
         "Pass 2: writing sorted output..."
     );
-    crate::debug::emit_marker("SORT_WRITER_SETUP_START");
+    host.invocation.marker("SORT_WRITER_SETUP_START");
     let header_bytes = super::output_header::build(
         &headers,
         &super::output_header::OutputFacts::sorted(plan.ways()),
@@ -252,15 +255,16 @@ pub(crate) fn sort_to<'a>(
     )?
     .bytes;
     let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
-    crate::debug::emit_marker("SORT_WRITER_SETUP_END");
+    host.invocation.marker("SORT_WRITER_SETUP_END");
 
     let sources = blob_merge::open_sources(vec![pin])?;
-    crate::debug::emit_counter("sort_overlap_runs", plan.runs.len());
+    host.invocation
+        .counter("sort_overlap_runs", plan.runs.len());
 
     // Overlap runs are swept on worker threads while this loop writes, so
     // SORT_WRITE_LOOP spans both (the separate SORT_OVERLAP_PARALLEL phase of
     // the earlier collect-then-write shape no longer exists).
-    crate::debug::emit_marker("SORT_WRITE_LOOP_START");
+    host.invocation.marker("SORT_WRITE_LOOP_START");
     let counts = blob_merge::write_plan(
         &plan,
         &sources,
@@ -269,27 +273,31 @@ pub(crate) fn sort_to<'a>(
         backend.supports_copy_range(),
         host,
     )?;
-    crate::debug::emit_marker("SORT_WRITE_LOOP_END");
+    host.invocation.marker("SORT_WRITE_LOOP_END");
 
-    crate::debug::emit_counter("sort_blobs_passthrough", counts.blobs_passthrough);
-    crate::debug::emit_counter("sort_blobs_rewritten", counts.blobs_rewritten);
-    crate::debug::emit_counter("sort_copy_range_calls", counts.copy_range_calls);
-    crate::debug::emit_counter("sort_copy_range_coalesced", counts.copy_range_coalesced);
+    host.invocation
+        .counter("sort_blobs_passthrough", counts.blobs_passthrough);
+    host.invocation
+        .counter("sort_blobs_rewritten", counts.blobs_rewritten);
+    host.invocation
+        .counter("sort_copy_range_calls", counts.copy_range_calls);
+    host.invocation
+        .counter("sort_copy_range_coalesced", counts.copy_range_coalesced);
 
-    crate::debug::emit_marker("SORT_FLUSH_START");
+    host.invocation.marker("SORT_FLUSH_START");
     // WAIT_WRITER spans the main thread's wait on the writer worker
     // to drain the coalesced `copy_file_range` (or its uring / userspace
     // fallback equivalent). On already-sorted input this is ~94 %
     // of wall, which `brokkr sidecar --durations` shows as the WAIT_WRITER
     // span (`--stalls` reads `*_wait_ns` counters, not marker pairs).
-    crate::debug::emit_marker("WAIT_WRITER_START");
+    host.invocation.marker("WAIT_WRITER_START");
     writer.flush()?;
-    crate::debug::emit_marker("WAIT_WRITER_END");
-    crate::debug::emit_marker("SORT_FLUSH_END");
+    host.invocation.marker("WAIT_WRITER_END");
+    host.invocation.marker("SORT_FLUSH_END");
     if let Ok(meta) = std::fs::metadata(output.path()) {
-        crate::debug::emit_counter("sort_total_bytes_out", meta.len());
+        host.invocation.counter("sort_total_bytes_out", meta.len());
     }
-    crate::debug::emit_marker("SORT_PASS2_END");
+    host.invocation.marker("SORT_PASS2_END");
     Ok(SortStats {
         nodes: counts.nodes,
         ways: counts.ways,

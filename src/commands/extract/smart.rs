@@ -237,7 +237,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     drop(decompress_buf);
 
     // Build per-type schedules from header-only scan via pread-only HeaderWalker.
-    crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
+    host.invocation.marker("SMART_PASS1_SCHEDULE_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -311,13 +311,18 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             full_way_schedule.push(entry);
         }
     }
-    crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_END");
+    host.invocation.marker("SMART_PASS1_SCHEDULE_SCAN_END");
 
-    crate::debug::emit_counter("smart_pass1_node_blobs", node_schedule.len());
-    crate::debug::emit_counter("smart_pass1_way_blobs", way_schedule.len());
-    crate::debug::emit_counter("smart_pass1_relation_blobs", relation_schedule.len());
-    crate::debug::emit_counter("smart_pass1_full_way_blobs", full_way_schedule.len());
-    crate::debug::emit_counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len());
+    host.invocation
+        .counter("smart_pass1_node_blobs", node_schedule.len());
+    host.invocation
+        .counter("smart_pass1_way_blobs", way_schedule.len());
+    host.invocation
+        .counter("smart_pass1_relation_blobs", relation_schedule.len());
+    host.invocation
+        .counter("smart_pass1_full_way_blobs", full_way_schedule.len());
+    host.invocation
+        .counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len());
 
     let shared_file = walker.input();
     drop(walker);
@@ -326,7 +331,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // For bbox-only regions, use columnar decode (batch IDs/lats/lons into
     // contiguous arrays) for cache-friendly classification. Polygon regions
     // fall back to element-by-element iteration.
-    crate::debug::emit_marker("PASS1_NODE_CLASSIFY_START");
+    host.invocation.marker("PASS1_NODE_CLASSIFY_START");
     let use_columnar = matches!(region, Region::Bbox(_));
     // The columnar classifier decides point membership, not blob candidacy,
     // so it must run against the exact box. `bbox_int` is deliberately
@@ -388,10 +393,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         },
         host,
     )?;
-    crate::debug::emit_marker("PASS1_NODE_CLASSIFY_END");
+    host.invocation.marker("PASS1_NODE_CLASSIFY_END");
 
     // Phase 2: Classify ways by ref intersection with bbox nodes.
-    crate::debug::emit_marker("PASS1_WAY_CLASSIFY_START");
+    host.invocation.marker("PASS1_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &way_schedule,
@@ -420,10 +425,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         },
         host,
     )?;
-    crate::debug::emit_marker("PASS1_WAY_CLASSIFY_END");
+    host.invocation.marker("PASS1_WAY_CLASSIFY_END");
 
     // Phase 3: Classify relations by member intersection.
-    crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_START");
+    host.invocation.marker("PASS1_RELATION_CLASSIFY_START");
     let collect_member_ids = H::COLLECT_MEMBER_IDS;
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,
@@ -455,7 +460,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         },
         host,
     )?;
-    crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_END");
+    host.invocation.marker("PASS1_RELATION_CLASSIFY_END");
 
     Ok(Pass1Result {
         bbox_node_ids,
@@ -500,19 +505,19 @@ pub(super) fn extract_smart(
     };
 
     // --- Pass 1: Collect matches + smart relation deps ---
-    crate::debug::emit_marker("SMART_PASS1_START");
+    host.invocation.marker("SMART_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
     let mut result =
         collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
     let mut extra_node_ids = handler.extra_node_ids;
-    crate::debug::emit_marker("SMART_PASS1_END");
+    host.invocation.marker("SMART_PASS1_END");
     // Brokkr stores named counters generically and reports changes in sidecar
-    // comparisons; this sample is inert unless the CLI initialized the FIFO.
-    crate::debug::emit_mallinfo2("MI_PASS1_END");
+    // comparisons; this sample is inert unless the invocation has a sink.
+    crate::debug::emit_mallinfo2(&host.invocation, "MI_PASS1_END");
 
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---
-    crate::debug::emit_marker("SMART_PASS2_START");
+    host.invocation.marker("SMART_PASS2_START");
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
     // Reuses PASS1's full_way_schedule (built during the manual header scan
@@ -521,7 +526,7 @@ pub(super) fn extract_smart(
     // wall on Europe extract-smart. Falls back to build_classify_schedule
     // for the unsorted-fallback path where PASS1 doesn't build a schedule.
     {
-        crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
+        host.invocation.marker("SMART_PASS2_SCHEDULE_START");
         let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
         let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
             crate::scan::classify::build_classify_schedule(
@@ -535,7 +540,7 @@ pub(super) fn extract_smart(
                 crate::read::input::InputFile::open(input)?,
             )
         };
-        crate::debug::emit_marker("SMART_PASS2_SCHEDULE_END");
+        host.invocation.marker("SMART_PASS2_SCHEDULE_END");
 
         let extra_way_ids_ref = &handler.extra_way_ids;
         let matched_way_ids_ref = &result.matched_way_ids;
@@ -547,7 +552,7 @@ pub(super) fn extract_smart(
         // memory peak it was originally framed as fixing turned out to be
         // elsewhere (cold-arena-page residency cascade, addressed by the
         // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
-        crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
+        host.invocation.marker("SMART_PASS2_CLASSIFY_START");
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
             &way_schedule,
@@ -574,14 +579,14 @@ pub(super) fn extract_smart(
             },
             host,
         )?;
-        crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
+        host.invocation.marker("SMART_PASS2_CLASSIFY_END");
     }
 
-    crate::debug::emit_marker("SMART_PASS2_END");
+    host.invocation.marker("SMART_PASS2_END");
 
     // --- Pass 3: Write matching elements via pread-from-workers ---
-    crate::debug::emit_marker("SMART_PASS3_START");
-    crate::debug::emit_marker("SMART_PASS3_SETUP_START");
+    host.invocation.marker("SMART_PASS3_START");
+    host.invocation.marker("SMART_PASS3_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader.leading_header()?;
@@ -612,8 +617,8 @@ pub(super) fn extract_smart(
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    crate::debug::emit_marker("SMART_PASS3_SETUP_END");
-    crate::debug::emit_marker("SMART_PASS3_WRITE_START");
+    host.invocation.marker("SMART_PASS3_SETUP_END");
+    host.invocation.marker("SMART_PASS3_WRITE_START");
     // Reuse PASS1's pre-built blob schedule if available, falling back to
     // build_blob_schedule for the unsorted-fallback path. Avoids the third
     // post-PASS1 header scan and its cold-arena-page residency cascade.
@@ -635,9 +640,9 @@ pub(super) fn extract_smart(
             host,
         )?;
     }
-    crate::debug::emit_marker("SMART_PASS3_WRITE_END");
+    host.invocation.marker("SMART_PASS3_WRITE_END");
 
-    crate::debug::emit_marker("SMART_PASS3_END");
+    host.invocation.marker("SMART_PASS3_END");
     Ok(stats)
 }
 

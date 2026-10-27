@@ -598,7 +598,7 @@ pub(crate) fn parse_osc_path<S: OscSink>(
     let result = drive_osc(&mut reader, sink, path);
     // Deliberately emit this historical name once per file, without accumulation,
     // from every sink. Changing attribution or totals breaks brokkr run comparisons.
-    crate::debug::emit_counter("merge_changes_decompress_ns", decompress_total.get());
+    cancel.counter("merge_changes_decompress_ns", decompress_total.get());
     result
 }
 

@@ -12,8 +12,8 @@
 //! test build's features and hands its path.
 //!
 //! A test's full libtest name is now `<file module>::<path inside the file>`
-//! (`host_contract::platform::...`). The tier submodules (`tier2`, `tier3`,
-//! `platform`, `serial`) keep matching brokkr's substring filters because
+//! (`host_contract::direct_read::...`). The tier submodules (`tier2`,
+//! `tier3`, `serial`) keep matching brokkr's substring filters because
 //! the module prefix only prepends.
 //!
 //! Every module here shares one process with every other, concurrently. The

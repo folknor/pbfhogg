@@ -281,19 +281,23 @@ default_profile = "tier1"
 gate_profile = "gate"
 
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
-# refactor. Skips the tier2/tier3/platform/serial submodules; runs
-# everything else across every listed sweep. `minimal` contributes
+# refactor. Skips the tier2/tier3/serial submodules; runs everything
+# else across every listed sweep, the O_DIRECT and io_uring tests
+# included (they exist only in the `all` sweep, which builds both
+# features, and skip on a typed platform refusal). `minimal` contributes
 # mostly a compile + clippy gate: the commands-gated test files cfg
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
 sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
-skip = ["tier2::", "tier3::", "platform::", "serial::"]
+skip = ["tier2::", "tier3::", "serial::"]
 include_ignored = false
 
 # Tier 3 - full in-project correctness gate (pre-merge). include_ignored
 # picks up fast ignored tests that #[ignore] keeps out of tier 1.
-# Platform tier handled separately. Tests slower than brokkr check's fixed
+# sort_overlapping_blobs_uring is skipped by name: it is ignored for a
+# known io_uring small-output bug, and on a host that can run io_uring
+# include_ignored would otherwise run it here and fail. Tests slower than brokkr check's fixed
 # 20 s per-test kill are skipped here BY NAME and must be run
 # individually via `brokkr test <name> --timeout <secs>` (add
 # `-p pbfhogg-cli` when the test is a CLI one, as sort_cross_validate_osmium
@@ -311,18 +315,9 @@ include_ignored = false
 description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
 sweeps = ["all"]
 skip = [
-    "platform::",
+    "cli_sort::backends::sort_overlapping_blobs_uring",
     "sort_cross_validate_osmium",
 ]
-include_ignored = true
-
-# Platform-sensitive tests: --direct-io, --io-uring, MEMLOCK-dependent
-# paths, feature-missing CLI behaviour. include_ignored picks up
-# known-bug-ignored tests like the io_uring small-output regression.
-[test.profiles.platform]
-description = "Platform-sensitive tests (--direct-io, --io-uring)"
-sweeps = ["all"]
-only = ["platform::"]
 include_ignored = true
 
 # Tests requiring --test-threads=1. Fault tests are not a serial case
@@ -340,7 +335,7 @@ include_ignored = true
 test_threads = 1
 
 # Tier 2 command-slice precedent. cli/tests/cli_sort.rs is already split into
-# root (tier 1) + mod platform; once it grows a mod tier2 (many-blob
+# root (tier 1) + mod backends (also tier 1); once it grows a mod tier2 (many-blob
 # boundary fixtures, scratch-leak sweeps), this profile picks them up.
 # Add similar entries for other commands as their tier-2 matrices
 # land - per testing.md, there is no generic tier2 profile.
@@ -358,7 +353,7 @@ extends = "tier1"
 sweeps = ["all", "consumer", "musl"]
 tests = ["all"]
 only = ["cli_sort::"]
-skip = ["platform::", "serial::"]
+skip = ["serial::"]
 
 # `brokkr check --gate`: every sweep with no filters, plus doctests, plus the
 # coverage audit. Under `certifies = "complete"` every (build shape, test)

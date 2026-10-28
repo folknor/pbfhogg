@@ -1080,11 +1080,12 @@ fn altw_dense_index_type_rejected_with_migration_hint() {
 }
 
 // ---------------------------------------------------------------------------
-// Platform tier
+// Output backends (tier 1: cheap, skip on the typed platform refusal; the
+// module only carries the feature gate)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "linux-direct-io")]
-mod platform {
+mod backends {
     use super::*;
 
     #[test]

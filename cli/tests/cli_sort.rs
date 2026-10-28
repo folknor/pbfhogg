@@ -1058,18 +1058,18 @@ fn sort_sorted_non_indexed_input_stays_on_passthrough() {
 }
 
 // ---------------------------------------------------------------------------
-// Platform tier
+// Output backends
 // ---------------------------------------------------------------------------
 //
-// Tests that exercise platform-gated CLI flags (`--direct-io`,
-// `--io-uring`). Wrapped in `mod platform` so the brokkr platform
-// profile (T11) can target them via `cargo test platform::` without
-// also pulling in the rest of the file. Cargo builds the binary these
-// tests invoke with the test build's own features, so it carries exactly
-// the flags the cfg gate sees.
+// Tests that exercise the feature-gated CLI flags (`--direct-io`,
+// `--io-uring`). They are tier 1: cheap, and each skips on the typed
+// platform refusal where the host lacks the feature. The module only
+// carries the shared feature gate. Cargo builds the binary these tests
+// invoke with the test build's own features, so it carries exactly the
+// flags the cfg gate sees.
 
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-mod platform {
+mod backends {
     use super::*;
 
     /// `--direct-io` on a filesystem that supports O_DIRECT must
@@ -1124,6 +1124,10 @@ mod platform {
         }
     }
 
+    /// Ignored for a known bug, and also skipped by name in the `full`
+    /// profile (which includes ignored tests), so a host that can run
+    /// io_uring does not turn that gate red on it. Run it by name to
+    /// re-verify: `brokkr test -p pbfhogg-cli sort_overlapping_blobs_uring`.
     #[cfg(feature = "linux-io-uring")]
     #[test]
     #[ignore = "pre-existing io_uring writer bug for small outputs; not re-verified on a host that can run io_uring"]
@@ -1185,7 +1189,7 @@ mod platform {
 // ["commands"]`, which builds pbfhogg-cli and its binary without the linux
 // features) and the `musl` sweep (default features). Under the
 // `all` sweep both features are on and these tests are excluded by
-// cfg, so the positive tests in `mod platform` cover that path.
+// cfg, so the positive tests in `mod backends` cover that path.
 
 #[cfg(not(feature = "linux-direct-io"))]
 #[test]

@@ -3557,11 +3557,12 @@ fn merge_keeps_honest_claims_on_decoded_blobs() {
 }
 
 // ---------------------------------------------------------------------------
-// Platform tier
+// Output backends (tier 1: cheap, skip on the typed platform refusal; the
+// module only carries the feature gate)
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-mod platform {
+mod backends {
     use super::*;
 
     fn basic_fixture(base: &Path, osc: &Path) {

@@ -523,8 +523,10 @@ fn a_group_publication_does_every_sync_once() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+// Tier 1: cheap, and each backend skips on its typed platform refusal; the
+// module only carries the feature gate.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-mod platform {
+mod backends {
     use super::*;
 
     /// The O_DIRECT and io_uring backends leave the sync to publication

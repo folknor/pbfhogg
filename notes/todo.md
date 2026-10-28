@@ -773,17 +773,32 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   destination; `Output` stages a fresh file) when this landed; recorded so
   the boundary is a decision, not an oversight.
 
-- [ ] **Library direct and io_uring write tests sit outside the `platform`
-  tier.** reference/testing.md puts platform-dependent tests in a
-  `platform` module so `brokkr check --profile platform` selects them;
-  `tests/roundtrip.rs` (`roundtrip_direct_io`,
-  `roundtrip_pipelined_direct_io`, `roundtrip_uring_tiny_output`,
-  `roundtrip_uring_small_size_sweep`) and `tests/fault_uring_writer.rs` are
-  top-level tests that skip inline instead. Either move them under
-  `mod platform` or state in testing.md that a feature-gated test that
-  skips cleanly may stay tier 1. The non-regular-target refusal tests added
-  beside them stay tier 1 on purpose: the refusal precedes any `O_DIRECT`
-  open, so the direct one runs on every host.
+- [ ] **Skip predicates disagree on whether an O_DIRECT refusal skips an
+  io_uring test.** `common::is_uring_unavailable` (library) and
+  `CliOutput::is_uring_unsupported` (cli/tests/invoker.rs) skip on a
+  `PlatformUnsupported` labelled `io-uring` OR `direct-io`, because the
+  io_uring writer also opens its output with `O_DIRECT`.
+  `uring_writer_refuses_non_regular_targets` (tests/roundtrip.rs) matches
+  inline, skips only on `io-uring` and fails on `direct-io`, and
+  reference/testing.md says library tests use the shared helper rather than
+  their own matching. Decide which classification is right for that test
+  (its doc comment argues a `direct-io` refusal there is a
+  misclassification) and either make it use the helper or record why it
+  must not.
+- [ ] **Silent and over-broad O_DIRECT skips in the direct reader unit
+  test.** `src/read/direct_reader.rs` `a_real_direct_file_reads_like_a_buffered_one`
+  returns without a `Skipping:` line and accepts a `PlatformUnsupported` of
+  any feature label, where the library tests' `common::is_einval` requires
+  `direct-io` and `common::skip` announces it. Unit tests cannot reach
+  `tests/common`, so it needs its own narrow match plus an eprintln, or a
+  test-support helper in `src/`.
+- [ ] **A library-driven test sits in the CLI package.**
+  `cli/tests/cli_add_locations_to_ways.rs`
+  `external_backend_output_refusal_stays_typed_across_stage_join` calls
+  `pbfhogg::altw::add_locations_to_ways` directly and never spawns the
+  binary, while reference/testing.md places only binary-driving tests in
+  `cli/tests/`. Its deterministic twin already lives in
+  `tests/host_contract.rs`; move it there (beside `direct_read`).
 
 ### Read path
 
@@ -988,6 +1003,8 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
   (`RLIMIT_MEMLOCK`, see the release-gate entry below), and
   `roundtrip_uring_tiny_output` now covers a sub-page output. Run it
   on a host with the raised limit; un-ignore it or describe the bug.
+  When it is un-ignored, also drop its by-name entry from the `full`
+  profile's skip list in brokkr.toml.
 
 ## Planet-scale validation coverage
 
@@ -1000,8 +1017,9 @@ that are not currently driven by `overnight.sh`.
 
 ### Release gate: the io_uring writer is unexercised on real data
 
-Read this before signing off a release. `brokkr check` (both profiles) and
-`brokkr verify all` are green and neither runs an `--io-uring` variant, so
+Read this before signing off a release. `brokkr check` and
+`brokkr verify all` are green; `brokkr check` selects the io_uring tests
+but they skip on this host, and `verify all` runs no `--io-uring` variant, so
 green does not mean the io_uring output backend was executed. It cannot be
 executed on this host at all: the writer registers 64 x 256 KB = 16 MB of
 buffers and the host's `RLIMIT_MEMLOCK` soft limit is 8 MB, so the
@@ -1017,8 +1035,13 @@ the registered buffers through a `ReadSink` impl in `write/copy_range.rs`
 `pipeline::deliver_in_order` loop (`7abba0df`), the CopyRange loop accepts
 a short pread as progress (`1dd2ea09`), and the buffer pool is allocated
 after the output open (`ea17fd86`). Close the gap on a host whose limit is
-raised: `brokkr check --profile platform`, the ignored
-`sort_overlapping_blobs_uring` (see "Ignored tests"), and `--io-uring` runs
+raised: the io_uring tests by name with `brokkr test <name> --sweep all`
+(add `-p pbfhogg-cli` for the CLI ones), confirming no `Skipping:` line -
+they are tier 1 and skip on a typed refusal, and `brokkr check` hides a
+passing test's output, so a green check does not prove the ring was used -
+the ignored
+`sort_overlapping_blobs_uring` by name (see "Ignored tests"; neither the
+gate nor `full` runs it), and `--io-uring` runs
 that take a passthrough copy as well as fresh blocks (plain `cat`, sort, or
 apply-changes on its splice route), since a command writing only fresh
 blocks never reaches `ReadSink`. `uring_writer_refuses_non_regular_targets`

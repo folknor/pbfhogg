@@ -11,7 +11,7 @@
 //! this mirrors: `autotests = false` in `cli/Cargo.toml`, so a file in
 //! `cli/tests/` that is not declared here is never compiled, and nothing
 //! reports it. A test's full libtest name is `<file module>::<path inside
-//! the file>` (`cli_sort::platform::...`), so brokkr's tier filters keep
+//! the file>` (`cli_sort::backends::...`), so brokkr's tier filters keep
 //! matching.
 //!
 //! Every module here shares one process with every other, concurrently: the

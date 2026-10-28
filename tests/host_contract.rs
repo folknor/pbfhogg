@@ -1089,9 +1089,11 @@ fn run_scratch_backend(
     }
 }
 
-// `has_indexdata` is a `commands` export.
+// `has_indexdata` is a `commands` export. The module groups the tests under
+// their feature gate only: they are cheap and skip on a typed O_DIRECT
+// refusal, so they run in tier 1 (reference/testing.md "Test placement").
 #[cfg(all(feature = "linux-direct-io", feature = "commands"))]
-mod platform {
+mod direct_read {
     use crate::common::{self, TestNode};
 
     fn direct_input(path: &std::path::Path) {
@@ -1117,7 +1119,10 @@ mod platform {
 
         let reader = match pbfhogg::BlobReader::open(&path, true) {
             Ok(reader) => reader,
-            Err(error) if common::is_einval(&error) => return,
+            Err(error) if common::is_einval(&error) => {
+                common::skip(format!("O_DIRECT not supported: {error}"));
+                return;
+            }
             Err(error) => panic!("open direct PBF reader: {error}"),
         };
         let mut count = 0;
@@ -1143,7 +1148,10 @@ mod platform {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("truncated header blob must fail while skipping"),
-                Err(error) if common::is_einval(&error) => return,
+                Err(error) if common::is_einval(&error) => {
+                    common::skip(format!("O_DIRECT not supported: {error}"));
+                    return;
+                }
                 Err(error) => error,
             };
         assert_unexpected_eof(&error);
@@ -1185,7 +1193,10 @@ mod platform {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("aligned skip beyond EOF must fail"),
-                Err(error) if common::is_einval(&error) => return,
+                Err(error) if common::is_einval(&error) => {
+                    common::skip(format!("O_DIRECT not supported: {error}"));
+                    return;
+                }
                 Err(error) => error,
             };
         assert_unexpected_eof(&error);

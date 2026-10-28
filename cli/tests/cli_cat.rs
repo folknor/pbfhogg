@@ -1594,15 +1594,16 @@ fn cat_dedupe_keeps_the_way_when_the_claim_is_honest() {
 }
 
 // ---------------------------------------------------------------------------
-// Platform tier
+// Output backends
 // ---------------------------------------------------------------------------
 //
 // `--direct-io` on a filesystem that supports O_DIRECT must produce
-// identical output to the default path. Wrapped in `mod platform` so
-// the brokkr platform profile can target it.
+// identical output to the default path. Tier 1: cheap, and skips on the
+// typed refusal where the host lacks O_DIRECT; the module only carries
+// the feature gate.
 
 #[cfg(feature = "linux-direct-io")]
-mod platform {
+mod backends {
     use super::*;
 
     #[test]

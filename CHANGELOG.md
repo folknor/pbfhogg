@@ -4,6 +4,20 @@
 
 ### Breaking
 
+- **`diff -v` detail lines are positioned edit scripts.** A modified way
+  used to print only `refs: N -> M nodes`, so a reordered or swapped node
+  printed `refs: 3 -> 3 nodes`; it now prints `-ref @i n<id>` /
+  `+ref @i n<id>` lines. Member lines gain the same zero-based position
+  (`-member @i type/id "role"`), so a member moved to different places no
+  longer prints identical detail, and a duplicate-key tag script prints
+  `-tag @i k=v` / `+tag @i k=v`. Removal positions index the old list,
+  insertion positions the new one. A script of more than 1000 edits, or one
+  too costly to compute, prints a single
+  `refs: N -> M, old @a..b -> new @c..d replaced (details omitted)` line
+  (`members:` / `tags:` likewise) instead of thousands of lines. Scripts
+  that parse `-v` detail need updating; what counts as modified is
+  unchanged.
+
 - **`check` library calls return `check::CheckOutcome`.** `check_refs`,
   `verify_ids` and `check_locations` return `Complete(report)` or, when a
   blob's kind claim is false, `Stopped(StoppedCheck)` carrying the
@@ -319,8 +333,8 @@
   (`omit_referenced` with `remove_tags` or a fixed parallelism),
   `MergeOptions::validate` (one worker; `force` with `locations_on_ways`),
   `AltwOptions::validate` (`force` with `IndexType::External` or
-  `inject_prepass`), `getid` with `remove_tags` but not `add_referenced`,
-  and `diff` with `verbose` and a fixed shard count above one.
+  `inject_prepass`), and `getid` with `remove_tags` but not
+  `add_referenced`.
   `ExportOptions::new` takes a parsed `Option<Bbox>`. New:
   `OutputHeaderEntry` (one parsed `--output-header` entry) with
   `HeaderOverrides::from_entries`, `tag_expr::validate_expressions`, and
@@ -1082,10 +1096,6 @@
   (it returned early and threw the rest away), and `-j/--jobs` and
   `--force` require `--nodes`, the only mode that reads them.
 
-- `diff` rejects an explicit `-j/--jobs` together with `-v/--verbose`.
-  Verbose output is sequential-only, so the job count was accepted and
-  ignored; `tags-filter` already rejected the equivalent `-R` + `-j`.
-
 - Library: `cat::cat`, `diff::DiffOptions`, `check::verify_ids::
   VerifyIdsOptions` and `tags_count::TagCountOptions` take a typed
   `Option<TypeFilter>` instead of an unvalidated type string, and
@@ -1448,7 +1458,7 @@
   tag reorder. Members now print an ordered edit script (a move is a
   `-member`/`+member` pair of the same member, a dropped duplicate one
   `-member`), a reorder of tag keys prints `tags: order changed`, a tag
-  list with a duplicate key prints an ordered `-k=v`/`+k=v` script, and an
+  list with a duplicate key prints an ordered script, and an
   unknown member type prints its raw value as `unknown(raw)/id`. What
   counts as modified is unchanged.
 

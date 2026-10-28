@@ -779,13 +779,110 @@ fn verbose_shows_member_order_and_multiplicity() {
     assert_eq!(detail("*n1"), vec!["  tags: order changed"]);
     let r100 = detail("*r100");
     assert_eq!(r100.len(), 2, "reorder detail: {r100:?}");
-    assert!(r100[0].starts_with("  -member way/"), "{r100:?}");
+    // A move is a -/+ pair of one member, at its old and its new position.
+    let payload = |l: &str, sign: &str| -> String {
+        let rest = l.strip_prefix(sign).unwrap_or_else(|| panic!("{l}"));
+        rest.split_once(' ')
+            .map(|(_, p)| p.to_owned())
+            .unwrap_or_default()
+    };
+    assert!(r100[0].starts_with("  -member @"), "{r100:?}");
+    assert!(r100[1].starts_with("  +member @"), "{r100:?}");
     assert_eq!(
-        r100[0].replacen('-', "+", 1),
-        r100[1],
-        "a move is a -/+ pair of one member"
+        payload(r100[0], "  -member @"),
+        payload(r100[1], "  +member @")
     );
-    assert_eq!(detail("*r101"), vec!["  -member way/3 \"z\""]);
+    assert_ne!(
+        r100[0],
+        r100[1].replacen('+', "-", 1),
+        "positions differ: {r100:?}"
+    );
+    assert_eq!(detail("*r101"), vec!["  -member @1 way/3 \"z\""]);
+}
+
+/// Way refs and member lines print positioned edit scripts, so moves to
+/// different places print differently and an equal-length ref change is
+/// itemised, not a bare count; a script past the edit cap prints one
+/// replaced-ranges line.
+#[test]
+fn verbose_positions_way_refs_and_members() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let m = |id| TestMember {
+        id: MemberId::Node(id),
+        role: "",
+    };
+    let rel = |id, ids: &[i64]| TestRelation {
+        id,
+        members: ids.iter().map(|&i| m(i)).collect(),
+        tags: vec![],
+        meta: None,
+    };
+    let way = |id, refs: Vec<i64>| TestWay {
+        id,
+        refs,
+        tags: vec![],
+        meta: None,
+    };
+    let long: Vec<i64> = (1..=1001).collect();
+
+    write_test_pbf_sorted(
+        &old,
+        &[],
+        &[
+            way(10, vec![1, 2, 3]),
+            way(11, vec![1, 2]),
+            way(12, vec![1]),
+        ],
+        &[rel(100, &[1, 2, 3]), rel(101, &[1, 2, 3])],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[],
+        &[
+            way(10, vec![2, 1, 3]),
+            way(11, vec![1, 5]),
+            way(12, [vec![1], long].concat()),
+        ],
+        &[rel(100, &[2, 1, 3]), rel(101, &[2, 3, 1])],
+    );
+
+    let (text, _) = run_diff(
+        &old,
+        &new,
+        DiffOpts {
+            suppress_common: true,
+            verbose: true,
+            ..DiffOpts::default()
+        },
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let detail = |head: &str| -> Vec<&str> {
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(head))
+            .unwrap_or_else(|| panic!("{head} missing; text:\n{text}"));
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("  "))
+            .copied()
+            .collect()
+    };
+    assert_eq!(detail("*w10"), vec!["  -ref @0 n1", "  +ref @1 n1"]);
+    assert_eq!(detail("*w11"), vec!["  -ref @1 n2", "  +ref @1 n5"]);
+    assert_eq!(
+        detail("*w12"),
+        vec!["  refs: 1 -> 1002, old @1..1 -> new @1..1002 replaced (details omitted)"]
+    );
+    assert_eq!(
+        detail("*r100"),
+        vec!["  -member @0 node/1 \"\"", "  +member @1 node/1 \"\""]
+    );
+    assert_eq!(
+        detail("*r101"),
+        vec!["  -member @0 node/1 \"\"", "  +member @2 node/1 \"\""]
+    );
 }
 
 #[test]

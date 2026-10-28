@@ -877,14 +877,9 @@ fn write_way_details_borrowed(
 ) -> Result<()> {
     let old_refs: Vec<i64> = old.refs().collect();
     let new_refs: Vec<i64> = new.refs().collect();
-    if old_refs != new_refs {
-        writeln!(
-            output,
-            "  refs: {} -> {} nodes",
-            old_refs.len(),
-            new_refs.len(),
-        )?;
-    }
+    write_seq_edit(output, "ref", "refs", &old_refs, &new_refs, |id| {
+        format!("n{id}")
+    })?;
     write_tag_diff_iter(output, old.tags_checked(), new.tags_checked())?;
     Ok(())
 }
@@ -914,16 +909,9 @@ fn write_tag_diff_iter<'a>(
     // A duplicate key makes the keyed view ambiguous: fall back to the
     // ordered (key, value) sequence diff, which accounts for every copy.
     if old_map.len() != old_vec.len() || new_map.len() != new_vec.len() {
-        let edit = seq::seq_diff(&old_vec, &new_vec);
-        for &i in &edit.removed {
-            let (k, v) = old_vec[i];
-            writeln!(output, "  -{k}={v}")?;
-        }
-        for &i in &edit.inserted {
-            let (k, v) = new_vec[i];
-            writeln!(output, "  +{k}={v}")?;
-        }
-        return Ok(());
+        return write_seq_edit(output, "tag", "tags", &old_vec, &new_vec, |(k, v)| {
+            format!("{k}={v}")
+        });
     }
 
     for (k, v) in &old_vec {
@@ -995,14 +983,51 @@ fn write_member_diff_borrowed(
     // Members are content in order with multiplicity, so the detail is an
     // ordered edit script: a move or a dropped duplicate is a -member and/or
     // +member line, never an empty detail.
-    let edit = seq::seq_diff(&old_members, &new_members);
-    for &i in &edit.removed {
-        let (id, role) = old_members[i];
-        writeln!(output, "  -member {} \"{role}\"", MemberLabel(id))?;
-    }
-    for &i in &edit.inserted {
-        let (id, role) = new_members[i];
-        writeln!(output, "  +member {} \"{role}\"", MemberLabel(id))?;
+    write_seq_edit(
+        output,
+        "member",
+        "members",
+        &old_members,
+        &new_members,
+        |(id, role)| format!("{} \"{role}\"", MemberLabel(*id)),
+    )
+}
+
+/// Print the ordered edit script between two sequences: every removal as
+/// `  -{item} @{old index} {value}`, then every insertion as
+/// `  +{item} @{new index} {value}`, positions zero-based into the original
+/// old and final new lists. A script too long or too costly to itemise
+/// prints one line instead, `  {list}: N -> M, old @a..b -> new @c..d
+/// replaced (details omitted)`, ranges half-open; the replacement is
+/// faithful but does not claim every item in the ranges differs. Equal
+/// sequences print nothing.
+fn write_seq_edit<T: Eq>(
+    output: &mut dyn Write,
+    item: &str,
+    list: &str,
+    old: &[T],
+    new: &[T],
+    value: impl Fn(&T) -> String,
+) -> Result<()> {
+    match seq::seq_diff(old, new) {
+        seq::SeqEdit::Exact { removed, inserted } => {
+            for i in removed {
+                writeln!(output, "  -{item} @{i} {}", value(&old[i]))?;
+            }
+            for i in inserted {
+                writeln!(output, "  +{item} @{i} {}", value(&new[i]))?;
+            }
+        }
+        seq::SeqEdit::Replaced { old: o, new: n } => writeln!(
+            output,
+            "  {list}: {} -> {}, old @{}..{} -> new @{}..{} replaced (details omitted)",
+            old.len(),
+            new.len(),
+            o.start,
+            o.end,
+            n.start,
+            n.end,
+        )?,
     }
     Ok(())
 }

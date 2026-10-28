@@ -645,16 +645,30 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **`diff -v` way detail is a bare count; member moves carry no
-  position.** `write_way_details_borrowed` prints only `refs: N -> M nodes`
-  when the ordered ref lists differ, so a pure reorder or a one-node swap
-  prints `refs: 3 -> 3 nodes`, nonempty but uninformative. Relation members
-  (and tags with a duplicate key) now print an ordered edit script via
-  `src/commands/diff/seq.rs`, but without positions, so `[A,B,C] -> [B,A,C]`
-  and `[A,B,C] -> [B,C,A]` can print the same `-A`/`+A` pair. Options: run
-  way refs through the same edit script (`-ref N`/`+ref N`), and/or add
-  positions (`@i`) to member lines. Both change the -v text surface; no user
-  has asked. Left open when member order detail landed (2026-10-28).
+- [ ] **`diff -v` detail lines print tag values and roles unescaped.** The
+  detail writers in `src/commands/diff/mod.rs` interpolate keys, values and
+  roles raw, so a value containing a newline splits one logical detail
+  record across physical lines, and nothing bounds a very long value. The
+  positioned edit scripts (refs, members, duplicate-key tags) are exact as
+  logical records only. Fix: escape control characters (at least `\n`,
+  `\r`, `\\`) in detail payloads and document the escaping in both CLI
+  docs. Noticed while positioning the scripts, 2026-10-28.
+
+- [ ] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` is unmeasured.** Its doc in
+  `src/tunables.rs` says "sized so one call stays in the low milliseconds;
+  not measured". With `VERBOSE_SEQUENCE_DIFF_MAX_EDITS` (1000) now stopping
+  the search past layer 1000, the work cap mostly matters for long snakes.
+  A unit-level timing of a worst-case call (two ~30k sequences differing
+  near the cap) would settle whether 1 << 20 is right. Low priority.
+
+- [ ] **`diff -v` keyed tag lines carry no positions.** Unique-key tag lists
+  print keyed `-k=v`/`+k=v`/`~k` plus `tags: order changed`, so
+  `[a=1] -> [a=1,b=2]` and `[a=1] -> [b=2,a=1]` print the same `+b=2`, and
+  the detail cannot reconstruct the new tag order. Deliberate: the keyed
+  view is the readable one for the common case, and the CLI docs say tags
+  are keyed without positions. Revisit only if someone wants `-v` to be a
+  reconstructible patch; then tags would go through the positioned script
+  always.
 
 - [ ] **`CompactDiffOverlay` never reclaims superseded arena records.** Every
   `push_node` / `push_way` / `push_relation` appends a fresh record and orphans

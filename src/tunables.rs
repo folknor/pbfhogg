@@ -578,15 +578,26 @@ pub(crate) const SWEEP_CHECKPOINT_REMOVALS: usize = 4096;
 // ---------------------------------------------------------------------------
 
 /// Work budget for one ordered sequence diff in `diff -v` details (a
-/// relation's member list, or a tag list with a duplicate key). Counts the
-/// Myers search's diagonal visits plus snake comparisons; since the traceback
-/// keeps one snapshot entry per diagonal visit, it also caps that storage
-/// (8 bytes an entry, so 8 MiB at most). Past the budget the detail falls
-/// back to removing the whole differing middle and inserting the new one,
-/// which is faithful but not minimal. Per call and independent of shard
-/// count, so a run's memory does not grow with it beyond one budget per
-/// worker. Sized so one call stays in the low milliseconds; not measured.
+/// relation's member list, a way's node refs, or a tag list with a duplicate
+/// key). Counts the Myers search's diagonal visits plus snake comparisons;
+/// since the traceback keeps one snapshot entry per diagonal visit, it also
+/// caps that storage (8 bytes an entry, so 8 MiB at most). Past the budget
+/// the detail prints one line naming the replaced old and new ranges instead
+/// of an edit script. Per call and independent of shard count, so a run's
+/// memory does not grow with it beyond one budget per worker. Sized so one
+/// call stays in the low milliseconds; not measured.
 pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_WORK: usize = 1 << 20;
+
+/// Most edit lines (removals plus insertions) one ordered sequence prints
+/// under a modified element in `diff -v`. A larger script, including a pure
+/// bulk insertion or deletion that needs no search at all, prints one
+/// summary line naming the replaced old and new ranges instead. This is a
+/// readability bound on output, independent of the search budget above
+/// (which by itself already stops near 1023 edits): it is what keeps a
+/// reversed long way or a rebuilt large relation from printing tens of
+/// thousands of lines. Per sequence, not per element; keyed tag lines are
+/// not counted.
+pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // Cat

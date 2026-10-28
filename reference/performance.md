@@ -1529,6 +1529,27 @@ overlapped a manual disk cleanup (`974d616a` / `10f71ab4`) was discarded and
 rerun as `ba12609f` / `9874e28c`. The altw node stage reads about 199 GB at
 under 3 cores, so it is I/O bound. No fstrim preceded these cells.
 
+### Scanner granularity read and the join-time domain check
+
+The node scanner reads `PrimitiveBlock.granularity` as any `int32`, like
+every reader, instead of bounding it to `1..=1e9` (a per-block change), and
+apply-changes `--locations-on-ways` refuses a kept base node outside the
+geographic domain (one branch on the kept-node path of the extraction sink,
+not per scanned node). Matched, interleaved `--bench 1` cells on bygg,
+2026-10-28, after a fresh `fstrim`: baseline is a clean `38f6ee8c`; the
+variant is the same tree with the change as uncommitted edits, run with
+`--force`, so its cells are not in results.db and its numbers come from
+the run output and `brokkr sidecar dirty`.
+
+| Arm | Wall (s), in run order | Median | `merge_streaming_coord_extract_ns` summed over workers (s), median |
+|---|---|---:|---:|
+| Baseline `38f6ee8c` | 305.6 `f1973516`, 301.4 `bc1e7026`, 302.4 `8995dd68` | 302.4 | 235.7 |
+| Variant (forced) | 295.6, 297.9, 299.8 | 297.9 | 237.9 |
+
+Wall -1.5 % (variant faster in all three pairs), extraction time +0.9 %:
+both inside noise. add-locations-to-ways was not re-measured: its per-node
+code is untouched, and the granularity read runs once per block.
+
 ## Tags-filter
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel

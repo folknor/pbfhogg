@@ -227,6 +227,14 @@ impl CoordFraming {
     /// `(lat, lon)` in decimicrodegrees from accumulated raw values, by the
     /// node scanner's exact scaling (`scan::node::scale_to_decimicro`).
     /// Truncates toward zero, like the node scanners.
+    ///
+    /// Granularity is any `int32`, as the node scanner and every reader
+    /// take it. No geographic-domain check is made here, on purpose: a
+    /// refreshed position takes the OSC coordinate (domain-checked at OSC
+    /// parse), and every other position keeps the base way's own inline
+    /// value, the same content an untouched way passes through with. The
+    /// domain is judged where a base node is joined into a way (the
+    /// kept-node sink in `streaming.rs`).
     #[inline]
     fn decimicro(self, raw_lat: i64, raw_lon: i64) -> Result<(i32, i32)> {
         Ok((

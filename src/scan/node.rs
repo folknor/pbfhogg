@@ -62,6 +62,14 @@ pub(crate) struct NodeTuple {
 /// somewhere else on Earth, which is exactly the class of silent corruption
 /// the paths that vouch for their output must not manufacture from
 /// untrusted metadata. Each caller words its own refusal.
+///
+/// Only the `i32` representation is bounded here, not the geographic
+/// domain: a latitude of 100 degrees is returned as stored, as every reader
+/// returns it. The domain is judged where a node coordinate is joined into
+/// output ways (the altw sparse and external stores, and the apply-changes
+/// `--locations-on-ways` kept-node sink in `streaming.rs`), on the referenced
+/// nodes only, so the per-node cost of this scan stays unchanged for every
+/// consumer, extract simple's classify included.
 #[inline]
 pub(crate) fn scale_to_decimicro(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
     match granularity
@@ -176,10 +184,13 @@ fn scan_dense_coords(
     // Deltas sum modulo 2^64, as the decoder and the writer do, so a
     // block whose IDs wrap (the writer encodes `i64::MIN` then
     // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
-    // yields. A wrapped coordinate cannot slip through: a sum that wraps
-    // lands at least 2^63 away from the previous, accepted coordinate,
-    // far outside the window `decimicro` accepts for any granularity and
-    // offset, so it is refused exactly where a checked sum was.
+    // yields. Coordinate sums wrap the same way, and the wrapped value is
+    // what gets scaled, so the scanner agrees with the wrapping accessors
+    // bit for bit. With a nonzero granularity a wrapped sum lands at least
+    // 2^63 raw units from the previous one, which no offset brings back
+    // inside the `i32` window `decimicro` accepts, so it is refused; with
+    // granularity 0 every sum, wrapped or not, scales to the offset, as it
+    // does in every reader.
     while !ids.is_empty() {
         let did = zigzag_decode_64(ids.read_varint().map_err(|_| dense_id_err())?);
         let dlat = zigzag_decode_64(lats.read_varint().map_err(|_| dense_coord_err())?);
@@ -250,32 +261,23 @@ pub(crate) fn extract_node_coords(
                 group_starts.push((offset, data.len()));
             }
             (17, WIRE_VARINT) => {
-                // `granularity` is attacker-controlled metadata: it comes off
-                // the wire before any element is decoded and is then
-                // multiplied by every node's accumulated delta below. An
-                // unvalidated read (`as i64`) turns a varint above
-                // `i64::MAX` into a negative granularity and a huge one into
-                // a multiplication that panics in debug and wraps in
-                // release. Bound it here, the way
-                // `blob_meta/scan_ids.rs::scan_dense_nodes` already does for
-                // the same three fields. The spec's unit is nanodegrees, so
-                // a full circle is 3.6e11 nanodegrees; anything above one
-                // degree per raw unit is not a real producer and the
-                // upper bound keeps `granularity * cum` inside i64 for any
-                // plausible delta.
-                let raw = cursor.read_varint()?;
-                granularity = i64::try_from(raw).ok().filter(|g| *g > 0).ok_or_else(|| {
-                    crate::error::new_wire_error(
-                        "PrimitiveBlock.granularity must be a positive int32; \
-                         got a value that is zero, negative, or too large",
-                    )
-                })?;
-                if granularity > crate::tunables::MAX_NODE_GRANULARITY {
-                    return Err(crate::error::new_wire_error(
-                        "PrimitiveBlock.granularity exceeds one degree per unit \
-                         (1e9 nanodegrees); refusing to decode coordinates from it",
-                    ));
-                }
+                // Read exactly as the block decoder, `blob_meta`'s indexdata
+                // scan, `check --locations` and the apply-changes way
+                // refresh read it: any `int32`, zero and negative included,
+                // and a value outside `int32` refused. This scanner used to
+                // refuse granularity outside `1..=1e9` so that
+                // `granularity * cum` stayed inside `i64`; since
+                // `scale_to_decimicro` is exact (cold `i128` fallback) that
+                // bound protected nothing, and it only made altw,
+                // `apply-changes -l` and extract simple's classify refuse
+                // blocks every other reader decodes. Granularity 0 scales
+                // every node to the offset here as it does in every reader:
+                // the scanner reproduces what the bytes say and does not
+                // judge the producer's framing.
+                granularity = i64::from(crate::read::wire::read_int32(
+                    &mut cursor,
+                    "PrimitiveBlock.granularity exceeds int32",
+                )?);
             }
             (19, WIRE_VARINT) => {
                 lat_offset = cursor.read_varint_i64()?;
@@ -573,35 +575,52 @@ mod tests {
         );
     }
 
-    /// `granularity` arrives from the wire before any element is decoded and
-    /// is then multiplied by every accumulated delta. Zero is nonsensical,
-    /// and a varint above `i64::MAX` used to become a negative granularity
-    /// via a bare `as i64` - both then flowed into an unchecked
-    /// multiplication that panics in debug and wraps in release.
+    /// `granularity` is read as the block decoder reads it: any `int32`,
+    /// refused only outside `int32`, for dense and plain nodes alike. With
+    /// exact scaling there is no overflow left for a tighter bound to
+    /// prevent; zero scales every node to the offset and a negative value
+    /// mirrors the raw coordinate, as every reader does.
     #[test]
-    fn hostile_granularity_is_refused_not_multiplied() {
-        for granularity in [0_i64, 4_000_000_000, i64::MAX] {
+    fn granularity_is_read_as_any_int32() {
+        for granularity in [4_000_000_000_i64, i64::MAX, i64::from(i32::MAX) + 1] {
             let block = dense_block(&[1], &[1], &[1], &[(17, granularity)]);
-            let err =
-                scan(&block).expect_err("a granularity outside the sane range must be refused");
+            let err = scan(&block).expect_err("a granularity outside int32 must be refused");
             assert!(
-                err.to_string().contains("granularity"),
-                "expected the granularity guard specifically. Got: {err}"
+                err.to_string().contains("granularity exceeds int32"),
+                "expected the int32 guard specifically. Got: {err}"
             );
         }
 
-        // -1 written as a varint is ten 0xFF-ish bytes, which `as i64` turned
-        // into a negative granularity. Same guard must catch it.
-        let err = scan(&dense_block(&[1], &[1], &[1], &[(17, -1)]))
-            .expect_err("a negative granularity must be refused");
-        assert!(
-            err.to_string().contains("granularity"),
-            "expected the granularity guard specifically. Got: {err}"
-        );
+        let coords = |granularity: i64, offset: i64| {
+            let block = dense_block(&[1], &[7], &[-3], &[(17, granularity), (19, offset)]);
+            let t = scan(&block).unwrap()[0];
+            (t.lat, t.lon)
+        };
+        assert_eq!(coords(0, 5_000), (50, 0), "zero scales to the offset");
+        assert_eq!(coords(-1, 0), (0, 0), "-7 nanodegrees truncates to 0");
+        assert_eq!(coords(-100, 0), (-7, 3));
+        assert_eq!(coords(i64::from(i32::MIN), 0), (-150_323_855, 64_424_509));
+        assert_eq!(coords(i64::from(i32::MAX), 0), (150_323_855, -64_424_509));
+        assert_eq!(coords(2_000_000_000, 0), (140_000_000, -60_000_000));
 
-        // Passing counterpart: a legal non-default granularity still decodes,
-        // so the guard is a bound and not a ban. At 1000 nanodegrees per unit
-        // a raw 55_000_000 is 55 degrees = 550_000_000 decimicrodegrees.
+        // The plain-node path reads the same field.
+        let mut plain = Vec::new();
+        scalar(1, 2, &mut plain); // zigzag ID 1
+        scalar(8, 14, &mut plain); // raw latitude 7
+        let mut group = Vec::new();
+        len_delimited(1, &plain, &mut group);
+        let mut block = Vec::new();
+        len_delimited(2, &group, &mut block);
+        scalar(17, 0, &mut block);
+        scalar(19, 5_000, &mut block);
+        let t = scan(&block).unwrap()[0];
+        assert_eq!((t.lat, t.lon), (50, 0));
+        let mut huge = block.clone();
+        scalar(17, 1 << 31, &mut huge);
+        assert!(scan(&huge).is_err());
+
+        // A legal non-default granularity decodes. At 1000 nanodegrees per
+        // unit a raw 55_000_000 is 55 degrees = 550_000_000 decimicrodegrees.
         let tuples = scan(&dense_block(
             &[1],
             &[55_000_000],

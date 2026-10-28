@@ -226,11 +226,6 @@ const _: () = assert!(
 /// bytes.
 pub(crate) const DECOMPRESS_EXPANSION_GUESS: usize = 4;
 
-/// Largest `PrimitiveBlock.granularity` (nanodegrees per raw unit) the node
-/// scanner will decode coordinates from: one degree per unit. Bounds
-/// `granularity * cum` inside i64 for any plausible delta.
-pub(crate) const MAX_NODE_GRANULARITY: i64 = 1_000_000_000;
-
 /// `WILLNEED` coalescing gap: schedule bodies separated by up to this many
 /// bytes (a BlobHeader-sized gap) are joined into one advised range.
 pub(crate) const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;

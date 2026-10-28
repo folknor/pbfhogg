@@ -1788,6 +1788,85 @@ fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
     assert!(!output.exists(), "failed merge must leave no output");
 }
 
+/// A base node an OSC way references becomes an inline way location, so
+/// under --locations-on-ways it must lie in the geographic domain, the rule
+/// add-locations-to-ways applies to the nodes it joins. Only joined nodes
+/// are judged: an unreferenced out-of-domain node passes through, and an
+/// OSC coordinate that replaces an out-of-domain base node is used.
+#[test]
+fn merge_locations_on_ways_refuses_a_joined_node_outside_the_domain() {
+    let dir = crate::common::test_scratch();
+    let osc = dir.path().join("diff.osc.gz");
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+    let ways = [(
+        10,
+        vec![1, 2],
+        vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+    )];
+    let run = |name: &str, nodes: &[(i64, i64, i64)], osc: &Path| {
+        let base = dir.path().join(format!("{name}.osm.pbf"));
+        let output = dir.path().join(format!("{name}-out.osm.pbf"));
+        write_low_pbf_raw_nodes(&base, &plain_node_block(nodes), &ways, true);
+        (run_apply_changes(&base, osc, &output, low_opts()), output)
+    };
+
+    // Way 30 joins node 2, one decimicrodegree past 90 degrees latitude
+    // (and, separately, past 180 degrees longitude).
+    for bad in [(2, 900_000_001, 0), (2, 0, -1_800_000_001)] {
+        let (out, output) = run(
+            "joined",
+            &[(1, 0, 0), bad, (3, 500_000_000, 600_000_000)],
+            &osc,
+        );
+        assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+        out.assert_stderr_contains("node 2 has coordinates outside the geographic domain");
+        assert!(!output.exists(), "failed merge must leave no output");
+    }
+
+    // Node 4 is out of domain but referenced by no way: accepted.
+    let (out, _) = run(
+        "unreferenced",
+        &[
+            (1, 0, 0),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+            (4, 900_000_001, 0),
+        ],
+        &osc,
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    // The OSC moves the out-of-domain node 2 back into the domain: the
+    // join takes the OSC coordinate and never sees the base one.
+    let moved = dir.path().join("moved.osc.gz");
+    write_osc(
+        &moved,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" version="2" lat="1.5" lon="2.5"/>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+  <create>
+    <way id="30" version="1"><nd ref="2"/></way>
+  </create>
+</osmChange>"#,
+    );
+    let (out, output) = run(
+        "moved",
+        &[
+            (1, 0, 0),
+            (2, 900_000_001, 0),
+            (3, 500_000_000, 600_000_000),
+        ],
+        &moved,
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let locs = read_way_locations(&output);
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(way30.1, vec![(15_000_000, 25_000_000)]);
+}
+
 /// A base whose way blob lacks indexdata while its node blob carries it is
 /// partially indexed, and the scanner's header walk refuses it at the way
 /// blob. Without that refusal the scanner would route the unindexed way blob

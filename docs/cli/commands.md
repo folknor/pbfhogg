@@ -1035,6 +1035,10 @@ declares it too.
   deleted by the OSC (`--ignore-missing-nodes` writes `(0, 0)` there instead).
   It fails as soon as the base's nodes have been read, before any way is
   written, and the error counts the distinct nodes it could not resolve.
+- A base node such a way takes its coordinate from must lie within +-90
+  degrees latitude and +-180 longitude; one outside fails the run, publishing
+  nothing, as `add-locations-to-ways` refuses it. Base nodes no changed way
+  references are not judged.
 
 **Prepare the base with `add-locations-to-ways --keep-untagged-nodes`.** A
 default `add-locations-to-ways` output drops untagged nodes, so it can fail on

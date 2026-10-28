@@ -15,7 +15,11 @@
 //!   exact value whenever it fits `i64` but turns a value past `i64` into
 //!   another, so wrap alone cannot judge it. `crate::scan::node` is exact
 //!   too (checked `i64`, `i128` on overflow) but bounds only the e7 range,
-//!   not the geographic domain checked here. Delta accumulation of the raw
+//!   not the geographic domain checked here; the commands that join node
+//!   coordinates into ways (add-locations-to-ways, apply-changes
+//!   `--locations-on-ways`) judge the domain on the joined nodes after
+//!   truncation to e7, so a value within 100 nanodegrees past a limit
+//!   that they accept at the limit is reported here. Delta accumulation of the raw
 //!   values still wraps in `i64`, exactly as the reader's does, so the raw
 //!   value is the one every reader decodes. Granularity is read as the reader
 //!   reads it (any `int32`).

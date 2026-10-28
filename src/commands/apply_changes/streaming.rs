@@ -616,13 +616,34 @@ fn handle_candidate(
         // the whole base PBF's coord population. An extraction error is
         // fatal: dropping this blob's coordinates would surface later
         // only as an unexplained count of unresolved references.
+        //
+        // A kept node is about to become an inline way location this
+        // command writes, so it must lie in the geographic domain, the
+        // rule the altw sparse and external stores apply to the nodes
+        // they join. It is judged here, on the kept nodes only, not in
+        // the scanner, so the per-node cost of the scan is unchanged; an
+        // unreferenced out-of-domain node is passed through like any
+        // other node content. Like the altw stores, it judges the
+        // truncated decimicrodegree, so a value within 100 nanodegrees
+        // past a limit is accepted at the limit (`check --locations`
+        // judges the exact value and reports it). OSC node coordinates
+        // are domain-checked at OSC parse and replace base ones in the
+        // drain; `needed_set` holds no OSC-upserted node.
+        let mut out_of_domain: Option<(i64, i32, i32)> = None;
         extract_node_coords(decompress_buf, node_groups_scratch, |id, lat, lon| {
             if needed_set.is_some_and(|ns| !ns.contains(&id)) {
+                return;
+            }
+            if !crate::coord_pack::in_domain(lat, lon) {
+                out_of_domain.get_or_insert((id, lat, lon));
                 return;
             }
             local_coords.insert(id, (lat, lon));
             hits += 1;
         })?;
+        if let Some((id, lat, lon)) = out_of_domain {
+            return Err(out_of_domain_node_err(id, lat, lon));
+        }
         counters
             .loc_node_blobs_scanned
             .fetch_add(1, Ordering::Relaxed);
@@ -1064,6 +1085,19 @@ fn upsert_slice(
 /// worker publishes its caught panic shortly after unwinding, and never
 /// delivers the node item it was processing, so the drain cannot publish a
 /// map built without it; the failure is checked again at shutdown.
+/// Refusal for a base node an OSC way references whose coordinates lie
+/// outside the geographic domain. Out of line: normal input never reaches it.
+#[cold]
+#[inline(never)]
+fn out_of_domain_node_err(node_id: i64, lat: i32, lon: i32) -> Error {
+    Error::invalid_data(format!(
+        "node {node_id} has coordinates outside the geographic domain \
+         (lat {lat}, lon {lon} in decimicrodegrees; latitude must be \
+         within +/-90 degrees and longitude within +/-180). Refusing to \
+         write it as an inline way location."
+    ))
+}
+
 fn flush_local_coords(
     slot: &Arc<Mutex<FxHashMap<i64, (i32, i32)>>>,
     local: &mut FxHashMap<i64, (i32, i32)>,

@@ -17,16 +17,16 @@
 //! rewrite path sees and writes, and gives a duplicated id within one blob
 //! the same winner the iterator would.
 //!
-//! All coordinate scaling is checked: granularity must be positive and at
-//! most one degree per unit, and the exact `offset + granularity * raw`,
-//! computed without intermediate overflow, must fit an `i32` decimicrodegree
-//! after truncation toward zero. Dense delta
-//! accumulation is modular, as in the decoder and the writer, so IDs that
-//! wrap extract as the values every reader yields; a coordinate sum that
-//! wraps lands at least 2^63 from the previous, accepted one, outside the
-//! window the checked scaling accepts, so it is refused as before. Every
-//! decoded node is validated before the caller decides whether it needs it,
-//! so a corrupt coordinate is an error even on a node no OSC way references.
+//! All coordinate scaling is checked: granularity is any `int32`, as every
+//! reader takes it, and the exact `offset + granularity * raw`, computed
+//! without intermediate overflow, must fit an `i32` decimicrodegree after
+//! truncation toward zero. Dense delta accumulation is modular, as in the
+//! decoder and the writer, so IDs and coordinate sums that wrap extract as
+//! the values every reader yields, or are refused when the scaled value
+//! leaves `i32`. Every decoded node is checked against `i32` before the
+//! caller decides whether it needs it, so an unrepresentable coordinate is
+//! an error even on a node no OSC way references. The geographic domain is
+//! judged by the caller, only on the nodes it keeps (`streaming.rs`).
 //! Group framing errors that the sub-message iterator cannot report are
 //! caught by the strict `PrimitiveBlock` parse that always follows this
 //! extraction on the same bytes.
@@ -179,12 +179,22 @@ mod tests {
         assert_eq!(got, vec![(1, 30, 40)]);
     }
 
+    /// Granularity is read as every reader reads it: any `int32`, zero and
+    /// negative included, and refused only outside `int32`.
     #[test]
-    fn zero_and_huge_granularity_are_rejected() {
+    fn granularity_is_any_int32() {
         let mut group = Vec::new();
         len_delimited(1, &plain(1, 3, 4), &mut group);
-        assert!(extract(&block(std::slice::from_ref(&group), Some(0))).is_err());
-        assert!(extract(&block(&[group], Some(2_000_000_000))).is_err());
+        let at = |g: u64| extract(&block(std::slice::from_ref(&group), Some(g)));
+        assert_eq!(at(0).unwrap(), vec![(1, 0, 0)]);
+        assert_eq!(
+            at(2_000_000_000).unwrap(),
+            vec![(1, 60_000_000, 80_000_000)]
+        );
+        #[allow(clippy::cast_sign_loss)]
+        let minus_100 = (-100_i64) as u64;
+        assert_eq!(at(minus_100).unwrap(), vec![(1, -3, -4)]);
+        assert!(at(1 << 31).is_err());
     }
 
     #[test]

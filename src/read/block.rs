@@ -886,10 +886,14 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// come from the header alone: modular deltas let an accumulated value be any
 /// `i64`, so every header except granularity 0, or granularity 1 with a
 /// zero offset, admits some overflowing coordinate.
-/// Paths that turn coordinates into output they vouch for (the altw node
-/// scanner in `scan/node.rs`, apply-changes' `node_coords.rs` extractor) do
-/// their own checked scaling and narrowing during the decode they already
-/// perform.
+/// Paths that turn coordinates into output they vouch for (the node scanner
+/// in `scan/node.rs` behind altw and apply-changes `--locations-on-ways`,
+/// and the apply-changes way refresh in `refresh.rs`) do their own exact
+/// scaling and checked `i32` narrowing during the decode they already
+/// perform. They read granularity as this decoder does (any `int32`). The
+/// geographic domain is judged only where a node coordinate is joined into
+/// an output way (the altw stores and the apply-changes kept-node sink), on
+/// the joined nodes, not per decoded node.
 ///
 /// The framing walk comes first deliberately - it is the check that makes the
 /// element iterators used below unable to terminate early, so running the

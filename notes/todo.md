@@ -820,11 +820,25 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 - [ ] **The PBF read path does not validate coordinate ranges.** `parse_bbox`
   now rejects a latitude outside -90..90 or a longitude outside -180..180, and
-  the sparse node store refuses to index a node whose coordinates leave the same
-  domain. The general read path (`read/elements.rs`, the dense node iterators)
-  still hands out whatever the file says. Recorded because the bbox work made
-  the asymmetry visible; changing the read path is a deliberate decision, not a
+  every path that joins node coordinates into ways (both add-locations-to-ways
+  stores, and the apply-changes `--locations-on-ways` kept-node sink) refuses a
+  joined node outside the same domain; `check --locations` reports one. The
+  general read path (`read/elements.rs`, the dense node iterators) and the node
+  scanner (`scan/node.rs`, which bounds only the `i32` representation) still
+  hand out whatever the file says. Recorded because the bbox work made the
+  asymmetry visible; changing the read path is a deliberate decision, not a
   follow-up.
+
+- [ ] **Join-time domain checks judge the truncated value.** add-locations-to-ways
+  and apply-changes `--locations-on-ways` test the domain on the
+  decimicrodegree value after truncation toward zero (`coord_pack::in_domain`),
+  so a node within 100 nanodegrees past +-90 / +-180 degrees (possible only
+  under a non-default granularity or offset) is accepted and written at the
+  limit, while `check --locations` judges the exact nanodegree value and
+  reports it. The written coordinate is in the domain; the two commands
+  disagree only about whether the input was. Judging the exact value would
+  need the scanner to hand out nanodegrees or a remainder flag on the hot
+  path; left as is unless a real producer is found writing such values.
 
 - [ ] **Duplicated pread consumer drains.** `pread_execute`
   (`extract/common.rs`) duplicates its entire consumer body twice - in-loop

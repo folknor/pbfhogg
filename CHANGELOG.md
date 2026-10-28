@@ -1431,6 +1431,17 @@
 
 ### Fixed
 
+- **Every command reads a node block's granularity alike, and
+  `apply-changes --locations-on-ways` refuses an out-of-domain joined
+  node.** `add-locations-to-ways`, `apply-changes --locations-on-ways` and
+  `extract --simple` refused node blocks whose granularity was zero,
+  negative or above 1e9 nanodegrees, which every other command reads; they
+  now take any `int32` granularity like the rest. `apply-changes
+  --locations-on-ways` wrote a base node's coordinate into a changed way
+  even when it lay outside +-90 / +-180 degrees; it now fails the run
+  naming the node, as `add-locations-to-ways` already did. Valid files are
+  unaffected.
+
 - **`diff -v` details account for member and tag order.** A relation whose
   members only moved, or lost a duplicate, used to print its `*r` line with
   no detail, because members were compared as a set; the same held for a

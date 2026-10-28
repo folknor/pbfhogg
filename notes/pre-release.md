@@ -124,20 +124,6 @@ v2). The CLI surface redesign is deferred past 0.6.0.
   the decision tree is with its cell below.
 - **diff `-j 1`**: if its cell shows it clearly worse, give one-shard runs a
   streaming read back, without restoring a second engine.
-- **Counter meanings that changed and are not in `reference/performance.md`**,
-  which the observability ruling says should note changes affecting how
-  stored numbers read: `merge_streaming_blobs_forced_rewrite` now also counts
-  unindexed blobs re-encoded on `apply-changes --force` (`f703b02b`); cat's
-  `blobs_decoded` and the "Decoded N blobs" summary count input blobs, not
-  framed output blobs (`8da26b23`); diff and derive runs now feed
-  the `pipeline_decompress_pool_*` counters (`126cbce2`); `publish_sync_calls`
-  / `publish_sync_ns` are a tally of the publication's own syncs rather than a
-  delta of the run's `writer_sync_all_*` (same values for a CLI run, which
-  never publishes concurrently). (`merge_header_read_ms` widening at
-  `a3f1a1bc` was ruled to need no entry; the comment at its timer says it.)
-- **brokkr and `cat --clean --force`**: since `8da26b23`, `--clean --force`
-  without `--type` is refused by clap. Unchecked whether any brokkr cell
-  passes that combination; check before the cat `--clean` cells.
 
 ---
 
@@ -198,10 +184,6 @@ From AGENTS.md and the record, the rules that matter most here:
 
 ### Prerequisites
 
-- Before the altw cells: `notes/todo.md` "Stall-counter follow-ups", first
-  bullet, the `s4_readiness_wait_ns` twin, so `--stalls` sees the stage 3 to
-  4 handoff `reference/performance.md` names as planet's streaming
-  constraint. A small code change; the rest of that entry stays backlog.
 - Variant builds that are code changes, each its own commit: the shared
   walker descriptor variant and, depending on its first cell, the
   `packed_varint_count` masked fast path.

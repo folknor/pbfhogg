@@ -103,6 +103,31 @@ usually small.
   depth, and the engine now records its own gate, send and receive waits
   (`ordered_pool_*_wait_ns`) for every ordered pool. A row from that range
   does not compare with either side on those counters.
+- **`s4_readiness_wait_ns` (2026-10-28) is not `s4_readiness_wait_ms` in
+  other units.** The new counter is the add-locations-to-ways external
+  stage 3 to 4 handoff as `brokkr sidecar --stalls` sees it: time from a
+  stage 4 worker's first park on the router to its return, summed across
+  workers, error-ending waits included, calls that never park excluded. The
+  `_ms` trio is unchanged and still times every successful way-blob call,
+  fast path included; `s4_readiness_wait_blobs` therefore counts way blobs,
+  not blocked ones. Neither total bounds the other, so older rows, which
+  have only `_ms`, do not compare with the new counter.
+- **Four late-October 2026 changes affect how these counters read.**
+  `merge_streaming_blobs_forced_rewrite` also counts, from `f703b02b`, the
+  otherwise untouched unindexed blobs an `apply-changes --force` run must
+  re-encode because no single index describes them (indexable ones are
+  reframed and not counted); earlier forced runs copied those raw, and runs on indexed input
+  read the same either side. `cat_blobs_decoded` and cat's "Decoded N blobs"
+  count input blobs decoded, not output blobs written, from `8da26b23`; a
+  `cat --clean` or `cat --type` row before it is not comparable on that
+  counter. Sequential diff and derive-changes merges (`-j 1`, `--verbose`, or
+  unindexed input) decode through a recycling pool from `126cbce2` and feed
+  the `pipeline_decompress_pool_*` drop counters, which earlier such rows
+  lack; parallel shard runs are unaffected. `publish_sync_calls` and
+  `publish_sync_ns` count the publication's own syncs from `0fe60da5`,
+  rather than a delta of the run's `writer_sync_all_*` totals; a CLI run
+  never publishes concurrently, so the two definitions give the same values
+  there.
 
 ## Cat passthrough (indexdata generation)
 

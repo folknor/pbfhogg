@@ -1291,11 +1291,6 @@ Known to work, no performance question open, but not in the results DB:
 
 - [ ] **Stall-counter follow-ups (found 2026-10-26 adding the unordered
   pools' `*_wait_ns` counters).** Each is its own change; none is measured.
-  - altw stage 4's readiness wait is accumulated in ns but emitted only as
-    `s4_readiness_wait_ms`, so `--stalls` cannot see the stage-3 -> stage-4
-    handoff that `reference/performance.md` names as planet's streaming
-    constraint. Add an `s4_readiness_wait_ns` twin (names are a contract;
-    no rename).
   - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`
     fan-out (`apply_changes/streaming.rs`).
   - The first-error slot is a mutex locked on every claim in altw stages 2
@@ -1303,9 +1298,8 @@ Known to work, no performance question open, but not in the results DB:
     shared cache-line traffic. Planet-measured paths: needs its own A/B.
   - Every altw router publish takes a global `stats` mutex and the global
     `notify_mu`. Same caveat.
-  - The first bullet is a prerequisite of the altw cells in
-    [notes/pre-release.md](pre-release.md)'s measurement campaign, which
-    also carries the `Mutex<Receiver>` reading that used to be listed here.
+  - [notes/pre-release.md](pre-release.md)'s measurement campaign carries
+    the `Mutex<Receiver>` reading that used to be listed here.
 
 - [ ] **tags-filter walks the headers again for each later pass.** The
   relation closure, the way dependencies and the pass-2 schedule each run

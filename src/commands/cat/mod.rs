@@ -43,6 +43,8 @@ impl CleanAttrs {
 /// Statistics from a cat operation.
 pub struct CatStats {
     pub blobs_passthrough: u64,
+    /// Input blobs decoded (sidecar `cat_blobs_decoded`, and the summary's
+    /// "Decoded N blobs"), not output blobs written.
     pub blobs_decoded: u64,
     pub elements_written: u64,
 }

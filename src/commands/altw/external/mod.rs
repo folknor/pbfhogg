@@ -1160,6 +1160,11 @@ pub(crate) fn external_join_in(
                 overrides,
                 host,
             );
+            // Stage 4's workers have joined inside `stage4_assembly`, so the
+            // total is final; emitted on failure too, where an aborted wait
+            // is part of the story.
+            host.invocation
+                .counter("s4_readiness_wait_ns", router_ref.readiness_wait_ns());
             if let Err(error) = &result {
                 router_ref.abort(error.clone());
             }

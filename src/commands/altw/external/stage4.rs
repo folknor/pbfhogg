@@ -80,7 +80,11 @@ crate::counters::counter_set! {
         /// Streaming-router readiness wait. `wait_ready` is called at the
         /// top of the way-blob branch, ahead of the input pread, so a decode
         /// worker never holds a decompressed block + StringTable resident
-        /// while blocked. Counted only for a positive measured wait.
+        /// while blocked. Timed around every successful way-blob call, the
+        /// already-published fast path included (any positive elapsed sample), so `_blobs` counts way
+        /// blobs rather than blocked ones; a call that returns an error is
+        /// not recorded. The gated `--stalls` view of the same wait is the
+        /// router's `s4_readiness_wait_ns`, which counts only real parks.
         readiness_wait_ns => "s4_readiness_wait_ms" / 1_000_000,
         readiness_wait_blobs => "s4_readiness_wait_blobs",
         readiness_wait_max_ns => "s4_readiness_wait_max_ms" / 1_000_000,

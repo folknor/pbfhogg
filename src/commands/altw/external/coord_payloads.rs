@@ -125,6 +125,14 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // Only the slow path below touches it, so the already-published fast
     // path stays lock-free.
     wait_gauge: crate::counters::StallGauge,
+    // Emitted as `s4_readiness_wait_ns`, the `--stalls` view of the stage 3
+    // to stage 4 handoff: nanoseconds from a `wait_ready` caller's first
+    // Condvar park to its return, summed across stage 4 threads, waits that
+    // end in an abort or a missing publication included. A call that never
+    // parks adds nothing. Not a unit twin of `s4_readiness_wait_ms`, which
+    // times every successful way-blob call, fast path included, and skips
+    // error-ending waits; neither bounds the other.
+    readiness_wait_ns: std::sync::atomic::AtomicU64,
     // Counters emitted by mod.rs after the scope joins.
     pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
 }
@@ -181,6 +189,7 @@ impl ConcurrentBlobLocationRouter {
                 "WAIT_S4_ROUTER_END",
                 invocation,
             ),
+            readiness_wait_ns: std::sync::atomic::AtomicU64::new(0),
             stats: std::sync::Mutex::new(stats),
         })
     }
@@ -378,7 +387,11 @@ impl ConcurrentBlobLocationRouter {
         // The initial published-slot fast path returned, so only the
         // readiness-wait path below enters the WAIT_S4_ROUTER duration span.
         let _stall = self.wait_gauge.track();
-        loop {
+        // Started at the first real Condvar park, not at the fast-path miss:
+        // a publication racing the miss, or an abort or producer-done seen on
+        // the first recheck, returns without waiting and records nothing.
+        let mut blocked: Option<crate::counters::Stopwatch> = None;
+        let outcome = loop {
             let mu_guard = self
                 .notify_mu
                 .lock()
@@ -394,27 +407,42 @@ impl ConcurrentBlobLocationRouter {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
                     .unwrap_or_else(|| Error::internal("router aborted (no message recorded)"));
-                return Err(err);
+                break Err(err);
             }
             {
                 let guard = self.slots[blob_idx]
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if guard.is_some() {
-                    return Ok(());
+                    break Ok(());
                 }
                 if self.producer_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(Error::internal(format!(
+                    break Err(Error::internal(format!(
                         "router: no publication for blob {blob_idx} after producer finished"
                     )));
                 }
+            }
+            if blocked.is_none() {
+                blocked = Some(crate::counters::Stopwatch::start());
             }
             drop(
                 self.notify
                     .wait(mu_guard)
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
+        };
+        if let Some(blocked) = blocked {
+            blocked.record_ns(&self.readiness_wait_ns);
         }
+        outcome
+    }
+
+    /// Nanoseconds of `wait_ready` wait episodes (first Condvar park through
+    /// the final predicate check, wakeups and lock reacquisition included),
+    /// summed across threads; see the field.
+    pub(super) fn readiness_wait_ns(&self) -> u64 {
+        self.readiness_wait_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Read blob `blob_idx`'s encoded payload. Callers that have already

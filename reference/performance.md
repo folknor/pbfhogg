@@ -1323,6 +1323,41 @@ compare per decoded block. Interleaved `--bench 1` cells against
 Both inside the noise band (extract medians 119.9 against 120.4 s, geocode
 316.0 against 321.2 s).
 
+### External stage 1 worker cap (bygg, 2026-10-28)
+
+Question: should external stage 1 pass A cap its worker count like stages
+2 and 3 do? Uncapped it runs host parallelism minus 2, 30 workers on bygg,
+each owning one 256 KiB writer per id bucket: 7,680 shard files and about
+1.9 GiB of shard buffers. Arm A is `49a03ebb` (uncapped); arm B is
+`fea271fd` (cap 8 applied before the descriptor request; a measurement
+commit whose code was not kept). Planet, `--index-type external`,
+`--bench 1`, alternating A then B, untrimmed. Seconds:
+
+| Pair | Arm | UUID | Wall | Pass A | Stage 2 | Streaming |
+|---|---|---|---:|---:|---:|---:|
+| 1 | A uncapped | `2cf75884` | 546.7 | 114.6 | 210.9 | 212.4 |
+| 1 | B cap 8 | `d05cddff` | 599.7 | 144.1 | 224.8 | 222.6 |
+| 2 | A uncapped | `3ccbb592` | 708.0 | 226.0 | 238.9 | 234.9 |
+| 2 | B cap 8 | `eed6408f` | 676.3 | 224.7 | 227.1 | 216.2 |
+| 3 | A uncapped | `b302f622` | 728.0 | 225.0 | 248.1 | 246.5 |
+| 3 | B cap 8 | `c83e69bd` | 701.3 | 221.2 | 244.0 | 227.7 |
+
+Wall medians 708.0 (A) against 676.3 s (B), signs +, -, -. Pass A tied in
+the slow-drive pairs and lost 26 % under the cap in the one fast-drive
+pair, where at 8 workers each worker's serial pread, decode and emit chain
+had less company to hide it (cumulative pread 461 s at 8 workers against
+289 s at 30). Cumulative shard write time collapses with the cap (pair 2:
+6,050 against 746 worker-seconds) because fewer workers sit in `write()`
+at once; these are occupancy figures, not device service time. The cap's
+wall wins in pairs 2 and 3 sit in stage 2 and streaming, opposite in sign
+to pair 1 and smaller than the drift between consecutive cells.
+
+Verdict: a cap of 8 did not show a reliable whole-command improvement, and
+stage 1 stays uncapped on the CPU side; the descriptor cap still bounds it.
+This does not show that 30 workers are free when the drive is slow, only
+that capping did not pay. Decoupling file count and buffer RAM from the
+worker count is the open alternative.
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

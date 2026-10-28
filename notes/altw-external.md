@@ -180,7 +180,8 @@ Shape (post-A1 rankless join, `--inject-prepass` capable):
 
 1. Blob metadata scan (pread-only HeaderWalker; also drives the tag-scan
    for node-blob filtering).
-2. Stage 1: single parallel way pass (22 workers). Per ref, emits one
+2. Stage 1: single parallel way pass (host parallelism minus 2 workers,
+   no fixed cap; 22 on plantasjen, 30 on bygg). Per ref, emits one
    12-byte IdRecord `(local_node_id u32 | CLOSURE_FLAG, blob_idx u32,
    blob_local_slot u32)` into 256 id-bucket shards (per-worker files),
    plus the blob-order refcount sidecars. Relation scan (sequential,
@@ -194,7 +195,8 @@ Shape (post-A1 rankless join, `--inject-prepass` capable):
 4. Stage 3 + stage 4 streaming: stage 3 (4 workers) reads slot buckets,
    scatters into dense per-bucket coord buffers, encodes per-way-blob
    delta-varint coord payloads into worker tmp files, publishes via the
-   ConcurrentBlobLocationRouter; stage 4 (22 decode threads) preads input
+   ConcurrentBlobLocationRouter; stage 4 (host parallelism minus 2 decode
+   threads, uncapped) preads input
    + payloads, wire-reframes way blobs, decodes/rebuilds node blobs
    (filtering untagged non-members), passthrough for relations, all
    through the generic parallel PbfWriter at zlib:6.
@@ -433,7 +435,13 @@ pre-N6); watch `s2_slot_flush_lock_wait_ms`, peak aggregate worker
 memory (bucket skew makes worst-case >> average), and device queue
 depth. On one drive expect modest gains at best; re-sweep after N6.
 The stage-3 `.min(4)` and stage-1 fd-capped counts are separate knobs;
-leave them unless a specific counter implicates them.
+leave them unless a specific counter implicates them. A stage-1 CPU cap
+of 8 was measured on bygg planet on 2026-10-28 and not adopted (no
+reliable whole-command win; pass A lost about a quarter in the one
+fast-drive pair): reference/performance.md "External stage 1 worker cap".
+Also open: `ALTW_STAGE2_WORKERS_CAP` in src/tunables.rs carries no
+rationale beyond "cap"; whatever this sweep settles should land there as
+its reason.
 
 ### N5. Second-NVMe scratch split (absorbs L14/L15; hardware-gated)
 
@@ -464,7 +472,7 @@ open question is the write side.
 Cautions (why this is a probe, not a plan): dirty pages cannot be
 dropped - eager eviction forces writeback and can serialize the
 producer; the tail of stage 1's writes IS useful cache for stage 2's
-first reads (same for stage 2 -> 3); O_DIRECT across 5,632 shard files
+first reads (same for stage 2 -> 3); O_DIRECT across every stage 1 shard file (workers x 256)
 needs aligned buffers and tail handling. Collect device writeback +
 cache-hit evidence first; implement as a scratch-only I/O backend, not
 coupled to the input `--direct-io` flag. N3 and N5 may shrink the
@@ -601,10 +609,25 @@ dispatch loop.
 
 ### S6. L6 consolidated shard writers (kept as fallback)
 
-Stage 1 holds 22 workers x 256 = 5,632 BufWriters (~1.4 GB buffer RAM).
-Consolidating to 256 shared writers with batched flush trades that for
-lock traffic. N1 shrinks the byte volume through these writers by a
-third, which weakens the case further. Fallback territory only.
+Stage 1 holds one 256 KiB BufWriter per id bucket per worker: workers x
+256 files and buffers (5,632 and ~1.4 GB at 22 workers on plantasjen;
+7,680 and ~1.9 GiB at 30 on bygg). Consolidating to 256 shared writers
+with batched flush trades that for lock traffic. N1 shrinks the byte
+volume through these writers by a third, which weakens the case further.
+
+Since the 2026-10-28 cap experiment (reference/performance.md "External
+stage 1 worker cap"), this is the one remaining lever on stage 1's file
+count and buffer RAM: capping workers did not pay, so the count can only
+shrink by decoupling it from the worker count. Correctness holds (records
+carry blob and slot identity, stage 2 sorts by node id, worker-file order
+is unused) provided whole-record batches stay contiguous under the bucket
+lock, counts stay exact and everything flushes before stage 2. Two
+cautions before measuring: copying stage 2's per-worker per-bucket 256 KiB
+batching recreates about the same RAM in local vectors, so the worker-local
+batch budget must be bounded in aggregate; and a bucket mutex held across a
+throttled write can convoy workers on hot buckets, so emit a lock-wait
+`_wait_ns` counter. Not motivated by a failure: no recorded EMFILE or
+memory failure exists at 30 workers.
 
 ---
 

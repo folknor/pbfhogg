@@ -492,15 +492,6 @@ pub(crate) const STAGE1_HEADROOM_FDS: u64 = 64;
 /// `BufWriter` capacity.
 pub(crate) const STAGE2_FLUSH_THRESHOLD: usize = 256 * 1024;
 
-/// Cap on the external join's stage 1 pass A worker count (applied on top
-/// of the decode-worker sizing, before the descriptor allowance is asked
-/// for). Each worker owns one `BUCKET_BUF_SIZE` writer per id bucket, so
-/// the count sets the open id-shard files, the shard buffer RAM and stage
-/// 2's per-bucket read fan-in. Pass A is bound by scratch writeback, not
-/// CPU: on a planet run at 30 workers the workers spent nearly all of pass
-/// A inside shard `write()` while the ordered consumer waited on them.
-pub(crate) const ALTW_STAGE1_WORKERS_CAP: usize = 8;
-
 /// Cap on stage 2's worker count (applied on top of the decode-worker
 /// sizing).
 pub(crate) const ALTW_STAGE2_WORKERS_CAP: usize = 6;

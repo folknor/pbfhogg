@@ -774,7 +774,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   blob whose first element is negative and whose range is mixed-sign
   (indexdata campaign, 2026-10-28).
 
-- [ ] **The promise guard has three blind spots.** Every CLI test runs
+- [ ] **The promise guard has two blind spots.** Every CLI test runs
   `pbfhogg` under the seccomp promise guard (`cli/tests/guard.rs`), which
   enforces the no-helper-process and inherited-descriptor promise of
   docs/cli/commands.md "Names pbfhogg leaves behind" for the whole
@@ -784,14 +784,13 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   descriptor, and only the brokkr.toml textlint rules guard that. (2) a
   process-creating `clone3` caller that ignores the `ENOSYS` the guard
   returns and carries on (glibc and musl fall back to `clone`, which the
-  guard kills; a raw caller need not). (3) hotpath builds - the guard runs
-  only the test builds, and `no-hotpath-cpu` matches the literal feature
-  name in the two Cargo.toml files only, so a transitive enablement of
-  hotpath's process-spawning CPU profiler (another crate's feature, or a
-  Cargo.lock-only change) would not trip it. Closing (1) would need a
+  guard kills; a raw caller need not). Closing (1) would need a
   ring-op allowlist (`IORING_REGISTER_RESTRICTIONS`) or a guard that bans
-  `io_uring_setup` on runs without `--io-uring`; (3) would need a
-  `cargo tree -e features` check in the gate.
+  `io_uring_setup` on runs without `--io-uring`. (hotpath builds, which the
+  guard never runs, are covered by the `no-hotpath-cpu` script check on the
+  resolved graph; its residue is that it certifies the checked resolution
+  only, trusting Cargo's source configuration, and not a build passing
+  `hotpath/hotpath-cpu` on the command line.)
 
 - [ ] **The O_DIRECT path constructors' non-regular-target check is not
   race-free.** `direct_io::create_for_write` (behind

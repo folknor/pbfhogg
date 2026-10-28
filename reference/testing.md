@@ -153,7 +153,11 @@ promise in `docs/cli/commands.md` "Names pbfhogg leaves behind". The guard is
 stricter than the promise (no duplicate of the lease, no `sendmsg`,
 `sendmmsg` or `pidfd_getfd` at all) and blind to io_uring submissions
 and to a `clone3` caller that ignores its `ENOSYS`; the module doc says
-why. `guard::tests` re-runs the test binary under the guard once per
+why. It also runs only the test builds, whose features never include
+hotpath's; the `no-hotpath-cpu` script check in `brokkr.toml`
+(`scripts/check_hotpath_cpu.py`) covers the profiler builds by failing
+when the resolved dependency graph, with every workspace feature on,
+enables hotpath's process-starting CPU profiler. `guard::tests` re-runs the test binary under the guard once per
 rule to prove each one fires and that the allowed neighbours do not. A
 test that starts the binary some other way escapes the guard: do not.
 

@@ -37,7 +37,10 @@
 //! there. A caller that tries `clone3`, gets `ENOSYS`, ignores it and
 //! carries on would pass as well: the guard proves that no process creation
 //! succeeded, not that none was attempted. And it covers the runs the tests
-//! make, not every command and flag combination.
+//! make, not every command and flag combination, built with the test
+//! features, never hotpath's: the `no-hotpath-cpu` script check in
+//! brokkr.toml keeps hotpath's process-starting CPU profiler out of every
+//! workspace build instead.
 //!
 //! Hosts: Linux on little-endian x86_64 or aarch64, with
 //! `SECCOMP_RET_KILL_PROCESS` (Linux 4.14). This process asks the kernel

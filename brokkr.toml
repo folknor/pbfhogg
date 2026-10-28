@@ -1231,12 +1231,17 @@ region = "code"
 message = "Only src/read/input.rs changes file-status flags, on descriptors it opened; inherited descriptors keep theirs"
 
 # hotpath's hotpath-cpu feature spawns a detached profiler process, which would
-# break the no-helper-process promise above.
-[[textlint]]
+# break the no-helper-process promise above. A manifest text match cannot see
+# the feature switched on by unification from another dependency, so the check
+# reads the resolved graph with every workspace feature on (cargo metadata)
+# and also fails on any hotpath version or source other than the audited one.
+# pre-test: clippy has brought the lock up to date with the manifests by then.
+[[script_check]]
 name = "no-hotpath-cpu"
-pattern = 'hotpath-cpu'
-paths = ["Cargo.toml", "cli/Cargo.toml"]
-message = "hotpath-cpu starts a helper process; the CLI promises it starts none"
+command = "python3 scripts/check_hotpath_cpu.py"
+expect = "hotpath-cpu absent"
+match = "last-line"
+stage = "pre-test"
 
 # statvfs in altw (sparse preallocation, external scratch precheck) guards
 # scratch writes and sizes no host resource.

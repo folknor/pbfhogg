@@ -28,6 +28,19 @@
   ` -> ` made the line ambiguous; each record is now one line and every
   separator outside a literal.
 
+- **`inspect` text output quotes and escapes text from the file, the same
+  way `diff -v` does.** `inspect tags` rows are `count`, TAB, `"key"`, TAB,
+  `"value"`. `inspect --show` prints tags as `"key"="value"`, the user as
+  `user: "name"` and members as `type/id "role"` (previously
+  `type/id (role)`; an unknown member type now shows its raw value as
+  `unknown(raw)/id`), with a bare `<invalid>` for an invalid user or role
+  string; a user with an invalid string used to be omitted silently. The
+  report quotes the file name, writing program, each header feature and the
+  replication URL, and now prints the `Repl:` line for a header that
+  carries only a URL. A tab or newline in a key, value or name used to
+  break fields and lines and could forge a further line. `--get` and
+  `--json` are unchanged.
+
 - **`check` library calls return `check::CheckOutcome`.** `check_refs`,
   `verify_ids` and `check_locations` return `Complete(report)` or, when a
   blob's kind claim is false, `Stopped(StoppedCheck)` carrying the

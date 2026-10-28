@@ -647,6 +647,22 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed on unindexed input with the slower fallback. **Requires `--nodes`**: only the node-stats scan refuses unindexed input, so passing it to another mode is an error rather than a no-op. |
 
+Text taken from the file prints as a quoted literal, escaped exactly as
+[`diff -v`](#diff) escapes keys, values and roles (a complete double-quoted
+string that is also a valid JSON string), so a newline, tab or quote in the
+text can never split a line or forge another one. In the report that is the
+file name (`File:     "name" (size)`), the writing program
+(`Program:  "..."`), each header feature (`Features: "a", "b"`) and the
+replication URL on the `Repl:` line. `--show` prints tags as
+`    "key"="value"`, the user as `  user: "name"`, and each member as
+`    type/id "role"` (an unknown member type as `unknown(raw)/id`); a user or
+role whose string index is invalid prints a bare `<invalid>`, which a real
+string, always quoted, cannot be confused with. `--get` is the exception: it
+prints the raw value followed by one newline, unescaped, so a value holding a
+newline spans lines; use `--json` to read such a value losslessly. The file
+name is the path's last component as UTF-8, with invalid bytes replaced, in
+every form.
+
 #### inspect tags
 
 Count tag key=value frequencies (subcommand of `inspect`).
@@ -665,6 +681,13 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
+
+Each output row on stdout is three tab-separated fields: the count, then the
+key and the value, each a double-quoted literal escaped as in
+[`diff -v`](#diff) (a valid JSON string), for example
+`120`, TAB, `"highway"`, TAB, `"primary"`. A tab or newline inside a key or value prints
+escaped, so splitting a row on tabs always yields three fields and each
+quoted field JSON-decodes to the original text.
 
 `inspect tags` expressions use the same syntax as `tags-filter`, including
 element-type prefixes. For example, `w/highway=primary` counts that match only

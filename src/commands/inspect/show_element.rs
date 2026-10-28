@@ -7,6 +7,7 @@ use std::path::Path;
 use super::super::Result;
 use crate::Element;
 use crate::ElementKind;
+use crate::text_quote::{MemberLabel, Quoted};
 
 /// Look up a single element by type and ID and write all its metadata,
 /// tags and refs/members to `out`. Returns whether the element was found;
@@ -173,14 +174,22 @@ fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io:
         {
             writeln!(out, "  uid: {uid}")?;
         }
-        if claims.user
-            && let Ok(user) = info.user()
-            && !user.is_empty()
-        {
-            writeln!(out, "  user: {user}")?;
+        if claims.user {
+            write_user(out, info.user().ok())?;
         }
     }
     Ok(())
+}
+
+/// `  user: "name"`, nothing for an empty name, and a bare `<invalid>` for a
+/// negative or out-of-range user string index, passed as `None` (a real name
+/// is always quoted, so the sentinel cannot be mistaken for one).
+fn write_user(out: &mut impl Write, user: Option<&str>) -> io::Result<()> {
+    match user {
+        Some("") => Ok(()),
+        Some(user) => writeln!(out, "  user: {}", Quoted(user)),
+        None => writeln!(out, "  user: <invalid>"),
+    }
 }
 
 fn write_info(out: &mut impl Write, info: &crate::Info<'_>) -> io::Result<()> {
@@ -202,10 +211,8 @@ fn write_info(out: &mut impl Write, info: &crate::Info<'_>) -> io::Result<()> {
     {
         writeln!(out, "  uid: {uid}")?;
     }
-    if let Some(Ok(user)) = info.user()
-        && !user.is_empty()
-    {
-        writeln!(out, "  user: {user}")?;
+    if let Some(user) = info.user() {
+        write_user(out, user.ok())?;
     }
     Ok(())
 }
@@ -218,7 +225,7 @@ fn write_tags<'a>(out: &mut impl Write, element: &impl HasTags<'a>) -> io::Resul
             writeln!(out, "  tags:")?;
             has_tags = true;
         }
-        writeln!(out, "    {k} = {v}")?;
+        writeln!(out, "    {}={}", Quoted(k), Quoted(v))?;
     }
     Ok(())
 }
@@ -230,7 +237,7 @@ fn write_tags_dense(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io::Resu
             writeln!(out, "  tags:")?;
             has_tags = true;
         }
-        writeln!(out, "    {k} = {v}")?;
+        writeln!(out, "    {}={}", Quoted(k), Quoted(v))?;
     }
     Ok(())
 }
@@ -251,14 +258,12 @@ fn write_relation_members(out: &mut impl Write, r: &crate::Relation<'_>) -> io::
     if !members.is_empty() {
         writeln!(out, "  members: ({})", members.len())?;
         for m in &members {
-            let type_str = match m.id {
-                crate::MemberId::Node(_) => "node",
-                crate::MemberId::Way(_) => "way",
-                crate::MemberId::Relation(_) => "relation",
-                crate::MemberId::Unknown(_, _) => "unknown",
-            };
-            let role = m.role().unwrap_or("<invalid>");
-            writeln!(out, "    {type_str}/{} ({})", m.id.id(), role)?;
+            // A real role is always quoted, so the bare `<invalid>` sentinel
+            // for a negative or out-of-range string index is unambiguous.
+            match m.role() {
+                Ok(role) => writeln!(out, "    {} {}", MemberLabel(m.id), Quoted(role))?,
+                Err(_) => writeln!(out, "    {} <invalid>", MemberLabel(m.id))?,
+            }
         }
     }
     Ok(())

@@ -666,16 +666,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   truncated); whether the line count should get a cap and an omission line
   is an open contract choice. Found 2026-10-28 while settling -v escaping.
 
-- [ ] **`inspect` text output prints tag values, users and roles raw.**
-  `inspect <element>` (`src/commands/inspect/show_element.rs`: `k = v`,
-  `user:`, `type/id (role)`) and `inspect tags` (`count TAB key TAB value`
-  in `cli/src/lib.rs`) interpolate string-table text unescaped, so a
-  newline or tab in a value breaks their line and field framing, the
-  defect `diff -v` had. `diff -v` now quotes every key, value and role as
-  a JSON-compatible literal (the `Quoted` formatter in
-  `src/commands/diff/mod.rs`); the same rule, or a shared formatter, would
-  fit here. Found 2026-10-28.
-
 - [ ] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` is unmeasured.** Its doc in
   `src/tunables.rs` says "sized so one call stays in the low milliseconds;
   not measured". With `VERBOSE_SEQUENCE_DIFF_MAX_EDITS` (1000) now stopping
@@ -745,6 +735,17 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   `BlockBuilder`: a write-path change, wide enough to deserve its own round.
 
 ### Core infrastructure and CLI
+
+- [ ] **JSON output and the human text quoting escape different sets.** The
+  human text (`diff -v`, `inspect --show`, the inspect report, `inspect
+  tags`) goes through `text_quote::Quoted`, which also escapes C1 controls,
+  DEL, U+2028/U+2029 and the bidi controls; `inspect --json` and export go
+  through serde_json, which escapes only quote, backslash and C0 and leaves
+  the rest literal (valid JSON, not terminal-safe). Both are correct for
+  their consumer; open question is whether JSON printed to a terminal
+  should match. Also: `inspect --get` prints raw values by design, so a
+  newline in a header string makes a multi-line answer (documented; use
+  `--json`). Found 2026-10-28 while quoting inspect text.
 
 - [ ] **`ReorderBuffer::with_capacity(N)` is a tuning guess at ~20 sites.** The
   `N` passed is rarely the caller's true permit window - `time_filter` asks for

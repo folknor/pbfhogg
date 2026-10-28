@@ -205,6 +205,9 @@ pub(crate) mod scan;
 pub mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
+// Shared with the CLI's `inspect tags` printer; not a library API.
+#[doc(hidden)]
+pub mod text_quote;
 // Unit-test skip support; every skip it serves is an O_DIRECT one.
 #[cfg(all(test, feature = "linux-direct-io"))]
 pub(crate) mod test_support;

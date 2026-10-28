@@ -126,3 +126,24 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
         "a file with no tag index has nothing to skip on: {unskipped}"
     );
 }
+
+/// Each `inspect tags` row is three tab-separated fields, the key and value
+/// as JSON-compatible literals: a tab or newline in the text stays inside
+/// its field and row.
+#[test]
+fn rows_quote_and_escape_key_and_value() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("text.osm.pbf");
+    let mut nodes = generate_nodes(2, 1);
+    nodes[0].tags = vec![("a\tb", "x\ny\"\\")];
+    nodes[1].tags = vec![("a\tb", "x\ny\"\\")];
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
+
+    let stdout = CliInvoker::new()
+        .arg("inspect")
+        .arg("tags")
+        .arg(&input)
+        .assert_success()
+        .stdout_str();
+    assert_eq!(stdout, "2\t\"a\\tb\"\t\"x\\ny\\\"\\\\\"\n");
+}

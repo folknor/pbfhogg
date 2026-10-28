@@ -9,6 +9,8 @@
 
 use std::io::{self, Write};
 
+use crate::text_quote::Quoted;
+
 use super::format::{format_number, format_number_signed, format_size, format_timestamp, yes_no};
 use super::keys::{InspectGetKey, InspectGetKeyKind};
 use super::types::{
@@ -92,11 +94,11 @@ impl InspectReport {
         writeln!(
             out,
             "File:     {} ({})",
-            self.file_name,
+            Quoted(&self.file_name),
             format_size(self.file_size)
         )?;
         if let Some(ref prog) = self.header_meta.writing_program {
-            writeln!(out, "Program:  {prog}")?;
+            writeln!(out, "Program:  {}", Quoted(prog))?;
         }
 
         // Combine features, skip boilerplate (OsmSchema-V0.6, DenseNodes)
@@ -110,8 +112,12 @@ impl InspectReport {
                 *f != crate::HeaderBlock::OSM_SCHEMA_V06 && *f != crate::HeaderBlock::DENSE_NODES
             })
             .collect();
-        if !features.is_empty() {
-            writeln!(out, "Features: {}", features.join(", "))?;
+        if let Some((first, rest)) = features.split_first() {
+            write!(out, "Features: {}", Quoted(first))?;
+            for feature in rest {
+                write!(out, ", {}", Quoted(feature))?;
+            }
+            writeln!(out)?;
         }
 
         if let Some((left, bottom, right, top)) = self.header_meta.bbox {
@@ -119,7 +125,10 @@ impl InspectReport {
         }
 
         let hm = &self.header_meta;
-        if hm.replication_sequence.is_some() || hm.replication_timestamp.is_some() {
+        if hm.replication_sequence.is_some()
+            || hm.replication_timestamp.is_some()
+            || hm.replication_url.is_some()
+        {
             let mut parts = Vec::new();
             if let Some(seq) = hm.replication_sequence {
                 parts.push(format!("seq {seq}"));
@@ -128,7 +137,7 @@ impl InspectReport {
                 parts.push(format!("timestamp {ts}"));
             }
             if let Some(ref url) = hm.replication_url {
-                parts.push(url.clone());
+                parts.push(Quoted(url).to_string());
             }
             writeln!(out, "Repl:     {}", parts.join(", "))?;
         }

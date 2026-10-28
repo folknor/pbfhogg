@@ -759,3 +759,126 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     assert!(!miss, "node 999 shouldn't exist");
     assert!(out_miss.is_empty(), "a miss must write nothing");
 }
+
+/// The report's header lines print the file name and each header feature
+/// as a quoted literal: a newline in a file name cannot forge a label line.
+#[test]
+fn report_header_quotes_file_name_and_features() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("x\nProgram:  forged.osm.pbf");
+    crate::common::write_test_pbf_impl(&input, &generate_nodes(2, 1), &[], &[], true, None);
+
+    let mut report = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: false,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
+    let mut out: Vec<u8> = Vec::new();
+    report.write_report(&mut out, None).expect("write_report");
+    let text = String::from_utf8(out).expect("utf8 output");
+    assert!(
+        text.starts_with("File:     \"x\\nProgram:  forged.osm.pbf\" ("),
+        "unexpected output: {text:?}"
+    );
+    assert!(
+        !text.contains("\nProgram:  forged"),
+        "forged line: {text:?}"
+    );
+    assert!(
+        text.contains("\nFeatures: \"Sort.Type_then_ID\""),
+        "unexpected output: {text:?}"
+    );
+    // `--get` stays the raw value: a scripting interface, not framed text.
+    assert_eq!(
+        report.get_value("file.name").as_deref(),
+        Some("x\nProgram:  forged.osm.pbf")
+    );
+}
+
+/// `--show` prints every key, value, user and role as a quoted, escaped
+/// literal, so a newline, tab or quote in string-table text cannot split a
+/// line or forge another one.
+#[test]
+fn show_element_quotes_and_escapes_text() {
+    use crate::common::{TestMember, TestMeta};
+    use pbfhogg::ElementKind;
+    use pbfhogg::MemberId;
+    use pbfhogg::inspect::show_element_to;
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("text.osm.pbf");
+    let meta = TestMeta {
+        user: "a\nuser: forged",
+        ..TestMeta::default()
+    };
+    crate::common::write_test_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![("k\t=", "v\n  refs: (9 nodes)\u{202e}\"\\")],
+            meta: Some(meta),
+        }],
+        &[],
+        &[TestRelation {
+            id: 7,
+            members: vec![
+                TestMember {
+                    id: MemberId::Way(5),
+                    role: "in) \nner",
+                },
+                TestMember {
+                    id: MemberId::Node(1),
+                    role: "",
+                },
+            ],
+            tags: vec![("type", "multipolygon")],
+            meta: Some(meta),
+        }],
+    );
+
+    let show = |kind, id| {
+        let mut out: Vec<u8> = Vec::new();
+        let found = show_element_to(
+            &input,
+            kind,
+            id,
+            false,
+            &mut out,
+            &crate::common::test_host(),
+        )
+        .expect("show_element");
+        assert!(found);
+        String::from_utf8(out).expect("utf8 output")
+    };
+
+    let node = show(ElementKind::Node, 1);
+    assert!(
+        node.contains("\n  user: \"a\\nuser: forged\"\n"),
+        "unexpected output: {node:?}"
+    );
+    assert!(
+        node.contains("\n    \"k\\t=\"=\"v\\n  refs: (9 nodes)\\u202e\\\"\\\\\"\n"),
+        "unexpected output: {node:?}"
+    );
+    assert!(!node.contains("\n  refs:"), "forged line: {node:?}");
+
+    let rel = show(ElementKind::Relation, 7);
+    assert!(
+        rel.contains("\n    way/5 \"in) \\nner\"\n    node/1 \"\"\n"),
+        "unexpected output: {rel:?}"
+    );
+    assert!(
+        rel.contains("\n    \"type\"=\"multipolygon\"\n"),
+        "unexpected output: {rel:?}"
+    );
+}

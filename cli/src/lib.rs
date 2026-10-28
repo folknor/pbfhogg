@@ -3800,9 +3800,18 @@ fn run_tags_count(
     };
     let results = pbfhogg::tags_count::tags_count(path, &opts, host)?;
 
+    use pbfhogg::text_quote::Quoted;
     let mut out = output::buffered();
     for entry in &results {
-        writeln!(out, "{}\t{}\t{}", entry.count, entry.key, entry.value)?;
+        // Tab-separated, the key and value as JSON-compatible literals: a tab
+        // or newline in the text cannot break field or row framing.
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            entry.count,
+            Quoted(&entry.key),
+            Quoted(&entry.value)
+        )?;
     }
     out.flush()?;
 

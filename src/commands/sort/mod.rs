@@ -372,7 +372,8 @@ pub(crate) fn sort_to<'a>(
 mod tests {
     use super::*;
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
-    use crate::read::header_walker::tests::{direct_opens, direct_reads_supported};
+    use crate::read::header_walker::tests::direct_opens;
+    use crate::test_support::direct_reads_supported;
     use crate::writer::{Compression, PbfWriter};
     use std::path::Path;
 
@@ -426,7 +427,7 @@ mod tests {
     #[test]
     fn direct_reads_walk_pass_1_direct() {
         let dir = crate::path_guard::tests::scratch();
-        if !direct_reads_supported(dir.path()) {
+        if !direct_reads_supported(dir.path(), "the whole test") {
             return;
         }
         let input = dir.path().join("unsorted.osm.pbf");

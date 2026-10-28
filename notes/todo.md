@@ -809,32 +809,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   destination; `Output` stages a fresh file) when this landed; recorded so
   the boundary is a decision, not an oversight.
 
-- [ ] **Skip predicates disagree on whether an O_DIRECT refusal skips an
-  io_uring test.** `common::is_uring_unavailable` (library) and
-  `CliOutput::is_uring_unsupported` (cli/tests/invoker.rs) skip on a
-  `PlatformUnsupported` labelled `io-uring` OR `direct-io`, because the
-  io_uring writer also opens its output with `O_DIRECT`.
-  `uring_writer_refuses_non_regular_targets` (tests/roundtrip.rs) matches
-  inline, skips only on `io-uring` and fails on `direct-io`, and
-  reference/testing.md says library tests use the shared helper rather than
-  their own matching. Decide which classification is right for that test
-  (its doc comment argues a `direct-io` refusal there is a
-  misclassification) and either make it use the helper or record why it
-  must not.
-- [ ] **Silent and over-broad O_DIRECT skips in the direct reader unit
-  test.** `src/read/direct_reader.rs` `a_real_direct_file_reads_like_a_buffered_one`
-  returns without a `Skipping:` line and accepts a `PlatformUnsupported` of
-  any feature label, where the library tests' `common::is_einval` requires
-  `direct-io` and `common::skip` announces it. Unit tests cannot reach
-  `tests/common`, so it needs its own narrow match plus an eprintln, or a
-  test-support helper in `src/`.
-- [ ] **A library-driven test sits in the CLI package.**
-  `cli/tests/cli_add_locations_to_ways.rs`
-  `external_backend_output_refusal_stays_typed_across_stage_join` calls
-  `pbfhogg::altw::add_locations_to_ways` directly and never spawns the
-  binary, while reference/testing.md places only binary-driving tests in
-  `cli/tests/`. Its deterministic twin already lives in
-  `tests/host_contract.rs`; move it there (beside `direct_read`).
 - [ ] **Two workflows deploy the docs site on every push to `main`.**
   `.github/workflows/docs.yml` ("Deploy docs", node 24, pnpm action v5) and
   `.github/workflows/deploy.yml` ("Deploy to GitHub Pages", node 22, pnpm
@@ -1095,8 +1069,10 @@ gate nor `full` runs it), and `--io-uring` runs
 that take a passthrough copy as well as fresh blocks (plain `cat`, sort, or
 apply-changes on its splice route), since a command writing only fresh
 blocks never reaches `ReadSink`. `uring_writer_refuses_non_regular_targets`
-(tests/roundtrip.rs) skips wherever the ring is refused, since the ring is
-set up before the output is checked. Do not raise the limit from inside a work
+(tests/roundtrip.rs) is no evidence either way: ring creation and the
+fixed-write probe precede its target check (a refusal there skips), but the
+buffer registration this host's limit refuses comes after it, so here it
+asserts the not-a-file refusal without ever registering a buffer. Do not raise the limit from inside a work
 session; it is a host-configuration change. Full entry, with the other work
 the same limit blocks, under "Deferred with explicit triggers" at the top
 of this file.

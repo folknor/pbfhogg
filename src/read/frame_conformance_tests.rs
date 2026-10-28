@@ -57,8 +57,8 @@ enum Source {
 }
 
 /// Every source, less the direct walk where this filesystem refuses
-/// `O_DIRECT` (a platform refusal, the one skip; any other open failure
-/// fails the test).
+/// `O_DIRECT` (the typed direct-io refusal, the one skip, announced; any
+/// other open failure fails the test).
 fn sources(dir: &Path) -> Vec<Source> {
     let all = vec![
         Source::Read,
@@ -70,7 +70,7 @@ fn sources(dir: &Path) -> Vec<Source> {
     #[cfg(feature = "linux-direct-io")]
     let all = {
         let mut all = all;
-        if crate::read::header_walker::tests::direct_reads_supported(dir) {
+        if crate::test_support::direct_reads_supported(dir, "the direct-walk source") {
             all.push(Source::DirectWalk);
         }
         all

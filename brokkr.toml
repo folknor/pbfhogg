@@ -297,12 +297,12 @@ include_ignored = false
 # picks up fast ignored tests that #[ignore] keeps out of tier 1.
 # sort_overlapping_blobs_uring is skipped by name: it is ignored for a
 # known io_uring small-output bug, and on a host that can run io_uring
-# include_ignored would otherwise run it here and fail. Tests slower than brokkr check's fixed
-# 20 s per-test kill are skipped here BY NAME and must be run
-# individually via `brokkr test <name> --timeout <secs>` (add
-# `-p pbfhogg-cli` when the test is a CLI one, as sort_cross_validate_osmium
-# is); without the
-# skip the profile could never pass, by construction.
+# include_ignored would otherwise run it here and fail. Tests slower
+# than brokkr check's fixed 20 s per-test kill are skipped here BY NAME
+# and must be run individually via `brokkr test <name> --timeout <secs>`
+# (add `-p pbfhogg-cli` when the test is a CLI one, as
+# sort_cross_validate_osmium is); without the skip the profile could
+# never pass, by construction.
 #
 # WARNING, and it has bitten once (2026-08-20): these entries are SUBSTRING
 # matches, not exact test names. Every fast synthetic test whose name merely

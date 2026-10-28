@@ -601,10 +601,14 @@ mod tests {
             .map(|i| u8::try_from(i % 253).unwrap())
             .collect();
         std::fs::write(&path, &bytes).unwrap();
-        // A platform refusal skips; any other failure fails.
+        // The typed direct-io refusal skips, announced; any other failure,
+        // a refusal labelled for another feature included, fails.
         let (file, align) = match crate::direct_io::open_for_read(&path) {
             Ok(opened) => opened,
-            Err(e) if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) => return,
+            Err(e) if crate::test_support::is_direct_io_refusal(&e) => {
+                crate::test_support::skip(format!("O_DIRECT not supported: {e}"));
+                return;
+            }
             Err(e) => panic!("{e}"),
         };
         let reader = DirectPositional::new(file, align);

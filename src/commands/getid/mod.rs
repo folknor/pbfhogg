@@ -1788,10 +1788,11 @@ mod tests {
                 .arm_input_replacement(&input, &replacement, OPENS + 1);
             match run(&reference, &host, direct) {
                 Ok((arm, _)) => assert_eq!(arm, Some(ScanArm::FullScan)),
-                Err(e)
-                    if direct
-                        && matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) =>
-                {
+                #[cfg(feature = "linux-direct-io")]
+                Err(e) if direct && crate::test_support::is_direct_io_refusal(&e) => {
+                    crate::test_support::skip(format!(
+                        "the direct transport: O_DIRECT not supported: {e}"
+                    ));
                     continue;
                 }
                 Err(e) => panic!("direct {direct}: unreplaced run: {e}"),

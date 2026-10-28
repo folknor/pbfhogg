@@ -442,9 +442,9 @@ mod tests {
     #[cfg(feature = "linux-direct-io")]
     #[test]
     fn direct_reads_walk_every_input_direct_in_pass_1() {
-        use crate::read::header_walker::tests::{direct_opens, direct_reads_supported};
+        use crate::read::header_walker::tests::direct_opens;
         let dir = crate::path_guard::tests::scratch();
-        if !direct_reads_supported(dir.path()) {
+        if !crate::test_support::direct_reads_supported(dir.path(), "the whole test") {
             return;
         }
         let (a, b) = fixtures(dir.path());

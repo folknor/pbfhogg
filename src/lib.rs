@@ -205,6 +205,9 @@ pub(crate) mod scan;
 pub mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
+// Unit-test skip support; every skip it serves is an O_DIRECT one.
+#[cfg(all(test, feature = "linux-direct-io"))]
+pub(crate) mod test_support;
 // Every performance and behaviour tunable lives here; public ones are
 // re-exported from the paths they were public at.
 pub(crate) mod tunables;

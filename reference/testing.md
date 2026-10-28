@@ -421,7 +421,9 @@ exception, not a tier - should not survive across many PRs.
   (`invoker::pbfhogg_bin`), nothing read at run time.
 - **Skips.** A test that cannot run on this host (no O_DIRECT, no
   io_uring, no osmium in PATH, no unprivileged user namespaces) calls
-  `common::skip(reason)` and returns.
+  `common::skip(reason)` (`test_support::skip` in a unit test under
+  `src/`) and returns, or names the portion it drops when the rest of
+  the test still runs.
 - **Adversarial fixtures.** `tests/common/adversarial.rs` provides
   byte-level mutation primitives: `locate_blobs`,
   `mutate_blob_header_indexdata`, `mutate_blob_payload`,
@@ -476,6 +478,16 @@ predicates require both that code and label. Runtime I/O failures are never
 setup refusals, and raw `EINVAL` is never a sufficient reason to skip.
 Library tests use `common::is_einval` (historical name; it requires the typed
 direct-I/O variant) and `common::is_uring_unavailable`, never their own errno
-or message matching.
+or message matching. The one exception is a test whose subject is the
+classification itself: it matches the typed variant on the exact feature
+label it may skip on, never errno or message text. `is_uring_unavailable`
+accepts `direct-io` as well (the io_uring writer opens its output
+`O_DIRECT`), so `roundtrip::uring_writer_refuses_non_regular_targets`
+skips only on `io-uring`: a `direct-io` label on a non-regular target is
+the misclassification it pins. The library's unit tests under `src/` cannot
+reach `tests/common`; they use `test_support` (`src/test_support.rs`),
+whose `is_direct_io_refusal` requires the `direct-io` label and whose
+`skip` is `tests/common/skip.rs` mounted by `#[path]`, so their skips
+announce `Skipping:` like any other.
 
 The default CLI timeout leaves diagnostics time before check's 20 s watchdog.

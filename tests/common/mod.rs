@@ -82,10 +82,9 @@ pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
     fifo
 }
 
-/// Report a test that cannot run on this host and returns early.
-pub fn skip(reason: impl std::fmt::Display) {
-    eprintln!("Skipping: {reason}");
-}
+mod skip;
+#[allow(unused_imports)]
+pub use skip::skip;
 
 // ---------------------------------------------------------------------------
 // Test element structs - lightweight descriptions of OSM elements for building

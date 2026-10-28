@@ -755,9 +755,10 @@ fn run_external_join(
 /// altw external builds its output writer in stage 4, on a scoped thread of
 /// its own. A backend setup refusal there must reach the caller as the typed
 /// `PlatformUnsupported` (the CLI's exit 3), not flattened at the stage join.
-/// The CLI test of the same contract cannot force the refusal without a host
-/// assumption, so the fault plan injects it at the one place a backend becomes
-/// a writer. Buffered reads, so no genuine input-side refusal can stand in for
+/// The real-refusal test of the same contract
+/// (`external_backend_output_refusal_stays_typed_across_stage_join`, below)
+/// cannot force the refusal without a host assumption, so the fault plan
+/// injects it at the one place a backend becomes a writer. Buffered reads, so no genuine input-side refusal can stand in for
 /// the injected one; its source message proves which refusal arrived.
 #[cfg(feature = "test-hooks")]
 #[test]
@@ -795,6 +796,64 @@ fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
     );
     assert!(!output.exists(), "a refused run published an output");
 }
+
+/// The same stage 4 contract on the real O_DIRECT refusal path.
+///
+/// This drives the library with a direct output and buffered reads
+/// (`direct_reads: false`), a combination the CLI cannot express (its
+/// `--direct-io` sets both, so an input-side refusal would fire first on the
+/// main thread and never reach stage 4). With reads buffered, the only way
+/// the run can fail with a refusal is stage 4's output open. A host whose
+/// filesystem accepts O_DIRECT output completes the run instead, so the test
+/// cannot force the refusal there; it then announces a skip without
+/// exercising the join, and only a failure is held to the contract. The
+/// injected twin above covers the join on every host with `test-hooks`.
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn external_backend_output_refusal_stays_typed_across_stage_join() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = crate::common::generate_nodes(6, 1);
+    let mut ways = crate::common::generate_ways(1, 1_000, 3, 1);
+    ways[0].refs = vec![1, 2, 3];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &ways, &[], 3);
+
+    let result = pbfhogg::altw::add_locations_to_ways(
+        &input,
+        crate::common::out(&output),
+        &pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes: true,
+            write: pbfhogg::write::WriteOptions {
+                backend: pbfhogg::write::OutputBackend::Direct,
+                direct_reads: false,
+                ..pbfhogg::write::WriteOptions::default()
+            },
+            index_type: pbfhogg::altw::IndexType::External,
+            inject_prepass: false,
+            ignore_missing_nodes: false,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
+    );
+    match result {
+        Ok(_) => crate::common::skip("O_DIRECT output accepted on this filesystem"),
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                pbfhogg::ErrorKind::PlatformUnsupported {
+                    feature: "direct-io",
+                    ..
+                }
+            ),
+            "an output-side O_DIRECT refusal must stay typed; got: {}",
+            error.report(),
+        ),
+    }
+}
+
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {
     let dir = crate::common::test_scratch();

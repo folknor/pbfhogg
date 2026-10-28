@@ -938,9 +938,17 @@ fn direct_writer_refuses_non_regular_targets() {
     }
 }
 
-/// `to_path_uring` refuses a non-regular target the same way. Its ring is
-/// probed before the output is opened, so a host without a usable io_uring
-/// skips; a `direct-io` refusal is the misclassification and fails.
+/// `to_path_uring` refuses a non-regular target the same way. Ring creation
+/// and the fixed-write probe run before the output is opened, so a typed
+/// `io-uring` refusal from either skips. The registered-buffer pool is
+/// registered after the open, so a host whose `RLIMIT_MEMLOCK` refuses only
+/// that registration reaches the target check and asserts here.
+///
+/// The skip deliberately does not use `common::is_uring_unavailable`, which
+/// also accepts `direct-io` because the writer opens its output `O_DIRECT`:
+/// for these targets a `direct-io` label is the misclassification this test
+/// pins (an `O_DIRECT` open of a character device or FIFO fails `EINVAL`), so
+/// the broad predicate would turn that regression into a passing skip.
 #[cfg(feature = "linux-io-uring")]
 #[test]
 fn uring_writer_refuses_non_regular_targets() {

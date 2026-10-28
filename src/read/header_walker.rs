@@ -589,19 +589,6 @@ pub(crate) mod tests {
         DIRECT_OPENS.with(std::cell::Cell::get)
     }
 
-    /// Whether files in `dir` open `O_DIRECT`. A platform refusal is the one
-    /// `false` (the caller skips); any other failure fails the test.
-    #[cfg(feature = "linux-direct-io")]
-    pub(crate) fn direct_reads_supported(dir: &std::path::Path) -> bool {
-        let probe = dir.join("direct-probe.bin");
-        std::fs::write(&probe, [0_u8; 16]).expect("write probe");
-        match crate::direct_io::open_for_read(&probe) {
-            Ok(_) => true,
-            Err(e) if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) => false,
-            Err(e) => panic!("{e}"),
-        }
-    }
-
     /// Walk the whole file, returning the frame count or the first error.
     fn count_frames<P: super::Positional>(
         mut walker: super::HeaderWalker<P>,
@@ -656,7 +643,7 @@ pub(crate) mod tests {
         #[cfg_attr(not(feature = "linux-direct-io"), allow(unused_mut))]
         let mut transports = vec![false];
         #[cfg(feature = "linux-direct-io")]
-        if direct_reads_supported(dir.path()) {
+        if crate::test_support::direct_reads_supported(dir.path(), "the direct transport") {
             transports.push(true);
         }
         let path = dir.path().join("extent.pbf");
@@ -686,7 +673,7 @@ pub(crate) mod tests {
     #[test]
     fn a_direct_walk_reads_what_a_buffered_walk_reads() {
         let dir = crate::path_guard::tests::scratch();
-        if !direct_reads_supported(dir.path()) {
+        if !crate::test_support::direct_reads_supported(dir.path(), "the whole test") {
             return;
         }
         let path = dir.path().join("walk.pbf");

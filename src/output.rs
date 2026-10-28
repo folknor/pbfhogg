@@ -138,6 +138,11 @@ pub enum PublishFault {
     AfterLink,
     /// Fail after member `k` (0-based) of a group was installed.
     AfterInstalled(usize),
+    /// Make the syscall that installs member `k` (0-based; a lone output is
+    /// member 0) answer `EXDEV`, as a rename or link across a mount does:
+    /// `renameat2`, the `link(2)` fallback, or the replacing rename after
+    /// any backup was made.
+    CrossMount(usize),
     /// Make every rollback restore step fail.
     Restore,
     /// Fail the directory sync after publication.
@@ -634,81 +639,51 @@ fn reserve(
 // A caller-chosen staging directory
 // ---------------------------------------------------------------------------
 
-/// The device and, where the kernel reports it, the mount a path lives on.
-/// Two directories can share a device and still be different mounts (a bind
-/// mount), across which `rename(2)` fails with `EXDEV`; the mount id tells
-/// them apart. `None` when the kernel cannot say.
-fn mount_of(path: &Path) -> io::Result<(u64, Option<u64>)> {
+/// The device a path lives on, following symlinks as publication's path
+/// walk does.
+fn device_of(path: &Path) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    let dev = fs::metadata(path)?.dev();
-    Ok((dev, mount_id(path)))
+    Ok(fs::metadata(path)?.dev())
 }
 
-/// The kernel's `struct statx` (256 bytes), spelled with only the two fields
-/// read here: `stx_mask` at offset 0 and `stx_mnt_id` at offset 144. Defined
-/// locally rather than taken from `libc`, whose `statx` is not available on
-/// musl in every `libc` release this crate's requirement admits; the layout
-/// is the kernel ABI and does not depend on the C library.
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct StatxMountId {
-    mask: u32,
-    _to_mnt_id: [u8; 140],
-    mnt_id: u64,
-    _rest: [u8; 104],
-}
-
-#[cfg(target_os = "linux")]
-const _: () = assert!(std::mem::size_of::<StatxMountId>() == 256);
-
-/// `STATX_MNT_ID`, from the kernel ABI for the same reason.
-#[cfg(target_os = "linux")]
-const STATX_MNT_ID: u32 = 0x1000;
-
-#[cfg(target_os = "linux")]
-fn mount_id(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stx = StatxMountId {
-        mask: 0,
-        _to_mnt_id: [0; 140],
-        mnt_id: 0,
-        _rest: [0; 104],
-    };
-    // The raw syscall rather than the libc wrapper, as for `renameat2`: musl
-    // builds link against C libraries that may lack `statx`. A kernel without
-    // it answers ENOSYS, and the mount id is then unknown.
-    // SAFETY: the path is a valid NUL-terminated string and `stx` a writable
-    // buffer of the kernel's `struct statx` size and alignment for the call.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            0,
-            STATX_MNT_ID,
-            std::ptr::addr_of_mut!(stx),
-        )
-    };
-    // The field is meaningful only when the kernel says it filled it in.
-    (rc == 0 && stx.mask & STATX_MNT_ID != 0).then_some(stx.mnt_id)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mount_id(_path: &Path) -> Option<u64> {
-    None
-}
-
-/// Whether two [`mount_of`] answers allow a rename between them: the same
-/// device, and the same mount when both mount ids are known. With one
-/// unknown the device decides, and a rename across a bind mount still fails
-/// with `EXDEV` at publication, which rolls back like any failed install.
-fn same_mount(a: (u64, Option<u64>), b: (u64, Option<u64>)) -> bool {
-    a.0 == b.0
-        && match (a.1, b.1) {
-            (Some(x), Some(y)) => x == y,
-            _ => true,
-        }
+/// Whether the kernel refuses a rename from directory `from` into directory
+/// `to` as crossing mounts, asked without renaming anything.
+///
+/// Two directories can share a device and still be different mounts (a
+/// bind mount), across which `rename(2)` fails with `EXDEV`. The kernel
+/// answers that question itself for `rename("from/.", "to/.")`: Linux
+/// resolves both parents, refuses with `EXDEV` when they are on different
+/// mounts, and only after that refuses a last component that is `.` with
+/// `EBUSY`, so the call can never rename anything. That order has held since
+/// before the oldest kernel Rust's standard library supports, so the answer
+/// is the same on a kernel that reports no `statx` mount id (before 5.8) as
+/// on one that does. Only `EXDEV` is a refusal; any other answer (`EBUSY`,
+/// or a sandbox denying the call) means "not refused by this check", never a
+/// promise that publication's rename succeeds: publication stays
+/// authoritative, and a refusal met there is attributed to the staging
+/// directory (see [`Target::install_refused`]). The device comparison stays
+/// alongside, because a filesystem can refuse after the mount check (btrfs
+/// subvolumes share a mount but not a device), which this probe never
+/// reaches.
+///
+/// Other platforms make no such promise about the order of their checks,
+/// and the device decides there alone.
+fn rename_refused_between(from: &Path, to: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // `push` keeps the literal `.`: it must stay the last component the
+        // kernel sees, with a symlinked directory an intermediate one.
+        let mut from = from.to_path_buf();
+        from.push(".");
+        let mut to = to.to_path_buf();
+        to.push(".");
+        matches!(fs::rename(&from, &to), Err(e) if e.raw_os_error() == Some(libc::EXDEV))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (from, to);
+        false
+    }
 }
 
 /// Whether the effective user may create and remove entries in `dir`. With a
@@ -740,13 +715,16 @@ fn writable_dir(dir: &Path) -> io::Result<()> {
 /// beside the destination, and a caller removing its staging directory must
 /// never delete an output or a backup), and not inside a directory output
 /// (replacing it would move the staging along with the old directory). The
-/// destination's directory must also be writable. Creates nothing.
+/// destination's directory must also be writable. Creates nothing. The
+/// same-mount test is the device plus [`rename_refused_between`].
 fn check_staging_dir(dir: &Path, dest: &Path, shape: Shape) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let refuse = |problem| {
         Err(new_output_error(OutputError::StagingDir {
             dir: dir.to_path_buf(),
             destination: dest.to_path_buf(),
             problem,
+            source: None,
         }))
     };
     let meta = match fs::metadata(dir) {
@@ -765,19 +743,15 @@ fn check_staging_dir(dir: &Path, dest: &Path, shape: Shape) -> Result<()> {
         return refuse(StagingProblem::NotADirectory);
     }
     let parent = parent_dir(dest);
-    let parent_mount = mount_of(parent).map_err(|e| {
+    let parent_device = device_of(parent).map_err(|e| {
         Error::from(e).context(format!(
             "cannot inspect the directory of output {}",
             dest.display()
         ))
     })?;
-    let dir_mount = mount_of(dir).map_err(|e| {
-        Error::from(e).context(format!(
-            "cannot inspect staging directory {}",
-            dir.display()
-        ))
-    })?;
-    if !same_mount(parent_mount, dir_mount) {
+    // `meta` is the staging directory's, followed through symlinks like the
+    // parent's.
+    if meta.dev() != parent_device || rename_refused_between(dir, parent) {
         return refuse(StagingProblem::OtherMount);
     }
     let within = |inner: &Path, outer: &Path| {
@@ -1035,6 +1009,17 @@ fn link_unsupported(e: &io::Error) -> bool {
     }
 }
 
+/// A rename or link refused as crossing a filesystem or mount boundary.
+fn is_cross_device(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EXDEV)
+}
+
+/// What an install syscall answers across a mount, for the `CrossMount`
+/// test fault.
+fn cross_mount_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::EXDEV)
+}
+
 // ---------------------------------------------------------------------------
 // One destination
 // ---------------------------------------------------------------------------
@@ -1081,6 +1066,11 @@ struct Target {
     /// directory it is not the destination's directory, and a rename changes
     /// both.
     source_dir: PathBuf,
+    /// The caller-chosen staging directory, as given, when there is one: a
+    /// refused install is attributed to it ([`Self::install_refused`]).
+    /// Not `source_dir`, which for a directory output is the reserved
+    /// container inside it.
+    staging_dir: Option<PathBuf>,
     overwrite: Overwrite,
     validator: Option<Validator>,
     state: State,
@@ -1196,6 +1186,7 @@ impl Target {
             staging,
             write,
             source_dir,
+            staging_dir: staging_dir.map(Path::to_path_buf),
             overwrite,
             validator,
             state: State::Staged,
@@ -1287,22 +1278,60 @@ impl Target {
     /// destination aside first (directories and group members, which may
     /// need restoring); a lone file under `Replace` is replaced in one
     /// atomic rename instead.
+    ///
+    /// `member` is this target's position in its group (0 for a lone
+    /// output), which only a test's fault plan reads.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     fn install(
         &mut self,
+        member: usize,
         use_backup: bool,
         faults: &Faults,
         metrics: &PublishSync<'_>,
     ) -> Result<()> {
         let identity = self.identity();
+        let cross_mount = fault_is!(faults, PublishFault::CrossMount(member));
         match self.overwrite {
-            Overwrite::Refuse => self.install_exclusive(identity, faults),
-            Overwrite::Replace => self.install_replacing(identity, use_backup, faults, metrics),
+            Overwrite::Refuse => self.install_exclusive(identity, cross_mount, faults),
+            Overwrite::Replace => {
+                self.install_replacing(identity, use_backup, cross_mount, faults, metrics)
+            }
         }
     }
 
-    fn install_exclusive(&mut self, identity: Option<Identity>, faults: &Faults) -> Result<()> {
+    /// The error for a failed install syscall that no earlier arm
+    /// classified. With a caller-chosen staging directory, `EXDEV` means
+    /// the rename (or link) out of it into the destination's directory was
+    /// refused as crossing a filesystem or mount boundary, which the
+    /// construction check could not foresee (a filesystem refusing after
+    /// the mount check, a mount table changed while the run worked): that
+    /// is a staging-directory refusal, typed so a front end can say which
+    /// setting caused it. Everything else, and `EXDEV` without a staging
+    /// directory, is a plain publication failure. Only the three forward
+    /// install syscalls come here, never a backup move or a rollback, none
+    /// of which touches the staging directory.
+    fn install_refused(&self, e: io::Error) -> Error {
+        match &self.staging_dir {
+            Some(dir) if is_cross_device(&e) => new_output_error(OutputError::StagingDir {
+                dir: dir.clone(),
+                destination: self.dest.clone(),
+                problem: StagingProblem::OtherMount,
+                source: Some(e),
+            }),
+            _ => Error::from(e).context(format!("cannot publish {}", self.dest.display())),
+        }
+    }
+
+    fn install_exclusive(
+        &mut self,
+        identity: Option<Identity>,
+        cross_mount: bool,
+        faults: &Faults,
+    ) -> Result<()> {
         let attempt = if fault_is!(faults, PublishFault::ForceLinkFallback) {
             Err(io::Error::from(io::ErrorKind::Unsupported))
+        } else if cross_mount {
+            Err(cross_mount_error())
         } else {
             rename_noreplace(&self.write, &self.dest)
         };
@@ -1327,19 +1356,27 @@ impl Target {
                     path: self.dest.clone(),
                     source: e,
                 })),
-                Shape::File => self.install_by_link(identity, faults),
+                Shape::File => self.install_by_link(identity, cross_mount, faults),
             },
-            Err(e) => {
-                Err(Error::from(e).context(format!("cannot publish {}", self.dest.display())))
-            }
+            Err(e) => Err(self.install_refused(e)),
         }
     }
 
     /// `link(2)` fails when the destination exists, so it is exclusive. It
     /// publishes at the moment it succeeds; removing the staging name after
     /// that is cleanup, never a publication failure.
-    fn install_by_link(&mut self, identity: Option<Identity>, faults: &Faults) -> Result<()> {
-        match fs::hard_link(&self.write, &self.dest) {
+    fn install_by_link(
+        &mut self,
+        identity: Option<Identity>,
+        cross_mount: bool,
+        faults: &Faults,
+    ) -> Result<()> {
+        let attempt = if cross_mount {
+            Err(cross_mount_error())
+        } else {
+            fs::hard_link(&self.write, &self.dest)
+        };
+        match attempt {
             Ok(()) => {
                 self.state = State::Installed {
                     backup: None,
@@ -1357,15 +1394,20 @@ impl Target {
                     path: self.dest.clone(),
                 }))
             }
+            // A link out of a staging directory refused as crossing a mount
+            // is that directory's fault, not a filesystem without links:
+            // checked before `link_unsupported`, which lists `EXDEV` for the
+            // beside-the-destination case.
+            Err(e) if self.staging_dir.is_some() && is_cross_device(&e) => {
+                Err(self.install_refused(e))
+            }
             Err(e) if link_unsupported(&e) => {
                 Err(new_output_error(OutputError::ExclusivePublishUnsupported {
                     path: self.dest.clone(),
                     source: e,
                 }))
             }
-            Err(e) => {
-                Err(Error::from(e).context(format!("cannot publish {}", self.dest.display())))
-            }
+            Err(e) => Err(self.install_refused(e)),
         }
     }
 
@@ -1373,6 +1415,7 @@ impl Target {
         &mut self,
         identity: Option<Identity>,
         use_backup: bool,
+        cross_mount: bool,
         faults: &Faults,
         metrics: &PublishSync<'_>,
     ) -> Result<()> {
@@ -1440,11 +1483,16 @@ impl Target {
         } else {
             None
         };
-        if let Err(e) = fs::rename(&self.write, &self.dest) {
+        let renamed = if cross_mount {
+            Err(cross_mount_error())
+        } else {
+            fs::rename(&self.write, &self.dest)
+        };
+        if let Err(e) = renamed {
             if let Some(backup) = backup {
                 self.state = State::BackedUp(backup);
             }
-            return Err(Error::from(e).context(format!("cannot publish {}", self.dest.display())));
+            return Err(self.install_refused(e));
         }
         self.state = State::Installed { backup, identity };
         Ok(())
@@ -1767,7 +1815,7 @@ fn publish_all(
     let group = targets.len() > 1;
     for i in 0..targets.len() {
         let use_backup = group || targets[i].shape == Shape::Dir;
-        let mut result = targets[i].install(use_backup, faults, metrics);
+        let mut result = targets[i].install(i, use_backup, faults, metrics);
         if result.is_ok() && fault_is!(faults, PublishFault::AfterInstalled(i)) {
             result = Err(injected("after a member was installed"));
         }
@@ -3541,48 +3589,41 @@ mod tests {
         assert_eq!(fs::read(&other).unwrap(), b"m");
     }
 
+    /// The rename probe finds nothing to refuse between directories of one
+    /// mount, spelled plainly, relatively or through a symlink, and renames
+    /// nothing. Its bind-mount answer, the case it exists for, is pinned
+    /// end to end by the CLI test that stages across a bind mount.
     #[test]
-    fn mounts_match_on_device_and_on_mount_id_when_both_are_known() {
-        assert!(same_mount((1, Some(7)), (1, Some(7))));
-        assert!(!same_mount((1, Some(7)), (1, Some(8))), "a bind mount");
-        assert!(!same_mount((1, None), (2, None)));
-        assert!(
-            same_mount((1, None), (1, Some(8))),
-            "unknown: the device decides"
-        );
-        // This host's answer for one directory is consistent with itself.
+    fn the_rename_probe_passes_directories_of_one_mount_and_moves_nothing() {
         let dir = scratch();
-        let here = mount_of(dir.path()).unwrap();
-        assert!(same_mount(here, mount_of(dir.path()).unwrap()));
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let link = dir.path().join("link-to-a");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert!(!rename_refused_between(&a, &b));
+        assert!(!rename_refused_between(&b, &a));
+        assert!(!rename_refused_between(&link, &b));
+        assert!(!rename_refused_between(&a, &a));
+        assert!(!rename_refused_between(&a, dir.path()));
+        assert_eq!(others(dir.path(), &[]), ["a", "b", "link-to-a"]);
+        assert!(others(&a, &[]).is_empty() && others(&b, &[]).is_empty());
     }
 
-    /// The local `statx` layout reads the mount id at the offset glibc's
-    /// own struct puts it, wherever both are available.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    /// A directory on another mount is refused by the probe as well as by
+    /// the device; `/proc` is one wherever this test can see it as such.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_local_statx_layout_matches_the_c_library() {
-        use std::os::unix::ffi::OsStrExt;
+    fn the_rename_probe_refuses_a_directory_on_another_mount() {
         let dir = scratch();
-        let Some(ours) = mount_id(dir.path()) else {
-            // The kernel reports no mount id: nothing to compare.
-            return;
-        };
-        let c_path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
-        // SAFETY: an all-zero `statx` is a valid value of a plain C struct.
-        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-        // SAFETY: valid path and a writable `statx`.
-        let rc = unsafe {
-            libc::statx(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                0,
-                libc::STATX_MNT_ID,
-                std::ptr::addr_of_mut!(stx),
-            )
-        };
-        assert_eq!(rc, 0);
-        assert_eq!(std::mem::size_of::<libc::statx>(), 256);
-        assert_eq!(ours, stx.stx_mnt_id);
+        let proc = Path::new("/proc");
+        match (device_of(proc), device_of(dir.path())) {
+            (Ok(p), Ok(d)) if p != d => {}
+            // `/proc` is missing or not a separate mount: nothing to probe.
+            _ => return,
+        }
+        assert!(rename_refused_between(proc, dir.path()));
+        assert!(rename_refused_between(dir.path(), proc));
     }
 
     #[cfg(feature = "test-hooks")]
@@ -3615,6 +3656,183 @@ mod tests {
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &["stage"]).is_empty());
             assert!(others(&stage_dir_path, &[]).is_empty());
+        }
+
+        /// A cross-mount refusal at publication, as the typed staging-directory
+        /// error carrying the kernel's answer.
+        fn assert_cross_mount_refusal(err: &Error, stage_dir_path: &Path, dest: &Path) {
+            let OutputError::StagingDir {
+                dir,
+                destination,
+                problem,
+                source,
+            } = output_error(err)
+            else {
+                panic!("expected a staging-directory refusal, got {err}");
+            };
+            assert_eq!(*problem, StagingProblem::OtherMount);
+            assert_eq!(dir, stage_dir_path);
+            assert_eq!(destination, dest);
+            assert_eq!(
+                source.as_ref().and_then(io::Error::raw_os_error),
+                Some(libc::EXDEV)
+            );
+            let report = err.report();
+            assert!(
+                report.contains(&stage_dir_path.display().to_string()),
+                "{report}"
+            );
+            assert!(!report.contains("--"), "names no front-end flag: {report}");
+        }
+
+        /// A rename out of a staging directory refused as crossing a mount
+        /// at publication, which the construction check missed, is the typed
+        /// staging-directory refusal naming the directory, on the exclusive
+        /// rename and on the link fallback alike (never "the filesystem has
+        /// no hard links"); nothing is published and nothing is left.
+        #[test]
+        fn a_cross_mount_refusal_at_publication_names_the_staging_directory() {
+            for link_fallback in [false, true] {
+                let dir = scratch();
+                let stage_dir_path = dir.path().join("stage");
+                fs::create_dir(&stage_dir_path).unwrap();
+                let dest = dir.path().join("out.osm.pbf");
+                let mut out = Output::with_staging(
+                    &dest,
+                    Overwrite::Refuse,
+                    Some(&stage_dir_path),
+                    &discard(),
+                )
+                .unwrap();
+                stage(&out, b"new").unwrap();
+                if link_fallback {
+                    out.inject_fault(PublishFault::ForceLinkFallback);
+                }
+                out.inject_fault(PublishFault::CrossMount(0));
+                let err = out.publish(run_token()).unwrap_err();
+                assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
+                assert!(!dest.exists());
+                assert!(others(dir.path(), &["stage"]).is_empty());
+                assert!(others(&stage_dir_path, &[]).is_empty());
+            }
+        }
+
+        /// Without a staging directory the same answer keeps its old
+        /// classification: a plain publication failure from the rename, and
+        /// a filesystem without exclusive publication from the link.
+        #[test]
+        fn a_cross_mount_answer_without_a_staging_directory_is_not_attributed_to_one() {
+            let dir = scratch();
+            let dest = dir.path().join("out.osm.pbf");
+            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            stage(&out, b"new").unwrap();
+            out.inject_fault(PublishFault::CrossMount(0));
+            let err = out.publish(run_token()).unwrap_err();
+            assert!(!matches!(err.kind(), crate::ErrorKind::Output(_)), "{err}");
+            assert!(err.report().contains("cannot publish"), "{err}");
+
+            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            stage(&out, b"new").unwrap();
+            out.inject_fault(PublishFault::ForceLinkFallback);
+            out.inject_fault(PublishFault::CrossMount(0));
+            let err = out.publish(run_token()).unwrap_err();
+            assert!(matches!(
+                output_error(&err),
+                OutputError::ExclusivePublishUnsupported { .. }
+            ));
+            assert!(!dest.exists());
+            assert!(others(dir.path(), &[]).is_empty());
+        }
+
+        /// A replaced directory output whose install is refused after the
+        /// previous index was moved to its backup: the previous index is
+        /// restored, the backup removed, and the refusal is the typed one.
+        #[test]
+        fn a_cross_mount_refusal_after_the_backup_restores_the_previous_output() {
+            let dir = scratch();
+            let stage_dir_path = dir.path().join("stage");
+            fs::create_dir(&stage_dir_path).unwrap();
+            let dest = dir.path().join("index");
+            fs::create_dir(&dest).unwrap();
+            fs::write(dest.join("old"), b"old").unwrap();
+            let mut out = OutputDir::with_staging(
+                &dest,
+                Overwrite::Replace,
+                None,
+                Some(&stage_dir_path),
+                &discard(),
+            )
+            .unwrap();
+            stage_dir(&out, "new", b"new");
+            out.inject_fault(PublishFault::CrossMount(0));
+            let err = out.publish(run_token()).unwrap_err();
+            assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
+            assert_eq!(fs::read(dest.join("old")).unwrap(), b"old");
+            assert!(!dest.join("new").exists());
+            assert!(others(dir.path(), &["index", "stage"]).is_empty());
+            assert!(others(&stage_dir_path, &[]).is_empty());
+        }
+
+        /// A group whose later member is refused rolls the earlier member
+        /// back to the previous output; when the rollback cannot restore it,
+        /// the incomplete rollback is reported with the typed refusal as its
+        /// cause and the previous output kept in its backup.
+        #[test]
+        fn a_cross_mount_refusal_in_a_group_rolls_back_or_reports_what_is_kept() {
+            for restore_fails in [false, true] {
+                let dir = scratch();
+                let stage_dir_path = dir.path().join("stage");
+                fs::create_dir(&stage_dir_path).unwrap();
+                let a = dir.path().join("a.pbf");
+                let b = dir.path().join("b.pbf");
+                fs::write(&a, b"old a").unwrap();
+                fs::write(&b, b"old b").unwrap();
+                let mut set = OutputSet::files_with_staging(
+                    [&a, &b],
+                    Overwrite::Replace,
+                    Some(&stage_dir_path),
+                    &discard(),
+                )
+                .unwrap();
+                for member in set.iter() {
+                    stage(member, b"new").unwrap();
+                }
+                set.inject_fault(PublishFault::CrossMount(1));
+                if restore_fails {
+                    set.inject_fault(PublishFault::Restore);
+                }
+                let err = set.publish(run_token()).unwrap_err();
+                if restore_fails {
+                    let OutputError::RollbackIncomplete { unresolved, source } = output_error(&err)
+                    else {
+                        panic!("expected an incomplete rollback, got {err}");
+                    };
+                    assert_cross_mount_refusal(source, &stage_dir_path, &b);
+                    // Neither previous output could be put back: each is
+                    // kept in its own backup, named in the error.
+                    let kept = others(dir.path(), &["a.pbf", "b.pbf", "stage"]);
+                    assert_eq!(kept.len(), 2, "{kept:?}");
+                    let mut previous = Vec::new();
+                    for name in &kept {
+                        assert!(name.starts_with(".pbfhogg-backup-"), "{kept:?}");
+                        assert!(
+                            unresolved.iter().any(|u| u.contains(name)),
+                            "{unresolved:?}"
+                        );
+                        for inner in others(&dir.path().join(name), &[]) {
+                            previous.push(fs::read(dir.path().join(name).join(inner)).unwrap());
+                        }
+                    }
+                    previous.sort();
+                    assert_eq!(previous, [b"old a".to_vec(), b"old b".to_vec()]);
+                } else {
+                    assert_cross_mount_refusal(&err, &stage_dir_path, &b);
+                    assert_eq!(fs::read(&a).unwrap(), b"old a");
+                    assert_eq!(fs::read(&b).unwrap(), b"old b");
+                    assert!(others(dir.path(), &["a.pbf", "b.pbf", "stage"]).is_empty());
+                }
+                assert!(others(&stage_dir_path, &[]).is_empty());
+            }
         }
 
         /// A replaced directory whose backup cannot be removed afterwards:

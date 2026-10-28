@@ -424,9 +424,11 @@ directory) in `DIR` instead of beside the output, under the same
 place, so `DIR` is checked before any work and refused unless:
 
 - it exists and is a directory;
-- it is on the same mount as every output's directory (the same device, and
-  the same mount where the kernel reports mount ids; a bind mount of the same
-  device is a different mount, across which a rename fails);
+- it is on the same mount as every output's directory: the same device, and
+  a mount the kernel does not refuse a rename across. A bind mount of the
+  same device is a different mount, across which a rename fails, and is
+  refused on every Linux kernel, including those that report no `statx`
+  mount id (before 5.8);
 - it is not, and does not contain, any output's directory (a directory below
   an output's directory is fine): a caller removes its staging directory
   whole, and a backup of a replaced output lands beside the output;
@@ -435,7 +437,12 @@ place, so `DIR` is checked before any work and refused unless:
 
 For `extract --config` it is checked against every output the config names
 before any output is reserved. A refusal names the staging directory and the
-output, exit `2`. `--staging-dir` needs an output: with `export` or a text
+output, exit `2`. The mount check detects a refusal rather than promising the
+rename: one it cannot foresee (a filesystem that refuses the rename itself, a
+mount table changed while the run worked) is met at the final rename, and is
+reported as the same staging-directory refusal with the kernel's error
+appended, after the run's outputs were rolled back as for any failed
+publication. `--staging-dir` needs an output: with `export` or a text
 `diff` writing to stdout it is refused as a usage error, exit `2`.
 Publication syncs both directories a rename changes, the staging side as well
 as the output's directory. Library callers get the same placement and checks
@@ -507,7 +514,11 @@ kept rather than removed, and the error names it. Library callers get the same s
 **A caller that kills pbfhogg children should not match these names at all.** The supported way
 to own cleanup is to give each run directories of its own. When both `--staging-dir` and
 `--tmp-dir` are given, pbfhogg creates every staging entry under `--staging-dir` and all run
-scratch under `--tmp-dir`. After every process using those directories has stopped, the caller
+scratch under `--tmp-dir`. They may be one directory: staging entries and run directories have
+distinct names, and a directory named by both is scanned once. `--tmp-dir` exists only on the
+commands that make run scratch (`add-locations-to-ways`, `diff`, `build-geocode-index`); every
+other command makes none, and `--staging-dir` alone holds everything disposable it leaves.
+After every process using those directories has stopped, the caller
 may remove them, provided they are private to the run, dedicated to its disposable state, and
 hold no outputs or other data it means to keep (pbfhogg refuses a `--staging-dir` that is or
 contains an output's directory; `--tmp-dir` is not checked that way). Publication may also leave

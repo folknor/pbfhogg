@@ -194,14 +194,19 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
 `--staging-dir <DIR>`, on every command that writes an output, puts each output's staging entry
 (the staging file, or the geocode index's staging directory) in `DIR` instead of beside the
 output. Publication still renames it into place, so `DIR` is checked before any work: it must
-exist, be a directory on the same mount as every output's directory, not be or contain any
+exist, be a directory on the same mount as every output's directory (a bind mount of the same
+device is another mount, and is refused on every Linux kernel), not be or contain any
 output's directory (a directory below one is fine), and for `build-geocode-index` not lie
 inside `--output-dir`. `extract --config` checks it against every output the config names
-before reserving any. It needs an output: with `export` or a text `diff` writing to stdout it
-is a usage error.
+before reserving any. A rename refused at the very end anyway (a filesystem that refuses it
+itself, a mount table changed during the run) is reported as the same staging-directory
+refusal, after the outputs were rolled back. It needs an output: with `export` or a text
+`diff` writing to stdout it is a usage error.
 
 To own cleanup after runs you may kill, give each run a private `--staging-dir` and `--tmp-dir`
-of its own, and remove both once the run has stopped. Everything disposable a run leaves is
+of its own, and remove both once the run has stopped. They may be one directory. Only
+`add-locations-to-ways`, `diff` and `build-geocode-index` take `--tmp-dir`; the other commands
+make no scratch, so `--staging-dir` alone covers them. Everything disposable a run leaves is
 then inside them. The one thing that can still appear beside an output is a backup of a
 replaced output (`.pbfhogg-backup-*`), which may be the only copy of it and is never yours to
 sweep automatically.

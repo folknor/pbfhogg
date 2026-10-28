@@ -49,13 +49,24 @@ output any other way.
   lock can provide where locks are unreliable (client-local NFS locks), while
   writers reopen the staging path by name. Construction refuses the
   directory (`OutputError::StagingDir`) unless it is a directory on the same
-  mount as every destination's directory (device, and `statx` mount id where
-  reported; a bind mount shares the device), is not and does not contain any
+  mount as every destination's directory, is not and does not contain any
   destination's directory (removing it must never delete an output or a
   backup beside one), and does not lie inside a directory output; a set is
   checked against every member before any is reserved. Because reserving
   there no longer proves the destination's directory is writable, that is
   checked separately (`faccessat` with `W_OK | X_OK` and `AT_EACCESS`).
+  "Same mount" is the same device and a rename the kernel does not refuse as
+  crossing mounts: a bind mount shares the device, and Linux answers
+  `rename("DIR/.", "PARENT/.")` with `EXDEV` across mounts before it refuses
+  the `.` with `EBUSY`, so the question is put to the kernel without renaming
+  anything, on every kernel, including those that report no `statx` mount
+  id (before 5.8), whose device-only comparison let a bind mount through to
+  fail at the final rename. The check detects a refusal, it does not promise
+  the rename: a refusal it cannot foresee (a filesystem refusing after the
+  mount check, a mount table changed during the run) is met at publication,
+  where an `EXDEV` out of a caller-chosen staging directory is reported as
+  the same `StagingDir` refusal carrying the kernel's error, and ends the
+  publication like any failed install.
 - **Library entry points take the output by value and are its only
   publisher.** `sort(input, output: Output, ...)` writes through a borrowing
   engine (`sort_to(input, &output, ...)`) and calls `output.publish(&host.invocation)` as its

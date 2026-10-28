@@ -254,6 +254,8 @@ enum Prop {
     Interrupted,
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     StagingDir,
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    SharedDir,
 }
 
 struct Row {
@@ -1841,14 +1843,43 @@ fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
 /// reports the staging entry it finds there.
 #[cfg(feature = "test-hooks")]
 fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Result<(), String> {
+    killed_run_in(fx, row, false)
+}
+
+/// The same guarantee for the layout a caller is advised to use, one private
+/// directory passed as both `--staging-dir` and `--tmp-dir`, on every row
+/// that takes both: the killed run's staging entries and its run directory
+/// end up side by side in it and nowhere else, the next run reports both
+/// and changes neither, removing the directory whole loses no output, and a
+/// replacing run through a fresh one leaves it empty. Rows without
+/// `--tmp-dir` make no run scratch, so `--staging-dir` alone is their whole
+/// layout and the property above covers them.
+#[cfg(feature = "test-hooks")]
+fn killed_run_sharing_one_directory_leaves_everything_there(
+    fx: &Fx,
+    row: &Row,
+) -> Result<(), String> {
+    killed_run_in(fx, row, true)
+}
+
+/// A run killed outright with `--staging-dir` (and `--tmp-dir` where the
+/// row takes it; with `shared`, the same directory for both).
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::too_many_lines)]
+fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     use std::time::{Duration, Instant};
     let count = interrupted::checkpoint_count(fx, row)?;
-    let (out_dir, staging, tmp, control) = (
+    let (out_dir, staging, separate_tmp, control) = (
         crate::common::test_scratch(),
         crate::common::test_scratch(),
         crate::common::test_scratch(),
         crate::common::test_scratch(),
     );
+    let tmp = if shared {
+        staging.path()
+    } else {
+        separate_tmp.path()
+    };
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -1858,7 +1889,7 @@ fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Resul
     );
     let mut extra: Vec<OsString> = vec!["--staging-dir".into(), staging.path().into()];
     extra.extend(interrupted::visible_scratch_args(row));
-    extra.extend(tmp_args(row.tmp_dir.then_some(tmp.path())));
+    extra.extend(tmp_args(row.tmp_dir.then_some(tmp)));
     let ready = control.path().join("ready");
     let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
     pause.push(ready.as_os_str());
@@ -1885,33 +1916,101 @@ fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Resul
         beside.is_empty(),
         "a killed run left {beside:?} beside its outputs"
     );
-    let staged = names(staging.path());
+    let left = names(staging.path());
+    let staged: Vec<&String> = left
+        .iter()
+        .filter(|n| n.starts_with(".pbfhogg-tmp-"))
+        .collect();
+    let run_dirs: Vec<&String> = left
+        .iter()
+        .filter(|n| n.starts_with(".pbfhogg-run-"))
+        .collect();
     ensure!(
-        !staged.is_empty() && staged.iter().all(|n| n.starts_with(".pbfhogg-tmp-")),
-        "--staging-dir holds {staged:?}, wanted the killed run's staging entries"
+        !staged.is_empty() && staged.len() + if shared { run_dirs.len() } else { 0 } == left.len(),
+        "--staging-dir holds {left:?}, wanted the killed run's staging entries{}",
+        if shared { " and its run directory" } else { "" }
     );
-    let scratch = names(tmp.path());
-    ensure!(
-        scratch.iter().all(|n| n.starts_with(".pbfhogg-run-")),
-        "--tmp-dir holds {scratch:?}"
-    );
+    if shared {
+        // A run that takes --tmp-dir makes its run directory at startup.
+        ensure!(
+            run_dirs.len() == 1,
+            "the shared directory holds {left:?}, wanted one run directory beside the staging"
+        );
+    } else {
+        let scratch = names(tmp);
+        ensure!(
+            scratch.iter().all(|n| n.starts_with(".pbfhogg-run-")),
+            "--tmp-dir holds {scratch:?}"
+        );
+    }
 
     let next = CliInvoker::new().args(&inv.args).args(&extra).run();
     let stderr = next.stderr_str();
     ensure!(exited_ok(row, &next), "the next run failed: {stderr}");
-    ensure!(
-        stderr.contains(&staging.path().join(&staged[0]).display().to_string()),
-        "the next run did not report the staging entry in --staging-dir; stderr:\n{stderr}"
-    );
+    for entry in staged.iter().take(1).chain(&run_dirs) {
+        // Reported, and once: a directory named by both flags is scanned
+        // once.
+        let reported = stderr
+            .matches(&staging.path().join(entry).display().to_string())
+            .count();
+        ensure!(
+            reported == 1,
+            "the next run reported {entry} in --staging-dir {reported} times, wanted once; \
+             stderr:\n{stderr}"
+        );
+    }
     ensure!(
         hidden_anywhere(out_dir.path()).is_empty(),
         "the next run left {:?} beside its outputs",
         hidden_anywhere(out_dir.path())
     );
     ensure!(
-        names(staging.path()) == staged,
-        "the next run changed --staging-dir: {:?}, before {staged:?}",
+        names(staging.path()) == left,
+        "the next run changed --staging-dir: {:?}, before {left:?}",
         names(staging.path())
+    );
+    if !shared {
+        return Ok(());
+    }
+
+    // The caller's cleanup: the directory goes whole, the outputs stay.
+    std::fs::remove_dir_all(staging.path()).unwrap();
+    for output in &inv.outputs {
+        ensure!(
+            replaced(output, row.kind),
+            "removing the shared directory took {} with it",
+            output.display()
+        );
+    }
+    ensure!(
+        names(out_dir.path()) == output_names(&inv),
+        "after removing the shared directory the output directory holds {:?}, wanted {:?}",
+        names(out_dir.path()),
+        output_names(&inv)
+    );
+    // A fresh private directory for the next run, which replaces the
+    // outputs and leaves the directory empty.
+    std::fs::create_dir(staging.path()).unwrap();
+    let again = CliInvoker::new()
+        .args(&inv.args)
+        .args(&extra)
+        .arg("--overwrite")
+        .run();
+    ensure!(
+        exited_ok(row, &again),
+        "a replacing run through a fresh shared directory failed: {}",
+        again.stderr_str()
+    );
+    ensure!(
+        names(staging.path()).is_empty(),
+        "a successful run left {:?} in the shared directory",
+        names(staging.path())
+    );
+    ensure!(
+        names(out_dir.path()) == output_names(&inv),
+        "a successful run through the shared directory left {:?}, wanted {:?}",
+        names(out_dir.path()),
+        output_names(&inv)
     );
     Ok(())
 }
@@ -1923,6 +2022,16 @@ fn a_killed_run_leaves_disposable_entries_only_in_the_directories_it_was_given()
         Prop::StagingDir,
         killed_run_leaves_only_what_its_directories_hold,
         |_| true,
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
+    run_property(
+        Prop::SharedDir,
+        killed_run_sharing_one_directory_leaves_everything_there,
+        |row| row.tmp_dir,
     );
 }
 
@@ -1959,6 +2068,91 @@ fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
         "{}",
         usage.stderr_str()
     );
+}
+
+/// A `--staging-dir` that is a bind mount of the output's own device is a
+/// different mount, across which publication's rename fails. It is refused
+/// before any work on every kernel, including one that reports no `statx`
+/// mount id, where comparing devices alone used to let it through to fail
+/// at the final rename. The bind mount lives in a private user and mount
+/// namespace of the child; a host without user namespaces skips. The same
+/// setup staging in the bound directory's source publishes, so the refusal
+/// is the bind mount's and not the namespace's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_work() {
+    use crate::invoker::{NAMESPACE_BROKEN, NAMESPACE_DENIED};
+    use std::os::unix::fs::MetadataExt;
+    let root = crate::common::test_scratch();
+    let out_dir = root.path().join("out");
+    let source = root.path().join("source");
+    let bound = root.path().join("bound");
+    for dir in [&out_dir, &source, &bound] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    // One device: only the mount differs, so the device check alone passes.
+    let dev = |path: &Path| std::fs::metadata(path).unwrap().dev();
+    assert_eq!(dev(&source), dev(&out_dir));
+    let input = root.path().join("in.osm.pbf");
+    crate::common::write_base_pbf(&input);
+    let missing = root.path().join(format!("{MISSING_MARK}.osm.pbf"));
+    let output = out_dir.join("out.osm.pbf");
+    let sort = |input: &Path, staging: &Path| {
+        CliInvoker::new()
+            .arg("sort")
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--staging-dir")
+            .arg(staging)
+            .bind_mounted(&source, &bound)
+            .run()
+    };
+
+    let refused = sort(&missing, &bound);
+    let stderr = refused.stderr_str();
+    match refused.status.code() {
+        Some(code) if (NAMESPACE_DENIED + 1..=NAMESPACE_DENIED + 6).contains(&code) => {
+            crate::common::skip(format!(
+                "the host refuses an unprivileged user and mount namespace (step {})",
+                code - NAMESPACE_DENIED
+            ));
+            return;
+        }
+        Some(code) if (NAMESPACE_BROKEN + 1..=NAMESPACE_BROKEN + 6).contains(&code) => {
+            panic!("namespace setup failed at step {}", code - NAMESPACE_BROKEN);
+        }
+        code => assert_eq!(code, Some(2), "{stderr}"),
+    }
+    assert!(
+        stderr.contains("crossing a filesystem or mount boundary"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&bound.display().to_string()), "{stderr}");
+    assert!(stderr.contains("--staging-dir"), "{stderr}");
+    assert!(
+        !stderr.contains(MISSING_MARK),
+        "the input was opened first: {stderr}"
+    );
+    assert!(!output.exists());
+    assert!(names(&out_dir).is_empty(), "{:?}", names(&out_dir));
+    assert!(names(&source).is_empty(), "{:?}", names(&source));
+
+    let published = sort(&input, &source);
+    assert!(published.status.success(), "{}", published.stderr_str());
+    let plain = root.path().join("plain.osm.pbf");
+    CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&plain)
+        .assert_success();
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        std::fs::read(&plain).unwrap()
+    );
+    assert_eq!(names(&out_dir), ["out.osm.pbf"]);
+    assert!(names(&source).is_empty(), "{:?}", names(&source));
 }
 
 /// Every row, a pause at every ordinal of its counting run rather than a

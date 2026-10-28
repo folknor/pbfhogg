@@ -479,6 +479,10 @@ impl Error {
                 | OutputError::Unsynced { source, .. },
             ) => Some(source),
             ErrorKind::Output(OutputError::RollbackIncomplete { source, .. }) => Some(source),
+            ErrorKind::Output(OutputError::StagingDir {
+                source: Some(source),
+                ..
+            }) => Some(source),
             ErrorKind::Output(_)
             | ErrorKind::StringtableIndexOutOfBounds { .. }
             | ErrorKind::Blob(_)
@@ -890,12 +894,21 @@ pub enum OutputError {
     /// what was synced is not what would be installed. Nothing was installed.
     StagingReplaced { path: PathBuf },
     /// The caller-chosen staging directory `dir` cannot hold the staging
-    /// entry of `destination`, for the reason `problem` gives. Nothing was
-    /// reserved.
+    /// entry of `destination`, for the reason `problem` gives.
+    ///
+    /// Usually refused at construction, before the output's staging entry
+    /// is reserved (a set checks every member before reserving any), and
+    /// then `source` is `None`. A rename refused at publication as crossing
+    /// a filesystem or mount boundary, which the construction check could
+    /// not foresee, is reported as [`StagingProblem::OtherMount`] too, with
+    /// the refusal in `source`; it ends the publication like any failed
+    /// install, and a rollback that cannot complete is reported as
+    /// [`OutputError::RollbackIncomplete`] with this error as its source.
     StagingDir {
         dir: PathBuf,
         destination: PathBuf,
         problem: StagingProblem,
+        source: Option<io::Error>,
     },
 }
 
@@ -907,8 +920,10 @@ pub enum StagingProblem {
     Missing,
     /// It exists and is not a directory.
     NotADirectory,
-    /// It is on another mount than the destination's directory, so the
-    /// staging entry could not be renamed into place.
+    /// A rename from it into the destination's directory is refused as
+    /// crossing a filesystem or mount boundary (another device, another
+    /// mount of the same device such as a bind mount, or a filesystem that
+    /// refuses the rename as such), and publication is that rename.
     OtherMount,
     /// The destination's directory is the staging directory or lies inside
     /// it. A caller removes its staging directory whole, which would delete
@@ -1006,6 +1021,7 @@ impl fmt::Display for OutputError {
                 dir,
                 destination,
                 problem,
+                ..
             } => write_staging_dir(f, dir, destination, *problem),
         }
     }
@@ -1023,9 +1039,10 @@ fn write_staging_dir(
         StagingProblem::NotADirectory => write!(f, "staging directory {dir} is not a directory"),
         StagingProblem::OtherMount => write!(
             f,
-            "staging directory {dir} is on another filesystem or mount than output \
-             {destination}; publication renames the staging entry into place, which needs the \
-             same mount"
+            "staging directory {dir} cannot stage output {destination}: a rename from it into \
+             the output's directory is refused as crossing a filesystem or mount boundary (a \
+             bind mount of the same device counts as another mount), and publication renames \
+             the staging entry into place"
         ),
         StagingProblem::HoldsDestination => write!(
             f,

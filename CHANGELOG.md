@@ -1105,18 +1105,23 @@
 - **`--staging-dir <DIR>` on every command that writes an output.** Each
   output's hidden staging entry is reserved in `DIR` instead of beside the
   output, so a harness that kills pbfhogg runs can give each run a private
-  `--staging-dir` and `--tmp-dir` and remove both afterwards, with no name
-  matching; stale staging never reaches the next run's output directory.
-  `DIR` is refused before any work unless it is a directory on the same
-  mount as every output's directory and is not, and does not contain, any
-  output's directory (nor, for `build-geocode-index`, lies inside
-  `--output-dir`); `extract --config` checks it against every output first.
+  `--staging-dir` and `--tmp-dir` (which may be one directory) and remove
+  both afterwards, with no name matching; stale staging never reaches the
+  next run's output directory. `DIR` is refused before any work unless it is
+  a directory on the same mount as every output's directory and is not, and
+  does not contain, any output's directory (nor, for `build-geocode-index`,
+  lies inside `--output-dir`); `extract --config` checks it against every
+  output first. A bind mount of the output's device counts as another mount
+  and is refused on every Linux kernel, including those before 5.8 that
+  report no `statx` mount id. A rename refused at the end anyway is reported
+  as the same staging-directory refusal, not as a bare publication failure.
   Backups of replaced outputs always stay beside the output. With `--staging-dir`
   the output's own directory is still checked for writability up front.
   Library: `Output::with_staging`, `OutputDir::with_staging`,
   `OutputSet::files_with_staging`,
   `geocode_index::builder::index_output_with_staging`, refusing with the new
-  `OutputError::StagingDir` and `StagingProblem`. Publication also now syncs
+  `OutputError::StagingDir` (whose `source` carries the kernel's error when
+  the refusal came at publication) and `StagingProblem`. Publication also now syncs
   every directory a rename changed, including a directory output's staging
   container.
 

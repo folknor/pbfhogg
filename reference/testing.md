@@ -168,7 +168,8 @@ for unit tests under `src/`, `Host::for_tests()` hand the library a
 `host::Fixed` (a fixed core count and memory budget), so library
 tests see the same machine everywhere; a test that needs a
 different machine sets its own `host::Fixed`. Tests may still skip where
-the host lacks a feature (O_DIRECT, io_uring, osmium in PATH).
+the host lacks a feature (O_DIRECT, io_uring, osmium in PATH,
+unprivileged user namespaces).
 
 **Small configurations come through existing seams, not tunable
 overrides.** The constants in `src/tunables.rs` get no runtime or
@@ -353,11 +354,17 @@ exception, not a tier - should not survive across many PRs.
   set below `brokkr check`'s 20 s watchdog, override via
   `.timeout(Duration)`. Platform-skip
   predicates `is_o_direct_unsupported`, `is_uring_unsupported` require
-  exit code 3 and a typed setup error.
+  exit code 3 and a typed setup error. `.bind_mounted(source, target)`
+  runs the child in a private user and mount namespace with `target` a
+  bind mount of `source`, set up between fork and exec so the test
+  process itself is untouched; a host that refuses the namespace ends
+  the child with `NAMESPACE_DENIED` plus the step (skip), any other setup
+  failure with `NAMESPACE_BROKEN` plus the step (fail).
   Binary located by cargo: `env!("CARGO_BIN_EXE_pbfhogg")`
   (`invoker::pbfhogg_bin`), nothing read at run time.
 - **Skips.** A test that cannot run on this host (no O_DIRECT, no
-  io_uring, no osmium in PATH) calls `common::skip(reason)` and returns.
+  io_uring, no osmium in PATH, no unprivileged user namespaces) calls
+  `common::skip(reason)` and returns.
 - **Adversarial fixtures.** `tests/common/adversarial.rs` provides
   byte-level mutation primitives: `locate_blobs`,
   `mutate_blob_header_indexdata`, `mutate_blob_payload`,

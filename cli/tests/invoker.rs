@@ -86,6 +86,15 @@ fn capture(mut reader: impl Read) -> Vec<u8> {
     first
 }
 
+/// The exit status base of a [`CliInvoker::bind_mounted`] child whose
+/// namespace setup the host refused; the failed step is added.
+#[cfg(target_os = "linux")]
+pub const NAMESPACE_DENIED: i32 = 100;
+/// The exit status base of a [`CliInvoker::bind_mounted`] child whose
+/// namespace setup failed for any other reason; the failed step is added.
+#[cfg(target_os = "linux")]
+pub const NAMESPACE_BROKEN: i32 = 110;
+
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
 pub struct CliInvoker {
@@ -165,6 +174,113 @@ impl CliInvoker {
                 limit.rlim_cur = bytes.min(limit.rlim_max);
                 if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
+    /// Run the child in a private user and mount namespace in which
+    /// `target` is a bind mount of `source`: the same device, another
+    /// mount. Nothing is mounted outside the child. Setup that fails ends
+    /// the child before `exec` with [`NAMESPACE_DENIED`] plus the step when
+    /// the host refuses it (user namespaces disabled or restricted, which a
+    /// test skips on), or [`NAMESPACE_BROKEN`] plus the step for any other
+    /// error (a setup bug, which a test fails on). Steps: 1 unshare, 2
+    /// setgroups, 3 uid_map, 4 gid_map, 5 private propagation, 6 bind mount.
+    #[cfg(target_os = "linux")]
+    pub fn bind_mounted(mut self, source: &std::path::Path, target: &std::path::Path) -> Self {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        // Everything the child needs is built here, before the fork: between
+        // fork and exec only raw syscalls on these buffers are safe.
+        // SAFETY: getuid and getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let uid_map = format!("{uid} {uid} 1");
+        let gid_map = format!("{gid} {gid} 1");
+        let c = |s: &[u8]| CString::new(s).expect("no NUL in a test path");
+        let setgroups_path = c(b"/proc/self/setgroups");
+        let uid_map_path = c(b"/proc/self/uid_map");
+        let gid_map_path = c(b"/proc/self/gid_map");
+        let root = c(b"/");
+        let source = c(source.as_os_str().as_bytes());
+        let target = c(target.as_os_str().as_bytes());
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions (`unshare`, `open`, `write`, `close`,
+        // `mount`, `_exit`) on buffers prepared above; it allocates nothing.
+        unsafe {
+            self.cmd.pre_exec(move || {
+                /// End the child, saying which step failed and whether the
+                /// host refused it.
+                unsafe fn fail(step: i32) -> ! {
+                    // SAFETY: reading this thread's errno is always valid.
+                    let errno = unsafe { *libc::__errno_location() };
+                    let denied = if step == 1 {
+                        // No user namespaces: disabled, unsupported, or the
+                        // per-user limit reached.
+                        matches!(
+                            errno,
+                            libc::EPERM
+                                | libc::EACCES
+                                | libc::EINVAL
+                                | libc::ENOSYS
+                                | libc::EUSERS
+                                | libc::ENOSPC
+                        )
+                    } else {
+                        // A restricted namespace (an LSM policy) refusing
+                        // the maps or the mounts.
+                        matches!(errno, libc::EPERM | libc::EACCES)
+                    };
+                    let base = if denied {
+                        NAMESPACE_DENIED
+                    } else {
+                        NAMESPACE_BROKEN
+                    };
+                    // SAFETY: `_exit` is async-signal-safe and never returns.
+                    unsafe { libc::_exit(base + step) }
+                }
+                unsafe fn write_file(path: &CString, text: &[u8], step: i32) {
+                    // SAFETY: a valid NUL-terminated path and a live buffer.
+                    unsafe {
+                        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                        if fd < 0 {
+                            fail(step);
+                        }
+                        let n = libc::write(fd, text.as_ptr().cast(), text.len());
+                        if usize::try_from(n).ok() != Some(text.len()) {
+                            fail(step);
+                        }
+                        libc::close(fd);
+                    }
+                }
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                    fail(1);
+                }
+                write_file(&setgroups_path, b"deny", 2);
+                write_file(&uid_map_path, uid_map.as_bytes(), 3);
+                write_file(&gid_map_path, gid_map.as_bytes(), 4);
+                if libc::mount(
+                    std::ptr::null(),
+                    root.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    fail(5);
+                }
+                if libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    fail(6);
                 }
                 Ok(())
             });

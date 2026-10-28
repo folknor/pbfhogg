@@ -666,7 +666,7 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **3-stage pipeline** - `src/read/pipeline.rs`
 1. **I/O thread**: reads raw compressed blobs (~32KB each) sequentially, sends via channel (READ_AHEAD=16 slots)
-2. **Rayon decode pool**: parallel decompress + parse. Thread count = `available_parallelism() - 2`
+2. **Rayon decode pool**: parallel decompress + parse. A dedicated per-read rayon pool, not the host's `Executor`. Thread count = `host::sized_workers` over the reader's resources, reserving threads for the I/O reader and the consumer (`ElementReader::decode_threads` overrides)
    - `decompress_blob()` - thread-local `flate2::Decompress` with `reset(true)`, reused per thread
    - `DecompressPool` - returns `Vec<u8>` to pool on drop instead of freeing
    - `PooledBuffer` wrapper - custom Drop via `Bytes::from_owner`

@@ -121,7 +121,7 @@ println!("Nodes: {node_count}");
 
 ### par_map_reduce - parallel aggregation
 
-Distributes blobs across rayon workers in unspecified order. Best for aggregation where order does not matter. Takes three closures: map, identity, and reduce.
+Distributes blobs across dedicated worker threads (not the host's `Executor`) in unspecified order. Best for aggregation where order does not matter. Takes three closures: map, identity, and reduce.
 
 ```rust
 use pbfhogg::{ElementReader, Element};
@@ -185,7 +185,7 @@ The pipelined methods accept optional tuning via builder methods:
 use pbfhogg::ElementReader;
 
 let reader = ElementReader::from_path("tests/test.osm.pbf")?
-    .decode_threads(4)    // override decode pool size (default: available_parallelism - 2)
+    .decode_threads(4)    // override decode pool size (default: sized from the host's resources)
     .read_ahead(32)       // raw blobs buffered between I/O and decode (default: 16)
     .decode_ahead(64);    // decoded blocks buffered before consumer (default: 32)
 # drop(reader);

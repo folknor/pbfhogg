@@ -1327,16 +1327,19 @@ paths = ["src/commands/**/*.rs", "src/geocode_index/builder/**/*.rs", "src/scan/
 region = "code"
 message = "Command readers must inherit the caller's host"
 
-# The library's parallel work runs on the caller's `host::Executor`, never on
-# whatever pool happens to be ambient. Par-iterators cannot be matched by text;
-# each one is wrapped in `executor.install` and checked in review.
+# The library's shared rayon tasks run on the caller's `host::Executor`, never
+# on whatever pool happens to be ambient. Par-iterators cannot be matched by
+# text; each one is wrapped in `executor.install` and checked in review.
+# Dedicated per-call worker sets (a ThreadPoolBuilder pool, std thread scopes)
+# are a separate category this rule does not see; the `Executor` rustdoc
+# lists what runs where.
 [[textlint]]
 name = "no-ambient-rayon"
 pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global'
 paths = ["src/**/*.rs"]
 exclude = ["src/host.rs"]
 region = "code"
-message = "Library parallel work must go through the caller's host::Executor"
+message = "Library rayon tasks must go through the caller's host::Executor, not an ambient pool"
 
 [[textlint]]
 name = "no-eprint-macro"

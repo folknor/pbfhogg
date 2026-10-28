@@ -346,7 +346,7 @@ impl WillneedPrefetch {
 
 /// Resolve a caller-supplied `threads: Option<usize>` override into a
 /// concrete decode-thread count. `None` (the default for every existing
-/// caller) picks `available_parallelism() - 2` clamped to ≥ 1, the
+/// caller) picks `host::sized_workers` over the host resources, the
 /// convention established by the pipelined reader and matching the
 /// comment in `src/read/pipeline.rs::run_pipeline`. `Some(0)` is
 /// treated identically to `None` so CLI flags that map "0 = auto"

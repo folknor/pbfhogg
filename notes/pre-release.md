@@ -56,15 +56,6 @@ pbfhogg workspace member, pbfhogg owns the scenario format and exposes a
 describe mode, digest is the equality check. pbfhogg-side work that has to
 land before or with the harness:
 
-- **`Executor` overpromises.** `docs/guide/advanced.md` and the
-  `no-ambient-rayon` textlint message say the library's parallel work runs on
-  the caller's `host::Executor`. It does not: the pipelined reader builds a
-  private rayon decode pool per read (`src/read/pipeline.rs`), and
-  `ordered_pool.rs` and `scan/classify.rs` run `std::thread::scope` workers.
-  Only writer framing and a few commands go through `Executor`. Decide what
-  `Executor` means (rayon work only, or every CPU worker) and make the code
-  and docs agree; until then a "caller-built executor" scenario proves
-  nothing.
 - **Tagged `MarkerFifo` handle.** A harness running several calls into one
   FIFO needs per-call sinks sharing one fd and one process-start clock,
   writing brokkr's call tag inside the 512-byte `tunables::PIPE_BUF` line

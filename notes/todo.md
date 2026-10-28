@@ -21,6 +21,35 @@ Picked 2026-07-30, right after the 0.5.0 release.
   example the `FileReader::open` / `FileWriter::buffered` removals and the
   `Host::scratch_parent` removal need that check).
 
+- [ ] **`Executor` residue** (decided 2026-10-28): `host::Executor` was
+  narrowed to the library's shared rayon tasks (writer framing, command
+  par-iterators); dedicated pipelines keep their own per-call workers.
+  Left over from that decision, each optional and unmeasured:
+  - merge-changes `Parallelism::Fixed(n)` builds its own pool and so
+    bypasses a caller `Executor::Pool`. The cleaner shape keeps the
+    executor always and makes `n` a job-lane limit: the streaming window
+    (`rayon::current_num_threads()`), the simplify `par_iter` over inputs
+    and the `par_chunks` sort would each honour `n` without spawning jobs
+    that block pool workers on a permit. Measured-path change.
+  - The pipelined reader's private decode pool drops without joining its
+    workers, so they can outlive the read. If a "no library thread left
+    after the call" promise is ever wanted, build it with rayon's
+    `build_scoped` and measure the per-read cost.
+  - Shape B, considered and not taken: put every CPU worker on a caller
+    scheduler, with blocking coordination (pread, bounded channels, reorder
+    back-pressure) kept off it and only runnable CPU tasks scheduled. It
+    would give callers aggregate CPU control across invocations, which the
+    narrowed `Executor` does not. The old ALTW stage 4 consolidation
+    datum (+30 s planet, reverted) concerns a different shape and does
+    not settle it.
+  - `no-ambient-rayon` cannot see `ThreadPoolBuilder`, pool-method scopes
+    or `std::thread`; a new dedicated worker set passes lint unreviewed.
+    A rule listing the sanctioned dedicated-pool sites would close that.
+  - `notes/altw-external.md` points to a "history doc" for the A2
+    milestone 1 write-up (the +30 s datum); no such text was found in
+    `reference/performance-history.md` or
+    `notes/altw-optimization-history.md`.
+
 - [ ] **Multi-region extract has no descriptor admission** (found
   2026-10-28, from the cat admission decision): only `cat`, `cat --dedupe`
   and altw external stage 1 ask `ProcessActions::fd_allowance`. A

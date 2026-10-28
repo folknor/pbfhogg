@@ -11,7 +11,9 @@ pub struct Host {
     /// Whether the library's own file readers drop the input's pages from the
     /// page cache behind the read head.
     pub page_cache: PageCachePolicy,
-    /// Where the library's own data-parallel work and writer framing run.
+    /// Where the library's shared rayon tasks run: writer framing and command
+    /// parallel-iterator work. Dedicated pipeline workers do not run here; see
+    /// [`Executor`].
     pub executor: Executor,
     /// The invocation this host runs: its cancellation request, and its
     /// instrumentation. Every command run under this host stops at its next
@@ -381,7 +383,22 @@ pub enum PageCachePolicy {
     /// Leave the page cache alone.
     Keep,
 }
-/// The rayon pool the library's parallel work runs on.
+/// The execution context for the library's shared rayon tasks: `PbfWriter`
+/// framing and the parallel-iterator work in commands (repack, degrade,
+/// simple extract, the geocode index builder, merge-changes).
+///
+/// It does not confine all library computation and imposes no aggregate
+/// concurrency limit. Dedicated pipelines (the pipelined reader's decode
+/// pool, the ordered and classify worker pools, per-stage threads) create
+/// separate worker sets that belong to the call, or to the returned session
+/// such as a block iterator or a writer, rather than scheduling those workers
+/// through this executor; their threads may exit after the call returns. Their
+/// worker counts come from explicit options, resource inputs or fixed
+/// tunables. Pipeline coordinators and consumers may run on the invoking
+/// thread, and may dispatch shared rayon tasks through this executor.
+/// Merge-changes with `Parallelism::Fixed(n)` runs on a dedicated rayon pool
+/// of `n` threads instead of this executor; with `Parallelism::Auto` it uses
+/// this executor.
 ///
 /// `Ambient` uses whatever pool the calling thread is in, or rayon's global
 /// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
@@ -634,7 +651,9 @@ pub(crate) fn sized_workers(
 /// host cannot say how many cores it has), and that sizing lives with the
 /// command. `Fixed(1)` runs a command's sequential path where it has one;
 /// `Fixed(n)` caps its worker pools at `n` threads. For `diff`, `n` is also
-/// the number of ID-range shards.
+/// the number of ID-range shards. For `merge_changes`, `Fixed(n)` runs the
+/// command on a dedicated rayon pool of `n` threads instead of
+/// [`Host::executor`]; `Auto` uses the executor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Parallelism {
     /// The command sizes its own pools from the host.

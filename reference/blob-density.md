@@ -185,8 +185,9 @@ threshold-based dispatch here is new ground.
 
 - **File-size thresholds**: several commands branch on `file_size`.
   Blob count is the right signal for header-walk-bound work.
-- **`parallel_classify_phase` thread count**: fixed at
-  `available_parallelism() - 2`. Per-blob coordination cost
+- **`parallel_classify_phase` thread count**: sized by
+  `host::sized_workers` from the host's parallelism, independent of
+  blob density. Per-blob coordination cost
   vs per-blob payload work balances differently across the two
   encodings.
 - **`BATCH_SIZE` (extract unsorted pass 2)**: since the fused command

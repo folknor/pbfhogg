@@ -659,7 +659,12 @@
 - **The `PbfWriter::to_path*` constructors take an `Executor`**
   (`host::Executor::Ambient` for rayon's ambient pool, or
   `Executor::Pool(Arc<rayon::ThreadPool>)` to confine framing to a pool of
-  your own). Commands run their parallel work on the new `Host::executor`.
+  your own). Commands run their shared rayon tasks (writer framing and the
+  parallel-iterator work in repack, degrade, simple extract, the geocode
+  index builder and merge-changes) on the new `Host::executor`. It is not a
+  confinement of all library work: the pipelined reader's decode pool and
+  the command worker pools are dedicated per-call threads that never run on
+  it, and `merge-changes` with a fixed job count uses its own pool.
 
 - **Report types write into a caller-supplied `io::Write` instead of printing
   to stdout.** A library does not own its host's stdout. Renamed, each now

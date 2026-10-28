@@ -562,7 +562,10 @@ where
         //
         // We use a dedicated rayon pool rather than the global rayon pool so that
         // the caller's own parallelism (e.g. geometry processing, tile generation)
-        // is not starved by decode work. The global pool is left entirely free.
+        // is not starved by decode work. The global pool is left entirely free,
+        // and so is the host's `Executor`: this pool is a dedicated per-read
+        // worker set, which the `Executor` rustdoc names as outside it. Its
+        // workers are not joined on drop, so they may outlive the read.
         //
         // Thread count rationale:
         //   The pipeline occupies 2 threads beyond this pool: the Stage 1 I/O reader

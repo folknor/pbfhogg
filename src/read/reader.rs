@@ -122,8 +122,10 @@ impl<R: Read + Send> ElementReader<R> {
     /// [`for_each_block_pipelined`](Self::for_each_block_pipelined), and
     /// [`into_blocks_pipelined`](Self::into_blocks_pipelined).
     ///
-    /// When not set, defaults to `available_parallelism() - 2` (reserving threads
-    /// for the I/O reader and the consumer). The minimum is clamped to 1.
+    /// When not set, the count comes from the reader's host resources (the
+    /// machine probe without a host), reserving threads for the I/O reader
+    /// and the consumer. The minimum is clamped to 1. The pool is dedicated
+    /// to the read, not the host's `Executor`.
     pub fn decode_threads(mut self, n: usize) -> Self {
         self.decode_threads = Some(n.max(1));
         self

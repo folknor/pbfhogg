@@ -366,6 +366,122 @@ fn instrumentation_reaches_only_the_invocations_own_sink() {
     }
 }
 
+/// Two concurrent calls write one real FIFO through their own `CallSink`s
+/// beside the untagged process stream: every line is whole, at most 512
+/// bytes, carries its own call's tag, and each call's stream holds its own
+/// markers and its own `writer_bytes_written`. A 512-byte tagged line goes
+/// out; a 513-byte one does not.
+#[cfg(unix)]
+#[test]
+fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
+    use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo};
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("sidecar.fifo");
+    let c_path = std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("c path");
+    // SAFETY: a valid NUL-terminated path in the test's own scratch.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    // The read end first: a non-blocking write open needs a reader.
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .expect("read end");
+
+    let fifo = MarkerFifo::open(&path).expect("write end");
+    // Drain while the calls write, so a small pipe capacity cannot drop
+    // lines; EOF arrives once every write handle has dropped.
+    let drain = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("drain FIFO: {e}"),
+            }
+        }
+        String::from_utf8(bytes).expect("utf-8 stream")
+    });
+    let start = fifo.now_us();
+    fifo.marker("PROCESS_START");
+    let sizes: Vec<(String, u64)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = [("small", 3_i64), ("large", 40)]
+            .into_iter()
+            .map(|(id, count)| {
+                let sink = fifo.call(CallId::new(id).expect("call id"));
+                scope.spawn(move || {
+                    let invocation = pbfhogg::host::Invocation::with_sink(Arc::new(sink));
+                    (id.to_owned(), instrumented_cat(count, invocation))
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().expect("run"))
+            .collect()
+    });
+    let edge = fifo.call(CallId::new(&"e".repeat(64)).expect("call id"));
+    // The width of the timestamp the line will carry: retry if the clock
+    // crossed a power of ten between sizing and emitting (that attempt's
+    // line is 513 bytes and dropped).
+    for _ in 0..5 {
+        let before = fifo.now_us();
+        let fixed = format!("{before} %{} \n", edge.id().as_str()).len();
+        edge.marker(&"n".repeat(512 - fixed));
+        edge.marker(&"o".repeat(513 - fixed));
+        if fifo.now_us().to_string().len() == before.to_string().len() {
+            break;
+        }
+    }
+    assert!(fifo.now_us() >= start, "the clock is monotonic");
+    drop(edge);
+    drop(fifo);
+
+    let text = drain.join().expect("drain");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(text.ends_with('\n'), "no fragment");
+    for line in &lines {
+        assert!(line.len() < 512, "line over budget: {}", line.len());
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.ends_with(" PROCESS_START") && !l.contains('%'))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" %eeee") && l.ends_with('n') && l.len() == 511),
+        "the 512-byte tagged line, newline included, goes out whole"
+    );
+    assert!(
+        !lines.iter().any(|l| l.ends_with('o')),
+        "513 bytes must drop"
+    );
+    for (id, size) in &sizes {
+        let tag = format!(" %{id} ");
+        let mine: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.split_once(&tag).map(|(_, body)| body))
+            .collect();
+        assert_eq!(
+            mine.iter().filter(|b| **b == "CAT_SCAN_START").count(),
+            1,
+            "{id}: {mine:?}"
+        );
+        let written: Vec<&str> = mine
+            .iter()
+            .filter_map(|b| b.strip_prefix("@writer_bytes_written="))
+            .collect();
+        assert_eq!(written, [size.to_string()], "{id}");
+    }
+}
+
 /// A sink that panics is switched off, and the run it observes completes.
 ///
 /// The sink unwinds with `resume_unwind`, which does not run the panic hook:

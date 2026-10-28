@@ -56,11 +56,18 @@ pbfhogg workspace member, pbfhogg owns the scenario format and exposes a
 describe mode, digest is the equality check. pbfhogg-side work that has to
 land before or with the harness:
 
-- **Tagged `MarkerFifo` handle.** A harness running several calls into one
-  FIFO needs per-call sinks sharing one fd and one process-start clock,
-  writing brokkr's call tag inside the 512-byte `tunables::PIPE_BUF` line
-  cap. The clock code is private to `src/debug.rs`; offer the handle there
-  (tag escaping, whole-line size check including the tag).
+- **FIFO line loss is invisible.** `debug::Line::emit` drops a line on a
+  full FIFO, a gone reader or a refused name with no count anywhere, and
+  brokkr's "incomplete" flag only sees malformed lines, not absent ones. A
+  harness comparing a call's stream against its `for_each_counter` snapshot
+  cannot tell "dropped" from "never emitted". Consider a per-sink dropped-line
+  count the harness can read and report in its artefact.
+- **SIGPIPE on a FIFO whose reader left.** `MarkerFifo` writes to a FIFO; with
+  no reader the write raises SIGPIPE. Rust binaries ignore it by default, but
+  a library host that restored the default disposition dies on its first
+  marker after brokkr closes the read end. Unverified; decide whether the docs
+  must state the requirement (the library may not change signal state,
+  ADR-0016) or whether the write should use a send path that suppresses it.
 - **Harness member wiring.** Add it to the `all`, `consumer` and `musl`
   sweeps with feature forwarding (keep `minimal` library-only), give it
   workspace lints, and widen the textlint rules that name the CLI as the

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- **Per-call sinks on one sidecar FIFO.** `debug::MarkerFifo::call(CallId)`
+  returns a `debug::CallSink` that writes brokkr's call stream
+  (`TS %CALL_ID NAME`, `TS %CALL_ID @NAME=VALUE`) through the FIFO's one
+  descriptor and process-start clock, so a caller running several
+  invocations in one process gives each its own sink and brokkr splits the
+  stream per call. `CallId::new` refuses an id outside 1 to 64 bytes of
+  `A-Z a-z 0-9 _ . -`; `MarkerFifo::now_us` reads the FIFO clock, and
+  `MarkerFifo` is now `Clone`. Every line, tag and newline included, stays
+  within 512 bytes or is dropped whole, as is a name the sidecar would
+  misread (a marker name that is empty, has a newline or trailing
+  whitespace, or starts with `@`, or with `%` on the untagged stream; a
+  counter name that is empty or holds a newline or `=`). The library's own
+  names are unaffected, so the CLI's stream is unchanged.
+
 ### Breaking
 
 - **`diff -v` detail lines are positioned edit scripts.** A modified way

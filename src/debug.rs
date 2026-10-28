@@ -24,7 +24,7 @@ use crate::tunables::PIPE_BUF;
 ///
 /// Calls carry no invocation identity: a caller that funnels several
 /// invocations into one collector gives each its own sink that tags what it
-/// forwards. Markers are point-in-time names; counters are `(name, value)`
+/// forwards ([`CallSink`] does this for the sidecar FIFO). Markers are point-in-time names; counters are `(name, value)`
 /// samples whose meaning is the name's (most are running totals that only
 /// grow, some are per-span deltas emitted repeatedly). Within one thread
 /// calls arrive in emission order; across threads nothing is ordered.
@@ -41,16 +41,33 @@ pub trait InstrumentSink: Send + Sync {
 
 /// The sidecar profiler's FIFO as an [`InstrumentSink`]: one line per event,
 /// `<timestamp_us> <name>` for a marker and `<timestamp_us> @<name>=<value>`
-/// for a counter.
+/// for a counter. This is the process stream; [`call`](Self::call) hands out
+/// a [`CallSink`] per invocation for the tagged call stream on the same FIFO.
 ///
 /// Timestamps are monotonic microseconds since process start (on Linux the
 /// epoch is recovered from `/proc/self/stat`, so it covers dynamic-loader
 /// and pre-`main` time too; elsewhere it is the moment the FIFO was opened),
 /// anchored once at [`open`](Self::open), so every invocation sharing one
-/// `MarkerFifo` shares its clock. The FIFO is opened `O_NONBLOCK` and each
-/// line is one `write` of at most `PIPE_BUF` bytes, which a FIFO delivers
-/// whole or not at all: a full FIFO drops the line, never a part of it.
+/// `MarkerFifo` - and every [`CallSink`] made from it - shares its clock,
+/// which [`now_us`](Self::now_us) reads. The FIFO is opened `O_NONBLOCK` and
+/// each line is one `write` of at most `PIPE_BUF` (512) bytes including its
+/// newline, which a FIFO delivers whole or not at all: a full FIFO drops the
+/// line, never a part of it.
+///
+/// A line the sidecar reader would reject, misread or alter is dropped
+/// whole rather than written: a marker name that is empty, contains a
+/// newline, ends in whitespace or starts with `@`; on the untagged stream, a
+/// marker name starting with `%` (that prefix means a call tag); a counter
+/// name that is empty or contains a newline or `=`; a line over 512 bytes.
+/// The library's own names never hit these.
+///
+/// Cloning is cheap and shares the descriptor and the clock.
+#[derive(Clone)]
 pub struct MarkerFifo {
+    shared: std::sync::Arc<FifoShared>,
+}
+
+struct FifoShared {
     file: std::fs::File,
     anchor: std::time::Instant,
     age_at_anchor: u64,
@@ -67,28 +84,152 @@ impl MarkerFifo {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let file = open_marker_fifo(path)?;
         Ok(Self {
-            file,
-            anchor: std::time::Instant::now(),
-            // Procfs recovers the true process epoch on Linux. If that probe
-            // is unavailable, zero age plus `Instant` still supplies a
-            // monotonic FIFO timestamp and preserves the wire format.
-            age_at_anchor: crate::process::micros_since_process_start().unwrap_or(0),
+            shared: std::sync::Arc::new(FifoShared {
+                file,
+                anchor: std::time::Instant::now(),
+                // Procfs recovers the true process epoch on Linux. If that
+                // probe is unavailable, zero age plus `Instant` still
+                // supplies a monotonic FIFO timestamp and preserves the wire
+                // format.
+                age_at_anchor: crate::process::micros_since_process_start().unwrap_or(0),
+            }),
         })
     }
 
-    fn now_us(&self) -> u128 {
-        u128::from(self.age_at_anchor) + self.anchor.elapsed().as_micros()
+    /// The current time on this FIFO's clock, in the microseconds its lines
+    /// carry, so a harness can record a call's start and end on the same
+    /// timeline as its markers.
+    #[must_use]
+    pub fn now_us(&self) -> u64 {
+        self.shared.now_us()
+    }
+
+    /// A sink for one invocation that writes this FIFO's call stream,
+    /// `<timestamp_us> %<call_id> <name>` and
+    /// `<timestamp_us> %<call_id> @<name>=<value>`, through the same
+    /// descriptor and clock. The caller keeps `id` unique among the calls of
+    /// one process run; the reader cannot check that.
+    #[must_use]
+    pub fn call(&self, id: CallId) -> CallSink {
+        CallSink {
+            shared: std::sync::Arc::clone(&self.shared),
+            id,
+        }
+    }
+}
+
+impl FifoShared {
+    fn now_us(&self) -> u64 {
+        let elapsed = u64::try_from(self.anchor.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.age_at_anchor.saturating_add(elapsed)
     }
 }
 
 impl InstrumentSink for MarkerFifo {
     fn marker(&self, name: &str) {
-        Line::marker(self.now_us(), name).emit(&self.file);
+        let shared = &self.shared;
+        Line::marker(shared.now_us(), None, name).emit(&shared.file);
     }
 
     fn counter(&self, name: &str, value: i64) {
-        Line::counter(self.now_us(), name, value).emit(&self.file);
+        let shared = &self.shared;
+        Line::counter(shared.now_us(), None, name, value).emit(&shared.file);
     }
+}
+
+/// The identity of one call on a [`MarkerFifo`]'s call stream: 1 to 64
+/// bytes of `A-Z a-z 0-9 _ . -`, so it is never escaped.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CallId {
+    bytes: [u8; CALL_ID_MAX],
+    len: u8,
+}
+
+/// The sidecar wire format's call-id length limit.
+const CALL_ID_MAX: usize = 64;
+
+impl CallId {
+    /// Validate `id`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` when `id` is empty, longer than 64 bytes, or holds a
+    /// byte outside `A-Z a-z 0-9 _ . -`.
+    pub fn new(id: &str) -> crate::Result<Self> {
+        let raw = id.as_bytes();
+        let valid = !raw.is_empty()
+            && raw.len() <= CALL_ID_MAX
+            && raw
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid {
+            return Err(crate::Error::invalid_argument(
+                "a call id is 1 to 64 bytes of A-Z a-z 0-9 _ . -",
+            ));
+        }
+        let mut bytes = [0; CALL_ID_MAX];
+        bytes[..raw.len()].copy_from_slice(raw);
+        Ok(Self {
+            bytes,
+            // Bounded by CALL_ID_MAX above.
+            len: u8::try_from(raw.len()).unwrap_or(u8::MAX),
+        })
+    }
+
+    /// The id as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Validated ASCII at construction.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+}
+
+/// One invocation's sink on a [`MarkerFifo`]'s call stream, made by
+/// [`MarkerFifo::call`]. Give each invocation its own (one id per call);
+/// every `CallSink` of one FIFO shares its descriptor and clock, and its
+/// lines follow the same whole-line and name rules, with the tag counted in
+/// the 512 bytes.
+#[derive(Clone)]
+pub struct CallSink {
+    shared: std::sync::Arc<FifoShared>,
+    id: CallId,
+}
+
+impl CallSink {
+    /// This sink's call id.
+    #[must_use]
+    pub fn id(&self) -> &CallId {
+        &self.id
+    }
+}
+
+impl InstrumentSink for CallSink {
+    fn marker(&self, name: &str) {
+        let shared = &self.shared;
+        Line::marker(shared.now_us(), Some(&self.id), name).emit(&shared.file);
+    }
+
+    fn counter(&self, name: &str, value: i64) {
+        let shared = &self.shared;
+        Line::counter(shared.now_us(), Some(&self.id), name, value).emit(&shared.file);
+    }
+}
+
+/// Whether the reader takes `name` back verbatim as a marker: it trims the
+/// line, splits off the timestamp (and call tag) once, reads a body starting
+/// `@` as a counter and an untagged payload starting `%` as a tag.
+fn marker_name_ok(name: &str, tagged: bool) -> bool {
+    !name.is_empty()
+        && !name.contains('\n')
+        && !name.ends_with(char::is_whitespace)
+        && !name.starts_with('@')
+        && (tagged || !name.starts_with('%'))
+}
+
+/// Whether the reader takes `name` back verbatim as a counter name: it
+/// splits the body at the first `=`.
+fn counter_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains('\n') && !name.contains('=')
 }
 
 /// The sidecar FIFO is the caller's instrumentation channel, not an input or
@@ -245,16 +386,39 @@ struct Line {
 }
 
 impl Line {
-    fn marker(us: u128, name: &str) -> Self {
+    fn marker(us: u64, call: Option<&CallId>, name: &str) -> Self {
         let mut line = Self::new();
-        line.push(format_args!("{us} {name}\n"));
+        if !marker_name_ok(name, call.is_some()) {
+            line.overflow = true;
+            return line;
+        }
+        line.stamp(us, call);
+        line.push(format_args!("{name}\n"));
         line
     }
 
-    fn counter(us: u128, name: &str, value: i64) -> Self {
+    fn counter(us: u64, call: Option<&CallId>, name: &str, value: i64) -> Self {
         let mut line = Self::new();
-        line.push(format_args!("{us} @{name}={value}\n"));
+        if !counter_name_ok(name) {
+            line.overflow = true;
+            return line;
+        }
+        line.stamp(us, call);
+        line.push(format_args!("@{name}={value}\n"));
         line
+    }
+
+    /// The timestamp and optional call tag, each followed by a space. The
+    /// reader parses the timestamp as `i64`, so a larger one drops the line.
+    fn stamp(&mut self, us: u64, call: Option<&CallId>) {
+        if i64::try_from(us).is_err() {
+            self.overflow = true;
+            return;
+        }
+        self.push(format_args!("{us} "));
+        if let Some(id) = call {
+            self.push(format_args!("%{} ", id.as_str()));
+        }
     }
 
     fn new() -> Self {
@@ -319,16 +483,72 @@ mod tests {
 
     #[test]
     fn line_formats_marker_exactly() {
-        let line = Line::marker(42, "PASS1_END");
+        let line = Line::marker(42, None, "PASS1_END");
         assert_eq!(&line.buf[..line.len], b"42 PASS1_END\n");
         assert!(!line.overflow);
     }
 
     #[test]
     fn line_formats_counter_exactly() {
-        let line = Line::counter(42, "nodes", -7);
+        let line = Line::counter(42, None, "nodes", -7);
         assert_eq!(&line.buf[..line.len], b"42 @nodes=-7\n");
         assert!(!line.overflow);
+    }
+
+    #[test]
+    fn tagged_lines_carry_the_call_id() {
+        let id = super::CallId::new("call-1.a_B").expect("valid id");
+        let line = Line::marker(42, Some(&id), "PASS1_END");
+        assert_eq!(&line.buf[..line.len], b"42 %call-1.a_B PASS1_END\n");
+        let line = Line::counter(42, Some(&id), "nodes", i64::MIN);
+        assert_eq!(
+            &line.buf[..line.len],
+            b"42 %call-1.a_B @nodes=-9223372036854775808\n"
+        );
+        // The reader strips the tag once, so a tagged name may start with %.
+        let line = Line::marker(42, Some(&id), "%x");
+        assert_eq!(&line.buf[..line.len], b"42 %call-1.a_B %x\n");
+    }
+
+    #[test]
+    fn call_ids_follow_the_wire_alphabet() {
+        assert!(super::CallId::new(&"a".repeat(64)).is_ok());
+        for bad in ["", "a b", "a%", "\u{e9}", "a\n", &"a".repeat(65)] {
+            assert!(super::CallId::new(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// Names the reader would reject, misread or alter are dropped whole.
+    #[test]
+    fn names_the_reader_would_misread_are_dropped() {
+        let id = super::CallId::new("c").expect("valid id");
+        for name in ["", "a\nb", "END ", "@x", "%x"] {
+            assert!(Line::marker(1, None, name).overflow, "untagged {name:?}");
+        }
+        for name in ["", "a\nb", "END\t", "@x"] {
+            assert!(Line::marker(1, Some(&id), name).overflow, "tagged {name:?}");
+        }
+        for name in ["", "a=b", "a\n"] {
+            assert!(Line::counter(1, None, name, 0).overflow, "counter {name:?}");
+        }
+        // Leading whitespace survives the reader's parse, so it is kept.
+        assert!(!Line::marker(1, None, " x").overflow);
+        assert!(!Line::counter(1, None, " x ", 0).overflow);
+        assert!(Line::marker(u64::MAX, None, "x").overflow, "ts beyond i64");
+    }
+
+    /// Exactly 512 bytes including the newline and the tag goes out; 513
+    /// drops the line.
+    #[test]
+    fn tagged_line_limit_includes_tag_and_newline() {
+        let id = super::CallId::new(&"i".repeat(64)).expect("valid id");
+        let fixed = "42 ".len() + 1 + 64 + 1 + 1;
+        let fits = "n".repeat(PIPE_BUF - fixed);
+        let line = Line::marker(42, Some(&id), &fits);
+        assert!(!line.overflow);
+        assert_eq!(line.len, PIPE_BUF);
+        let over = "n".repeat(PIPE_BUF - fixed + 1);
+        assert!(Line::marker(42, Some(&id), &over).overflow);
     }
 
     #[test]
@@ -350,7 +570,7 @@ mod tests {
     fn line_over_pipe_buf_emits_nothing_at_all() {
         let name = "X".repeat(PIPE_BUF);
         let mut line = Line::new();
-        line.push(format_args!("{} {name}\n", 42_u128));
+        line.push(format_args!("{} {name}\n", 42_u64));
 
         let scratch = crate::path_guard::tests::scratch();
         let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");

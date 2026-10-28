@@ -181,7 +181,7 @@ pbfhogg apply-changes planet.osm.pbf week.osc.gz -o updated.osm.pbf
 
 One merge plus one apply is much cheaper than N applies: each `apply-changes` pass rewrites the whole base PBF, while the squash itself is cheap - 55 s at planet scale for 7 dailies (see the table above; down from 4m27s since the parallel merge drain, commit `99057fa`). Adding `--simplify` keeps only the last change per object across the merged diffs, so the single apply can also touch fewer elements than the individual applies would in sequence.
 
-See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, and index type details.
+See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, index types and embedding the library (`Host`, scratch).
 
 ## Performance
 

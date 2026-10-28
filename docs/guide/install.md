@@ -8,7 +8,7 @@ Install the `pbfhogg` binary from crates.io:
 cargo install pbfhogg-cli
 ```
 
-This builds from source with fat LTO. The binary is called `pbfhogg`. Requires Rust 1.96+.
+This builds from source with fat LTO. The binary is called `pbfhogg`. Requires the Rust version named by `rust-version` in the workspace `Cargo.toml` (the MSRV badge in the README).
 
 ## Library
 
@@ -19,7 +19,7 @@ Add the library to your `Cargo.toml`:
 pbfhogg = "0.5"
 ```
 
-This enables the default `commands` feature. If you only need read/write (no extract, check-refs, or geocode index), disable it to skip `serde_json` and `s2` dependencies:
+This enables the default `commands` feature. If you only need read/write (no `check`, `export`, `extract` or geocode index builder), disable it to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
@@ -30,10 +30,10 @@ pbfhogg = { version = "0.5", default-features = false }
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `commands` | yes | Enables `check_refs`, `extract`, geocode index builder, and their deps (`serde_json`, `s2`) |
+| `commands` | yes | Enables `check`, `export`, `extract`, the spatial helpers, JSON output for `inspect`, the geocode index builder, and their deps (`serde_json`, `s2`) |
 | `geocode-reader` | included by `commands` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`) |
 | `linux-direct-io` | no | O_DIRECT read/write paths - bypasses page cache for planet-scale I/O (Linux only) |
-| `linux-io-uring` | no | io_uring writer with registered buffers - faster writes above ~4 GB (Linux only, requires kernel 5.1+) |
+| `linux-io-uring` | no | io_uring writer with registered buffers (Linux only, requires kernel 5.1+) |
 
 The two Linux features gate only `O_DIRECT` and `io_uring`. Every Linux build, with or without them, copies passthrough blobs with `copy_file_range`, hints sequential readahead on buffered reads, and drops `add-locations-to-ways --index-type external` scratch from the page cache once it is read.
 
@@ -60,7 +60,7 @@ cargo install --path cli --features linux-direct-io,linux-io-uring
 
 ### Build requirements
 
-- Rust 1.96 or later
+- Rust at or above the workspace `rust-version` in `Cargo.toml`
 - No C compiler required - all protobuf encoding is hand-rolled wire format, and zlib uses `zlib-rs` (pure Rust)
 - No `protoc` or Protocol Buffers toolchain needed
 

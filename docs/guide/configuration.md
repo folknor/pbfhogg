@@ -8,11 +8,13 @@ Control output blob compression with `--compression`:
 
 ```sh
 pbfhogg sort input.osm.pbf -o sorted.osm.pbf --compression zstd
-pbfhogg cat input.osm.pbf -o output.osm.pbf --compression zlib:9
+pbfhogg repack input.osm.pbf -o output.osm.pbf --compression zlib:9
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf --compression none
 ```
 
-The default is `zlib` (level 6), which produces standard PBF files compatible with all tools. Use `none` for intermediate files or when the filesystem handles compression (erofs). Use `zstd` for better compression ratio and faster decompression.
+The flag applies to blobs the command encodes. Blobs a command passes through (plain `cat`, unchanged blobs in `apply-changes`) keep the compression they had; `repack` re-encodes every blob.
+
+The default is `zlib` (level 6; `renumber` defaults to `zlib:1`), which produces standard PBF files compatible with all tools. Use `none` for intermediate files or when the filesystem handles compression (erofs). Use `zstd` for better compression ratio and faster decompression.
 
 ## Index type for add-locations-to-ways
 

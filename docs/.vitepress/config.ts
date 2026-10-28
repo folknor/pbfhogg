@@ -1,11 +1,9 @@
 import { defineConfig } from 'vitepress'
 
-// ── Replace these per-project ──────────────────────────────────────────────
 const projectName = 'pbfhogg'
 const projectDescription = 'Fast OpenStreetMap PBF reader and writer for Rust'
 const githubUrl = 'https://github.com/folknor/pbfhogg'
 const base = '/pbfhogg/'
-// ────────────────────────────────────────────────────────────────────────────
 
 export default defineConfig({
   title: projectName,
@@ -45,15 +43,19 @@ export default defineConfig({
           text: 'Guide',
           items: [
             { text: 'Getting Started', link: '/guide/' },
+            { text: 'Installation', link: '/guide/install' },
+            { text: 'Basic Usage', link: '/guide/usage' },
             { text: 'Reading PBF Files', link: '/guide/reading' },
             { text: 'Writing PBF Files', link: '/guide/writing' },
             { text: 'Indexdata', link: '/guide/indexdata' },
+            { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Performance', link: '/guide/performance' },
           ],
         },
         {
           text: 'Reference',
           items: [
+            { text: 'Advanced Topics', link: '/guide/advanced' },
             { text: 'Correctness', link: '/guide/correctness' },
           ],
         },

@@ -6,7 +6,7 @@ pbfhogg includes a command-line toolkit for common OSM PBF operations. Install i
 cargo install pbfhogg-cli
 ```
 
-The binary is called `pbfhogg`. Requires Rust 1.96+.
+The binary is called `pbfhogg`. Requires the Rust version named by `rust-version` in the workspace `Cargo.toml`.
 
 ## Commands at a Glance
 

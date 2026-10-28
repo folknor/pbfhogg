@@ -809,17 +809,28 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   destination; `Output` stages a fresh file) when this landed; recorded so
   the boundary is a decision, not an oversight.
 
-- [ ] **Two workflows deploy the docs site on every push to `main`.**
-  `.github/workflows/docs.yml` ("Deploy docs", node 24, pnpm action v5) and
-  `.github/workflows/deploy.yml` ("Deploy to GitHub Pages", node 22, pnpm
-  action v4, an unmodified template with commented-out API-doc blocks) both
-  build `docs/` and upload `docs/.vitepress/dist` to Pages. Whether both
-  succeed, and which deployment wins, was not checked. Keep one.
-- [ ] **Guide pages outside the site sidebar.** `docs/guide/advanced.md`,
-  `install.md`, `configuration.md` and `usage.md` exist but
-  `docs/.vitepress/config.ts` lists none of them (README links
-  `docs/guide/advanced.md`). Either list them or fold and delete them; not
-  investigated beyond the listing.
+- [ ] **Uncited performance figures on the site.** `docs/guide/performance.md`
+  (the N. America apply-changes table with 14.9s / 11.9s, the Japan osmium
+  36.6s, "~92% of blobs", "RSS under 600 MB") and `docs/guide/indexdata.md`
+  ("~92% of blobs", "under 0.5%" size overhead) carry numbers with no commit
+  or host, against the AGENTS.md convention. The four guide pages that were
+  added to the sidebar had theirs replaced by a pointer to the Performance
+  page; these two pages still need each figure either sourced from
+  `.brokkr/results.db` / `reference/performance.md` with commit and host, or
+  dropped.
+- [ ] **Nothing catches a site page missing from the sidebar.** Four guide
+  pages sat outside `docs/.vitepress/config.ts` from the scaffold until they
+  were listed; `scripts/check_doc_links.py` checks links and anchors only.
+  Have it parse the sidebar links out of config.ts and fail on a `docs/`
+  page (outside `docs/public/` and the home page) that no sidebar entry names.
+- [ ] **Guide pages duplicate the CLI reference.** `docs/guide/usage.md`
+  (common flags table, `--force`, output files), `configuration.md`
+  (compression, index type, I/O flags) and `advanced.md` (compression table,
+  ALTW index types, multi-extract, tags-filter -R) restate what
+  `docs/cli/commands.md` and `reference/cli-reference.md` say, so a flag
+  change lands in up to four places. Decide with the commands.md vs
+  cli-reference.md fork (doc-conventions-audit item 4): walkthroughs that
+  link to the reference for flag semantics instead of restating them.
 - [ ] **Old site fragments into the correctness and deviations pages land on
   a pointer.** Those two site pages became pointers to the root
   `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such
@@ -1660,7 +1671,7 @@ deferred ledger live in
 - [ ] CI status badge - `https://img.shields.io/github/actions/workflow/status/folknor/pbfhogg/ci.yml`
   (requires GitHub Actions CI workflow)
 - [ ] Add GitHub Actions CI - clippy, tests, rustfmt, doc build on Linux
-  (`.github/workflows/` has only `deploy.yml` + `docs.yml` today; no
+  (`.github/workflows/` holds only the docs-site deploy, `docs.yml`; no
   clippy/test workflow)
 - [ ] Add GitHub Actions release pipeline - build binaries on tag push, attach to GitHub release
 - [ ] CI with benchmark regression guard.

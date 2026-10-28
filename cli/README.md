@@ -8,7 +8,7 @@ Fast command-line toolkit for OpenStreetMap PBF files. Built on the [pbfhogg](ht
 cargo install pbfhogg-cli
 ```
 
-Requires Rust 1.96+. The binary is called `pbfhogg`.
+Requires the Rust version named by the crate's `rust-version`. The binary is called `pbfhogg`.
 
 ## Commands
 

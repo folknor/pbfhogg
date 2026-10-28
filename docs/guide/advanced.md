@@ -4,7 +4,7 @@
 
 pbfhogg embeds additional metadata in BlobHeader fields: element type, ID range, spatial bounding box, and tag key sets. Standard PBF readers silently skip these fields per protobuf wire format rules.
 
-This metadata enables commands to skip decompression of irrelevant blobs entirely. For example, `apply-changes` classifies blobs in O(1) without decompressing them, passing through ~92% of blobs as raw bytes. `tags-filter` skips blobs that provably lack required tag keys.
+This metadata enables commands to skip decompression of irrelevant blobs entirely. For example, `apply-changes` classifies blobs in O(1) without decompressing them and passes the blobs a diff does not touch through as raw bytes. `tags-filter` skips blobs that provably lack required tag keys.
 
 Generate an indexed PBF:
 
@@ -12,7 +12,7 @@ Generate an indexed PBF:
 pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-Without a `--type` flag, `cat` adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal. Planet (87 GB) completes in ~8 minutes with under 0.5% file size overhead.
+Without a `--type` flag, `cat` adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal and the size overhead is small; see [Performance](./performance) for measurements.
 
 Commands that benefit from indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, and `build-geocode-index`.
 
@@ -24,7 +24,7 @@ Planet-scale operations read and write 80 GB+, polluting the entire page cache a
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io
 ```
 
-O_DIRECT requires a real filesystem (not tmpfs). Wall time is typically unchanged at country scale (CPU-bound) - the benefit is cache hygiene at planet scale. For sequential single-file passthrough (`cat`), buffered I/O is actually faster because the page cache prefetch helps. `--direct-io` wins for concurrent read/write patterns like merge.
+O_DIRECT requires a real filesystem (not tmpfs). The intended benefit is cache hygiene at planet scale, not wall time; whether it is faster or slower than buffered I/O depends on the command and the host, so measure on yours.
 
 ## io_uring writes
 
@@ -34,7 +34,7 @@ The `linux-io-uring` feature replaces the synchronous writer thread with io_urin
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 ```
 
-At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up - io_uring overhead dominates when the page cache absorbs everything.
+Whether it beats buffered writes depends on output size and host: when the page cache absorbs the whole output, buffered writes keep up. See [Performance](./performance).
 
 ## Embedding pbfhogg
 
@@ -57,17 +57,17 @@ The CLI's arena cap is a `mallopt(M_ARENA_MAX, 2)` call, which overrides `GLIBC_
 
 ## Compression modes
 
-All write commands accept `--compression`:
+All PBF-writing commands accept `--compression`. It applies to the blobs a command encodes; passed-through blobs keep their compression, and `repack` re-encodes every blob.
 
 | Value | Description |
 |-------|-------------|
 | `none` | No compression. Fastest writes, largest files. Ideal for intermediate files or erofs storage. |
-| `zlib` | Zlib level 6 (default). Standard PBF compression, compatible with all tools. |
+| `zlib` | Zlib level 6 (default; `renumber` defaults to `zlib:1`). Standard PBF compression, compatible with all tools. |
 | `zlib:LEVEL` | Zlib with explicit level (0-9). Higher = smaller + slower. |
 | `zstd` | Zstandard level 3. Better ratio and faster decompression than zlib. |
 | `zstd:LEVEL` | Zstandard with explicit level. |
 
-With pipelined writes (the production path), compression is dispatched to rayon and all modes converge to the decode + serialization floor. The choice mainly affects file size and downstream read speed.
+Compression runs on the parallel pool alongside encoding, so the choice affects file size and downstream read speed as well as write time.
 
 Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
 
@@ -103,15 +103,15 @@ A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was remo
 Extract multiple regions in a single pass using a JSON config file:
 
 ```sh
-pbfhogg extract input.osm.pbf --config regions.json
+pbfhogg extract input.osm.pbf --config regions.json --simple
 ```
 
-The config file defines multiple extract regions, each with a name, output path, and bounding box or polygon. All regions are extracted in one pass over the input, which is much faster than running separate extracts.
+The config file defines multiple extract regions, each with a name, output path, and bounding box or polygon. With `--simple` on sorted input, all regions are extracted in one pass over the input. The complete-ways (default) and `--smart` strategies, and unsorted input, extract the regions one after another, each with its own passes.
 
 Use `-d` to override the output directory for all extracts:
 
 ```sh
-pbfhogg extract input.osm.pbf --config regions.json -d /data/extracts/
+pbfhogg extract input.osm.pbf --config regions.json --simple -d /data/extracts/
 ```
 
 ## Tags-filter with and without -R

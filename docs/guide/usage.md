@@ -34,7 +34,7 @@ Many commands are faster with blob-level indexdata. Generate an indexed PBF with
 pbfhogg cat denmark-raw.osm.pbf -o denmark.osm.pbf
 ```
 
-This passthrough path adds indexdata without re-compressing blobs - minimal memory, suitable for planet-scale files (87 GB planet in ~8 minutes). No `--type` flag means passthrough; adding `-t` does full decode and re-encode.
+This passthrough path adds indexdata without re-compressing blobs, with minimal memory, so it suits planet-scale files; see [Performance](./performance) for measurements. A blob that already carries indexdata is copied as it is; `cat --reindex` rebuilds indexdata from the payload when it is suspect.
 
 ## Extracting a region
 
@@ -142,7 +142,7 @@ Most write commands accept these flags:
 |------|-------------|
 | `-o, --output <FILE>` | Output file path |
 | `-O, --overwrite` | Replace the output if it already exists |
-| `--compression <SPEC>` | Compression: `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`) |
+| `--compression <SPEC>` | Compression: `none`, `zlib` (default; `renumber` defaults to `zlib:1`), `zstd`, or with level (`zlib:9`, `zstd:19`) |
 | `--direct-io` | Bypass page cache via O_DIRECT (Linux, requires `linux-direct-io` feature) |
 | `--io-uring` | Use io_uring for output writes (Linux, requires `linux-io-uring` feature) |
 | `--force` | Proceed without indexdata (slower fallback path) |
@@ -151,7 +151,8 @@ Most write commands accept these flags:
 
 An existing output is refused before any work is done unless `-O,
 --overwrite` is given, and a symlink is never accepted as an output. Every
-output is written to a hidden staging file beside it and renamed into place
+output is written to a hidden staging file (beside it by default;
+`--staging-dir` moves it) and renamed into place
 only when the command succeeds, so a failed run never leaves a partial file
 under the output name. The [CLI reference](../cli/commands#output-files) has
 the details.

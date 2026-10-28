@@ -887,6 +887,17 @@ xxhash = "222152d6a1093e27f40e87bbafbb1bb6"
 [bygg.datasets.germany]
 origin = "Geofabrik"
 download_date = "2026-02-24"
+# Berlin. Sized for verify extract on this host: osmium reads the whole file
+# whatever the box, so the box only scales its selected-ID sets, and a city
+# box keeps complete_ways/smart well inside 30 GiB while still crossing
+# dense multipolygons. Also the box multi-extract splits into 5 strips.
+bbox = "13.0,52.3,13.8,52.7"
+# Germany holds none of the built-in Denmark IDs. getid: the lowest and
+# highest ID of each kind in pbf.indexed. getparents: the first and last node
+# of the lowest way, and a way member of the lowest relation, so every seed
+# has a parent. All present in snapshot 20260420 too (checked 2026-10-28).
+getid_ids = ["n100", "n13596564006", "w92", "w1482676703", "r882", "r20258307"]
+getparents_ids = ["n442734", "n442740", "w481211268"]
 
 [bygg.datasets.germany.pbf.indexed]
 file = "germany-20260224-seq4704-with-indexdata.osm.pbf"
@@ -896,6 +907,16 @@ seq = 4704
 [bygg.datasets.germany.pbf.raw]
 file = "germany-20260224-seq4704.osm.pbf"
 xxhash = "9e63140da7898b66bd0ee19a48d5a86f"
+seq = 4704
+
+# Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes`
+# (default sparse index, 2026-10-28; run through `brokkr run pbfhogg`): every
+# node kept, so apply-changes --locations-on-ways can resolve every OSC-way
+# ref and `brokkr verify all` runs its -l check. Same seq-4704 base the
+# configured OSCs chain from; osc.4705 is the one that applies directly.
+[bygg.datasets.germany.pbf.altw-keep-untagged]
+file = "germany-20260224-seq4704-altw-keep-untagged.osm.pbf"
+xxhash = "177f46b2481f2a230eb5935dd8b62310"
 seq = 4704
 
 [bygg.datasets.germany.osc.4705]
@@ -945,6 +966,9 @@ xxhash = "b40b32fa9a4679a66d8bbe218c296b08"
 origin = "Geofabrik"
 download_date = "2026-02-25"
 bbox = "139.5,35.5,140.0,36.0"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n31236558", "n13599471502", "w4847506", "w1483060390", "r12578", "r20260457"]
+getparents_ids = ["n31236733", "n31236562", "w23959494"]
 
 [bygg.datasets.japan.pbf.indexed]
 file = "japan-20260225-seq4706-with-indexdata.osm.pbf"
@@ -962,6 +986,9 @@ xxhash = "2688aefbe9710c1fe6b748140b550481"
 
 [bygg.datasets.north-america]
 origin = "Geofabrik"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n4", "n13568274997", "w379", "w1479042478", "r638", "r20223454"]
+getparents_ids = ["n362288", "n362304", "w4592300"]
 
 [bygg.datasets.north-america.pbf.indexed]
 file = "north-america-seq4710-with-indexdata.osm.pbf"
@@ -975,6 +1002,9 @@ xxhash = "8fc177ca4c07c600099f8f0810f4e712"
 [bygg.datasets.norway]
 origin = "Geofabrik"
 download_date = "2026-02-25"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n110", "n13599469869", "w1227", "w1483063577", "r336", "r20262413"]
+getparents_ids = ["n625114", "n6754363953", "w43759879"]
 
 [bygg.datasets.norway.pbf.indexed]
 file = "norway-20260225-seq4709-with-indexdata.osm.pbf"
@@ -993,6 +1023,9 @@ xxhash = "bc081b3f8b3766dcb0e100aaa6f95b84"
 [bygg.datasets.switzerland]
 origin = "Geofabrik"
 download_date = "2026-02-25"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n172206", "n13599449089", "w78216", "w1483061615", "r410", "r20261201"]
+getparents_ids = ["n1130782429", "n255308686", "w4354700"]
 
 [bygg.datasets.switzerland.pbf.indexed]
 file = "switzerland-20260225-seq4707-with-indexdata.osm.pbf"
@@ -1011,6 +1044,9 @@ xxhash = "079448509b57c41ec31baa32656059db"
 [bygg.datasets.malta]
 origin = "Geofabrik"
 download_date = "2026-02-25"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n197798", "n13598386330", "w4813306", "w1482929313", "r26717", "r20260717"]
+getparents_ids = ["n244533748", "n265929626", "w15590360"]
 
 [bygg.datasets.malta.pbf.indexed]
 file = "malta-20260225-seq4706-with-indexdata.osm.pbf"
@@ -1029,6 +1065,9 @@ xxhash = "560c8161214e2d83e2433b94f712a5bb"
 [bygg.datasets.greater-london]
 origin = "Geofabrik"
 download_date = "2026-02-25"
+# getid/getparents IDs chosen as for germany (see the comment there).
+getid_ids = ["n78112", "n13599443769", "w74", "w1482995541", "r152", "r20258682"]
+getparents_ids = ["n196101", "n2121445348", "w4082762"]
 
 [bygg.datasets.greater-london.pbf.indexed]
 file = "greater-london-20260225-seq4704-with-indexdata.osm.pbf"
@@ -1117,6 +1156,14 @@ origin = "planet.openstreetmap.org"
 download_date = "2026-03-07"
 # seq 4912 = daily-replication boundary at 2026-02-23 00:00 UTC.
 # PBF repl timestamp is 2026-02-23 01:00 UTC (1h past the boundary) - filename date matches cutoff.
+# Same Berlin box as germany, for verify extract: a continent box would grow
+# osmium's selected-ID sets for complete_ways/smart toward this host's RAM.
+# The relation index osmium builds does not shrink with the box, so this
+# limits the selection, not osmium's total memory; planet verify extract is
+# unmeasured. Benches that want the Europe box pass --bbox explicitly.
+# Planet and europe keep the built-in getid/getparents IDs: they contain
+# Denmark, so the IDs exist (checked 2026-10-28) and history stays paired.
+bbox = "13.0,52.3,13.8,52.7"
 
 [bygg.datasets.planet.pbf.indexed]
 file = "planet-20260223-with-indexdata.osm.pbf"

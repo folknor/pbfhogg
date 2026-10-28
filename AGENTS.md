@@ -128,6 +128,9 @@ Datasets have one **primary** PBF (`[datasets.<region>.pbf.*]` + `[datasets.<reg
 - `snapshot.<key>` - named point-in-time captures with own `pbf`/`osc` tables.
 - `download_date` - human annotation only, not read by code.
 - `xxhash` - XXH128 hash. `brokkr env` shows computed values.
+- `pbf.altw-keep-untagged` - the LocationsOnWays base `brokkr verify all` runs its `apply-changes -l` check on (built with `--keep-untagged-nodes` from the same base the dataset's OSCs chain from; absent, the check is skipped). No brokkr producer registers it: build it with `brokkr run pbfhogg -- add-locations-to-ways ...` and add the block by hand with the hash `brokkr env` prints.
+- `bbox` (dataset level) - default box for `extract` / `multi-extract` benches and `verify`; absent, verify skips extract and multi-extract. Choose it for verify cost on the host, not only for lying inside the region.
+- `getid_ids` / `getparents_ids` (dataset level) - IDs the getid/getparents benches request; absent, brokkr's built-in Denmark IDs. A configured list qualifies the result rows' pairing key. `brokkr man datasets` has the full rules.
 
 Results in `.brokkr/results.db` (SQLite, tracked in git).
 

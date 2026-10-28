@@ -487,7 +487,7 @@ follow the store's page-cache residency, not CPU.
 (`1cadc624`, `9bcc192d`, `13aaad48`, `176d004e`), medians +0.5 %.
 
 **diff `-c`**, which now counts single-sided runs from the decoded block:
-planet does not fit brokkr's 16 MiB stdout capture, so germany with OSC
+planet did not fit brokkr's stdout capture when these cells ran, so germany with OSC
 4705 stands in: 3.2, 3.1, 3.1 and 3.1 s (`d0e29e64`, `bd8e6362`,
 `f4204986`, `9bcdff49`).
 
@@ -1423,7 +1423,10 @@ PASS2 and PASS3 via `Pass1Result::pass3_blob_schedule` and
 `pread_write_pass_with_schedule`.
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
-Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent).
+Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent). Europe's
+is its configured dataset bbox; planet's dataset bbox in `brokkr.toml` is a
+Berlin box chosen for `brokkr verify` cost, so planet extract cells that
+want the continent box pass `--bbox` explicitly.
 
 Simple extract uses a 3-phase barrier pipeline with parallel classification
 and raw frame passthrough. Each phase (nodes, ways, relations) classifies

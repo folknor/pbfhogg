@@ -579,6 +579,21 @@ pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
 pub(crate) const SWEEP_CHECKPOINT_REMOVALS: usize = 4096;
 
 // ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+/// Work budget for one ordered sequence diff in `diff -v` details (a
+/// relation's member list, or a tag list with a duplicate key). Counts the
+/// Myers search's diagonal visits plus snake comparisons; since the traceback
+/// keeps one snapshot entry per diagonal visit, it also caps that storage
+/// (8 bytes an entry, so 8 MiB at most). Past the budget the detail falls
+/// back to removing the whole differing middle and inserting the new one,
+/// which is faithful but not minimal. Per call and independent of shard
+/// count, so a run's memory does not grow with it beyond one budget per
+/// worker. Sized so one call stays in the low milliseconds; not measured.
+pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_WORK: usize = 1 << 20;
+
+// ---------------------------------------------------------------------------
 // Cat
 // ---------------------------------------------------------------------------
 

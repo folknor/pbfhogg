@@ -93,10 +93,6 @@ v2). The CLI surface redesign is deferred past 0.6.0.
     --compare` matches a repeated phase name to its first occurrence only.
     No stored run repeats a marker name, so existing data cannot settle it.
     Matters for multi-input cat `--clean` per-kind rows.
-  - `#20` (p3, parked): `diff -v` compares relation members as sets, so a
-    reorder or a dropped duplicate prints the modification with no member
-    lines. Open: diff member order (osmium's CRC is order-sensitive), or say
-    "member order or multiplicity changed".
 - **`packed_varint_count`** (`e61e0ad7`): ruled measure first, then decide;
   the decision tree is with its cell below.
 - **diff `-j 1`**: if its cell shows it clearly worse, give one-shard runs a

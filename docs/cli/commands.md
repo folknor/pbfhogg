@@ -794,6 +794,8 @@ With `--format osc`, generates an OSC diff file instead of text output. Text-onl
 
 With the global `-q, --quiet` a text diff prints nothing, neither the diff text nor its summary, and the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does, sharding included, but formats nothing, so it writes no scratch. `-o`, `-c`, `-v` and `-s`, which only shape that output, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
+With `-v`, each modified element is followed by indented detail lines: `coordinates: (lat, lon) -> (lat, lon)` for a node, `refs: N -> M nodes` for a way, `-member type/id "role"` and `+member type/id "role"` for a relation (an unknown member type prints as `unknown(raw)/id`), and `-k=v`, `+k=v`, `~k: old -> new` for tags. Member and tag order are content, so detail is never empty for a modified element. Members are an ordered edit script: a moved member prints as a `-member`/`+member` pair of the same member, a dropped duplicate as one `-member`. The script explains the difference without positions, and when several shortest scripts exist the one printed is fixed by the algorithm, not by which member moved; a very large difference prints the whole differing middle removed and re-added. Tags are keyed: a reorder of keys present on both sides adds `tags: order changed`, and a tag list with a duplicate key prints an ordered `-k=v`/`+k=v` edit script instead.
+
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
 ```

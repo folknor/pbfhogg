@@ -645,6 +645,17 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
 
+- [ ] **`diff -v` way detail is a bare count; member moves carry no
+  position.** `write_way_details_borrowed` prints only `refs: N -> M nodes`
+  when the ordered ref lists differ, so a pure reorder or a one-node swap
+  prints `refs: 3 -> 3 nodes`, nonempty but uninformative. Relation members
+  (and tags with a duplicate key) now print an ordered edit script via
+  `src/commands/diff/seq.rs`, but without positions, so `[A,B,C] -> [B,A,C]`
+  and `[A,B,C] -> [B,C,A]` can print the same `-A`/`+A` pair. Options: run
+  way refs through the same edit script (`-ref N`/`+ref N`), and/or add
+  positions (`@i`) to member lines. Both change the -v text surface; no user
+  has asked. Left open when member order detail landed (2026-10-28).
+
 - [ ] **`CompactDiffOverlay` never reclaims superseded arena records.** Every
   `push_node` / `push_way` / `push_relation` appends a fresh record and orphans
   the previous one; the index is overwritten, the bytes are not. Accumulating
@@ -1218,12 +1229,10 @@ Known to work, no performance question open, but not in the results DB:
   sequential == parallel output. **Gap found by the flip:** the
   parallel text path never implemented `-v/--verbose` per-field
   detail lines (acceptable while parallel was opt-in; four cli_diff
-  tests caught it the moment parallel became the default). Fix:
-  verbose diffs always dispatch to the sequential path
-  (`src/commands/diff/mod.rs`, `!options.verbose` in the parallel
-  guard), documented in `--help` and CHANGELOG. If parallel verbose
-  is ever wanted, the shard workers need per-field detail emission -
-  new work, not scheduled.
+  tests caught it the moment parallel became the default). That gap
+  is closed: verbose text diffs now shard like any other, every path
+  formatting details through the one `write_modified_details_borrowed`,
+  and `diff_verbose_sharded_matches_one_shard` pins the parity.
 
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   instrumentation calls in per-command `probes` modules, then swap the

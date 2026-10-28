@@ -1431,6 +1431,16 @@
 
 ### Fixed
 
+- **`diff -v` details account for member and tag order.** A relation whose
+  members only moved, or lost a duplicate, used to print its `*r` line with
+  no detail, because members were compared as a set; the same held for a
+  tag reorder. Members now print an ordered edit script (a move is a
+  `-member`/`+member` pair of the same member, a dropped duplicate one
+  `-member`), a reorder of tag keys prints `tags: order changed`, a tag
+  list with a duplicate key prints an ordered `-k=v`/`+k=v` script, and an
+  unknown member type prints its raw value as `unknown(raw)/id`. What
+  counts as modified is unchanged.
+
 - **`PbfWriter::to_path_direct` and `to_path_uring` refuse a target that is
   not a regular file.** A FIFO, socket, device or directory is refused with
   `OutputError::NotAFile` before it is opened. A FIFO without a reader used

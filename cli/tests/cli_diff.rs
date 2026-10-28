@@ -704,6 +704,90 @@ fn verbose_shows_tag_details() {
     );
 }
 
+/// Member and tag order are element content, so a reorder or a dropped
+/// duplicate member must print detail lines, not a bare `*` line.
+#[test]
+fn verbose_shows_member_order_and_multiplicity() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let m = |id, role| TestMember { id, role };
+    let rel = |id, members| TestRelation {
+        id,
+        members,
+        tags: vec![("type", "route")],
+        meta: None,
+    };
+    let node = |tags| TestNode {
+        id: 1,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags,
+        meta: None,
+    };
+
+    write_test_pbf_sorted(
+        &old,
+        &[node(vec![("a", "1"), ("b", "2")])],
+        &[],
+        &[
+            rel(
+                100,
+                vec![m(MemberId::Way(1), "x"), m(MemberId::Way(2), "y")],
+            ),
+            rel(
+                101,
+                vec![m(MemberId::Way(3), "z"), m(MemberId::Way(3), "z")],
+            ),
+        ],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[node(vec![("b", "2"), ("a", "1")])],
+        &[],
+        &[
+            rel(
+                100,
+                vec![m(MemberId::Way(2), "y"), m(MemberId::Way(1), "x")],
+            ),
+            rel(101, vec![m(MemberId::Way(3), "z")]),
+        ],
+    );
+
+    let (text, stats) = run_diff(
+        &old,
+        &new,
+        DiffOpts {
+            suppress_common: true,
+            verbose: true,
+            ..DiffOpts::default()
+        },
+    );
+    assert_eq!(stats.modified, 3, "text:\n{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let detail = |head: &str| -> Vec<&str> {
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(head))
+            .unwrap_or_else(|| panic!("{head} missing; text:\n{text}"));
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("  "))
+            .copied()
+            .collect()
+    };
+    assert_eq!(detail("*n1"), vec!["  tags: order changed"]);
+    let r100 = detail("*r100");
+    assert_eq!(r100.len(), 2, "reorder detail: {r100:?}");
+    assert!(r100[0].starts_with("  -member way/"), "{r100:?}");
+    assert_eq!(
+        r100[0].replacen('-', "+", 1),
+        r100[1],
+        "a move is a -/+ pair of one member"
+    );
+    assert_eq!(detail("*r101"), vec!["  -member way/3 \"z\""]);
+}
+
 #[test]
 fn verbose_shows_coordinate_details() {
     let dir = crate::common::test_scratch();

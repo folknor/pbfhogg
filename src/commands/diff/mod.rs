@@ -15,6 +15,7 @@
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
 pub mod derive;
+mod seq;
 mod shard;
 mod sharded;
 
@@ -26,7 +27,7 @@ use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, strea
 use crate::owned::TypeFilter;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::{Element, MemberType};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -910,6 +911,21 @@ fn write_tag_diff_iter<'a>(
     let old_map: HashMap<&str, &str> = old_vec.iter().copied().collect();
     let new_map: HashMap<&str, &str> = new_vec.iter().copied().collect();
 
+    // A duplicate key makes the keyed view ambiguous: fall back to the
+    // ordered (key, value) sequence diff, which accounts for every copy.
+    if old_map.len() != old_vec.len() || new_map.len() != new_vec.len() {
+        let edit = seq::seq_diff(&old_vec, &new_vec);
+        for &i in &edit.removed {
+            let (k, v) = old_vec[i];
+            writeln!(output, "  -{k}={v}")?;
+        }
+        for &i in &edit.inserted {
+            let (k, v) = new_vec[i];
+            writeln!(output, "  +{k}={v}")?;
+        }
+        return Ok(());
+    }
+
     for (k, v) in &old_vec {
         if !new_map.contains_key(k) {
             writeln!(output, "  -{k}={v}")?;
@@ -926,6 +942,14 @@ fn write_tag_diff_iter<'a>(
         {
             writeln!(output, "  ~{k}: {old_v} -> {new_v}")?;
         }
+    }
+    // Tag order is element content, so a reorder needs a line of its own.
+    // Only keys present on both sides are compared, so a plain insertion or
+    // removal is not mistaken for a reorder.
+    let common_old = old_vec.iter().filter(|(k, _)| new_map.contains_key(k));
+    let common_new = new_vec.iter().filter(|(k, _)| old_map.contains_key(k));
+    if !common_old.map(|(k, _)| k).eq(common_new.map(|(k, _)| k)) {
+        writeln!(output, "  tags: order changed")?;
     }
     Ok(())
 }
@@ -968,30 +992,31 @@ fn write_member_diff_borrowed(
         .map(|m| m.role().map(|role| (m.id, role)))
         .collect::<Result<_>>()?;
 
-    let new_set: HashSet<(crate::MemberId, &str)> = new_members.iter().copied().collect();
-    let old_set: HashSet<(crate::MemberId, &str)> = old_members.iter().copied().collect();
-
-    for (id, role) in &old_members {
-        if !new_set.contains(&(*id, *role)) {
-            writeln!(
-                output,
-                "  -member {}/{} \"{}\"",
-                member_type_str(id.member_type()),
-                id.id(),
-                role,
-            )?;
-        }
+    // Members are content in order with multiplicity, so the detail is an
+    // ordered edit script: a move or a dropped duplicate is a -member and/or
+    // +member line, never an empty detail.
+    let edit = seq::seq_diff(&old_members, &new_members);
+    for &i in &edit.removed {
+        let (id, role) = old_members[i];
+        writeln!(output, "  -member {} \"{role}\"", MemberLabel(id))?;
     }
-    for (id, role) in &new_members {
-        if !old_set.contains(&(*id, *role)) {
-            writeln!(
-                output,
-                "  +member {}/{} \"{}\"",
-                member_type_str(id.member_type()),
-                id.id(),
-                role,
-            )?;
-        }
+    for &i in &edit.inserted {
+        let (id, role) = new_members[i];
+        writeln!(output, "  +member {} \"{role}\"", MemberLabel(id))?;
     }
     Ok(())
+}
+
+/// `type/id`, with an unknown member type's raw value spelled out
+/// (`unknown(5)/id`): the raw type is part of member identity, so two
+/// unknown members differing only in it must not print identically.
+struct MemberLabel(crate::MemberId);
+
+impl std::fmt::Display for MemberLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.member_type() {
+            MemberType::Unknown(raw) => write!(f, "unknown({raw})/{}", self.0.id()),
+            mt => write!(f, "{}/{}", member_type_str(mt), self.0.id()),
+        }
+    }
 }

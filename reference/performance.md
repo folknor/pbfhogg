@@ -1444,6 +1444,56 @@ Counters emitted (UUID `c1ff6ec9` values):
 - `multi_extract_nodes_written`, `multi_extract_ways_written`,
   `multi_extract_relations_written` (cross-region totals)
 
+## Coordinate scaling (bygg, 2026-10-28)
+
+`71fd420b` below is the measurement build of the commit that landed these
+changes: the same non-test code, with this record and one more unit test
+added when the commit was amended, so the hash in `results.db` is not on
+`main`.
+
+### Columnar granularity-100 shortcut
+
+The columnar dense-node decode (`DenseNodeColumns::decode_append`, used by
+`extract --strategy smart` and multi-extract node classification) once had a
+granularity-100 shortcut, `cumulative + offset / 100`, that skipped the
+per-node multiply and divide. It was added on an estimate (about 8 cycles x
+4B nodes, about 10 s at planet), never measured, and it wrapped at a
+different point from the element accessors, so on a block whose true
+nanodegree value overflows `i64` it classified a node at a different
+coordinate from every other reader. Removing it was measured as matched,
+interleaved `--bench 1` cells on planet, `64e478f8` (with) against
+`71fd420b` (without; the same build also carries the exact node-scanner
+scaling below, which these commands do not run):
+
+| Command | With (s) | Without (s) | Median delta |
+|---|---|---|---:|
+| `extract --strategy smart --bbox=-25.0,34.0,45.0,72.0` | 139.3 `fcd813b1`, 140.3 `61ae1b01`, 141.2 `f73d8063` | 138.3 `2275347f`, 140.9 `c5c4c31f`, 140.9 `069114e2` | +0.4 % |
+| `multi-extract --regions 5 --strategy smart --bbox=-10.0,35.0,32.0,72.0` | 481.5 `c207a1e9`, 487.5 `a0e311f1`, 486.7 `7a65cd87` | 482.9 `71901454`, 487.8 `167d427e`, 487.4 `9137d2c6` | +0.1 % |
+
+Node classification is the phase the shortcut lived in, and it did not
+move: `PASS1_NODE_CLASSIFY` 21.76 s against 21.62 s (`61ae1b01` against
+`c5c4c31f`), about 19 s on both sides in multi-extract. The phase reads
+about 56 GB and runs about 25 cores; it is bound by decompression and I/O,
+not by the scaling arithmetic. The shortcut was deleted.
+
+### Exact node-scanner scaling
+
+The node scanner (`scan/node.rs`, used by add-locations-to-ways and the
+apply-changes `--locations-on-ways` extractors) scales with checked `i64`
+arithmetic and falls back to exact `i128` only when an intermediate
+overflows, so the hot path keeps its `i64` multiply and divide. Matched,
+interleaved `--bench 1` cells on planet, `64e478f8` against `71fd420b`:
+
+| Command | Before (s) | After (s) | Median delta |
+|---|---|---|---:|
+| `add-locations-to-ways --index-type external` | 735.6 `a8fe2f08`, 707.8 `bec9aaf8`, 675.1 `ba12609f` | 669.5 `20585f4b`, 691.2 `73adb2d8`, 698.5 `9874e28c` | -2.3 % |
+| `apply-changes --locations-on-ways`, `altw-keep-untagged` base, OSC 4913 | 335.6 `c5ff6ab4`, 307.3 `f95e13b2`, 307.5 `558d3e1e` | 311.5 `029a1e71`, 305.5 `b40e1b3c`, 310.8 `49d568d7` | +1.1 % |
+
+Both inside noise, with mixed signs across pairs. The altw pair that
+overlapped a manual disk cleanup (`974d616a` / `10f71ab4`) was discarded and
+rerun as `ba12609f` / `9874e28c`. The altw node stage reads about 199 GB at
+under 3 cores, so it is I/O bound. No fstrim preceded these cells.
+
 ## Tags-filter
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel

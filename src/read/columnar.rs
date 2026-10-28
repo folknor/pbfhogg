@@ -91,50 +91,35 @@ impl DenseNodeColumns {
             self.ids.push(cumulative_id);
         }
 
-        // Fast path for standard granularity (100, the default for nearly all
-        // PBFs): eliminates the per-node multiply + divide entirely.
-        // nano = offset + 100 * cumulative → decimicro = nano / 100
-        //      = cumulative + offset / 100
-        if granularity == 100 && lat_offset % 100 == 0 && lon_offset % 100 == 0 {
-            // Add in i64 before the final i32 narrowing, as the general
-            // path does: adding narrowed operands panics in debug on an
-            // offset or coordinate near the i32 edge. Scaling and offsets
-            // wrap rather than being validated (see "What is deliberately
-            // not checked" on block construction in `block.rs`), so a value
-            // past i64 is garbage, and this path and the general one need
-            // not agree on which garbage.
-            let lat_off_e7 = lat_offset / 100;
-            let lon_off_e7 = lon_offset / 100;
+        // One scaling for every granularity, the element accessors' own:
+        // nanodegrees = offset + granularity * cumulative modulo 2^64, then
+        // / 100 truncating toward zero and narrowed by `as i32`. Scaling and
+        // offsets wrap rather than being validated (see "What is
+        // deliberately not checked" on block construction in `block.rs`),
+        // and because this is the accessors' arithmetic step for step, a
+        // node classifies at the same coordinate here as in every reader
+        // built on the accessors, even when the true value is past `i64`.
+        //
+        // There is deliberately no granularity-100 shortcut
+        // (`cumulative + offset / 100`, skipping the multiply and divide).
+        // One existed; it wrapped at a different point from the accessors,
+        // so on a block whose true nanodegree value overflows `i64` it put
+        // the node somewhere else than a simple extract does, and a matched
+        // planet A/B of extract --strategy smart and multi-extract found
+        // its removal inside noise (reference/performance.md, "Columnar
+        // granularity-100 shortcut").
+        let mut cumulative_lat: i64 = 0;
+        for delta in PackedSint64Iter::new(dense.lat_data) {
+            cumulative_lat = cumulative_lat.wrapping_add(delta);
+            let nano = lat_offset.wrapping_add(gran.wrapping_mul(cumulative_lat));
+            self.lats.push((nano / 100) as i32);
+        }
 
-            let mut cumulative_lat: i64 = 0;
-            for delta in PackedSint64Iter::new(dense.lat_data) {
-                cumulative_lat = cumulative_lat.wrapping_add(delta);
-                self.lats
-                    .push(cumulative_lat.wrapping_add(lat_off_e7) as i32);
-            }
-
-            let mut cumulative_lon: i64 = 0;
-            for delta in PackedSint64Iter::new(dense.lon_data) {
-                cumulative_lon = cumulative_lon.wrapping_add(delta);
-                self.lons
-                    .push(cumulative_lon.wrapping_add(lon_off_e7) as i32);
-            }
-        } else {
-            // General path for non-standard granularity. Scaling wraps, as
-            // in the element accessors.
-            let mut cumulative_lat: i64 = 0;
-            for delta in PackedSint64Iter::new(dense.lat_data) {
-                cumulative_lat = cumulative_lat.wrapping_add(delta);
-                let nano = lat_offset.wrapping_add(gran.wrapping_mul(cumulative_lat));
-                self.lats.push((nano / 100) as i32);
-            }
-
-            let mut cumulative_lon: i64 = 0;
-            for delta in PackedSint64Iter::new(dense.lon_data) {
-                cumulative_lon = cumulative_lon.wrapping_add(delta);
-                let nano = lon_offset.wrapping_add(gran.wrapping_mul(cumulative_lon));
-                self.lons.push((nano / 100) as i32);
-            }
+        let mut cumulative_lon: i64 = 0;
+        for delta in PackedSint64Iter::new(dense.lon_data) {
+            cumulative_lon = cumulative_lon.wrapping_add(delta);
+            let nano = lon_offset.wrapping_add(gran.wrapping_mul(cumulative_lon));
+            self.lons.push((nano / 100) as i32);
         }
     }
 
@@ -260,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn columnar_fast_path_adds_offset_before_narrowing() {
+    fn columnar_scaling_adds_offset_before_narrowing() {
         let coordinate = [0xfe, 0xff, 0xff, 0xff, 0x0f]; // zigzag(i32::MAX)
         let dense = WireDenseNodes {
             id_data: &[2],

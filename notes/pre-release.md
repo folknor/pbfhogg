@@ -97,21 +97,11 @@ v2). The CLI surface redesign is deferred past 0.6.0.
     reorder or a dropped duplicate prints the modification with no member
     lines. Open: diff member order (osmium's CRC is order-sensitive), or say
     "member order or multiplicity changed".
-  - `#21` (p2): `decimicro` in `scan/node.rs` (altw and `apply-changes -l`
-    coordinate extraction) checks the product and the add separately in
-    `i64`, so it refuses the cancelling encoding `check --index`, the scanner
-    and the element accessors accept. Not blocked on `#23`: it needs its own
-    planet A/B of altw (and `apply-changes -l`) before a fix lands. The
-    fallback-only variant (checked `i64` first, `i128` on `None`) leaves the
-    hot path unchanged. Low priority: no real producer emits such offsets.
-  - `#22` (p2, blocked by `#23`): the columnar granularity-100 fast path and
-    the element accessors give different garbage when the true nanodegree
-    value overflows `i64`. Rejecting at block construction was considered
-    and turned down earlier (`7de3b144`). Resolved by `#23`'s outcome: below
-    noise, delete the fast path and the paths agree by construction; above
-    it, record the divergence durably. Either way add a test pinning
-    columnar, accessors and scanner on the cancelling encoding.
-  - `#23` (p2): measure that fast path; cell in the campaign below.
+  - `#21`, `#22`, `#23`: done 2026-10-28. The node scanner and the
+    apply-changes way-location refresh scale exactly (checked `i64`, `i128`
+    on overflow); the columnar granularity-100 shortcut is deleted. Planet
+    A/Bs of all four commands were inside noise; numbers in
+    `reference/performance.md` "Coordinate scaling".
 - **`packed_varint_count`** (`e61e0ad7`): ruled measure first, then decide;
   the decision tree is with its cell below.
 - **diff `-j 1`**: if its cell shows it clearly worse, give one-shard runs a
@@ -195,12 +185,12 @@ From AGENTS.md and the record, the rules that matter most here:
   4 handoff `reference/performance.md` names as planet's streaming
   constraint. A small code change; the rest of that entry stays backlog.
 - Variant builds that are code changes, each its own commit: the shared
-  walker descriptor variant, `#23`'s fast-path-removed variant, `#21`'s fix,
-  and, depending on its first cell, the `packed_varint_count` masked fast
-  path.
-- Inputs: the planet `pbf.altw` variant for `apply-changes -l` (Denmark has
-  none, so `brokkr verify merge` never runs `-l`; whether brokkr's
-  apply-changes passes `-l` is unchecked); a Denmark unsorted snapshot for the
+  walker descriptor variant and, depending on its first cell, the
+  `packed_varint_count` masked fast path.
+- Inputs: the planet `altw-keep-untagged` variant for `apply-changes -l`,
+  passed by brokkr's `--locations-on-ways` (the plain `pbf.altw` base is
+  refused: OSC 4913 references about 4.2M nodes it dropped as untagged;
+  Denmark has neither, so `brokkr verify merge` never runs `-l`); a Denmark unsorted snapshot for the
   sort cell (`unsorted` and `test-unsorted` are registered); an unindexed
   Europe or planet input for `sort --force` (`pbf.raw`).
 - Already done, no longer owed: the merge engine's pass split and stall
@@ -262,7 +252,8 @@ behind a slow head for no memory gain; with `--keep-untagged-nodes`, stage 4
 copying the node prefix only after the first way result. The audit specified
 `60e1b691` vs `56a50e0d`; that pair measures the window-deep channel the fix
 removed, so pair `60e1b691` against `c2409c45` (the shape that ships) and
-bisect inside if it moves. Phase split first, in this order:
+bisect inside if it moves. (The `#23` cell named at the end of this item
+is done.) Phase split first, in this order:
 
 1. `add-locations-to-ways --index-type external` on planet, zlib:6: stage 1
    and stage 4 walls, peak anon, `s4_*`.
@@ -396,8 +387,7 @@ moves.
   hands the walker's descriptor to the workers. Renumber is not on the
   shared-walker side (its one shared body descriptor is a different
   question), and `InputFront` is a probe closed before any pass.
-- `#21`'s fix, when written: planet altw (and `apply-changes -l`), HEAD vs
-  the fix.
+- `#21`'s fix: done 2026-10-28, inside noise on both.
 
 **8. apply-changes.**
 

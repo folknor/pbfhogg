@@ -224,8 +224,9 @@ impl CoordFraming {
         self == Self::DEFAULT
     }
 
-    /// `(lat, lon)` in decimicrodegrees from accumulated raw values, in
-    /// checked arithmetic. Truncates toward zero, like the node scanners.
+    /// `(lat, lon)` in decimicrodegrees from accumulated raw values, by the
+    /// node scanner's exact scaling (`scan::node::scale_to_decimicro`).
+    /// Truncates toward zero, like the node scanners.
     #[inline]
     fn decimicro(self, raw_lat: i64, raw_lon: i64) -> Result<(i32, i32)> {
         Ok((
@@ -237,16 +238,7 @@ impl CoordFraming {
 
 #[inline]
 fn scale(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
-    let nano = granularity
-        .checked_mul(raw)
-        .and_then(|scaled| offset.checked_add(scaled))
-        .ok_or_else(|| {
-            new_wire_error(
-                "way node location arithmetic overflowed i64; the block's \
-                 granularity, offset, or coordinate deltas are corrupt",
-            )
-        })?;
-    i32::try_from(nano / 100).map_err(|_| {
+    crate::scan::node::scale_to_decimicro(offset, granularity, raw).ok_or_else(|| {
         new_wire_error(
             "way node location does not fit in an i32 decimicrodegree; the \
              block's granularity, offset, or coordinate deltas are corrupt",
@@ -673,6 +665,22 @@ mod tests {
         assert!(!detect(&last_scaled, &scaled).stale);
         let last_default = two_group_block(&[(17, 1000), (19, 500), (17, 100), (19, 0)]);
         assert!(detect(&last_default, &scaled).stale);
+    }
+
+    /// Way locations scale exactly, like the node scanner: a raw latitude
+    /// whose product with the granularity overflows `i64` but which the
+    /// offset cancels to 100 nanodegrees reads as 1 decimicrodegree, where
+    /// the old checked `i64` arithmetic refused the blob.
+    #[test]
+    fn wire_detection_accepts_the_cancelling_encoding() {
+        let block = block(
+            &[group(&[way(2, &[7], &[92_233_720_368_547_759], &[0])])],
+            &[(19, -9_223_372_036_854_775_800)],
+        );
+        let exact = probe(&[(7, ProbeEntry::Upserted(1, 0))]);
+        assert!(!detect(&block, &exact).stale);
+        let other = probe(&[(7, ProbeEntry::Upserted(2, 0))]);
+        assert!(detect(&block, &other).stale);
     }
 
     /// A clean blob's deleted-node refs are counted across every group.

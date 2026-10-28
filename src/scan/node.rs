@@ -37,28 +37,55 @@ pub(crate) struct NodeTuple {
     pub lon: i32,
 }
 
-/// Error for coordinate scaling (`offset + granularity * raw`) that ran past
-/// `i64`.
-fn overflow_err() -> crate::error::Error {
-    crate::error::new_wire_error(
-        "node coordinate arithmetic overflowed i64; the blob's \
-         granularity, offset, or coordinate deltas are corrupt",
-    )
-}
-
-/// `(offset + granularity * raw) / 100`, in checked arithmetic, narrowed to
-/// the decimicrodegree `i32` the rest of the codebase carries.
+/// The exact `(offset + granularity * raw) / 100`, truncated toward zero,
+/// narrowed to the decimicrodegree `i32` the rest of the codebase carries,
+/// or `None` when the exact value does not fit `i32`.
+///
+/// The arithmetic is exact, not checked per step: a product that overflows
+/// `i64` but is cancelled by the offset (granularity 100, raw
+/// 92_233_720_368_547_759, offset -9_223_372_036_854_775_800 is latitude 100
+/// nanodegrees) is accepted, as `transform_range` in `blob_meta/scan.rs`
+/// (`check --index`) and the wrapping element accessors accept it. The
+/// common case runs the checked `i64` path and its `i64` division; only an
+/// intermediate overflow takes the cold `i128` path, so the per-node cost of
+/// the altw scanner and the apply-changes extractors is unchanged. A final
+/// nanodegree value outside `i64` can never narrow into `i32` after `/ 100`,
+/// so the fallback only ever admits cancelled intermediates.
+///
+/// Rounding is truncation toward zero, like the accessors. It is not
+/// `transform_range`'s rounding: that computes a box and floors its low edge
+/// and ceils its high edge, so for a value not divisible by 100 the point
+/// lies inside the box rather than equal to an edge.
 ///
 /// The narrowing is checked rather than truncating: `as i32` on an
 /// out-of-range value silently produces a plausible-looking coordinate
 /// somewhere else on Earth, which is exactly the class of silent corruption
-/// this scanner must not manufacture from untrusted metadata.
-fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
-    let nano = granularity
+/// the paths that vouch for their output must not manufacture from
+/// untrusted metadata. Each caller words its own refusal.
+#[inline]
+pub(crate) fn scale_to_decimicro(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
+    match granularity
         .checked_mul(raw)
         .and_then(|scaled| offset.checked_add(scaled))
-        .ok_or_else(overflow_err)?;
-    i32::try_from(nano / 100).map_err(|_| {
+    {
+        Some(nano) => i32::try_from(nano / 100).ok(),
+        None => scale_to_decimicro_wide(offset, granularity, raw),
+    }
+}
+
+/// The exact `i128` fallback of [`scale_to_decimicro`]. Three `i64`
+/// operands cannot overflow `i128` here: the product is below `2^126`.
+#[cold]
+#[inline(never)]
+fn scale_to_decimicro_wide(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
+    let nano = i128::from(offset) + i128::from(granularity) * i128::from(raw);
+    i32::try_from(nano / 100).ok()
+}
+
+/// [`scale_to_decimicro`] with this scanner's refusal.
+#[inline]
+fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
+    scale_to_decimicro(offset, granularity, raw).ok_or_else(|| {
         crate::error::new_wire_error(
             "node coordinate does not fit in an i32 decimicrodegree; \
              the blob's granularity, offset, or deltas are corrupt",
@@ -325,7 +352,7 @@ pub(crate) fn extract_node_coords(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ElementKind, KindSet, NodeTuple, extract_node_tuples};
+    use super::{ElementKind, KindSet, NodeTuple, extract_node_tuples, scale_to_decimicro};
 
     fn varint(mut v: u64, out: &mut Vec<u8>) {
         loop {
@@ -599,9 +626,57 @@ mod tests {
         let err = scan(&dense_block(&[1, 2], &[i64::MAX, i64::MAX], &[0, 0], &[]))
             .expect_err("a coordinate outside the scalable range must be refused");
         assert!(
-            err.to_string().contains("overflow"),
-            "expected an overflow guard. Got: {err}"
+            err.to_string().contains("does not fit in an i32"),
+            "expected the narrowing guard. Got: {err}"
         );
+    }
+
+    /// Exact scaling: an intermediate product past `i64` that the offset
+    /// cancels is accepted, at the value `transform_range` and the wrapping
+    /// accessors give, and truncates toward zero like the accessors.
+    #[test]
+    fn scale_to_decimicro_is_exact_and_truncates_toward_zero() {
+        let raw = 92_233_720_368_547_759_i64;
+        let offset = -9_223_372_036_854_775_800_i64;
+        assert!(100_i64.checked_mul(raw).is_none(), "product must overflow");
+        // 100 * raw + offset = 100 nanodegrees = 1 decimicrodegree.
+        assert_eq!(scale_to_decimicro(offset, 100, raw), Some(1));
+        // Wrapping arithmetic, as the accessors do, agrees.
+        assert_eq!(
+            offset.wrapping_add(100_i64.wrapping_mul(raw)) / 100,
+            1,
+            "accessor arithmetic"
+        );
+        // Negative cancellation with a nonzero remainder: -101 nano -> -1.
+        let neg_raw = -92_233_720_368_547_759_i64;
+        let neg_off = 9_223_372_036_854_775_799_i64; // 100*neg_raw + neg_off = -101
+        assert!(100_i64.checked_mul(neg_raw).is_none());
+        assert_eq!(scale_to_decimicro(neg_off, 100, neg_raw), Some(-1));
+        // Addition-only overflow, cancelled by nothing: refused.
+        assert_eq!(scale_to_decimicro(i64::MAX, 1, 1), None);
+        // Multiplication overflow that does not cancel: refused.
+        assert_eq!(scale_to_decimicro(0, 100, raw), None);
+        // i32 edges and their neighbours, in the fast path.
+        let max = i64::from(i32::MAX) * 100;
+        let min = i64::from(i32::MIN) * 100;
+        assert_eq!(scale_to_decimicro(0, 1, max + 99), Some(i32::MAX));
+        assert_eq!(scale_to_decimicro(0, 1, max + 100), None);
+        assert_eq!(scale_to_decimicro(0, 1, min - 99), Some(i32::MIN));
+        assert_eq!(scale_to_decimicro(0, 1, min - 100), None);
+    }
+
+    /// The cancelling encoding scans through the dense path to the value the
+    /// accessors give, rather than being refused as an overflow.
+    #[test]
+    fn cancelling_encoding_scans() {
+        let tuples = scan(&dense_block(
+            &[1],
+            &[92_233_720_368_547_759],
+            &[0],
+            &[(19, -9_223_372_036_854_775_800)],
+        ))
+        .unwrap();
+        assert_eq!((tuples[0].lat, tuples[0].lon), (1, 0));
     }
 
     /// BUG-183: the dense loop used to zip three infallible packed iterators

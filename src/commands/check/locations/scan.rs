@@ -10,10 +10,12 @@
 //!
 //! - **Exact coordinates.** A coordinate is `offset + granularity * raw`
 //!   nanodegrees, computed in `i128`, where the reader computes it in `i64`
-//!   with wrapping arithmetic and `crate::scan::node` refuses an `i64`
-//!   overflow. A multiplication that overflows `i64` can be cancelled by the
-//!   offset into a legal coordinate, so neither "wrap" nor "overflow is an
-//!   error" judges such a value correctly. Delta accumulation of the raw
+//!   with wrapping arithmetic. A multiplication that overflows `i64` can be
+//!   cancelled by the offset into a legal coordinate; wrapping reaches the
+//!   exact value whenever it fits `i64` but turns a value past `i64` into
+//!   another, so wrap alone cannot judge it. `crate::scan::node` is exact
+//!   too (checked `i64`, `i128` on overflow) but bounds only the e7 range,
+//!   not the geographic domain checked here. Delta accumulation of the raw
 //!   values still wraps in `i64`, exactly as the reader's does, so the raw
 //!   value is the one every reader decodes. Granularity is read as the reader
 //!   reads it (any `int32`).

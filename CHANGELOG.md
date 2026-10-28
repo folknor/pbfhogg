@@ -1422,6 +1422,17 @@
 
 ### Fixed
 
+- **Every reader puts a node at the same coordinate.**
+  `add-locations-to-ways` and `apply-changes --locations-on-ways` refused a
+  node block whose `granularity * raw` overflows `i64` even when the
+  block's offset brings the value back into range ("node coordinate
+  arithmetic overflowed i64"); they now scale exactly and refuse only a
+  coordinate that does not fit an `i32` decimicrodegree, matching
+  `check --index` and the element accessors. `extract --strategy smart`
+  and `multi-extract` could classify a node from a block whose true
+  coordinate is past `i64` at a different point from `extract --simple`;
+  they now use the accessors' arithmetic. Valid files are unaffected.
+
 - **A geocode index whose rollback stops halfway is reported as missing,
   not as still in place.** When replacing an index failed after the new
   index was installed, the rollback moves the new index out before putting

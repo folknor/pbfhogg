@@ -18,8 +18,9 @@
 //! the same winner the iterator would.
 //!
 //! All coordinate scaling is checked: granularity must be positive and at
-//! most one degree per unit, `offset + granularity * raw` must not overflow
-//! `i64`, and the decimicrodegree result must fit in `i32`. Dense delta
+//! most one degree per unit, and the exact `offset + granularity * raw`,
+//! computed without intermediate overflow, must fit an `i32` decimicrodegree
+//! after truncation toward zero. Dense delta
 //! accumulation is modular, as in the decoder and the writer, so IDs that
 //! wrap extract as the values every reader yields; a coordinate sum that
 //! wraps lands at least 2^63 from the previous, accepted one, outside the

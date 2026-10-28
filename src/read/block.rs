@@ -1671,6 +1671,91 @@ mod strict_validation_tests {
         out
     }
 
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            #[allow(clippy::cast_possible_truncation)]
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(v as u8);
+    }
+
+    /// A block holding one dense node with the given raw lat (lon 0) under
+    /// the given granularity and lat_offset.
+    fn scaled_dense_block(granularity: i32, lat_offset: i64, raw_lat: i64) -> PrimitiveBlock {
+        let zz = |v: i64| ((v << 1) ^ (v >> 63)).cast_unsigned();
+        let mut lat = Vec::new();
+        varint(zz(raw_lat), &mut lat);
+        let mut dense = len_field(1, &[0x02]);
+        dense.extend_from_slice(&len_field(8, &lat));
+        dense.extend_from_slice(&len_field(9, &[0x00]));
+        let mut buffer = block_with_groups(&[len_field(2, &dense)]);
+        varint(17 << 3, &mut buffer);
+        varint(i64::from(granularity).cast_unsigned(), &mut buffer);
+        varint(19 << 3, &mut buffer);
+        varint(lat_offset.cast_unsigned(), &mut buffer);
+        PrimitiveBlock::from_vec(buffer).unwrap()
+    }
+
+    /// Every dense-node reader puts a node at the same coordinate: the
+    /// columnar decode (extract smart, multi-extract) and the element
+    /// accessors (every other reader) always, and the vouching node scanner
+    /// (altw, apply-changes -l) wherever it accepts the value. That holds on
+    /// the cancelling encoding, whose product overflows `i64` while the
+    /// offset brings it back to 100 nanodegrees, and on a block whose true
+    /// nanodegree value is past `i64`, where columnar and accessors give the
+    /// same wrapped value (the deleted granularity-100 shortcut did not).
+    #[test]
+    fn columnar_accessors_and_scanner_agree_on_coordinates() {
+        let cases: [(i32, i64, i64); 5] = [
+            (100, 0, 550_000_000),
+            (100, -9_223_372_036_854_775_800, 92_233_720_368_547_759),
+            (100, 9_223_372_036_854_775_799, -92_233_720_368_547_759),
+            (1000, 500, -35),
+            // True value 100 * (i64::MAX / 50) is past i64.
+            (100, 0, i64::MAX / 50),
+        ];
+        for (granularity, lat_offset, raw_lat) in cases {
+            let block = scaled_dense_block(granularity, lat_offset, raw_lat);
+            let mut columns = crate::read::columnar::DenseNodeColumns::new();
+            block.decode_dense_columns(&mut columns);
+            let accessor: Vec<i32> = block
+                .elements()
+                .filter_map(|e| match e {
+                    Element::DenseNode(n) => Some(n.decimicro_lat()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                columns.lats, accessor,
+                "case {granularity} {lat_offset} {raw_lat}"
+            );
+            if let Some(scanned) =
+                crate::scan::node::scale_to_decimicro(lat_offset, i64::from(granularity), raw_lat)
+            {
+                assert_eq!(accessor, [scanned], "scanner, case {lat_offset} {raw_lat}");
+            }
+        }
+        // The cancelling encodings scan, at 1 and -1 decimicrodegrees.
+        assert_eq!(
+            crate::scan::node::scale_to_decimicro(
+                -9_223_372_036_854_775_800,
+                100,
+                92_233_720_368_547_759
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            crate::scan::node::scale_to_decimicro(
+                9_223_372_036_854_775_799,
+                100,
+                -92_233_720_368_547_759
+            ),
+            Some(-1)
+        );
+    }
+
     /// A DenseNodes group whose packed id/lat/lon arrays hold the given counts
     /// of one-byte varints.
     fn dense_group(ids: usize, lats: usize, lons: usize) -> Vec<u8> {

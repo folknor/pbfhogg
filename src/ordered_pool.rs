@@ -59,7 +59,11 @@
 //!   After a worker panic the consumer learns of it only once every other
 //!   worker has finished its admitted task and gone (the missing task then
 //!   fails the run), so a worker parked on a wait outside the pool keeps the
-//!   run alive until that wait ends.
+//!   run alive until that wait ends, unless the worker that panicked
+//!   releases the wait during its own unwind (altw stage 4 guards each
+//!   worker body to abort its router). The pool does not turn a task panic
+//!   into an ordered failure: `abandon` would then still wait for every
+//!   lower task, a lower one parked on that same wait included.
 //!
 //! # Stall counters
 //!
@@ -335,8 +339,8 @@ impl Drop for CloseOnDrop<'_> {
 }
 
 /// Closes the gate if the holding thread unwinds, so the other workers stop
-/// claiming and the ones parked on the gate wake. Workers
-/// install it before running any caller code (their local init included).
+/// claiming and the ones parked on the gate wake. Workers install it before
+/// running any caller code (their local init included).
 struct CloseOnUnwind<'a>(&'a OrderedGate);
 
 impl Drop for CloseOnUnwind<'_> {
@@ -426,8 +430,10 @@ pub(crate) trait OrderedConsumer<T> {
     /// below a worker's failing one has been consumed by then, so releasing
     /// the wait cannot fail an earlier task.
     ///
-    /// Not called on success, on a consumer panic (a consumer that needs
-    /// the release then guards its own callbacks), or for a failure before
+    /// Not called on success, on a panic (a consumer that needs the release
+    /// then guards its own callbacks against a consumer panic, and its
+    /// worker bodies against a worker panic, as altw stage 4 does), or for
+    /// a failure before
     /// the workers start (an empty pool, a cancellation already tripped).
     /// It must neither wait for the workers nor panic: it runs ahead of
     /// their join, and a panic would replace `error`.

@@ -274,6 +274,10 @@ pub struct FaultPlan {
     pub altw_stage4_fail_consume_at: AtomicUsize,
     /// The same, panicking instead of returning an error.
     pub altw_stage4_panic_consume_at: AtomicUsize,
+    /// Decode ordinal at which a stage 4 worker panics as it starts the
+    /// task, once the held stage 3 bucket is claimed and another worker has
+    /// reached its readiness wait for way blob 0 (bounded).
+    pub altw_stage4_panic_work_at: AtomicUsize,
     /// Set by a stage 4 worker just before it waits on the router for way
     /// blob 0.
     pub altw_stage4_way0_entered: AtomicBool,
@@ -413,6 +417,7 @@ impl FaultPlan {
             altw_stage4_fail_at_start: AtomicBool::new(false),
             altw_stage4_fail_consume_at: AtomicUsize::new(usize::MAX),
             altw_stage4_panic_consume_at: AtomicUsize::new(usize::MAX),
+            altw_stage4_panic_work_at: AtomicUsize::new(usize::MAX),
             altw_stage4_way0_entered: AtomicBool::new(false),
             altw_hook_timed_out: AtomicBool::new(false),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
@@ -900,6 +905,20 @@ impl FaultPlan {
         if way_blob_idx == 0 {
             self.altw_stage4_way0_entered.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Called by a stage 4 worker as it starts decode ordinal `ordinal`:
+    /// panics there, as armed, once the held stage 3 bucket has been
+    /// claimed and a worker is at its readiness wait for way blob 0.
+    pub(crate) fn on_altw_stage4_work(&self, ordinal: usize) {
+        if ordinal != self.altw_stage4_panic_work_at.load(Ordering::SeqCst) {
+            return;
+        }
+        self.wait_until(&self.altw_hook_timed_out, || {
+            self.altw_stage3_bucket_held.load(Ordering::SeqCst)
+                && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
+        });
+        panic!("test-hooks: stage 4 worker panicking at ordinal {ordinal}");
     }
 
     /// Called as stage 4 starts: fails it, as armed, once the held stage 3

@@ -1138,7 +1138,7 @@ pub(crate) fn external_join_in(
         // bucket claim instead of finishing the rest for nobody: on a returned
         // error here, and through the guard on a panic. Failures inside the
         // ordered pool abort earlier, before the pool joins its workers (see
-        // `S4Consumer`); this covers everything else (the schedule, the
+        // `S4Consumer` and the worker guards in `stage4_assembly`); this covers everything else (the schedule, the
         // writer, the final flush). An abort already raised keeps its first
         // error.
         let s4_handle = scope.spawn(move || -> crate::Result<Stats> {

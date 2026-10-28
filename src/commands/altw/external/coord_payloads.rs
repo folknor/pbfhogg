@@ -493,7 +493,8 @@ impl Clone for BlobLocation {
 }
 
 /// Panic-safe bilateral cancellation guard. Each stage 3 worker, the stage 4
-/// thread and stage 4's consumer callbacks build one on entry and call
+/// thread, stage 4's consumer callbacks and stage 4's worker bodies (task
+/// and local init) build one on entry and call
 /// `disarm` on every return, an error included. If the holder panics
 /// instead, the `Drop` impl fires `router.abort`, which wakes every
 /// `wait_ready` caller via `notify_all` and stops stage 3 at its next bucket

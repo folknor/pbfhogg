@@ -170,7 +170,8 @@ struct S4Local {
 /// slot stage 3 has not published, and the join would otherwise wait for
 /// stage 3 to get there. A returned error aborts through `abandon`; a panic
 /// in either callback aborts through the guard each one holds, during the
-/// unwind, which also runs before the join.
+/// unwind, which also runs before the join. A worker panic aborts through
+/// the guard around each worker body (see `stage4_assembly`).
 struct S4Consumer<'a> {
     router: &'a super::coord_payloads::ConcurrentBlobLocationRouter,
     interleaved: crate::ordered_pool::Interleaved<'a>,
@@ -509,7 +510,8 @@ pub(super) fn stage4_assembly(
     // Dedicated threads, NOT global rayon (PbfWriter uses rayon for
     // compression). Cancellation is checked on the consumer; workers parked
     // in `wait_ready` are woken by stage 3, which observes the same token
-    // per bucket and aborts the router.
+    // per bucket and aborts the router. A worker panic (task body or local
+    // init) aborts the router through the worker's own guard.
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
         decode_at.len(),
@@ -525,17 +527,33 @@ pub(super) fn stage4_assembly(
                 ..crate::ordered_pool::Waits::default()
             },
         },
-        |_| S4Local {
-            read_buf: Vec::new(),
-            decompress_buf: Vec::new(),
-            bb: BlockBuilder::new(),
-            output_blocks: Vec::new(),
-            way_reframe_scratch: WayReframeScratch::new(),
-            reframe_output: Vec::new(),
-            coord_payload_buf: Vec::new(),
+        |_| {
+            let guard = AbortOnDrop::new(coord_payloads_reader, "stage 4 worker");
+            let local = S4Local {
+                read_buf: Vec::new(),
+                decompress_buf: Vec::new(),
+                bb: BlockBuilder::new(),
+                output_blocks: Vec::new(),
+                way_reframe_scratch: WayReframeScratch::new(),
+                reframe_output: Vec::new(),
+                coord_payload_buf: Vec::new(),
+            };
+            guard.disarm();
+            local
         },
         |(), l: &mut S4Local, ordinal| {
             use std::sync::atomic::Ordering::Relaxed;
+            // A worker panic aborts the router during its unwind, so the
+            // other workers parked in `wait_ready` wake and stage 3 stops.
+            // The pool alone would not: it learns of a worker panic only
+            // once every other worker has finished its admitted task, and
+            // a parked one finishes only when stage 3 publishes its slot.
+            // Disarmed only at the one return below, Ok or Err alike: a
+            // returned error stays an ordered failure and reaches the
+            // router through `abandon`.
+            let guard = AbortOnDrop::new(coord_payloads_reader, "stage 4 worker");
+            #[cfg(feature = "test-hooks")]
+            host.invocation.faults().on_altw_stage4_work(ordinal);
             let desc = &schedule[decode_at[ordinal]];
             let file = &shared_file;
 
@@ -735,6 +753,7 @@ pub(super) fn stage4_assembly(
                 record_max(&c.max_worker_buf_bytes, worker_bytes);
             }
 
+            guard.disarm();
             // The pool times the send (`s4_send_ms`), opens the
             // WAIT_S4_SEND span only when the result channel is full,
             // and records the channel's depth high-water

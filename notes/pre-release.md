@@ -89,12 +89,6 @@ v2). The CLI surface redesign is deferred past 0.6.0.
 
 - **bz issues filed in this work** (run `bz show pbfhogg#N` for the full
   text):
-  - `#17` (p2, parked): after a worker panic in altw external stage 4 the run
-    lingers until stage 3 publishes the slot the parked worker awaits.
-    Correctness intact, only promptness. Undecided between a drop guard on
-    the stage 4 worker body that aborts the router, and a worker-panic hook
-    in `run_ordered` that calls the consumer's `abandon`. Needs a test-hooks
-    fault case to pin it.
   - `#18` (p3, waiting on brokkr's source): whether `brokkr sidecar
     --compare` matches a repeated phase name to its first occurrence only.
     No stored run repeats a marker name, so existing data cannot settle it.

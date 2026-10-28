@@ -70,7 +70,12 @@ and any consumer exit closes the gate and drops the result receiver before
 the scope joins. Work already admitted is not interrupted, but a failing run
 calls the consumer's `abandon` first, which altw stage 4 uses to abort its
 router so workers parked in its readiness wait are released before the
-join. Every run records its gate, send and receive waits into its
+join. `abandon` covers returned errors only; a panic never reaches it, so
+stage 4 also guards its consumer callbacks and each worker body, and the
+guard aborts the router during the unwind. A worker panic otherwise reaches
+the consumer only once every other worker has finished its admitted task,
+which a worker parked in the readiness wait does only when stage 3 publishes
+its slot. Every run records its gate, send and receive waits into its
 invocation's one set of stall counters (`ordered_pool_*_wait_ns`).
 
 Where only some schedule positions are decoded and the rest are passthrough

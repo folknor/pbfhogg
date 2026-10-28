@@ -137,3 +137,23 @@ fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
     assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
     assert_stage3_stopped(&host);
 }
+
+/// A worker panic, with another worker waiting on the held bucket, aborts
+/// the router through the worker's own guard during its unwind. The pool
+/// would not release the parked worker by itself: it learns of a worker
+/// panic only once every other worker has finished its task.
+#[test]
+fn a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3() {
+    let host = crate::common::test_host();
+    let faults = host.invocation.faults();
+    faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+    faults.altw_stage4_panic_work_at.store(0, Ordering::SeqCst);
+
+    let err = run_failing(&host);
+    assert!(
+        err.contains("stage 4 thread"),
+        "the run failed, but not with stage 4's panic: {err}"
+    );
+    assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
+    assert_stage3_stopped(&host);
+}

@@ -1,7 +1,7 @@
 //! The output-header contract, enforced on every PBF-writing subcommand by one
 //! table.
 //!
-//! The contract is `reference/cli-reference.md` "Output header": a header
+//! The contract is `docs/cli/commands.md` "Output header": a header
 //! never claims more than the output contains, and every command derives its
 //! header from the same rule (`src/commands/output_header.rs`). For every row
 //! of [`ROWS`], over every fixture of [`Fixture`]:

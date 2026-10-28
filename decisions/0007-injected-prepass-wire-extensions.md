@@ -23,7 +23,7 @@ remain unpinned, preserving the existing zero-coordinate sentinel behavior.
 
 The extension is opt-in. Normal ALTW output remains compatible with existing
 flows. Commands that rewrite way payloads do not preserve these extensions.
-The output-header policy (`reference/cli-reference.md` "Output header")
+The output-header policy (`docs/cli/commands.md` "Output header")
 declares them on a command's output only where every way blob is copied whole
 from a single input with nothing added, and warns when it stops declaring
 them. The fields are authoritative only in a file whose header declares them:

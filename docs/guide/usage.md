@@ -34,7 +34,7 @@ Many commands are faster with blob-level indexdata. Generate an indexed PBF with
 pbfhogg cat denmark-raw.osm.pbf -o denmark.osm.pbf
 ```
 
-This passthrough path adds indexdata without re-compressing blobs, with minimal memory, so it suits planet-scale files; see [Performance](./performance) for measurements. A blob that already carries indexdata is copied as it is; `cat --reindex` rebuilds indexdata from the payload when it is suspect.
+This passthrough path adds indexdata without re-compressing blobs, with minimal memory, so it suits planet-scale files; see [Performance](./performance.md) for measurements. A blob that already carries indexdata is copied as it is; `cat --reindex` rebuilds indexdata from the payload when it is suspect.
 
 ## Extracting a region
 
@@ -124,35 +124,30 @@ pbfhogg getid denmark.osm.pbf -o filtered.osm.pbf --invert n123 w456
 
 ## The --force flag
 
-Commands that benefit from indexdata (`apply-changes`, `sort`, `extract`, `tags-filter`, `getid`, `add-locations-to-ways`, and others) will error if the input PBF lacks it. Pass `--force` to proceed without indexdata - the command will work but use slower fallback paths:
+Many commands refuse an input without indexdata. On those that offer it,
+`--force` runs the slower fallback instead:
 
 ```sh
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
 ```
 
-`renumber` has no such escape and `build-geocode-index` uses `--allow-unindexed`; see [Indexdata](./indexdata#which-commands-require-indexdata) for the per-command rules.
+Which commands refuse, and where `--force` is not the escape, is in
+[Indexdata](./indexdata.md#which-commands-require-indexdata). The
+recommended workflow is to generate an indexed PBF once with `pbfhogg cat`,
+then use it for all subsequent operations.
 
-The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
+## Outputs
 
-## Common flags
+Commands that write a file take `-o`. An existing output is refused unless
+`-O, --overwrite` is given, and a failed run never leaves a partial file
+under the output name:
 
-Most write commands accept these flags:
+```sh
+pbfhogg sort input.osm.pbf -o sorted.osm.pbf --overwrite
+```
 
-| Flag | Description |
-|------|-------------|
-| `-o, --output <FILE>` | Output file path |
-| `-O, --overwrite` | Replace the output if it already exists |
-| `--compression <SPEC>` | Compression: `none`, `zlib` (default; `renumber` defaults to `zlib:1`), `zstd`, or with level (`zlib:9`, `zstd:19`) |
-| `--direct-io` | Bypass page cache via O_DIRECT (Linux, requires `linux-direct-io` feature) |
-| `--io-uring` | Use io_uring for output writes (Linux, requires `linux-io-uring` feature) |
-| `--force` | Proceed without indexdata (slower fallback path) |
-| `--generator <NAME>` | Override the writing program name in the output header |
-| `--output-header <K=V>` | Set replication metadata fields in the output header |
-
-An existing output is refused before any work is done unless `-O,
---overwrite` is given, and a symlink is never accepted as an output. Every
-output is written to a hidden staging file (beside it by default;
-`--staging-dir` moves it) and renamed into place
-only when the command succeeds, so a failed run never leaves a partial file
-under the output name. The [CLI reference](../cli/commands#output-files) has
-the details.
+Every flag, and the full output contract, is in the
+[CLI reference](../cli/commands.md); its
+[Common flags](../cli/commands.md#common-flags) and
+[Output files](../cli/commands.md#output-files) sections cover what most
+write commands share.

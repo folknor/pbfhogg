@@ -88,7 +88,7 @@ directory.
   index, else legacy scratch). Names are matched on bytes, since a staging or
   backup name keeps a destination tail that need not be UTF-8. A classified
   entry is one entry whatever is inside it. The exact spellings are defined
-  in prose in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
+  in prose in `docs/cli/commands.md`, "Names pbfhogg leaves behind".
   Replacing an index with `--overwrite` deletes the old index directory,
   `.buckets-level*` trees in it included. That is accepted: replacing an
   index wholesale is what was asked for, only an index or an empty directory

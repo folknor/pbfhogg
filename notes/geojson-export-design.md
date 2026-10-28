@@ -7,7 +7,7 @@ osm2pgsql + PostGIS).
 **v1 shipped 2026-07-13.** This doc is now the forward-looking record:
 what shipped, in brief, and the deferred work. Durable homes for the
 shipped surface are the code (`src/commands/export/`), the CLI reference
-(`reference/cli-reference.md`), the format / area / property decisions
+(`docs/cli/commands.md`), the format / area / property decisions
 ([ADR-0010](../decisions/0010-geojson-export-format-and-area-heuristic.md)),
 and the osmium deviation (`DEVIATIONS.md`). The implementation spec that
 drove the landing was retired on completion; its deferred items are all
@@ -104,4 +104,4 @@ These cannot be built from inside the pbfhogg workspace; they need the
   - format framing, `@id`/`@type` identity model, `AREA_KEYS` + closed-ring
   area rule, reserved-key collision precedence, polygon validity/winding.
 - `DEVIATIONS.md` "export" - why output is not osmium byte-parity.
-- `reference/cli-reference.md` "export" - the user-facing flag surface.
+- `docs/cli/commands.md` "export" - the user-facing flag surface.

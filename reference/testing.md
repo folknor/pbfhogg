@@ -149,7 +149,7 @@ lease, and a seccomp filter kills it with `SIGSYS` if it starts a
 process or closes, duplicates, passes or reflags that descriptor, at
 any point in its run. `CliInvoker` turns such a death into a failure
 naming the guard, so every CLI test doubles as a behavioural test of the
-promise in `cli-reference.md` "Names pbfhogg leaves behind". The guard is
+promise in `docs/cli/commands.md` "Names pbfhogg leaves behind". The guard is
 stricter than the promise (no duplicate of the lease, no `sendmsg`,
 `sendmmsg` or `pidfd_getfd` at all) and blind to io_uring submissions
 and to a `clone3` caller that ignores its `ENOSYS`; the module doc says
@@ -473,7 +473,7 @@ variant. Every `O_DIRECT`
 open (reader, direct header walk, direct writer, io_uring writer) classifies its refusal through
 one helper, and path context added above it must keep the carrier typed. The
 CLI exits 3 for this variant (see the exit-code table in
-`reference/cli-reference.md`) and keeps its feature label in stderr; CLI skip
+`docs/cli/commands.md`) and keeps its feature label in stderr; CLI skip
 predicates require both that code and label. Runtime I/O failures are never
 setup refusals, and raw `EINVAL` is never a sufficient reason to skip.
 Library tests use `common::is_einval` (historical name; it requires the typed

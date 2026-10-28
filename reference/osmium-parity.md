@@ -158,7 +158,7 @@ pbfhogg inspect tags input.pbf -t way --sort count-desc --min-count 100
 ```
 
 pbfhogg gives each short flag one meaning across all subcommands (see
-`reference/cli-reference.md`, "Short flags"), so several of osmium's
+`docs/cli/commands.md`, "Short flags"), so several of osmium's
 per-command shorts are long-only here and refuse naming the long flag:
 `tags-count -s` is `--sort`, `tags-filter -i` / `-t` are `--invert-match` /
 `--remove-tags`, `getid -t` is `--remove-tags`, `getparents -s` is

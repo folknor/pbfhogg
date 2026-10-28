@@ -8,7 +8,7 @@
 //! how the output is ordered, what it did to way payloads and way blob
 //! headers, what bounding box and replication state apply. [`build`] derives
 //! every header field from those facts and the input headers by one rule,
-//! written out in `reference/cli-reference.md` "Output header".
+//! written out in `docs/cli/commands.md` "Output header".
 //!
 //! The rule is that a header never claims more than the output contains:
 //!

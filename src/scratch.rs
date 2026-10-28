@@ -59,7 +59,7 @@
 //! previous output and is reported as its own kind.
 //!
 //! The exact names, and which of them an external tool may delete, are
-//! defined in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
+//! defined in `docs/cli/commands.md`, "Names pbfhogg leaves behind".
 
 // This module is the scratch choke point the crate-root deny points at: the
 // run directory, its lock, scratch files and their removal are the calls

@@ -22,6 +22,7 @@ The binary is called `pbfhogg`. Requires the Rust version named by `rust-version
 | `tags-filter` | Filter elements by tag expressions (PBF or OSC input) |
 | `export` | Stream tagged nodes/ways to GeoJSON or GeoJSONSeq |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
+| `digest` | Print a digest of a PBF's element content, equal for files `diff` finds identical |
 | `getid` | Extract or remove elements by ID |
 | `getparents` | Find ways/relations referencing given IDs |
 | `apply-changes` | Apply OSC diff to a sorted PBF with blob passthrough |
@@ -31,14 +32,11 @@ The binary is called `pbfhogg`. Requires the Rust version named by `rust-version
 | `merge-changes` | Merge multiple OSC files into one |
 | `build-geocode-index` | Build reverse geocoding index (S2 cells, mmap-ready) |
 
-## Common Flags
+The benchmark instruments `bench-read`, `bench-write` and `bench-merge` are
+commands too.
 
-Most write commands accept:
+## Flags
 
-- `-o, --output <FILE>` - output file
-- `-O, --overwrite` - replace the output if it already exists (an existing output is refused before any work without it; a symlink is refused either way)
-- `--compression <SPEC>` - `none`, `zlib` (default; `renumber` defaults to `zlib:1`), `zstd`, or with level (`zlib:9`, `zstd:19`)
-- `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` - proceed without indexdata (slower) on commands that accept it; for `build-geocode-index`, it is a legacy shorthand for `--overwrite --allow-unindexed`
-
-See [Commands](./commands) for the full reference.
+`pbfhogg <command> --help` lists a command's flags. [Commands](./commands.md)
+is the full reference: every flag, the [flags most write commands
+share](./commands.md#common-flags), the exit codes and the output contract.

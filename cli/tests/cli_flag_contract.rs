@@ -1,5 +1,5 @@
-//! The flag contract, enforced by tables (`reference/cli-reference.md`,
-//! "Flag rules", "`-j/--jobs`" and "`--force`"):
+//! The flag contract, enforced by tables (`docs/cli/commands.md`,
+//! "Flag rules", "Worker threads" and "Proceeding without indexdata"):
 //!
 //! - A flag the command line itself makes ineffective is refused, as a usage
 //!   error (exit 2), and so is a malformed flag value. Both happen before any

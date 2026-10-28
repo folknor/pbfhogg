@@ -108,21 +108,12 @@ Generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent 
 
 ### Choose the right ALTW index type
 
-`add-locations-to-ways` supports two index strategies (plus `auto`):
-
-| Type | Best for | Trade-off |
-|------|----------|-----------|
-| `sparse` (default) | When the working set fits available page cache | Rank-indexed flat mmap (~8 bytes per referenced node); needs `referenced_count * 8` bytes of temp disk |
-| `external` | Sorted, indexed input when the sparse working set is too large | Bounded memory and sequential I/O; see `reference/performance.md` for measured scratch-disk needs |
-| `auto` | Runtime routing by input eligibility and estimated store/page-cache budget | See `reference/pipeline.md` |
-
-See `reference/performance.md` for measured comparisons between the sparse and external strategies and for the scale-specific behavior of earlier strategies.
-
-`auto` uses sparse for unsorted or unindexed input. For sorted, indexed input,
-it uses external when the estimated store exceeds a fixed share of the
-page-cache budget; if either estimate is unavailable, it uses external. The
-full routing rule and fallback behavior are documented in
-`reference/pipeline.md`.
+`sparse` (the default) is fastest while the referenced nodes' working set
+fits the page cache; past that, `external` trades heavy scratch-disk use for
+bounded memory, and `auto` picks between them at run time. When to use each
+is in [Advanced Topics](./advanced.md#add-locations-to-ways-index-types),
+and measured comparisons between the strategies are in
+[performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
 ### O_DIRECT for planet-scale I/O
 

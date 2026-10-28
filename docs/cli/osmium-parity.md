@@ -182,7 +182,7 @@ pbfhogg export input.pbf                                  # geojsonseq to stdout
 (as Points) and tagged, closed-or-open ways (as Polygons or LineStrings) are
 exported - relation features are never emitted, and untagged nodes/ways are
 skipped. Way export requires the input header to declare `LocationsOnWays`;
-`--type node` works without it. See [Commands](./commands#export) for filter,
+`--type node` works without it. See [Commands](./commands.md#export) for filter,
 property, bbox, and metadata flags.
 
 ### fileinfo is now `inspect`

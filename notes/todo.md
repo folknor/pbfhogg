@@ -169,7 +169,7 @@ together so the surface changes once.
 
   Partially delivered already: exit codes now split into 0 success,
   1 semantic-negative answer, 2 failure, documented in
-  `reference/cli-reference.md` and `docs/cli/commands.md`. The
+  `docs/cli/commands.md` "Exit codes". The
   stdout half is partly delivered: the CLI writes stdout through
   `cli/src/output.rs` (a closed reader is a silent exit 0, not a panic), the
   library's report types render into a caller-supplied `io::Write`, and
@@ -184,7 +184,7 @@ together so the surface changes once.
   identical.
 
 - [ ] **A `--json` diagnostics mode.** The global `-q, --quiet` landed
-  (`reference/cli-reference.md` "Quiet": a kind filter in
+  (`docs/cli/commands.md` "Quiet": a kind filter in
   `StderrSink::event`, `cli/src/host.rs`). Still open: `--json`, a second
   sink serializing each diagnostic event's kind, key and arguments, which
   needs no library changes. It is a new capability with a public format to
@@ -237,7 +237,7 @@ together so the surface changes once.
   except multi-extract's single-pass path.
 
   Two consequences are visible to a user. The "I/O capability matrix" in
-  `reference/cli-reference.md` marks most of these commands "Yes (R+W)" or
+  `docs/cli/commands.md` marks most of these commands "Yes (R+W)" or
   "Yes" and has no row for `digest`: it describes the flag's presence, not
   its reach. And in a build without the `linux-direct-io` feature, whether
   `--direct-io` is refused ("requires the linux-direct-io feature", exit 2)
@@ -279,7 +279,7 @@ The maintainer wants this resolved, but not in the drain.
   `worker_loop` and `handle_candidate`, several CLI `run_*` functions, and
   more. A denied lint with that many local exemptions enforces nothing.
   The flag-refusal half of the original finding is done
-  (`reference/cli-reference.md`, "Flag rules"), and the library already
+  (`docs/cli/commands.md`, "Flag rules"), and the library already
   takes one `WriteOptions` instead of positional bools.
 
   Suggested shape, from the 2026-10-25 and 2026-10-26 sessions, to spar
@@ -662,7 +662,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   members, duplicate-key tags) but its doc says keyed unique-key tag lines
   are not counted, so an element with thousands of changed unique keys
   prints thousands of `-"k"="v"` / `+` / `~` lines. Values are printed whole
-  by contract (the -v paragraph in both CLI docs: complete literals, never
+  by contract (the -v paragraph in the CLI reference: complete literals, never
   truncated); whether the line count should get a cap and an omission line
   is an open contract choice. Found 2026-10-28 while settling -v escaping.
 
@@ -687,7 +687,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   print keyed `-"k"="v"`/`+"k"="v"`/`~"k"` plus `tags: order changed`, so
   `[a=1] -> [a=1,b=2]` and `[a=1] -> [b=2,a=1]` print the same `+"b"="2"`, and
   the detail cannot reconstruct the new tag order. Deliberate: the keyed
-  view is the readable one for the common case, and the CLI docs say tags
+  view is the readable one for the common case, and the CLI reference says tags
   are keyed without positions. Revisit only if someone wants `-v` to be a
   reconstructible patch; then tags would go through the positioned script
   always.
@@ -777,7 +777,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 - [ ] **The promise guard has three blind spots.** Every CLI test runs
   `pbfhogg` under the seccomp promise guard (`cli/tests/guard.rs`), which
   enforces the no-helper-process and inherited-descriptor promise of
-  reference/cli-reference.md "Names pbfhogg leaves behind" for the whole
+  docs/cli/commands.md "Names pbfhogg leaves behind" for the whole
   run. It cannot see: (1) io_uring submissions - an `IORING_OP_CLOSE` (or
   similar) on the inherited descriptor is no syscall the filter checks; the
   `--io-uring` writer is the only ring and never touches an inherited
@@ -817,20 +817,31 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   added to the sidebar had theirs replaced by a pointer to the Performance
   page; these two pages still need each figure either sourced from
   `.brokkr/results.db` / `reference/performance.md` with commit and host, or
-  dropped.
+  dropped. The same holds for the CLI reference `docs/cli/commands.md`
+  (inspect's "~36ms on 473 MB vs ~4s for full decode", diff's "~30 GB text,
+  ~45 GB osc XML" shard files at planet scale) and the Performance table and
+  North America sentence of `cli/README.md`.
 - [ ] **Nothing catches a site page missing from the sidebar.** Four guide
   pages sat outside `docs/.vitepress/config.ts` from the scaffold until they
   were listed; `scripts/check_doc_links.py` checks links and anchors only.
   Have it parse the sidebar links out of config.ts and fail on a `docs/`
   page (outside `docs/public/` and the home page) that no sidebar entry names.
-- [ ] **Guide pages duplicate the CLI reference.** `docs/guide/usage.md`
-  (common flags table, `--force`, output files), `configuration.md`
-  (compression, index type, I/O flags) and `advanced.md` (compression table,
-  ALTW index types, multi-extract, tags-filter -R) restate what
-  `docs/cli/commands.md` and `reference/cli-reference.md` say, so a flag
-  change lands in up to four places. Decide with the commands.md vs
-  cli-reference.md fork (doc-conventions-audit item 4): walkthroughs that
-  link to the reference for flag semantics instead of restating them.
+- [ ] **Site pages cite `reference/` documents as backticked paths.**
+  `docs/guide/index.md`, `advanced.md` (build-geocode-index),
+  `performance.md`, `docs/cli/osmium-parity.md` (`--index-type` row) and the
+  CLI reference itself (renumber's `--compression` row, the promise-guard
+  sentence citing `reference/testing.md`) name `reference/performance.md`,
+  `reference/pipeline.md` and the like in code spans, which neither VitePress
+  nor GitHub makes clickable. Turn each into a GitHub URL link, the form
+  `scripts/check_doc_links.py` resolves for site pages.
+- [ ] **AGENTS.md "Commands requiring indexdata" is out of step with the
+  CLI.** It lists `inspect --tags --type` (brokkr's spelling); the CLI's
+  `inspect tags` refuses unindexed input on every path, `--type` or not
+  (`src/commands/tags_count/mod.rs` calls `require_indexdata` before
+  looking at the filter), and `degrade` refuses on its decode path, which
+  the list omits. The per-command truth is the "Proceeding without
+  indexdata" table in `docs/cli/commands.md`; the AGENTS.md list should
+  point there or match it.
 - [ ] **Old site fragments into the correctness and deviations pages land on
   a pointer.** Those two site pages became pointers to the root
   `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such
@@ -839,6 +850,18 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   removed (recreating the headings would be a second copy to drift); a
   fragment-forwarding script on those two pages is the fix if it matters.
   The site's search also no longer indexes their content.
+  The CLI commands page lost three site fragments the same way when the
+  repository's CLI reference replaced it (headings renamed so both renderers
+  slug them alike): `#index-verifying-blob-level-metadata`,
+  `#locations-verifying-inline-way-locations` and
+  `#locations-on-ways-maintaining-a-locationsonways-file` now open the page
+  top; they are `#index-verification`, `#inline-location-verification` and
+  `#locations-on-ways`. Repository links of the form
+  `blob/main/reference/cli-reference.md#...` (outside this tree: issue
+  comments, other projects' notes) no longer resolve at all; the content
+  is `docs/cli/commands.md` under the same section names except
+  "`-j/--jobs`" (now "Worker threads"), "`--force`" (now "Proceeding
+  without indexdata") and the two `check` subsections above.
 
 ### Read path
 
@@ -985,7 +1008,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
   **Release / measurement follow-ups:**
   - [x] ~~**Register the 8 k-packed planet as a snapshot.**~~ Done 2026-07-10: UUID `8027765b` (377.5 s at `8c1cf03`, plantasjen) promoted its output to `data/planet-8k-with-indexdata.osm.pbf`, registered as `snapshot.8k` `pbf.indexed`. The two earlier bench runs (`0ae01c09`, `a4791ddc`) wrote to scratch and kept nothing. The snapshot is the input for every same-corpus-different-encoding pair the `reference/blob-density.md` matrix needs, and for the deferred `getparents` HeaderWalker dispatch decision (europe-regressing / planet-winning along the same blob-count axis); consumer commands reach it via `--snapshot 8k`.
 
-- [ ] **degrade** - adversarial-test tool, v1 shipped (`--unsort`, `--unsort-intra`, `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--drop-ids`). Flag semantics + preservation contract in reference/cli-reference.md; design note retired to git history 2026-07-16 (notes/degrade.md). Deferred v2 items, pick up when a consumer surfaces: `--recompress C` (forces decode even for passthrough-eligible flags), richer `--unsort` chaos modes (rotate/shuffle/reverse - only when sort measurement needs more than one overlap per kind), a registered `planet-unsorted` artefact for `sort` benching, and `--unsort` throughput recovery (denmark 7.7 -> 27.3 s from the Owned round-trip through the merge thread; three sketches in the retired note's git history, worker-fires-the-swap being the cleanest - acceptable today because `--unsort` is one-time generation work). The `--unsort` cross-blob bug (found 2026-07-10) was **fixed 2026-07-11**: `--unsort` now suppresses the per-input-blob boundary flush so the swap straddles a genuine output-blob boundary, and the old intra-blob shape is preserved as the deliberate `--unsort-intra` flag (keyed to the first two elements so it stays intra-blob for any input blob size). **Correctness gate CLOSED 2026-07-11**: snapshot regenerated post-fix, `verify sort --snapshot unsorted` PASS, and the overlap-rewrite path fires on the regenerated data - `sort_blobs_overlap=6`, `sort_overlap_runs=3`, `sort_blobs_rewritten=6` (one adjacent same-kind pair per kind, exactly the designed shape; UUID `11062bdd` at `29e4eab`, plantasjen). The pre-fix run `f5cd6522` saw 0 overlaps / full passthrough.
+- [ ] **degrade** - adversarial-test tool, v1 shipped (`--unsort`, `--unsort-intra`, `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--drop-ids`). Flag semantics + preservation contract in docs/cli/commands.md; design note retired to git history 2026-07-16 (notes/degrade.md). Deferred v2 items, pick up when a consumer surfaces: `--recompress C` (forces decode even for passthrough-eligible flags), richer `--unsort` chaos modes (rotate/shuffle/reverse - only when sort measurement needs more than one overlap per kind), a registered `planet-unsorted` artefact for `sort` benching, and `--unsort` throughput recovery (denmark 7.7 -> 27.3 s from the Owned round-trip through the merge thread; three sketches in the retired note's git history, worker-fires-the-swap being the cleanest - acceptable today because `--unsort` is one-time generation work). The `--unsort` cross-blob bug (found 2026-07-10) was **fixed 2026-07-11**: `--unsort` now suppresses the per-input-blob boundary flush so the swap straddles a genuine output-blob boundary, and the old intra-blob shape is preserved as the deliberate `--unsort-intra` flag (keyed to the first two elements so it stays intra-blob for any input blob size). **Correctness gate CLOSED 2026-07-11**: snapshot regenerated post-fix, `verify sort --snapshot unsorted` PASS, and the overlap-rewrite path fires on the regenerated data - `sort_blobs_overlap=6`, `sort_overlap_runs=3`, `sort_blobs_rewritten=6` (one adjacent same-kind pair per kind, exactly the designed shape; UUID `11062bdd` at `29e4eab`, plantasjen). The pre-fix run `f5cd6522` saw 0 overlaps / full passthrough.
 
 - [ ] **getparents** (whole-file scan listing ways / relations referencing a given ID set; plan note retired to git history 2026-07-16, its measurement record lives in reference/blob-density.md + ADR-0006). Drafted 2026-04-23, headline experiment landed 2026-04-24 (`783970a`). The HeaderWalker + `parallel_classify_phase` rewrite shipped: planet 44.8 s -> **23.5 s** (-46 %, UUID `11bc44dc` at `16e3694`), europe 26.4 s -> **44.2 s** (+68 %, blob-density asymmetry - see [reference/blob-density.md](../reference/blob-density.md)). Original 4-8x estimate was wrong: blob indexdata stores `(min_id, max_id)` of *elements in the blob*, not the *ref/member IDs* the typical "find ways referencing these nodes" query cares about, so `IdSet::any_in_range()` pre-screen does not apply. Actual win comes from IO byte reduction (74.8 GB -> 30 GB at planet) by skipping blob kinds structurally incapable of producing matches. Planet hotpath at `4fc8e35` (UUID `00253c7d`): 23.0 s wall, 78 % in `parallel_classify_phase` - that **is** the post-experiment state, not headroom. The c912e4d Denmark 4.7x sequential-decode regression rule remains explicitly off the table (it targets sequential-decode conversions; `parallel_classify_phase` keeps decompression parallel via pread workers). **The europe-regression question (revert / threshold-dispatch / accept) is RESOLVED**: the crossover was measured 2026-07-10 on the 8k-packed planet (HW 82.7 s vs scan 52.8 s; walk ~45 us/blob, linear in blob count) and the dispatch was ratified as [`ADR-0006`](../decisions/0006-blob-count-threshold-dispatch.md) (full matrix in reference/blob-density.md "getparents three-cell matrix"; the RESOLVED paragraph moved to the Completed record below). One idea from the retired note stays parked without a trigger: converting the FullScan arm from pipelined decode to `parallel_classify_phase` (pure per-blob work, lower memory ceiling; est. 10-20 % where oversubscription bites) - bench-gated, speculative, and ADR-0006's dispatch already routes the cases where it would matter most. Residual opportunities, absorbed here from the note (2026-07-13):
   - [x] ~~**#3 blob-filter skip-rate readout - MEASURED 2026-07-13**~~ from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). The CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim vs this 64.6 % is **RESOLVED as metric confusion, not an error to correct** - three different metrics collide: nodes are **~90 % of elements** (encoding-independent; ~10.4 B of 11.6 B), **64.6 % of blobs on the byte-packed primary planet** (node blobs avg ~317 k elements vs way blobs ~66 k, so way blobs are overrepresented in blob count), **~90 % of blobs on the 8k-uniform encoding** (blob share = element share when every blob holds 8,000 elements), and **~75 % of planet bytes** (the module doc's metric). The "~85 %" was element share mislabeled as blob share, written 2026-04-27 - months before repack and any blob-density awareness. **Decision (2026-07-13): CHANGELOG.md stays untouched** - historical release record, defensible under the element-share reading; this entry is the durable explanation. **Filter-semantics confirm CLOSED 2026-07-13.** `needed_blob_kinds` (`src/commands/getparents/mod.rs`) is sound for all seven non-empty query shapes: node queries scan way + relation blobs, way queries scan relation blobs (way blobs skipped - nothing references a way from a way), relation queries scan relation blobs only. The "parent relations of a node still needs way blobs" worry was a misconception - a relation parent of node N holds N *directly* as a member and is found in the relation blob; way blobs are needed on a node query in their own right (ways are direct parents of nodes), which `need_way_blobs` already covers. Key subtlety found: both scan arms share `needed_blob_kinds` (walker schedule + pipelined `BlobFilter`), so the pre-existing walker-vs-pipelined equality tests could NOT catch a wrong kind-mapping - both arms would drop the same parent. Pinned instead by four hand-computed-oracle tests over a relations-bearing fixture (`node_query_scans_relation_blobs_for_relation_parents`, `way_query_skips_way_blobs_but_finds_relation_parents`, `relation_query_scans_relation_blobs_only`, `add_self_node_query_emits_node_and_all_parent_kinds`). #3 fully resolved.

@@ -1,5 +1,5 @@
 //! `-q, --quiet`, the one global flag that changes what a run prints
-//! (`reference/cli-reference.md`, "Quiet"): the exit code is the answer.
+//! (`docs/cli/commands.md`, "Quiet"): the exit code is the answer.
 //!
 //! - Notes, progress and summaries go; warnings and the `Error:` line stay,
 //!   since they explain the exit code.

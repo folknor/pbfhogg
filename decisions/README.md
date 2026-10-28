@@ -28,8 +28,9 @@ Don't add one when:
 - The rationale is already captured in an existing `reference/` doc,
   `DEVIATIONS.md`, or a rich commit message, and no cross-cutting
   decision is being made.
-- You're documenting *behavior* rather than a *decision*. Behavior goes
-  in `reference/`. Decisions go here.
+- You're documenting *behavior* rather than a *decision*. How the thing
+  is built goes in `reference/`, how it is used (the CLI reference
+  included) in `docs/`. Decisions go here.
 
 ## File naming and numbering
 
@@ -92,9 +93,11 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   captures the rule and the DEVIATIONS entry captures the behavior
   comparison. The ADR references DEVIATIONS.md inline where it's
   load-bearing (usually a sentence in the Decision section).
-- **`reference/`** owns architectural and behavioral reality (blob
-  encoding, pipeline shapes, performance topology). ADRs reference
-  these inline when relevant; they don't duplicate them.
+- **`reference/`** owns architectural and implementation reality (blob
+  encoding, pipeline shapes, performance topology), and **`docs/`** the
+  behaviour a user relies on, the CLI's flags and output contract in
+  `docs/cli/commands.md` among it. ADRs reference these inline when
+  relevant; they don't duplicate them.
 - **`CHANGELOG.md`** owns user-visible release notes. ADRs are for the
   *why*, not the *what shipped*.
 - **`CLAUDE.md`** owns rules for AI-assisted work. When an ADR

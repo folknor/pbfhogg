@@ -60,7 +60,7 @@
 //!
 //! The staging and backup names, which an external tool may delete, and the
 //! guarantee a caller-chosen staging directory gives a caller that removes
-//! it after a killed run, are defined in `reference/cli-reference.md`,
+//! it after a killed run, are defined in `docs/cli/commands.md`,
 //! "Staging directory" and "Names pbfhogg leaves behind". A backup always
 //! stays beside its destination, never in a staging directory.
 //! Durability and timing are decided in ADR-0017: writers finish their files,

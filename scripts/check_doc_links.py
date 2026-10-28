@@ -49,6 +49,13 @@ other ignored trees never matter:
      one: the site cannot link outside ``docs/`` any other way, so those
      links are where it cites the root documents.
 
+     A link from a site page to a site page must also work on GitHub, which
+     renders the same files: a relative path naming the target's ``.md``
+     file, inside ``docs/``, with a fragment that both slug rules produce.
+     A site-root or extensionless page link, one that climbs out of the
+     site, or a GitHub URL naming a site page, is reported even when the
+     file exists.
+
   3. source-comment-citations: comments under ``src/`` do not cite a Rust
      source line number. It loses its context as code moves; the comment must
      carry the needed context inline. (The work-item list lives in ``notes/``,
@@ -412,6 +419,57 @@ def bare_paths(text):
         yield match.start(), path
 
 
+PAGE_SUFFIXES = ("", ".md", ".html")
+
+
+def site_link_problem(rel, target, fragment):
+    """Why a link on a site page cannot be followed on both of the site's
+    reading surfaces, or None. A `docs/` page is rendered by VitePress and,
+    being a repository file, by GitHub too, so a link from one site page to
+    another must work in both: a relative path naming the target's `.md`
+    file (`index.md` for a directory), never a site-root `/path` or an
+    extensionless one, which only VitePress resolves; a path that stays
+    inside the site, since VitePress cannot serve what lies outside `docs/`
+    (the rest of the repository is linked by its GitHub URL); and a
+    fragment that names the same heading under both slug rules. Assets
+    (images, downloads) are not pages and are left to the dangling check."""
+    path = target
+    if path.startswith("github:"):
+        named = normalize(path[len("github:") :]) or ""
+        if named.endswith(".md") and in_site(named):
+            return "a site page on GitHub; link it by its relative .md path"
+        return None
+    if path and pathlib.PurePosixPath(path).suffix not in PAGE_SUFFIXES:
+        return None
+    if path and not path.endswith(".md"):
+        # An extensionless target that names an existing non-page file (a
+        # download under docs/public/) is an asset, not a page.
+        resolved, ok = resolve_link(rel, path)
+        if ok and not resolved.endswith(".md"):
+            return None
+    if path:
+        if path.startswith("/"):
+            return "site-root link; name the page's .md file by a relative path"
+        if not path.endswith(".md"):
+            return "name the page's .md file (index.md for a directory)"
+        resolved = normalize(f"{parent_of(rel)}/{path}")
+        if resolved is None or not in_site(resolved):
+            return "leaves the site; link the repository file by its GitHub URL"
+        if resolved not in FILE_SET:
+            return None  # the dangling check reports it
+    else:
+        resolved = rel
+    if fragment:
+        missing = [
+            renderer
+            for renderer in ("vitepress", "github")
+            if fragment not in anchors(resolved, renderer)
+        ]
+        if missing:
+            return f"no such anchor under the {' and '.join(missing)} slug rule"
+    return None
+
+
 def dangling_paths(rel, text, markdown):
     """(offset, description) for each path named in `text` that does not
     exist. Paths into the notes folder are check 1's, which already refuses
@@ -421,6 +479,11 @@ def dangling_paths(rel, text, markdown):
         links, text = link_targets(text)
         for offset, target, fragment in links:
             shown = target + (f"#{fragment}" if fragment else "")
+            if in_site(rel):
+                problem = site_link_problem(rel, target, fragment)
+                if problem:
+                    out.append((offset, f"link {shown}: {problem}", None))
+                    continue
             if target.startswith("github:"):
                 resolved = normalize(target[len("github:") :]) or ""
                 ok = exists(resolved)

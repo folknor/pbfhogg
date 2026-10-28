@@ -1205,7 +1205,7 @@ exclude = ["src/process.rs"]
 region = "code"
 message = "Process mutations belong to the caller's explicit process toolbox"
 
-# reference/cli-reference.md "Names pbfhogg leaves behind" promises that the
+# docs/cli/commands.md "Names pbfhogg leaves behind" promises that the
 # CLI starts no other process and never closes, replaces or changes the flags
 # of a descriptor it inherited: a caller hands pbfhogg a descriptor holding a
 # lease lock and removes the run's private directories once no process holds
@@ -1218,7 +1218,7 @@ name = "no-child-process-or-descriptor-reset"
 pattern = '\bprocess::(?:Command|Child|Stdio|CommandExt)\b|\buse\s+std::process::\{[^}]*\b(?:Command|CommandExt|Child)\b|\blibc::(?:fork|vfork|exec\w*|posix_spawn\w*|daemon|clone3?|close|close_range|closefrom|dup|dup2|dup3|ioctl)\b|\b(?:F_SETFD|FD_CLOEXEC|FIONBIO)\b|\bfrom_raw_fd\b'
 paths = ["src/**/*.rs", "cli/src/**/*.rs"]
 region = "code"
-message = "The CLI promises it starts no other process and leaves inherited descriptors alone (cli-reference.md, Names pbfhogg leaves behind)"
+message = "The CLI promises it starts no other process and leaves inherited descriptors alone (docs/cli/commands.md, Names pbfhogg leaves behind)"
 
 # The same promise covers file-status flags. The one F_SETFL clears O_NONBLOCK
 # on a descriptor src/read/input.rs opened itself.

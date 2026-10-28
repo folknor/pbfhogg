@@ -444,10 +444,10 @@ accumulation at 28.6x blob count is implicated. Uninvestigated.
 
 ## Cross-references
 
-- `repack` (`reference/cli-reference.md`) - the command that produces
+- `repack` (`docs/cli/commands.md`) - the command that produces
   the alternate-packing planet for measurements (its design note was
   retired to git history 2026-07-16).
-- `degrade` (`reference/cli-reference.md`) - command for producing
+- `degrade` (`docs/cli/commands.md`) - command for producing
   adversarial test PBFs; the `--unsort` mode exercises `sort`'s
   overlap-run path which is orthogonal to but motivated alongside
   this work (its design note was retired to git history).

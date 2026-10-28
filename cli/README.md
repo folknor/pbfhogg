@@ -24,6 +24,7 @@ Requires the Rust version named by the crate's `rust-version`. The binary is cal
 | `export` | Stream tagged nodes and ways to GeoJSON / GeoJSONSeq |
 | `tags-filter` | Filter elements by tag expressions (also supports OSC input) |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
+| `digest` | Print a digest of a PBF's element content, equal for files `diff` finds identical |
 | `getid` | Extract or remove (`--invert`) elements by ID |
 | `getparents` | Find ways/relations referencing given IDs |
 | `apply-changes` | Apply OSC diff to a sorted PBF with blob passthrough |
@@ -33,20 +34,13 @@ Requires the Rust version named by the crate's `rust-version`. The binary is cal
 | `merge-changes` | Merge multiple OSC files into one |
 | `build-geocode-index` | Build a reverse geocoding index (S2 cells, mmap-ready) |
 
-## Common flags
+## Flags
 
-Most write commands accept:
-
-- `-o, --output <FILE>` - output file
-- `-O, --overwrite` - replace the output if it already exists (an existing output is refused before any work without it; a symlink is refused either way)
-- `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
-- `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` - on a command that would refuse unindexed input, proceed with the slower fallback; only those commands have it. For `build-geocode-index` it is a legacy shorthand for `--overwrite --allow-unindexed` that warns every time
-- `--generator <NAME>` - override writing program in output header
-- `--output-header <K=V>` - set replication metadata fields
-- `-j, --jobs <N>` (on the commands with worker pools that take it) - `0` (default) sizes them automatically, `1` runs sequentially, `N` caps them at `N` threads
-
-Every short flag means the same thing on every subcommand (`-t` is always `--type`, `-c` always `--suppress-common`, `-s` always `--osmium-summary`, and so on). Shorts that used to mean something else on a command (`cat -c`, `extract -c` / `-s`, `renumber -s`, `getparents -s`, `inspect -e`, `inspect tags -s`, `tags-filter -t` / `-i`, `getid -t`) now refuse, naming the long flag to use. A flag that would have no effect on a command line is refused rather than ignored, and every flag is checked before any input is opened. The full rules are in `reference/cli-reference.md`.
+`pbfhogg <command> --help` lists a command's flags. Every flag, the rules
+they share (one meaning per short flag across all commands, a flag that
+would have no effect refused rather than ignored, every flag checked before
+any input is opened), the exit codes and the output contract are in the
+[CLI reference](https://github.com/folknor/pbfhogg/blob/main/docs/cli/commands.md).
 
 ## Indexdata
 

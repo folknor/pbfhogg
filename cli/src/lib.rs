@@ -275,7 +275,7 @@ fn quiet_refused(path: &[&str], flag: &str, why: &str) -> Box<dyn std::error::Er
 
 /// A short flag a command used to have with a meaning that is not the
 /// short's meaning in the one vocabulary every subcommand shares
-/// (`reference/cli-reference.md`, "Short flags"). The letter stays reserved
+/// (`docs/cli/commands.md`, "Short flags"). The letter stays reserved
 /// on that command as a hidden argument whose only job is to refuse, naming
 /// the long flag to spell instead, so an old command line never silently
 /// means something else.
@@ -1306,9 +1306,9 @@ enum Command {
     /// input has it.
     ///
     /// Primary use case: producing same-corpus-different-encoding pairs
-    /// for the blob-density measurement matrix. v1 only fires the cap
-    /// on shrinks (cap < input blob size); growing across input blobs
-    /// is deferred to v2.
+    /// for the blob-density measurement matrix. The cap applies both
+    /// ways: a larger cap coalesces elements across input blobs, a
+    /// smaller one splits them.
     Repack {
         /// Input PBF file
         file: PathBuf,
@@ -5158,7 +5158,7 @@ fn run_bench_merge(
 }
 
 /// The short-flag vocabulary: every short letter has one meaning across all
-/// subcommands. `reference/cli-reference.md` "Short flags" is the same table
+/// subcommands. `docs/cli/commands.md` "Short flags" is the same table
 /// for readers, and a test keeps the two equal.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -5346,13 +5346,13 @@ mod short_flag_tests {
     fn the_reference_table_is_the_vocabulary() {
         let doc = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../reference/cli-reference.md"
+            "/../docs/cli/commands.md"
         ))
         .unwrap();
         let section = doc
             .split("## Short flags")
             .nth(1)
-            .expect("reference/cli-reference.md has a `## Short flags` section");
+            .expect("docs/cli/commands.md has a `## Short flags` section");
         let section = section.split("\n## ").next().unwrap_or(section);
         let mut documented: Vec<(char, Vec<String>)> = Vec::new();
         for line in section.lines() {
@@ -5388,5 +5388,330 @@ mod short_flag_tests {
         let mut expected = expected;
         expected.sort();
         assert_eq!(documented, expected);
+    }
+}
+
+/// `docs/cli/commands.md` is the CLI reference, written by hand. These tests
+/// keep its surface in step with the built command tree: every visible
+/// command has exactly one section under `## Commands`, every visible option
+/// exactly one table row in its own command's section, every visible
+/// enumerated value a mention in that row, every positional a mention in its
+/// section, and every global option a row under `## Global flags`. They
+/// check presence only, never what the prose says about a flag.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod doc_coverage_tests {
+    use super::cli_command;
+
+    struct Heading {
+        level: usize,
+        text: String,
+        line: usize,
+    }
+
+    /// ATX headings outside fenced code.
+    fn headings(lines: &[&str]) -> Vec<Heading> {
+        let mut out = Vec::new();
+        let mut fenced = false;
+        for (line, raw) in lines.iter().enumerate() {
+            let trimmed = raw.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            if (1..=6).contains(&level) && trimmed[level..].starts_with(' ') {
+                out.push(Heading {
+                    level,
+                    text: trimmed[level..].trim().to_owned(),
+                    line,
+                });
+            }
+        }
+        out
+    }
+
+    /// True when `token` occurs in `hay` with no option-name character
+    /// (`[A-Za-z0-9-]`) on either side, so `--output` is not found inside
+    /// `--output-header` and `sync` not inside `async`.
+    fn has_token(hay: &str, token: &str) -> bool {
+        let is_name = |c: char| c.is_ascii_alphanumeric() || c == '-';
+        hay.match_indices(token).any(|(at, _)| {
+            let before = hay[..at].chars().next_back();
+            let after = hay[at + token.len()..].chars().next();
+            !before.is_some_and(is_name) && !after.is_some_and(is_name)
+        })
+    }
+
+    /// The tokens a reader would look for: `--long` and every visible long
+    /// alias, or `-x` for an option with no long.
+    fn option_tokens(arg: &clap::Arg) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        if let Some(long) = arg.get_long() {
+            tokens.push(format!("--{long}"));
+            for alias in arg.get_visible_aliases().unwrap_or_default() {
+                tokens.push(format!("--{alias}"));
+            }
+        } else if let Some(short) = arg.get_short() {
+            tokens.push(format!("-{short}"));
+        }
+        tokens
+    }
+
+    fn visible_values(arg: &clap::Arg) -> Vec<String> {
+        if !arg.get_action().takes_values() {
+            return Vec::new();
+        }
+        arg.get_possible_values()
+            .iter()
+            .filter(|value| !value.is_hide_set())
+            .map(|value| value.get_name().to_owned())
+            .collect()
+    }
+
+    fn is_generated(arg: &clap::Arg) -> bool {
+        matches!(arg.get_id().as_str(), "help" | "version")
+    }
+
+    /// Check `cmd`'s own arguments against its section: `rows` are the
+    /// section's table rows, `text` all of it.
+    fn check_args(
+        path: &str,
+        cmd: &clap::Command,
+        rows: &[&str],
+        text: &str,
+        globals: bool,
+        problems: &mut Vec<String>,
+    ) {
+        for arg in cmd.get_arguments() {
+            if arg.is_hide_set() || is_generated(arg) || arg.is_global_set() != globals {
+                continue;
+            }
+            let id = arg.get_id().as_str();
+            if arg.is_positional() {
+                let names: Vec<String> = arg.get_value_names().map_or_else(
+                    || vec![id.to_ascii_uppercase()],
+                    |names| names.iter().map(ToString::to_string).collect(),
+                );
+                for name in names {
+                    if !text.contains(&format!("<{name}>")) && !text.contains(&format!("[{name}]"))
+                    {
+                        problems.push(format!(
+                            "`{path}`: positional <{name}> appears nowhere in its section"
+                        ));
+                    }
+                }
+                if !visible_values(arg).is_empty() {
+                    problems.push(format!(
+                        "`{path}`: positional <{id}> takes enumerated values; give it a table row \
+                         and extend this test to check them there"
+                    ));
+                }
+                continue;
+            }
+            let tokens = option_tokens(arg);
+            let matching: Vec<&&str> = rows
+                .iter()
+                .filter(|row| {
+                    let first = row.split('|').nth(1).unwrap_or_default();
+                    tokens.iter().any(|token| has_token(first, token))
+                })
+                .collect();
+            let shown = tokens.join(" / ");
+            match matching.as_slice() {
+                [] => problems.push(format!("`{path}`: {shown} has no table row")),
+                [row] => {
+                    let first = row.split('|').nth(1).unwrap_or_default();
+                    for token in &tokens {
+                        if !has_token(first, token) {
+                            problems.push(format!(
+                                "`{path}`: the row for {shown} does not name {token}"
+                            ));
+                        }
+                    }
+                    for value in visible_values(arg) {
+                        if !has_token(row, &value) {
+                            problems.push(format!(
+                                "`{path}`: {shown} accepts `{value}`, which its row does not name"
+                            ));
+                        }
+                    }
+                }
+                _ => problems.push(format!(
+                    "`{path}`: {shown} has {} table rows; it must have one",
+                    matching.len()
+                )),
+            }
+        }
+    }
+
+    /// Table rows outside fenced code: a `|` line in an example block is not
+    /// part of a rendered table. `lines` must start outside a fence, which a
+    /// region opened by a heading does.
+    fn table_rows<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        let mut fenced = false;
+        let mut rows = Vec::new();
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                fenced = !fenced;
+            } else if !fenced && trimmed.starts_with('|') {
+                rows.push(*line);
+            }
+        }
+        rows
+    }
+
+    fn visible_subcommands(cmd: &clap::Command) -> Vec<&clap::Command> {
+        cmd.get_subcommands()
+            .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn the_cli_reference_covers_the_command_tree() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/cli/commands.md"
+        ))
+        .unwrap();
+        let lines: Vec<&str> = doc.lines().collect();
+        let heads = headings(&lines);
+        let mut cmd = cli_command();
+        cmd.build();
+        let mut problems = Vec::new();
+
+        // The end of the region a heading opens: the next heading for which
+        // `ends` holds, or the end of the file.
+        let region_end = |from: usize, ends: &dyn Fn(&Heading) -> bool| -> usize {
+            heads
+                .iter()
+                .find(|h| h.line > from && ends(h))
+                .map_or(lines.len(), |h| h.line)
+        };
+
+        let level2 = |name: &str| -> Vec<&Heading> {
+            heads
+                .iter()
+                .filter(|h| h.level == 2 && h.text == name)
+                .collect()
+        };
+
+        // Global options, in their own section.
+        match level2("Global flags").as_slice() {
+            [global] => {
+                let end = region_end(global.line, &|h| h.level <= 2);
+                let region = &lines[global.line..end];
+                check_args(
+                    "pbfhogg",
+                    &cmd,
+                    &table_rows(region),
+                    &region.join("\n"),
+                    true,
+                    &mut problems,
+                );
+            }
+            found => problems.push(format!(
+                "expected one `## Global flags` heading, found {}",
+                found.len()
+            )),
+        }
+        check_args("pbfhogg", &cmd, &[], "", false, &mut problems);
+
+        let container = level2("Commands");
+        let [container] = container.as_slice() else {
+            panic!(
+                "expected one `## Commands` heading, found {}",
+                container.len()
+            );
+        };
+        let container_end = region_end(container.line, &|h| h.level <= 2);
+        let in_container = |h: &&Heading| h.line > container.line && h.line < container_end;
+
+        let commands = visible_subcommands(&cmd);
+        for h in heads.iter().filter(in_container).filter(|h| h.level == 3) {
+            if !commands.iter().any(|c| c.get_name() == h.text) {
+                problems.push(format!(
+                    "`### {}` under `## Commands` names no visible command",
+                    h.text
+                ));
+            }
+        }
+
+        for command in &commands {
+            let name = command.get_name();
+            let path = format!("pbfhogg {name}");
+            let sections: Vec<&Heading> = heads
+                .iter()
+                .filter(in_container)
+                .filter(|h| h.level == 3 && h.text == name)
+                .collect();
+            let [section] = sections.as_slice() else {
+                problems.push(format!(
+                    "`{path}` needs exactly one `### {name}` section, found {}",
+                    sections.len()
+                ));
+                continue;
+            };
+            let children = visible_subcommands(command);
+            let child_heading = |h: &Heading| {
+                h.level == 4
+                    && children
+                        .iter()
+                        .any(|child| h.text == format!("{name} {}", child.get_name()))
+            };
+            let end = region_end(section.line, &|h| h.level <= 3 || child_heading(h));
+            let region = &lines[section.line..end];
+            check_args(
+                &path,
+                command,
+                &table_rows(region),
+                &region.join("\n"),
+                false,
+                &mut problems,
+            );
+
+            let section_end = region_end(section.line, &|h| h.level <= 3);
+            for child in children {
+                let child_path = format!("{path} {}", child.get_name());
+                if !visible_subcommands(child).is_empty() {
+                    problems.push(format!(
+                        "`{child_path}` has subcommands of its own; extend this test to a deeper \
+                         heading level"
+                    ));
+                }
+                let title = format!("{name} {}", child.get_name());
+                let found: Vec<&Heading> = heads
+                    .iter()
+                    .filter(|h| h.line > section.line && h.line < section_end)
+                    .filter(|h| h.level == 4 && h.text == title)
+                    .collect();
+                let [child_section] = found.as_slice() else {
+                    problems.push(format!(
+                        "`{child_path}` needs exactly one `#### {title}` section inside `### \
+                         {name}`, found {}",
+                        found.len()
+                    ));
+                    continue;
+                };
+                let child_end = region_end(child_section.line, &|h| h.level <= 4);
+                let region = &lines[child_section.line..child_end];
+                check_args(
+                    &child_path,
+                    child,
+                    &table_rows(region),
+                    &region.join("\n"),
+                    false,
+                    &mut problems,
+                );
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

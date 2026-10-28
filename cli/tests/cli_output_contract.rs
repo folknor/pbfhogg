@@ -4,7 +4,7 @@
 //! The contract is ADR-0017 (outputs are published by the library), ADR-0018
 //! (scratch is one run directory and leftovers are reported) and the "Output
 //! files", "Scratch files" and "Names pbfhogg leaves behind" sections of
-//! `reference/cli-reference.md`. For every subcommand that writes an output
+//! `docs/cli/commands.md`. For every subcommand that writes an output
 //! (a file, several files, a directory; PBF or text):
 //!
 //! - an existing output is refused before any work, with the typed advice;
@@ -1870,7 +1870,7 @@ fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// The `--staging-dir` guarantee (`reference/cli-reference.md`, "Names
+/// The `--staging-dir` guarantee (`docs/cli/commands.md`, "Names
 /// pbfhogg leaves behind"): a run killed outright, with no chance to clean
 /// up, leaves its staging only in `--staging-dir` and its scratch only in
 /// `--tmp-dir`, and nothing beside its outputs, for every output form a

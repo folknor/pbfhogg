@@ -73,7 +73,7 @@ pub struct TagCountOptions<'a> {
 /// neither limits this map. Early eviction can lose a later threshold crossing,
 /// and a sketch would change the exact-count contract. Use type/expression
 /// restrictions to reduce cardinality, rather than treating thresholds as a
-/// memory budget. See reference/cli-reference.md, "inspect tags".
+/// memory budget. See docs/cli/commands.md, "inspect tags".
 ///
 /// The input must be a regular file (`InvalidArgument` otherwise), and is pinned for the run once the expressions are accepted
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is

@@ -11,4 +11,4 @@ This site does not carry a copy, so there is no second version to fall out of
 date.
 
 For intentional behavioral differences from osmium, see
-[Deviations](/cli/deviations).
+[Deviations](../cli/deviations.md).

@@ -590,7 +590,7 @@ fn assert_not_guard_killed(status: ExitStatus) {
         !crate::guard::killed_by_guard(status),
         "pbfhogg died of SIGSYS under the promise guard: it started a process, \
          or closed, duplicated, passed or reflagged the descriptor it inherited \
-         (reference/cli-reference.md, Names pbfhogg leaves behind)"
+         (docs/cli/commands.md, Names pbfhogg leaves behind)"
     );
     #[cfg(not(target_os = "linux"))]
     let _ = status;

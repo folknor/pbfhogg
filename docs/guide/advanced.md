@@ -12,9 +12,9 @@ Generate an indexed PBF:
 pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-Without a `--type` flag, `cat` adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal and the size overhead is small; see [Performance](./performance) for measurements.
+Without a `--type` flag, `cat` adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal and the size overhead is small; see [Performance](./performance.md) for measurements.
 
-Commands that benefit from indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, and `build-geocode-index`.
+Which commands need indexdata, and what each does without it, is in [Indexdata](./indexdata.md#which-commands-require-indexdata).
 
 ## O_DIRECT for planet-scale I/O
 
@@ -34,7 +34,7 @@ The `linux-io-uring` feature replaces the synchronous writer thread with io_urin
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 ```
 
-Whether it beats buffered writes depends on output size and host: when the page cache absorbs the whole output, buffered writes keep up. See [Performance](./performance).
+Whether it beats buffered writes depends on output size and host: when the page cache absorbs the whole output, buffered writes keep up. See [Performance](./performance.md).
 
 ## Embedding pbfhogg
 
@@ -57,17 +57,7 @@ The CLI's arena cap is a `mallopt(M_ARENA_MAX, 2)` call, which overrides `GLIBC_
 
 ## Compression modes
 
-All PBF-writing commands accept `--compression`. It applies to the blobs a command encodes; passed-through blobs keep their compression, and `repack` re-encodes every blob.
-
-| Value | Description |
-|-------|-------------|
-| `none` | No compression. Fastest writes, largest files. Ideal for intermediate files or erofs storage. |
-| `zlib` | Zlib level 6 (default; `renumber` defaults to `zlib:1`). Standard PBF compression, compatible with all tools. |
-| `zlib:LEVEL` | Zlib with explicit level (0-9). Higher = smaller + slower. |
-| `zstd` | Zstandard level 3. Better ratio and faster decompression than zlib. |
-| `zstd:LEVEL` | Zstandard with explicit level. |
-
-Compression runs on the parallel pool alongside encoding, so the choice affects file size and downstream read speed as well as write time.
+The values `--compression` accepts, and which blobs it reaches, are in the CLI reference's [Common flags](../cli/commands.md#common-flags). `none` gives the fastest writes and the largest files, `zlib` the format's standard compression, and `zstd` a better ratio and faster decompression; a higher level is smaller and slower. Compression runs on the parallel pool alongside encoding, so the choice affects file size and downstream read speed as well as write time.
 
 Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
 
@@ -79,24 +69,13 @@ Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
 pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type external
 ```
 
-| Type | Memory | Disk | Sorted required | Best for |
-|------|--------|------|-----------------|----------|
-| `sparse` (default) | Depends on the referenced-node working set | `referenced_count * 8` bytes | no | When the working set fits available page cache; see `reference/performance.md` for measurements |
-| `external` | Bounded memory | High scratch-disk demand; see `reference/performance.md` for measurements | yes + indexdata | Sorted, indexed input when the sparse working set is too large |
-| `auto` | Runtime routing by input eligibility and estimated store/page-cache budget | varies | no (unsorted or unindexed input routes to sparse) | Selects a backend at runtime |
+Which to choose:
 
-**sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF. With `--inject-prepass`, that first pass also builds a second IdSet over the same node-ID range (it must remember which referenced nodes are shared, not just referenced), so its set memory can approach double the default's.
+- **sparse** (the default) when the referenced nodes' working set (about 8 bytes per referenced node) fits the page cache. It works on any PBF, sorted or not. With `--inject-prepass` its first pass also remembers which referenced nodes are shared, so its ID-set memory can approach double the default's.
+- **external** when it does not: bounded memory at the cost of heavy scratch-disk use. It needs sorted input with indexdata.
+- **auto** to let the run decide: unsorted or unindexed input goes to sparse, and sorted, indexed input to external when the estimated store exceeds a fixed share of the page-cache budget (or either estimate is unavailable). The choice is reported on stderr.
 
-**external** uses a four-stage ID- and slot-position-bucketed join with bounded memory. Requires sorted input with indexdata. See `reference/performance.md` for measured scratch-disk needs.
-
-**auto** uses sparse for unsorted or unindexed input. For sorted, indexed input,
-it uses external when the estimated store exceeds a fixed share of the
-page-cache budget; if either estimate is unavailable, it uses external. The
-full routing rule is documented in `reference/pipeline.md`; the selected
-backend is reported to stderr. Explicit `--index-type sparse|external`
-bypasses auto routing.
-
-A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was removed. See `reference/performance.md` for measured comparisons.
+The flag's exact contract is in the CLI reference's [add-locations-to-ways](../cli/commands.md#add-locations-to-ways) section; how each backend works, and the full routing rule, in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways), and measured resource use in [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
 ## Multi-extract
 

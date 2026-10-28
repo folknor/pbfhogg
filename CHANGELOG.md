@@ -288,7 +288,7 @@
   `-i`), `getid --remove-tags` (was `-t`). The old letter is refused on that
   command with an error naming the long flag, so an old command line never
   silently means something new. The vocabulary is in
-  `reference/cli-reference.md`, "Short flags". New shorts:
+  `docs/cli/commands.md`, "Short flags". New shorts:
   `build-geocode-index -o` (`--output-dir`), `export -t` (`--type`) and
   `-b` (`--bbox`), `check -q` (`--quiet`).
 
@@ -1088,7 +1088,7 @@
   indistinguishable from "the files differ". Scripts branching on `1`
   for the semantic answer, or on any non-zero for failure, are
   unaffected; a script reading `1` as "failed" must widen to `!= 0`.
-  See the exit-code table in `reference/cli-reference.md`.
+  See the exit-code table in `docs/cli/commands.md`.
 
 - `inspect` rejects the flag combinations it used to accept and discard.
   `--show` is now mutually exclusive with every other `inspect` flag
@@ -1391,7 +1391,7 @@
   complete, and where `tags-filter` would skip the blob on the strength of it).
   Ordinary reads treat all three as "no metadata, decode the blob", which is
   the right call for a reader and no answer at all from a verifier. See
-  [the CLI reference](reference/cli-reference.md#check).
+  [the CLI reference](docs/cli/commands.md#check).
 
 - **`--distrust-metadata` on `tags-filter` and `inspect`.** Both commands
   make decisions from per-blob sidecar metadata that nothing validates
@@ -2281,7 +2281,7 @@
   Library: `extract::ExtractSlot` gains a `polygon_file` field.
 
 - **Output headers describe the output.** Every PBF-writing command now
-  derives its header from one rule (`reference/cli-reference.md` "Output
+  derives its header from one rule (`docs/cli/commands.md` "Output
   header"); what changed:
   - `extract` no longer declares `Sort.Type_then_ID` on the extract of an
     unsorted file (every strategy, and `--config`). Downstream commands that

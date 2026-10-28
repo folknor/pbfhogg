@@ -1,6 +1,6 @@
 //! The promise guard: every `pbfhogg` child this package starts runs under a
 //! seccomp filter that enforces, for its whole life, the promise in
-//! reference/cli-reference.md "Names pbfhogg leaves behind": the CLI starts
+//! docs/cli/commands.md "Names pbfhogg leaves behind": the CLI starts
 //! no other process, and never closes, replaces or changes the descriptor or
 //! file-status flags of a descriptor it inherited.
 //!

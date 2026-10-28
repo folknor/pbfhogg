@@ -30,7 +30,7 @@ This enables O(1) blob classification. For example, `apply-changes` determines w
 
 A variable-length blob containing the set of unique tag key strings present in the blob. Wire format: version byte (`0x01`) + key count (`u16` LE) + repeated `[key_len (u16 LE) + key_bytes]`.
 
-This enables `tags-filter`, `tags-count` and filtered reads to skip decompression of blobs that provably lack required tag keys. For example, `tags-filter highway=primary` skips all blobs without a `highway` key.
+This enables `tags-filter`, `inspect tags` and filtered reads to skip decompression of blobs that provably lack required tag keys. For example, `tags-filter highway=primary` skips all blobs without a `highway` key.
 
 ## Verifying indexdata
 
@@ -46,7 +46,7 @@ every blob and diffs what it finds against what the header claims, and
 `--ids` checks ID and type order; either exits `1` on a disagreement. It has
 gaps: element-kind order is not checked on a file without indexdata, and the
 header's feature flags (`LocationsOnWays` and the like) are not checked at
-all. See [check](/cli/commands#check), and the
+all. See [check](../cli/commands.md#check), and the
 [indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md)
 for which command believes which claim, what a false one costs, and what no
 check covers.
@@ -84,8 +84,8 @@ These commands will error if the input PBF lacks indexdata:
 - `getid` - skips blobs whose ID range has no intersection with requested IDs
 - `cat --type` (with or without `--clean`) - skips non-matching blob types entirely (except `--type node,way,relation --clean`, which skips nothing and does not refuse)
 - `cat --dedupe` - blob-level overlap planning and merging
-- `repack` and `degrade` (except the metadata-only `--strip-indexdata` path) - per-kind blob schedules
-- `inspect tags --type` - type-filtered tag counting
+- `repack`, and `degrade` on its decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`; its header-only flags never refuse) - per-kind blob schedules
+- `inspect tags` (with or without `--type`) - its blob schedule
 - `inspect --nodes` - node coordinate analysis
 - `build-geocode-index` - multi-pass pipeline with type filtering (escape differs, see below)
 - `renumber` - per-blob element counts for ID assignment (no escape, see below)
@@ -102,10 +102,14 @@ The escape, and whether a command refuses at all, is decided per command:
   `getparents` uses indexdata to choose a scan strategy, and `check --ids`
   warns that unindexed input is scanned more slowly.
 - `tags-filter` asks for indexdata only when it would use it: not with
-  `--invert` or `--distrust-metadata`.
+  `--invert-match` or `--distrust-metadata`, nor on OSC input.
 - `cat --clean` without `--type` does not refuse: it decodes every blob
   exactly once whether or not it is indexed, so indexdata would save it
   nothing.
+
+The full per-command table, with the modes where `--force` itself is
+refused, is in the
+[CLI reference](../cli/commands.md#proceeding-without-indexdata).
 
 Except for renumber's scan, the check reads only the first data blob's
 header. It is not a whole-file validation: a file whose first data blob is

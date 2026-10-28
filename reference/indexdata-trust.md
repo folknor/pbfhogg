@@ -21,7 +21,7 @@ acts on these claims cites it.
 Out of scope: the header's feature declarations (`LocationsOnWays`,
 `pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`). They are believed too
 and no command verifies them; their meaning is owned by the "Output header"
-section of [cli-reference.md](cli-reference.md#output-header).
+section of the [CLI reference](../docs/cli/commands.md#output-header).
 
 ## The ruling
 
@@ -74,7 +74,7 @@ checks the group fields it reads itself, as `check --locations` does.
 
 In `check --refs`, `check --ids` and (through its own raw scanner)
 `check --locations` a contradiction stops the check rather than refuses the
-file: the check fails it, exit 1 (cli-reference.md, `check`). Everywhere
+file: the check fails it, exit 1 ([CLI reference](../docs/cli/commands.md#check), `check`). Everywhere
 else it is a refusal, exit 2, with nothing published. Adopted by:
 
 - repack, and degrade's decode path and `--drop-ids` selection;
@@ -305,7 +305,7 @@ take the bound from `IdSet::file_bounded_max_id`.
   can describe, and a file indexed on some blobs and not others. It never
   routes on what it verifies. It does not check order: the intra-blob
   sortedness its scanner computes is discarded. The field-by-field contract
-  is in [cli-reference.md](cli-reference.md#--index-the-metadata-trust-boundary).
+  is in the [CLI reference](../docs/cli/commands.md#index-verification).
 - **`check --ids`** checks ID order within each blob and across blobs, per
   kind, and type order across blobs on indexed input. It tests the order
   requirement, not the header's claim: an honestly unsorted file fails it
@@ -426,8 +426,9 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   enrichment, which way declaration the output header makes.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
-  The user-facing statement is the `--force` section of
-  [cli-reference.md](cli-reference.md#--force); the outcome of every command
+  The user-facing statement is the "Proceeding without indexdata" section
+  of the [CLI reference](../docs/cli/commands.md#proceeding-without-indexdata);
+  the outcome of every command
   line on an unindexed file, and on a partially indexed one in either
   order, is pinned by the tables in `cli/tests/cli_input_contract.rs`. A
   change to any outcome moves a row there. `renumber` has no `--force` and

@@ -12,9 +12,7 @@ pbfhogg repack input.osm.pbf -o output.osm.pbf --compression zlib:9
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf --compression none
 ```
 
-The flag applies to blobs the command encodes. Blobs a command passes through (plain `cat`, unchanged blobs in `apply-changes`) keep the compression they had; `repack` re-encodes every blob.
-
-The default is `zlib` (level 6; `renumber` defaults to `zlib:1`), which produces standard PBF files compatible with all tools. Use `none` for intermediate files or when the filesystem handles compression (erofs). Use `zstd` for better compression ratio and faster decompression.
+The default, `zlib`, produces standard PBF files every tool reads. Use `none` for intermediate files or when the filesystem handles compression (erofs). Use `zstd` for a better compression ratio and faster decompression, where the tools that read the file support it. The accepted values and levels, each command's default, and which blobs the flag reaches are in the CLI reference's [Common flags](../cli/commands.md#common-flags).
 
 ## Index type for add-locations-to-ways
 
@@ -24,7 +22,7 @@ Select the node coordinate index strategy with `--index-type`:
 pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type auto
 ```
 
-Options: `sparse` (default), `external`, `auto`. See [Advanced Topics](./advanced#add-locations-to-ways-index-types) for details on each strategy and when to use them.
+Options: `sparse` (default), `external`, `auto`. See [Advanced Topics](./advanced.md#add-locations-to-ways-index-types) for when to use each.
 
 ## Output header metadata
 
@@ -49,7 +47,7 @@ pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf \
   --output-header osmosis_replication_base_url=https://download.geofabrik.de/europe/denmark-updates
 ```
 
-Supported keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. An empty value (`--output-header osmosis_replication_base_url=`) omits the field.
+The keys, and how each command derives the header it writes, are in the CLI reference's [Output header](../cli/commands.md#output-header).
 
 `apply-changes` drops the base's replication timestamp and sequence number (the output is past them, and an OSC does not say where to) and keeps its base URL, so an updater should stamp the state of the last diff it applied, as above.
 
@@ -77,7 +75,7 @@ Requires the `linux-io-uring` feature at compile time, Linux 5.1+, and sufficien
 
 ## RLIMIT_MEMLOCK for io_uring
 
-io_uring with registered buffers needs to pin memory pages. The default 64-buffer pool requires about 16 MB of locked memory. If the limit is too low, pbfhogg will print an error suggesting the fix:
+io_uring with registered buffers needs to pin memory pages. The default 64-buffer pool requires about 16 MB of locked memory. If the limit is too low, the run is refused at setup with exit code 3 and an `Error: platform feature io-uring unavailable: ...` line (kernels before 5.12 can report it as a generic exit 2 instead; see [Exit codes](../cli/commands.md#exit-codes)). Raise the limit:
 
 ```sh
 ulimit -l unlimited

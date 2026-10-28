@@ -50,11 +50,12 @@ pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf
 
 ## Next Steps
 
-- [Installation](./install) - CLI and library install, feature flags, platform
-- [Basic Usage](./usage) - walkthroughs of the common CLI commands
-- [Reading PBF Files](./reading) - ElementReader API, read modes, blob filtering
-- [Writing PBF Files](./writing) - BlockBuilder, PbfWriter, compression options
-- [Indexdata](./indexdata) - what it is, how to generate it, which commands use it
-- [Configuration](./configuration) - compression, index type, output header, I/O modes
-- [Performance](./performance) - benchmarks, optimization tips, planet-scale considerations
-- [Advanced Topics](./advanced) - O_DIRECT, io_uring, embedding the library, geocode index
+- [Installation](./install.md) - CLI and library install, feature flags, platform
+- [Basic Usage](./usage.md) - walkthroughs of the common CLI commands
+- [Reading PBF Files](./reading.md) - ElementReader API, read modes, blob filtering
+- [Writing PBF Files](./writing.md) - BlockBuilder, PbfWriter, compression options
+- [Indexdata](./indexdata.md) - what it is, how to generate it, which commands use it
+- [Configuration](./configuration.md) - compression, index type, output header, I/O modes
+- [Performance](./performance.md) - benchmarks, optimization tips, planet-scale considerations
+- [Advanced Topics](./advanced.md) - O_DIRECT, io_uring, embedding the library, geocode index
+- [CLI reference](../cli/commands.md) - every command, flag and output contract

@@ -742,6 +742,39 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   and assert the pipe reads EOF. It still proves less than the whole
   contract (one checkpoint, one command), so it complements the tripwires.
 
+- [ ] **The O_DIRECT path constructors' non-regular-target check is not
+  race-free.** `direct_io::create_for_write` (behind
+  `PbfWriter::to_path_direct` and `to_path_uring`) stats the path before
+  its `O_DIRECT` open, re-stats it when the open fails `EINVAL` or
+  `EOPNOTSUPP`, and fstats the opened descriptor. A FIFO renamed into place
+  between the first stat and the open still blocks the open, and a device
+  renamed in sees the open (it is never written). A failed re-stat keeps
+  the open's own classification, so an `EINVAL` from a swapped-in device can
+  still read as `direct-io` unavailable. Closing it would need a
+  non-blocking probe open plus a `/proc/self/fd` reopen (the input-pinning
+  pattern), or `O_NONBLOCK` cleared afterwards, which the brokkr.toml
+  `fcntl F_SETFL` textlint rule confines to `src/read/input.rs`. Judged
+  outside the path constructors' contract (their caller owns the
+  destination; `Output` stages a fresh file) when this landed; recorded so
+  the boundary is a decision, not an oversight.
+
+- [ ] **Library direct and io_uring write tests sit outside the `platform`
+  tier.** reference/testing.md puts platform-dependent tests in a
+  `platform` module so `brokkr check --profile platform` selects them;
+  `tests/roundtrip.rs` (`roundtrip_direct_io`,
+  `roundtrip_pipelined_direct_io`, `roundtrip_uring_tiny_output`,
+  `roundtrip_uring_small_size_sweep`) and `tests/fault_uring_writer.rs` are
+  top-level tests that skip inline instead. Either move them under
+  `mod platform` or state in testing.md that a feature-gated test that
+  skips cleanly may stay tier 1. The non-regular-target refusal tests added
+  beside them stay tier 1 on purpose: the refusal precedes any `O_DIRECT`
+  open, so the direct one runs on every host.
+
+- [ ] **`notes/review-audit.md` is cited but absent.** bz tickets
+  pbfhogg#19 (closed) and pbfhogg#20 (open) cite it for "Slice D" and the
+  orchestrator's checks; the file is not in the tree (git history not
+  searched). Restore it from history or reword the citation in #20.
+
 ### Read path
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
@@ -948,7 +981,9 @@ raised: `brokkr check --profile platform`, the ignored
 `sort_overlapping_blobs_uring` (see "Ignored tests"), and `--io-uring` runs
 that take a passthrough copy as well as fresh blocks (plain `cat`, sort, or
 apply-changes on its splice route), since a command writing only fresh
-blocks never reaches `ReadSink`. Do not raise the limit from inside a work
+blocks never reaches `ReadSink`. `uring_writer_refuses_non_regular_targets`
+(tests/roundtrip.rs) skips wherever the ring is refused, since the ring is
+set up before the output is checked. Do not raise the limit from inside a work
 session; it is a host-configuration change. Full entry, with the other work
 the same limit blocks, under "Deferred with explicit triggers" at the top
 of this file.

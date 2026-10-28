@@ -896,6 +896,83 @@ fn roundtrip_uring_small_size_sweep() {
     }
 }
 
+/// The non-regular targets an `O_DIRECT` writer must refuse before opening:
+/// a FIFO with no reader (whose open would block), a character device (whose
+/// `O_DIRECT` open fails `EINVAL`, once misreported as direct I/O being
+/// unavailable) and a directory.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+fn non_regular_targets(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    vec![
+        crate::common::make_fifo(dir, "fifo.osm.pbf"),
+        std::path::PathBuf::from("/dev/null"),
+        dir.to_path_buf(),
+    ]
+}
+
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+fn is_not_a_file(err: &pbfhogg::Error) -> bool {
+    matches!(
+        err.kind(),
+        pbfhogg::ErrorKind::Output(pbfhogg::OutputError::NotAFile { .. })
+    )
+}
+
+/// `to_path_direct` refuses a non-regular target as not a regular file,
+/// before any `O_DIRECT` open, so the refusal holds on every host.
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_writer_refuses_non_regular_targets() {
+    let dir = crate::common::test_scratch();
+    let header = block_builder::HeaderBuilder::new().build().unwrap();
+    for target in non_regular_targets(dir.path()) {
+        let result = PbfWriter::to_path_direct(
+            &target,
+            Compression::default(),
+            &header,
+            pbfhogg::host::Executor::Ambient,
+        );
+        match result {
+            Ok(_) => panic!("{}: accepted as a direct output", target.display()),
+            Err(e) => assert!(is_not_a_file(&e), "{}: {e}", target.display()),
+        }
+    }
+}
+
+/// `to_path_uring` refuses a non-regular target the same way. Its ring is
+/// probed before the output is opened, so a host without a usable io_uring
+/// skips; a `direct-io` refusal is the misclassification and fails.
+#[cfg(feature = "linux-io-uring")]
+#[test]
+fn uring_writer_refuses_non_regular_targets() {
+    let dir = crate::common::test_scratch();
+    let header = block_builder::HeaderBuilder::new().build().unwrap();
+    for target in non_regular_targets(dir.path()) {
+        let result = PbfWriter::to_path_uring(
+            &target,
+            Compression::default(),
+            &header,
+            pbfhogg::host::Executor::Ambient,
+        );
+        match result {
+            Ok(_) => panic!("{}: accepted as an io_uring output", target.display()),
+            Err(e) if is_not_a_file(&e) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    pbfhogg::ErrorKind::PlatformUnsupported {
+                        feature: "io-uring",
+                        ..
+                    }
+                ) =>
+            {
+                crate::common::skip(format!("io_uring not available: {e}"));
+                return;
+            }
+            Err(e) => panic!("{}: {e}", target.display()),
+        }
+    }
+}
+
 /// Write a PBF with zstd compression, read it back, verify the data survives the roundtrip.
 #[test]
 fn roundtrip_zstd() {

@@ -82,7 +82,8 @@ impl FileWriter {
     ///
     /// Durability is now something a caller asks for by name. `flush` flushes.
     ///
-    /// One exception, buffered variant only: a target that does not support
+    /// One exception, buffered variant only (the direct variant never opens
+    /// anything but a regular file): a target that does not support
     /// synchronization - a FIFO, a socket, or a character device such as
     /// `/dev/null` - makes `fsync` fail with `EINVAL` after every byte has
     /// already been handed over by `write(2)` and every write error already

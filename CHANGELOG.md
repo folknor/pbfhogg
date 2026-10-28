@@ -1431,6 +1431,14 @@
 
 ### Fixed
 
+- **`PbfWriter::to_path_direct` and `to_path_uring` refuse a target that is
+  not a regular file.** A FIFO, socket, device or directory is refused with
+  `OutputError::NotAFile` before it is opened. A FIFO without a reader used
+  to block the call, `/dev/null` was reported as direct I/O being
+  unavailable on the platform, and a block device was written and then
+  failed at truncation. The CLI never reached these: its outputs are staged
+  in a fresh regular file.
+
 - **Every reader puts a node at the same coordinate.**
   `add-locations-to-ways` and `apply-changes --locations-on-ways` refused a
   node block whose `granularity * raw` overflows `i64` even when the

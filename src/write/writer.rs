@@ -417,7 +417,10 @@ impl PbfWriter<FileWriter> {
     ///
     /// All writes bypass the kernel page cache, preventing cache pollution
     /// during planet-scale (80 GB+) PBF writes. Requires a filesystem that
-    /// supports `O_DIRECT` (not tmpfs).
+    /// supports `O_DIRECT` (not tmpfs), and a `path` that is a regular file
+    /// or absent: a FIFO, socket, device or directory is refused with
+    /// [`OutputError::NotAFile`](crate::OutputError::NotAFile) before it is
+    /// opened.
     #[cfg(feature = "linux-direct-io")]
     pub fn to_path_direct(
         path: &Path,
@@ -468,7 +471,8 @@ impl PbfWriter<FileWriter> {
     /// registered page-aligned buffers. This provides maximum throughput
     /// when the pipeline is I/O-bound (e.g. `Compression::None` on fast storage).
     ///
-    /// Requires the `linux-io-uring` feature and Linux 5.1+.
+    /// Requires the `linux-io-uring` feature and Linux 5.1+. `path` must be a
+    /// regular file or absent, as for [`to_path_direct`](Self::to_path_direct).
     ///
     /// # Latent blocking scenario
     ///

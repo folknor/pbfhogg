@@ -81,7 +81,28 @@ mod imp {
     /// path, or a path constructor's caller) chose; the caller names the path
     /// in an ordinary failure. A filesystem that refuses `O_DIRECT` at open
     /// fails with `ErrorKind::PlatformUnsupported` (feature `direct-io`).
+    ///
+    /// The target must be a regular file, or absent. Padding the tail and
+    /// truncating to the logical size assume one, and a FIFO, socket or
+    /// device is not a page-cache file `O_DIRECT` could bypass. An existing
+    /// target that is not a regular file (symlinks followed, as the open
+    /// follows them) is refused with
+    /// [`OutputError::NotAFile`](crate::error::OutputError::NotAFile) and
+    /// never opened: a FIFO without a reader would block the open, and
+    /// Linux fails an `O_DIRECT` open of a FIFO or character device with
+    /// `EINVAL`, which must not read as "direct I/O unavailable". Should the
+    /// open still fail that way, the path is looked at again and a
+    /// non-regular file found there is refused the same way. The opened
+    /// descriptor is checked too, so a block device (whose `O_DIRECT` open
+    /// succeeds) is never written, padded or truncated.
+    ///
+    /// That narrows, and does not close, the race with a process that
+    /// replaces the target concurrently: a FIFO put in its place after the
+    /// first look can still block the open, and a device put there sees the
+    /// open. A path constructor's caller owns its destination; outputs that
+    /// need more go through `Output`, whose staging file is created fresh.
     pub(crate) fn create_for_write(path: &Path) -> Result<(File, usize)> {
+        refuse_non_regular(path)?;
         #[allow(clippy::disallowed_methods)]
         let opened = std::fs::OpenOptions::new()
             .write(true)
@@ -89,9 +110,41 @@ mod imp {
             .truncate(true)
             .custom_flags(libc::O_DIRECT)
             .open(path);
-        let file = opened.map_err(crate::error::direct_io_open_error)?;
+        let file = match opened {
+            Ok(file) => file,
+            Err(e) => {
+                if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+                    // Best effort: a failed look keeps the open's own error.
+                    refuse_non_regular(path)?;
+                }
+                return Err(crate::error::direct_io_open_error(e));
+            }
+        };
+        if !file.metadata()?.is_file() {
+            return Err(not_a_file(path));
+        }
         let align = resolve(query(&file, Access::Write)).map_err(|r| refusal(None, r))?;
         Ok((file, align))
+    }
+
+    /// Refuse `path` when it names an existing file that is not a regular
+    /// file. Absent is fine (the open creates it); any other failure to look
+    /// is returned as the I/O error it is.
+    fn refuse_non_regular(path: &Path) -> Result<()> {
+        #[allow(clippy::disallowed_methods)]
+        match std::fs::metadata(path) {
+            Ok(meta) if !meta.is_file() => Err(not_a_file(path)),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[cold]
+    fn not_a_file(path: &Path) -> Error {
+        crate::error::new_output_error(crate::error::OutputError::NotAFile {
+            path: path.to_path_buf(),
+        })
     }
 
     /// Open `path` for `O_DIRECT` reading, and return it with the alignment

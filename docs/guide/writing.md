@@ -269,7 +269,7 @@ Three things follow from handing the writer a pool:
 
 ### to_path_direct - O_DIRECT writes
 
-Bypasses the page cache. Prevents cache pollution at planet scale (80 GB+ output). Requires the `linux-direct-io` feature and a real filesystem (not tmpfs).
+Bypasses the page cache. Prevents cache pollution at planet scale (80 GB+ output). Requires the `linux-direct-io` feature and a real filesystem (not tmpfs). The path must be a regular file or absent: a FIFO, socket, device or directory is refused with `OutputError::NotAFile` before it is opened (the same holds for `to_path_uring`).
 
 ```rust
 use pbfhogg::write::writer::{PbfWriter, Compression};

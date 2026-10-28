@@ -1820,6 +1820,41 @@ fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
     run_property(Prop::Interrupted, interrupted_run_leaves_nothing, |_| true);
 }
 
+/// What one entry under a snapshotted directory is: a directory, a file and
+/// its bytes, or a symlink and its target.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, PartialEq, Eq)]
+enum Snapshot {
+    Dir,
+    File(Vec<u8>),
+    Link(PathBuf),
+}
+
+/// Every entry under `dir` at any depth, by path relative to `dir`, sorted.
+/// Symlinks are recorded, never followed.
+#[cfg(feature = "test-hooks")]
+fn tree_snapshot(dir: &Path) -> Vec<(PathBuf, Snapshot)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Snapshot)>) {
+        for name in names(dir) {
+            let path = dir.join(&name);
+            let rel = path.strip_prefix(root).unwrap().to_path_buf();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                out.push((rel, Snapshot::Link(std::fs::read_link(&path).unwrap())));
+            } else if meta.is_dir() {
+                out.push((rel, Snapshot::Dir));
+                walk(root, &path, out);
+            } else {
+                out.push((rel, Snapshot::File(std::fs::read(&path).unwrap())));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Every name pbfhogg leaves behind anywhere under `dir`.
 #[cfg(feature = "test-hooks")]
 fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
@@ -1944,6 +1979,7 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
         );
     }
 
+    let before = tree_snapshot(staging.path());
     let next = CliInvoker::new().args(&inv.args).args(&extra).run();
     let stderr = next.stderr_str();
     ensure!(exited_ok(row, &next), "the next run failed: {stderr}");
@@ -1964,10 +2000,15 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
         "the next run left {:?} beside its outputs",
         hidden_anywhere(out_dir.path())
     );
+    // Every entry at every depth, with every file's bytes: the next run
+    // reports leftovers and touches none of them, so a truncated staging
+    // file or a file removed inside a kept run directory fails here.
+    let after = tree_snapshot(staging.path());
     ensure!(
-        names(staging.path()) == left,
-        "the next run changed --staging-dir: {:?}, before {left:?}",
-        names(staging.path())
+        after == before,
+        "the next run changed --staging-dir: {:?}, before {:?}",
+        after.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        before.iter().map(|(path, _)| path).collect::<Vec<_>>()
     );
     if !shared {
         return Ok(());

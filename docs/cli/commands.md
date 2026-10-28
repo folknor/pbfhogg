@@ -195,7 +195,9 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
 (the staging file, or the geocode index's staging directory) in `DIR` instead of beside the
 output. Publication still renames it into place, so `DIR` is checked before any work: it must
 exist, be a directory on the same mount as every output's directory (a bind mount of the same
-device is another mount, and is refused on every Linux kernel), not be or contain any
+device is another mount, and is refused on every Linux kernel unless a sandbox or lookup error
+keeps the kernel from answering, in which case the run goes ahead and meets the refusal at the
+end), not be or contain any
 output's directory (a directory below one is fine), and for `build-geocode-index` not lie
 inside `--output-dir`. `extract --config` checks it against every output the config names
 before reserving any. A rename refused at the very end anyway (a filesystem that refuses it

@@ -432,8 +432,8 @@ place, so `DIR` is checked before any work and refused unless:
 - it is on the same mount as every output's directory: the same device, and
   a mount the kernel does not refuse a rename across. A bind mount of the
   same device is a different mount, across which a rename fails, and is
-  refused on every Linux kernel, including those that report no `statx`
-  mount id (before 5.8);
+  refused on every Linux kernel whose answer settles it (see below),
+  including those that report no `statx` mount id (before 5.8);
 - it is not, and does not contain, any output's directory (a directory below
   an output's directory is fine): a caller removes its staging directory
   whole, and a backup of a replaced output lands beside the output;
@@ -443,8 +443,12 @@ place, so `DIR` is checked before any work and refused unless:
 For `extract --config` it is checked against every output the config names
 before any output is reserved. A refusal names the staging directory and the
 output, exit `2`. The mount check detects a refusal rather than promising the
-rename: one it cannot foresee (a filesystem that refuses the rename itself, a
-mount table changed while the run worked) is met at the final rename, and is
+rename. It asks the kernel with a rename that cannot move anything, and an
+answer that settles nothing (a lookup error such as `EACCES`, or a sandbox
+such as a seccomp filter refusing the call) lets the run go ahead rather than
+refusing a directory that may be fine. A refusal it cannot foresee, or that
+went unanswered (a filesystem that refuses the rename itself, a mount table
+changed while the run worked), is met at the final rename, and is
 reported as the same staging-directory refusal with the kernel's error
 appended, after the run's outputs were rolled back as for any failed
 publication. `--staging-dir` needs an output: with `export` or a text

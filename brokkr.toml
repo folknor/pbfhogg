@@ -1511,8 +1511,9 @@ must_scan = [
 message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
 
 # Presence of the CLI exit-path hook calls, the function-scoped probe_lock
-# open flags, and no `as i64` cast inside a `.counter(` call's arguments
-# (which rustfmt wraps across lines): none fits a one-line forbid rule.
+# open flags, no `as i64` cast inside a `.counter(` call's arguments (which
+# rustfmt wraps across lines), and no static under a test-hooks gate anywhere
+# in src/ (the gate is on the line above): none fits a one-line forbid rule.
 [[script_check]]
 name = "source-invariants"
 command = "python3 scripts/check_source_invariants.py"

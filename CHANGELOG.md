@@ -1113,7 +1113,8 @@
   lies inside `--output-dir`); `extract --config` checks it against every
   output first. A bind mount of the output's device counts as another mount
   and is refused on every Linux kernel, including those before 5.8 that
-  report no `statx` mount id. A rename refused at the end anyway is reported
+  report no `statx` mount id, unless a sandbox keeps the kernel from
+  answering the check. A rename refused at the end anyway is reported
   as the same staging-directory refusal, not as a bare publication failure.
   Backups of replaced outputs always stay beside the output. With `--staging-dir`
   the output's own directory is still checked for writability up front.

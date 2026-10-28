@@ -61,9 +61,13 @@ output any other way.
   the `.` with `EBUSY`, so the question is put to the kernel without renaming
   anything, on every kernel, including those that report no `statx` mount
   id (before 5.8), whose device-only comparison let a bind mount through to
-  fail at the final rename. The check detects a refusal, it does not promise
-  the rename: a refusal it cannot foresee (a filesystem refusing after the
-  mount check, a mount table changed during the run) is met at publication,
+  fail at the final rename. Any other answer settles nothing (a lookup error
+  such as `EACCES`, a seccomp filter refusing the call with `EPERM` or
+  another errno) and lets the run go ahead rather than refuse a directory
+  that may be fine. The check detects a refusal, it does not promise the
+  rename: a refusal it cannot foresee or that went unanswered (a filesystem
+  refusing after the mount check, a mount table changed during the run, a
+  sandboxed probe) is met at publication,
   where an `EXDEV` out of a caller-chosen staging directory is reported as
   the same `StagingDir` refusal carrying the kernel's error, and ends the
   publication like any failed install.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source invariants that need a presence check or a function-scoped scan.
 
-Textlint rules can only forbid a token on one physical line, so these three
+Textlint rules can only forbid a token on one physical line, so these four
 cannot be textlint rules:
 
 - The CLI's exit path must call both counter-emission hooks. The library's
@@ -15,6 +15,15 @@ cannot be textlint rules:
   line, so the call has to be read whole. A user-supplied u64 whose bit
   pattern is the meaning (degrade's drop seed) uses `cast_signed()`. The scan
   sees the call's arguments only, not casts made upstream of a local.
+- No `static` item gated on the `test-hooks` feature anywhere in the
+  library. Test pause and fault state rides the run's Invocation token
+  (src/test_hooks.rs, reference/testing.md); a gated static is process-global
+  hook state that reaches every concurrent test. The textlint rule
+  `no-static-fault-hook-state` covers src/test_hooks.rs whole, but test-hook
+  items also live with the code they reach (src/output.rs, src/host.rs), and
+  the gate sits on the line above the item, which a one-line rule cannot
+  read. The scan reads each static's own attribute block, so a static
+  nested inside a gated module or macro body is not seen.
 
 Comments are stripped before scanning so a commented-out call or a comment
 that mentions a forbidden token cannot decide the outcome.
@@ -155,6 +164,64 @@ for pattern in ("src/**/*.rs", "cli/src/**/*.rs"):
                 f"{path.relative_to(root)}:{line}: counter argument casts "
                 f"`as i64` ({args}); pass the unsigned value, Invocation::counter saturates it"
             )
+
+
+STATIC_ITEM = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?static\s")
+TEST_HOOKS_GATE = re.compile(r'feature\s*=\s*"test-hooks"')
+
+
+def gated_statics(src):
+    """Line numbers of `static` items whose attribute block names the
+    `test-hooks` feature. The block is the lines above the item up to the end
+    of the previous statement or brace; the gate is read from the raw text,
+    since blanking literals hides the feature name."""
+    code = blank_comments_and_literals(src).splitlines()
+    raw = src.splitlines()
+    found = []
+    for i, line in enumerate(code):
+        if not STATIC_ITEM.match(line):
+            continue
+        j = i - 1
+        while j >= 0:
+            stripped = code[j].strip()
+            if stripped.endswith((";", "{", "}")):
+                break
+            if stripped and TEST_HOOKS_GATE.search(raw[j]):
+                found.append(i + 1)
+                break
+            j -= 1
+    return found
+
+
+GATED_STATIC_SELF_TEST = [
+    # (source, expected number of flagged statics)
+    ('#[cfg(feature = "test-hooks")]\nstatic X: u8 = 0;', 1),
+    ('#[cfg(feature = "test-hooks")]\npub(crate) static X: u8 = 0;', 1),
+    ('#[cfg(all(\n    test,\n    feature = "test-hooks"\n))]\n/// doc\nstatic X: u8 = 0;', 1),
+    ('#[cfg(feature = "test-hooks")]\n\n#[allow(dead_code)]\nstatic X: u8 = 0;', 1),
+    ("static SEQ: AtomicU64 = AtomicU64::new(0);", 0),
+    ('#[cfg(feature = "test-hooks")]\nfn f() {}\nstatic X: u8 = 0;', 0),
+    ('#[cfg(feature = "test-hooks")]\nuse a::b;\nstatic X: u8 = 0;', 0),
+    ('// #[cfg(feature = "test-hooks")]\nstatic X: u8 = 0;', 0),
+    ('#[cfg(feature = "other")]\nstatic X: u8 = 0;', 0),
+    ('let s = "#[cfg(feature = \\"test-hooks\\")]";\nstatic X: u8 = 0;', 0),
+]
+
+for source, expected in GATED_STATIC_SELF_TEST:
+    got = len(gated_statics(source))
+    if got != expected:
+        errors.append(
+            f"check_source_invariants.py self-test: expected {expected} gated "
+            f"static(s), got {got}, in {source!r}"
+        )
+
+for path in sorted(root.glob("src/**/*.rs")):
+    for line in gated_statics(path.read_text()):
+        errors.append(
+            f"{path.relative_to(root)}:{line}: a static gated on the test-hooks "
+            "feature is process-global hook state; put it in FaultPlan, carried by "
+            "the run's Invocation token"
+        )
 
 
 def code_only(source):

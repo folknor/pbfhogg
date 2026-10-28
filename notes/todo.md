@@ -770,11 +770,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   beside them stay tier 1 on purpose: the refusal precedes any `O_DIRECT`
   open, so the direct one runs on every host.
 
-- [ ] **`notes/review-audit.md` is cited but absent.** bz tickets
-  pbfhogg#19 (closed) and pbfhogg#20 (open) cite it for "Slice D" and the
-  orchestrator's checks; the file is not in the tree (git history not
-  searched). Restore it from history or reword the citation in #20.
-
 ### Read path
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
@@ -793,6 +788,22 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   means a scheduled interleaved matched A/B at planet scale on a trimmed drive,
   with the host's cache state accepted as spent for the duration. It has
   survived four rounds untouched for that reason.
+
+- [ ] **The checked and dense tag iterators report the default `size_hint`.**
+  `CheckedTagIter` (`src/read/elements.rs`), `DenseTagIter`,
+  `CheckedDenseTagIter` and `DenseRawTagIter` (`src/read/dense.rs`) return
+  `(0, None)`, while `TagIter` and `RawTagIter` report a finite upper bound.
+  The default is true, so nothing is wrong; a known upper bound would only let
+  adapters size better. If added: `CheckedTagIter` needs `(0, max of the two
+  array uppers)`, not the minimum, because on mismatched arrays (unreachable on
+  a constructed block) it yields one extra `Err` item past the shorter array;
+  the dense ones can bound by `cursor.remaining() / 2` (every pair is at least
+  two bytes), and `CheckedDenseTagIter` must report `(0, Some(0))` once failed.
+- [ ] **The tag-iterator section exists twice.** `CORRECTNESS.md` "Tag
+  iterators end early on an out-of-range string index" and its copy in
+  `docs/guide/correctness.md` are maintained by hand and drift independently;
+  any edit has to land in both. Nothing checks they agree. Either generate one
+  from the other or add a script check comparing the two sections.
 
 ### Spatial and node-location resolution
 

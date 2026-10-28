@@ -467,6 +467,26 @@ impl WayNodeLocation {
     impl_coordinate_conversions!();
 }
 
+/// Combine the `size_hint`s of iterators advanced in lockstep, the way
+/// `std::iter::Zip` does: the minimum of the lower bounds and the minimum of
+/// the known upper bounds.
+///
+/// Block construction (`validate_groups_strict` in `block.rs`) rejects
+/// parallel arrays of different lengths, so on a constructed block every
+/// component reports the same count and any one of them would do. Taking the
+/// minimum keeps the hint true without leaning on that invariant: if
+/// a path ever bypasses the check, `next` stops at the shortest array and the
+/// hint already says so. The component hints are protohoggr's packed-array
+/// hints, whose lower bound is a documented overclaim on a malformed varint
+/// (see the "Size hint" section on protohoggr's `PackedIter`); construction
+/// also rejects those, and this combination neither fixes nor worsens that.
+pub(super) fn zip_hint(hints: &[(usize, Option<usize>)]) -> (usize, Option<usize>) {
+    let lower = hints.iter().map(|h| h.0).min().unwrap_or(0);
+    let upper = hints.iter().filter_map(|h| h.1).min();
+    let upper = if hints.is_empty() { Some(0) } else { upper };
+    (lower, upper)
+}
+
 /// An iterator over the node locations of a way.
 #[derive(Clone)]
 pub struct WayNodeLocationsIter<'a> {
@@ -499,12 +519,21 @@ impl Iterator for WayNodeLocationsIter<'_> {
                         .wrapping_add(self.granularity.wrapping_mul(self.clon)),
                 })
             }
-            _ => None,
+            (dlat, dlon) => {
+                // Construction (`validate_way_geometry_arrays` in `block.rs`)
+                // rejects lat and lon arrays of different lengths, so both
+                // end together.
+                debug_assert!(
+                    dlat.is_none() && dlon.is_none(),
+                    "way lat/lon arrays differ in length"
+                );
+                None
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.dlats.size_hint()
+        zip_hint(&[self.dlats.size_hint(), self.dlons.size_hint()])
     }
 }
 
@@ -638,12 +667,25 @@ impl<'a> Iterator for RelMemberIter<'a> {
                     id: MemberId::from_id_and_type(self.current_member_id, mt),
                 })
             }
-            _ => None,
+            (role_sid, mem_id_delta, member_type) => {
+                // Construction (`validate_relation_member_arrays` in
+                // `block.rs`) rejects member arrays of different lengths, so
+                // all three end together.
+                debug_assert!(
+                    role_sid.is_none() && mem_id_delta.is_none() && member_type.is_none(),
+                    "relation member arrays differ in length"
+                );
+                None
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.role_sids.size_hint()
+        zip_hint(&[
+            self.role_sids.size_hint(),
+            self.member_id_deltas.size_hint(),
+            self.member_types.size_hint(),
+        ])
     }
 }
 
@@ -660,20 +702,46 @@ impl<'a> Iterator for TagIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // wontfix(type-result-fallible): Iterator trait constrains return type;
-        // an out-of-range stringtable index ends iteration rather than
-        // propagating an error. See CORRECTNESS.md.
-        get_stringtable_key_value(
-            self.block,
-            self.key_indices.next().map(|v| v as usize),
-            self.val_indices.next().map(|v| v as usize),
-        )
+        match (self.key_indices.next(), self.val_indices.next()) {
+            (Some(k), Some(v)) => {
+                // wontfix(type-result-fallible): Iterator trait constrains
+                // return type; an out-of-range stringtable index ends
+                // iteration rather than propagating an error. See
+                // CORRECTNESS.md. Emptying both arrays on that branch keeps
+                // the end final (the iterator is fused) at no cost on the
+                // success path.
+                let pair =
+                    get_stringtable_key_value(self.block, Some(k as usize), Some(v as usize));
+                if pair.is_none() {
+                    self.key_indices = PackedUint32Iter::empty();
+                    self.val_indices = PackedUint32Iter::empty();
+                }
+                pair
+            }
+            (k, v) => {
+                // Construction (`validate_tag_arrays` in `block.rs`) rejects
+                // keys and vals arrays of different lengths.
+                debug_assert!(
+                    k.is_none() && v.is_none(),
+                    "tag key/value arrays differ in length"
+                );
+                None
+            }
+        }
     }
 
+    /// The lower bound is 0: a string index past the table ends iteration
+    /// early, and only resolving every remaining index could rule that out.
+    /// The upper bound is the shorter array's.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.key_indices.size_hint()
+        (
+            0,
+            zip_hint(&[self.key_indices.size_hint(), self.val_indices.size_hint()]).1,
+        )
     }
 }
+
+impl std::iter::FusedIterator for TagIter<'_> {}
 
 /// The fallible sibling of [`TagIter`]: yields `Err` for a tag whose key or
 /// value index points past the block's string table, instead of ending
@@ -737,12 +805,20 @@ impl Iterator for RawTagIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match (self.key_indices.next(), self.val_indices.next()) {
             (Some(key_index), Some(val_index)) => Some((key_index, val_index)),
-            _ => None,
+            (k, v) => {
+                // Construction (`validate_tag_arrays` in `block.rs`) rejects
+                // keys and vals arrays of different lengths.
+                debug_assert!(
+                    k.is_none() && v.is_none(),
+                    "tag key/value arrays differ in length"
+                );
+                None
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.key_indices.size_hint()
+        zip_hint(&[self.key_indices.size_hint(), self.val_indices.size_hint()])
     }
 }
 

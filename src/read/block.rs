@@ -2187,6 +2187,42 @@ mod strict_validation_tests {
         }
     }
 
+    /// `TagIter` on a tag index past the string table: its `size_hint` lower
+    /// bound must not promise the remaining tags (iteration ends there), and
+    /// the end is final - the tags after the bad one never resume. The
+    /// zipped `RawTagIter` hint stays exact on the same arrays.
+    #[test]
+    fn tag_iter_hint_and_fusing_on_out_of_range_string_index() {
+        use std::iter::FusedIterator;
+        fn assert_fused<I: FusedIterator>(_: &I) {}
+
+        // The fixture string table has one entry (index 0); key index 1 on
+        // the second tag points past it. Three tags, all one-byte varints.
+        let mut way = vec![0x08u8, 0x01];
+        way.extend_from_slice(&len_field(2, &[0x00, 0x01, 0x00]));
+        way.extend_from_slice(&len_field(3, &[0x00, 0x00, 0x00]));
+        let block = PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)]))
+            .expect("bad string indices are not a construction error");
+        let Some(Element::Way(w)) = block.elements().next() else {
+            panic!("expected one way");
+        };
+
+        let raw = w.raw_tags();
+        assert_eq!(raw.size_hint(), (0, Some(3)));
+        assert_eq!(raw.count(), 3);
+
+        let mut tags = w.tags();
+        assert_fused(&tags);
+        let (lower, upper) = tags.size_hint();
+        assert_eq!(lower, 0);
+        assert_eq!(upper, Some(3));
+        assert_eq!(tags.next(), Some(("", "")));
+        assert_eq!(tags.next(), None);
+        // The third tag is valid; a non-fused iterator would resume with it.
+        assert_eq!(tags.next(), None);
+        assert_eq!(tags.size_hint(), (0, Some(0)));
+    }
+
     /// A packed array on a regular element that ends mid-varint is rejected
     /// rather than silently yielding one value fewer.
     ///

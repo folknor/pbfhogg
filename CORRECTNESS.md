@@ -54,6 +54,9 @@ tag iterators cannot surface it: `TagIter` (`src/read/elements.rs`) and
 `Iterator<Item = (&str, &str)>`, and `get_stringtable_key_value` discards the
 error as `None`. A tag with an out-of-range key or value index therefore ends
 the element's tag list early, silently dropping it and every tag after it.
+Both iterators are fused, so that end is final even for a caller that keeps
+calling `next`, and neither promises a positive `size_hint` lower bound,
+since the early end cannot be predicted without resolving every index.
 
 `tags_checked()` on `Node`, `Way`, `Relation` and `DenseNode` returns the
 fallible sibling (`CheckedTagIter`, `CheckedDenseTagIter`), which yields an

@@ -1,6 +1,7 @@
 //! Iterate over the dense nodes in a `PrimitiveGroup`
 
 use super::block::{get_stringtable_key_value, str_from_stringtable, validated};
+use super::elements::zip_hint;
 use super::wire::{
     Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, WireBlock,
     WireDenseInfo, WireDenseNodes,
@@ -251,12 +252,27 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                     lon_offset: self.lon_offset,
                 })
             }
-            _ => None,
+            (did, dlat, dlon, _) => {
+                // Construction rejects id, lat and lon arrays of different
+                // lengths (`validate_groups_strict` in `block.rs`), so all
+                // three end together.
+                debug_assert!(
+                    did.is_none() && dlat.is_none() && dlon.is_none(),
+                    "dense id/lat/lon arrays differ in length"
+                );
+                None
+            }
         }
     }
 
+    /// `info_iter` is left out: it is optional, has no hint of its own, and
+    /// never limits iteration (a node without info still yields).
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.dids.size_hint()
+        zip_hint(&[
+            self.dids.size_hint(),
+            self.dlats.size_hint(),
+            self.dlons.size_hint(),
+        ])
     }
 }
 
@@ -528,12 +544,19 @@ impl<'a> Iterator for DenseTagIter<'a> {
         // different - construction does not resolve indices - and still ends
         // iteration, because Iterator constrains the return type. See
         // CORRECTNESS.md "Tag iterators end early on an out-of-range string
-        // index".
+        // index". Emptying the cursor on that branch keeps the end final
+        // (the iterator is fused) at no cost on the success path.
         let key = validated(self.cursor.read_varint(), "DenseNodes keys_vals key") as usize;
         let val = validated(self.cursor.read_varint(), "DenseNodes keys_vals value") as usize;
-        get_stringtable_key_value(self.block, Some(key), Some(val))
+        let pair = get_stringtable_key_value(self.block, Some(key), Some(val));
+        if pair.is_none() {
+            self.cursor = Cursor::new(&[]);
+        }
+        pair
     }
 }
+
+impl std::iter::FusedIterator for DenseTagIter<'_> {}
 
 /// The fallible sibling of [`DenseTagIter`]: yields `Err` for a malformed
 /// varint or a key or value index past the string table, instead of ending

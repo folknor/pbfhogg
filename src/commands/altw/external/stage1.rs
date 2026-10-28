@@ -21,9 +21,9 @@ use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
 use crate::error::Error;
 use crate::scratch::{RunScratch, ScratchPath};
 use crate::tunables::{
-    BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
-    NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, REF_COUNT_SIDECAR_BUF_BYTES,
-    STAGE1_HEADROOM_FDS, STAGE1_VARINT_BUF_CAPACITY,
+    ALTW_STAGE1_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
+    DECODE_WORKERS_RESERVED, NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
+    REF_COUNT_SIDECAR_BUF_BYTES, STAGE1_HEADROOM_FDS, STAGE1_VARINT_BUF_CAPACITY,
 };
 
 crate::counters::counter_set! {
@@ -615,12 +615,16 @@ pub(super) fn stage1_way_pass(
     // exercisable without mutating the test process. Private per-worker shards
     // keep pass A writes independent; shared appenders would add synchronization
     // to the measured external pipeline, not merely remove a limit probe.
-    let cpu_cap = crate::host::sized_workers(
+    // The policy cap (ALTW_STAGE1_WORKERS_CAP, rationale in tunables.rs)
+    // applies before the allowance is requested, so the caller is never
+    // asked for descriptors sized for workers that will not run.
+    let host_workers = crate::host::sized_workers(
         &*host.resources,
         DECODE_WORKERS_RESERVED,
         DECODE_WORKERS_MIN,
         DECODE_WORKERS_FALLBACK,
     );
+    let cpu_cap = host_workers.min(ALTW_STAGE1_WORKERS_CAP);
     let fd_budget = host
         .process
         .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + STAGE1_HEADROOM_FDS);
@@ -655,7 +659,8 @@ pub(super) fn stage1_way_pass(
             Developer,
             "altw.external.workers",
             "[altw external] num_workers = {num_workers} \
-             (cpu-bound; fd budget allows up to {fd_cap} workers)"
+             (host sizing {host_workers}, stage 1 cap {ALTW_STAGE1_WORKERS_CAP}; \
+             fd budget allows up to {fd_cap} workers)"
         );
     }
     if let Some(probe) = fd_budget.probe {
@@ -663,6 +668,8 @@ pub(super) fn stage1_way_pass(
             .counter("extjoin_nofile_soft_cap", probe.soft_limit);
     }
     host.invocation.counter("extjoin_fd_available", available);
+    host.invocation
+        .counter("extjoin_host_sized_workers", host_workers);
     host.invocation.counter("extjoin_cpu_cap_workers", cpu_cap);
     host.invocation.counter("extjoin_fd_cap_workers", fd_cap);
 

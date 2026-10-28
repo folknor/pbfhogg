@@ -5,8 +5,8 @@ use std::path::Path;
 
 use super::super::Result;
 use super::types::{
-    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, OrderingSegment, ScanState,
-    classify_block, is_standard_ordering, update_extended_for_element,
+    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, classify_block,
+    update_extended_for_element,
 };
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
@@ -199,7 +199,7 @@ fn try_index_only_scan(
     let mut data_buf: Vec<u8> = Vec::new();
 
     let mut accum = BlockAccum::new(show_blocks);
-    let mut block_number = 0u32;
+    let mut block_number = 0u64;
     let mut state = ScanState::new(show_id_ranges, false, false);
     let mut total_data_blobs = 0u64;
 
@@ -273,7 +273,7 @@ fn accumulate_from_index(
     index: &crate::blob_meta::BlobIndex,
     data_size: usize,
     frame_size: usize,
-    block_number: u32,
+    block_number: u64,
     state: &mut ScanState,
     accum: &mut BlockAccum,
 ) {
@@ -307,16 +307,7 @@ fn accumulate_from_index(
     stats.frame_bytes += frame_size as u64;
     stats.element_count += index.count;
 
-    // Ordering segments
-    if let Some(last) = accum.segments.last_mut().filter(|s| s.kind == kind) {
-        last.last_block = block_number;
-    } else {
-        accum.segments.push(OrderingSegment {
-            kind,
-            first_block: block_number,
-            last_block: block_number,
-        });
-    }
+    accum.ordering.observe(kind, block_number);
 
     // Per-block detail
     if let Some(ref mut infos) = accum.block_infos {
@@ -389,7 +380,7 @@ fn full_decode_scan(
     let mut total_data_blobs = 0u64;
 
     let mut accum = BlockAccum::new(show_blocks);
-    let mut block_number = 0u32;
+    let mut block_number = 0u64;
     let mut state = ScanState::new(show_id_ranges, show_locations, extended);
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -434,9 +425,9 @@ fn full_decode_scan(
 
     let is_indexed = total_data_blobs > 0 && indexed_blobs == total_data_blobs;
 
-    // Compute objects_ordered from ordering segments + ID monotonicity.
+    // Compute objects_ordered from the block-kind order + ID monotonicity.
     if let Some(ref mut ext) = state.extended {
-        let type_ordered = is_standard_ordering(&accum.segments);
+        let type_ordered = accum.ordering.is_standard();
         let ids_monotonic = state
             .node_ids
             .as_ref()
@@ -470,7 +461,7 @@ fn scan_data_blob(
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
     state: &mut ScanState,
-    block_number: u32,
+    block_number: u64,
     accum: &mut BlockAccum,
 ) -> Result<()> {
     let frame_size = frame.frame_bytes.len();
@@ -529,16 +520,7 @@ fn scan_data_blob(
     stats.frame_bytes += frame_size as u64;
     stats.element_count += block_elements;
 
-    // Update ordering segments
-    if let Some(last) = accum.segments.last_mut().filter(|s| s.kind == kind) {
-        last.last_block = block_number;
-    } else {
-        accum.segments.push(OrderingSegment {
-            kind,
-            first_block: block_number,
-            last_block: block_number,
-        });
-    }
+    accum.ordering.observe(kind, block_number);
 
     // Per-block detail
     if let Some(ref mut infos) = accum.block_infos {

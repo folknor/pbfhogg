@@ -237,7 +237,7 @@ fn inspect_json_base() {
     let json = report.to_json(None);
 
     // Schema version
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
 
     // File metadata
     assert!(
@@ -269,8 +269,19 @@ fn inspect_json_base() {
     assert!(json["blocks"]["total"].as_u64().expect("value") > 0);
 
     // Ordering
-    assert!(json["ordering"]["sequence"].is_array());
-    assert!(json["ordering"]["standard"].is_boolean());
+    // test.osm.pbf is canonical: one segment per kind, each listed whole.
+    assert_eq!(json["ordering"]["standard"], true);
+    assert_eq!(json["ordering"]["segment_count"], 3);
+    let head = json["ordering"]["segments_head"]
+        .as_array()
+        .expect("segments_head");
+    let kinds: Vec<&str> = head
+        .iter()
+        .map(|s| s["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(kinds, ["nodes", "ways", "relations"]);
+    assert_eq!(head[0]["first_block"], 1);
+    assert!(json["ordering"].get("sequence").is_none());
 
     // Optional fields should be null when not requested
     assert!(json["id_ranges"].is_null());

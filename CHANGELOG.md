@@ -41,6 +41,17 @@
   break fields and lines and could forge a further line. `--get` and
   `--json` are unchanged.
 
+- **`inspect --json` is `schema_version` 2: the ordering sequence is a
+  bounded head.** `ordering.sequence` (one label per run of same-kind
+  blobs, so one per blob on a file whose kind keeps changing) is gone.
+  `ordering` now holds `standard` (unchanged), `segment_count` (every run)
+  and `segments_head`, the first 64 runs as
+  `{"kind", "first_block", "last_block"}` records. The text report lists
+  the same head and ends the sequence with `... (+N more segments)`. A
+  standard order has at most three runs, so the run where a file first
+  leaves it is always shown. inspect now holds no per-blob ordering state,
+  where it used to keep and print every run in memory.
+
 - **`check` library calls return `check::CheckOutcome`.** `check_refs`,
   `verify_ids` and `check_locations` return `Complete(report)` or, when a
   blob's kind claim is false, `Stopped(StoppedCheck)` carrying the

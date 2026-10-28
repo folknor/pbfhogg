@@ -15,7 +15,7 @@ use super::format::{format_number, format_number_signed, format_size, format_tim
 use super::keys::{InspectGetKey, InspectGetKeyKind};
 use super::types::{
     BlockInfo, BlockKind, ExtendedStats, InspectReport, LocationStats, MetadataCoverage,
-    TypeIdRange, anomaly_blocks, anomaly_threshold_description, is_standard_ordering,
+    TypeIdRange, anomaly_blocks, anomaly_threshold_description,
 };
 
 impl InspectReport {
@@ -205,25 +205,33 @@ impl InspectReport {
     }
 
     fn write_ordering(&self, out: &mut impl Write) -> io::Result<()> {
-        if self.accum.segments.is_empty() {
+        let ordering = &self.accum.ordering;
+        if ordering.segment_count() == 0 {
             return writeln!(out, "Ordering: (empty file)");
         }
 
-        let labels: Vec<&str> = self
-            .accum
-            .segments
+        let labels: Vec<&str> = ordering
+            .head()
             .iter()
             .map(|s| s.kind.short_label())
             .collect();
-        let sequence = labels.join(" \u{2192} ");
+        let omitted = ordering.omitted();
+        let sequence = if omitted > 0 {
+            format!(
+                "{} \u{2192} ... (+{} more segments)",
+                labels.join(" \u{2192} "),
+                format_number(omitted)
+            )
+        } else {
+            labels.join(" \u{2192} ")
+        };
 
-        if is_standard_ordering(&self.accum.segments) {
+        if ordering.is_standard() {
             writeln!(out, "Ordering: {sequence} (strict)")?;
         } else {
             writeln!(out, "Ordering: {sequence} (NON-STANDARD)")?;
-            let ranges: Vec<String> = self
-                .accum
-                .segments
+            let ranges: Vec<String> = ordering
+                .head()
                 .iter()
                 .map(|s| {
                     if s.first_block == s.last_block {

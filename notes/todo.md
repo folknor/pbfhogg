@@ -747,6 +747,31 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   newline in a header string makes a multi-line answer (documented; use
   `--json`). Found 2026-10-28 while quoting inspect text.
 
+- [ ] **`inspect --blocks` / `--anomalies` and `--locations` still hold
+  per-blob and per-way lists.** The ordering sequence is bounded now (a
+  64-segment head plus a count), but `--blocks`/`--anomalies` keep a
+  `BlockInfo` per data blob (`BlockAccum.block_infos`), and the JSON path
+  re-collects them into a `Vec` of `Value`s even when `--blocks N` asks for
+  only the first and last N. `--locations` keeps one `u32` per located way
+  (`LocationStats.coord_counts`, around a billion entries at planet) and
+  `locations_json` clones and sorts it for the percentiles, so twice that.
+  Both are opt-in and not on brokkr verify's path. Fix shape: a first-N /
+  last-N ring for the block listing with streaming per-kind stats (the
+  anomaly medians need a decision: exact medians need the values, an
+  approximate sketch does not), and a histogram over coord counts for the
+  `--locations` percentiles (coord counts per way are capped by the way
+  node limit, so an exact histogram is small). Found 2026-10-28 bounding
+  the ordering sequence.
+
+- [ ] **A decoded data blob with no elements is classified mixed.**
+  `classify_block(false, false, false)` returns `BlockKind::Mixed`, so under
+  `--distrust-metadata` / `--extended` / `--locations` an empty data blob
+  makes `ordering.standard` and `data.objects_ordered` false and counts as
+  a mixed block, while the index-only path reports the blob's declared kind.
+  Whether an empty blob should be neutral to ordering (skipped) or flagged
+  as its own anomaly is undecided; "mixed" is the wrong word for it either
+  way. Found 2026-10-28 bounding the ordering sequence.
+
 - [ ] **`ReorderBuffer::with_capacity(N)` is a tuning guess at ~20 sites.** The
   `N` passed is rarely the caller's true permit window - `time_filter` asks for
   64 with no matching semaphore anywhere in the file. Round 4 added a

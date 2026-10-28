@@ -71,8 +71,92 @@ pub(super) struct TypeStats {
 
 pub(super) struct OrderingSegment {
     pub(super) kind: BlockKind,
-    pub(super) first_block: u32,
-    pub(super) last_block: u32,
+    pub(super) first_block: u64,
+    pub(super) last_block: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Ordering summary: bounded record of the segment sequence
+// ---------------------------------------------------------------------------
+
+const _: () = assert!(
+    INSPECT_ORDERING_HEAD_SEGMENTS >= 4,
+    "the head must reach the fourth segment, where a standard order can first break"
+);
+
+/// The block-kind sequence of a file, observed one data blob at a time,
+/// held in bounded memory however many segments the file has.
+///
+/// A segment is a run of consecutive blobs of one kind. The summary keeps
+/// the exact count of segments, whether the whole sequence is standard,
+/// and the first `INSPECT_ORDERING_HEAD_SEGMENTS` segments with their exact
+/// block ranges (the last retained one keeps growing while it is the
+/// current run). A standard sequence has at most three segments, so the
+/// segment where a file first leaves standard order is always in the head.
+pub(super) struct OrderingSummary {
+    current: Option<BlockKind>,
+    segment_count: u64,
+    standard: bool,
+    head: Vec<OrderingSegment>,
+}
+
+impl OrderingSummary {
+    pub(super) fn new() -> Self {
+        Self {
+            current: None,
+            segment_count: 0,
+            standard: true,
+            head: Vec::new(),
+        }
+    }
+
+    /// Record data blob `block` (1-based, in file order) of kind `kind`.
+    pub(super) fn observe(&mut self, kind: BlockKind, block: u64) {
+        if self.current == Some(kind) {
+            if self.segment_count <= INSPECT_ORDERING_HEAD_SEGMENTS as u64
+                && let Some(last) = self.head.last_mut()
+            {
+                last.last_block = block;
+            }
+            return;
+        }
+        // Standard: at most one run each of nodes, ways, relations, in that
+        // order. Mixed (rank 0) is never standard.
+        let prev_rank = self.current.map_or(0, BlockKind::rank);
+        let rank = kind.rank();
+        if rank == 0 || rank <= prev_rank {
+            self.standard = false;
+        }
+        self.current = Some(kind);
+        self.segment_count += 1;
+        if self.head.len() < INSPECT_ORDERING_HEAD_SEGMENTS {
+            self.head.push(OrderingSegment {
+                kind,
+                first_block: block,
+                last_block: block,
+            });
+        }
+    }
+
+    /// Segments in the file, including those past the head.
+    pub(super) fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    /// Whether the whole sequence is standard ordering.
+    pub(super) fn is_standard(&self) -> bool {
+        self.standard
+    }
+
+    /// The first segments, at most `INSPECT_ORDERING_HEAD_SEGMENTS`.
+    pub(super) fn head(&self) -> &[OrderingSegment] {
+        &self.head
+    }
+
+    /// Segments counted but not retained in the head.
+    pub(super) fn omitted(&self) -> u64 {
+        self.segment_count - self.head.len() as u64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +165,7 @@ pub(super) struct OrderingSegment {
 
 use crate::tunables::{
     ANOMALY_LARGE_DENOMINATOR, ANOMALY_LARGE_NUMERATOR, ANOMALY_SMALL_DENOMINATOR,
-    ANOMALY_SMALL_NUMERATOR,
+    ANOMALY_SMALL_NUMERATOR, INSPECT_ORDERING_HEAD_SEGMENTS,
 };
 
 /// Describe the thresholds used by `inspect --anomalies`.
@@ -93,7 +177,7 @@ pub(super) fn anomaly_threshold_description() -> String {
 }
 
 pub(super) struct BlockInfo {
-    pub(super) number: u32,
+    pub(super) number: u64,
     pub(super) kind: BlockKind,
     pub(super) elements: u64,
     pub(super) compressed: usize,
@@ -441,7 +525,7 @@ pub(super) struct BlockAccum {
     pub(super) way_type: TypeStats,
     pub(super) relation_type: TypeStats,
     pub(super) mixed_type: TypeStats,
-    pub(super) segments: Vec<OrderingSegment>,
+    pub(super) ordering: OrderingSummary,
     pub(super) block_infos: Option<Vec<BlockInfo>>,
 }
 
@@ -452,7 +536,7 @@ impl BlockAccum {
             way_type: TypeStats::default(),
             relation_type: TypeStats::default(),
             mixed_type: TypeStats::default(),
-            segments: Vec::new(),
+            ordering: OrderingSummary::new(),
             block_infos: if show_blocks { Some(Vec::new()) } else { None },
         }
     }
@@ -498,20 +582,6 @@ pub(super) fn classify_block(has_nodes: bool, has_ways: bool, has_relations: boo
         (false, false, true) => BlockKind::Relations,
         _ => BlockKind::Mixed,
     }
-}
-
-/// Standard ordering: at most one run each of [Nodes, Ways, Relations] in that order.
-/// Mixed blocks or repeated/out-of-order segments make it non-standard.
-pub(super) fn is_standard_ordering(segments: &[OrderingSegment]) -> bool {
-    let mut prev_rank = 0u8;
-    for seg in segments {
-        let rank = seg.kind.rank();
-        if rank == 0 || rank <= prev_rank {
-            return false;
-        }
-        prev_rank = rank;
-    }
-    true
 }
 
 pub(super) fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<(&BlockInfo, &'static str)> {
@@ -560,4 +630,130 @@ fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64>
     }
     values.sort_unstable();
     Some(values[values.len() / 2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, OrderingSummary};
+
+    const KINDS: [BlockKind; 4] = [
+        BlockKind::Nodes,
+        BlockKind::Ways,
+        BlockKind::Relations,
+        BlockKind::Mixed,
+    ];
+
+    /// The whole segment list, built the way the scan built it before the
+    /// summary: one entry per run, with its block range.
+    fn reference_segments(blobs: &[BlockKind]) -> Vec<(BlockKind, u64, u64)> {
+        let mut segs: Vec<(BlockKind, u64, u64)> = Vec::new();
+        for (i, &kind) in blobs.iter().enumerate() {
+            let block = i as u64 + 1;
+            match segs.last_mut() {
+                Some(last) if last.0 == kind => last.2 = block,
+                _ => segs.push((kind, block, block)),
+            }
+        }
+        segs
+    }
+
+    fn reference_standard(segs: &[(BlockKind, u64, u64)]) -> bool {
+        let mut prev = 0u8;
+        for s in segs {
+            let rank = s.0.rank();
+            if rank == 0 || rank <= prev {
+                return false;
+            }
+            prev = rank;
+        }
+        true
+    }
+
+    fn summarise(blobs: &[BlockKind]) -> OrderingSummary {
+        let mut summary = OrderingSummary::new();
+        for (i, &kind) in blobs.iter().enumerate() {
+            summary.observe(kind, i as u64 + 1);
+        }
+        summary
+    }
+
+    fn assert_matches_reference(blobs: &[BlockKind]) {
+        let segs = reference_segments(blobs);
+        let summary = summarise(blobs);
+        assert_eq!(summary.segment_count(), segs.len() as u64, "{blobs:?}");
+        assert_eq!(
+            summary.is_standard(),
+            reference_standard(&segs),
+            "{blobs:?}"
+        );
+        let keep = segs.len().min(INSPECT_ORDERING_HEAD_SEGMENTS);
+        let head: Vec<(BlockKind, u64, u64)> = summary
+            .head()
+            .iter()
+            .map(|s| (s.kind, s.first_block, s.last_block))
+            .collect();
+        assert_eq!(head, segs[..keep], "{blobs:?}");
+        assert_eq!(summary.omitted(), (segs.len() - keep) as u64);
+    }
+
+    /// Every blob sequence of up to six blobs over all four kinds agrees
+    /// with the full-list reference on count, verdict and ranges.
+    #[test]
+    fn short_sequences_match_the_full_list() {
+        for len in 0..=6u32 {
+            for code in 0..4usize.pow(len) {
+                let mut c = code;
+                let blobs: Vec<BlockKind> = (0..len)
+                    .map(|_| {
+                        let k = KINDS[c % 4];
+                        c /= 4;
+                        k
+                    })
+                    .collect();
+                assert_matches_reference(&blobs);
+            }
+        }
+    }
+
+    /// Head boundaries: exactly N segments, N + 1, a long last retained
+    /// run, and a long run past the head.
+    #[test]
+    fn head_boundaries_match_the_full_list() {
+        let n = INSPECT_ORDERING_HEAD_SEGMENTS;
+        let alternating = |segments: usize, last_run: usize| -> Vec<BlockKind> {
+            let mut blobs = Vec::new();
+            for i in 0..segments {
+                let kind = if i % 2 == 0 {
+                    BlockKind::Nodes
+                } else {
+                    BlockKind::Ways
+                };
+                let run = if i + 1 == segments { last_run } else { 1 };
+                blobs.extend(std::iter::repeat_n(kind, run));
+            }
+            blobs
+        };
+        assert_matches_reference(&alternating(n, 1));
+        assert_matches_reference(&alternating(n, 1000));
+        assert_matches_reference(&alternating(n + 1, 1));
+        assert_matches_reference(&alternating(n + 1, 1000));
+        assert_matches_reference(&alternating(3 * n, 7));
+
+        // The head's last segment keeps growing while it is the current run.
+        let summary = summarise(&alternating(n, 1000));
+        let last = summary.head().last().expect("head");
+        assert_eq!(last.last_block - last.first_block, 999);
+    }
+
+    /// A Mixed blob, including a first one, makes the order non-standard;
+    /// a header-only file is standard.
+    #[test]
+    fn mixed_is_never_standard() {
+        assert!(!summarise(&[BlockKind::Mixed]).is_standard());
+        assert!(!summarise(&[BlockKind::Nodes, BlockKind::Mixed]).is_standard());
+        assert!(summarise(&[]).is_standard());
+        assert!(
+            summarise(&[BlockKind::Nodes, BlockKind::Ways, BlockKind::Relations]).is_standard()
+        );
+    }
 }

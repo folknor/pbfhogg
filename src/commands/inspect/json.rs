@@ -6,7 +6,7 @@
 use super::format::format_timestamp;
 use super::types::{
     BlockInfo, ExtendedStats, InspectReport, LocationStats, MetadataCoverage, ScanState,
-    TypeIdRange, TypeStats, anomaly_blocks, is_standard_ordering,
+    TypeIdRange, TypeStats, anomaly_blocks,
 };
 
 impl InspectReport {
@@ -44,15 +44,21 @@ impl InspectReport {
             },
         });
 
-        let sequence: Vec<&str> = self
-            .accum
-            .segments
+        let ordering = &self.accum.ordering;
+        let segments_head: Vec<serde_json::Value> = ordering
+            .head()
             .iter()
-            .map(|s| s.kind.short_label())
+            .map(|s| {
+                serde_json::json!({
+                    "kind": s.kind.short_label(),
+                    "first_block": s.first_block,
+                    "last_block": s.last_block,
+                })
+            })
             .collect();
 
         let mut json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "file": self.file_name,
             "file_size": self.file_size,
             "header": header,
@@ -72,8 +78,9 @@ impl InspectReport {
                 "total": self.state.node_count + self.state.way_count + self.state.relation_count,
             },
             "ordering": {
-                "sequence": sequence,
-                "standard": is_standard_ordering(&self.accum.segments),
+                "standard": ordering.is_standard(),
+                "segment_count": ordering.segment_count(),
+                "segments_head": segments_head,
             },
             "id_ranges": id_ranges_json(&self.state),
             "anomalies_only": anomalies_only,

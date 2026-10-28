@@ -647,6 +647,16 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed on unindexed input with the slower fallback. **Requires `--nodes`**: only the node-stats scan refuses unindexed input, so passing it to another mode is an error rather than a no-op. |
 
+The ordering analysis splits the data blobs into segments, runs of
+consecutive blobs of one kind (nodes, ways, relations, or mixed for a
+decoded blob holding more than one kind). The order is standard when there
+is at most one segment of each kind, in that order, and none mixed. The
+report counts every segment but lists only the first 64 with their block
+ranges (`ordering.segment_count` and `ordering.segments_head` in `--json`),
+so a file whose kind changes every blob costs no per-blob memory; the
+segment where a file first leaves standard order is always among those
+listed.
+
 Text taken from the file prints as a quoted literal, escaped exactly as
 [`diff -v`](#diff) escapes keys, values and roles (a complete double-quoted
 string that is also a valid JSON string), so a newline, tab or quote in the

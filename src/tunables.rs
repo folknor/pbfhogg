@@ -710,6 +710,14 @@ pub(crate) const ANOMALY_LARGE_NUMERATOR: u64 = 3;
 /// Denominator of the large-block anomaly ratio; see `ANOMALY_LARGE_NUMERATOR`.
 pub(crate) const ANOMALY_LARGE_DENOMINATOR: u64 = 2;
 
+/// `inspect`: ordering segments (runs of same-kind blobs) the report keeps
+/// with their block ranges; the rest are only counted, so a file whose kind
+/// changes every blob costs no per-blob memory. A standard order has at most
+/// three segments, so a head of four or more always holds the segment where
+/// a file first leaves standard order (asserted where it is used). 64 leaves
+/// room to see the shape of a non-standard file.
+pub(crate) const INSPECT_ORDERING_HEAD_SEGMENTS: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Debug sidecar
 // ---------------------------------------------------------------------------

@@ -5,8 +5,7 @@
 Picked 2026-07-30, right after the 0.5.0 release.
 
 - [ ] **Release gates for library use** (raised 2026-10-26): library use
-  verified by brokkr, per-invocation instrumentation, and cat's descriptor
-  admission for library callers. Tracked, with their open design
+  verified by brokkr and per-invocation instrumentation. Tracked, with their open design
   questions, in [notes/pre-release.md](pre-release.md) "Release gates",
   together with the measurement campaign that comes before the release.
 
@@ -21,6 +20,17 @@ Picked 2026-07-30, right after the 0.5.0 release.
   and fold or delete entries whose subject 0.5.0 never shipped (for
   example the `FileReader::open` / `FileWriter::buffered` removals and the
   `Host::scratch_parent` removal need that check).
+
+- [ ] **Multi-region extract has no descriptor admission** (found
+  2026-10-28, from the cat admission decision): only `cat`, `cat --dedupe`
+  and altw external stage 1 ask `ProcessActions::fd_allowance`. A
+  multi-output `extract --config` holds descriptors per region (each file
+  output keeps its reservation's descriptor until publication, ADR-0017,
+  beside its writer's) and asks for nothing, so a library caller at a
+  default soft limit of 1024 with enough regions fails with EMFILE partway
+  instead of being refused up front; the CLI hides it only when it happens
+  to raise the limit first, which extract's path does not. Count what one
+  region holds, then either admit up front as cat does or record why not.
 
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).

@@ -35,9 +35,14 @@ only exists under library use is unverified:
 - a caller-supplied `Host`: `Resources` figures instead of the machine probe,
   the page-cache policy, the executor, a caller tripping its `Invocation`;
 - a process whose soft fd limit nobody raised (the CLI raises it; the
-  library may not, ADR-0016): cat's admission refusal below, and altw
-  external stage 1's fd allowance, which has the same shape (bz `pbfhogg#11`
-  records that stage 1 opens thousands of shard files at once);
+  library may not, ADR-0016). Decided 2026-10-28: cat keeps its held pins
+  and refuses up front when the limit is short, naming the remedy
+  (reference/pipeline.md "One input, one file, across passes" says why);
+  altw external stage 1 runs fewer shard workers (three at soft 1024) and
+  refuses below 320 available. The harness checks both: a library cat of
+  ~1000 distinct inputs at soft 1024 is refused before anything is read,
+  publishing nothing, and altw external at soft 1024 completes with
+  matching output;
 - no stderr from the library (diagnostics only through `host::Diagnostics`).
 
 Filed as brokkr#46, now that each `Invocation` owns its counters and its
@@ -75,20 +80,6 @@ land before or with the harness:
   `visible`, header fields and `LocationsOnWays` coordinates
   (`src/content.rs`), so altw and cat scenarios need checks of their own
   beyond digest equality.
-
-### cat's descriptor admission for library callers
-
-Reopened 2026-10-26 because the release is gated on library use; undecided.
-Since input pinning (`56f8d9a9`), plain cat and `cat --dedupe` pin every
-input for the whole run and refuse up front when the host allows fewer
-descriptors than the inputs plus `CAT_EXTRA_FDS` (`ProcessActions::
-fd_allowance`). The CLI raises its soft limit first; the library cannot, so a
-library caller at a soft limit of 1024 can no longer cat about 1000 files,
-which it could before pinning (it held one input at a time). A library-only
-regression the CLI hides. Candidate fixes: pin each input only while cat reads
-it, or take an fd budget from the caller on the `Host`. Whichever is chosen
-should be checked against altw external stage 1's allowance, which has the
-same CLI-raises, library-cannot shape.
 
 ### io_uring on real data
 

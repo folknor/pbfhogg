@@ -84,9 +84,19 @@ impl CatStats {
 /// sharing one pin, so each is read from the file the run started on. An
 /// input handed over as a caller's pin is used as it is (see
 /// [`InputSource::pin`](crate::read::input::InputSource::pin)) and never
-/// shared with a path. The pins are held for the whole run, one descriptor
-/// per distinct input, which the run first asks the host for
-/// (`ProcessActions::fd_allowance`).
+/// shared with a path. The pins are held for the whole run: one new
+/// descriptor per distinct path spelling (a caller's pin opens none), which
+/// the run first asks the host for (`ProcessActions::fd_allowance`), with a
+/// fixed allowance on top for the reader, writer and transient opens.
+///
+/// The library never raises the process's open-file limit (descriptor
+/// limits are the caller's policy). An embedding program that cats more
+/// files than its soft `RLIMIT_NOFILE` leaves room for raises the limit
+/// itself (up to the hard limit, which the refusal names when it probed
+/// it), has its `ProcessActions` grant more, or cats fewer files per call.
+/// Holding the pins is the price of reading each input from one file:
+/// re-opening a path between its header read and its blob read could read
+/// a file replaced in between.
 ///
 /// # Errors
 /// Besides read, decode and write failures: an input that is not a regular
@@ -126,10 +136,18 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     // Every input is read at least twice (its header, then its blobs, and
     // between them an indexdata probe on some routes), with every header
     // read before any blob, so every input is pinned up front and holds its
-    // pin for the run: one descriptor per distinct input.
+    // pin for the run: one new descriptor per distinct path spelling.
     let sources: Vec<InputSource<'a>> = files.iter().map(|&file| file.into()).collect();
-    let distinct = crate::read::input::distinct_inputs(&sources);
-    admit_descriptors(distinct, files.len(), distinct, host)?;
+    let new_pins = crate::read::input::new_pins(&sources);
+    admit_descriptors(
+        new_pins,
+        &format!(
+            "cat holds a file descriptor per distinct input for the whole run: {} input \
+             files ({new_pins} distinct paths to pin)",
+            files.len()
+        ),
+        host,
+    )?;
     let pins = crate::read::input::pin_sources(&sources, host)?;
     let files = pins.as_slice();
 
@@ -184,42 +202,56 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     Ok(result)
 }
 
-/// Ask the host for the descriptors a cat run holds: `inputs` (its pins, or
-/// dedupe's pass-2 sources) plus [`CAT_EXTRA_FDS`], and refuse the run up
-/// front when the host allows fewer. `arguments` and `distinct` only name
-/// the demand in the refusal. An admission check, not a reservation: the
-/// built-in providers answer from a snapshot of the open descriptors.
+/// Ask the host for the descriptors a cat run opens and holds: `held` (its
+/// new pins, or dedupe's pass-2 sources) plus [`CAT_EXTRA_FDS`], and refuse
+/// the run up front when the host allows fewer. `demand` names what is
+/// held in the refusal. A conservative requirement (the fixed allowance has
+/// slack), and an admission check, not a reservation: the built-in
+/// providers answer from a snapshot of the open descriptors.
 ///
 /// [`CAT_EXTRA_FDS`]: crate::tunables::CAT_EXTRA_FDS
-pub(super) fn admit_descriptors(
-    inputs: usize,
-    arguments: usize,
-    distinct: usize,
-    host: &crate::host::Host,
-) -> Result<()> {
-    let wanted = u64::try_from(inputs)
+pub(super) fn admit_descriptors(held: usize, demand: &str, host: &crate::host::Host) -> Result<()> {
+    let wanted = u64::try_from(held)
         .ok()
         .and_then(|n| n.checked_add(crate::tunables::CAT_EXTRA_FDS))
-        .ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "{arguments} input files are more than cat can hold"
-            ))
-        })?;
+        .ok_or_else(|| Error::invalid_argument(format!("{demand}: more than cat can hold")))?;
     let allowance = host.process.fd_allowance(wanted);
     if allowance.descriptors < wanted {
-        let remedy = if allowance.probe.is_some() {
-            "; raise the open-file limit (ulimit -n), or cat fewer files at a time"
-        } else {
-            "; cat fewer files at a time"
-        };
         return Err(Error::invalid_argument(format!(
-            "cat holds a file descriptor per input for the whole run: {arguments} input \
-             files ({distinct} distinct) need {wanted} descriptors, but only {} are \
-             allowed ({allowance}){remedy}",
-            allowance.descriptors
+            "{demand} need {wanted} descriptors, but only {} are allowed ({allowance}); {}",
+            allowance.descriptors,
+            descriptor_remedy(&allowance, wanted)
         )));
     }
     Ok(())
+}
+
+/// What a refused run's caller can do. A host grant is the host's policy,
+/// which no process limit changes; a probed allowance is the process's soft
+/// limit, which the caller (never the library) may raise up to the hard
+/// limit when that is known to leave room.
+fn descriptor_remedy(allowance: &crate::process::FdAllowance, wanted: u64) -> String {
+    let Some(probe) = allowance.probe else {
+        return "grant more descriptors from the host's ProcessActions::fd_allowance, or \
+                cat fewer files per call"
+            .to_owned();
+    };
+    let already_open = probe.soft_limit.saturating_sub(allowance.descriptors);
+    let needed_limit = already_open.saturating_add(wanted);
+    let raise = match probe.hard_limit {
+        Some(hard) if hard >= needed_limit && hard > probe.soft_limit => format!(
+            "raise the process's soft open-file limit to at least {needed_limit} (ulimit -n, \
+             or setrlimit in an embedding program; the hard limit {hard} allows it)"
+        ),
+        Some(hard) if hard < needed_limit => format!(
+            "the run needs an open-file limit of at least {needed_limit}, above the hard \
+             limit {hard}; raise the hard limit"
+        ),
+        _ => "raise the process's soft open-file limit (ulimit -n, or setrlimit in an \
+              embedding program)"
+            .to_owned(),
+    };
+    format!("{raise}, close other descriptors, or cat fewer files per call")
 }
 
 // ---------------------------------------------------------------------------

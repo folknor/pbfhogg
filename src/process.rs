@@ -334,6 +334,10 @@ pub struct FdProbe {
     /// `None` when the provider did not try to adjust the limit.
     pub adjustment: Option<FdAdjustment>,
     pub open: FdCount,
+    /// Hard `RLIMIT_NOFILE`, clamped as `soft_limit` is: how far the
+    /// process could raise its soft limit without privilege. `None` when
+    /// the probe could not read it.
+    pub hard_limit: Option<u64>,
 }
 
 /// Descriptors a run may hold, as answered by
@@ -381,7 +385,12 @@ impl std::fmt::Display for FdAllowance {
         };
         let soft = probe.soft_limit;
         match probe.adjustment {
-            None => write!(f, "RLIMIT_NOFILE: {soft} (not adjusted)")?,
+            None => match probe.hard_limit {
+                Some(hard) if hard > soft => {
+                    write!(f, "RLIMIT_NOFILE: {soft} (not adjusted; hard limit {hard})")?;
+                }
+                _ => write!(f, "RLIMIT_NOFILE: {soft} (not adjusted)")?,
+            },
             Some(FdAdjustment::ProbeFailed) => {
                 write!(f, "RLIMIT_NOFILE: probe failed; assuming {soft}")?;
             }
@@ -463,11 +472,16 @@ pub fn count_open_descriptors(limit: u64) -> FdCount {
 }
 
 /// Probe with the open descriptors counted against `soft_limit`.
-fn probed(soft_limit: u64, adjustment: Option<FdAdjustment>) -> FdAllowance {
+fn probed(
+    soft_limit: u64,
+    hard_limit: Option<u64>,
+    adjustment: Option<FdAdjustment>,
+) -> FdAllowance {
     FdAllowance::from_probe(FdProbe {
         soft_limit,
         adjustment,
         open: count_open_descriptors(soft_limit),
+        hard_limit,
     })
 }
 
@@ -494,21 +508,27 @@ pub fn raise_nofile_to_hard_cap() -> FdAllowance {
     // SAFETY: `getrlimit`/`setrlimit` are pure-data FFI calls. The
     // rlimit struct is fully initialised before being passed as
     // `&mut`, and we don't share it across threads.
-    let (soft, adjustment) = unsafe {
+    let (soft, hard, adjustment) = unsafe {
         let mut rlim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            (NOFILE_PROBE_FAILED_ASSUMED_SOFT, FdAdjustment::ProbeFailed)
+            (
+                NOFILE_PROBE_FAILED_ASSUMED_SOFT,
+                None,
+                FdAdjustment::ProbeFailed,
+            )
         } else {
             let soft_before: u64 = rlim.rlim_cur;
             let hard: u64 = rlim.rlim_max;
+            let hard_seen = Some(hard.min(NOFILE_SOFT_LIMIT_CLAMP));
             if soft_before >= hard {
                 // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
                 // Linux); clamp so downstream arithmetic doesn't overflow.
                 (
                     soft_before.min(NOFILE_SOFT_LIMIT_CLAMP),
+                    hard_seen,
                     FdAdjustment::AlreadyAtCap,
                 )
             } else {
@@ -524,36 +544,40 @@ pub fn raise_nofile_to_hard_cap() -> FdAllowance {
                     if raise_ok {
                         (
                             hard.min(NOFILE_SOFT_LIMIT_CLAMP),
+                            hard_seen,
                             FdAdjustment::Raised { from: soft_before },
                         )
                     } else {
                         (
                             soft_before.min(NOFILE_SOFT_LIMIT_CLAMP),
+                            hard_seen,
                             FdAdjustment::RaiseFailed,
                         )
                     }
                 } else if raise_ok {
                     (
                         rlim.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP),
+                        Some(rlim.rlim_max.min(NOFILE_SOFT_LIMIT_CLAMP)),
                         FdAdjustment::Raised { from: soft_before },
                     )
                 } else {
                     (
                         rlim.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP),
+                        Some(rlim.rlim_max.min(NOFILE_SOFT_LIMIT_CLAMP)),
                         FdAdjustment::RaiseFailed,
                     )
                 }
             }
         }
     };
-    probed(soft, Some(adjustment))
+    probed(soft, hard, Some(adjustment))
 }
 /// Probe the current descriptor allowance without adjusting the limit:
 /// the soft limit less the descriptors already open. Same snapshot caveat
 /// as [`raise_nofile_to_hard_cap`].
 pub fn current_nofile() -> FdAllowance {
     // SAFETY: the output structure is initialized and exclusively borrowed.
-    let soft = unsafe {
+    let limits = unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -561,13 +585,17 @@ pub fn current_nofile() -> FdAllowance {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
             None
         } else {
-            Some(limit.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP))
+            Some((
+                limit.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP),
+                limit.rlim_max.min(NOFILE_SOFT_LIMIT_CLAMP),
+            ))
         }
     };
-    match soft {
-        Some(soft) => probed(soft, None),
+    match limits {
+        Some((soft, hard)) => probed(soft, Some(hard), None),
         None => probed(
             NOFILE_PROBE_FAILED_ASSUMED_SOFT,
+            None,
             Some(FdAdjustment::ProbeFailed),
         ),
     }

@@ -512,11 +512,11 @@ fn repeats(earlier: &Path, path: &Path) -> bool {
     earlier.as_os_str() == path.as_os_str()
 }
 
-/// How many pins [`pin_sources`] takes for `sources`: one per distinct
-/// spelling among the paths, and one per caller's pin argument (a caller's
-/// pin is shared, not taken again, but it is counted per position so the
-/// descriptor admission stays conservative).
-pub(crate) fn distinct_inputs(sources: &[InputSource<'_>]) -> usize {
+/// How many pins [`pin_sources`] takes for `sources`, each a new descriptor:
+/// one per distinct spelling among the paths. A caller's pin is shared as
+/// it is (a clone, no descriptor), and its anchor is already open, so a
+/// probed allowance has already counted it.
+pub(crate) fn new_pins(sources: &[InputSource<'_>]) -> usize {
     sources
         .iter()
         .enumerate()
@@ -524,7 +524,7 @@ pub(crate) fn distinct_inputs(sources: &[InputSource<'_>]) -> usize {
             InputSource::Path(path) => !sources[..i].iter().any(
                 |earlier| matches!(*earlier, InputSource::Path(earlier) if repeats(earlier, path)),
             ),
-            InputSource::Pinned(_) => true,
+            InputSource::Pinned(_) => false,
         })
         .count()
 }
@@ -545,9 +545,9 @@ pub(crate) fn distinct_inputs(sources: &[InputSource<'_>]) -> usize {
 /// for a caller's pin, whatever their spellings: two pins of one path may
 /// identify different files on purpose.
 ///
-/// Holds one descriptor per distinct input until the pins are dropped; a
-/// caller that may be handed many inputs asks the host for them first
-/// (`ProcessActions::fd_allowance`).
+/// Holds one new descriptor per distinct path spelling ([`new_pins`]) until
+/// the pins are dropped; a caller that may be handed many inputs asks the
+/// host for them first (`ProcessActions::fd_allowance`).
 ///
 /// # Errors
 /// As [`PinnedInput::pin`], for the first path that fails.
@@ -747,7 +747,7 @@ mod pin_tests {
 
     /// An argument spelled exactly as an earlier one shares its pin; any
     /// other spelling, even of the same file, gets its own, and the count
-    /// of pins taken agrees with `distinct_inputs`.
+    /// of pins taken agrees with `new_pins`.
     #[test]
     fn pin_sources_shares_a_pin_per_exact_spelling() {
         let dir = crate::path_guard::tests::scratch();
@@ -760,7 +760,7 @@ mod pin_tests {
         let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
         assert!(same(0, 2) && same(1, 4));
         assert!(!same(0, 1) && !same(0, 3) && !same(1, 3));
-        assert_eq!(super::distinct_inputs(&sources), 3);
+        assert_eq!(super::new_pins(&sources), 3);
         for (pin, path) in pins.iter().zip(paths) {
             assert_eq!(pin.path().as_os_str(), path.as_os_str());
         }
@@ -789,6 +789,8 @@ mod pin_tests {
         assert!(std::sync::Arc::ptr_eq(&pins[2].0, &second.0));
         assert!(same(0, 4) && same(1, 3));
         assert!(!same(0, 1) && !same(0, 2) && !same(1, 2));
+        // Only the path takes a new pin: the caller's pins are open already.
+        assert_eq!(super::new_pins(&sources), 1);
     }
 
     /// A FIFO is refused at pin time, without blocking on a writer.

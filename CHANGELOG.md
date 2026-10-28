@@ -1938,13 +1938,20 @@
   with `ErrorKind::InputReplaced` and publishes nothing. An input that is
   a FIFO, socket or character device is now refused up front, before any
   other input is read. Plain `cat` holds its pins for the run, one
-  descriptor per distinct input (it used to hold one input open at a
-  time), and `--dedupe` one per argument as before, so `cat` now asks its
-  host for them first: the CLI raises its soft
-  open-file limit to the hard limit, and a run the limit cannot hold is
-  refused before it reads anything, naming the counts. Library hosts are
-  asked through `ProcessActions::fd_allowance`, which `cat::cat` and
-  `cat::dedupe::merge_pbf` now call.
+  descriptor per distinct input path (it used to hold one input open at a
+  time; an input handed over already pinned costs nothing new), and
+  `--dedupe` one per argument as before, so `cat` now asks its host for
+  them first: the CLI raises its soft open-file limit to the hard limit,
+  and a run the limit cannot hold is refused before it reads anything,
+  naming the counts and the remedy. Library hosts are asked through
+  `ProcessActions::fd_allowance`, which `cat::cat` and
+  `cat::dedupe::merge_pbf` now call. **Library callers:** the library
+  never raises the limit, so a program at a default soft limit of 1024
+  that cats about a thousand files in one call is now refused; raise the
+  soft limit in the embedding program (the refusal names the value and
+  whether the hard limit allows it), grant more through its
+  `ProcessActions`, or cat fewer files per call. `process::FdProbe` gains
+  a `hard_limit` field (breaking for struct literals).
 
 - **`renumber` reads one input file even if it is replaced mid-run.**
   Every run opens the input three times (the header read, the one reader

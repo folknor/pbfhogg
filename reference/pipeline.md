@@ -596,11 +596,28 @@ twice rather than two files if `a` is replaced while the pins are taken;
 other spellings of one file are pinned separately. Each argument's opens
 stay its own. Since its input count is unbounded, `cat` first asks the host
 for the descriptors it will hold (`ProcessActions::fd_allowance`) and
-refuses the run up front when allowed fewer: plain `cat` holds its pins,
-one per distinct input, for the whole run; `cat --dedupe` asks for one per
-argument, because its second pass holds a source per argument, opened from
-the pins, each pin dropped as its sources open. Both ask for a fixed
-allowance on top, for the writer and one transient open.
+refuses the run up front when allowed fewer: plain `cat` holds its pins
+for the whole run and asks for one per distinct path spelling (a caller's
+pin is shared as it is and opens nothing new); `cat --dedupe` asks for one
+per argument, caller's pins included, because its second pass opens a
+source per argument from the pins, each pin dropped as its sources open.
+Both ask for a fixed allowance on top (`CAT_EXTRA_FDS`), for the active
+reader, the writer and its ring, and the transient procfs probe, with
+slack: the request is conservative, not an exact minimum.
+
+The library never raises the open-file limit (ADR-0016), so a library
+caller at a default soft limit of 1024 cannot cat about a thousand files
+in one call, which it could before cat pinned, when it held one input at a
+time. That is deliberate. The pins must span the run because every
+input's header is read before any blob (the output header reconciles
+them all), and the alternatives were weighed and refused: re-pinning each
+input by path between its header and its blobs cannot prove it is the same
+file (an inode freed by an unlink may be reused, and timestamps are not a
+generation number), and copying inputs to scratch to bound descriptors
+would silently demand the inputs' size in scratch space. The refusal names
+the remedy instead: for a probed limit, the soft limit to raise to when
+the hard limit allows it (the caller raises it); for a host grant, the
+host's `ProcessActions::fd_allowance`.
 
 `diff` pins its two inputs the same way, `old` first, once its options are
 accepted and before either is read, so `diff a a` compares one pinned file

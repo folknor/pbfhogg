@@ -90,7 +90,9 @@ impl MergePbfStats {
 /// it is. Pass 2 holds one source
 /// per argument, so the run asks the host for one descriptor per argument
 /// (`ProcessActions::fd_allowance`) and is refused up front when allowed
-/// fewer.
+/// fewer. A caller's pin counts here too: pass 2 opens a new description
+/// of it. As with [`cat`](super::cat), the library never raises the open-file
+/// limit; the refusal says what the caller can change.
 pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
     inputs: &[S],
     output: crate::output::Output,
@@ -147,8 +149,11 @@ fn plan_merge(
     // per argument.
     super::admit_descriptors(
         inputs.len(),
-        inputs.len(),
-        crate::read::input::distinct_inputs(inputs),
+        &format!(
+            "a deduplicating cat holds a file descriptor per input argument through its second pass: {} \
+             input files",
+            inputs.len()
+        ),
         host,
     )?;
     let pins = crate::read::input::pin_sources(inputs, host)?;

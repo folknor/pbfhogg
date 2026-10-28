@@ -629,6 +629,15 @@ throttled write can convoy workers on hot buckets, so emit a lock-wait
 `_wait_ns` counter. Not motivated by a failure: no recorded EMFILE or
 memory failure exists at 30 workers.
 
+A second motive, unmeasured (2026-10-28): a library caller at the default
+soft limit of 1024 (the library never raises it) gets
+`min(cpu_cap, (available - 64) / 256)` = three stage-1 workers on any
+host, and is refused below 320 available. Consolidated writers would make
+stage 1's descriptor need independent of the worker count, so a library
+caller would run at full width. Measure stage 1 at soft 1024 against the
+raised limit (the harness on brokkr#46 can) before deciding whether this
+matters.
+
 ---
 
 ## Tier 3: hardware-gated

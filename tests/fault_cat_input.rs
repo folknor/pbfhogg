@@ -670,6 +670,93 @@ fn descriptors_are_asked_for_per_pinned_input_and_refused_when_short() {
         assert_eq!(attempts, 0, "{cell}: refused before any input is read");
         assert!(!output.exists(), "{cell}: a refused run publishes nothing");
     }
+
+    // A caller's pin is open already, so plain cat takes no new descriptor
+    // for it: pinned `a` plus path `b` asks what `b` alone does. Dedupe's
+    // pass 2 opens a source per argument, caller's pin included.
+    let pinned = PinnedInput::pin(a, &crate::common::test_host()).expect("pin a");
+    let plain_with_pin = |mode: Mode| {
+        let grant = std::sync::Arc::new(Grant {
+            asked: Mutex::new(Vec::new()),
+            short: 0,
+        });
+        let mut host = crate::common::test_host();
+        host.process = std::sync::Arc::clone(&grant) as std::sync::Arc<dyn ProcessActions>;
+        let sources = [
+            pbfhogg::read::input::InputSource::from(&pinned),
+            pbfhogg::read::input::InputSource::from(b),
+        ];
+        let write = WriteOptions::default();
+        let overrides = pbfhogg::HeaderOverrides::default();
+        let out = crate::common::out(&output);
+        let result = if mode == Mode::Dedupe {
+            pbfhogg::cat::dedupe::merge_pbf(&sources, out, &write, &overrides, &host).map(drop)
+        } else {
+            pbfhogg::cat::cat(
+                &sources,
+                out,
+                None,
+                &CleanAttrs::default(),
+                &write,
+                &overrides,
+                &host,
+            )
+            .map(drop)
+        };
+        result.unwrap_or_else(|e| panic!("{mode:?} with a caller's pin: {}", e.report()));
+        std::fs::remove_file(&output).expect("remove output");
+        grant.asked.lock().expect("requests").clone()
+    };
+    assert_eq!(plain_with_pin(Mode::Plain), [base]);
+    assert_eq!(plain_with_pin(Mode::Dedupe), [base + 1]);
+}
+
+/// A refusal names what the caller can change: a host grant points at the
+/// host, a probed limit at the process's soft limit and, when the hard
+/// limit leaves room, the value to raise it to.
+#[test]
+fn a_descriptor_refusal_names_the_callers_remedy() {
+    use pbfhogg::process::{FdCount, FdProbe};
+    let inputs = inputs(Route::of(Mode::Plain));
+    let [a, b] = [inputs.paths[0].as_path(), inputs.paths[1].as_path()];
+    let output = inputs.dir.path().join("out.osm.pbf");
+
+    struct Fixed(FdAllowance);
+    impl ProcessActions for Fixed {
+        fn cross_thread_alloc_pool(&self) {}
+        fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+            self.0
+        }
+    }
+    let refusal = |allowance: FdAllowance| {
+        let mut host = crate::common::test_host();
+        host.process = std::sync::Arc::new(Fixed(allowance));
+        let err = run(Route::of(Mode::Plain), &[a, b], &output, &host).expect_err("refused");
+        assert!(!output.exists(), "a refused run publishes nothing");
+        err.to_string()
+    };
+    let probe = |hard_limit| {
+        FdAllowance::from_probe(FdProbe {
+            soft_limit: 6,
+            adjustment: None,
+            open: FdCount::Counted(3),
+            hard_limit,
+        })
+    };
+
+    let text = refusal(FdAllowance::host_grant(1));
+    assert!(text.contains("ProcessActions::fd_allowance"), "{text}");
+    assert!(!text.contains("ulimit"), "{text}");
+
+    let text = refusal(probe(Some(4096)));
+    assert!(text.contains("soft open-file limit to at least"), "{text}");
+    assert!(text.contains("hard limit 4096 allows it"), "{text}");
+
+    let text = refusal(probe(Some(6)));
+    assert!(text.contains("above the hard limit 6"), "{text}");
+
+    let text = refusal(probe(None));
+    assert!(text.contains("soft open-file limit (ulimit -n"), "{text}");
 }
 
 /// Every input is pinned before any is read, so a FIFO is refused up front,

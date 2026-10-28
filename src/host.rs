@@ -801,11 +801,23 @@ mod tests {
                     soft_limit: 4096,
                     adjustment,
                     open,
+                    hard_limit: Some(4096),
                 });
                 assert_eq!(allowance.descriptors, descriptors);
                 assert_eq!(allowance.to_string(), format!("{text}{suffix}"));
             }
         }
+        // An unadjusted probe names a hard limit it could be raised to.
+        let unraised = FdAllowance::from_probe(FdProbe {
+            soft_limit: 1024,
+            adjustment: None,
+            open: FdCount::Counted(4),
+            hard_limit: Some(524_288),
+        });
+        assert_eq!(
+            unraised.to_string(),
+            "RLIMIT_NOFILE: 1024 (not adjusted; hard limit 524288); 4 open, 1020 available"
+        );
         assert_eq!(
             FdAllowance::host_grant(512).to_string(),
             "descriptor allowance: 512 (host grant)"

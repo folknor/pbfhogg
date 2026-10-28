@@ -604,14 +604,14 @@ pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 // ---------------------------------------------------------------------------
 
 /// Descriptors a `cat` run asks the host for beyond its baseline input
-/// count: one pin per distinct input for plain cat, one pass-2 source per
-/// argument for `cat --dedupe`. It covers, at worst, the writer's own open
+/// count: one new pin per distinct input path for plain cat (a caller's
+/// pin is already open), one pass-2 source per argument for
+/// `cat --dedupe`. It covers, at worst, the writer's own open
 /// of the output's staging path, the io_uring ring when that backend is
 /// chosen, and one input descriptor beside the baseline (a header reader,
 /// indexdata probe, body reader or classify walker, a pin's procfs check
 /// while pins are taken, or dedupe's newly opened source before the pin it
-/// came from is dropped), with slack. Those add up to three today;
-/// recheck this when an output backend or a cat pool starts holding more.
+/// came from is dropped), with slack over their sum; recheck this when an output backend or a cat pool starts holding more.
 /// A fixed, conservative allowance rather than per-backend arithmetic,
 /// which would be a second copy of the writers' internals.
 pub(crate) const CAT_EXTRA_FDS: u64 = 8;

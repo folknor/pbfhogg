@@ -15,8 +15,19 @@
 //!   [`Output::publish`] decides is refused there; once publication has
 //!   decided it completes (ADR-0019). A process ended without unwinding
 //!   (SIGKILL, the OOM killer, power loss, the CLI's second interrupt) skips
-//!   the cleanup and can leave a hidden `.pbfhogg-tmp-*` sibling, never a
-//!   file under the name the caller chose.
+//!   the cleanup and can leave a hidden `.pbfhogg-tmp-*` entry (in the
+//!   staging directory, when there is one), never a partial file under the
+//!   name the caller chose. Ended inside publication, it can also leave
+//!   `.pbfhogg-backup-*` entries beside the destinations (empty, holding the
+//!   previous output whole, or holding part of it when the end came while a
+//!   backup was being removed), and each destination holds its previous
+//!   output, its whole new one, or, while a backed-up destination is between
+//!   its two renames, nothing, with the previous output in its backup. A
+//!   group is not all-or-nothing across such an end. At each step a
+//!   publication announces to a test (`PublishStep`) the names are exactly
+//!   what the steps so far describe; between two steps the only operation
+//!   that leaves an intermediate state is a backup's recursive removal,
+//!   which deletes only inside that backup.
 //! - **An existing destination is refused unless the caller asked to replace
 //!   it** ([`Overwrite::Replace`]). The check runs at construction, which a
 //!   caller does before handing the output to a command, so a refusal costs
@@ -128,6 +139,9 @@ pub enum PublishFault {
     /// Fail after every recheck passed, before anything is installed: the
     /// latest point at which a run can fail with its output fully written.
     BeforeInstall,
+    /// Make the rename that moves an existing destination into its freshly
+    /// reserved backup fail.
+    MoveAside,
     /// Fail after an existing destination was moved to its backup, before
     /// the new output is renamed in.
     AfterBackup,
@@ -143,8 +157,14 @@ pub enum PublishFault {
     /// `renameat2`, the `link(2)` fallback, or the replacing rename after
     /// any backup was made.
     CrossMount(usize),
-    /// Make every rollback restore step fail.
+    /// Make every rollback restore step fail: nothing is taken back out of
+    /// the destination and no previous output is put back.
     Restore,
+    /// Make only the rename that puts a previous output back fail, after
+    /// any step that took the new output out of the destination succeeded
+    /// (a directory output's new generation is then back in staging and the
+    /// destination is empty).
+    RestoreRename,
     /// Fail the directory sync after publication.
     DirSync,
     /// Fail the sync that makes a previous output's backup durable, after
@@ -155,29 +175,217 @@ pub enum PublishFault {
     BackupRemoval,
 }
 
+/// One spelling per fault, the one [`std::str::FromStr`] reads: kebab case,
+/// a member index after a colon (`after-installed:1`).
 #[cfg(feature = "test-hooks")]
-type Faults = Vec<PublishFault>;
+impl std::str::FromStr for PublishFault {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (name, member) = split_member(s)?;
+        let fault = match (name, member) {
+            ("before-install", None) => Self::BeforeInstall,
+            ("move-aside", None) => Self::MoveAside,
+            ("after-backup", None) => Self::AfterBackup,
+            ("force-link-fallback", None) => Self::ForceLinkFallback,
+            ("after-link", None) => Self::AfterLink,
+            ("after-installed", Some(k)) => Self::AfterInstalled(k),
+            ("cross-mount", Some(k)) => Self::CrossMount(k),
+            ("restore", None) => Self::Restore,
+            ("restore-rename", None) => Self::RestoreRename,
+            ("dir-sync", None) => Self::DirSync,
+            ("backup-sync", None) => Self::BackupSync,
+            ("backup-removal", None) => Self::BackupRemoval,
+            _ => {
+                return Err(Error::invalid_argument(format!(
+                    "not a publication fault: {s}"
+                )));
+            }
+        };
+        Ok(fault)
+    }
+}
+
+/// `name` or `name:k`.
+#[cfg(feature = "test-hooks")]
+fn split_member(s: &str) -> Result<(&str, Option<usize>)> {
+    match s.split_once(':') {
+        None => Ok((s, None)),
+        Some((name, k)) => k
+            .parse()
+            .map(|k| (name, Some(k)))
+            .map_err(|_| Error::invalid_argument(format!("not a member index in {s}"))),
+    }
+}
+
+/// A namespace operation inside publication that has just succeeded,
+/// announced to the invocation's publication observer
+/// ([`FaultPlan::on_publish_step`](crate::test_hooks::FaultPlan::on_publish_step))
+/// so a test can see, or stop the process at, every state a publication
+/// passes through. A process killed while the observer runs leaves exactly
+/// the names the step describes, since no cleanup runs after it.
+///
+/// Only successful operations are announced, each at the syscall that made
+/// it; a failed step changes nothing and announces nothing, and a missing
+/// step never means a failure (the unlink after a link install is best
+/// effort). `k` is the member's position in its group (0 for a lone
+/// output). Directory syncs change no names, so they are one step that
+/// says every attempt finished, whatever the outcome; durability is not
+/// something a killed process can show.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishStep {
+    /// Every staged file or tree was synced; nothing is installed yet.
+    StagedSynced,
+    /// An empty `.pbfhogg-backup-*` container was created beside member
+    /// `k`'s destination.
+    BackupReserved(usize),
+    /// Member `k`'s previous output was moved into its backup: the
+    /// destination is absent and the backup is its only name.
+    MovedAside(usize),
+    /// Member `k`'s backup container and parent were synced.
+    BackupSynced(usize),
+    /// Member `k` was installed by `link(2)`: the destination and the
+    /// staging name are two links to the new output.
+    Linked(usize),
+    /// The staging name of a link-installed member `k` was unlinked.
+    StagingUnlinked(usize),
+    /// Member `k`'s new output was renamed into place.
+    Installed(usize),
+    /// Rollback took member `k`'s new output out of the destination (a
+    /// directory renamed back into staging, a file without a backup
+    /// unlinked): the destination is absent.
+    Uninstalled(usize),
+    /// Rollback renamed member `k`'s previous output back into place; its
+    /// backup container is empty.
+    Restored(usize),
+    /// Member `k`'s backup container was removed: emptied by a restore, or
+    /// removed with the previous output after a successful publication.
+    BackupRemoved(usize),
+    /// Every changed directory's sync was attempted.
+    DirsSynced,
+    /// A published directory output's emptied staging container (member
+    /// `k`) was removed.
+    StagingRemoved(usize),
+}
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Display for PublishStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, member) = match *self {
+            Self::StagedSynced => ("staged-synced", None),
+            Self::BackupReserved(k) => ("backup-reserved", Some(k)),
+            Self::MovedAside(k) => ("moved-aside", Some(k)),
+            Self::BackupSynced(k) => ("backup-synced", Some(k)),
+            Self::Linked(k) => ("linked", Some(k)),
+            Self::StagingUnlinked(k) => ("staging-unlinked", Some(k)),
+            Self::Installed(k) => ("installed", Some(k)),
+            Self::Uninstalled(k) => ("uninstalled", Some(k)),
+            Self::Restored(k) => ("restored", Some(k)),
+            Self::BackupRemoved(k) => ("backup-removed", Some(k)),
+            Self::DirsSynced => ("dirs-synced", None),
+            Self::StagingRemoved(k) => ("staging-removed", Some(k)),
+        };
+        match member {
+            Some(k) => write!(f, "{name}:{k}"),
+            None => f.write_str(name),
+        }
+    }
+}
+
+/// Reads what [`Display`](std::fmt::Display) writes.
+#[cfg(feature = "test-hooks")]
+impl std::str::FromStr for PublishStep {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (name, member) = split_member(s)?;
+        let step = match (name, member) {
+            ("staged-synced", None) => Self::StagedSynced,
+            ("backup-reserved", Some(k)) => Self::BackupReserved(k),
+            ("moved-aside", Some(k)) => Self::MovedAside(k),
+            ("backup-synced", Some(k)) => Self::BackupSynced(k),
+            ("linked", Some(k)) => Self::Linked(k),
+            ("staging-unlinked", Some(k)) => Self::StagingUnlinked(k),
+            ("installed", Some(k)) => Self::Installed(k),
+            ("uninstalled", Some(k)) => Self::Uninstalled(k),
+            ("restored", Some(k)) => Self::Restored(k),
+            ("backup-removed", Some(k)) => Self::BackupRemoved(k),
+            ("dirs-synced", None) => Self::DirsSynced,
+            ("staging-removed", Some(k)) => Self::StagingRemoved(k),
+            _ => {
+                return Err(Error::invalid_argument(format!(
+                    "not a publication step: {s}"
+                )));
+            }
+        };
+        Ok(step)
+    }
+}
+
+/// One publication's test hooks, read from the publishing invocation's
+/// fault plan once, at the start: the faults armed there, and the plan
+/// whose observer hears every [`PublishStep`]. Publication faults ride the
+/// token like every other fault, so a front end that builds its outputs in
+/// several places arms them in one.
+#[cfg(feature = "test-hooks")]
+struct Faults {
+    armed: Vec<PublishFault>,
+    invocation: crate::host::Invocation,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Faults {
+    fn of(invocation: &crate::host::Invocation) -> Self {
+        Self {
+            armed: invocation.faults().publish_faults(),
+            invocation: invocation.clone(),
+        }
+    }
+
+    fn has(&self, wanted: PublishFault) -> bool {
+        self.armed.contains(&wanted)
+    }
+
+    fn step(&self, step: PublishStep) {
+        self.invocation.faults().publish_step(step);
+    }
+}
+
 /// Without `test-hooks` there are no faults to carry.
 #[cfg(not(feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Default)]
 struct Faults;
 
-#[cfg(feature = "test-hooks")]
-fn fault(faults: &Faults, wanted: PublishFault) -> bool {
-    faults.contains(&wanted)
+#[cfg(not(feature = "test-hooks"))]
+impl Faults {
+    fn of(_invocation: &crate::host::Invocation) -> Self {
+        Self
+    }
 }
 
 /// Spell a fault in a way that compiles away without `test-hooks`.
 macro_rules! fault_is {
     ($faults:expr, $variant:expr) => {{
         #[cfg(feature = "test-hooks")]
-        let hit = fault($faults, $variant);
+        let hit = $faults.has($variant);
         #[cfg(not(feature = "test-hooks"))]
         let hit = {
             let _ = $faults;
             false
         };
         hit
+    }};
+}
+
+/// Announce a [`PublishStep`]; compiles away without `test-hooks`.
+macro_rules! step {
+    ($faults:expr, $step:expr) => {{
+        #[cfg(feature = "test-hooks")]
+        $faults.step($step);
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = $faults;
     }};
 }
 
@@ -1050,6 +1258,18 @@ enum State {
     Committed,
 }
 
+/// How far rolling back an installed member got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Undone {
+    /// The destination is as it was before publication.
+    Fully,
+    /// A directory's new generation was renamed back into staging, but its
+    /// previous one could not be put back: the destination is empty.
+    TakenOut,
+    /// Nothing changed: the new output is still at the destination.
+    Not,
+}
+
 #[derive(Debug)]
 struct Target {
     shape: Shape,
@@ -1292,9 +1512,9 @@ impl Target {
         let identity = self.identity();
         let cross_mount = fault_is!(faults, PublishFault::CrossMount(member));
         match self.overwrite {
-            Overwrite::Refuse => self.install_exclusive(identity, cross_mount, faults),
+            Overwrite::Refuse => self.install_exclusive(member, identity, cross_mount, faults),
             Overwrite::Replace => {
-                self.install_replacing(identity, use_backup, cross_mount, faults, metrics)
+                self.install_replacing(member, identity, use_backup, cross_mount, faults, metrics)
             }
         }
     }
@@ -1322,8 +1542,10 @@ impl Target {
         }
     }
 
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     fn install_exclusive(
         &mut self,
+        member: usize,
         identity: Option<Identity>,
         cross_mount: bool,
         faults: &Faults,
@@ -1341,6 +1563,7 @@ impl Target {
                     backup: None,
                     identity,
                 };
+                step!(faults, PublishStep::Installed(member));
                 Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1356,7 +1579,7 @@ impl Target {
                     path: self.dest.clone(),
                     source: e,
                 })),
-                Shape::File => self.install_by_link(identity, cross_mount, faults),
+                Shape::File => self.install_by_link(member, identity, cross_mount, faults),
             },
             Err(e) => Err(self.install_refused(e)),
         }
@@ -1365,8 +1588,10 @@ impl Target {
     /// `link(2)` fails when the destination exists, so it is exclusive. It
     /// publishes at the moment it succeeds; removing the staging name after
     /// that is cleanup, never a publication failure.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     fn install_by_link(
         &mut self,
+        member: usize,
         identity: Option<Identity>,
         cross_mount: bool,
         faults: &Faults,
@@ -1383,10 +1608,13 @@ impl Target {
                     identity,
                 };
                 self.linked = true;
+                step!(faults, PublishStep::Linked(member));
                 if fault_is!(faults, PublishFault::AfterLink) {
                     return Err(injected("after link"));
                 }
-                drop(fs::remove_file(&self.write));
+                if fs::remove_file(&self.write).is_ok() {
+                    step!(faults, PublishStep::StagingUnlinked(member));
+                }
                 Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1411,8 +1639,10 @@ impl Target {
         }
     }
 
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     fn install_replacing(
         &mut self,
+        member: usize,
         identity: Option<Identity>,
         use_backup: bool,
         cross_mount: bool,
@@ -1432,15 +1662,25 @@ impl Target {
             // backup can be the only copy of the previous output, and a
             // caller removes its staging directory wholesale.
             let container = reserve(&self.dest, None, "backup", |path| fs::create_dir(path))?;
+            step!(faults, PublishStep::BackupReserved(member));
             let entry = container.join(self.dest.file_name().unwrap_or_default());
-            if let Err(e) = fs::rename(&self.dest, &entry) {
-                if let Err(e) = fs::remove_dir(&container) {
-                    self.pending.push(format!(
+            let moved = if fault_is!(faults, PublishFault::MoveAside) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected move-aside fault",
+                ))
+            } else {
+                fs::rename(&self.dest, &entry)
+            };
+            if let Err(e) = moved {
+                match fs::remove_dir(&container) {
+                    Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
+                    Err(e) => self.pending.push(format!(
                         "could not remove the empty backup directory {} after moving {} aside \
                          failed: {e}; it can be deleted by hand",
                         container.display(),
                         self.dest.display()
-                    ));
+                    )),
                 }
                 return Err(Error::from(e).context(format!(
                     "cannot move existing output {} aside",
@@ -1448,6 +1688,7 @@ impl Target {
                 )));
             }
             self.state = State::BackedUp(Backup { container, entry });
+            step!(faults, PublishStep::MovedAside(member));
             if fault_is!(faults, PublishFault::AfterBackup) {
                 return Err(injected("after backup"));
             }
@@ -1472,6 +1713,7 @@ impl Target {
                         self.dest.display()
                     ))
                 })?;
+                step!(faults, PublishStep::BackupSynced(member));
             }
             match std::mem::replace(&mut self.state, State::Staged) {
                 State::BackedUp(backup) => Some(backup),
@@ -1495,12 +1737,16 @@ impl Target {
             return Err(self.install_refused(e));
         }
         self.state = State::Installed { backup, identity };
+        step!(faults, PublishStep::Installed(member));
         Ok(())
     }
 
     /// Undo this member's installation. `Some` describes what could not be
     /// undone; whatever it names is left in place, never deleted.
-    fn rollback(&mut self, faults: &Faults) -> Option<String> {
+    ///
+    /// `member` is this target's position in its group, for the steps it
+    /// announces.
+    fn rollback(&mut self, member: usize, faults: &Faults) -> Option<String> {
         let fail_restore = fault_is!(faults, PublishFault::Restore);
         match std::mem::replace(&mut self.state, State::Staged) {
             State::Staged => None,
@@ -1513,17 +1759,11 @@ impl Target {
                     fs::symlink_metadata(&self.dest),
                     Err(ref e) if e.kind() == io::ErrorKind::NotFound
                 );
-                if !fail_restore && dest_free && fs::rename(&backup.entry, &self.dest).is_ok() {
-                    self.remove_empty_backup(&backup);
+                if !fail_restore && dest_free && self.restore(member, &backup, faults) {
+                    self.remove_empty_backup(member, &backup, faults);
                     None
                 } else {
-                    let note = format!(
-                        "{}: the previous output could not be restored and is kept at {}",
-                        self.dest.display(),
-                        backup.entry.display()
-                    );
-                    self.state = State::BackedUp(backup);
-                    Some(note)
+                    Some(self.keep_backed_up(backup))
                 }
             }
             State::Installed { backup, identity } => {
@@ -1534,62 +1774,109 @@ impl Target {
                     }
                     Err(_) => false,
                 };
-                let restored = !fail_restore && ours && self.uninstall(backup.as_ref());
-                if restored {
-                    if let Some(backup) = backup {
-                        self.remove_empty_backup(&backup);
-                    }
-                    None
+                let undone = if !fail_restore && ours {
+                    self.uninstall(member, backup.as_ref(), faults)
                 } else {
-                    let note = match &backup {
-                        Some(backup) => format!(
-                            "{}: the new output could not be rolled back; the previous output \
-                             is kept at {}",
-                            self.dest.display(),
-                            backup.entry.display()
-                        ),
-                        None => format!(
-                            "{}: the new output could not be removed and remains in place",
-                            self.dest.display()
-                        ),
-                    };
-                    self.state = State::Installed { backup, identity };
-                    Some(note)
+                    Undone::Not
+                };
+                match undone {
+                    Undone::Fully => {
+                        if let Some(backup) = backup {
+                            self.remove_empty_backup(member, &backup, faults);
+                        }
+                        None
+                    }
+                    // The new output is back in staging and the destination
+                    // is empty: the state is a backed-up one again, whose
+                    // backup holds the only copy of the previous output.
+                    Undone::TakenOut => backup.map(|backup| self.keep_backed_up(backup)),
+                    Undone::Not => {
+                        let note = match &backup {
+                            Some(backup) => format!(
+                                "{}: the new output could not be rolled back; the previous \
+                                 output is kept at {}",
+                                self.dest.display(),
+                                backup.entry.display()
+                            ),
+                            None => format!(
+                                "{}: the new output could not be removed and remains in place",
+                                self.dest.display()
+                            ),
+                        };
+                        self.state = State::Installed { backup, identity };
+                        Some(note)
+                    }
                 }
             }
         }
     }
 
+    /// Record a previous output that could not be put back: the target stays
+    /// backed up, and the note names where the previous output is kept.
+    fn keep_backed_up(&mut self, backup: Backup) -> String {
+        let note = format!(
+            "{}: the previous output could not be restored and is kept at {}",
+            self.dest.display(),
+            backup.entry.display()
+        );
+        self.state = State::BackedUp(backup);
+        note
+    }
+
+    /// Rename the previous output back to the destination.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn restore(&self, member: usize, backup: &Backup, faults: &Faults) -> bool {
+        let restored = !fault_is!(faults, PublishFault::RestoreRename)
+            && fs::rename(&backup.entry, &self.dest).is_ok();
+        if restored {
+            step!(faults, PublishStep::Restored(member));
+        }
+        restored
+    }
+
     /// Take our output back out of the destination and put the backup (if
     /// any) back. The new output returns to the staging area, where Drop
-    /// removes it.
-    fn uninstall(&self, backup: Option<&Backup>) -> bool {
-        let moved_back = match self.shape {
-            Shape::Dir => fs::rename(&self.dest, &self.write).is_ok(),
-            Shape::File => match backup {
-                // The restore below replaces our file in one rename.
-                Some(_) => true,
-                None => fs::remove_file(&self.dest).is_ok(),
-            },
+    /// removes it. A file with a backup is restored by one rename over the
+    /// new file, so it is never taken out without being restored; a
+    /// directory is renamed back into staging first, so it can be taken
+    /// out and its previous generation still fail to come back.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn uninstall(&self, member: usize, backup: Option<&Backup>, faults: &Faults) -> Undone {
+        let taken_out = match (self.shape, backup) {
+            (Shape::File, Some(_)) => false,
+            (Shape::Dir, _) => fs::rename(&self.dest, &self.write).is_ok(),
+            (Shape::File, None) => fs::remove_file(&self.dest).is_ok(),
         };
-        if !moved_back {
-            return false;
+        if taken_out {
+            step!(faults, PublishStep::Uninstalled(member));
         }
         match backup {
-            Some(backup) => fs::rename(&backup.entry, &self.dest).is_ok(),
-            None => true,
+            None if taken_out => Undone::Fully,
+            None => Undone::Not,
+            Some(backup) if self.shape == Shape::File || taken_out => {
+                if self.restore(member, backup, faults) {
+                    Undone::Fully
+                } else if taken_out {
+                    Undone::TakenOut
+                } else {
+                    Undone::Not
+                }
+            }
+            Some(_) => Undone::Not,
         }
     }
 
     /// Remove a backup container that a restore just emptied.
-    fn remove_empty_backup(&mut self, backup: &Backup) {
-        if let Err(e) = fs::remove_dir(&backup.container) {
-            self.pending.push(format!(
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn remove_empty_backup(&mut self, member: usize, backup: &Backup, faults: &Faults) {
+        match fs::remove_dir(&backup.container) {
+            Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
+            Err(e) => self.pending.push(format!(
                 "{} was restored, but removing its emptied backup directory {} failed: {e}; it \
                  can be deleted by hand",
                 self.dest.display(),
                 backup.container.display()
-            ));
+            )),
         }
     }
 
@@ -1602,7 +1889,8 @@ impl Target {
     /// deletes, or cannot complete: then it is kept and reported. Cleanup is
     /// best effort: the output is already in place, so trouble is recorded
     /// for the warning, never returned as an error.
-    fn commit(&mut self, remove_backup: bool, faults: &Faults) -> Option<PathBuf> {
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn commit(&mut self, member: usize, remove_backup: bool, faults: &Faults) -> Option<PathBuf> {
         let mut kept = None;
         if let State::Installed {
             backup: Some(backup),
@@ -1610,25 +1898,27 @@ impl Target {
         } = std::mem::replace(&mut self.state, State::Committed)
         {
             if remove_backup {
-                self.remove_backup(&backup, faults);
+                self.remove_backup(member, &backup, faults);
             } else {
                 kept = Some(backup.container);
             }
         }
-        if self.shape == Shape::Dir
-            && let Err(e) = fs::remove_dir(&self.staging)
-        {
-            self.pending.push(format!(
-                "{} was published, but removing its staging directory {} failed: {e}; it can \
-                 be deleted by hand",
-                self.dest.display(),
-                self.staging.display()
-            ));
+        if self.shape == Shape::Dir {
+            match fs::remove_dir(&self.staging) {
+                Ok(()) => step!(faults, PublishStep::StagingRemoved(member)),
+                Err(e) => self.pending.push(format!(
+                    "{} was published, but removing its staging directory {} failed: {e}; it \
+                     can be deleted by hand",
+                    self.dest.display(),
+                    self.staging.display()
+                )),
+            }
         }
         kept
     }
 
-    fn remove_backup(&mut self, backup: &Backup, faults: &Faults) {
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn remove_backup(&mut self, member: usize, backup: &Backup, faults: &Faults) {
         match crate::scratch::protected_entries(&backup.container) {
             Ok(found) if found.is_empty() => {}
             Ok(found) => {
@@ -1660,14 +1950,18 @@ impl Target {
         } else {
             fs::remove_dir_all(&backup.container)
         };
-        if let Err(e) = removed {
-            self.pending.push(format!(
+        // A removal killed or failing partway leaves a backup holding only
+        // what was not yet removed; it creates no name anywhere, so that
+        // state needs no step of its own.
+        match removed {
+            Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
+            Err(e) => self.pending.push(format!(
                 "{} was published, but removing the backup of the previous output at {} \
                  failed: {e}; the cleanup is incomplete and what is left there can be \
                  deleted by hand",
                 self.dest.display(),
                 backup.container.display()
-            ));
+            )),
         }
     }
 
@@ -1809,6 +2103,7 @@ fn publish_all(
     for target in targets.iter() {
         target.sync_staged(metrics)?;
     }
+    step!(faults, PublishStep::StagedSynced);
     if fault_is!(faults, PublishFault::BeforeInstall) {
         return Err(injected("before install"));
     }
@@ -1823,8 +2118,9 @@ fn publish_all(
             let touched = &mut targets[..=i];
             let unresolved: Vec<String> = touched
                 .iter_mut()
+                .enumerate()
                 .rev()
-                .filter_map(|target| target.rollback(faults))
+                .filter_map(|(member, target)| target.rollback(member, faults))
                 .collect();
             // Best effort: the restored names are visible now; syncing their
             // directories (and any backup kept by a failed restore) is all
@@ -1876,10 +2172,11 @@ fn publish_all(
             unsynced = Some((dest, source));
         }
     }
+    step!(faults, PublishStep::DirsSynced);
     let remove_backups = unsynced.is_none();
     let mut kept = Vec::new();
-    for target in targets.iter_mut() {
-        kept.extend(target.commit(remove_backups, faults));
+    for (member, target) in targets.iter_mut().enumerate() {
+        kept.extend(target.commit(member, remove_backups, faults));
     }
     let Some((path, source)) = unsynced else {
         return Ok(());
@@ -1954,8 +2251,6 @@ fn sync_dir(_dir: &Path, _sync: &PublishSync<'_>) -> io::Result<()> {
 #[derive(Debug)]
 pub struct Output {
     target: Target,
-    #[cfg(feature = "test-hooks")]
-    faults: Faults,
 }
 
 impl Output {
@@ -2006,8 +2301,6 @@ impl Output {
                 staging_dir,
                 diagnostics,
             )?,
-            #[cfg(feature = "test-hooks")]
-            faults: Faults::new(),
         })
     }
 
@@ -2254,24 +2547,11 @@ impl Output {
     /// published and only the directory sync failed.
     pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
-        let faults = self.faults();
-        publish_all(std::slice::from_mut(&mut self.target), &faults, cancel)
-    }
-
-    #[cfg(feature = "test-hooks")]
-    fn faults(&self) -> Faults {
-        self.faults.clone()
-    }
-    #[cfg(not(feature = "test-hooks"))]
-    fn faults(&self) -> Faults {
-        Faults
-    }
-
-    /// Test hook: inject a publication fault.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inject_fault(&mut self, fault: PublishFault) {
-        self.faults.push(fault);
+        publish_all(
+            std::slice::from_mut(&mut self.target),
+            &Faults::of(cancel),
+            cancel,
+        )
     }
 }
 
@@ -2280,8 +2560,6 @@ impl Output {
 #[derive(Debug)]
 pub struct OutputDir {
     target: Target,
-    #[cfg(feature = "test-hooks")]
-    faults: Faults,
 }
 
 impl OutputDir {
@@ -2327,8 +2605,6 @@ impl OutputDir {
                 staging_dir,
                 diagnostics,
             )?,
-            #[cfg(feature = "test-hooks")]
-            faults: Faults::new(),
         })
     }
 
@@ -2367,18 +2643,11 @@ impl OutputDir {
     /// error names where it is kept).
     pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
-        #[cfg(feature = "test-hooks")]
-        let faults = self.faults.clone();
-        #[cfg(not(feature = "test-hooks"))]
-        let faults = Faults;
-        publish_all(std::slice::from_mut(&mut self.target), &faults, cancel)
-    }
-
-    /// Test hook: inject a publication fault.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inject_fault(&mut self, fault: PublishFault) {
-        self.faults.push(fault);
+        publish_all(
+            std::slice::from_mut(&mut self.target),
+            &Faults::of(cancel),
+            cancel,
+        )
     }
 }
 
@@ -2391,8 +2660,6 @@ impl OutputDir {
 #[derive(Debug)]
 pub struct OutputSet {
     members: Vec<Output>,
-    #[cfg(feature = "test-hooks")]
-    faults: Faults,
 }
 
 impl OutputSet {
@@ -2466,11 +2733,7 @@ impl OutputSet {
             .iter()
             .map(|path| Output::with_staging(path, overwrite, staging_dir, diagnostics))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            members,
-            #[cfg(feature = "test-hooks")]
-            faults: Faults::new(),
-        })
+        Ok(Self { members })
     }
 
     /// Number of members.
@@ -2508,22 +2771,11 @@ impl OutputSet {
     /// naming every member whose previous state could not be restored.
     pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
-        #[cfg(feature = "test-hooks")]
-        let faults = self.faults.clone();
-        #[cfg(not(feature = "test-hooks"))]
-        let faults = Faults;
         let mut targets: Vec<Target> = Vec::with_capacity(self.members.len());
         for member in self.members.drain(..) {
             targets.push(member.into_target());
         }
-        publish_all(&mut targets, &faults, cancel)
-    }
-
-    /// Test hook: inject a publication fault.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inject_fault(&mut self, fault: PublishFault) {
-        self.faults.push(fault);
+        publish_all(&mut targets, &Faults::of(cancel), cancel)
     }
 }
 
@@ -2603,14 +2855,24 @@ mod tests {
 
     /// Write `bytes` through the output's writing session and finish it.
     fn stage(out: &Output, bytes: &[u8]) -> Result<()> {
-        let mut writer = out.writer(run_token())?;
+        stage_under(out, run_token(), bytes)
+    }
+
+    /// [`stage`] under a token of the test's own (one it arms faults on).
+    fn stage_under(out: &Output, token: &crate::host::Invocation, bytes: &[u8]) -> Result<()> {
+        let mut writer = out.writer(token)?;
         writer.write_all(bytes)?;
         writer.finish()
     }
 
     /// Write one file into a directory output's session and finish it.
     fn stage_dir(out: &OutputDir, name: &str, bytes: &[u8]) {
-        let writer = out.writer(run_token()).unwrap();
+        stage_dir_under(out, run_token(), name, bytes);
+    }
+
+    /// [`stage_dir`] under a token of the test's own.
+    fn stage_dir_under(out: &OutputDir, token: &crate::host::Invocation, name: &str, bytes: &[u8]) {
+        let writer = out.writer(token).unwrap();
         fs::write(writer.path().join(name), bytes).unwrap();
         writer.finish();
     }
@@ -3336,11 +3598,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         fs::write(entry.join("old-file"), b"old").unwrap();
         let backup = Backup { container, entry };
-        #[cfg(feature = "test-hooks")]
-        let faults = Faults::new();
-        #[cfg(not(feature = "test-hooks"))]
-        let faults = Faults;
-        target.remove_backup(&backup, &faults);
+        target.remove_backup(0, &backup, &Faults::of(run_token()));
         drop(target);
         assert!(run.exists());
         assert_eq!(fs::read(backup.entry.join("old-file")).unwrap(), b"old");
@@ -3629,6 +3887,17 @@ mod tests {
     #[cfg(feature = "test-hooks")]
     mod faults {
         use super::*;
+        use crate::host::Invocation;
+
+        /// A token of the test's own with `faults` armed: publication faults
+        /// ride the token, so every scenario gets one.
+        fn armed(faults: &[PublishFault]) -> Invocation {
+            let token = Invocation::new();
+            for fault in faults {
+                token.faults().arm_publish_fault(*fault);
+            }
+            token
+        }
 
         /// A group that fails after one member was installed rolls it back
         /// out of the destination and into the staging directory, where
@@ -3641,18 +3910,18 @@ mod tests {
             fs::create_dir(&stage_dir_path).unwrap();
             let a = dir.path().join("a.pbf");
             let b = dir.path().join("b.pbf");
-            let mut set = OutputSet::files_with_staging(
+            let set = OutputSet::files_with_staging(
                 [&a, &b],
                 Overwrite::Refuse,
                 Some(&stage_dir_path),
                 &discard(),
             )
             .unwrap();
+            let token = armed(&[PublishFault::AfterInstalled(0)]);
             for member in set.iter() {
-                stage(member, b"m").unwrap();
+                stage_under(member, &token, b"m").unwrap();
             }
-            set.inject_fault(PublishFault::AfterInstalled(0));
-            assert!(set.publish(run_token()).is_err());
+            assert!(set.publish(&token).is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &["stage"]).is_empty());
             assert!(others(&stage_dir_path, &[]).is_empty());
@@ -3697,19 +3966,20 @@ mod tests {
                 let stage_dir_path = dir.path().join("stage");
                 fs::create_dir(&stage_dir_path).unwrap();
                 let dest = dir.path().join("out.osm.pbf");
-                let mut out = Output::with_staging(
+                let out = Output::with_staging(
                     &dest,
                     Overwrite::Refuse,
                     Some(&stage_dir_path),
                     &discard(),
                 )
                 .unwrap();
-                stage(&out, b"new").unwrap();
-                if link_fallback {
-                    out.inject_fault(PublishFault::ForceLinkFallback);
-                }
-                out.inject_fault(PublishFault::CrossMount(0));
-                let err = out.publish(run_token()).unwrap_err();
+                let token = if link_fallback {
+                    armed(&[PublishFault::ForceLinkFallback, PublishFault::CrossMount(0)])
+                } else {
+                    armed(&[PublishFault::CrossMount(0)])
+                };
+                stage_under(&out, &token, b"new").unwrap();
+                let err = out.publish(&token).unwrap_err();
                 assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
                 assert!(!dest.exists());
                 assert!(others(dir.path(), &["stage"]).is_empty());
@@ -3724,18 +3994,17 @@ mod tests {
         fn a_cross_mount_answer_without_a_staging_directory_is_not_attributed_to_one() {
             let dir = scratch();
             let dest = dir.path().join("out.osm.pbf");
-            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::CrossMount(0));
-            let err = out.publish(run_token()).unwrap_err();
+            let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::CrossMount(0)]);
+            stage_under(&out, &token, b"new").unwrap();
+            let err = out.publish(&token).unwrap_err();
             assert!(!matches!(err.kind(), crate::ErrorKind::Output(_)), "{err}");
             assert!(err.report().contains("cannot publish"), "{err}");
 
-            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::ForceLinkFallback);
-            out.inject_fault(PublishFault::CrossMount(0));
-            let err = out.publish(run_token()).unwrap_err();
+            let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::ForceLinkFallback, PublishFault::CrossMount(0)]);
+            stage_under(&out, &token, b"new").unwrap();
+            let err = out.publish(&token).unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::ExclusivePublishUnsupported { .. }
@@ -3755,7 +4024,7 @@ mod tests {
             let dest = dir.path().join("index");
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old"), b"old").unwrap();
-            let mut out = OutputDir::with_staging(
+            let out = OutputDir::with_staging(
                 &dest,
                 Overwrite::Replace,
                 None,
@@ -3763,9 +4032,9 @@ mod tests {
                 &discard(),
             )
             .unwrap();
-            stage_dir(&out, "new", b"new");
-            out.inject_fault(PublishFault::CrossMount(0));
-            let err = out.publish(run_token()).unwrap_err();
+            let token = armed(&[PublishFault::CrossMount(0)]);
+            stage_dir_under(&out, &token, "new", b"new");
+            let err = out.publish(&token).unwrap_err();
             assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
             assert_eq!(fs::read(dest.join("old")).unwrap(), b"old");
             assert!(!dest.join("new").exists());
@@ -3787,21 +4056,22 @@ mod tests {
                 let b = dir.path().join("b.pbf");
                 fs::write(&a, b"old a").unwrap();
                 fs::write(&b, b"old b").unwrap();
-                let mut set = OutputSet::files_with_staging(
+                let set = OutputSet::files_with_staging(
                     [&a, &b],
                     Overwrite::Replace,
                     Some(&stage_dir_path),
                     &discard(),
                 )
                 .unwrap();
+                let token = if restore_fails {
+                    armed(&[PublishFault::CrossMount(1), PublishFault::Restore])
+                } else {
+                    armed(&[PublishFault::CrossMount(1)])
+                };
                 for member in set.iter() {
-                    stage(member, b"new").unwrap();
+                    stage_under(member, &token, b"new").unwrap();
                 }
-                set.inject_fault(PublishFault::CrossMount(1));
-                if restore_fails {
-                    set.inject_fault(PublishFault::Restore);
-                }
-                let err = set.publish(run_token()).unwrap_err();
+                let err = set.publish(&token).unwrap_err();
                 if restore_fails {
                     let OutputError::RollbackIncomplete { unresolved, source } = output_error(&err)
                     else {
@@ -3844,10 +4114,10 @@ mod tests {
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old-file"), b"old").unwrap();
             let (sink, diagnostics) = recording();
-            let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
-            stage_dir(&out, "new-file", b"new");
-            out.inject_fault(PublishFault::BackupRemoval);
-            out.publish(run_token()).unwrap();
+            let out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
+            let token = armed(&[PublishFault::BackupRemoval]);
+            stage_dir_under(&out, &token, "new-file", b"new");
+            out.publish(&token).unwrap();
             assert_eq!(fs::read(dest.join("new-file")).unwrap(), b"new");
             let events = sink.0.lock().unwrap();
             assert_eq!(events.len(), 1, "{events:?}");
@@ -3874,10 +4144,10 @@ mod tests {
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old-file"), b"old").unwrap();
             let (sink, diagnostics) = recording();
-            let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
-            stage_dir(&out, "new-file", b"new");
-            out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(run_token()).unwrap_err();
+            let out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
+            let token = armed(&[PublishFault::DirSync]);
+            stage_dir_under(&out, &token, "new-file", b"new");
+            let err = out.publish(&token).unwrap_err();
             let OutputError::Unsynced {
                 kept, kept_synced, ..
             } = output_error(&err)
@@ -3907,21 +4177,25 @@ mod tests {
             let dest = dir.path().join("index");
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old-file"), b"old").unwrap();
-            let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
-            stage_dir(&out, "new-file", b"new");
-            out.inject_fault(PublishFault::BackupSync);
-            assert!(out.publish(run_token()).is_err());
+            let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
+            let token = armed(&[PublishFault::BackupSync]);
+            stage_dir_under(&out, &token, "new-file", b"new");
+            assert!(out.publish(&token).is_err());
             assert_eq!(fs::read(dest.join("old-file")).unwrap(), b"old");
             assert!(!dest.join("new-file").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
         }
 
-        fn staged_set(dir: &Path, overwrite: Overwrite) -> (OutputSet, PathBuf, PathBuf) {
+        fn staged_set(
+            dir: &Path,
+            overwrite: Overwrite,
+            token: &Invocation,
+        ) -> (OutputSet, PathBuf, PathBuf) {
             let a = dir.join("a.osm.pbf");
             let b = dir.join("b.osm.pbf");
             let set = OutputSet::files([&a, &b], overwrite, &discard()).unwrap();
             for member in set.iter() {
-                stage(member, b"new").unwrap();
+                stage_under(member, token, b"new").unwrap();
             }
             (set, a, b)
         }
@@ -3933,10 +4207,10 @@ mod tests {
             let dir = scratch();
             let dest = dir.path().join("out.osm.pbf");
             fs::write(&dest, b"user data").unwrap();
-            let mut out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::BeforeInstall);
-            assert!(out.publish(run_token()).is_err());
+            let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+            let token = armed(&[PublishFault::BeforeInstall]);
+            stage_under(&out, &token, b"new").unwrap();
+            assert!(out.publish(&token).is_err());
             assert_eq!(fs::read(&dest).unwrap(), b"user data");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -3945,20 +4219,20 @@ mod tests {
         fn the_link_fallback_publishes_exclusively() {
             let dir = scratch();
             let dest = dir.path().join("out.osm.pbf");
-            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::ForceLinkFallback);
-            out.publish(run_token()).unwrap();
+            let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::ForceLinkFallback]);
+            stage_under(&out, &token, b"new").unwrap();
+            out.publish(&token).unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
 
             // Exclusive: an entry that appeared meanwhile is not replaced.
             let other = dir.path().join("other.osm.pbf");
-            let mut out = Output::new(&other, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"ours").unwrap();
+            let out = Output::new(&other, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::ForceLinkFallback]);
+            stage_under(&out, &token, b"ours").unwrap();
             fs::write(&other, b"theirs").unwrap();
-            out.inject_fault(PublishFault::ForceLinkFallback);
-            let err = out.publish(run_token()).unwrap_err();
+            let err = out.publish(&token).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Exists { .. }));
             assert_eq!(fs::read(&other).unwrap(), b"theirs");
         }
@@ -3969,11 +4243,10 @@ mod tests {
         fn a_failure_after_link_rolls_the_output_back() {
             let dir = scratch();
             let dest = dir.path().join("out.osm.pbf");
-            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::ForceLinkFallback);
-            out.inject_fault(PublishFault::AfterLink);
-            assert!(out.publish(run_token()).is_err());
+            let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::ForceLinkFallback, PublishFault::AfterLink]);
+            stage_under(&out, &token, b"new").unwrap();
+            assert!(out.publish(&token).is_err());
             assert!(!dest.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -3983,18 +4256,18 @@ mod tests {
             let dir = scratch();
             fs::write(dir.path().join("a.osm.pbf"), b"old a").unwrap();
             fs::write(dir.path().join("b.osm.pbf"), b"old b").unwrap();
-            let (mut set, a, b) = staged_set(dir.path(), Overwrite::Replace);
-            set.inject_fault(PublishFault::AfterInstalled(1));
-            assert!(set.publish(run_token()).is_err());
+            let token = armed(&[PublishFault::AfterInstalled(1)]);
+            let (set, a, b) = staged_set(dir.path(), Overwrite::Replace, &token);
+            assert!(set.publish(&token).is_err());
             assert_eq!(fs::read(&a).unwrap(), b"old a");
             assert_eq!(fs::read(&b).unwrap(), b"old b");
             assert!(others(dir.path(), &["a.osm.pbf", "b.osm.pbf"]).is_empty());
 
             // Refuse: nothing existed, so a rolled-back group leaves nothing.
             let dir = scratch();
-            let (mut set, a, b) = staged_set(dir.path(), Overwrite::Refuse);
-            set.inject_fault(PublishFault::AfterInstalled(0));
-            assert!(set.publish(run_token()).is_err());
+            let token = armed(&[PublishFault::AfterInstalled(0)]);
+            let (set, a, b) = staged_set(dir.path(), Overwrite::Refuse, &token);
+            assert!(set.publish(&token).is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -4007,10 +4280,10 @@ mod tests {
             let dest = dir.path().join("index");
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old.bin"), b"old").unwrap();
-            let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
-            stage_dir(&out, "new.bin", b"new");
-            out.inject_fault(PublishFault::AfterBackup);
-            assert!(out.publish(run_token()).is_err());
+            let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
+            let token = armed(&[PublishFault::AfterBackup]);
+            stage_dir_under(&out, &token, "new.bin", b"new");
+            assert!(out.publish(&token).is_err());
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
             assert!(!dest.join("new.bin").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -4025,10 +4298,9 @@ mod tests {
             let b = dir.path().join("b.osm.pbf");
             fs::write(&a, b"old a").unwrap();
             fs::write(&b, b"old b").unwrap();
-            let (mut set, _, _) = staged_set(dir.path(), Overwrite::Replace);
-            set.inject_fault(PublishFault::AfterInstalled(1));
-            set.inject_fault(PublishFault::Restore);
-            let err = set.publish(run_token()).unwrap_err();
+            let token = armed(&[PublishFault::AfterInstalled(1), PublishFault::Restore]);
+            let (set, _, _) = staged_set(dir.path(), Overwrite::Replace, &token);
+            let err = set.publish(&token).unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -4056,11 +4328,10 @@ mod tests {
             let dest = dir.path().join("index");
             fs::create_dir(&dest).unwrap();
             fs::write(dest.join("old.bin"), b"old").unwrap();
-            let mut out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
-            stage_dir(&out, "new.bin", b"new");
-            out.inject_fault(PublishFault::AfterBackup);
-            out.inject_fault(PublishFault::Restore);
-            let err = out.publish(run_token()).unwrap_err();
+            let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
+            let token = armed(&[PublishFault::AfterBackup, PublishFault::Restore]);
+            stage_dir_under(&out, &token, "new.bin", b"new");
+            let err = out.publish(&token).unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::RollbackIncomplete { .. }
@@ -4077,13 +4348,394 @@ mod tests {
         fn a_sync_failure_reports_a_published_output() {
             let dir = scratch();
             let dest = dir.path().join("out.osm.pbf");
-            let mut out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-            stage(&out, b"new").unwrap();
-            out.inject_fault(PublishFault::DirSync);
-            let err = out.publish(run_token()).unwrap_err();
+            let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+            let token = armed(&[PublishFault::DirSync]);
+            stage_under(&out, &token, b"new").unwrap();
+            let err = out.publish(&token).unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Unsynced { .. }));
             assert!(err.to_string().contains("was published"), "{err}");
             assert_eq!(fs::read(&dest).unwrap(), b"new");
+        }
+
+        /// A directory taken back out of its destination whose previous
+        /// generation then cannot be renamed back: the destination is empty,
+        /// the previous generation is kept in its backup and named as such,
+        /// and the new generation goes with the staging, so nothing else is
+        /// left anywhere.
+        #[test]
+        fn a_directory_taken_out_but_not_restored_names_the_kept_previous_output() {
+            let dir = scratch();
+            let stage_dir_path = dir.path().join("stage");
+            fs::create_dir(&stage_dir_path).unwrap();
+            let dest = dir.path().join("index");
+            fs::create_dir(&dest).unwrap();
+            fs::write(dest.join("old.bin"), b"old").unwrap();
+            let out = OutputDir::with_staging(
+                &dest,
+                Overwrite::Replace,
+                None,
+                Some(&stage_dir_path),
+                &discard(),
+            )
+            .unwrap();
+            let token = armed(&[PublishFault::AfterInstalled(0), PublishFault::RestoreRename]);
+            stage_dir_under(&out, &token, "new.bin", b"new");
+            let err = out.publish(&token).unwrap_err();
+            let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
+                panic!("expected an incomplete rollback, got {err}");
+            };
+            assert!(!dest.exists(), "the new generation was taken out");
+            let left = others(dir.path(), &["stage"]);
+            assert_eq!(left.len(), 1, "{left:?}");
+            assert!(left[0].starts_with(".pbfhogg-backup-"), "{left:?}");
+            assert_eq!(
+                fs::read(dir.path().join(&left[0]).join("index").join("old.bin")).unwrap(),
+                b"old"
+            );
+            assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+            assert!(
+                unresolved[0].contains("previous output could not be restored"),
+                "{unresolved:?}"
+            );
+            assert!(others(&stage_dir_path, &[]).is_empty());
+        }
+
+        #[derive(Clone, Copy)]
+        enum Form {
+            File,
+            Set,
+            Dir,
+        }
+
+        /// Publish one output form with the given members already present
+        /// and `faults` armed, recording every step the publication
+        /// announces.
+        fn trace(
+            form: Form,
+            overwrite: Overwrite,
+            present: &[bool],
+            faults: &[PublishFault],
+        ) -> (Vec<String>, Result<()>) {
+            let dir = scratch();
+            let token = armed(faults);
+            let steps = Arc::new(Mutex::new(Vec::new()));
+            let heard = Arc::clone(&steps);
+            token
+                .faults()
+                .on_publish_step(move |step| heard.lock().unwrap().push(step.to_string()));
+            let names = ["a.osm.pbf", "b.osm.pbf"];
+            let result = match form {
+                Form::File | Form::Set => {
+                    let count = if matches!(form, Form::File) { 1 } else { 2 };
+                    let paths: Vec<PathBuf> =
+                        names[..count].iter().map(|n| dir.path().join(n)).collect();
+                    for (path, &here) in paths.iter().zip(present) {
+                        if here {
+                            fs::write(path, b"old").unwrap();
+                        }
+                    }
+                    if count == 1 {
+                        let out = Output::new(&paths[0], overwrite, &discard()).unwrap();
+                        stage_under(&out, &token, b"new").unwrap();
+                        out.publish(&token)
+                    } else {
+                        let set = OutputSet::files(&paths, overwrite, &discard()).unwrap();
+                        for member in set.iter() {
+                            stage_under(member, &token, b"new").unwrap();
+                        }
+                        set.publish(&token)
+                    }
+                }
+                Form::Dir => {
+                    let dest = dir.path().join("index");
+                    if present[0] {
+                        fs::create_dir(&dest).unwrap();
+                        fs::write(dest.join("old.bin"), b"old").unwrap();
+                    }
+                    let out = OutputDir::new(&dest, overwrite, None, &discard()).unwrap();
+                    stage_dir_under(&out, &token, "new.bin", b"new");
+                    out.publish(&token)
+                }
+            };
+            let steps = steps.lock().unwrap().clone();
+            (steps, result)
+        }
+
+        /// The steps every output form announces, in order, on success and
+        /// on each rollback path: the states a killed publication can leave
+        /// are exactly the prefixes of these traces, which the CLI's
+        /// in-publication kill tests walk.
+        #[test]
+        #[allow(clippy::too_many_lines, clippy::type_complexity)]
+        fn every_publication_announces_its_namespace_steps_in_order() {
+            use Form::{Dir, File, Set};
+            use Overwrite::{Refuse, Replace};
+            use PublishFault as F;
+            let backed_up = |k: usize| {
+                [
+                    format!("backup-reserved:{k}"),
+                    format!("moved-aside:{k}"),
+                    format!("backup-synced:{k}"),
+                ]
+            };
+            let swap = |k: usize| {
+                let mut v = backed_up(k).to_vec();
+                v.push(format!("installed:{k}"));
+                v
+            };
+            let cases: Vec<(&str, Form, Overwrite, Vec<bool>, Vec<F>, bool, Vec<String>)> = vec![
+                (
+                    "file, refuse",
+                    File,
+                    Refuse,
+                    vec![false],
+                    vec![],
+                    true,
+                    s(&["staged-synced", "installed:0", "dirs-synced"]),
+                ),
+                (
+                    "file, link fallback",
+                    File,
+                    Refuse,
+                    vec![false],
+                    vec![F::ForceLinkFallback],
+                    true,
+                    s(&[
+                        "staged-synced",
+                        "linked:0",
+                        "staging-unlinked:0",
+                        "dirs-synced",
+                    ]),
+                ),
+                (
+                    "file, link fallback, failure after link",
+                    File,
+                    Refuse,
+                    vec![false],
+                    vec![F::ForceLinkFallback, F::AfterLink],
+                    false,
+                    s(&["staged-synced", "linked:0", "uninstalled:0"]),
+                ),
+                (
+                    "file, replace",
+                    File,
+                    Replace,
+                    vec![true],
+                    vec![],
+                    true,
+                    s(&["staged-synced", "installed:0", "dirs-synced"]),
+                ),
+                (
+                    "set, replace",
+                    Set,
+                    Replace,
+                    vec![true, true],
+                    vec![],
+                    true,
+                    [
+                        s(&["staged-synced"]),
+                        swap(0),
+                        swap(1),
+                        s(&["dirs-synced", "backup-removed:0", "backup-removed:1"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "set, replace, only the second present",
+                    Set,
+                    Replace,
+                    vec![false, true],
+                    vec![],
+                    true,
+                    [
+                        s(&["staged-synced", "installed:0"]),
+                        swap(1),
+                        s(&["dirs-synced", "backup-removed:1"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "set, replace, rolled back",
+                    Set,
+                    Replace,
+                    vec![true, true],
+                    vec![F::AfterInstalled(1)],
+                    false,
+                    [
+                        s(&["staged-synced"]),
+                        swap(0),
+                        swap(1),
+                        s(&[
+                            "restored:1",
+                            "backup-removed:1",
+                            "restored:0",
+                            "backup-removed:0",
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "set, refuse, rolled back",
+                    Set,
+                    Refuse,
+                    vec![false, false],
+                    vec![F::AfterInstalled(1)],
+                    false,
+                    s(&[
+                        "staged-synced",
+                        "installed:0",
+                        "installed:1",
+                        "uninstalled:1",
+                        "uninstalled:0",
+                    ]),
+                ),
+                (
+                    "dir, refuse",
+                    Dir,
+                    Refuse,
+                    vec![false],
+                    vec![],
+                    true,
+                    s(&[
+                        "staged-synced",
+                        "installed:0",
+                        "dirs-synced",
+                        "staging-removed:0",
+                    ]),
+                ),
+                (
+                    "dir, replace",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![],
+                    true,
+                    [
+                        s(&["staged-synced"]),
+                        swap(0),
+                        s(&["dirs-synced", "backup-removed:0", "staging-removed:0"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "dir, replace, unsynced",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::DirSync],
+                    false,
+                    [
+                        s(&["staged-synced"]),
+                        swap(0),
+                        s(&["dirs-synced", "staging-removed:0"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "dir, replace, failure after the backup",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::AfterBackup],
+                    false,
+                    s(&[
+                        "staged-synced",
+                        "backup-reserved:0",
+                        "moved-aside:0",
+                        "restored:0",
+                        "backup-removed:0",
+                    ]),
+                ),
+                (
+                    "dir, replace, move aside fails",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::MoveAside],
+                    false,
+                    s(&["staged-synced", "backup-reserved:0", "backup-removed:0"]),
+                ),
+                (
+                    "set, replace, second move aside fails",
+                    Set,
+                    Replace,
+                    vec![false, true],
+                    vec![F::MoveAside],
+                    false,
+                    s(&[
+                        "staged-synced",
+                        "installed:0",
+                        "backup-reserved:1",
+                        "backup-removed:1",
+                        "uninstalled:0",
+                    ]),
+                ),
+                (
+                    "dir, replace, install refused",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::CrossMount(0)],
+                    false,
+                    [
+                        s(&["staged-synced"]),
+                        backed_up(0).to_vec(),
+                        s(&["restored:0", "backup-removed:0"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "dir, replace, rolled back",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::AfterInstalled(0)],
+                    false,
+                    [
+                        s(&["staged-synced"]),
+                        swap(0),
+                        s(&["uninstalled:0", "restored:0", "backup-removed:0"]),
+                    ]
+                    .concat(),
+                ),
+                (
+                    "dir, replace, rolled back, restore rename fails",
+                    Dir,
+                    Replace,
+                    vec![true],
+                    vec![F::AfterInstalled(0), F::RestoreRename],
+                    false,
+                    [s(&["staged-synced"]), swap(0), s(&["uninstalled:0"])].concat(),
+                ),
+            ];
+            for (name, form, overwrite, present, faults, succeeds, expected) in cases {
+                let (steps, result) = trace(form, overwrite, &present, &faults);
+                assert_eq!(result.is_ok(), succeeds, "{name}: {result:?}");
+                assert_eq!(steps, expected, "{name}");
+                for step in &steps {
+                    let parsed: PublishStep = step.parse().unwrap();
+                    assert_eq!(&parsed.to_string(), step, "{name}: spelling round trip");
+                }
+            }
+        }
+
+        fn s(steps: &[&str]) -> Vec<String> {
+            steps.iter().map(|step| (*step).to_owned()).collect()
+        }
+
+        /// Every fault has one spelling, which the CLI's test hooks read.
+        #[test]
+        fn publication_faults_parse_from_their_spellings() {
+            assert_eq!(
+                "after-installed:1".parse::<PublishFault>().ok(),
+                Some(PublishFault::AfterInstalled(1))
+            );
+            assert_eq!(
+                "force-link-fallback".parse::<PublishFault>().ok(),
+                Some(PublishFault::ForceLinkFallback)
+            );
+            assert!("after-installed".parse::<PublishFault>().is_err());
+            assert!("restore:1".parse::<PublishFault>().is_err());
         }
     }
 }

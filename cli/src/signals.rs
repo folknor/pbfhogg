@@ -213,6 +213,93 @@ pub(crate) mod test_hooks {
         });
     }
 
+    /// Arm publication's test hooks on the run's token. Publication is not
+    /// cancellable, so the checkpoint pause above can never land inside it;
+    /// these let a test stop a run at every state a publication passes
+    /// through and kill it there:
+    ///
+    /// - `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>[,<fault>...]` arms publication
+    ///   faults, spelled as `pbfhogg::test_hooks::PublishFault` parses them
+    ///   (`force-link-fallback`, `after-installed:1`, ...). A spelling that
+    ///   does not parse ends the run with a message, so a test cannot
+    ///   silently run unarmed.
+    /// - `PBFHOGG_TEST_PUBLISH_STEPS=<file>` appends every publication step
+    ///   to the file as it happens, one per line (`installed:0`), so a run
+    ///   killed partway still leaves its trace. A trace or ready file that
+    ///   cannot be written ends the run, so a short trace never passes for a
+    ///   whole one.
+    /// - `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` with
+    ///   `PBFHOGG_TEST_PUBLISH_READY=<file>` parks the publishing thread
+    ///   after that step: it writes the ready file and never returns, so
+    ///   only a kill ends the run.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only hook files, outside every output and scratch API"
+    )]
+    pub(crate) fn arm_publication(cancel: &Invocation) {
+        // A trace or ready file that cannot be written ends the run: a test
+        // reading a short trace would silently skip kill points, and one
+        // waiting for a ready file would report an unreachable step.
+        fn fail(what: &str, path: &std::path::Path, e: &std::io::Error) -> ! {
+            crate::host::cli_note(
+                "cli.test_hooks",
+                format_args!("cannot write the {what} {}: {e}", path.display()),
+            );
+            std::process::exit(101);
+        }
+        use pbfhogg::test_hooks::{PublishFault, PublishStep};
+        use std::io::Write;
+        let faults = cancel.faults();
+        if let Some(spec) = std::env::var_os("PBFHOGG_TEST_PUBLISH_FAULTS") {
+            for name in spec.to_string_lossy().split(',').filter(|n| !n.is_empty()) {
+                match name.parse::<PublishFault>() {
+                    Ok(fault) => faults.arm_publish_fault(fault),
+                    Err(e) => {
+                        crate::host::cli_note("cli.test_hooks", format_args!("{e}"));
+                        std::process::exit(101);
+                    }
+                }
+            }
+        }
+        let steps = std::env::var_os("PBFHOGG_TEST_PUBLISH_STEPS").map(std::path::PathBuf::from);
+        let pause = match std::env::var_os("PBFHOGG_TEST_PUBLISH_PAUSE") {
+            Some(spec) => match spec.to_string_lossy().parse::<PublishStep>() {
+                Ok(step) => Some(step),
+                Err(e) => {
+                    crate::host::cli_note("cli.test_hooks", format_args!("{e}"));
+                    std::process::exit(101);
+                }
+            },
+            None => None,
+        };
+        let ready = std::env::var_os("PBFHOGG_TEST_PUBLISH_READY").map(std::path::PathBuf::from);
+        if steps.is_none() && pause.is_none() {
+            return;
+        }
+        faults.on_publish_step(move |step| {
+            if let Some(path) = &steps {
+                let appended = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| writeln!(file, "{step}"));
+                if let Err(e) = appended {
+                    fail("publication step trace", path, &e);
+                }
+            }
+            if pause == Some(step) {
+                if let Some(ready) = &ready
+                    && let Err(e) = std::fs::write(ready, step.to_string())
+                {
+                    fail("publication pause ready file", ready, &e);
+                }
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        });
+    }
+
     /// Arm the library's input replacement fault on the run's token, so a
     /// test can rename a file over a pinned input between two opens of a CLI
     /// run that composes several library calls (see

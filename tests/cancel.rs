@@ -439,9 +439,11 @@ fn a_cancelled_output_writer_cannot_be_published() {
 fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
-    let mut output = crate::common::out(&dest);
-    output.inject_fault(pbfhogg::output::PublishFault::DirSync);
+    let output = crate::common::out(&dest);
     let cancel = pbfhogg::host::Invocation::new();
+    cancel
+        .faults()
+        .arm_publish_fault(pbfhogg::output::PublishFault::DirSync);
     let mut writer = output.writer(&cancel).unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();

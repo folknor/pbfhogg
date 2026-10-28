@@ -1421,6 +1421,14 @@
 
 ### Fixed
 
+- **A geocode index whose rollback stops halfway is reported as missing,
+  not as still in place.** When replacing an index failed after the new
+  index was installed, the rollback moves the new index out before putting
+  the old one back. If only that second rename failed, the error said the
+  new index "could not be rolled back", although the output directory was
+  then empty. It now says the previous index could not be restored and
+  names the `.pbfhogg-backup-*` directory that holds it.
+
 - **`degrade --corrupt-indexdata` and `--corrupt-indexdata-kind` refuse a
   blob they cannot corrupt.** A blob with no indexdata, or indexdata that
   does not parse, used to be written back unchanged, so the run exited 0

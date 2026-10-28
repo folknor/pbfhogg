@@ -30,10 +30,15 @@
 //!
 //! # Hooks owned elsewhere
 //!
+//! Output publication's hooks are token-scoped like the rest: a
+//! [`PublishFault`] is armed with [`FaultPlan::arm_publish_fault`], and
+//! [`FaultPlan::on_publish_step`] observes every [`PublishStep`] (both types
+//! live with the output code and are re-exported here). A front end builds
+//! its outputs in several places, and the token is the one thing they all
+//! publish under.
+//!
 //! These are per-object rather than per-token, and stay with their owner:
 //!
-//! - [`PublishFault`], re-exported here: faults in output publication, set on
-//!   the output (`Output::inject_fault` and its set and directory siblings).
 //! - `Invocation::on_check` / `Invocation::checks_passed`: the cancellation
 //!   checkpoint callback (cancellation semantics, not a fault).
 //! - The geocode index reader's lookup counter, on the reader.
@@ -41,11 +46,11 @@
 //! Disarmed is a sentinel (`MAX` for an index or a count), never zero, since
 //! zero is a real worker, shard or sequence number.
 
-pub use crate::output::PublishFault;
+pub use crate::output::{PublishFault, PublishStep};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Upper bound on every bounded hook wait, so a broken pipeline fails the
@@ -286,7 +291,18 @@ pub struct FaultPlan {
     /// refuse a replaced file. Read once, when the pin is taken.
     pub force_pin_path_reopen: AtomicBool,
     input_replacement: Mutex<Option<InputReplacement>>,
+
+    // --- output publication (`output::publish_all`) ---
+    /// Faults every publication under this token injects, read once as each
+    /// publication starts; see [`arm_publish_fault`](Self::arm_publish_fault).
+    publish_faults: Mutex<Vec<PublishFault>>,
+    /// Hears every [`PublishStep`]; see [`on_publish_step`](Self::on_publish_step).
+    publish_observer: OnceLock<PublishObserver>,
 }
+
+/// A publication observer; it may block (a test parks the publishing thread
+/// in it until the process is killed).
+type PublishObserver = Box<dyn Fn(PublishStep) + Send + Sync>;
 
 /// An armed input replacement and what it observed; see
 /// [`FaultPlan::arm_input_replacement`].
@@ -402,6 +418,42 @@ impl FaultPlan {
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             force_pin_path_reopen: AtomicBool::new(false),
             input_replacement: Mutex::new(None),
+            publish_faults: Mutex::new(Vec::new()),
+            publish_observer: OnceLock::new(),
+        }
+    }
+
+    // ---- output publication -------------------------------------------
+
+    /// Make every publication under this token inject `fault`. Arm before
+    /// publishing: each publication reads the armed set once, as it starts.
+    pub fn arm_publish_fault(&self, fault: PublishFault) {
+        self.publish_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(fault);
+    }
+
+    /// The armed publication faults, for a publication starting now.
+    pub(crate) fn publish_faults(&self) -> Vec<PublishFault> {
+        self.publish_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Run `observer` on the publishing thread after every namespace step
+    /// of every publication under this token, with no lock held. It may
+    /// block: publication is not cancellable, so a test that parks it there
+    /// ends the process to move on. Set once; a second call is ignored.
+    pub fn on_publish_step(&self, observer: impl Fn(PublishStep) + Send + Sync + 'static) {
+        drop(self.publish_observer.set(Box::new(observer)));
+    }
+
+    /// Called by publication after each step.
+    pub(crate) fn publish_step(&self, step: PublishStep) {
+        if let Some(observer) = self.publish_observer.get() {
+            observer(step);
         }
     }
 

@@ -396,8 +396,13 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   no file at the output path and leaves an existing output untouched. So does
   a run interrupted by SIGINT or SIGTERM (see [Interruption](#interruption)). A
   run killed outright (SIGKILL, the OOM killer, power loss, a second
-  interrupt) before publication can leave the hidden staging file behind,
-  never a file under the output name. The
+  interrupt) can leave the hidden staging file behind, never a partial file
+  under the output name. Killed during publication, it can also leave
+  `.pbfhogg-backup-*` entries beside the outputs (see
+  [Names pbfhogg leaves behind](#names-pbfhogg-leaves-behind)), and an output
+  that was being replaced through a backup (a geocode index, an
+  `extract --config` output) may be missing, its previous version in the
+  backup. The
   rename itself is the last step, and the few failures possible after it are
   reported as such: a directory sync that fails after the output was put in
   place is an error that says the output *was* published (naming any backup
@@ -524,7 +529,8 @@ hold no outputs or other data it means to keep (pbfhogg refuses a `--staging-dir
 contains an output's directory; `--tmp-dir` is not checked that way). Publication may also leave
 backup entries (`.pbfhogg-backup-*`) beside the outputs. They are excluded from automatic
 cleanup: one can hold the only copy of a replaced output, though one left by an interrupted
-publication may also be empty. The run's diagnostics name them when they get to, and every later
+publication may also be empty, or hold only part of the previous output when the run was killed
+while removing it after the new one was in place. The run's diagnostics name them when they get to, and every later
 scan of that directory reports them. Published outputs stay at the paths that were asked for,
 including ones a killed group publication left installed: publishing several outputs is not
 all-or-nothing across a process death. Stale staging therefore never reaches the next run's
@@ -1669,7 +1675,8 @@ another producer stays readable.
 
 ### Overwriting an existing index
 
-Every build writes a complete generation in a sibling staging directory and
+Every build writes a complete generation in a staging directory (beside the
+output directory, or in `--staging-dir`) and
 publishes it only after the build and smoke test succeed; `--overwrite` (or
 legacy `--force`) lets that publication replace an existing index. Failed
 builds leave the existing index intact. Publication moves the old directory aside, moves
@@ -1684,8 +1691,8 @@ partway (SIGINT and SIGTERM do not stop one that has started) may leave the old
 index in a `.pbfhogg-backup-*` directory beside the output directory; a
 publication that fails and cannot put the old index back says so and names that
 directory. SIGKILL, power loss or a second SIGINT/SIGTERM during a build can also leave an
-incomplete `.pbfhogg-tmp-*` staging directory beside it because process cleanup
-does not run. The next command that writes in that directory reports both
+incomplete `.pbfhogg-tmp-*` staging directory beside it (in `--staging-dir`,
+when given) because process cleanup does not run. The next command that writes in that directory reports both
 (see Scratch files) but never removes them: a directory may belong to a
 concurrent build, and a backup may hold the only recoverable prior index. After
 confirming no builder is active, inspect abandoned staging directories and

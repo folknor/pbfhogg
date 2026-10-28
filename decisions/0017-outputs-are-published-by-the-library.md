@@ -229,7 +229,18 @@ in its end-of-stream `flush`) observe the token, so a run cancelled mid-write
 fails its session. A process killed outright (SIGKILL, the OOM killer, power
 loss, the CLI's second interrupt) can leave `.pbfhogg-tmp-*` staging behind (in the staging directory, when the caller chose one), and a failed rollback or an unsynced
 publication leaves `.pbfhogg-backup-*` on purpose; neither is ever under the
-name the caller chose. Every recursive removal publication does - a replaced
+name the caller chose. A process killed inside publication can also leave a
+backup beside a destination: empty, holding the previous output whole, or
+holding what a removal had not yet reached; each destination then holds its
+previous output, the new one, or nothing while a backed-up destination is
+between its two renames (the previous output is then in the backup). A group
+is not all-or-nothing across a kill. Publication announces each namespace
+step to a test-hooks observer on the invocation (`PublishStep`), and the CLI
+tests kill a run after every step of each output shape, so the state at every
+step is tested; a kill inside a backup's recursive removal falls between two
+steps and is covered by confinement instead (the removal deletes only inside
+that backup), and durability across power loss is not something a killed
+process can show. Every recursive removal publication does - a replaced
 output's backup after success, an unpublished directory output's staging on
 drop - first walks what it is about to remove; anything pbfhogg never
 deletes found there (or a walk that cannot complete) keeps the whole entry.

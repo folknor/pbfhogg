@@ -2035,6 +2035,516 @@ fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Killed inside publication
+// ---------------------------------------------------------------------------
+//
+// Publication is not cancellable (ADR-0019), so no checkpoint lies inside it
+// and the checkpoint pauses above all land before it. These tests stop a run
+// after each namespace step publication announces (the CLI's
+// `PBFHOGG_TEST_PUBLISH_*` hooks, `cli/src/signals.rs`) and SIGKILL it there.
+// A counting run records the scenario's steps first, under the same faults,
+// so every step the scenario reaches is visited and a new step is visited
+// without editing the test. The expected state at each kill comes from
+// replaying the recorded steps up to it through a per-output model; the
+// library test `every_publication_announces_its_namespace_steps_in_order`
+// pins the traces themselves. One output form per shape stands for all
+// commands: publication is one routine behind every shape, and the
+// per-command `--staging-dir` wiring is the properties above.
+
+#[cfg(feature = "test-hooks")]
+mod in_publication {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Which outputs exist before the run (planted, and replaced with
+    /// `--overwrite`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Seeded {
+        None,
+        All,
+        /// Only the last output, so a group mixes a replaced member with a
+        /// fresh one.
+        Last,
+    }
+
+    pub(super) struct Scenario {
+        /// The row label of the command that stands for the output shape.
+        pub(super) row: &'static str,
+        pub(super) seeded: Seeded,
+        /// `PBFHOGG_TEST_PUBLISH_FAULTS`.
+        pub(super) faults: &'static str,
+        /// The faults make the run fail.
+        pub(super) fails: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Dest {
+        Old,
+        New,
+        Absent,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Backup {
+        None,
+        Empty,
+        Old,
+    }
+
+    /// Every output's expected destination and backup after the steps in
+    /// `trace`, from the outputs that were planted. In these scenarios a
+    /// backup at a step is empty, holds the whole previous output, or is
+    /// gone. A removal only deletes inside its container, so one killed
+    /// mid-removal, between two steps, holds part of the previous output;
+    /// so does one whose removal failed partway, which no scenario here
+    /// injects.
+    fn model(trace: &[String], seeded: &[bool]) -> Result<Vec<(Dest, Backup)>, String> {
+        let mut state: Vec<(Dest, Backup)> = seeded
+            .iter()
+            .map(|&here| (if here { Dest::Old } else { Dest::Absent }, Backup::None))
+            .collect();
+        for step in trace {
+            let (name, member) = match step.split_once(':') {
+                Some((name, k)) => (name, Some(k.parse::<usize>().map_err(|e| e.to_string())?)),
+                None => (step.as_str(), None),
+            };
+            let Some(k) = member else { continue };
+            let entry = state
+                .get_mut(k)
+                .ok_or_else(|| format!("step {step} names no output"))?;
+            match name {
+                "backup-reserved" => entry.1 = Backup::Empty,
+                "moved-aside" => *entry = (Dest::Absent, Backup::Old),
+                "installed" | "linked" => entry.0 = Dest::New,
+                "uninstalled" => entry.0 = Dest::Absent,
+                "restored" => *entry = (Dest::Old, Backup::Empty),
+                "backup-removed" => entry.1 = Backup::None,
+                "backup-synced" | "staging-unlinked" | "staging-removed" => {}
+                _ => return Err(format!("unknown publication step {step}")),
+            }
+        }
+        Ok(state)
+    }
+
+    /// Every entry under a directory, relative, with a file's bytes (`None`
+    /// for a directory).
+    type Snapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+    fn snapshot(dir: &Path) -> Snapshot {
+        fn walk(root: &Path, dir: &Path, out: &mut Snapshot) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() && !path.is_symlink() {
+                    out.push((rel, None));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, Some(std::fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn row(label: &str) -> &'static Row {
+        ROWS.iter().find(|row| row.label == label).unwrap()
+    }
+
+    /// The header file name that makes a directory one the index builder
+    /// agrees to replace (it refuses any other non-empty directory).
+    const INDEX_HEADER: &str = "geocode_header.bin";
+
+    /// Plant a previous output with bytes of its own: a file holding
+    /// [`USER_DATA`], or an index directory whose header file holds it, so
+    /// a backup can be checked byte for byte.
+    fn plant(path: &Path, kind: Kind) {
+        match kind {
+            Kind::File => std::fs::write(path, USER_DATA).unwrap(),
+            Kind::Dir => {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join(INDEX_HEADER), USER_DATA).unwrap();
+            }
+        }
+    }
+
+    /// `path` holds exactly what [`plant`] put there.
+    fn planted(path: &Path, kind: Kind) -> bool {
+        match kind {
+            Kind::File => intact(path, kind),
+            Kind::Dir => {
+                path.is_dir()
+                    && names(path) == [INDEX_HEADER]
+                    && std::fs::read(path.join(INDEX_HEADER)).is_ok_and(|b| b == USER_DATA)
+            }
+        }
+    }
+
+    /// One scenario's directories, planted outputs and command line.
+    struct Setup {
+        out: TempDir,
+        staging: TempDir,
+        tmp: TempDir,
+        inv: Invocation,
+        seeded: Vec<bool>,
+        args: Vec<OsString>,
+    }
+
+    impl Setup {
+        fn new(fx: &Fx, row: &Row, seeded: Seeded) -> Self {
+            let (out, staging, tmp) = (
+                crate::common::test_scratch(),
+                crate::common::test_scratch(),
+                crate::common::test_scratch(),
+            );
+            let inv = (row.build)(
+                &Ctx {
+                    fx,
+                    out: out.path(),
+                },
+                Input::Good,
+            );
+            let last = inv.outputs.len() - 1;
+            let seeded: Vec<bool> = (0..inv.outputs.len())
+                .map(|i| match seeded {
+                    Seeded::None => false,
+                    Seeded::All => true,
+                    Seeded::Last => i == last,
+                })
+                .collect();
+            for (output, &here) in inv.outputs.iter().zip(&seeded) {
+                if here {
+                    plant(output, row.kind);
+                }
+            }
+            let mut args = inv.args.clone();
+            args.extend(["--staging-dir".into(), staging.path().into()]);
+            args.extend(tmp_args(row.tmp_dir.then_some(tmp.path())));
+            if seeded.contains(&true) {
+                args.push("--overwrite".into());
+            }
+            Self {
+                out,
+                staging,
+                tmp,
+                inv,
+                seeded,
+                args,
+            }
+        }
+    }
+
+    /// The steps one run of the scenario announces.
+    fn steps_of(fx: &Fx, scenario: &Scenario) -> Result<Vec<String>, String> {
+        let row = row(scenario.row);
+        let setup = Setup::new(fx, row, scenario.seeded);
+        let control = crate::common::test_scratch();
+        let trace = control.path().join("steps");
+        let out = CliInvoker::new()
+            .args(&setup.args)
+            .env("PBFHOGG_TEST_PUBLISH_FAULTS", scenario.faults)
+            .env("PBFHOGG_TEST_PUBLISH_STEPS", &trace)
+            .run();
+        // 101 is the hooks' own failure (a bad spelling, a trace that could
+        // not be written) or a panic, never the injected failure a failing
+        // scenario wants.
+        ensure!(
+            out.status.code() != Some(101),
+            "the counting run's test hooks failed or it panicked; stderr:\n{}",
+            out.stderr_str()
+        );
+        ensure!(
+            exited_ok(row, &out) != scenario.fails,
+            "the counting run exited {:?}, wanted {}; stderr:\n{}",
+            out.status.code(),
+            if scenario.fails {
+                "a failure"
+            } else {
+                "success"
+            },
+            out.stderr_str()
+        );
+        let steps: Vec<String> = std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        ensure!(!steps.is_empty(), "the counting run announced no step");
+        let mut unique = steps.clone();
+        unique.sort();
+        unique.dedup();
+        ensure!(
+            unique.len() == steps.len(),
+            "a step repeats in {steps:?}, so a pause at it would be ambiguous"
+        );
+        Ok(steps)
+    }
+
+    /// Kill the scenario after step `at` of `steps` and check what it left,
+    /// the caller's cleanup, and the next run.
+    #[allow(clippy::too_many_lines)]
+    fn killed_at(
+        fx: &Fx,
+        scenario: &Scenario,
+        steps: &[String],
+        at: usize,
+        reference: &[Vec<(PathBuf, Vec<u8>)>],
+    ) -> Result<(), String> {
+        let row = row(scenario.row);
+        let setup = Setup::new(fx, row, scenario.seeded);
+        let step = &steps[at];
+        let control = crate::common::test_scratch();
+        let ready = control.path().join("ready");
+        let mut child = CliInvoker::new()
+            .args(&setup.args)
+            .env("PBFHOGG_TEST_PUBLISH_FAULTS", scenario.faults)
+            .env("PBFHOGG_TEST_PUBLISH_PAUSE", step)
+            .env("PBFHOGG_TEST_PUBLISH_READY", &ready)
+            .spawn();
+        let start = Instant::now();
+        while !ready.exists() {
+            ensure!(!child.has_exited(), "{step}: the run ended before the step");
+            ensure!(
+                start.elapsed() < Duration::from_secs(10),
+                "{step}: the step was never reached"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        child.signal(libc::SIGKILL);
+        drop(child.wait());
+
+        // What the kill left: in the output directory only the outputs and
+        // backups, each as the steps so far say.
+        let expected = model(&steps[..=at], &setup.seeded)?;
+        let out_dir = setup.out.path();
+        let mut backups = Vec::new();
+        for found in hidden_anywhere(out_dir) {
+            let name = found.file_name().unwrap().to_string_lossy().into_owned();
+            ensure!(
+                found.parent() == Some(out_dir) && name.starts_with(".pbfhogg-backup-"),
+                "{step}: left {} beside its outputs",
+                found.display()
+            );
+            backups.push(name);
+        }
+        let names_left = names(out_dir);
+        let outputs = output_names(&setup.inv);
+        ensure!(
+            names_left
+                .iter()
+                .all(|n| outputs.contains(n) || backups.contains(n)),
+            "{step}: the output directory holds {names_left:?}"
+        );
+        // A whole new output: a file byte for byte as the reference run
+        // wrote it; an index with the reference's files that also opens,
+        // since two builds need not be byte-identical and the reader's
+        // structural validation is what catches a short or empty file.
+        let complete = |i: usize, output: &Path| {
+            std::fs::symlink_metadata(output).is_ok()
+                && contents(output, row.kind) == reference[i]
+                && (row.kind == Kind::File
+                    || pbfhogg::geocode_index::reader::Reader::open(output).is_ok())
+        };
+        let mut accounted = 0;
+        for (i, ((output, &(dest, backup)), seeded)) in setup
+            .inv
+            .outputs
+            .iter()
+            .zip(&expected)
+            .zip(&setup.seeded)
+            .enumerate()
+        {
+            let shown = output.display();
+            let state_ok = match dest {
+                Dest::Old => planted(output, row.kind),
+                Dest::New => complete(i, output),
+                Dest::Absent => std::fs::symlink_metadata(output).is_err(),
+            };
+            ensure!(
+                state_ok,
+                "{step}: {shown} is not {dest:?} (planted: {seeded})"
+            );
+            let name = output.file_name().unwrap().to_string_lossy().into_owned();
+            let suffix = format!(".{name}");
+            let mine: Vec<&String> = backups.iter().filter(|b| b.ends_with(&suffix)).collect();
+            match backup {
+                Backup::None => ensure!(mine.is_empty(), "{step}: {shown} has backups {mine:?}"),
+                Backup::Empty | Backup::Old => {
+                    ensure!(
+                        mine.len() == 1,
+                        "{step}: {shown} has backups {mine:?}, wanted one"
+                    );
+                    accounted += 1;
+                    let container = out_dir.join(mine[0]);
+                    let inside = names(&container);
+                    if backup == Backup::Empty {
+                        ensure!(
+                            inside.is_empty(),
+                            "{step}: {shown}'s backup holds {inside:?}, wanted nothing"
+                        );
+                    } else {
+                        ensure!(
+                            inside == [name.clone()] && planted(&container.join(&name), row.kind),
+                            "{step}: {shown}'s backup does not hold the whole previous output: \
+                             {inside:?}"
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            accounted == backups.len(),
+            "{step}: backups {backups:?}, expected {accounted}"
+        );
+        // Disposable entries only where the caller put them.
+        let staged = names(setup.staging.path());
+        ensure!(
+            staged.iter().all(|n| n.starts_with(".pbfhogg-tmp-")),
+            "{step}: --staging-dir holds {staged:?}"
+        );
+        let scratch = names(setup.tmp.path());
+        ensure!(
+            scratch.iter().all(|n| n.starts_with(".pbfhogg-run-")),
+            "{step}: --tmp-dir holds {scratch:?}"
+        );
+
+        // The caller's cleanup: both directories go whole and nothing in
+        // the output directory changes (a link-installed output's staging
+        // name is a second link, so removing it loses nothing).
+        let before = snapshot(out_dir);
+        let kept: Vec<(String, Snapshot)> = backups
+            .iter()
+            .map(|b| (b.clone(), snapshot(&out_dir.join(b))))
+            .collect();
+        for dir in [setup.staging.path(), setup.tmp.path()] {
+            std::fs::remove_dir_all(dir).unwrap();
+            std::fs::create_dir(dir).unwrap();
+        }
+        ensure!(
+            snapshot(out_dir) == before,
+            "{step}: removing --staging-dir and --tmp-dir changed the output directory"
+        );
+
+        // The next run replaces the outputs and leaves every backup as the
+        // kill left it: a backup is never a run's to remove.
+        let mut again = setup.inv.args.clone();
+        again.extend(["--staging-dir".into(), setup.staging.path().into()]);
+        again.extend(tmp_args(row.tmp_dir.then_some(setup.tmp.path())));
+        again.push("--overwrite".into());
+        let next = CliInvoker::new().args(&again).run();
+        ensure!(
+            exited_ok(row, &next),
+            "{step}: the next run failed: {}",
+            next.stderr_str()
+        );
+        for (i, output) in setup.inv.outputs.iter().enumerate() {
+            ensure!(
+                complete(i, output),
+                "{step}: the next run did not write the whole {}",
+                output.display()
+            );
+        }
+        for (name, contents) in &kept {
+            ensure!(
+                snapshot(&out_dir.join(name)) == *contents,
+                "{step}: the next run changed the backup {name}"
+            );
+        }
+        let mut wanted = outputs.clone();
+        wanted.extend(backups.iter().cloned());
+        wanted.sort();
+        ensure!(
+            names(out_dir) == wanted,
+            "{step}: after the next run the output directory holds {:?}, wanted {wanted:?}",
+            names(out_dir)
+        );
+        ensure!(
+            names(setup.staging.path()).is_empty(),
+            "{step}: the next run left {:?} in --staging-dir",
+            names(setup.staging.path())
+        );
+        Ok(())
+    }
+
+    /// Every step of one scenario, each killed in a run of its own.
+    pub(super) fn killed_at_every_step(scenario: &Scenario) {
+        let fx = Fx::new();
+        let label = format!("[{} {}]", scenario.row, scenario.faults);
+        let steps = steps_of(&fx, scenario).unwrap_or_else(|why| panic!("{label} {why}"));
+        // What a whole new output holds (see `contents`), from a run nobody
+        // interferes with.
+        let row = row(scenario.row);
+        let clean = Setup::new(&fx, row, Seeded::None);
+        let out = CliInvoker::new().args(&clean.args).run();
+        assert!(
+            exited_ok(row, &out),
+            "{label} the reference run failed: {}",
+            out.stderr_str()
+        );
+        let reference: Vec<Vec<(PathBuf, Vec<u8>)>> = clean
+            .inv
+            .outputs
+            .iter()
+            .map(|output| contents(output, row.kind))
+            .collect();
+        let failures: Vec<String> = (0..steps.len())
+            .filter_map(|at| killed_at(&fx, scenario, &steps, at, &reference).err())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{label} steps {steps:?}:\n{}",
+            failures.join("\n")
+        );
+    }
+}
+
+/// One test per scenario: `name`, the row standing for the output shape,
+/// which outputs are planted, the faults, and whether they fail the run.
+#[cfg(feature = "test-hooks")]
+macro_rules! killed_in_publication {
+    ($($name:ident: $row:expr, $seeded:ident, $faults:expr, $fails:expr;)*) => {$(
+        #[test]
+        fn $name() {
+            in_publication::killed_at_every_step(&in_publication::Scenario {
+                row: $row,
+                seeded: in_publication::Seeded::$seeded,
+                faults: $faults,
+                fails: $fails,
+            });
+        }
+    )*};
+}
+
+#[cfg(feature = "test-hooks")]
+mod killed_in_publication {
+    use super::in_publication;
+
+    killed_in_publication! {
+        a_file_published_exclusively: "cat", None, "", false;
+        a_file_published_by_link: "cat", None, "force-link-fallback", false;
+        a_file_rolled_back_while_linked: "cat", None, "force-link-fallback,after-link", true;
+        a_replaced_file: "cat", All, "", false;
+        a_group_published_exclusively: "extract --config", None, "", false;
+        a_replaced_group: "extract --config", All, "", false;
+        a_group_replacing_one_member: "extract --config", Last, "", false;
+        a_replaced_group_rolled_back: "extract --config", All, "after-installed:1", true;
+        a_replaced_group_whose_rollback_fails: "extract --config", All, "after-installed:1,restore", true;
+        a_directory_published_exclusively: "build-geocode-index", None, "", false;
+        a_directory_rolled_back_out_of_place: "build-geocode-index", None, "after-installed:0", true;
+        a_replaced_directory: "build-geocode-index", All, "", false;
+        a_replaced_directory_that_cannot_be_moved_aside: "build-geocode-index", All, "move-aside", true;
+        a_replaced_directory_failing_after_its_backup: "build-geocode-index", All, "after-backup", true;
+        a_replaced_directory_whose_install_is_refused: "build-geocode-index", All, "cross-mount:0", true;
+        a_replaced_directory_rolled_back: "build-geocode-index", All, "after-installed:0", true;
+        a_replaced_directory_taken_out_but_not_restored: "build-geocode-index", All, "after-installed:0,restore-rename", true;
+        a_replaced_directory_left_unsynced: "build-geocode-index", All, "dir-sync", true;
+        a_replaced_directory_whose_backup_is_not_removed: "build-geocode-index", All, "backup-removal", false;
+    }
+}
+
 /// `--staging-dir` is checked before any work, and its refusals exit as
 /// usage or output errors that name the flag in their advice.
 #[test]

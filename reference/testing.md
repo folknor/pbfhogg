@@ -328,10 +328,12 @@ exception, not a tier - should not survive across many PRs.
   `ElementReader::cancel`; a public path constructor mints its own,
   reached through `PbfWriter::test_faults`. Per-token isolation does not
   stop an armed run's own parked workers: a test that parks them still
-  releases and joins on every exit path. Per-object hooks stay with
-  their owner and are listed in the module docs: `PublishFault` on an
-  output, the geocode reader's counter, and the cancellation hooks
-  below.
+  releases and joins on every exit path. Output publication's hooks are
+  on the plan too: `FaultPlan::arm_publish_fault` arms a `PublishFault`
+  and `FaultPlan::on_publish_step` observes every `PublishStep` (see
+  Publication hooks below). Per-object hooks stay with their owner and
+  are listed in the module docs: the geocode reader's counter, and the
+  cancellation hooks below.
 - **Cancellation hooks.** `Invocation::on_check` (per-instance, `test-hooks`)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from
@@ -349,6 +351,29 @@ exception, not a tier - should not survive across many PRs.
   positions, not sites, and the fixture's counts are not real data's, so
   neither sweep proves every checkpoint site of a planet run unwinds. `CliInvoker::spawn` returns a `RunningCli`
   that can be signalled and is killed on drop.
+- **Publication hooks.** Publication is not cancellable, so no checkpoint
+  lies inside it and the pauses above never land there. Instead it
+  announces each namespace step that succeeded (`PublishStep`: a backup
+  reserved, the previous output moved aside, a member installed or
+  linked, a rollback step, a backup removed, the directory syncs done) to
+  the token's publication observer, from the publishing thread with no
+  lock held. The CLI, built with `test-hooks`, reads
+  `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>,...` (faults spelled as
+  `PublishFault` parses them; a bad spelling exits 101, as does a trace
+  or ready file that cannot be written),
+  `PBFHOGG_TEST_PUBLISH_STEPS=<file>` (appends each step as it happens)
+  and `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` with
+  `PBFHOGG_TEST_PUBLISH_READY=<file>` (writes the ready file after that
+  step and never returns, so only a kill ends the run). The
+  `killed_in_publication` tests in `cli/tests/cli_output_contract.rs`
+  record each scenario's steps with a counting run under the same faults,
+  SIGKILL a run after every one, check the leftovers against the recorded
+  steps replayed through a per-output model, remove `--staging-dir` and
+  `--tmp-dir` whole, and run again; the library test
+  `every_publication_announces_its_namespace_steps_in_order` pins the
+  traces. A kill inside a backup's recursive removal is between two steps
+  and is covered by confinement (it only deletes inside the backup), not
+  sampled.
 - **CliInvoker for CLI-driven tests.** `cli/tests/invoker.rs`. Every
   new `cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via

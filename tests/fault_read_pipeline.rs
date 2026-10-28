@@ -1,6 +1,6 @@
 //! Fault injection into the pipelined reader's decode admission, through
 //! the decode gate in the reader's token's fault plan (`pbfhogg::test_hooks`).
-//! The reader is handed that token explicitly (`ElementReader::cancel`); a
+//! The reader is handed that token explicitly (`ElementReader::invocation`); a
 //! reader built without one would mint its own and never see the gate.
 
 #![allow(clippy::unwrap_used)]

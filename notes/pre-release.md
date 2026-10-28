@@ -46,8 +46,35 @@ ships for this. The likely shape is a small harness
 binary depending on pbfhogg as a library, running a scripted sequence of calls
 in one process (sequential and concurrent), with a brokkr subcommand that runs
 it, records walls and stalls per call, and compares its outputs with the CLI's.
-Nothing about it is designed; brokkr's source has not been readable from the
-sandboxes this work ran in, so the brokkr half needs a host where it is.
+pbfhogg's position is posted on brokkr#46 (2026-10-28): the harness is a
+pbfhogg workspace member, pbfhogg owns the scenario format and exposes a
+describe mode, digest is the equality check. pbfhogg-side work that has to
+land before or with the harness:
+
+- **`Executor` overpromises.** `docs/guide/advanced.md` and the
+  `no-ambient-rayon` textlint message say the library's parallel work runs on
+  the caller's `host::Executor`. It does not: the pipelined reader builds a
+  private rayon decode pool per read (`src/read/pipeline.rs`), and
+  `ordered_pool.rs` and `scan/classify.rs` run `std::thread::scope` workers.
+  Only writer framing and a few commands go through `Executor`. Decide what
+  `Executor` means (rayon work only, or every CPU worker) and make the code
+  and docs agree; until then a "caller-built executor" scenario proves
+  nothing.
+- **Tagged `MarkerFifo` handle.** A harness running several calls into one
+  FIFO needs per-call sinks sharing one fd and one process-start clock,
+  writing brokkr's call tag inside the 512-byte `tunables::PIPE_BUF` line
+  cap. The clock code is private to `src/debug.rs`; offer the handle there
+  (tag escaping, whole-line size check including the tag).
+- **Harness member wiring.** Add it to the `all`, `consumer` and `musl`
+  sweeps with feature forwarding (keep `minimal` library-only), give it
+  workspace lints, and widen the textlint rules that name the CLI as the
+  only caller of `emit_writer_counters` / `emit_read_counters` to admit a
+  second frontend; the library-only prohibitions (env reads, setrlimit) must
+  not apply to it.
+- **Content blind spots.** `digest`/`diff` content excludes metadata,
+  `visible`, header fields and `LocationsOnWays` coordinates
+  (`src/content.rs`), so altw and cat scenarios need checks of their own
+  beyond digest equality.
 
 ### cat's descriptor admission for library callers
 

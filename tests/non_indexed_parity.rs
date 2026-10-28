@@ -840,7 +840,7 @@ fn diff_non_indexed_parity() {
     }
     for line in [
         "*n2 v1 -> v2",
-        "  +amenity=restaurant",
+        "  +\"amenity\"=\"restaurant\"",
         "-n3 v1",
         "+n100 v1",
     ] {

@@ -691,15 +691,15 @@ fn verbose_shows_tag_details() {
     );
     assert_eq!(stats.modified, 1);
     assert!(
-        text.contains("~name: old -> new"),
+        text.contains("~\"name\": \"old\" -> \"new\""),
         "verbose tag change; text:\n{text}"
     );
     assert!(
-        text.contains("-amenity=cafe"),
+        text.contains("-\"amenity\"=\"cafe\""),
         "verbose tag remove; text:\n{text}"
     );
     assert!(
-        text.contains("+highway=primary"),
+        text.contains("+\"highway\"=\"primary\""),
         "verbose tag add; text:\n{text}"
     );
 }
@@ -883,6 +883,96 @@ fn verbose_positions_way_refs_and_members() {
         detail("*r101"),
         vec!["  -member @0 node/1 \"\"", "  +member @2 node/1 \"\""]
     );
+}
+
+/// Keys, values and roles print as escaped double-quoted literals, so a
+/// newline, quote, `=` or ` -> ` inside one cannot split a detail record or
+/// forge another line. Covers keyed tags, a duplicate-key tag script and
+/// member roles.
+#[test]
+fn verbose_escapes_keys_values_and_roles() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let node = |id, tags| TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags,
+        meta: None,
+    };
+    let rel = |role| TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(1),
+            role,
+        }],
+        tags: vec![],
+        meta: None,
+    };
+
+    write_test_pbf_sorted(
+        &old,
+        &[
+            node(1, vec![("a=b", "x -> y"), ("gone", "1\n*n9 v1")]),
+            node(2, vec![("k", "1"), ("k", "2")]),
+        ],
+        &[],
+        &[rel("in\nner")],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[
+            node(1, vec![("a=b", "q\"\\\u{202e}"), ("new\n  -x", "v")]),
+            node(2, vec![("k", "1"), ("k", "3\r")]),
+        ],
+        &[],
+        &[rel("a\"b")],
+    );
+
+    let (text, stats) = run_diff(
+        &old,
+        &new,
+        DiffOpts {
+            suppress_common: true,
+            verbose: true,
+            ..DiffOpts::default()
+        },
+    );
+    assert_eq!(stats.modified, 3, "text:\n{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let detail = |head: &str| -> Vec<&str> {
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(head))
+            .unwrap_or_else(|| panic!("{head} missing; text:\n{text}"));
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("  "))
+            .copied()
+            .collect()
+    };
+    assert_eq!(
+        detail("*n1"),
+        vec![
+            "  -\"gone\"=\"1\\n*n9 v1\"",
+            "  +\"new\\n  -x\"=\"v\"",
+            "  ~\"a=b\": \"x -> y\" -> \"q\\\"\\\\\\u202e\"",
+        ]
+    );
+    assert_eq!(
+        detail("*n2"),
+        vec!["  -tag @1 \"k\"=\"2\"", "  +tag @1 \"k\"=\"3\\r\""]
+    );
+    assert_eq!(
+        detail("*r100"),
+        vec![
+            "  -member @0 way/1 \"in\\nner\"",
+            "  +member @0 way/1 \"a\\\"b\"",
+        ]
+    );
+    // Three heads plus seven detail lines, nothing else.
+    assert_eq!(lines.len(), 10, "text:\n{text}");
 }
 
 #[test]
@@ -1745,7 +1835,7 @@ fn diff_verbose_emits_payload_deltas_not_metadata_deltas() {
     );
     assert!(text.contains("*n1 v1 -> v2"), "v-bump line; text:\n{text}");
     assert!(
-        text.contains("+name=added"),
+        text.contains("+\"name\"=\"added\""),
         "tag-add detail; text:\n{text}"
     );
     for line in text.lines() {

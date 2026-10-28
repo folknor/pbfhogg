@@ -10,13 +10,23 @@
   `+ref @i n<id>` lines. Member lines gain the same zero-based position
   (`-member @i type/id "role"`), so a member moved to different places no
   longer prints identical detail, and a duplicate-key tag script prints
-  `-tag @i k=v` / `+tag @i k=v`. Removal positions index the old list,
+  `-tag @i "k"="v"` / `+tag @i "k"="v"`. Removal positions index the old list,
   insertion positions the new one. A script of more than 1000 edits, or one
   too costly to compute, prints a single
   `refs: N -> M, old @a..b -> new @c..d replaced (details omitted)` line
   (`members:` / `tags:` likewise) instead of thousands of lines. Scripts
   that parse `-v` detail need updating; what counts as modified is
   unchanged.
+
+- **`diff -v` quotes and escapes tag keys, values and roles.** Tag lines
+  read `-"k"="v"`, `+"k"="v"` and `~"k": "old" -> "new"`, and roles keep
+  their quotes. Every key, value and role is a complete JSON-compatible
+  string literal: quotes, backslashes, control characters, U+2028/U+2029
+  and the bidi controls are escaped. A newline in a value used to split
+  one detail record across lines, which could read as a further detail
+  line or a new element, and a key containing `=` or a value containing
+  ` -> ` made the line ambiguous; each record is now one line and every
+  separator outside a literal.
 
 - **`check` library calls return `check::CheckOutcome`.** `check_refs`,
   `verify_ids` and `check_locations` return `Complete(report)` or, when a
@@ -32,11 +42,6 @@
   `--locations-on-ways`, distinct nodes referenced by the ways the change
   creates or modifies. The messages say so; apply-changes' used to call its
   distinct-node count "way node references".
-- **`pbfhogg::host::Cancel` is renamed `Invocation`, and `Host::cancel` is
-  `Host::invocation`.** The token is the one invocation a run belongs to:
-  its cancellation request and, from this release, its instrumentation.
-  `cancel()`, `is_cancelled()` and `check()` are unchanged. A struct literal
-  writes `invocation: Invocation::new()`.
 - **Engine counters belong to the invocation, not the process.** The
   read pipeline's, the worker pools', the writers' and the `fadvise`
   counters used to be process-global totals that every library call in a
@@ -45,8 +50,9 @@
   names as the sidecar stream). The CLI's totals are unchanged.
   `pbfhogg::write::emit_writer_counters` and `pbfhogg::read::emit_read_counters`
   take the invocation, `report_writer_degradations` takes the `Host`. Readers
-  and writers bind the invocation at construction: the `cancel(token)`
-  setters on `BlobReader` and `ElementReader` are `invocation(token)`, and
+  and writers bind the invocation at construction: a reader built by hand
+  takes one through `BlobReader::invocation` or `ElementReader::invocation`,
+  and
   `BlobReader::open_with`, `ElementReader::open_with`, `FileReader::open_in`,
   `FileReader::buffered_in`, `PbfWriter::to_path_with` and
   `PbfWriter::new_in` open under a caller's host or token; the tokenless
@@ -63,7 +69,7 @@
   counter sample a run emits goes to its `Invocation`'s
   `debug::InstrumentSink` (`Invocation::with_sink`), so concurrent library
   calls no longer interleave on one process-wide stream. The library holds
-  no FIFO state: `debug::initialize_marker_fifo` and the free
+  no FIFO state and never reads `BROKKR_MARKER_FIFO`: the free
   `emit_marker` / `emit_counter` / `emit_mallinfo2` / `read_page_faults`
   functions are gone; `debug::MarkerFifo::open` is the sidecar sink, with
   the same wire format and clock. A sink that panics is switched off for
@@ -78,14 +84,12 @@
   publishing at once under one token no longer interleave their
   `PUBLISH_START` .. `PUBLISH_END` spans and `publish_sync_*` samples on the
   invocation's stream; the second waits for the first's syncs.
-- **Once-only diagnostics are once per invocation, not per `Diagnostics`.**
-  The warnings and notes a run reports only once (missing or unrecognised
-  indexdata, writer degradations) used to be keyed on the `Diagnostics`
-  handle, so two runs given clones of one `Diagnostics`, under separate
-  invocations, silently suppressed each other's. They are now keyed on the
-  `Invocation`: each invocation reports its own, and calls grouped under one
-  `Invocation` report each once between them. `Diagnostics` is only a sink
-  handle; `host::OnceKeys` and `Diagnostics::with_once` are gone.
+- **Once-only diagnostics are once per invocation.** The warnings and
+  notes a run reports only once (missing or unrecognised indexdata, writer
+  degradations) are keyed on the `Invocation`: each invocation reports its
+  own, and calls grouped under one `Invocation` report each once between
+  them. `Diagnostics` is only a sink handle, so runs sharing one sink do
+  not share suppression.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming
@@ -357,14 +361,15 @@
   after the run completed no longer changes its result. Scripts that
   matched the shell's own `130` keep working.
 
-- **`Host` gains a `cancel: pbfhogg::host::Cancel` field**, and
-  `Output::publish`, `OutputDir::publish` and `OutputSet::publish` take
-  `&Cancel`, as does `Output::writer`. A struct literal adds
-  `cancel: Cancel::new()`; callers that never cancel pass `&host.cancel`.
-  `Cancel::cancel` from any thread makes a running command stop at its next
-  checkpoint, remove its staging and scratch, publish nothing and return
+- **A run can be cancelled.** `Host` carries an
+  `invocation: pbfhogg::host::Invocation` (a struct literal writes
+  `invocation: Invocation::new()`), and `Output::publish`,
+  `OutputDir::publish` and `OutputSet::publish` take `&Invocation`, as does
+  `Output::writer`; callers that never cancel pass `&host.invocation`.
+  `Invocation::cancel` from any thread makes a running command stop at its
+  next checkpoint, remove its staging and scratch, publish nothing and return
   `ErrorKind::Cancelled` (`Error::is_cancelled` looks through context and
-  `io::Error` carriers); `Cancel::check` gives a caller's own code between
+  `io::Error` carriers); `Invocation::check` gives a caller's own code between
   library calls the same error. The library never installs a signal
   handler; the caller decides what trips the token. A publication that has
   started is never interrupted.
@@ -596,9 +601,10 @@
   default. The library no longer calls `mallopt`, raises `RLIMIT_NOFILE` or
   reads `BROKKR_MARKER_FIFO` unless the caller asks: `ProcessActions` hooks
   fire at the same program points the CLI used to mutate the process, and
-  sidecar markers are inert until the caller opens a FIFO with
-  `debug::initialize_marker_fifo(path)`; the library never reads
-  `BROKKR_MARKER_FIFO` itself.
+  markers and counter samples go to the sink the caller gives the run's
+  invocation with `Invocation::with_sink` (inert without one);
+  `debug::MarkerFifo::open(path)` is the sink that writes the sidecar FIFO.
+  The library never reads `BROKKR_MARKER_FIFO` itself.
   `debug::cap_malloc_arenas`, `debug::set_mmap_threshold` and
   `debug::malloc_trim` moved to `process::`. Thread counts and the altw
   `auto` memory budget come from `host::Resources` (`MachineProbe` or
@@ -611,7 +617,7 @@
   `write_summary` and `write_osmium_summary` into an `io::Write`.
   `has_indexdata`, `has_tagdata` and `osc::parse::load_all_diffs` take
   `&Diagnostics`. The unrecognised-indexdata warning is once per
-  `Diagnostics` handle (shareable through `OnceKeys`), not once per process.
+  invocation, not once per process.
   `BlobReader` and `ElementReader` gain a `.diagnostics(d)` builder.
   CLI benchmark readers attach the same handle, retaining malformed-indexdata
   warnings in modes that parse indexdata.
@@ -1058,13 +1064,6 @@
   and `cat --dedupe` summaries count physical blobs and report how many
   empty blocks were omitted.
 
-- **`pbfhogg::debug::emit_counter` takes `impl CounterValue`.** The value
-  parameter was `i64`; it is now any sealed `CounterValue` (`i64`, `i32`,
-  `u32`, `u64`, `usize` and `bool`; `u64` and `usize` saturate at
-  `i64::MAX`). Callers passing an `i64`
-  compile unchanged; code that names the function's type, such as a
-  function pointer to it, must be updated.
-
 - Library: errors detected by the blob framing layer now carry the byte
   offset at which they were found, reachable via `Error::byte_offset()`
   and appended to the `Display` output as ` (at byte offset N)`. A
@@ -1262,10 +1261,10 @@
   first byte, without requiring `Seek`. **`Blob::locate_error`** is public,
   so a decode error on a blob can carry the same location.
 
-- **`BlobReader::cancel` and `ElementReader::cancel`** attach a
-  `pbfhogg::host::Cancel` to a reader built by hand; it then stops with
-  `ErrorKind::Cancelled` at the next blob once the token is tripped.
-  Readers the commands open take `host.cancel` already.
+- **`BlobReader::invocation` and `ElementReader::invocation`** attach a
+  `pbfhogg::host::Invocation` to a reader built by hand; it then stops with
+  `ErrorKind::Cancelled` at the next blob once the token is cancelled.
+  Readers the commands open take `host.invocation` already.
 
 - **`--tmp-dir <DIR>` on `add-locations-to-ways`, `diff` and
   `build-geocode-index`** chooses where the run's scratch goes, for when the

@@ -356,7 +356,7 @@ exception, not a tier - should not survive across many PRs.
   call. One token is one fault scenario: everything run under it shares
   its plan (sequence numbers, worker indices, counters), so an armed and
   an unarmed run use two tokens. A reader takes its token through
-  `ElementReader::cancel`; a public path constructor mints its own,
+  `ElementReader::invocation`; a public path constructor mints its own,
   reached through `PbfWriter::test_faults`. Per-token isolation does not
   stop an armed run's own parked workers: a test that parks them still
   releases and joins on every exit path. Output publication's hooks are

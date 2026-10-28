@@ -10,6 +10,18 @@ Picked 2026-07-30, right after the 0.5.0 release.
   questions, in [notes/pre-release.md](pre-release.md) "Release gates",
   together with the measurement campaign that comes before the release.
 
+- [ ] **CHANGELOG Unreleased narrates intermediate states** (found
+  2026-10-28): the block spans everything since v0.5.0, but many entries
+  describe a change against an API that was itself added inside the
+  block (renames of things 0.5.0 never had, "used to" sentences about
+  unreleased behaviour). The Host, Cancel/Invocation, marker FIFO,
+  `OnceKeys` and `emit_counter` cluster was rewritten to net change against
+  v0.5.0 on 2026-10-28; the rest of the block has not been audited. Before
+  the release, check each entry's "before" against `git show v0.5.0:...`
+  and fold or delete entries whose subject 0.5.0 never shipped (for
+  example the `FileReader::open` / `FileWriter::buffered` removals and the
+  `Host::scratch_parent` removal need that check).
+
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
   `pbfhogg export --format geoparquet`: stream tagged nodes and
@@ -645,14 +657,24 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **`diff -v` detail lines print tag values and roles unescaped.** The
-  detail writers in `src/commands/diff/mod.rs` interpolate keys, values and
-  roles raw, so a value containing a newline splits one logical detail
-  record across physical lines, and nothing bounds a very long value. The
-  positioned edit scripts (refs, members, duplicate-key tags) are exact as
-  logical records only. Fix: escape control characters (at least `\n`,
-  `\r`, `\\`) in detail payloads and document the escaping in both CLI
-  docs. Noticed while positioning the scripts, 2026-10-28.
+- [ ] **`diff -v` keyed tag lines are not bounded in count.**
+  `VERBOSE_SEQUENCE_DIFF_MAX_EDITS` caps the positioned scripts (refs,
+  members, duplicate-key tags) but its doc says keyed unique-key tag lines
+  are not counted, so an element with thousands of changed unique keys
+  prints thousands of `-"k"="v"` / `+` / `~` lines. Values are printed whole
+  by contract (the -v paragraph in both CLI docs: complete literals, never
+  truncated); whether the line count should get a cap and an omission line
+  is an open contract choice. Found 2026-10-28 while settling -v escaping.
+
+- [ ] **`inspect` text output prints tag values, users and roles raw.**
+  `inspect <element>` (`src/commands/inspect/show_element.rs`: `k = v`,
+  `user:`, `type/id (role)`) and `inspect tags` (`count TAB key TAB value`
+  in `cli/src/lib.rs`) interpolate string-table text unescaped, so a
+  newline or tab in a value breaks their line and field framing, the
+  defect `diff -v` had. `diff -v` now quotes every key, value and role as
+  a JSON-compatible literal (the `Quoted` formatter in
+  `src/commands/diff/mod.rs`); the same rule, or a shared formatter, would
+  fit here. Found 2026-10-28.
 
 - [ ] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` is unmeasured.** Its doc in
   `src/tunables.rs` says "sized so one call stays in the low milliseconds;
@@ -662,8 +684,8 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   near the cap) would settle whether 1 << 20 is right. Low priority.
 
 - [ ] **`diff -v` keyed tag lines carry no positions.** Unique-key tag lists
-  print keyed `-k=v`/`+k=v`/`~k` plus `tags: order changed`, so
-  `[a=1] -> [a=1,b=2]` and `[a=1] -> [b=2,a=1]` print the same `+b=2`, and
+  print keyed `-"k"="v"`/`+"k"="v"`/`~"k"` plus `tags: order changed`, so
+  `[a=1] -> [a=1,b=2]` and `[a=1] -> [b=2,a=1]` print the same `+"b"="2"`, and
   the detail cannot reconstruct the new tag order. Deliberate: the keyed
   view is the readable one for the common case, and the CLI docs say tags
   are keyed without positions. Revisit only if someone wants `-v` to be a

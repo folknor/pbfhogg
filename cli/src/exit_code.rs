@@ -212,6 +212,11 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
         ErrorKind::Output(pbfhogg::OutputError::ExclusivePublishUnsupported { .. }) => {
             Some("; pass --overwrite (-O) to publish without the exclusive check".to_owned())
         }
+        ErrorKind::Output(pbfhogg::OutputError::StagingDir { .. }) => Some(
+            "; choose a --staging-dir on the same mount as the output that neither is nor \
+             contains the output's directory"
+                .to_owned(),
+        ),
         _ => None,
     }
 }

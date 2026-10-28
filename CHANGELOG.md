@@ -1102,6 +1102,24 @@
 
 ### Added
 
+- **`--staging-dir <DIR>` on every command that writes an output.** Each
+  output's hidden staging entry is reserved in `DIR` instead of beside the
+  output, so a harness that kills pbfhogg runs can give each run a private
+  `--staging-dir` and `--tmp-dir` and remove both afterwards, with no name
+  matching; stale staging never reaches the next run's output directory.
+  `DIR` is refused before any work unless it is a directory on the same
+  mount as every output's directory and is not, and does not contain, any
+  output's directory (nor, for `build-geocode-index`, lies inside
+  `--output-dir`); `extract --config` checks it against every output first.
+  Backups of replaced outputs always stay beside the output. With `--staging-dir`
+  the output's own directory is still checked for writability up front.
+  Library: `Output::with_staging`, `OutputDir::with_staging`,
+  `OutputSet::files_with_staging`,
+  `geocode_index::builder::index_output_with_staging`, refusing with the new
+  `OutputError::StagingDir` and `StagingProblem`. Publication also now syncs
+  every directory a rename changed, including a directory output's staging
+  container.
+
 - **`sort --distrust-metadata` sorts a file whose claims are false.** It
   believes neither the header's `Sort.Type_then_ID` nor any blob's
   indexdata or tagdata: every blob is decoded in pass 1, a blob out of order

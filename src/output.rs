@@ -4,8 +4,9 @@
 //! # The contract
 //!
 //! - **Nothing is written under the destination's name until the run has
-//!   succeeded.** Constructing an output reserves a hidden staging sibling in
-//!   the destination's directory (`.pbfhogg-tmp-<pid>-<n>.<name>`); the
+//!   succeeded.** Constructing an output reserves a hidden staging entry
+//!   (`.pbfhogg-tmp-<pid>-<n>.<name>`) in the destination's directory, or in
+//!   a caller-chosen staging directory ([`Output::with_staging`]); the
 //!   command writes there, and [`Output::publish`] renames it into place
 //!   after the final flush and every post-write check. Dropping an output
 //!   without publishing removes the staging entry, so a failed, cancelled,
@@ -46,8 +47,11 @@
 //!   output is constructed with a [`Diagnostics`]; cleanup that fails, and
 //!   anything kept back from cleanup, becomes an `output.cleanup` warning.
 //!
-//! The staging and backup names, and which an external tool may delete, are
-//! defined in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
+//! The staging and backup names, which an external tool may delete, and the
+//! guarantee a caller-chosen staging directory gives a caller that removes
+//! it after a killed run, are defined in `reference/cli-reference.md`,
+//! "Staging directory" and "Names pbfhogg leaves behind". A backup always
+//! stays beside its destination, never in a staging directory.
 //! Durability and timing are decided in ADR-0017: writers finish their files,
 //! publication syncs them, and `PUBLISH_START`/`PUBLISH_END` bracket it.
 //!
@@ -87,7 +91,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::error::{Error, OutputError, Result, new_output_error};
+use crate::error::{Error, OutputError, Result, StagingProblem, new_output_error};
 use crate::host::Diagnostics;
 use crate::write::metrics::WriterMetrics;
 
@@ -579,9 +583,10 @@ fn bounded_tail(name: &OsStr) -> &OsStr {
     name
 }
 
-/// A sibling of `dest` named `.pbfhogg-<kind>-<pid>-<n>.<name tail>`. The
-/// marker is a prefix, so the sibling keeps the destination's suffix.
-fn sibling(dest: &Path, kind: &str) -> Result<PathBuf> {
+/// An entry named `.pbfhogg-<kind>-<pid>-<n>.<name tail>` for `dest`: in
+/// `dir` when given (a caller-chosen staging directory), else beside `dest`.
+/// The marker is a prefix, so the entry keeps the destination's suffix.
+fn sibling(dest: &Path, dir: Option<&Path>, kind: &str) -> Result<PathBuf> {
     let name = dest.file_name().ok_or_else(|| {
         new_output_error(OutputError::InvalidPath {
             path: dest.to_path_buf(),
@@ -590,26 +595,213 @@ fn sibling(dest: &Path, kind: &str) -> Result<PathBuf> {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut sibling_name = OsString::from(format!(".pbfhogg-{kind}-{}-{seq}.", std::process::id()));
     sibling_name.push(bounded_tail(name));
-    Ok(dest.with_file_name(sibling_name))
+    Ok(match dir {
+        Some(dir) => dir.join(sibling_name),
+        None => dest.with_file_name(sibling_name),
+    })
 }
 
-/// Create a fresh sibling of `dest` with `make`, retrying under a new name
-/// while the name is taken. Exclusive by construction: `make` must fail with
-/// `AlreadyExists` rather than reuse an entry.
-fn reserve(dest: &Path, kind: &str, make: impl Fn(&Path) -> io::Result<()>) -> Result<PathBuf> {
+/// Create a fresh entry for `dest` (in `dir`, else beside `dest`) with
+/// `make`, retrying under a new name while the name is taken. Exclusive by
+/// construction: `make` must fail with `AlreadyExists` rather than reuse an
+/// entry.
+fn reserve(
+    dest: &Path,
+    dir: Option<&Path>,
+    kind: &str,
+    make: impl Fn(&Path) -> io::Result<()>,
+) -> Result<PathBuf> {
     loop {
-        let path = sibling(dest, kind)?;
+        let path = sibling(dest, dir, kind)?;
         match make(&path) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => {
+                let place = match dir {
+                    Some(dir) => format!("in staging directory {}", dir.display()),
+                    None => "beside it".to_owned(),
+                };
                 return Err(Error::from(e).context(format!(
-                    "cannot create a staging entry beside output {}",
+                    "cannot create a staging entry for output {} {place}",
                     dest.display()
                 )));
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// A caller-chosen staging directory
+// ---------------------------------------------------------------------------
+
+/// The device and, where the kernel reports it, the mount a path lives on.
+/// Two directories can share a device and still be different mounts (a bind
+/// mount), across which `rename(2)` fails with `EXDEV`; the mount id tells
+/// them apart. `None` when the kernel cannot say.
+fn mount_of(path: &Path) -> io::Result<(u64, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = fs::metadata(path)?.dev();
+    Ok((dev, mount_id(path)))
+}
+
+/// The kernel's `struct statx` (256 bytes), spelled with only the two fields
+/// read here: `stx_mask` at offset 0 and `stx_mnt_id` at offset 144. Defined
+/// locally rather than taken from `libc`, whose `statx` is not available on
+/// musl in every `libc` release this crate's requirement admits; the layout
+/// is the kernel ABI and does not depend on the C library.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct StatxMountId {
+    mask: u32,
+    _to_mnt_id: [u8; 140],
+    mnt_id: u64,
+    _rest: [u8; 104],
+}
+
+#[cfg(target_os = "linux")]
+const _: () = assert!(std::mem::size_of::<StatxMountId>() == 256);
+
+/// `STATX_MNT_ID`, from the kernel ABI for the same reason.
+#[cfg(target_os = "linux")]
+const STATX_MNT_ID: u32 = 0x1000;
+
+#[cfg(target_os = "linux")]
+fn mount_id(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stx = StatxMountId {
+        mask: 0,
+        _to_mnt_id: [0; 140],
+        mnt_id: 0,
+        _rest: [0; 104],
+    };
+    // The raw syscall rather than the libc wrapper, as for `renameat2`: musl
+    // builds link against C libraries that may lack `statx`. A kernel without
+    // it answers ENOSYS, and the mount id is then unknown.
+    // SAFETY: the path is a valid NUL-terminated string and `stx` a writable
+    // buffer of the kernel's `struct statx` size and alignment for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            0,
+            STATX_MNT_ID,
+            std::ptr::addr_of_mut!(stx),
+        )
+    };
+    // The field is meaningful only when the kernel says it filled it in.
+    (rc == 0 && stx.mask & STATX_MNT_ID != 0).then_some(stx.mnt_id)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_id(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether two [`mount_of`] answers allow a rename between them: the same
+/// device, and the same mount when both mount ids are known. With one
+/// unknown the device decides, and a rename across a bind mount still fails
+/// with `EXDEV` at publication, which rolls back like any failed install.
+fn same_mount(a: (u64, Option<u64>), b: (u64, Option<u64>)) -> bool {
+    a.0 == b.0
+        && match (a.1, b.1) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
+}
+
+/// Whether the effective user may create and remove entries in `dir`. With a
+/// staging directory the reservation no longer proves the destination's
+/// directory is writable, and publication renames into it.
+fn writable_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: the path is a valid NUL-terminated string for the call.
+    let rc = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Check that `dir` can hold the staging entry of `dest`: it is a directory,
+/// on the same mount as the destination's directory (publication renames
+/// across them), not holding the destination's directory (a backup lands
+/// beside the destination, and a caller removing its staging directory must
+/// never delete an output or a backup), and not inside a directory output
+/// (replacing it would move the staging along with the old directory). The
+/// destination's directory must also be writable. Creates nothing.
+fn check_staging_dir(dir: &Path, dest: &Path, shape: Shape) -> Result<()> {
+    let refuse = |problem| {
+        Err(new_output_error(OutputError::StagingDir {
+            dir: dir.to_path_buf(),
+            destination: dest.to_path_buf(),
+            problem,
+        }))
+    };
+    let meta = match fs::metadata(dir) {
+        Ok(meta) => meta,
+        // Missing, or a symlink to nothing.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return refuse(StagingProblem::Missing);
+        }
+        Err(e) => {
+            return Err(
+                Error::from(e).context(format!("staging directory {} is unusable", dir.display()))
+            );
+        }
+    };
+    if !meta.is_dir() {
+        return refuse(StagingProblem::NotADirectory);
+    }
+    let parent = parent_dir(dest);
+    let parent_mount = mount_of(parent).map_err(|e| {
+        Error::from(e).context(format!(
+            "cannot inspect the directory of output {}",
+            dest.display()
+        ))
+    })?;
+    let dir_mount = mount_of(dir).map_err(|e| {
+        Error::from(e).context(format!(
+            "cannot inspect staging directory {}",
+            dir.display()
+        ))
+    })?;
+    if !same_mount(parent_mount, dir_mount) {
+        return refuse(StagingProblem::OtherMount);
+    }
+    let within = |inner: &Path, outer: &Path| {
+        crate::scratch::is_within(inner, outer).map_err(|e| {
+            Error::from(e).context(format!(
+                "cannot compare staging directory {} with output {}",
+                dir.display(),
+                dest.display()
+            ))
+        })
+    };
+    if within(parent, dir)? {
+        return refuse(StagingProblem::HoldsDestination);
+    }
+    if shape == Shape::Dir && within(dir, dest)? {
+        return refuse(StagingProblem::InsideDestination);
+    }
+    writable_dir(parent).map_err(|e| {
+        Error::from(e).context(format!(
+            "the directory of output {} is not writable",
+            dest.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// `dest` rebuilt from its components: a trailing `/` or `/.` is dropped,
@@ -883,6 +1075,12 @@ struct Target {
     /// Where the command writes: `staging` for a file, `staging/new` for a
     /// directory.
     write: PathBuf,
+    /// The directory installation renames `write` out of (the staging
+    /// file's directory, or a directory output's staging container), synced
+    /// with the destination's directory at publication. With a staging
+    /// directory it is not the destination's directory, and a rename changes
+    /// both.
+    source_dir: PathBuf,
     overwrite: Overwrite,
     validator: Option<Validator>,
     state: State,
@@ -917,10 +1115,14 @@ impl Target {
         shape: Shape,
         overwrite: Overwrite,
         validator: Option<Validator>,
+        staging_dir: Option<&Path>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
         let dest = normalize(dest)?;
         inspect(&dest, shape, overwrite, validator)?;
+        if let Some(dir) = staging_dir {
+            check_staging_dir(dir, &dest, shape)?;
+        }
         // A staging entry this constructor made and could not remove again
         // is reported, never left silently.
         let undo = |path: &Path, removed: io::Result<()>| {
@@ -940,7 +1142,7 @@ impl Target {
         };
         let (staging, write) = match shape {
             Shape::File => {
-                let staging = reserve(&dest, "tmp", |path| {
+                let staging = reserve(&dest, staging_dir, "tmp", |path| {
                     fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
@@ -950,7 +1152,7 @@ impl Target {
                 (staging.clone(), staging)
             }
             Shape::Dir => {
-                let staging = reserve(&dest, "tmp", |path| fs::create_dir(path))?;
+                let staging = reserve(&dest, staging_dir, "tmp", |path| fs::create_dir(path))?;
                 let write = staging.join("new");
                 if let Err(e) = fs::create_dir(&write) {
                     undo(&staging, fs::remove_dir(&staging));
@@ -984,11 +1186,16 @@ impl Target {
                 .and_then(|meta| identity_of(&meta)),
         };
         let session = Completion::new(&dest);
+        let source_dir = match shape {
+            Shape::File => parent_dir(&staging).to_path_buf(),
+            Shape::Dir => staging.clone(),
+        };
         Ok(Self {
             shape,
             dest,
             staging,
             write,
+            source_dir,
             overwrite,
             validator,
             state: State::Staged,
@@ -1178,7 +1385,10 @@ impl Target {
             }
         };
         let backup = if present && use_backup {
-            let container = reserve(&self.dest, "backup", |path| fs::create_dir(path))?;
+            // Always beside the destination, never in a staging directory: a
+            // backup can be the only copy of the previous output, and a
+            // caller removes its staging directory wholesale.
+            let container = reserve(&self.dest, None, "backup", |path| fs::create_dir(path))?;
             let entry = container.join(self.dest.file_name().unwrap_or_default());
             if let Err(e) = fs::rename(&self.dest, &entry) {
                 if let Err(e) = fs::remove_dir(&container) {
@@ -1571,8 +1781,8 @@ fn publish_all(
             // Best effort: the restored names are visible now; syncing their
             // directories (and any backup kept by a failed restore) is all
             // that can be done for their durability on an error path.
-            for parent in distinct_parents(touched) {
-                drop(sync_dir(&parent, metrics));
+            for dir in changed_dirs(touched) {
+                drop(sync_dir(&dir, metrics));
             }
             for target in touched.iter() {
                 if let State::BackedUp(backup)
@@ -1599,22 +1809,22 @@ fn publish_all(
     // every parent is durable: until then a backup may be the only copy that
     // is, so on a failure every one is kept and named.
     let mut unsynced: Option<(PathBuf, io::Error)> = None;
-    for parent in distinct_parents(targets) {
+    for dir in changed_dirs(targets) {
         let result = if fault_is!(faults, PublishFault::DirSync) {
             Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 "injected directory sync fault",
             ))
         } else {
-            sync_dir(&parent, metrics)
+            sync_dir(&dir, metrics)
         };
         if let Err(source) = result
             && unsynced.is_none()
         {
             let dest = targets
                 .iter()
-                .find(|target| parent_dir(&target.dest) == parent)
-                .map_or_else(|| parent.clone(), |target| target.dest.clone());
+                .find(|target| parent_dir(&target.dest) == dir || target.source_dir == dir)
+                .map_or_else(|| dir.clone(), |target| target.dest.clone());
             unsynced = Some((dest, source));
         }
     }
@@ -1639,16 +1849,22 @@ fn publish_all(
     }))
 }
 
-/// The parent directories of `targets`, each once, in order.
-fn distinct_parents(targets: &[Target]) -> Vec<PathBuf> {
-    let mut parents: Vec<PathBuf> = Vec::new();
+/// Every directory installing `targets` changes, each once, in order: each
+/// destination's directory, and the directory its new generation was renamed
+/// out of (the staging file's directory, which a staging directory makes a
+/// different one, or a directory output's staging container). A rename
+/// changes both directories, and only syncing each one makes its change
+/// durable; syncing an ancestor does not.
+fn changed_dirs(targets: &[Target]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for target in targets {
-        let parent = parent_dir(&target.dest).to_path_buf();
-        if !parents.contains(&parent) {
-            parents.push(parent);
+        for dir in [parent_dir(&target.dest), target.source_dir.as_path()] {
+            if !dirs.iter().any(|seen| seen == dir) {
+                dirs.push(dir.to_path_buf());
+            }
         }
     }
-    parents
+    dirs
 }
 
 #[cfg(unix)]
@@ -1712,12 +1928,34 @@ impl Output {
         overwrite: Overwrite,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
+        Self::with_staging(destination, overwrite, None, diagnostics)
+    }
+
+    /// [`Output::new`], with the staging file reserved in `staging_dir`
+    /// instead of beside the destination when it is given. A caller that
+    /// owns a private staging directory can remove it whole once every
+    /// process using it has stopped, so a run killed outright leaves no
+    /// staging where its destination is.
+    ///
+    /// # Errors
+    /// As [`Output::new`], plus [`OutputError::StagingDir`] when
+    /// `staging_dir` is missing, is not a directory, is on another mount
+    /// than the destination's directory, or is or holds the destination's
+    /// directory; an I/O error when either directory cannot be inspected or
+    /// the destination's directory is not writable.
+    pub fn with_staging(
+        destination: impl AsRef<Path>,
+        overwrite: Overwrite,
+        staging_dir: Option<&Path>,
+        diagnostics: &Diagnostics,
+    ) -> Result<Self> {
         Ok(Self {
             target: Target::prepare(
                 destination.as_ref(),
                 Shape::File,
                 overwrite,
                 None,
+                staging_dir,
                 diagnostics,
             )?,
             #[cfg(feature = "test-hooks")]
@@ -2014,12 +2252,31 @@ impl OutputDir {
         validator: Option<Validator>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
+        Self::with_staging(destination, overwrite, validator, None, diagnostics)
+    }
+
+    /// [`OutputDir::new`], with the staging directory reserved in
+    /// `staging_dir` instead of beside the destination when it is given, as
+    /// [`Output::with_staging`].
+    ///
+    /// # Errors
+    /// As [`OutputDir::new`] and [`Output::with_staging`], plus
+    /// [`OutputError::StagingDir`] when `staging_dir` lies inside the
+    /// destination.
+    pub fn with_staging(
+        destination: impl AsRef<Path>,
+        overwrite: Overwrite,
+        validator: Option<Validator>,
+        staging_dir: Option<&Path>,
+        diagnostics: &Diagnostics,
+    ) -> Result<Self> {
         Ok(Self {
             target: Target::prepare(
                 destination.as_ref(),
                 Shape::Dir,
                 overwrite,
                 validator,
+                staging_dir,
                 diagnostics,
             )?,
             #[cfg(feature = "test-hooks")]
@@ -2107,6 +2364,27 @@ impl OutputSet {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        Self::files_with_staging(destinations, overwrite, None, diagnostics)
+    }
+
+    /// [`OutputSet::files`], with every member's staging file reserved in
+    /// `staging_dir` when it is given, as [`Output::with_staging`]. The
+    /// directory is checked against every member's destination before any
+    /// member is reserved: one staging directory cannot serve destinations
+    /// on different mounts, and such a set is refused whole.
+    ///
+    /// # Errors
+    /// As [`OutputSet::files`] and [`Output::with_staging`].
+    pub fn files_with_staging<I, P>(
+        destinations: I,
+        overwrite: Overwrite,
+        staging_dir: Option<&Path>,
+        diagnostics: &Diagnostics,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         let paths = destinations
             .into_iter()
             .map(|path| normalize(path.as_ref()))
@@ -2131,9 +2409,14 @@ impl OutputSet {
             }
             planned.push((resolved, identity));
         }
+        if let Some(dir) = staging_dir {
+            for path in &paths {
+                check_staging_dir(dir, path, Shape::File)?;
+            }
+        }
         let members = paths
             .iter()
-            .map(|path| Output::new(path, overwrite, diagnostics))
+            .map(|path| Output::with_staging(path, overwrite, staging_dir, diagnostics))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             members,
@@ -2995,6 +3278,7 @@ mod tests {
             Shape::Dir,
             Overwrite::Refuse,
             None,
+            None,
             &diagnostics,
         )
         .unwrap();
@@ -3021,9 +3305,317 @@ mod tests {
         );
     }
 
+    /// The names in `dir` that pbfhogg leaves behind.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        others(dir, &[])
+            .into_iter()
+            .filter(|name| crate::scratch::is_leftover_name(OsStr::new(name)))
+            .collect()
+    }
+
+    /// With a staging directory the staging file lives there for the whole
+    /// run, and nowhere beside the destination; publication empties it.
+    #[test]
+    fn a_staging_directory_holds_the_staging_file_and_nothing_beside_the_output() {
+        let dir = scratch();
+        let (stage_dir_path, out_dir) = (dir.path().join("stage"), dir.path().join("out"));
+        fs::create_dir(&stage_dir_path).unwrap();
+        fs::create_dir(&out_dir).unwrap();
+        let dest = out_dir.join("out.osm.pbf");
+        let out = Output::with_staging(&dest, Overwrite::Refuse, Some(&stage_dir_path), &discard())
+            .unwrap();
+        assert_eq!(out.path().parent(), Some(stage_dir_path.as_path()));
+        assert!(
+            out.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".out.osm.pbf")
+        );
+        assert!(
+            others(&out_dir, &[]).is_empty(),
+            "nothing beside the output"
+        );
+        stage(&out, b"new").unwrap();
+        out.publish(run_token()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(others(&out_dir, &["out.osm.pbf"]).is_empty());
+        assert!(others(&stage_dir_path, &[]).is_empty());
+    }
+
+    /// A run that fails or is dropped before publication removes its staging
+    /// file from the staging directory, as it would beside the output.
+    #[test]
+    fn a_dropped_output_removes_its_entry_from_the_staging_directory() {
+        let dir = scratch();
+        let stage_dir_path = dir.path().join("stage");
+        fs::create_dir(&stage_dir_path).unwrap();
+        let out_dir = dir.path().join("out");
+        fs::create_dir(&out_dir).unwrap();
+        let out = Output::with_staging(
+            out_dir.join("o.pbf"),
+            Overwrite::Refuse,
+            Some(&stage_dir_path),
+            &discard(),
+        )
+        .unwrap();
+        stage(&out, b"partial").unwrap();
+        assert_eq!(leftovers(&stage_dir_path).len(), 1);
+        drop(out);
+        assert!(others(&stage_dir_path, &[]).is_empty());
+        assert!(others(&out_dir, &[]).is_empty());
+    }
+
+    /// A directory output's staging container goes in the staging
+    /// directory; replacing an existing index keeps its backup beside the
+    /// index, never in the staging directory, and both are gone after a
+    /// successful replacement.
+    #[test]
+    fn a_directory_output_stages_in_the_staging_directory_and_backs_up_beside_itself() {
+        let dir = scratch();
+        let stage_dir_path = dir.path().join("stage");
+        fs::create_dir(&stage_dir_path).unwrap();
+        let dest = dir.path().join("index");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("old"), b"old").unwrap();
+        let out = OutputDir::with_staging(
+            &dest,
+            Overwrite::Replace,
+            None,
+            Some(&stage_dir_path),
+            &discard(),
+        )
+        .unwrap();
+        assert_eq!(leftovers(&stage_dir_path).len(), 1);
+        assert!(leftovers(dir.path()).is_empty());
+        stage_dir(&out, "new", b"new");
+        out.publish(run_token()).unwrap();
+        assert_eq!(fs::read(dest.join("new")).unwrap(), b"new");
+        assert!(!dest.join("old").exists());
+        assert!(others(&stage_dir_path, &[]).is_empty());
+        assert!(others(dir.path(), &["index", "stage"]).is_empty());
+    }
+
+    /// Every refusal happens at construction and reserves nothing: a staging
+    /// directory that is not a directory, is missing, is or contains the
+    /// output's directory, or lies inside the directory output it stages.
+    #[test]
+    fn an_unusable_staging_directory_is_refused_before_anything_is_reserved() {
+        let dir = scratch();
+        let out_dir = dir.path().join("out");
+        fs::create_dir(&out_dir).unwrap();
+        let dest = out_dir.join("o.pbf");
+        let problem = |err: &Error| match output_error(err) {
+            OutputError::StagingDir { problem, .. } => *problem,
+            other => panic!("expected a staging-directory refusal, got {other:?}"),
+        };
+
+        let file = dir.path().join("plain-file");
+        fs::write(&file, b"x").unwrap();
+        let err =
+            Output::with_staging(&dest, Overwrite::Refuse, Some(&file), &discard()).unwrap_err();
+        assert_eq!(problem(&err), StagingProblem::NotADirectory);
+        // The text names no front-end flag.
+        assert!(!err.to_string().contains("--"), "{err}");
+
+        let missing = dir.path().join("missing");
+        let err =
+            Output::with_staging(&dest, Overwrite::Refuse, Some(&missing), &discard()).unwrap_err();
+        assert_eq!(problem(&err), StagingProblem::Missing);
+        assert!(err.to_string().contains("missing"), "{err}");
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        let err = Output::with_staging(&dest, Overwrite::Refuse, Some(&dangling), &discard())
+            .unwrap_err();
+        assert_eq!(problem(&err), StagingProblem::Missing);
+
+        // The output's own directory, and any directory above it.
+        for holder in [&out_dir, &dir.path().to_path_buf()] {
+            let err = Output::with_staging(&dest, Overwrite::Refuse, Some(holder), &discard())
+                .unwrap_err();
+            assert_eq!(
+                problem(&err),
+                StagingProblem::HoldsDestination,
+                "{holder:?}"
+            );
+        }
+        // Through a symlink too.
+        let link = dir.path().join("link-to-out");
+        std::os::unix::fs::symlink(&out_dir, &link).unwrap();
+        let err =
+            Output::with_staging(&dest, Overwrite::Refuse, Some(&link), &discard()).unwrap_err();
+        assert_eq!(problem(&err), StagingProblem::HoldsDestination);
+
+        // Inside a directory output, which publication replaces.
+        let index = dir.path().join("index");
+        fs::create_dir_all(index.join("sub")).unwrap();
+        let err = OutputDir::with_staging(
+            &index,
+            Overwrite::Replace,
+            None,
+            Some(&index.join("sub")),
+            &discard(),
+        )
+        .unwrap_err();
+        assert_eq!(problem(&err), StagingProblem::InsideDestination);
+
+        assert!(others(&out_dir, &[]).is_empty());
+        assert_eq!(others(&index, &[]), ["sub"]);
+        assert!(others(&index.join("sub"), &[]).is_empty());
+    }
+
+    /// A staging directory below the output's directory is allowed: removing
+    /// it deletes neither the output nor a backup beside it.
+    #[test]
+    fn a_staging_directory_below_the_output_directory_is_accepted() {
+        let dir = scratch();
+        let below = dir.path().join(".stage");
+        fs::create_dir(&below).unwrap();
+        let dest = dir.path().join("o.pbf");
+        let out = Output::with_staging(&dest, Overwrite::Refuse, Some(&below), &discard()).unwrap();
+        stage(&out, b"x").unwrap();
+        out.publish(run_token()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"x");
+        assert!(others(&below, &[]).is_empty());
+    }
+
+    /// A set is checked against every member's directory before any member
+    /// is reserved: one member the staging directory holds refuses the set
+    /// and leaves nothing in the staging directory. The staging directory is
+    /// made read-only for the refusal, so reserving the first member before
+    /// the second is checked would fail with a permission error instead of
+    /// the staging refusal: the error kind proves the order.
+    #[test]
+    fn a_set_checks_the_staging_directory_against_every_member_first() {
+        let dir = scratch();
+        let stage_dir_path = dir.path().join("stage");
+        fs::create_dir_all(stage_dir_path.join("inner")).unwrap();
+        let fine = dir.path().join("a.pbf");
+        let held = stage_dir_path.join("inner").join("b.pbf");
+        let read_only = |mode| {
+            fs::set_permissions(
+                &stage_dir_path,
+                std::os::unix::fs::PermissionsExt::from_mode(mode),
+            )
+            .unwrap();
+        };
+        // Root creates entries in a read-only directory, so the order cannot
+        // be observed this way there; the refusal itself still can.
+        // SAFETY: geteuid has no preconditions.
+        let ordered = unsafe { libc::geteuid() } != 0;
+        read_only(0o500);
+        let err = OutputSet::files_with_staging(
+            [&fine, &held],
+            Overwrite::Refuse,
+            Some(&stage_dir_path),
+            &discard(),
+        )
+        .unwrap_err();
+        read_only(0o700);
+        let refused_by_check = matches!(
+            output_error(&err),
+            OutputError::StagingDir {
+                problem: StagingProblem::HoldsDestination,
+                ..
+            }
+        );
+        assert!(refused_by_check || !ordered, "{err}");
+        assert_eq!(others(&stage_dir_path, &[]), ["inner"]);
+        assert!(others(dir.path(), &["stage"]).is_empty());
+
+        let other = dir.path().join("b.pbf");
+        let set = OutputSet::files_with_staging(
+            [&fine, &other],
+            Overwrite::Refuse,
+            Some(&stage_dir_path),
+            &discard(),
+        )
+        .unwrap();
+        assert_eq!(leftovers(&stage_dir_path).len(), 2);
+        for member in set.iter() {
+            stage(member, b"m").unwrap();
+        }
+        set.publish(run_token()).unwrap();
+        assert_eq!(others(&stage_dir_path, &[]), ["inner"]);
+        assert_eq!(fs::read(&fine).unwrap(), b"m");
+        assert_eq!(fs::read(&other).unwrap(), b"m");
+    }
+
+    #[test]
+    fn mounts_match_on_device_and_on_mount_id_when_both_are_known() {
+        assert!(same_mount((1, Some(7)), (1, Some(7))));
+        assert!(!same_mount((1, Some(7)), (1, Some(8))), "a bind mount");
+        assert!(!same_mount((1, None), (2, None)));
+        assert!(
+            same_mount((1, None), (1, Some(8))),
+            "unknown: the device decides"
+        );
+        // This host's answer for one directory is consistent with itself.
+        let dir = scratch();
+        let here = mount_of(dir.path()).unwrap();
+        assert!(same_mount(here, mount_of(dir.path()).unwrap()));
+    }
+
+    /// The local `statx` layout reads the mount id at the offset glibc's
+    /// own struct puts it, wherever both are available.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_local_statx_layout_matches_the_c_library() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch();
+        let Some(ours) = mount_id(dir.path()) else {
+            // The kernel reports no mount id: nothing to compare.
+            return;
+        };
+        let c_path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // SAFETY: an all-zero `statx` is a valid value of a plain C struct.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: valid path and a writable `statx`.
+        let rc = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                0,
+                libc::STATX_MNT_ID,
+                std::ptr::addr_of_mut!(stx),
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(std::mem::size_of::<libc::statx>(), 256);
+        assert_eq!(ours, stx.stx_mnt_id);
+    }
+
     #[cfg(feature = "test-hooks")]
     mod faults {
         use super::*;
+
+        /// A group that fails after one member was installed rolls it back
+        /// out of the destination and into the staging directory, where
+        /// dropping it removes it: nothing is left beside the outputs, and
+        /// the staging directory is empty again.
+        #[test]
+        fn a_rolled_back_group_leaves_its_staging_only_in_the_staging_directory() {
+            let dir = scratch();
+            let stage_dir_path = dir.path().join("stage");
+            fs::create_dir(&stage_dir_path).unwrap();
+            let a = dir.path().join("a.pbf");
+            let b = dir.path().join("b.pbf");
+            let mut set = OutputSet::files_with_staging(
+                [&a, &b],
+                Overwrite::Refuse,
+                Some(&stage_dir_path),
+                &discard(),
+            )
+            .unwrap();
+            for member in set.iter() {
+                stage(member, b"m").unwrap();
+            }
+            set.inject_fault(PublishFault::AfterInstalled(0));
+            assert!(set.publish(run_token()).is_err());
+            assert!(!a.exists() && !b.exists());
+            assert!(others(dir.path(), &["stage"]).is_empty());
+            assert!(others(&stage_dir_path, &[]).is_empty());
+        }
 
         /// A replaced directory whose backup cannot be removed afterwards:
         /// the replacement still succeeds, and the warning names the backup.

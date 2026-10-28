@@ -133,6 +133,14 @@ struct OutputArg {
     output: PathBuf,
     #[command(flatten)]
     overwrite: OverwriteArg,
+    /// Directory to stage the output in instead of beside it. It must exist,
+    /// be on the same mount as the output's directory, and not be or contain
+    /// that directory.
+    /// A run killed outright leaves its staging entry there and nowhere
+    /// else, so a caller that gives each run a private directory can remove
+    /// it once the run has stopped
+    #[arg(long = "staging-dir", value_name = "DIR")]
+    staging_dir: Option<PathBuf>,
 }
 
 impl OutputArg {
@@ -143,9 +151,10 @@ impl OutputArg {
         &self,
         host: &pbfhogg::host::Host,
     ) -> Result<pbfhogg::Output, Box<dyn std::error::Error>> {
-        Ok(pbfhogg::Output::new(
+        Ok(pbfhogg::Output::with_staging(
             &self.output,
             self.overwrite.intent(),
+            self.staging_dir.as_deref(),
             &host.diagnostics,
         )?)
     }
@@ -159,7 +168,7 @@ struct TmpDirArg {
     /// each shard write its full text output, unchanged lines included unless `-c`). The directory must exist and be writable; it is checked before any
     /// work starts. Each run makes one hidden `.pbfhogg-run-*` directory in it and removes it
     /// at the end. Default: the output's directory, or the current directory when there is
-    /// no output file. Output staging files stay beside the output regardless.
+    /// no output file. Output staging is placed by --staging-dir, not by this flag.
     #[arg(long = "tmp-dir", value_name = "DIR")]
     tmp_dir: Option<PathBuf>,
 }
@@ -178,8 +187,9 @@ impl OverwriteArg {
     }
 }
 
-/// `-O` for a command whose output is optional (stdout otherwise): without
-/// `-o` there is no output to replace, so `-O` alone is refused.
+/// `-O` and `--staging-dir` for a command whose output is optional (stdout
+/// otherwise): without `-o` there is no output to replace or stage, so
+/// either alone is refused.
 #[derive(Args)]
 struct OverwriteOutputArg {
     /// Replace an output that already exists. Without it an existing output
@@ -187,11 +197,37 @@ struct OverwriteOutputArg {
     /// Requires -o: stdout is never replaced.
     #[arg(short = 'O', long, requires = "output")]
     overwrite: bool,
+    /// Directory to stage the output in instead of beside it. It must exist,
+    /// be on the same mount as the output's directory, and not be or contain
+    /// that directory.
+    /// A run killed outright leaves its staging entry there and nowhere
+    /// else, so a caller that gives each run a private directory can remove
+    /// it once the run has stopped. Requires -o
+    #[arg(long = "staging-dir", value_name = "DIR", requires = "output")]
+    staging_dir: Option<PathBuf>,
 }
 
 impl OverwriteOutputArg {
     const fn intent(&self) -> pbfhogg::Overwrite {
         pbfhogg::Overwrite::from_flag(self.overwrite)
+    }
+
+    /// The optional output, checked and staged before any work is done.
+    fn open(
+        &self,
+        output: Option<&std::path::Path>,
+        host: &pbfhogg::host::Host,
+    ) -> Result<Option<pbfhogg::Output>, Box<dyn std::error::Error>> {
+        Ok(output
+            .map(|path| {
+                pbfhogg::Output::with_staging(
+                    path,
+                    self.intent(),
+                    self.staging_dir.as_deref(),
+                    &host.diagnostics,
+                )
+            })
+            .transpose()?)
     }
 }
 
@@ -1713,6 +1749,14 @@ enum Command {
         /// any work is done. A symlink is refused either way.
         #[arg(short = 'O', long)]
         overwrite: bool,
+        /// Directory to stage the output, or every output a --config names,
+        /// in instead of beside it. It must exist, be on the same mount as
+        /// every output's directory, and not be or contain any of them. A run
+        /// killed outright leaves its staging entries there and nowhere else,
+        /// so a caller that gives each run a private directory can remove it
+        /// once the run has stopped
+        #[arg(long = "staging-dir", value_name = "DIR")]
+        staging_dir: Option<PathBuf>,
         /// Bounding box: minlon,minlat,maxlon,maxlat
         #[arg(
             short = 'b',
@@ -2129,6 +2173,15 @@ enum Command {
         /// is refused before any work is done.
         #[arg(short = 'O', long)]
         overwrite: bool,
+        /// Directory to stage the new index in instead of beside
+        /// --output-dir. It must exist, be on the same mount as the index's
+        /// parent directory, not be or contain that directory, and not lie
+        /// inside --output-dir. A run killed outright
+        /// leaves its staging directory there and nowhere else, so a caller
+        /// that gives each run a private directory can remove it once the run
+        /// has stopped
+        #[arg(long = "staging-dir", value_name = "DIR")]
+        staging_dir: Option<PathBuf>,
         /// Accept input without blob-level indexdata (slower fallback path).
         #[arg(long)]
         allow_unindexed: bool,
@@ -2699,12 +2752,7 @@ pub fn run() -> process::ExitCode {
                 )?;
                 run_export(
                     &file,
-                    output
-                        .as_deref()
-                        .map(|path| {
-                            pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
-                        })
-                        .transpose()?,
+                    overwrite.open(output.as_deref(), &host)?,
                     &options,
                     &host,
                 )
@@ -2728,11 +2776,11 @@ pub fn run() -> process::ExitCode {
             } => match format {
                 DiffFormat::Osc => {
                     // `validate_diff` refused a missing -o.
-                    let output = output.ok_or("--output is required with --format osc")?;
                     // The output is checked before the scratch directory is
                     // made, so a missing output directory reports the output.
-                    let output_handle =
-                        pbfhogg::Output::new(&output, overwrite.intent(), &host.diagnostics)?;
+                    let output_handle = overwrite
+                        .open(output.as_deref(), &host)?
+                        .ok_or("--output is required with --format osc")?;
                     let scratch = paths.create_scratch(&host)?;
                     accept_outcome(
                         &mut outcome,
@@ -2756,12 +2804,7 @@ pub fn run() -> process::ExitCode {
                         osmium_summary,
                         quiet,
                     };
-                    let output_handle = output
-                        .as_deref()
-                        .map(|path| {
-                            pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
-                        })
-                        .transpose()?;
+                    let output_handle = overwrite.open(output.as_deref(), &host)?;
                     // Only a text diff that may shard writes scratch
                     // (`diff_writes_scratch`); it gets its directory now,
                     // before any input is opened.
@@ -2881,6 +2924,7 @@ pub fn run() -> process::ExitCode {
                 file,
                 output,
                 overwrite,
+                staging_dir,
                 bbox,
                 polygon,
                 config,
@@ -2908,6 +2952,7 @@ pub fn run() -> process::ExitCode {
                         config_path,
                         directory.as_deref(),
                         overwrite,
+                        staging_dir.as_deref(),
                         extract_strategy(simple, smart),
                         set_bounds,
                         &clean_attrs(&clean),
@@ -2922,7 +2967,12 @@ pub fn run() -> process::ExitCode {
                     let region = extract_region(bbox, polygon.as_deref())?;
                     run_extract(
                         &file,
-                        pbfhogg::Output::new(output, overwrite, &host.diagnostics)?,
+                        pbfhogg::Output::with_staging(
+                            output,
+                            overwrite,
+                            staging_dir.as_deref(),
+                            &host.diagnostics,
+                        )?,
                         &region,
                         extract_strategy(simple, smart),
                         set_bounds,
@@ -3179,6 +3229,7 @@ pub fn run() -> process::ExitCode {
                 force,
                 // Placed by `paths`.
                 tmp: _,
+                staging_dir: _,
             } => {
                 // The one --force that is not the indexdata rule: it predates
                 // --overwrite and --allow-unindexed and still grants both, so
@@ -3326,9 +3377,10 @@ fn run_build_geocode_index(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // The caller has already expanded the legacy `--force` into both
     // permissions. Refusals happen here, before any work.
-    let output = pbfhogg::geocode_index::builder::index_output(
+    let output = pbfhogg::geocode_index::builder::index_output_with_staging(
         output_dir,
         pbfhogg::Overwrite::from_flag(overwrite),
+        paths.staging_dir(),
         &host.diagnostics,
     )?;
     // After the output, so an existing index directory is judged before the
@@ -4305,6 +4357,7 @@ fn run_extract_config(
     config_path: &std::path::Path,
     directory_override: Option<&std::path::Path>,
     overwrite: pbfhogg::Overwrite,
+    staging_dir: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -4333,10 +4386,13 @@ fn run_extract_config(
     // Every output the config names is checked here, before any extraction:
     // an existing one (without --overwrite), a symlink, two slots resolving
     // to one file. A config with many regions never fails on a late one
-    // after the early ones were extracted.
-    let outputs = pbfhogg::OutputSet::files(
+    // after the early ones were extracted. A --staging-dir is checked against
+    // every output's directory before any member is reserved. (It was
+    // scanned with the command's other locations.)
+    let outputs = pbfhogg::OutputSet::files_with_staging(
         slots.iter().map(|slot| &slot.output),
         overwrite,
+        staging_dir,
         &host.diagnostics,
     )?;
     let destinations: Vec<PathBuf> = outputs

@@ -225,7 +225,8 @@ pub mod write;
 pub use blob_meta::{BlobBbox, BlobFilter};
 pub use element_kind::ElementKind;
 pub use error::{
-    BlobError, Error, ErrorKind, KindContradiction, OutputError, OversizePart, Result, Unresolved,
+    BlobError, Error, ErrorKind, KindContradiction, OutputError, OversizePart, Result,
+    StagingProblem, Unresolved,
 };
 pub use output::{Output, OutputDir, OutputSet, Overwrite};
 pub use owned::{ParseTypeFilterError, TypeFilter};

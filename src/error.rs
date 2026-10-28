@@ -852,7 +852,8 @@ pub enum OutputError {
     /// Publication without replacement needs an exclusive rename (or, for a
     /// file, a hard link), and this filesystem offers neither.
     ExclusivePublishUnsupported { path: PathBuf, source: io::Error },
-    /// The output *was* published; syncing its directory failed, so its
+    /// The output *was* published; syncing a directory its publication
+    /// changed (its own, or the one its staging entry left) failed, so its
     /// survival across a crash is unconfirmed. Every previous output the
     /// publication moved aside is kept, never removed, at the paths in
     /// `kept`; `kept_synced` is false when syncing one of those backups
@@ -888,6 +889,34 @@ pub enum OutputError {
     /// The staging entry is no longer the file reserved for this output, so
     /// what was synced is not what would be installed. Nothing was installed.
     StagingReplaced { path: PathBuf },
+    /// The caller-chosen staging directory `dir` cannot hold the staging
+    /// entry of `destination`, for the reason `problem` gives. Nothing was
+    /// reserved.
+    StagingDir {
+        dir: PathBuf,
+        destination: PathBuf,
+        problem: StagingProblem,
+    },
+}
+
+/// Why a caller-chosen staging directory cannot serve an output.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagingProblem {
+    /// It does not exist (or is a symlink to nothing).
+    Missing,
+    /// It exists and is not a directory.
+    NotADirectory,
+    /// It is on another mount than the destination's directory, so the
+    /// staging entry could not be renamed into place.
+    OtherMount,
+    /// The destination's directory is the staging directory or lies inside
+    /// it. A caller removes its staging directory whole, which would delete
+    /// the output, or a backup of the previous one kept beside it.
+    HoldsDestination,
+    /// It lies inside the directory output it would stage, which
+    /// publication replaces.
+    InsideDestination,
 }
 
 impl fmt::Display for OutputError {
@@ -973,7 +1002,42 @@ impl fmt::Display for OutputError {
                 "output {} was not published: its staging file was replaced while the run wrote it",
                 path.display()
             ),
+            Self::StagingDir {
+                dir,
+                destination,
+                problem,
+            } => write_staging_dir(f, dir, destination, *problem),
         }
+    }
+}
+
+fn write_staging_dir(
+    f: &mut fmt::Formatter,
+    dir: &std::path::Path,
+    destination: &std::path::Path,
+    problem: StagingProblem,
+) -> fmt::Result {
+    let (dir, destination) = (dir.display(), destination.display());
+    match problem {
+        StagingProblem::Missing => write!(f, "staging directory {dir} does not exist"),
+        StagingProblem::NotADirectory => write!(f, "staging directory {dir} is not a directory"),
+        StagingProblem::OtherMount => write!(
+            f,
+            "staging directory {dir} is on another filesystem or mount than output \
+             {destination}; publication renames the staging entry into place, which needs the \
+             same mount"
+        ),
+        StagingProblem::HoldsDestination => write!(
+            f,
+            "staging directory {dir} is or contains the directory of output {destination}; \
+             removing the staging directory would then delete the output, or a backup of the \
+             previous one kept beside it"
+        ),
+        StagingProblem::InsideDestination => write!(
+            f,
+            "staging directory {dir} lies inside output directory {destination}, which \
+             publication replaces"
+        ),
     }
 }
 
@@ -993,7 +1057,8 @@ fn write_unsynced(
 ) -> fmt::Result {
     write!(
         f,
-        "output {} was published, but syncing its directory failed, so it may not survive a \
+        "output {} was published, but syncing a directory its publication changed failed, so \
+         it may not survive a \
          crash",
         path.display()
     )?;
@@ -1099,7 +1164,8 @@ impl From<Error> for io::Error {
                 | OutputError::NotADirectory { .. }
                 | OutputError::MountPoint { .. }
                 | OutputError::InvalidPath { .. }
-                | OutputError::ReservedName { .. },
+                | OutputError::ReservedName { .. }
+                | OutputError::StagingDir { .. },
             ) => io::ErrorKind::InvalidInput,
             _ => io::ErrorKind::Other,
         };

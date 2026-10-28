@@ -114,6 +114,7 @@ These flags appear on most commands that produce PBF output:
 |------|-------------|
 | `-o, --output <FILE>` | Output file path |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression <COMPRESSION>` | Blob compression: `none`, `zlib` (default; `renumber` defaults to `zlib:1`, see its section), `zstd`, or with level (`zlib:9`, `zstd:19`) |
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
 | `--force` | On a command that would refuse unindexed input: proceed with the slower fallback (see [`--force`](#--force)) |
@@ -389,10 +390,11 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   read back.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
-  (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after
-  its final flush; a run that fails before that removes it, so it leaves no
-  file at the output path and leaves an existing output untouched. So does a
-  run interrupted by SIGINT or SIGTERM (see [Interruption](#interruption)). A
+  (`.pbfhogg-tmp-<pid>-<n>.<name>`), or in `--staging-dir` when given (see
+  [Staging directory](#staging-directory)), syncs it and renames it into place
+  after its final flush; a run that fails before that removes it, so it leaves
+  no file at the output path and leaves an existing output untouched. So does
+  a run interrupted by SIGINT or SIGTERM (see [Interruption](#interruption)). A
   run killed outright (SIGKILL, the OOM killer, power loss, a second
   interrupt) before publication can leave the hidden staging file behind,
   never a file under the output name. The
@@ -401,7 +403,7 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   place is an error that says the output *was* published (naming any backup
   of a replaced output, which is then kept), and a group whose rollback
   cannot complete names what is left where. The output's directory must
-  exist and be writable.
+  exist and be writable, which is checked before any work.
 - Without `--overwrite` publication is exclusive: an output that appears
   while the command runs is not replaced either. On a filesystem with
   neither an exclusive rename nor hard links, such a run fails at the end
@@ -412,6 +414,35 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   directory beside it and the error names it.
 
 `-o /dev/null` is not an output: it is refused as not a regular file.
+
+### Staging directory
+
+`--staging-dir <DIR>`, on every command that writes an output, puts each
+output's staging entry (the staging file, or the geocode index's staging
+directory) in `DIR` instead of beside the output, under the same
+`.pbfhogg-tmp-<pid>-<n>.<name>` name. Publication still renames it into
+place, so `DIR` is checked before any work and refused unless:
+
+- it exists and is a directory;
+- it is on the same mount as every output's directory (the same device, and
+  the same mount where the kernel reports mount ids; a bind mount of the same
+  device is a different mount, across which a rename fails);
+- it is not, and does not contain, any output's directory (a directory below
+  an output's directory is fine): a caller removes its staging directory
+  whole, and a backup of a replaced output lands beside the output;
+- for `build-geocode-index`, it does not lie inside `--output-dir`, which
+  publication replaces.
+
+For `extract --config` it is checked against every output the config names
+before any output is reserved. A refusal names the staging directory and the
+output, exit `2`. `--staging-dir` needs an output: with `export` or a text
+`diff` writing to stdout it is refused as a usage error, exit `2`.
+Publication syncs both directories a rename changes, the staging side as well
+as the output's directory. Library callers get the same placement and checks
+from `Output::with_staging`, `OutputDir::with_staging`,
+`OutputSet::files_with_staging` and
+`geocode_index::builder::index_output_with_staging`, whose refusals are
+`OutputError::StagingDir` with a `StagingProblem`.
 
 ## Scratch files
 
@@ -430,14 +461,14 @@ writing any text) makes no directory and needs no writable location.
   it the scratch goes in the output's directory (the current directory for `diff` text to
   stdout, and for an output name with no directory part). `build-geocode-index` refuses a `--tmp-dir` inside the index
   directory it replaces.
-- An output's own staging file (`.pbfhogg-tmp-*`) and a replaced output's backup
-  (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a
-  rename, which needs the same filesystem.
+- `--tmp-dir` never moves an output's staging entry (`.pbfhogg-tmp-*`), which stays beside the
+  output unless `--staging-dir` moves it, nor a replaced output's backup (`.pbfhogg-backup-*`),
+  which always stays beside the output: publication is a rename, which needs the same mount.
 
 **Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer, a second
 SIGINT or SIGTERM) are reported,
 never removed. Before it starts, a command that writes an output scans the output's directory
-(and `--tmp-dir`, when given) and prints one `Warning:` per entry it finds: an unfinished run
+(and `--tmp-dir` and `--staging-dir`, when given) and prints one `Warning:` per entry it finds: an unfinished run
 directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
 `.pbfhogg-sparse-index-*`, `diff-par-*`, `derive-*` files), and an output's hidden staging
 file. Each line gives the size and why the entry is believed stale. That is a belief, not a
@@ -467,21 +498,36 @@ An output named like one of these names, or inside one, is refused the same way.
 A `.pbfhogg-backup-*` entry is reported with its own wording. It can be the only copy of a
 previous output, so pbfhogg never deletes one and you should look at it before removing it.
 If a backup cannot be removed after a successful replacement, the run still succeeds and
-prints a `Warning:` naming it. If the replacement's directory cannot be synced, the backup is
+prints a `Warning:` naming it. If a directory the replacement's publication changed cannot be synced, the backup is
 kept rather than removed, and the error names it. Library callers get the same scan as typed values from
 `pbfhogg::scratch::find_stale` and `pbfhogg::scratch::find_stale_in_index`.
 
 ### Names pbfhogg leaves behind
 
-The spellings below are the contract for an external tool (a benchmark harness that kills
-pbfhogg children, a cleanup job). `<pid>` is the pid of the pbfhogg process, `<seq>` a counter
-within it, `<dest name>` the last component of the output path (the last 200 bytes of it, when
-longer).
+**A caller that kills pbfhogg children should not match these names at all.** The supported way
+to own cleanup is to give each run directories of its own. When both `--staging-dir` and
+`--tmp-dir` are given, pbfhogg creates every staging entry under `--staging-dir` and all run
+scratch under `--tmp-dir`. After every process using those directories has stopped, the caller
+may remove them, provided they are private to the run, dedicated to its disposable state, and
+hold no outputs or other data it means to keep (pbfhogg refuses a `--staging-dir` that is or
+contains an output's directory; `--tmp-dir` is not checked that way). Publication may also leave
+backup entries (`.pbfhogg-backup-*`) beside the outputs. They are excluded from automatic
+cleanup: one can hold the only copy of a replaced output, though one left by an interrupted
+publication may also be empty. The run's diagnostics name them when they get to, and every later
+scan of that directory reports them. Published outputs stay at the paths that were asked for,
+including ones a killed group publication left installed: publishing several outputs is not
+all-or-nothing across a process death. Stale staging therefore never reaches the next run's
+directories, so no run has to decide whether to overwrite or refuse it.
+
+The spellings below are the contract for an external tool that cannot do that (a cleanup job
+sweeping directories it did not hand out). `<pid>` is the pid of the pbfhogg process, `<seq>` a
+counter within it, `<dest name>` the last component of the output path (the last 200 bytes of
+it, when longer).
 
 | Name | What it is | An external tool may delete it |
 |------|-----------|--------------------------------|
-| `.pbfhogg-tmp-<pid>-<seq>.<dest name>` | Staging for an output, beside the destination: a file for file outputs, a directory (holding `new/`) for the geocode index. Never a file under the output name. | When no pbfhogg process is live that could own it (check `<pid>`; it is a hint only) |
-| `.pbfhogg-backup-<pid>-<seq>.<dest name>` | A directory holding the previous output, kept while a replacement is published, and kept for good when a rollback could not restore it, when syncing the replacement's directory failed (the error names it), when removing it after a successful replacement failed, or when something pbfhogg never deletes turned up inside it (a warning names it in the last two cases). | **Never without a human.** It can hold the only copy of the previous output |
+| `.pbfhogg-tmp-<pid>-<seq>.<dest name>` | Staging for an output, beside the destination or in `--staging-dir`: a file for file outputs, a directory (holding `new/`) for the geocode index. Never a file under the output name. | When no pbfhogg process is live that could own it (check `<pid>`; it is a hint only) |
+| `.pbfhogg-backup-<pid>-<seq>.<dest name>` | A directory holding the previous output, kept while a replacement is published, and kept for good when a rollback could not restore it, when syncing a directory the replacement's publication changed failed (the error names it), when removing it after a successful replacement failed, or when something pbfhogg never deletes turned up inside it (a warning names it in the last two cases). | **Never without a human.** It can hold the only copy of the previous output |
 | `.pbfhogg-run-<pid>-<random>` | One run's scratch directory, in the output's directory or `--tmp-dir`. | When its lock is not held (below), and nothing is using it |
 
 A run directory holds a `LOCK` file, on which the owning process keeps an exclusive `flock(2)`
@@ -889,6 +935,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation). Not valid with `--dedupe`. |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user). Not valid with `--dedupe`. (`-c` used to be its short; `-c` now refuses here, naming `--clean`.) |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither. |
@@ -951,6 +998,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
@@ -983,6 +1031,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--elements-per-blob <N>` | Per-blob element cap [default: 8000]. `8000` matches the osmium / Geofabrik convention; pass a larger value to approximate `planet.openstreetmap.org`-style packing. Must be > 0. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -1005,6 +1054,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more than `block-cap + 1` elements). Triggers `sort`'s overlap-rewrite path. |
 | `--unsort-intra` | Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with an internal ID-order inversion but non-overlapping blob ranges - the intra-blob shape `sort`'s overlap detector cannot see. Mutually exclusive with `--unsort`. |
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved; downstream `add-locations-to-ways` runs see a redundancy-free starting point. |
@@ -1051,6 +1101,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
 | `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see `reference/performance.md`). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -1087,6 +1138,7 @@ pbfhogg extract [OPTIONS] <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file (required for single extract, omit with --config) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output, or every output a `--config` names, in `DIR` instead of beside it; checked against every output's directory before any is reserved (see [Staging directory](#staging-directory)) |
 | `-b, --bbox <BBOX>` | Bounding box: minlon,minlat,maxlon,maxlat |
 | `-p, --polygon <FILE>` | Polygon GeoJSON file |
 | `--config <FILE>` | Multi-extract JSON config file. (`-c` used to be its short; `-c` now refuses here, naming `--config`.) |
@@ -1148,6 +1200,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--input-kind <KIND>` | Input kind override: `pbf` or `osc` (autodetect from extension by default) |
 | `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only). Not with `--remove-tags` (no referenced objects to strip) or `-j` (no worker pool) |
 | `--invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only). (`-i` used to be its short; `-i` now refuses here, naming `--invert-match`.) |
@@ -1180,6 +1233,7 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `-o, --output <FILE>` | Write to a file instead of stdout |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)). Requires `-o` |
 | `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
 | `-t, --type <TYPE>` | Export only these kinds: `node`, `way` or `node,way`. `relation` is refused |
 | `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
@@ -1212,6 +1266,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-s, --osmium-summary` | Print osmium-style summary (`Summary: left=N right=N same=N different=N`) on stderr instead of the default pbfhogg-format summary. Both formats fire on stderr unless `-q` (text only; refused with `-q`) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`; refused with `-q` on a text diff) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)). Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `-j, --jobs <N>` | Worker threads, and the number of ID-range shards (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses one shard per core; `1` runs one shard on the main thread, which for text writes no scratch. The answer is the same at any `-j`. Applies to both text and `--format osc`; sharding requires both inputs to be indexed. A multi-shard run writes its shard files to the run's scratch directory (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion; a quiet text diff, which only counts, writes none. |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
@@ -1282,6 +1337,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `--remove-tags` | Remove tags from referenced objects. Requires `-r`, which is what emits them (so not with `--invert`). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
@@ -1319,6 +1375,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--add-self` | Also include the queried objects themselves in the output. (`-s` used to be its short; `-s` now refuses here, naming `--add-self`.) |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
@@ -1361,6 +1418,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (runtime routing; see [pipeline.md](pipeline.md#add-locations-to-ways)) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata into the output header, readable back via `Blob::way_members` / `Way::shared_node_pins` |
@@ -1400,6 +1458,7 @@ is.
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--generator` | Override writing program name |
@@ -1436,6 +1495,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--locations-on-ways` | Keep inline way-node locations current through the merge (see below and DEVIATIONS.md). |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
 | `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum 2). An explicit `-j N` runs exactly `N` workers, `1` included. |
@@ -1531,6 +1591,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--simplify` | Keep only the last change per object (type + id) |
 | `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
 | `-j, --jobs <N>` | Worker threads (see [`-j/--jobs`](#-j--jobs)). Sizes both the per-input parse fan-out (capped by input count) and the simplify path's chunk fan-out. |
@@ -1560,6 +1621,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `-O, --overwrite` | Replace an existing index (or empty directory) at `--output-dir` after the new build succeeds. Without it an existing `--output-dir` is refused before any work. Does not bypass the indexdata requirement |
+| `--staging-dir <DIR>` | Stage the new index in `DIR` instead of beside `--output-dir`; `DIR` must not lie inside `--output-dir` (see [Staging directory](#staging-directory)) |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
 | `--force` | Legacy shorthand equivalent to `--overwrite --allow-unindexed`. Every use warns that it also grants overwrite, naming the two flags to spell instead |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the directory containing `--output-dir` |

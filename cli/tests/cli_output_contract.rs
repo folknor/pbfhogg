@@ -252,6 +252,8 @@ enum Prop {
     Quiet,
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     Interrupted,
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    StagingDir,
 }
 
 struct Row {
@@ -1398,11 +1400,13 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
             .args([row.command, "--help"])
             .assert_success()
             .stdout_str();
-        if !help.contains("--overwrite") {
-            problems.push(format!(
-                "[{}] is in ROWS but `{} --help` offers no --overwrite",
-                row.label, row.command
-            ));
+        for flag in ["--overwrite", "--staging-dir"] {
+            if !help.contains(flag) {
+                problems.push(format!(
+                    "[{}] is in ROWS but `{} --help` offers no {flag}",
+                    row.label, row.command
+                ));
+            }
         }
         if row.tmp_dir != help.contains("--tmp-dir") {
             problems.push(format!(
@@ -1416,7 +1420,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
             .args([name, "--help"])
             .assert_success()
             .stdout_str();
-        for flag in ["--overwrite", "--output-dir", "--output <"] {
+        for flag in ["--overwrite", "--output-dir", "--output <", "--staging-dir"] {
             if help.contains(flag) {
                 problems.push(format!(
                     "`{name}` is marked as writing no output ({reason}) but offers {flag}"
@@ -1812,6 +1816,149 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
 #[test]
 fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
     run_property(Prop::Interrupted, interrupted_run_leaves_nothing, |_| true);
+}
+
+/// Every name pbfhogg leaves behind anywhere under `dir`.
+#[cfg(feature = "test-hooks")]
+fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for name in names(dir) {
+        let path = dir.join(&name);
+        if name.starts_with(".pbfhogg-") {
+            found.push(path);
+        } else if path.is_dir() && !path.is_symlink() {
+            found.extend(hidden_anywhere(&path));
+        }
+    }
+    found
+}
+
+/// The `--staging-dir` guarantee (`reference/cli-reference.md`, "Names
+/// pbfhogg leaves behind"): a run killed outright, with no chance to clean
+/// up, leaves its staging only in `--staging-dir` and its scratch only in
+/// `--tmp-dir`, and nothing beside its outputs, for every output form a
+/// caller can pass. The next run in the same directories succeeds and
+/// reports the staging entry it finds there.
+#[cfg(feature = "test-hooks")]
+fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let count = interrupted::checkpoint_count(fx, row)?;
+    let (out_dir, staging, tmp, control) = (
+        crate::common::test_scratch(),
+        crate::common::test_scratch(),
+        crate::common::test_scratch(),
+        crate::common::test_scratch(),
+    );
+    let inv = (row.build)(
+        &Ctx {
+            fx,
+            out: out_dir.path(),
+        },
+        Input::Good,
+    );
+    let mut extra: Vec<OsString> = vec!["--staging-dir".into(), staging.path().into()];
+    extra.extend(interrupted::visible_scratch_args(row));
+    extra.extend(tmp_args(row.tmp_dir.then_some(tmp.path())));
+    let ready = control.path().join("ready");
+    let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
+    pause.push(ready.as_os_str());
+    pause.push(":stuck");
+    let mut child = CliInvoker::new()
+        .args(&inv.args)
+        .args(&extra)
+        .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
+        .spawn();
+    let start = Instant::now();
+    while !ready.exists() {
+        ensure!(!child.has_exited(), "the run ended before its pause");
+        ensure!(
+            start.elapsed() < Duration::from_secs(10),
+            "the pause was never reached"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    child.signal(libc::SIGKILL);
+    drop(child.wait());
+
+    let beside = hidden_anywhere(out_dir.path());
+    ensure!(
+        beside.is_empty(),
+        "a killed run left {beside:?} beside its outputs"
+    );
+    let staged = names(staging.path());
+    ensure!(
+        !staged.is_empty() && staged.iter().all(|n| n.starts_with(".pbfhogg-tmp-")),
+        "--staging-dir holds {staged:?}, wanted the killed run's staging entries"
+    );
+    let scratch = names(tmp.path());
+    ensure!(
+        scratch.iter().all(|n| n.starts_with(".pbfhogg-run-")),
+        "--tmp-dir holds {scratch:?}"
+    );
+
+    let next = CliInvoker::new().args(&inv.args).args(&extra).run();
+    let stderr = next.stderr_str();
+    ensure!(exited_ok(row, &next), "the next run failed: {stderr}");
+    ensure!(
+        stderr.contains(&staging.path().join(&staged[0]).display().to_string()),
+        "the next run did not report the staging entry in --staging-dir; stderr:\n{stderr}"
+    );
+    ensure!(
+        hidden_anywhere(out_dir.path()).is_empty(),
+        "the next run left {:?} beside its outputs",
+        hidden_anywhere(out_dir.path())
+    );
+    ensure!(
+        names(staging.path()) == staged,
+        "the next run changed --staging-dir: {:?}, before {staged:?}",
+        names(staging.path())
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_killed_run_leaves_disposable_entries_only_in_the_directories_it_was_given() {
+    run_property(
+        Prop::StagingDir,
+        killed_run_leaves_only_what_its_directories_hold,
+        |_| true,
+    );
+}
+
+/// `--staging-dir` is checked before any work, and its refusals exit as
+/// usage or output errors that name the flag in their advice.
+#[test]
+fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    crate::common::write_base_pbf(&input);
+    let output = dir.path().join("out.osm.pbf");
+    let refused = CliInvoker::new()
+        .args(["sort", input.to_str().unwrap(), "-o"])
+        .arg(&output)
+        .arg("--staging-dir")
+        .arg(dir.path())
+        .run();
+    let stderr = refused.stderr_str();
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("is or contains the directory"), "{stderr}");
+    assert!(stderr.contains("--staging-dir"), "{stderr}");
+    assert!(!output.exists());
+    assert!(hidden(dir.path()).is_empty(), "{:?}", hidden(dir.path()));
+
+    // A text diff to stdout has no output to stage.
+    let usage = CliInvoker::new()
+        .args(["diff", input.to_str().unwrap(), input.to_str().unwrap()])
+        .arg("--staging-dir")
+        .arg(dir.path())
+        .run();
+    assert_eq!(usage.status.code(), Some(2), "{}", usage.stderr_str());
+    assert!(
+        usage.stderr_str().contains("--output"),
+        "{}",
+        usage.stderr_str()
+    );
 }
 
 /// Every row, a pause at every ordinal of its counting run rather than a

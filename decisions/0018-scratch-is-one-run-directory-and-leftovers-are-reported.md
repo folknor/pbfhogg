@@ -8,8 +8,10 @@ Status: Accepted (supersedes the scratch-directory and entry-time-sweep rules of
 Disposable files a command writes - the external join's id shards and slot
 buckets, the sparse node store, diff and derive shard files, the geocode
 builder's cell buckets - live in exactly one directory per run, a
-`pbfhogg::scratch::RunScratch`. Outputs are not scratch (ADR-0017); they are
-staged beside their destination because publication is a rename.
+`pbfhogg::scratch::RunScratch`. Outputs are not scratch (ADR-0017); their
+staging goes beside the destination, or in a caller-chosen staging directory
+on the same mount, because publication is a rename, and never in the run
+directory.
 
 - **The directory.** `RunScratch::create(parent, &host)` requires `parent` to
   exist and be a directory, then makes
@@ -65,8 +67,9 @@ staged beside their destination because publication is a rename.
   are what was seen, not proofs: network filesystems may lock locally (below), a forked
   child can keep a lock alive, and a pid can be reused or belong to another
   container sharing the volume; the rendered text says "probably". The CLI
-  scans each output directory and `--tmp-dir` once, before it reserves any
-  output of its own, and `report_stale` emits one warning per entry through the
+  scans each output directory, `--tmp-dir` and `--staging-dir` (ADR-0017)
+  once, before it reserves any output of its own, and `report_stale` emits
+  one warning per entry through the
   diagnostics sink (`scratch.stale`, and `scratch.backup` for backups).
   A `.pbfhogg-backup-*` entry can hold the only copy of a user's previous
   output: it is its own kind with its own wording, and no code path removes it.

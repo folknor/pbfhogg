@@ -29,11 +29,33 @@ output any other way.
   kind is anywhere inside it, live run directories included, because
   replacing it deletes the old tree; only an index's `.buckets-level*`
   scratch trees may go with it (ADR-0018). Construction then reserves a hidden
-  staging sibling, `.pbfhogg-tmp-<pid>-<n>.<name tail>` (the marker is a
+  staging entry, `.pbfhogg-tmp-<pid>-<n>.<name tail>` (the marker is a
   prefix, so suffix-sniffing writers see the destination's suffix), created
-  exclusively, which also proves the directory exists and is writable.
+  exclusively. By default it is a sibling of the destination, and creating
+  it also proves the destination's directory exists and is writable.
   `OutputSet::files` checks every member, and refuses members resolving to
   one file, before any of them is staged.
+- **A caller may choose where staging goes.** The `with_staging`
+  constructors (`Output`, `OutputDir`, `OutputSet::files_with_staging`,
+  `index_output_with_staging`) reserve the staging entry in a caller-chosen
+  directory instead, so a caller that gives each run a private directory can
+  remove it whole after a run killed outright, without matching any name.
+  Nothing else moves there: a backup always stays beside its destination,
+  because it can be the only copy of a previous output and the caller removes
+  its staging directory wholesale. The names stay unique per process and
+  sequence: a name derived from the destination alone would put every run to
+  one destination in one namespace, and taking over a dead run's entry there
+  needs an ownership protocol spanning reservation through rollback that no
+  lock can provide where locks are unreliable (client-local NFS locks), while
+  writers reopen the staging path by name. Construction refuses the
+  directory (`OutputError::StagingDir`) unless it is a directory on the same
+  mount as every destination's directory (device, and `statx` mount id where
+  reported; a bind mount shares the device), is not and does not contain any
+  destination's directory (removing it must never delete an output or a
+  backup beside one), and does not lie inside a directory output; a set is
+  checked against every member before any is reserved. Because reserving
+  there no longer proves the destination's directory is writable, that is
+  checked separately (`faccessat` with `W_OK | X_OK` and `AT_EACCESS`).
 - **Library entry points take the output by value and are its only
   publisher.** `sort(input, output: Output, ...)` writes through a borrowing
   engine (`sort_to(input, &output, ...)`) and calls `output.publish(&host.invocation)` as its
@@ -115,10 +137,14 @@ output any other way.
   `File::sync_all` and `sync_data` across the library and the CLI so a
   hand-rolled sync cannot return. `O_DIRECT` and `io_uring` outputs are
   synced too: bypassing the page cache is not stable storage.
+  After the renames publication syncs every directory they changed: each
+  destination's directory and the directory each new generation was renamed
+  out of (a staging directory, or a directory output's staging container).
+  Syncing an ancestor does not make a child directory's change durable.
   What changed at the end of a run, for anyone reading the counters or the
   descriptor budget: `writer_sync_all_calls` / `writer_sync_all_ns` now also
-  count the directory syncs (each parent once, plus a backup's container and
-  parent before a replacing swap), not just file syncs; for the
+  count the directory syncs (each changed directory once, plus a backup's
+  container and parent before a replacing swap), not just file syncs; for the
   command-layer writers `writer_flush_ns` no longer includes the `fsync`,
   which moved into the publication span (the public durable
   `PbfWriter::to_path*` writers, `bench-write`'s among them, still sync
@@ -157,9 +183,9 @@ output any other way.
   guard) spans the whole process by definition and includes publication.
   Brokkr's external wall clock around the child process necessarily includes
   the sync and the rename; that is intended, and the sidecar's spans are how to
-  attribute it. The parent directory is synced after the renames, every
-  distinct parent is attempted, and only when every one succeeded are the
-  replaced outputs' backups removed. A sync failure returns
+  attribute it. The changed directories are synced after the renames, every
+  one is attempted, and only when every one succeeded are the replaced
+  outputs' backups removed. A sync failure returns
   `OutputError::Unsynced`, whose text says the output was published; every
   backup is then kept, its container synced best effort, and the error names
   each one (and says so if that sync failed too): until the replacement is
@@ -190,7 +216,7 @@ decision is made publication completes; `Output::writer(&Invocation)` (on each
 buffer flush and in `finish`) and the PBF writer (on each write method, not
 in its end-of-stream `flush`) observe the token, so a run cancelled mid-write
 fails its session. A process killed outright (SIGKILL, the OOM killer, power
-loss, the CLI's second interrupt) can leave `.pbfhogg-tmp-*` staging behind, and a failed rollback or an unsynced
+loss, the CLI's second interrupt) can leave `.pbfhogg-tmp-*` staging behind (in the staging directory, when the caller chose one), and a failed rollback or an unsynced
 publication leaves `.pbfhogg-backup-*` on purpose; neither is ever under the
 name the caller chose. Every recursive removal publication does - a replaced
 output's backup after success, an unpublished directory output's staging on
@@ -209,6 +235,21 @@ leftover instead. A previous output whose contents cannot be unlinked stays
 in its `.pbfhogg-backup-*` sibling, possibly partly removed.
 
 ## Alternatives considered
+
+- **Staging named by the destination alone (`.pbfhogg-tmp.<name>`), a dead
+  run's entry taken over by the next run.** Rejected (2026-10-28): a renamed
+  file frees the name while group rollback can still unlink the destination,
+  so a second run reserving it can lose its published output; writers reopen
+  the staging path by name, so on client-local NFS locks a displaced run
+  writes into the new owner's file and an identity check only detects it;
+  and a staging directory without its lock file cannot be told apart from
+  one being set up. A caller-chosen staging directory gives a caller the same
+  cleanup without any shared namespace.
+- **Deterministic backup names, refusing while one exists.** Rejected: a
+  backup is never a caller's to clean up, so a computable name buys no
+  cleanup, while refusing turns one interrupted publication into a failure
+  of every later replacing run, and it would not serialize concurrent
+  publishers anyway.
 
 - **Keep the guard at the CLI front end (ADR-0003's rule).** A library
   caller then got truncate-then-fail, and two library entry points had

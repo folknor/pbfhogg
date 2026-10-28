@@ -104,6 +104,9 @@ pub(crate) struct CommandPaths {
     /// Further directories the leftover scan covers, scanned first: where
     /// older versions of the command, or its other modes, put their scratch.
     also_scan: Vec<PathBuf>,
+    /// `--staging-dir`: where the run's output staging goes instead of
+    /// beside each output.
+    staging: Option<PathBuf>,
 }
 
 impl CommandPaths {
@@ -118,12 +121,14 @@ impl CommandPaths {
             outputs: Vec::new(),
             scratch: None,
             also_scan: Vec::new(),
+            staging: None,
         };
         let file = |path: &PathBuf| NamedOutput::File(path.clone());
         match command {
             Command::Cat { files, output, .. } => {
                 paths.inputs.clone_from(files);
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::Sort {
                 file: input,
@@ -152,6 +157,7 @@ impl CommandPaths {
             } => {
                 paths.inputs.push(input.clone());
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::AddLocationsToWays {
                 file: input,
@@ -161,6 +167,7 @@ impl CommandPaths {
             } => {
                 paths.inputs.push(input.clone());
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
                 paths.scratch = Some(ScratchSite::new(tmp, Some(&output.output)));
             }
             Command::TagsFilter {
@@ -172,6 +179,7 @@ impl CommandPaths {
                 paths.inputs.push(input.clone());
                 paths.inputs.extend(expressions_file.clone());
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::Getid {
                 file: input,
@@ -191,21 +199,25 @@ impl CommandPaths {
                 paths.inputs.extend(id_file.clone());
                 paths.inputs.extend(id_osm_file.clone());
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::Export {
                 file: input,
                 output,
+                overwrite,
                 expressions_file,
                 ..
             } => {
                 paths.inputs.push(input.clone());
                 paths.inputs.extend(expressions_file.clone());
                 paths.outputs.extend(output.as_ref().map(file));
+                paths.staging.clone_from(&overwrite.staging_dir);
             }
             Command::Diff {
                 old,
                 new,
                 output,
+                overwrite,
                 jobs,
                 format,
                 tmp,
@@ -213,6 +225,7 @@ impl CommandPaths {
             } => {
                 paths.inputs.extend([old.clone(), new.clone()]);
                 paths.outputs.extend(output.as_ref().map(file));
+                paths.staging.clone_from(&overwrite.staging_dir);
                 if diff_writes_scratch(*format, quiet, *jobs) {
                     paths.scratch = Some(ScratchSite::new(tmp, output.as_deref()));
                 }
@@ -229,6 +242,7 @@ impl CommandPaths {
             Command::Extract {
                 file: input,
                 output,
+                staging_dir,
                 polygon,
                 config,
                 ..
@@ -237,6 +251,7 @@ impl CommandPaths {
                 paths.inputs.extend(polygon.clone());
                 paths.inputs.extend(config.clone());
                 paths.outputs.extend(output.as_ref().map(file));
+                paths.staging.clone_from(staging_dir);
             }
             Command::ApplyChanges {
                 base,
@@ -252,23 +267,27 @@ impl CommandPaths {
             } => {
                 paths.inputs.extend([base.clone(), changes.clone()]);
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::MergeChanges {
                 changes, output, ..
             } => {
                 paths.inputs.clone_from(changes);
                 paths.outputs.push(file(&output.output));
+                paths.staging.clone_from(&output.staging_dir);
             }
             Command::BuildGeocodeIndex {
                 file: input,
                 output_dir,
                 tmp,
+                staging_dir,
                 ..
             } => {
                 paths.inputs.push(input.clone());
                 paths
                     .outputs
                     .push(NamedOutput::IndexDir(output_dir.clone()));
+                paths.staging.clone_from(staging_dir);
                 paths.scratch = Some(ScratchSite::new(tmp, Some(output_dir)));
             }
             Command::Inspect {
@@ -343,16 +362,25 @@ impl CommandPaths {
             .transpose()
     }
 
+    /// `--staging-dir`, when given.
+    pub(crate) fn staging_dir(&self) -> Option<&Path> {
+        self.staging.as_deref()
+    }
+
     /// Report what earlier runs that never finished left where this command
     /// line's leftovers would be: the places in `also_scan`, the directory of
-    /// each output (staging and backups sit beside it), the scratch location,
-    /// and the inside of an index directory about to be replaced.
+    /// each output (staging, unless `--staging-dir` moves it, and backups sit
+    /// beside it), `--staging-dir`, the scratch location, and the inside of
+    /// an index directory about to be replaced.
     pub(crate) fn scan_leftovers(&self, scanner: &mut LeftoverScanner, host: &pbfhogg::host::Host) {
         for dir in &self.also_scan {
             scanner.dir(dir, host);
         }
         for output in &self.outputs {
             scanner.dir(&parent_of(output.path()), host);
+        }
+        if let Some(dir) = &self.staging {
+            scanner.dir(dir, host);
         }
         if let Some(site) = &self.scratch {
             scanner.dir(&site.parent, host);

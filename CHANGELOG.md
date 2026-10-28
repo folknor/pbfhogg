@@ -285,7 +285,7 @@
   --force` with `--index-type external` or `--inject-prepass`, and
   `apply-changes --force --locations-on-ways` (all three used to be refused
   only on unindexed input, after the input was opened; on indexed input
-  `--force` did nothing); `diff --tmp-dir` with text `-j 1` or `-v`; `diff
+  `--force` did nothing); `diff --tmp-dir` with text `-j 1`; `diff
   -q` with `-c`, `-v` or `-s`; `check -q` with `--show-ids` or
   `--max-errors`; and in OSC-mode `tags-filter`, `--compression`,
   `--direct-io` and `--force`, which were accepted and discarded. `getid`
@@ -1101,6 +1101,15 @@
   CLI. Same for the `dense` index-type parse error.
 
 ### Added
+
+- **The CLI's process contract is stated: it starts no other process and
+  leaves inherited descriptors alone.** Once the `pbfhogg` process has
+  exited, nothing it started can still use its `--staging-dir` or
+  `--tmp-dir`, and a descriptor the caller passes it (for example one
+  holding a lock as a lease on those directories) stays open until it
+  exits: pbfhogg never closes, replaces or changes the flags of a
+  descriptor it inherited. A caller can tie the removal of a run's private
+  directories to that lease.
 
 - **`--staging-dir <DIR>` on every command that writes an output.** Each
   output's hidden staging entry is reserved in `DIR` instead of beside the
@@ -2176,7 +2185,7 @@
   negative IDs, which the external join cannot handle (the sparse index
   can). Ranges are exact by contract, so a file whose indexdata overstates
   `max_id` is refused too.
-- **`diff -j 1`, `diff -v` and a quiet text `diff` no longer need a
+- **`diff -j 1` and a quiet text `diff` no longer need a
   writable current directory.** A text diff whose command line guarantees
   the sequential path makes no scratch directory, so it runs from a
   read-only directory and no longer creates and removes a `.pbfhogg-run-*`

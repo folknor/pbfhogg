@@ -213,9 +213,14 @@ then inside them. The one thing that can still appear beside an output is a back
 replaced output (`.pbfhogg-backup-*`), which may be the only copy of it and is never yours to
 sweep automatically.
 
+"Once the run has stopped" means once the pbfhogg process has exited: the CLI starts no other
+process, and it never closes, replaces or changes the flags of a descriptor it inherited, so a
+descriptor you pass it (say, one holding a lock as a lease on those directories) stays open
+exactly until it exits.
+
 ## Scratch files
 
-`add-locations-to-ways`, `diff` (parallel `-j` text that is not `--quiet`, and `--format osc`) and
+`add-locations-to-ways`, `diff` (text other than `-j 1` or `--quiet`, and `--format osc`) and
 `build-geocode-index` write scratch: disposable files that can be very large (hundreds of GB for
 `add-locations-to-ways --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,

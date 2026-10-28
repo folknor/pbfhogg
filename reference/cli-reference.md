@@ -462,15 +462,18 @@ from `Output::with_staging`, `OutputDir::with_staging`,
 
 ## Scratch files
 
-`add-locations-to-ways`, `diff` (parallel `-j`, and `--format osc`) and `build-geocode-index` write
+`add-locations-to-ways`, `diff` (text other than `-j 1` or `--quiet`, and `--format osc`) and `build-geocode-index` write
 scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
 whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
 says where the leftover is. The directory is made at startup, before any input is opened, by
 every run that may need scratch. A run whose command line guarantees it writes none (text
-`diff -j 1`, text `diff -v`, and a quiet text `diff`, which only counts and shards without
-writing any text) makes no directory and needs no writable location.
+`diff -j 1`, and a quiet text `diff`, which only counts and shards without writing any text)
+makes no directory and needs no writable location. `-v` does not suppress the directory: a
+verbose text diff shards like any other. A text diff with automatic jobs makes its directory
+even when the run turns out to need one shard and writes nothing there, since the shard count
+depends on inputs it has not opened yet.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
@@ -539,6 +542,15 @@ scan of that directory reports them. Published outputs stay at the paths that we
 including ones a killed group publication left installed: publishing several outputs is not
 all-or-nothing across a process death. Stale staging therefore never reaches the next run's
 directories, so no run has to decide whether to overwrite or refuse it.
+
+"Every process using those directories" is the pbfhogg process alone. The `pbfhogg` CLI starts no
+other process; its threads end when it exits, so once it has exited no process or thread it
+started can still use its staging or scratch directories. It never closes or replaces a
+descriptor it inherited, nor changes that descriptor's descriptor or file-status flags, so an
+extra descriptor the caller passes it (for example one on which the caller holds a lock as a
+lease for those directories) stays open until the pbfhogg process exits. This is about processes
+and descriptors, not kernel I/O: the kernel may finish asynchronous cleanup after the process is
+gone.
 
 The spellings below are the contract for an external tool that cannot do that (a cleanup job
 sweeping directories it did not hand out). `<pid>` is the pid of the pbfhogg process, `<seq>` a

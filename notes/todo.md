@@ -727,6 +727,21 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   blob whose first element is negative and whose range is mixed-sign
   (indexdata campaign, 2026-10-28).
 
+- [ ] **The no-helper-process and inherited-descriptor promise has no
+  behavioural test.** reference/cli-reference.md "Names pbfhogg leaves
+  behind" promises the CLI starts no other process and never closes,
+  replaces or changes the flags of an inherited descriptor (brokkr ties
+  removal of a run's private directories to a lease lock on a descriptor it
+  passes the child). Only brokkr.toml textlint tripwires guard it
+  (`no-child-process-or-descriptor-reset`, `no-file-status-flag-change`,
+  `no-hotpath-cpu`), which an aliased or wrapped import, or a dependency
+  that starts a process, escapes. A deterministic test is possible: give
+  `CliInvoker` a way to pass an extra non-CLOEXEC pipe descriptor, park the
+  run with `PBFHOGG_TEST_CANCEL_PAUSE`, assert `/proc/<pid>/fd/<n>` is still
+  that pipe and no process has the child as its parent, then let it finish
+  and assert the pipe reads EOF. It still proves less than the whole
+  contract (one checkpoint, one command), so it complements the tripwires.
+
 ### Read path
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**

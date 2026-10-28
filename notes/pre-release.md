@@ -97,11 +97,6 @@ v2). The CLI surface redesign is deferred past 0.6.0.
     reorder or a dropped duplicate prints the modification with no member
     lines. Open: diff member order (osmium's CRC is order-sensitive), or say
     "member order or multiplicity changed".
-  - `#21`, `#22`, `#23`: done 2026-10-28. The node scanner and the
-    apply-changes way-location refresh scale exactly (checked `i64`, `i128`
-    on overflow); the columnar granularity-100 shortcut is deleted. Planet
-    A/Bs of all four commands were inside noise; numbers in
-    `reference/performance.md` "Coordinate scaling".
 - **`packed_varint_count`** (`e61e0ad7`): ruled measure first, then decide;
   the decision tree is with its cell below.
 - **diff `-j 1`**: if its cell shows it clearly worse, give one-shard runs a
@@ -252,8 +247,7 @@ behind a slow head for no memory gain; with `--keep-untagged-nodes`, stage 4
 copying the node prefix only after the first way result. The audit specified
 `60e1b691` vs `56a50e0d`; that pair measures the window-deep channel the fix
 removed, so pair `60e1b691` against `c2409c45` (the shape that ships) and
-bisect inside if it moves. (The `#23` cell named at the end of this item
-is done.) Phase split first, in this order:
+bisect inside if it moves. Phase split first, in this order:
 
 1. `add-locations-to-ways --index-type external` on planet, zlib:6: stage 1
    and stage 4 walls, peak anon, `s4_*`.
@@ -270,10 +264,7 @@ is done.) Phase split first, in this order:
 Also here: extract simple's two pools moved onto the unordered driver and
 gained `WILLNEED` (`8928de18`; ruled kept, measured in the campaign):
 `extract --simple` on planet (a recorded row exists) and europe,
-`8928de18^` vs `8928de18`. And `#23`: `extract --strategy smart` (Europe
-bbox) and `multi-extract --regions 5` on planet, HEAD vs the variant with
-the columnar granularity-100 fast path and its `offset % 100` guard removed;
-under noise, delete it and resolve `#22`.
+`8928de18^` vs `8928de18`.
 
 **3. sort and `cat --dedupe` on one engine** (`79d2e923`, then `060c2f74`
 and `8928de18`). Pass 1 moved to `HeaderWalker` preads (sort's measured
@@ -387,7 +378,6 @@ moves.
   hands the walker's descriptor to the workers. Renumber is not on the
   shared-walker side (its one shared body descriptor is a different
   question), and `InputFront` is a probe closed before any pass.
-- `#21`'s fix: done 2026-10-28, inside noise on both.
 
 **8. apply-changes.**
 

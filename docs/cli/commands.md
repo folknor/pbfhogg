@@ -788,7 +788,7 @@ geometry are skipped and reported in the stderr summary.
 
 ### diff
 
-Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](/cli/deviations#diff-content-equality-vs-version-ordering)).
+Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
@@ -816,7 +816,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1` and with `-q` on a text diff, which write no scratch |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
-With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
+With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
 
 Inputs holding any negative ID always run as one shard, whatever `-j` says: shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
 

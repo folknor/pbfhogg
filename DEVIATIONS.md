@@ -80,7 +80,9 @@ publishes the output; that is pbfhogg's own placeholder, not osmium's output.
 
 **Rationale:** Null Island is a valid coordinate, so a placeholder-bearing
 output cannot distinguish missing data from real data. Failure by default
-matches `add-locations-to-ways` and keeps the lossy behavior explicit.
+matches `add-locations-to-ways` and keeps the lossy behavior explicit. The
+escape hatch matters for incremental extracts, where a regional base plus a
+full-planet change stream legitimately references nodes outside the region.
 
 Only the references of ways the OSC creates or modifies are resolved against
 the base's node records. A surviving base way is not: it keeps its inline
@@ -235,23 +237,45 @@ project rule that a command must not report success having done something
 other than what was asked. The escape hatch exists because replaying a
 change stream backwards is a legitimate, if rare, thing to want.
 
-## derive-changes: lossless delete roundtrip
+## derive-changes: changes are decided by content, not version
 
-**osmium behavior:** `osmium derive-changes` loses deletes when generating an OSC
-from two PBFs. In Denmark cross-validation, osmium's OSC is missing 1243 deletes
-that are present in the original diff.
+**osmium behavior:** `osmium derive-changes` walks both inputs in
+type/id/version/timestamp order (timestamps take part only when both are
+valid). An object only in the old file is written as a delete, one only in the
+new file as a create or modify, and two objects with the same type, id and
+version (and timestamp, where both are valid) count as unchanged whatever
+their content. So a content change that kept its version and timestamp is
+missed, and a new version or timestamp with identical content is written as a
+change.
 
-**pbfhogg behavior:** `diff --format osc` produces a perfect roundtrip - applying
-the derived OSC to the old PBF reproduces the new PBF exactly. As of
-2026-07-10 this includes element metadata: derive emits the full
-attribute set (version, timestamp, changeset, uid, user) and
-apply-changes carries OSC metadata into its output, so the roundtrip is
-metadata-lossless, not just content-lossless (pinned by
-`derive_then_apply_preserves_metadata` in `tests/roundtrip_invariants.rs`).
+**pbfhogg behavior:** `diff --format osc` decides by content - coordinates,
+tags, way refs and relation members, exactly what `diff` compares (defined in
+`src/content.rs`) - and ignores metadata. Applying the derived OSC to the old
+PBF therefore gives a file whose content equals the new PBF's, so a `diff` of
+the result against the new PBF reports no differences. Creates and modifies
+carry each element's metadata (version, timestamp, changeset, uid, user) and
+deletes carry its version, the same whether or not the inputs have indexdata;
+`derive_then_apply_preserves_metadata` in `tests/roundtrip_invariants.rs`
+pins that the metadata of a changed element survives the roundtrip.
 
-**Rationale:** Not a design choice - osmium simply cannot represent certain deletes
-when the deleted element is absent from both input files. pbfhogg's content-equality
-diff captures all three change types (create, modify, delete) correctly.
+What that check cannot see is metadata, and anything else outside the content
+definition (inline way coordinates, `visible`, the file header). An element
+whose only change is its metadata (a version bump with identical content) is
+not a change at all: it gets no OSC entry, and the applied result keeps the old
+file's metadata for it. A further margin: a dense node with no version (stored
+as version 0) prints only its non-zero metadata fields, because a zero there
+cannot be told apart from the padding a node without metadata gets (see
+CORRECTNESS.md, "Version 0 is not a version claim either"), so a zero-valued
+field on such a node does not survive the roundtrip.
+
+**Cross-validation:** The two tools agree on deletes: both write one for every
+object only the old file holds. A derived OSC is a snapshot delta, so neither
+reproduces changes a replication diff for the same window also carries, such
+as an object created and deleted between the two snapshots.
+
+**Rationale:** Content equality is deterministic regardless of metadata
+completeness, and matches what `diff` reports; see "diff: content equality vs
+version ordering" above.
 
 ## extract: relation inclusion criteria differences
 

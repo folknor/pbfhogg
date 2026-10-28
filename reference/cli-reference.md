@@ -1311,7 +1311,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1`, whose one shard writes no scratch, and with `-q` on a text diff, which only counts (`--format osc` writes scratch on every path) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
-With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
+With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
 
 Inputs holding any negative ID always run as one shard, whatever `-j` says: shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
 

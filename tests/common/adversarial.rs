@@ -190,9 +190,10 @@ pub fn forge_indexdata_range(
 ///
 /// **Scope.** This helper is byte-level: the inner protobuf encoding
 /// produced by the original `BlockBuilder` is preserved unchanged.
-/// pbfhogg's parser silently skips repeated scalar fields encoded as
-/// non-packed entries (see `CORRECTNESS.md` "Non-packed repeated
-/// fields"), but `mutate_blob_payload` cannot exercise that edge case
+/// pbfhogg's parser accepts one unpacked value for a repeated scalar
+/// field and refuses several (see `CORRECTNESS.md` "Repeated scalar
+/// fields: one non-empty wire occurrence"), but `mutate_blob_payload`
+/// cannot exercise that edge case
 /// on its own: the closure receives bytes that are already
 /// packed-encoded by the fixture writer, so chopping or splicing them
 /// keeps them packed. A future test that needs to inject non-packed

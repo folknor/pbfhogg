@@ -37,6 +37,18 @@ other ignored trees never matter:
      code files only comment text is read: a string literal legitimately
      carries a path that need not exist, such as a test's invented argv.
 
+     A link's ``#fragment`` is checked too when the link resolves to a
+     markdown file, a same-page ``#fragment`` included: it must name a
+     heading (or an explicit ``{#id}`` or ``<a id=...>``/``<a name=...>``
+     anchor) of that file, slugged the way the page that receives the reader
+     renders it. A link from a site page to a site page lands on VitePress,
+     every other link on GitHub, and the two slug rules differ (VitePress
+     collapses a run of punctuation into one hyphen, GitHub keeps each
+     hyphen). A link to this repository's GitHub URL (``blob/main/PATH`` or
+     ``tree/main/PATH``) is resolved against the checkout like a relative
+     one: the site cannot link outside ``docs/`` any other way, so those
+     links are where it cites the root documents.
+
   3. source-comment-citations: comments under ``src/`` do not cite a Rust
      source line number. It loses its context as code moves; the comment must
      carry the needed context inline. (The work-item list lives in ``notes/``,
@@ -44,6 +56,10 @@ other ignored trees never matter:
 
 Root-level files and ``notes/`` are not scanned at all: the first are exempt,
 the second carries no truth guarantee, so a dead link there is its own business.
+The exception is ``CORRECTNESS.md`` and ``DEVIATIONS.md``: they sit at the root
+but are durable documents rather than tooling-found convention files, and the
+site's correctness and deviations pages point at them instead of carrying
+copies, so they are held to every check above.
 
 The last line on success is exactly ``document conventions ok``. brokkr's
 script_check matches the last line and ignores the exit code, so the sentinel is
@@ -55,6 +71,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -66,6 +83,16 @@ RUST = {".rs"}
 # Other authored text, read on comment lines only.
 COMMENTED = {".py", ".sh", ".toml", ".ts", ".yml", ".yaml", ".java", ".css"}
 DURABLE_DOC_DIRS = ("reference", "docs")
+# Root-level documents that are durable, not convention files: the single
+# source the site's pages link to (see the module docstring).
+DURABLE_ROOT_DOCS = frozenset({"CORRECTNESS.md", "DEVIATIONS.md"})
+# This repository on GitHub. A link of this shape names a checkout path.
+GITHUB_DOC_RE = re.compile(
+    r"^https://github\.com/folknor/pbfhogg/(?:blob|tree)/main/([^?#]*)(?:\?[^#]*)?(?:#(.*))?$"
+)
+ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
+EXPLICIT_ID_RE = re.compile(r"\s*\{#([^}\s]+)\}\s*$")
+HTML_ANCHOR_RE = re.compile(r"<a\s[^>]*\b(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
 # Top-level names claimed by the backticked-path leg even though git does not
 # track them: `.plans/` is gitignored local scratch and `plans/` the retired
@@ -162,6 +189,8 @@ def parent_of(rel):
 
 
 def is_durable(rel):
+    if rel in DURABLE_ROOT_DOCS:
+        return True
     return "/" in rel and not rel.startswith("notes/")
 
 
@@ -202,12 +231,17 @@ def notes_citations(rel, line):
 # ---------------------------------------------------------------- check 2
 
 
+def in_site(rel):
+    return rel.startswith("docs/") and not rel.startswith("docs/public/")
+
+
 def resolve_link(rel, target):
     """The repository path a markdown link from `rel` names, and whether it
-    exists."""
-    in_site = rel.startswith("docs/") and not rel.startswith("docs/public/")
+    exists. For a site link to a page the path is the markdown file VitePress
+    serves for it."""
+    site = in_site(rel)
     if target.startswith("/"):
-        if not in_site:
+        if not site:
             return target, False
         candidates = [normalize("docs" + target), normalize("docs/public" + target)]
     else:
@@ -215,12 +249,13 @@ def resolve_link(rel, target):
     for candidate in candidates:
         if candidate is None:
             continue
+        if site:
+            stem = candidate[:-5] if candidate.endswith(".html") else candidate
+            for page in (f"{stem}.md", f"{stem}/index.md"):
+                if page in FILE_SET:
+                    return page, True
         if exists(candidate):
             return candidate, True
-        if in_site:
-            stem = candidate[:-5] if candidate.endswith(".html") else candidate
-            if f"{stem}.md" in FILE_SET or f"{stem}/index.md" in FILE_SET:
-                return candidate, True
     return candidates[0], False
 
 
@@ -230,10 +265,11 @@ def blank(text, match, group=0):
 
 
 def link_targets(text):
-    """(offset, target) for every local markdown link, and `text` with the
-    links blanked so their text is not read again as a path citation (the link
-    target is the citation; a backticked copy of it in the link text is not a
-    second one)."""
+    """(offset, target, fragment) for every local markdown link, and `text`
+    with the links blanked so their text is not read again as a path citation
+    (the link target is the citation; a backticked copy of it in the link text
+    is not a second one). A same-page link has an empty target; a link to this
+    repository on GitHub has a target of the form `github:PATH`."""
     found = []
     for match in MD_LINK_RE.finditer(text):
         found.append((match.start(), match.group(2)))
@@ -243,12 +279,108 @@ def link_targets(text):
         text = blank(text, match)
     out = []
     for offset, target in found:
-        if SCHEME_RE.match(target) or target.startswith(("#", "//")):
+        github = GITHUB_DOC_RE.match(target)
+        if github:
+            path = urllib.parse.unquote(github.group(1)).rstrip("/")
+            fragment = urllib.parse.unquote(github.group(2) or "")
+            out.append((offset, f"github:{path}", fragment))
             continue
-        target = urllib.parse.unquote(target.split("#", 1)[0].split("?", 1)[0])
-        if target:
-            out.append((offset, target))
+        if SCHEME_RE.match(target) or target.startswith("//"):
+            continue
+        path, _, fragment = target.partition("#")
+        path = urllib.parse.unquote(path.split("?", 1)[0])
+        fragment = urllib.parse.unquote(fragment)
+        if path or fragment:
+            out.append((offset, path, fragment))
     return out, text
+
+
+# ---------------------------------------------------------------- anchors
+
+
+def strip_inline(text):
+    """Heading text as rendered: links reduced to their text, images
+    dropped, HTML tags and emphasis markers removed, code spans kept as
+    their literal content."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    spans = []
+
+    def keep(match):
+        spans.append(match.group(2).strip())
+        return f"\0{len(spans) - 1}\0"
+
+    text = CODE_SPAN_RE.sub(keep, text)
+    text = re.sub(r"\*+|(?<!\w)_+|_+(?!\w)", "", text)
+    return re.sub(r"\0(\d+)\0", lambda m: spans[int(m.group(1))], text)
+
+
+def github_slug(text):
+    """GitHub's heading id: lowercase, every character that is not a letter,
+    digit, space, hyphen or underscore dropped, each space a hyphen."""
+    text = text.strip().lower()
+    text = "".join(c for c in text if c.isalnum() or c in " -_")
+    return text.replace(" ", "-")
+
+
+# Spelled as code points so this file carries no typographic characters.
+CURLY_QUOTES = "".join(map(chr, (0x201C, 0x201D, 0x2018, 0x2019)))
+COMBINING_RE = re.compile("[" + chr(0x300) + "-" + chr(0x36F) + "]")
+VITEPRESS_SPECIAL_RE = re.compile(
+    "[\\s~`!@#$%^&*()\\-_+=\\[\\]{}|\\\\;:\"'" + CURLY_QUOTES + "<>,.?/]+"
+)
+
+
+def vitepress_slug(text):
+    """VitePress's heading id (the @mdit-vue slugify): accents decomposed and
+    dropped, each run of whitespace and ASCII punctuation one hyphen, no
+    hyphen at either end, a leading digit prefixed with an underscore."""
+    text = unicodedata.normalize("NFKD", text)
+    text = COMBINING_RE.sub("", text)
+    text = re.sub("[\u0000-\u001f]", "", text)
+    text = VITEPRESS_SPECIAL_RE.sub("-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    text = re.sub(r"^(\d)", r"_\1", text)
+    return text.lower()
+
+
+ANCHOR_CACHE = {}
+
+
+def anchors(rel, renderer):
+    """Every fragment a reader can land on in markdown file `rel` under the
+    given renderer (`github` or `vitepress`). Headings inside fenced code are
+    not headings; a repeated heading gets `-1`, `-2`, ... as both renderers
+    number it."""
+    key = (rel, renderer)
+    if key in ANCHOR_CACHE:
+        return ANCHOR_CACHE[key]
+    slug = github_slug if renderer == "github" else vitepress_slug
+    found, seen, fenced = set(), {}, False
+    for line in (ROOT / rel).read_text(encoding="utf-8").splitlines():
+        if FENCE_RE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        found.update(HTML_ANCHOR_RE.findall(line))
+        match = ATX_HEADING_RE.match(line)
+        if not match:
+            continue
+        text = match.group(1)
+        explicit = EXPLICIT_ID_RE.search(text)
+        if explicit and renderer == "vitepress":
+            found.add(explicit.group(1))
+            continue
+        if explicit:
+            text = text[: explicit.start()]
+        base = slug(strip_inline(text))
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        found.add(base if count == 0 else f"{base}-{count}")
+    ANCHOR_CACHE[key] = found
+    return found
 
 
 def span_paths(text):
@@ -287,10 +419,26 @@ def dangling_paths(rel, text, markdown):
     out = []
     if markdown:
         links, text = link_targets(text)
-        for offset, target in links:
-            resolved, ok = resolve_link(rel, target)
-            if not ok and not resolved.startswith("notes/"):
-                out.append((offset, f"link {target}", resolved))
+        for offset, target, fragment in links:
+            shown = target + (f"#{fragment}" if fragment else "")
+            if target.startswith("github:"):
+                resolved = normalize(target[len("github:") :]) or ""
+                ok = exists(resolved)
+                renderer = "github"
+            elif not target:
+                resolved, ok = rel, True
+                renderer = "vitepress" if in_site(rel) else "github"
+            else:
+                resolved, ok = resolve_link(rel, target)
+                renderer = "vitepress" if in_site(rel) and in_site(resolved) else "github"
+            if not ok:
+                if not resolved.startswith("notes/"):
+                    out.append((offset, f"link {shown}", resolved))
+                continue
+            if fragment and resolved.endswith(".md") and resolved in FILE_SET:
+                if fragment not in anchors(resolved, renderer):
+                    # No path: an ignore rule never excuses a missing anchor.
+                    out.append((offset, f"link {shown}: no such anchor", None))
     for offset, path in [*span_paths(text), *bare_paths(text)]:
         if path.startswith("notes/") or PLACEHOLDER_RE.search(path):
             continue
@@ -375,9 +523,13 @@ def main():
         return 1
 
     skip = ignored(
-        [p for _, p in candidates if p.split("/", 1)[0] not in UNTRACKED_CLAIMED_ROOTS]
+        [
+            p
+            for _, p in candidates
+            if p is not None and p.split("/", 1)[0] not in UNTRACKED_CLAIMED_ROOTS
+        ]
     )
-    dangling = [row for row, path in candidates if path not in skip]
+    dangling = [row for row, path in candidates if path is None or path not in skip]
 
     checks = (
         ("durable-cites-notes", transient_cites),

@@ -130,60 +130,103 @@ historical version.
    stores `version: i32` and `changeset: i64` as plain non-optional values decoded
    from packed arrays in the dense node iterator - the tightest loop in the library
    (~8 billion iterations for planet). Changing these to `Option` would add per-element
-   overhead on a path where every nanosecond matters. Instead, the four conversion
-   sites that bridge dense reads to writes guard against -1:
+   overhead on a path where every nanosecond matters. Instead, the sites that
+   bridge dense reads to writes guard against -1:
    - `dense_node_metadata`, `dense_node_raw_metadata` and `read_dense_node` in
      `src/owned.rs`
-   - `convert_node` in `src/osc/merge_join.rs`
+   - the derive OSC writer in `src/osc/write.rs`, through
+     `DenseNodeInfo::claims`
 
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
 directly (not through pbfhogg's commands) will still observe raw `-1` values from
 Osmosis-generated PBFs. This is documented on the `DenseNodeInfo` struct. Library
-users who need to handle Osmosis input should check for `-1` themselves. The tradeoff
-is accepted: the dense iterator is too hot to add branches for a single producer's
-non-standard encoding.
+users who need to handle Osmosis input should check for `-1` themselves, or use
+`claimed_version()` (below). The tradeoff is accepted: the dense iterator is too
+hot to add branches for a single producer's non-standard encoding.
+
+### Version 0 is not a version claim either
+
+OSM versions start at 1, and the writers spell "no version" as 0. pbfhogg's
+`BlockBuilder` stores version 0 with zeroed fields in the `DenseInfo` slot of a
+node added without metadata to a block whose other nodes carry it (the arrays
+must stay aligned), and writes version 0 for a versionless element that carries
+other metadata (an apply-changes OSC element with a timestamp but no version).
+libosmium does the same: it writes 0 for any versionless object, reads both 0 and
+-1 back as its own "no version", and its XML writer omits a zero version. The
+encoding is left alone; outputs that print metadata read it instead:
+
+- **A version is printed only when it is 1 or more**, on `Info` and `DenseInfo`
+  alike: OSC from `diff --format osc` (creates, modifies and deletes, so a
+  metadata-less node no longer deletes as `version="0"`, or `version="1"` under
+  `--increment-version`), the text diff's `vN`, `inspect --show`, the
+  `inspect --extended` metadata census and `export --metadata`. `Info::claimed_version()` and
+  `DenseNodeInfo::claimed_version()` are the public form of the rule; `version()`
+  still returns the raw value.
+- **The other fields of an `Info`** keep their own presence, zeros included.
+- **The other fields of a `DenseInfo` slot** depend on its version, because a
+  packed column cannot mark one slot absent. Version 1 or more: every field is
+  present as decoded. Negative: no metadata (the Osmosis rule above). Version 0:
+  a field counts only with a value no padding slot holds - non-zero timestamp,
+  positive changeset and uid, a non-empty user, `visible` false - the same tests
+  as libosmium's `detect_available_metadata`. So the padding slot prints nothing,
+  and a real versionless node keeps its non-zero fields. A zero field in such a
+  slot (an anonymous `uid` 0, say) is dropped: on the wire it cannot be told
+  apart from padding.
+
+Re-encoding is unaffected: the conversions that feed a rewrite keep a version-0
+slot and its fields as they are, and drop only `-1` slots.
 
 ## Null Island ambiguity in coordinate indexes
 
-**Status:** Fixed in `add-locations-to-ways` and in the geocode index
-builder.
+**Status:** Fixed. This class is closed - no index in the crate spells absence
+as an all-zero coordinate any more.
 
 **Context:** An index that stores node coordinates as `(lat: i32, lon: i32)`
 in a zero-initialized backing store is tempted to spell "unset" as `(0, 0)`.
 That is Null Island, a real coordinate in the Gulf of Guinea, so the
 sentinel collides with data in both directions: a node genuinely at `0, 0`
 reports as missing, and a missing node is written into a way as if it were
-there. All-zero as an absence sentinel is the same mistake indexdata v3
-already corrected by spelling an absent bbox as an inverted box.
+there.
 
-Fixed sites:
+Every flat, rank-indexed coordinate store in the crate (the
+`add-locations-to-ways` sparse store and the geocode builder's Pass 2 store
+among them) shares one slot encoding, defined once in `src/coord_pack.rs`:
+latitude biased by 90 degrees, which puts every legal latitude below `2^31`
+and leaves bit 31 of the low word free as an explicit presence flag, with
+longitude verbatim in the high word. An untouched slot still reads as absent
+because the backing store zero-fills, but no coordinate can set that bit by
+accident, and a coordinate outside the geographic domain is refused rather
+than stored as some other place. No bitmap, no extra memory, exact across the
+whole domain. Because the encoding is defined once, its users cannot drift
+apart; its layout, domain and Null Island behaviour are pinned by unit tests
+beside it.
 
-- `SparseArrayIndex` (`src/commands/altw/sparse.rs`) stores latitude biased
-  by 90 degrees, which puts every legal latitude below `2^31` and frees bit
-  31 of the low word as an explicit presence flag. The slot is still eight
-  bytes and `set_len` still zero-fills, so an untouched slot still reads as
-  absent - but no coordinate can set that bit by accident. No bitmap, no
-  extra memory, exact across the whole domain.
-- External-join stage 2 (`src/commands/altw/external/mod.rs`) counts a slot
-  as resolved when its id was *found* in the id-sorted node stream, not when
-  the coordinate it found was non-zero. Before this the two backends
-  disagreed about the same input.
+The `external` ALTW backend reaches the same answer differently: stage 2
+counts a reference as resolved when its id was *found* in the id-sorted node
+stream, not when the coordinate it found was non-zero. Before this the two
+backends disagreed about the same input.
 
-- The geocode builder's Pass 2 coordinate store
-  (`src/geocode_index/builder/pass2.rs`) uses the same `coord_pack`
-  encoding as the sparse store, so a street vertex at Null Island is kept
-  rather than read as an unwritten slot.
-
-The altw sites are pinned by `null_island_real_node_is_not_reported_missing`
-in `cli/tests/cli_add_locations_to_ways.rs`, which runs on both backends; the
-geocode site by `null_island_street_vertex_is_not_treated_as_absent` in
+The end-to-end behaviour is pinned by
+`null_island_real_node_is_not_reported_missing` in
+`cli/tests/cli_add_locations_to_ways.rs`, which runs on both backends, and by
+`null_island_street_vertex_is_not_treated_as_absent` in
 `tests/geocode_index.rs`.
+
+The one remaining all-zero sentinel of this shape, the blob index's "no
+bbox", was also retired: `(0, 0, 0, 0)` is the legal bbox of a single-node
+blob at Null Island, so index v3 spells absence as an inverted box that no
+well-formed bbox can equal. v2 files keep their original reading, because
+that is what their writer meant.
 
 **Related:** unresolvable way node references are a hard error in both
 `add-locations-to-ways` and `apply-changes --locations-on-ways` rather
 than a silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the
 placeholders (only under that flag does the placeholder ambiguity
-reappear, now opt-in). The first withdrew a documented osmium deviation
+reappear, now opt-in). That filler is opt-in, counted, and gated by a
+check that refuses before anything is published (add-locations-to-ways
+after its write, counting references; apply-changes at its node-to-way
+barrier, counting distinct nodes), so it is a deliberate output rather than
+an ambiguous sentinel. The first withdrew a documented osmium deviation
 and the second added one - see `DEVIATIONS.md`.
 
 ## Geocode index: interpolation unresolved-endpoint sentinel

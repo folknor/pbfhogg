@@ -799,6 +799,25 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   binary, while reference/testing.md places only binary-driving tests in
   `cli/tests/`. Its deterministic twin already lives in
   `tests/host_contract.rs`; move it there (beside `direct_read`).
+- [ ] **Two workflows deploy the docs site on every push to `main`.**
+  `.github/workflows/docs.yml` ("Deploy docs", node 24, pnpm action v5) and
+  `.github/workflows/deploy.yml` ("Deploy to GitHub Pages", node 22, pnpm
+  action v4, an unmodified template with commented-out API-doc blocks) both
+  build `docs/` and upload `docs/.vitepress/dist` to Pages. Whether both
+  succeed, and which deployment wins, was not checked. Keep one.
+- [ ] **Guide pages outside the site sidebar.** `docs/guide/advanced.md`,
+  `install.md`, `configuration.md` and `usage.md` exist but
+  `docs/.vitepress/config.ts` lists none of them (README links
+  `docs/guide/advanced.md`). Either list them or fold and delete them; not
+  investigated beyond the listing.
+- [ ] **Old site fragments into the correctness and deviations pages land on
+  a pointer.** Those two site pages became pointers to the root
+  `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such
+  as `/pbfhogg/cli/deviations#diff-content-equality-vs-version-ordering`
+  now opens the pointer page, not the section. Accepted when the copies were
+  removed (recreating the headings would be a second copy to drift); a
+  fragment-forwarding script on those two pages is the fix if it matters.
+  The site's search also no longer indexes their content.
 
 ### Read path
 
@@ -829,11 +848,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   a constructed block) it yields one extra `Err` item past the shorter array;
   the dense ones can bound by `cursor.remaining() / 2` (every pair is at least
   two bytes), and `CheckedDenseTagIter` must report `(0, Some(0))` once failed.
-- [ ] **The tag-iterator section exists twice.** `CORRECTNESS.md` "Tag
-  iterators end early on an out-of-range string index" and its copy in
-  `docs/guide/correctness.md` are maintained by hand and drift independently;
-  any edit has to land in both. Nothing checks they agree. Either generate one
-  from the other or add a script check comparing the two sections.
 
 ### Spatial and node-location resolution
 

@@ -19,7 +19,7 @@ command count.
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
 | `time-filter` | `time-filter` | Same |
-| `diff` | `diff` | Content equality instead of version ordering (see [DEVIATIONS](/cli/deviations#diff-content-equality-vs-version-ordering)) |
+| `diff` | `diff` | Content equality instead of version ordering (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#diff-content-equality-vs-version-ordering)) |
 | `apply-changes` | `apply-changes` | Same |
 | `merge-changes` | `merge-changes` | Same |
 | `fileinfo` | `inspect` | Different name, more capabilities |
@@ -99,11 +99,12 @@ and vice versa for `--increment-version` / `--update-timestamp`. The global
 `-q` works with both: a quiet text diff answers by exit code alone, a quiet
 OSC diff still writes its `-o`.
 
-**Lossless deletes:** pbfhogg's `diff --format osc` roundtrips content -
-applying the derived OSC to the old PBF gives a file `diff` finds identical to
-the new PBF (metadata, which `diff` ignores, is outside that check).
-osmium's `derive-changes` can lose deletes when the deleted element is absent
-from both input files (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
+**Changes by content:** pbfhogg's `diff --format osc` decides what changed by
+content, not by version and timestamp as osmium's `derive-changes` does, and
+roundtrips content - applying the derived OSC to the old PBF gives a file
+`diff` finds identical to the new PBF (metadata, which `diff` ignores, is
+outside that check). Both tools write a delete for every object only the old
+file holds (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
 
 ### merge is now `cat --dedupe`
 

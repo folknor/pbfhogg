@@ -550,7 +550,9 @@ descriptor it inherited, nor changes that descriptor's descriptor or file-status
 extra descriptor the caller passes it (for example one on which the caller holds a lock as a
 lease for those directories) stays open until the pbfhogg process exits. This is about processes
 and descriptors, not kernel I/O: the kernel may finish asynchronous cleanup after the process is
-gone.
+gone. The CLI test suite runs every pbfhogg child it starts under a seccomp filter that kills it
+on any breach of this, for the whole run (`reference/testing.md` says what that filter does and
+does not see).
 
 The spellings below are the contract for an external tool that cannot do that (a cleanup job
 sweeping directories it did not hand out). `<pid>` is the pid of the pbfhogg process, `<seq>` a

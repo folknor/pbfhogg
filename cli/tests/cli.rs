@@ -1,13 +1,12 @@
-//! CLI integration tests - invoke the `pbfhogg` binary via `std::process::Command`.
+//! CLI integration tests - invoke the `pbfhogg` binary via `CliInvoker`.
 //!
 //! These tests verify that the CLI dispatches correctly, flags are accepted,
 //! and feature-gated flags produce clear error messages when the feature is
 //! absent at compile time.
 
 use std::path::Path;
-use std::process::Command;
 
-use crate::invoker::pbfhogg_bin;
+use crate::invoker::CliInvoker;
 
 /// Write a minimal valid PBF file using the library API.
 fn write_minimal_pbf(path: &Path) {
@@ -54,10 +53,7 @@ fn write_minimal_pbf_impl(path: &Path, sorted: bool) {
 
 #[test]
 fn cli_version() {
-    let output = Command::new(pbfhogg_bin())
-        .arg("--version")
-        .output()
-        .expect("run pbfhogg --version");
+    let output = CliInvoker::new().arg("--version").run();
     assert!(output.status.success(), "exit code: {}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pbfhogg"), "version output: {stdout}");
@@ -65,10 +61,7 @@ fn cli_version() {
 
 #[test]
 fn cli_help() {
-    let output = Command::new(pbfhogg_bin())
-        .arg("--help")
-        .output()
-        .expect("run pbfhogg --help");
+    let output = CliInvoker::new().arg("--help").run();
     assert!(output.status.success(), "exit code: {}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cat"), "help should list cat command");
@@ -83,15 +76,14 @@ fn cli_cat_passthrough() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "cat",
             input.to_str().expect("path"),
             "-o",
             output.to_str().expect("path"),
         ])
-        .output()
-        .expect("run pbfhogg cat");
+        .run();
 
     assert!(
         result.status.success(),
@@ -113,15 +105,14 @@ fn cli_sort() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "sort",
             input.to_str().expect("path"),
             "-o",
             output.to_str().expect("path"),
         ])
-        .output()
-        .expect("run pbfhogg sort");
+        .run();
 
     assert!(
         result.status.success(),
@@ -138,10 +129,9 @@ fn cli_inspect() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args(["inspect", input.to_str().expect("path")])
-        .output()
-        .expect("run pbfhogg inspect");
+        .run();
 
     assert!(
         result.status.success(),
@@ -162,10 +152,9 @@ fn cli_check() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args(["check", input.to_str().expect("path")])
-        .output()
-        .expect("run pbfhogg check");
+        .run();
 
     assert!(
         result.status.success(),
@@ -185,12 +174,11 @@ fn cli_check_refs_reports_direct_io_as_having_no_effect() {
     let input = dir.path().join("input.osm.pbf");
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .arg("check")
         .arg(&input)
         .args(["--refs", "--direct-io"])
-        .output()
-        .expect("run pbfhogg check");
+        .run();
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "{stderr}");
     assert!(
@@ -199,12 +187,11 @@ fn cli_check_refs_reports_direct_io_as_having_no_effect() {
     );
 
     // Without the flag there is nothing to say.
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .arg("check")
         .arg(&input)
         .arg("--refs")
-        .output()
-        .expect("run pbfhogg check");
+        .run();
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "{stderr}");
     assert!(!stderr.contains("--direct-io"), "{stderr}");
@@ -222,15 +209,14 @@ fn cli_renumber() {
 
     write_minimal_sorted_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "renumber",
             input.to_str().expect("path"),
             "-o",
             output.to_str().expect("path"),
         ])
-        .output()
-        .expect("run pbfhogg renumber");
+        .run();
 
     assert!(
         result.status.success(),
@@ -253,7 +239,7 @@ fn cli_renumber_custom_start_id() {
 
     write_minimal_sorted_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "renumber",
             "--start-id",
@@ -262,8 +248,7 @@ fn cli_renumber_custom_start_id() {
             "-o",
             output.to_str().expect("path"),
         ])
-        .output()
-        .expect("run pbfhogg renumber -s ...");
+        .run();
 
     assert!(
         result.status.success(),
@@ -319,7 +304,7 @@ fn cli_direct_io_rejected_without_feature() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "sort",
             input.to_str().expect("path"),
@@ -327,8 +312,7 @@ fn cli_direct_io_rejected_without_feature() {
             output.to_str().expect("path"),
             "--direct-io",
         ])
-        .output()
-        .expect("run pbfhogg sort --direct-io");
+        .run();
 
     assert!(
         !result.status.success(),
@@ -351,7 +335,7 @@ fn cli_io_uring_rejected_without_feature() {
 
     write_minimal_pbf(&input);
 
-    let result = Command::new(pbfhogg_bin())
+    let result = CliInvoker::new()
         .args([
             "sort",
             input.to_str().expect("path"),
@@ -359,8 +343,7 @@ fn cli_io_uring_rejected_without_feature() {
             output.to_str().expect("path"),
             "--io-uring",
         ])
-        .output()
-        .expect("run pbfhogg sort --io-uring");
+        .run();
 
     assert!(
         !result.status.success(),
@@ -380,10 +363,7 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
         vec!["inspect"],
         vec!["extract", "input.pbf", "-o", "output.pbf"],
     ] {
-        let output = Command::new(pbfhogg_bin())
-            .args(&args)
-            .output()
-            .expect("run CLI");
+        let output = CliInvoker::new().args(&args).run();
         assert_eq!(output.status.code(), Some(2), "args: {args:?}");
     }
 }
@@ -398,14 +378,13 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
     ] {
         let input = dir.path().join(name);
         std::fs::write(&input, bytes).expect("write input");
-        let output = Command::new(pbfhogg_bin())
+        let output = CliInvoker::new()
             .arg("tags-filter")
             .arg(&input)
             .arg("name")
             .arg("-o")
             .arg(dir.path().join("out.pbf"))
-            .output()
-            .expect("run tags-filter");
+            .run();
         assert!(!output.status.success());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
     }
@@ -420,24 +399,22 @@ fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
         b"\xef\xbb\xbf  \n<osmChange version=\"0.6\"></osmChange>",
     )
     .expect("write XML");
-    let output = Command::new(pbfhogg_bin())
+    let output = CliInvoker::new()
         .arg("tags-filter")
         .arg(&input)
         .arg("name")
         .arg("-o")
         .arg(dir.path().join("out.osc"))
-        .output()
-        .expect("run tags-filter");
+        .run();
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
 }
 
 #[test]
 fn cli_diff_quiet_osc_without_output_retains_error() {
-    let output = Command::new(pbfhogg_bin())
+    let output = CliInvoker::new()
         .args(["diff", "old.pbf", "new.pbf", "--format", "osc", "-q"])
-        .output()
-        .expect("run diff");
+        .run();
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--output is required with --format osc")
@@ -452,12 +429,11 @@ fn cli_check_json_preserves_non_utf8_filename_lossily() {
     let name = std::ffi::OsString::from_vec(b"actual-\xff.pbf".to_vec());
     let input = dir.path().join(&name);
     write_minimal_pbf(&input);
-    let output = Command::new(pbfhogg_bin())
+    let output = CliInvoker::new()
         .arg("check")
         .arg(&input)
         .args(["--ids", "--json"])
-        .output()
-        .expect("run check");
+        .run();
     assert!(
         output.status.success(),
         "{}",
@@ -475,12 +451,11 @@ fn cli_osc_outputs_are_plain_under_osc_and_keep_metadata() {
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
     for command in ["tags-filter", "merge-changes"] {
         let output = dir.path().join(format!("{command}.osc"));
-        let mut cli = Command::new(pbfhogg_bin());
-        cli.arg(command).arg(&input);
+        let mut cli = CliInvoker::new().arg(command).arg(&input);
         if command == "tags-filter" {
-            cli.args(["--input-kind", "osc", "name"]);
+            cli = cli.args(["--input-kind", "osc", "name"]);
         }
-        let result = cli.arg("-o").arg(&output).output().expect("run command");
+        let result = cli.arg("-o").arg(&output).run();
         assert!(
             result.status.success(),
             "{}",
@@ -511,17 +486,17 @@ fn cli_merge_changes_non_utf8_osc_gz_path_is_gzipped() {
         let output = dir
             .path()
             .join(std::ffi::OsStr::from_bytes(b"invalid-\xff.osc.gz"));
-        let mut cli = Command::new(pbfhogg_bin());
         // Both passes write the same name; the second replaces the first.
-        cli.arg("merge-changes")
+        let mut cli = CliInvoker::new()
+            .arg("merge-changes")
             .arg(&input)
             .arg("-o")
             .arg(&output)
             .arg("--overwrite");
         if simplify {
-            cli.arg("--simplify");
+            cli = cli.arg("--simplify");
         }
-        let result = cli.output().expect("merge");
+        let result = cli.run();
         assert!(
             result.status.success(),
             "{}",
@@ -543,24 +518,18 @@ fn cli_osc_counters_keep_historical_name_and_per_file_values() {
     for command in ["merge-changes", "tags-filter", "apply-changes"] {
         let markers = dir.path().join(format!("{command}.markers"));
         std::fs::write(&markers, []).expect("markers");
-        let mut cli = Command::new(pbfhogg_bin());
-        cli.env("BROKKR_MARKER_FIFO", &markers).arg(command);
-        match command {
-            "apply-changes" => {
-                cli.arg(&base).arg(&input);
-            }
-            "tags-filter" => {
-                cli.arg(&input).args(["--input-kind", "osc", "name"]);
-            }
-            _ => {
-                cli.arg(&input).arg(&input);
-            }
-        }
+        let cli = CliInvoker::new()
+            .env("BROKKR_MARKER_FIFO", &markers)
+            .arg(command);
+        let cli = match command {
+            "apply-changes" => cli.arg(&base).arg(&input),
+            "tags-filter" => cli.arg(&input).args(["--input-kind", "osc", "name"]),
+            _ => cli.arg(&input).arg(&input),
+        };
         let result = cli
             .arg("-o")
             .arg(dir.path().join(format!("{command}-out.osc")))
-            .output()
-            .expect("command");
+            .run();
         assert!(
             result.status.success(),
             "{}",

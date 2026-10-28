@@ -738,20 +738,24 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   blob whose first element is negative and whose range is mixed-sign
   (indexdata campaign, 2026-10-28).
 
-- [ ] **The no-helper-process and inherited-descriptor promise has no
-  behavioural test.** reference/cli-reference.md "Names pbfhogg leaves
-  behind" promises the CLI starts no other process and never closes,
-  replaces or changes the flags of an inherited descriptor (brokkr ties
-  removal of a run's private directories to a lease lock on a descriptor it
-  passes the child). Only brokkr.toml textlint tripwires guard it
-  (`no-child-process-or-descriptor-reset`, `no-file-status-flag-change`,
-  `no-hotpath-cpu`), which an aliased or wrapped import, or a dependency
-  that starts a process, escapes. A deterministic test is possible: give
-  `CliInvoker` a way to pass an extra non-CLOEXEC pipe descriptor, park the
-  run with `PBFHOGG_TEST_CANCEL_PAUSE`, assert `/proc/<pid>/fd/<n>` is still
-  that pipe and no process has the child as its parent, then let it finish
-  and assert the pipe reads EOF. It still proves less than the whole
-  contract (one checkpoint, one command), so it complements the tripwires.
+- [ ] **The promise guard has three blind spots.** Every CLI test runs
+  `pbfhogg` under the seccomp promise guard (`cli/tests/guard.rs`), which
+  enforces the no-helper-process and inherited-descriptor promise of
+  reference/cli-reference.md "Names pbfhogg leaves behind" for the whole
+  run. It cannot see: (1) io_uring submissions - an `IORING_OP_CLOSE` (or
+  similar) on the inherited descriptor is no syscall the filter checks; the
+  `--io-uring` writer is the only ring and never touches an inherited
+  descriptor, and only the brokkr.toml textlint rules guard that. (2) a
+  process-creating `clone3` caller that ignores the `ENOSYS` the guard
+  returns and carries on (glibc and musl fall back to `clone`, which the
+  guard kills; a raw caller need not). (3) hotpath builds - the guard runs
+  only the test builds, and `no-hotpath-cpu` matches the literal feature
+  name in the two Cargo.toml files only, so a transitive enablement of
+  hotpath's process-spawning CPU profiler (another crate's feature, or a
+  Cargo.lock-only change) would not trip it. Closing (1) would need a
+  ring-op allowlist (`IORING_REGISTER_RESTRICTIONS`) or a guard that bans
+  `io_uring_setup` on runs without `--io-uring`; (3) would need a
+  `cargo tree -e features` check in the gate.
 
 - [ ] **The O_DIRECT path constructors' non-regular-target check is not
   race-free.** `direct_io::create_for_write` (behind

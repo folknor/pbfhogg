@@ -28,6 +28,14 @@
 //! 20 s per-test watchdog in `brokkr check`. Explicit overrides
 //! remain subject to that outer watchdog.
 //!
+//! ## The promise guard
+//!
+//! On Linux every child runs under `guard` (seccomp): starting a process,
+//! or closing, duplicating, passing or reflagging the descriptor it
+//! inherits as a lease, kills it with `SIGSYS`, and [`CliInvoker::run`] and
+//! [`RunningCli::wait`] fail the test naming the guard. Start the binary
+//! only through this type, or the run escapes the guard.
+//!
 //! ## Platform skips
 //!
 //! [`CliOutput::is_o_direct_unsupported`] and
@@ -305,6 +313,7 @@ impl CliInvoker {
             self.cmd.stderr(Stdio::piped());
         }
 
+        guard(&mut self.cmd);
         let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
 
         // Drain stdout/stderr in background threads so a chatty
@@ -341,6 +350,7 @@ impl CliInvoker {
                 Err(e) => panic!("error waiting for pbfhogg child: {e}"),
             }
         };
+        assert_not_guard_killed(status);
 
         let stdout_buf = stdout_thread.join().unwrap_or_default();
         let stderr_buf = stderr_thread
@@ -368,6 +378,7 @@ impl CliInvoker {
     pub fn spawn(mut self) -> RunningCli {
         self.cmd.stdout(Stdio::piped());
         self.cmd.stderr(Stdio::piped());
+        guard(&mut self.cmd);
         let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -477,6 +488,7 @@ impl RunningCli {
                 Err(e) => panic!("error waiting for pbfhogg child: {e}"),
             }
         };
+        assert_not_guard_killed(status);
         let stdout = self
             .stdout_thread
             .take()
@@ -559,6 +571,29 @@ impl CliOutput {
                 .stderr_str()
                 .contains(&format!("platform feature {feature} unavailable:"))
     }
+}
+
+/// Put `cmd` under the promise guard (see `guard`), registered last so that
+/// no other `pre_exec` hook runs after its filter.
+fn guard(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    crate::guard::apply(cmd);
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+/// Fail the test when the promise guard killed the child: it started a
+/// process, or touched the descriptor it inherited.
+fn assert_not_guard_killed(status: ExitStatus) {
+    #[cfg(target_os = "linux")]
+    assert!(
+        !crate::guard::killed_by_guard(status),
+        "pbfhogg died of SIGSYS under the promise guard: it started a process, \
+         or closed, duplicated, passed or reflagged the descriptor it inherited \
+         (reference/cli-reference.md, Names pbfhogg leaves behind)"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = status;
 }
 
 /// The `pbfhogg` binary cargo built for this test build.

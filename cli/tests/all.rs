@@ -31,6 +31,8 @@
 
 #[path = "../../tests/common/mod.rs"]
 mod common;
+#[cfg(target_os = "linux")]
+mod guard;
 mod invoker;
 
 mod cli;

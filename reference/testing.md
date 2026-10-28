@@ -130,6 +130,22 @@ and `geocode-reader` sweeps stay root-only: the CLI's lib dep would turn
 `[test] default_package = "pbfhogg"`; a CLI test needs
 `brokkr test -p pbfhogg-cli NAME`.
 
+Every `pbfhogg` child the CLI tests start goes through `CliInvoker`, and
+on Linux (little-endian x86_64 or aarch64, with
+`SECCOMP_RET_KILL_PROCESS`) runs under the promise guard
+(`cli/tests/guard.rs`): it inherits a pipe descriptor as a caller's
+lease, and a seccomp filter kills it with `SIGSYS` if it starts a
+process or closes, duplicates, passes or reflags that descriptor, at
+any point in its run. `CliInvoker` turns such a death into a failure
+naming the guard, so every CLI test doubles as a behavioural test of the
+promise in `cli-reference.md` "Names pbfhogg leaves behind". The guard is
+stricter than the promise (no duplicate of the lease, no `sendmsg`,
+`sendmmsg` or `pidfd_getfd` at all) and blind to io_uring submissions
+and to a `clone3` caller that ignores its `ENOSYS`; the module doc says
+why. `guard::tests` re-runs the test binary under the guard once per
+rule to prove each one fires and that the allowed neighbours do not. A
+test that starts the binary some other way escapes the guard: do not.
+
 ## Validation tiers
 
 Runtime-ranked. Each tier subsumes the cost of the previous; higher
@@ -349,8 +365,9 @@ exception, not a tier - should not survive across many PRs.
   `tier3` shards, run by `--profile full` and the gate), signal it, and
   assert the exit code and an empty directory, with no sleeps. Ordinals are
   positions, not sites, and the fixture's counts are not real data's, so
-  neither sweep proves every checkpoint site of a planet run unwinds. `CliInvoker::spawn` returns a `RunningCli`
-  that can be signalled and is killed on drop.
+  neither sweep proves every checkpoint site of a planet run unwinds.
+  `CliInvoker::spawn` returns a `RunningCli` that can be signalled and is
+  killed on drop.
 - **Publication hooks.** Publication is not cancellable, so no checkpoint
   lies inside it and the pauses above never land there. Instead it
   announces each namespace step that succeeded (`PublishStep`: a backup

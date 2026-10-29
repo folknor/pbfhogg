@@ -18,7 +18,8 @@
 //!   the cleanup and can leave a hidden `.pbfhogg-tmp-*` entry (in the
 //!   staging directory, when there is one), never a partial file under the
 //!   name the caller chose. Ended inside publication, it can also leave
-//!   `.pbfhogg-backup-*` entries beside the destinations (empty, holding the
+//!   `.pbfhogg-backup-*` entries beside the destinations (in the staging
+//!   directory under [`Staging::DirWithBackups`]; empty, holding the
 //!   previous output whole, or holding part of it when the end came while a
 //!   backup was being removed), and each destination holds its previous
 //!   output, its whole new one, or, while a backed-up destination is between
@@ -61,8 +62,10 @@
 //! The staging and backup names, which an external tool may delete, and the
 //! guarantee a caller-chosen staging directory gives a caller that removes
 //! it after a killed run, are defined in `docs/cli/commands.md`,
-//! "Staging directory" and "Names pbfhogg leaves behind". A backup always
-//! stays beside its destination, never in a staging directory.
+//! "Staging directory" and "Names pbfhogg leaves behind". A backup stays
+//! beside its destination unless the caller chose
+//! [`Staging::DirWithBackups`], accepting that removing its staging
+//! directory removes any previous output kept there.
 //! Durability and timing are decided in ADR-0017: writers finish their files,
 //! publication syncs them, and `PUBLISH_START`/`PUBLISH_END` bracket it.
 //!
@@ -87,7 +90,8 @@
 //! A group publishes all or nothing as far as failures allow: if a member
 //! fails to install, members already installed are rolled back, and a
 //! rollback step that cannot complete keeps the previous output in a
-//! `.pbfhogg-backup-*` sibling and says so in the error.
+//! `.pbfhogg-backup-*` entry (a sibling, or in the staging directory under
+//! [`Staging::DirWithBackups`]) and says so in the error.
 
 // This module is the output choke point the crate-root deny points at: the
 // staging, publication, rollback and directory syncs it owns are the calls
@@ -123,6 +127,60 @@ impl Overwrite {
     #[must_use]
     pub const fn from_flag(replace: bool) -> Self {
         if replace { Self::Replace } else { Self::Refuse }
+    }
+}
+
+/// Where publication puts the entries it creates for an output: the staging
+/// entry it writes, and, when it replaces an existing directory output or a
+/// member of a group, the backup the previous output is moved into.
+///
+/// Both directory variants are checked at construction the same way: the
+/// directory must exist, be on the same mount as every destination's
+/// directory, not be or contain a destination's directory, not lie inside a
+/// directory output, and the destination's directory must be writable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Staging<'a> {
+    /// Everything beside the destination.
+    Beside,
+    /// The staging entry in this directory; a backup stays beside its
+    /// destination. A caller that gives each run a directory of its own may
+    /// remove it whole once the run has stopped, without losing a previous
+    /// output: a backup can be the only copy of one, so it never goes there.
+    Dir(&'a Path),
+    /// The staging entry and every backup in this directory, so publication
+    /// creates nothing beside a destination but the destination itself.
+    /// Choosing it accepts that removing the directory also removes any
+    /// previous output a publication kept there (a rollback that could not
+    /// restore it, an unsynced replacement, a removal that failed, a process
+    /// killed inside publication), which can be the only copy of that
+    /// output. pbfhogg itself still never deletes a kept backup, and errors
+    /// and warnings name it at its path in this directory. For a caller whose
+    /// destinations are its own disposable state, a test harness's output
+    /// slots, say, where an undeclared sibling is a failure.
+    DirWithBackups(&'a Path),
+}
+
+impl<'a> Staging<'a> {
+    /// `Dir(dir)` when `dir` is given, else `Beside`.
+    #[must_use]
+    pub fn dir(dir: Option<&'a Path>) -> Self {
+        dir.map_or(Self::Beside, Self::Dir)
+    }
+
+    /// The caller-chosen directory, if any.
+    #[must_use]
+    pub fn directory(self) -> Option<&'a Path> {
+        match self {
+            Self::Beside => None,
+            Self::Dir(dir) | Self::DirWithBackups(dir) => Some(dir),
+        }
+    }
+
+    fn backup_dir(self) -> Option<&'a Path> {
+        match self {
+            Self::DirWithBackups(dir) => Some(dir),
+            Self::Beside | Self::Dir(_) => None,
+        }
     }
 }
 
@@ -170,6 +228,14 @@ pub enum PublishFault {
     /// Fail the sync that makes a previous output's backup durable, after
     /// the output was moved aside and before the new one is installed.
     BackupSync,
+    /// Fail only the sync of the directory holding a backup's container,
+    /// made when that is not the destination's directory
+    /// ([`Staging::DirWithBackups`]): after the container's own sync, before
+    /// the destination's directory is synced.
+    BackupLinkSync,
+    /// Make the move into a backup answer as a rename across mounts does
+    /// (`EXDEV`).
+    MoveAsideCrossMount,
     /// Fail the removal of a replaced output's backup after a successful
     /// publication.
     BackupRemoval,
@@ -195,6 +261,8 @@ impl std::str::FromStr for PublishFault {
             ("restore-rename", None) => Self::RestoreRename,
             ("dir-sync", None) => Self::DirSync,
             ("backup-sync", None) => Self::BackupSync,
+            ("backup-link-sync", None) => Self::BackupLinkSync,
+            ("move-aside-cross-mount", None) => Self::MoveAsideCrossMount,
             ("backup-removal", None) => Self::BackupRemoval,
             _ => {
                 return Err(Error::invalid_argument(format!(
@@ -238,8 +306,9 @@ fn split_member(s: &str) -> Result<(&str, Option<usize>)> {
 pub enum PublishStep {
     /// Every staged file or tree was synced; nothing is installed yet.
     StagedSynced,
-    /// An empty `.pbfhogg-backup-*` container was created beside member
-    /// `k`'s destination.
+    /// An empty `.pbfhogg-backup-*` container was created for member `k`:
+    /// beside its destination, or in the staging directory under
+    /// [`Staging::DirWithBackups`].
     BackupReserved(usize),
     /// Member `k`'s previous output was moved into its backup: the
     /// destination is absent and the backup is its only name.
@@ -834,8 +903,13 @@ fn reserve(
                     Some(dir) => format!("in staging directory {}", dir.display()),
                     None => "beside it".to_owned(),
                 };
+                let what = if kind == "backup" {
+                    "a backup"
+                } else {
+                    "a staging entry"
+                };
                 return Err(Error::from(e).context(format!(
-                    "cannot create a staging entry for output {} {place}",
+                    "cannot create {what} for output {} {place}",
                     dest.display()
                 )));
             }
@@ -917,11 +991,12 @@ fn writable_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Check that `dir` can hold the staging entry of `dest`: it is a directory,
-/// on the same mount as the destination's directory (publication renames
-/// across them), not holding the destination's directory (a backup lands
-/// beside the destination, and a caller removing its staging directory must
-/// never delete an output or a backup), and not inside a directory output
+/// Check that `dir` can hold the staging entry of `dest`, and with
+/// [`Staging::DirWithBackups`] its backup: it is a directory, on the same
+/// mount as the destination's directory (publication renames across them),
+/// not holding the destination's directory (a caller removing its staging
+/// directory must never delete an output, nor a backup kept beside one under
+/// [`Staging::Dir`]), and not inside a directory output
 /// (replacing it would move the staging along with the old directory). The
 /// destination's directory must also be writable. Creates nothing. The
 /// same-mount test is the device plus [`rename_refused_between`].
@@ -1291,6 +1366,9 @@ struct Target {
     /// Not `source_dir`, which for a directory output is the reserved
     /// container inside it.
     staging_dir: Option<PathBuf>,
+    /// Where a backup's container is reserved: the staging directory under
+    /// [`Staging::DirWithBackups`], else `None`, beside the destination.
+    backup_dir: Option<PathBuf>,
     overwrite: Overwrite,
     validator: Option<Validator>,
     state: State,
@@ -1325,9 +1403,11 @@ impl Target {
         shape: Shape,
         overwrite: Overwrite,
         validator: Option<Validator>,
-        staging_dir: Option<&Path>,
+        staging: Staging<'_>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
+        let staging_dir = staging.directory();
+        let backup_dir = staging.backup_dir().map(Path::to_path_buf);
         let dest = normalize(dest)?;
         inspect(&dest, shape, overwrite, validator)?;
         if let Some(dir) = staging_dir {
@@ -1407,6 +1487,7 @@ impl Target {
             write,
             source_dir,
             staging_dir: staging_dir.map(Path::to_path_buf),
+            backup_dir,
             overwrite,
             validator,
             state: State::Staged,
@@ -1527,9 +1608,10 @@ impl Target {
     /// the mount check, a mount table changed while the run worked): that
     /// is a staging-directory refusal, typed so a front end can say which
     /// setting caused it. Everything else, and `EXDEV` without a staging
-    /// directory, is a plain publication failure. Only the three forward
-    /// install syscalls come here, never a backup move or a rollback, none
-    /// of which touches the staging directory.
+    /// directory, is a plain publication failure. The three forward install
+    /// syscalls come here, and the move into a backup when the backup lives
+    /// in the staging directory ([`Staging::DirWithBackups`]); never a
+    /// rollback, whose failure is reported with what it kept.
     fn install_refused(&self, e: io::Error) -> Error {
         match &self.staging_dir {
             Some(dir) if is_cross_device(&e) => new_output_error(OutputError::StagingDir {
@@ -1658,10 +1740,14 @@ impl Target {
             }
         };
         let backup = if present && use_backup {
-            // Always beside the destination, never in a staging directory: a
-            // backup can be the only copy of the previous output, and a
-            // caller removes its staging directory wholesale.
-            let container = reserve(&self.dest, None, "backup", |path| fs::create_dir(path))?;
+            // Beside the destination unless the caller put backups in its
+            // staging directory (`Staging::DirWithBackups`): a backup can be
+            // the only copy of the previous output, and a caller removes its
+            // staging directory wholesale, so only a caller that accepted
+            // losing it there gets it there.
+            let container = reserve(&self.dest, self.backup_dir.as_deref(), "backup", |path| {
+                fs::create_dir(path)
+            })?;
             step!(faults, PublishStep::BackupReserved(member));
             let entry = container.join(self.dest.file_name().unwrap_or_default());
             let moved = if fault_is!(faults, PublishFault::MoveAside) {
@@ -1669,6 +1755,8 @@ impl Target {
                     io::ErrorKind::PermissionDenied,
                     "injected move-aside fault",
                 ))
+            } else if fault_is!(faults, PublishFault::MoveAsideCrossMount) {
+                Err(cross_mount_error())
             } else {
                 fs::rename(&self.dest, &entry)
             };
@@ -1681,6 +1769,13 @@ impl Target {
                         container.display(),
                         self.dest.display()
                     )),
+                }
+                // A move into a backup in the staging directory crosses from
+                // the destination's directory into it, so a refusal across
+                // mounts there is the staging directory's, typed as at
+                // install, whether or not the empty container went.
+                if self.backup_dir.is_some() && is_cross_device(&e) {
+                    return Err(self.install_refused(e));
                 }
                 return Err(Error::from(e).context(format!(
                     "cannot move existing output {} aside",
@@ -1695,8 +1790,12 @@ impl Target {
             // The backup is the previous output's only name from here until
             // the new output is in place, so it is made durable before
             // anything relies on it: the entry inside its container, then
-            // the container's link and the vacated name in the parent. A
-            // failure is an install failure, and the rollback restores.
+            // the container's link in the staging directory when it lives
+            // there, then the vacated name in the destination's directory
+            // (the container's link too when it lives beside the
+            // destination). Each step needs the one before, so the first
+            // failure stops the chain; it is an install failure, and the
+            // rollback restores.
             if let State::BackedUp(backup) = &self.state {
                 let synced = if fault_is!(faults, PublishFault::BackupSync) {
                     Err(io::Error::new(
@@ -1705,6 +1804,16 @@ impl Target {
                     ))
                 } else {
                     sync_dir(&backup.container, metrics)
+                        .and_then(|()| match self.backup_dir.as_deref() {
+                            Some(_) if fault_is!(faults, PublishFault::BackupLinkSync) => {
+                                Err(io::Error::new(
+                                    io::ErrorKind::StorageFull,
+                                    "injected backup link sync fault",
+                                ))
+                            }
+                            Some(dir) => sync_dir(dir, metrics),
+                            None => Ok(()),
+                        })
                         .and_then(|()| sync_dir(parent_dir(&self.dest), metrics))
                 };
                 synced.map_err(|e| {
@@ -2028,7 +2137,8 @@ impl Drop for Target {
     fn drop(&mut self) {
         match self.state {
             // Only ever the staging entry this run reserved. A backup is a
-            // separate `.pbfhogg-backup-*` sibling and is never touched here:
+            // separate `.pbfhogg-backup-*` entry (wherever `Staging` put it,
+            // never inside the staging container) and is never touched here:
             // after a failed restore it may be the only copy of the old
             // output.
             //
@@ -2122,22 +2232,7 @@ fn publish_all(
                 .rev()
                 .filter_map(|(member, target)| target.rollback(member, faults))
                 .collect();
-            // Best effort: the restored names are visible now; syncing their
-            // directories (and any backup kept by a failed restore) is all
-            // that can be done for their durability on an error path.
-            for dir in changed_dirs(touched) {
-                drop(sync_dir(&dir, metrics));
-            }
-            for target in touched.iter() {
-                if let State::BackedUp(backup)
-                | State::Installed {
-                    backup: Some(backup),
-                    ..
-                } = &target.state
-                {
-                    drop(sync_dir(&backup.container, metrics));
-                }
-            }
+            sync_after_rollback(touched, metrics);
             if unresolved.is_empty() {
                 return Err(error);
             }
@@ -2192,6 +2287,38 @@ fn publish_all(
         kept,
         kept_synced,
     }))
+}
+
+/// Best effort after a rollback: the restored names are visible now; syncing
+/// their directories, and first every backup a failed restore kept (its
+/// container, then the directory holding the container, which for a
+/// directory output's backup in the staging directory is no changed
+/// directory at all), is all
+/// that can be done for their durability on an error path. Every sync is
+/// attempted whatever the others answer; nothing renames in between, so a
+/// directory synced for a backup is not synced again.
+fn sync_after_rollback(touched: &[Target], metrics: &PublishSync<'_>) {
+    let mut synced: Vec<PathBuf> = Vec::new();
+    for target in touched {
+        if let State::BackedUp(backup)
+        | State::Installed {
+            backup: Some(backup),
+            ..
+        } = &target.state
+        {
+            drop(sync_dir(&backup.container, metrics));
+            let holder = parent_dir(&backup.container).to_path_buf();
+            if !synced.contains(&holder) {
+                drop(sync_dir(&holder, metrics));
+                synced.push(holder);
+            }
+        }
+    }
+    for dir in changed_dirs(touched) {
+        if !synced.contains(&dir) {
+            drop(sync_dir(&dir, metrics));
+        }
+    }
 }
 
 /// Every directory installing `targets` changes, each once, in order: each
@@ -2271,25 +2398,26 @@ impl Output {
         overwrite: Overwrite,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
-        Self::with_staging(destination, overwrite, None, diagnostics)
+        Self::with_staging(destination, overwrite, Staging::Beside, diagnostics)
     }
 
-    /// [`Output::new`], with the staging file reserved in `staging_dir`
-    /// instead of beside the destination when it is given. A caller that
-    /// owns a private staging directory can remove it whole once every
-    /// process using it has stopped, so a run killed outright leaves no
-    /// staging where its destination is.
+    /// [`Output::new`], with the staging file reserved where `staging`
+    /// says. A caller that owns a private staging directory can remove it
+    /// whole once every process using it has stopped, so a run killed
+    /// outright leaves no staging where its destination is. A lone file
+    /// never has a backup; as a member of an [`OutputSet`] it does, placed
+    /// by `staging` too.
     ///
     /// # Errors
-    /// As [`Output::new`], plus [`OutputError::StagingDir`] when
-    /// `staging_dir` is missing, is not a directory, is on another mount
-    /// than the destination's directory, or is or holds the destination's
+    /// As [`Output::new`], plus [`OutputError::StagingDir`] when the staging
+    /// directory is missing, is not a directory, is on another mount than
+    /// the destination's directory, or is or holds the destination's
     /// directory; an I/O error when either directory cannot be inspected or
     /// the destination's directory is not writable.
     pub fn with_staging(
         destination: impl AsRef<Path>,
         overwrite: Overwrite,
-        staging_dir: Option<&Path>,
+        staging: Staging<'_>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
         Ok(Self {
@@ -2298,7 +2426,7 @@ impl Output {
                 Shape::File,
                 overwrite,
                 None,
-                staging_dir,
+                staging,
                 diagnostics,
             )?,
         })
@@ -2578,22 +2706,28 @@ impl OutputDir {
         validator: Option<Validator>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
-        Self::with_staging(destination, overwrite, validator, None, diagnostics)
+        Self::with_staging(
+            destination,
+            overwrite,
+            validator,
+            Staging::Beside,
+            diagnostics,
+        )
     }
 
-    /// [`OutputDir::new`], with the staging directory reserved in
-    /// `staging_dir` instead of beside the destination when it is given, as
+    /// [`OutputDir::new`], with the staging directory, and the backup of a
+    /// replaced directory, placed where `staging` says, as
     /// [`Output::with_staging`].
     ///
     /// # Errors
     /// As [`OutputDir::new`] and [`Output::with_staging`], plus
-    /// [`OutputError::StagingDir`] when `staging_dir` lies inside the
-    /// destination.
+    /// [`OutputError::StagingDir`] when the staging directory lies inside
+    /// the destination.
     pub fn with_staging(
         destination: impl AsRef<Path>,
         overwrite: Overwrite,
         validator: Option<Validator>,
-        staging_dir: Option<&Path>,
+        staging: Staging<'_>,
         diagnostics: &Diagnostics,
     ) -> Result<Self> {
         Ok(Self {
@@ -2602,7 +2736,7 @@ impl OutputDir {
                 Shape::Dir,
                 overwrite,
                 validator,
-                staging_dir,
+                staging,
                 diagnostics,
             )?,
         })
@@ -2679,21 +2813,22 @@ impl OutputSet {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        Self::files_with_staging(destinations, overwrite, None, diagnostics)
+        Self::files_with_staging(destinations, overwrite, Staging::Beside, diagnostics)
     }
 
-    /// [`OutputSet::files`], with every member's staging file reserved in
-    /// `staging_dir` when it is given, as [`Output::with_staging`]. The
-    /// directory is checked against every member's destination before any
-    /// member is reserved: one staging directory cannot serve destinations
-    /// on different mounts, and such a set is refused whole.
+    /// [`OutputSet::files`], with every member's staging file, and every
+    /// replaced member's backup, placed where `staging` says, as
+    /// [`Output::with_staging`]. A staging directory is checked against
+    /// every member's destination before any member is reserved: one
+    /// staging directory cannot serve destinations on different mounts, and
+    /// such a set is refused whole.
     ///
     /// # Errors
     /// As [`OutputSet::files`] and [`Output::with_staging`].
     pub fn files_with_staging<I, P>(
         destinations: I,
         overwrite: Overwrite,
-        staging_dir: Option<&Path>,
+        staging: Staging<'_>,
         diagnostics: &Diagnostics,
     ) -> Result<Self>
     where
@@ -2724,14 +2859,14 @@ impl OutputSet {
             }
             planned.push((resolved, identity));
         }
-        if let Some(dir) = staging_dir {
+        if let Some(dir) = staging.directory() {
             for path in &paths {
                 check_staging_dir(dir, path, Shape::File)?;
             }
         }
         let members = paths
             .iter()
-            .map(|path| Output::with_staging(path, overwrite, staging_dir, diagnostics))
+            .map(|path| Output::with_staging(path, overwrite, staging, diagnostics))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { members })
     }
@@ -3588,7 +3723,7 @@ mod tests {
             Shape::Dir,
             Overwrite::Refuse,
             None,
-            None,
+            Staging::Beside,
             &diagnostics,
         )
         .unwrap();
@@ -3628,8 +3763,13 @@ mod tests {
         fs::create_dir(&stage_dir_path).unwrap();
         fs::create_dir(&out_dir).unwrap();
         let dest = out_dir.join("out.osm.pbf");
-        let out = Output::with_staging(&dest, Overwrite::Refuse, Some(&stage_dir_path), &discard())
-            .unwrap();
+        let out = Output::with_staging(
+            &dest,
+            Overwrite::Refuse,
+            Staging::Dir(&stage_dir_path),
+            &discard(),
+        )
+        .unwrap();
         assert_eq!(out.path().parent(), Some(stage_dir_path.as_path()));
         assert!(
             out.path()
@@ -3661,7 +3801,7 @@ mod tests {
         let out = Output::with_staging(
             out_dir.join("o.pbf"),
             Overwrite::Refuse,
-            Some(&stage_dir_path),
+            Staging::Dir(&stage_dir_path),
             &discard(),
         )
         .unwrap();
@@ -3688,7 +3828,7 @@ mod tests {
             &dest,
             Overwrite::Replace,
             None,
-            Some(&stage_dir_path),
+            Staging::Dir(&stage_dir_path),
             &discard(),
         )
         .unwrap();
@@ -3718,27 +3858,34 @@ mod tests {
 
         let file = dir.path().join("plain-file");
         fs::write(&file, b"x").unwrap();
-        let err =
-            Output::with_staging(&dest, Overwrite::Refuse, Some(&file), &discard()).unwrap_err();
+        let err = Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&file), &discard())
+            .unwrap_err();
         assert_eq!(problem(&err), StagingProblem::NotADirectory);
         // The text names no front-end flag.
         assert!(!err.to_string().contains("--"), "{err}");
 
         let missing = dir.path().join("missing");
         let err =
-            Output::with_staging(&dest, Overwrite::Refuse, Some(&missing), &discard()).unwrap_err();
+            Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&missing), &discard())
+                .unwrap_err();
         assert_eq!(problem(&err), StagingProblem::Missing);
         assert!(err.to_string().contains("missing"), "{err}");
         let dangling = dir.path().join("dangling");
         std::os::unix::fs::symlink(&missing, &dangling).unwrap();
-        let err = Output::with_staging(&dest, Overwrite::Refuse, Some(&dangling), &discard())
-            .unwrap_err();
+        let err = Output::with_staging(
+            &dest,
+            Overwrite::Refuse,
+            Staging::Dir(&dangling),
+            &discard(),
+        )
+        .unwrap_err();
         assert_eq!(problem(&err), StagingProblem::Missing);
 
         // The output's own directory, and any directory above it.
         for holder in [&out_dir, &dir.path().to_path_buf()] {
-            let err = Output::with_staging(&dest, Overwrite::Refuse, Some(holder), &discard())
-                .unwrap_err();
+            let err =
+                Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(holder), &discard())
+                    .unwrap_err();
             assert_eq!(
                 problem(&err),
                 StagingProblem::HoldsDestination,
@@ -3748,8 +3895,8 @@ mod tests {
         // Through a symlink too.
         let link = dir.path().join("link-to-out");
         std::os::unix::fs::symlink(&out_dir, &link).unwrap();
-        let err =
-            Output::with_staging(&dest, Overwrite::Refuse, Some(&link), &discard()).unwrap_err();
+        let err = Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&link), &discard())
+            .unwrap_err();
         assert_eq!(problem(&err), StagingProblem::HoldsDestination);
 
         // Inside a directory output, which publication replaces.
@@ -3759,7 +3906,7 @@ mod tests {
             &index,
             Overwrite::Replace,
             None,
-            Some(&index.join("sub")),
+            Staging::Dir(&index.join("sub")),
             &discard(),
         )
         .unwrap_err();
@@ -3778,7 +3925,8 @@ mod tests {
         let below = dir.path().join(".stage");
         fs::create_dir(&below).unwrap();
         let dest = dir.path().join("o.pbf");
-        let out = Output::with_staging(&dest, Overwrite::Refuse, Some(&below), &discard()).unwrap();
+        let out = Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&below), &discard())
+            .unwrap();
         stage(&out, b"x").unwrap();
         out.publish(run_token()).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"x");
@@ -3813,7 +3961,7 @@ mod tests {
         let err = OutputSet::files_with_staging(
             [&fine, &held],
             Overwrite::Refuse,
-            Some(&stage_dir_path),
+            Staging::Dir(&stage_dir_path),
             &discard(),
         )
         .unwrap_err();
@@ -3833,7 +3981,7 @@ mod tests {
         let set = OutputSet::files_with_staging(
             [&fine, &other],
             Overwrite::Refuse,
-            Some(&stage_dir_path),
+            Staging::Dir(&stage_dir_path),
             &discard(),
         )
         .unwrap();
@@ -3913,7 +4061,7 @@ mod tests {
             let set = OutputSet::files_with_staging(
                 [&a, &b],
                 Overwrite::Refuse,
-                Some(&stage_dir_path),
+                Staging::Dir(&stage_dir_path),
                 &discard(),
             )
             .unwrap();
@@ -3969,7 +4117,7 @@ mod tests {
                 let out = Output::with_staging(
                     &dest,
                     Overwrite::Refuse,
-                    Some(&stage_dir_path),
+                    Staging::Dir(&stage_dir_path),
                     &discard(),
                 )
                 .unwrap();
@@ -4028,7 +4176,7 @@ mod tests {
                 &dest,
                 Overwrite::Replace,
                 None,
-                Some(&stage_dir_path),
+                Staging::Dir(&stage_dir_path),
                 &discard(),
             )
             .unwrap();
@@ -4059,7 +4207,7 @@ mod tests {
                 let set = OutputSet::files_with_staging(
                     [&a, &b],
                     Overwrite::Replace,
-                    Some(&stage_dir_path),
+                    Staging::Dir(&stage_dir_path),
                     &discard(),
                 )
                 .unwrap();
@@ -4374,7 +4522,7 @@ mod tests {
                 &dest,
                 Overwrite::Replace,
                 None,
-                Some(&stage_dir_path),
+                Staging::Dir(&stage_dir_path),
                 &discard(),
             )
             .unwrap();
@@ -4398,6 +4546,405 @@ mod tests {
                 "{unresolved:?}"
             );
             assert!(others(&stage_dir_path, &[]).is_empty());
+        }
+
+        /// The outcome of one replacing publication under
+        /// [`Staging::DirWithBackups`]: what each destination's directory
+        /// held at every announced step, and what is left.
+        struct WithBackups {
+            /// Entries other than a destination name seen in a destination's
+            /// directory, with the step they were seen at.
+            beside: Vec<String>,
+            result: Result<()>,
+            /// Every entry left in the staging directory.
+            staged: Vec<String>,
+            /// The diagnostics text.
+            warnings: Vec<String>,
+            stage_dir: PathBuf,
+            /// Every announced step, with the entry count of each backup in
+            /// the staging directory at that step (`moved-aside:0 [1]`).
+            steps: Vec<String>,
+            /// The syncs the publication made (`writer_sync_all_calls`).
+            syncs: u64,
+            /// What each destination holds afterwards: the new contents, the
+            /// previous ones, or nothing.
+            destinations: Vec<Option<Vec<u8>>>,
+            /// Kept alive for the paths above.
+            _dir: tempfile::TempDir,
+        }
+
+        /// Replace either a directory output, or a two-member group whose
+        /// members share a file name in two different directories (each
+        /// with its own previous contents), with `faults` armed and the
+        /// staging directory taking the backups. The destination
+        /// directories are listed at every step publication announces.
+        fn replace_with_backups(group: bool, faults: &[PublishFault]) -> WithBackups {
+            replace_staged(group, faults, true)
+        }
+
+        /// [`replace_with_backups`], or with `backups_staged` false the same
+        /// publication under `Staging::Dir` (whose backups go beside the
+        /// destinations, so `beside` is not meaningful).
+        #[allow(clippy::too_many_lines)]
+        fn replace_staged(
+            group: bool,
+            faults: &[PublishFault],
+            backups_staged: bool,
+        ) -> WithBackups {
+            let dir = scratch();
+            let stage_dir = dir.path().join("stage");
+            fs::create_dir(&stage_dir).unwrap();
+            let name = if group { "out.osm.pbf" } else { "index" };
+            let parents: Vec<PathBuf> = if group {
+                vec![dir.path().join("p0"), dir.path().join("p1")]
+            } else {
+                vec![dir.path().join("p0")]
+            };
+            for (k, parent) in parents.iter().enumerate() {
+                fs::create_dir(parent).unwrap();
+                let dest = parent.join(name);
+                if group {
+                    fs::write(&dest, format!("old {k}")).unwrap();
+                } else {
+                    fs::create_dir(&dest).unwrap();
+                    fs::write(dest.join("old.bin"), b"old").unwrap();
+                }
+            }
+            let token = armed(faults);
+            let beside = Arc::new(Mutex::new(Vec::new()));
+            let heard = Arc::clone(&beside);
+            let steps = Arc::new(Mutex::new(Vec::new()));
+            let stepped = Arc::clone(&steps);
+            let watched = parents.clone();
+            let watched_stage = stage_dir.clone();
+            token.faults().on_publish_step(move |step| {
+                for parent in &watched {
+                    for entry in others(parent, &[name]) {
+                        heard.lock().unwrap().push(format!("{step}: {entry}"));
+                    }
+                }
+                // Each step with what the staging directory then holds: its
+                // backups, each with how many entries are inside it.
+                let mut backups: Vec<String> = others(&watched_stage, &[])
+                    .into_iter()
+                    .filter(|e| e.starts_with(".pbfhogg-backup-"))
+                    .map(|e| others(&watched_stage.join(&e), &[]).len().to_string())
+                    .collect();
+                backups.sort();
+                stepped
+                    .lock()
+                    .unwrap()
+                    .push(format!("{step} [{}]", backups.join(",")));
+            });
+            let (sink, diagnostics) = recording();
+            let staging = if backups_staged {
+                Staging::DirWithBackups(&stage_dir)
+            } else {
+                Staging::Dir(&stage_dir)
+            };
+            let result = if group {
+                let set = OutputSet::files_with_staging(
+                    parents.iter().map(|p| p.join(name)),
+                    Overwrite::Replace,
+                    staging,
+                    &diagnostics,
+                )
+                .unwrap();
+                for member in set.iter() {
+                    stage_under(member, &token, b"new").unwrap();
+                }
+                set.publish(&token)
+            } else {
+                let out = OutputDir::with_staging(
+                    parents[0].join(name),
+                    Overwrite::Replace,
+                    None,
+                    staging,
+                    &diagnostics,
+                )
+                .unwrap();
+                stage_dir_under(&out, &token, "new.bin", b"new");
+                out.publish(&token)
+            };
+            let mut beside = beside.lock().unwrap().clone();
+            for parent in &parents {
+                for entry in others(parent, &[name]) {
+                    beside.push(format!("after: {entry}"));
+                }
+            }
+            let staged = others(&stage_dir, &[]);
+            let warnings = sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect();
+            let mut syncs = 0;
+            token.for_each_counter(|counter, value| {
+                if counter == "writer_sync_all_calls" {
+                    syncs = value;
+                }
+            });
+            let destinations = parents
+                .iter()
+                .map(|parent| {
+                    let dest = parent.join(name);
+                    if group {
+                        fs::read(&dest).ok()
+                    } else if dest.exists() {
+                        let file = if dest.join("new.bin").exists() {
+                            "new.bin"
+                        } else {
+                            "old.bin"
+                        };
+                        Some(fs::read(dest.join(file)).unwrap())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let steps = steps.lock().unwrap().clone();
+            WithBackups {
+                beside,
+                result,
+                staged,
+                warnings,
+                stage_dir,
+                steps,
+                syncs,
+                destinations,
+                _dir: dir,
+            }
+        }
+
+        /// With the staging directory taking backups, a replacing
+        /// publication creates nothing beside a destination at any step, on
+        /// success and on every failure path; whatever it keeps is in the
+        /// staging directory, holds a previous generation whole, and is named
+        /// by the error or a warning. A process killed at any step leaves
+        /// exactly that step's state, so nothing beside a destination either.
+        #[test]
+        #[allow(clippy::type_complexity, clippy::too_many_lines)]
+        fn backups_in_the_staging_directory_leave_nothing_beside_a_destination() {
+            use PublishFault as F;
+            const NEW: Option<&[u8]> = Some(b"new");
+            const OLD: Option<&[u8]> = Some(b"old");
+            const OLD0: Option<&[u8]> = Some(b"old 0");
+            const OLD1: Option<&[u8]> = Some(b"old 1");
+            // (form is a group, faults, succeeds, backups kept, what each
+            // destination holds afterwards)
+            let cases: Vec<(bool, Vec<F>, bool, usize, Vec<Option<&[u8]>>)> = vec![
+                (false, vec![], true, 0, vec![NEW]),
+                (true, vec![], true, 0, vec![NEW, NEW]),
+                (false, vec![F::AfterBackup], false, 0, vec![OLD]),
+                (false, vec![F::MoveAside], false, 0, vec![OLD]),
+                (false, vec![F::BackupSync], false, 0, vec![OLD]),
+                (false, vec![F::BackupLinkSync], false, 0, vec![OLD]),
+                (true, vec![F::BackupLinkSync], false, 0, vec![OLD0, OLD1]),
+                (
+                    false,
+                    vec![F::BackupLinkSync, F::Restore],
+                    false,
+                    1,
+                    vec![None],
+                ),
+                (false, vec![F::CrossMount(0)], false, 0, vec![OLD]),
+                (false, vec![F::AfterInstalled(0)], false, 0, vec![OLD]),
+                (
+                    false,
+                    vec![F::AfterInstalled(0), F::RestoreRename],
+                    false,
+                    1,
+                    vec![None],
+                ),
+                (true, vec![F::AfterInstalled(1)], false, 0, vec![OLD0, OLD1]),
+                (
+                    true,
+                    vec![F::AfterInstalled(1), F::Restore],
+                    false,
+                    2,
+                    vec![NEW, NEW],
+                ),
+                (
+                    true,
+                    vec![F::CrossMount(1), F::Restore],
+                    false,
+                    2,
+                    vec![NEW, None],
+                ),
+                (false, vec![F::DirSync], false, 1, vec![NEW]),
+                (true, vec![F::DirSync], false, 2, vec![NEW, NEW]),
+                (false, vec![F::BackupRemoval], true, 1, vec![NEW]),
+                (true, vec![F::BackupRemoval], true, 2, vec![NEW, NEW]),
+            ];
+            for (group, faults, succeeds, kept, holds) in cases {
+                let name = format!("group {group}, {faults:?}");
+                let run = replace_with_backups(group, &faults);
+                assert!(run.beside.is_empty(), "{name}: {:?}", run.beside);
+                assert_eq!(run.result.is_ok(), succeeds, "{name}: {:?}", run.result);
+                let holds: Vec<Option<Vec<u8>>> =
+                    holds.iter().map(|h| h.map(<[u8]>::to_vec)).collect();
+                assert_eq!(run.destinations, holds, "{name}");
+                // The steps were heard, and the backups they describe were in
+                // the staging directory as they happened: empty when reserved
+                // and once restored, holding the previous output once moved.
+                let moved = !faults.contains(&F::MoveAside);
+                assert_eq!(
+                    run.steps.iter().any(|s| s.starts_with("moved-aside:")),
+                    moved,
+                    "{name}: {:?}",
+                    run.steps
+                );
+                for step in &run.steps {
+                    let (label, counts) = step.split_once(" [").unwrap();
+                    let counts: Vec<&str> = counts.trim_end_matches(']').split(',').collect();
+                    let expect = if label.starts_with("moved-aside:") {
+                        Some("1")
+                    } else if label.starts_with("backup-reserved:")
+                        || label.starts_with("restored:")
+                    {
+                        Some("0")
+                    } else {
+                        None
+                    };
+                    if let Some(expect) = expect {
+                        assert!(counts.contains(&expect), "{name}: {step}");
+                    }
+                }
+                let backups: Vec<&String> = run
+                    .staged
+                    .iter()
+                    .filter(|e| e.starts_with(".pbfhogg-backup-"))
+                    .collect();
+                assert_eq!(backups.len(), kept, "{name}: {:?}", run.staged);
+                assert_eq!(
+                    run.staged.len(),
+                    kept,
+                    "{name}: only kept backups stay: {:?}",
+                    run.staged
+                );
+                let told = match &run.result {
+                    Ok(()) => run.warnings.join("\n"),
+                    Err(err) => err.report(),
+                };
+                let mut previous = Vec::new();
+                for backup in backups {
+                    assert!(told.contains(backup.as_str()), "{name}: {told}");
+                    for entry in others(&run.stage_dir.join(backup), &[]) {
+                        let path = run.stage_dir.join(backup).join(entry);
+                        previous.push(if group {
+                            fs::read(path).unwrap()
+                        } else {
+                            fs::read(path.join("old.bin")).unwrap()
+                        });
+                    }
+                }
+                previous.sort();
+                let whole: Vec<Vec<u8>> = match (group, kept) {
+                    (_, 0) => vec![],
+                    (false, _) => vec![b"old".to_vec()],
+                    (true, _) => vec![b"old 0".to_vec(), b"old 1".to_vec()],
+                };
+                assert_eq!(previous, whole, "{name}: kept generations whole");
+            }
+        }
+
+        /// A backup in the staging directory costs exactly one more sync
+        /// than one beside its destination: the staging directory, after the
+        /// container and before the destination's directory, once for every
+        /// backup made (a second member's backup needs it again), and once
+        /// more after a failed install whose restore failed, for the
+        /// directory holding the kept backup. Under `Staging::Dir` that
+        /// directory is the destination's, synced either way. Removing
+        /// either sync, or the syncs after a failed install, makes the two
+        /// placements' counts meet.
+        #[test]
+        fn a_backup_in_the_staging_directory_syncs_the_staging_directory() {
+            use PublishFault as F;
+            let cases: Vec<(bool, Vec<F>, u64)> = vec![
+                (false, vec![], 1),
+                (true, vec![], 2),
+                (false, vec![F::BackupSync, F::Restore], 1),
+                // Restored: no backup kept, nothing more to sync.
+                (false, vec![F::BackupSync], 0),
+            ];
+            for (group, faults, extra) in cases {
+                let beside = replace_staged(group, &faults, false);
+                let staged = replace_staged(group, &faults, true);
+                assert_eq!(
+                    staged.syncs,
+                    beside.syncs + extra,
+                    "group {group}, {faults:?}: {} beside, {} staged",
+                    beside.syncs,
+                    staged.syncs
+                );
+            }
+        }
+
+        /// The new sync of the staging directory holding a backup is made
+        /// only when the backup lives there: under `Staging::Dir` the fault
+        /// that fails it never fires, and the replacement succeeds with its
+        /// backup beside the destination, then removed.
+        #[test]
+        fn the_backup_link_sync_is_only_for_backups_in_the_staging_directory() {
+            let dir = scratch();
+            let stage_dir_path = dir.path().join("stage");
+            fs::create_dir(&stage_dir_path).unwrap();
+            let dest = dir.path().join("index");
+            fs::create_dir(&dest).unwrap();
+            fs::write(dest.join("old"), b"old").unwrap();
+            let out = OutputDir::with_staging(
+                &dest,
+                Overwrite::Replace,
+                None,
+                Staging::Dir(&stage_dir_path),
+                &discard(),
+            )
+            .unwrap();
+            let token = armed(&[PublishFault::BackupLinkSync]);
+            stage_dir_under(&out, &token, "new", b"new");
+            out.publish(&token).unwrap();
+            assert_eq!(fs::read(dest.join("new")).unwrap(), b"new");
+            assert!(others(dir.path(), &["index", "stage"]).is_empty());
+            assert!(others(&stage_dir_path, &[]).is_empty());
+        }
+
+        /// A move into a backup in the staging directory refused as
+        /// crossing a mount is the staging directory's refusal, typed as an
+        /// install's; the previous output never moved. With the backup
+        /// beside the destination the same answer stays a plain failure to
+        /// move it aside.
+        #[test]
+        fn a_cross_mount_move_into_a_staged_backup_is_the_staging_directorys() {
+            for with_backups in [true, false] {
+                let dir = scratch();
+                let stage_dir_path = dir.path().join("stage");
+                fs::create_dir(&stage_dir_path).unwrap();
+                let dest = dir.path().join("index");
+                fs::create_dir(&dest).unwrap();
+                fs::write(dest.join("old"), b"old").unwrap();
+                let staging = if with_backups {
+                    Staging::DirWithBackups(&stage_dir_path)
+                } else {
+                    Staging::Dir(&stage_dir_path)
+                };
+                let out =
+                    OutputDir::with_staging(&dest, Overwrite::Replace, None, staging, &discard())
+                        .unwrap();
+                let token = armed(&[PublishFault::MoveAsideCrossMount]);
+                stage_dir_under(&out, &token, "new", b"new");
+                let err = out.publish(&token).unwrap_err();
+                if with_backups {
+                    assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
+                } else {
+                    assert!(!matches!(err.kind(), crate::ErrorKind::Output(_)), "{err}");
+                    assert!(err.report().contains("aside"), "{err}");
+                }
+                assert_eq!(fs::read(dest.join("old")).unwrap(), b"old");
+                assert!(others(dir.path(), &["index", "stage"]).is_empty());
+                assert!(others(&stage_dir_path, &[]).is_empty());
+            }
         }
 
         #[derive(Clone, Copy)]

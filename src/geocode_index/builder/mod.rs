@@ -321,11 +321,16 @@ pub fn index_output(
     overwrite: crate::output::Overwrite,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<IndexOutput> {
-    index_output_with_staging(destination, overwrite, None, diagnostics)
+    index_output_with_staging(
+        destination,
+        overwrite,
+        crate::output::Staging::Beside,
+        diagnostics,
+    )
 }
 
-/// [`index_output`], with the staging directory reserved in `staging_dir`
-/// when it is given.
+/// [`index_output`], with the staging directory, and the backup of a
+/// replaced index, placed where `staging` says.
 ///
 /// # Errors
 /// As [`OutputDir::with_staging`](crate::output::OutputDir::with_staging),
@@ -333,14 +338,14 @@ pub fn index_output(
 pub fn index_output_with_staging(
     destination: impl AsRef<std::path::Path>,
     overwrite: crate::output::Overwrite,
-    staging_dir: Option<&std::path::Path>,
+    staging: crate::output::Staging<'_>,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<IndexOutput> {
     crate::output::OutputDir::with_staging(
         destination,
         overwrite,
         Some(replaceable_index_dir),
-        staging_dir,
+        staging,
         diagnostics,
     )
     .map(IndexOutput)

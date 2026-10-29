@@ -400,6 +400,16 @@ above its final value is a defect). Proposed: keep the ticket's order.
   whose plan expects an `ok` outcome and an installed PBF output. brokkr
   requires the library output to exist as a regular file and the replay
   to exit 0, and it has no expected-refusal mode.
+- **Staging and scratch.** Every output a call constructs takes
+  `Staging::DirWithBackups(private_dir)`, the `--private-dir` brokkr passes,
+  and every `RunScratch` is created in it. Then nothing a publication
+  creates lands in `roles/` (brokkr's layout check refuses any undeclared
+  entry there): staging entries and the backups of replaced directory roles
+  and group members all live in the private directory. A displaced
+  publication's kept backup goes with brokkr's release of that directory,
+  as the protocol's `displaced` effect says; whether it survived until then
+  is the harness's own assertion to make, before the call document is
+  written. `Staging::Dir` would leave such a backup in `roles/`.
 - **Generated inputs.** A `hotpath` scenario binds only dataset roles,
   because setup in a profiled run may do no library work. Non-profiled
   scenarios may generate fixtures with the library during setup.

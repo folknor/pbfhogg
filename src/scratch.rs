@@ -13,9 +13,10 @@
 //! The public entry points that use scratch take the guard by value, so one
 //! invocation owns exactly one directory and two invocations cannot share one.
 //!
-//! Outputs are not scratch. An output is staged beside its destination so it
-//! can be renamed into place (`crate::output`); that placement is not
-//! governed by the scratch parent.
+//! Outputs are not scratch. An output is staged beside its destination, or
+//! in a caller-chosen staging directory on its mount, so it can be renamed
+//! into place (`crate::output::Staging`); that placement is not governed by
+//! the scratch parent.
 //!
 //! The scratch parent is trusted, as an output's parent is: it and the path
 //! to it must stay stable for the run. The operations are path based.

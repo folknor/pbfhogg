@@ -1183,7 +1183,12 @@
   the output's own directory is still checked for writability up front.
   Library: `Output::with_staging`, `OutputDir::with_staging`,
   `OutputSet::files_with_staging`,
-  `geocode_index::builder::index_output_with_staging`, refusing with the new
+  `geocode_index::builder::index_output_with_staging`, taking the new
+  `Staging` placement (`Beside`, `Dir` as the CLI uses it, or
+  `DirWithBackups`, which also puts the backups of replaced outputs in the
+  staging directory, so nothing but the outputs appears beside them; removing
+  that directory then removes any previous output a publication kept there),
+  refusing with the new
   `OutputError::StagingDir` (whose `source` carries the kernel's error when
   the refusal came at publication) and `StagingProblem`. Publication also now syncs
   every directory a rename changed, including a directory output's staging

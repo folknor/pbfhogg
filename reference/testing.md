@@ -409,7 +409,15 @@ exception, not a tier - should not survive across many PRs.
   `every_publication_announces_its_namespace_steps_in_order` pins the
   traces. A kill inside a backup's recursive removal is between two steps
   and is covered by confinement (it only deletes inside the backup), not
-  sampled.
+  sampled. `Staging::DirWithBackups` has no CLI spelling, so its kill
+  states are covered in the library instead:
+  `backups_in_the_staging_directory_leave_nothing_beside_a_destination`
+  lists every destination's directory at every announced step of each
+  replacing shape and failure path and the backups the staging directory
+  then holds (empty when reserved and once restored, holding the previous
+  output once moved), then checks what each destination and kept backup
+  holds at the end. It walks the step prefixes a kill would leave, without
+  killing anything.
 - **CliInvoker for CLI-driven tests.** `cli/tests/invoker.rs`. Every
   new `cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via

@@ -783,6 +783,20 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Core infrastructure and CLI
 
+- [ ] **Replacing a directory output the caller cannot write fails at the
+  move into its backup, and nothing says so up front.** The move renames
+  the old directory into the backup container, a new parent, and Linux
+  then requires write permission on the moved directory itself
+  (`vfs_rename`, `MAY_WRITE` on a directory source whose parent changes).
+  So an unprivileged `build-geocode-index --overwrite` over a read-only
+  index (mode 0555, say) passes construction and fails at publication with
+  "cannot move existing output ... aside"; nothing is lost (the empty
+  container is removed) but the work is. True for every `Staging`
+  placement, not introduced by `Staging::DirWithBackups`. Decide whether
+  construction should check it and refuse before any work, and document
+  it in `docs/cli/commands.md`. Found 2026-10-29 by the backup-placement
+  item's spar.
+
 - [ ] **A standalone pipelined `PbfWriter` flushes `Ok` after a write
   already returned its writer thread's error.** `pipeline_send_error`
   takes the join handle, so a later `flush` finds no thread to join and

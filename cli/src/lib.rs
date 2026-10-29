@@ -154,7 +154,7 @@ impl OutputArg {
         Ok(pbfhogg::Output::with_staging(
             &self.output,
             self.overwrite.intent(),
-            self.staging_dir.as_deref(),
+            pbfhogg::Staging::dir(self.staging_dir.as_deref()),
             &host.diagnostics,
         )?)
     }
@@ -223,7 +223,7 @@ impl OverwriteOutputArg {
                 pbfhogg::Output::with_staging(
                     path,
                     self.intent(),
-                    self.staging_dir.as_deref(),
+                    pbfhogg::Staging::dir(self.staging_dir.as_deref()),
                     &host.diagnostics,
                 )
             })
@@ -2972,7 +2972,7 @@ pub fn run() -> process::ExitCode {
                         pbfhogg::Output::with_staging(
                             output,
                             overwrite,
-                            staging_dir.as_deref(),
+                            pbfhogg::Staging::dir(staging_dir.as_deref()),
                             &host.diagnostics,
                         )?,
                         &region,
@@ -3382,7 +3382,7 @@ fn run_build_geocode_index(
     let output = pbfhogg::geocode_index::builder::index_output_with_staging(
         output_dir,
         pbfhogg::Overwrite::from_flag(overwrite),
-        paths.staging_dir(),
+        pbfhogg::Staging::dir(paths.staging_dir()),
         &host.diagnostics,
     )?;
     // After the output, so an existing index directory is judged before the
@@ -4403,7 +4403,7 @@ fn run_extract_config(
     let outputs = pbfhogg::OutputSet::files_with_staging(
         slots.iter().map(|slot| &slot.output),
         overwrite,
-        staging_dir,
+        pbfhogg::Staging::dir(staging_dir),
         &host.diagnostics,
     )?;
     let destinations: Vec<PathBuf> = outputs

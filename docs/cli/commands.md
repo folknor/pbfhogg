@@ -476,8 +476,14 @@ Publication syncs both directories a rename changes, the staging side as well
 as the output's directory. Library callers get the same placement and checks
 from `Output::with_staging`, `OutputDir::with_staging`,
 `OutputSet::files_with_staging` and
-`geocode_index::builder::index_output_with_staging`, whose refusals are
-`OutputError::StagingDir` with a `StagingProblem`.
+`geocode_index::builder::index_output_with_staging` with `Staging::Dir`,
+whose refusals are `OutputError::StagingDir` with a `StagingProblem`. A
+library caller may also pass `Staging::DirWithBackups`, which the CLI never
+uses: backups of replaced outputs then go in the staging directory too, so
+nothing but the outputs appears beside them, and removing that directory
+removes any previous output a publication kept there. The same checks
+apply, and a move into such a backup refused across mounts is the same
+staging-directory refusal.
 
 ## Scratch files
 

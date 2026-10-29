@@ -237,7 +237,7 @@ pub use error::{
     BlobError, Error, ErrorKind, KindContradiction, OutputError, OversizePart, Result,
     StagingProblem, Unresolved,
 };
-pub use output::{Output, OutputDir, OutputSet, Overwrite};
+pub use output::{Output, OutputDir, OutputSet, Overwrite, Staging};
 pub use owned::{ParseTypeFilterError, TypeFilter};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,

@@ -37,12 +37,27 @@ output any other way.
   one file, before any of them is staged.
 - **A caller may choose where staging goes.** The `with_staging`
   constructors (`Output`, `OutputDir`, `OutputSet::files_with_staging`,
-  `index_output_with_staging`) reserve the staging entry in a caller-chosen
-  directory instead, so a caller that gives each run a private directory can
-  remove it whole after a run killed outright, without matching any name.
-  Nothing else moves there: a backup always stays beside its destination,
-  because it can be the only copy of a previous output and the caller removes
-  its staging directory wholesale. The names stay unique per process and
+  `index_output_with_staging`) take a `Staging` placement. `Staging::Dir`
+  reserves the staging entry in a caller-chosen directory instead, so a
+  caller that gives each run a private directory can remove it whole after a
+  run killed outright, without matching any name; a backup then stays beside
+  its destination, because it can be the only copy of a previous output and
+  the caller removes its staging directory wholesale. The CLI's
+  `--staging-dir` is `Staging::Dir`. `Staging::DirWithBackups` puts every
+  backup in that directory too, so publication creates nothing beside a
+  destination but the destination itself: for a caller whose destinations
+  are its own disposable state (a test harness whose output slots must hold
+  only declared names), which declares by choosing it that removing the
+  directory may remove a previous output a publication kept there. Only the
+  placement changes: pbfhogg keeps, reports and never deletes such a backup
+  exactly as one beside a destination, and the same directory checks apply.
+  The backup's container then lives in the staging directory, so the
+  durability chain before the swap gains a link (the container, then the
+  staging directory, then the destination's directory), the best-effort
+  syncs after a failed install sync each kept backup's container and the
+  directory holding it before the changed directories, and an `EXDEV` moving
+  the previous output into it is the staging directory's refusal
+  (`OutputError::StagingDir`), as at install. The names stay unique per process and
   sequence: a name derived from the destination alone would put every run to
   one destination in one namespace, and taking over a dead run's entry there
   needs an ownership protocol spanning reservation through rollback that no
@@ -122,12 +137,14 @@ output any other way.
   never to a check-then-rename; where neither exists the publish is refused
   (`OutputError::ExclusivePublishUnsupported`). A directory, or any member of
   a group, moves an existing destination into an exclusively created
-  `.pbfhogg-backup-*` sibling, installs, and on a later failure rolls the
+  `.pbfhogg-backup-*` sibling (in the staging directory under
+  `Staging::DirWithBackups`), installs, and on a later failure rolls the
   installed members back in reverse; a rollback step that cannot complete
   keeps the backup (never deleted) and the error names it
   (`OutputError::RollbackIncomplete`). The backup is the previous output's
   only name from the move until the new output is in place, so the move is
-  made durable first (the backup container, then the parent) and a failure
+  made durable first (the backup container, then the directory holding it
+  when that is a staging directory, then the parent) and a failure
   there is an install failure that restores. After a rollback the touched
   parents and any kept backup are synced best effort: a successful rollback
   is a statement about what is visible, not about crash durability. Every
@@ -234,7 +251,8 @@ fails its session. A process killed outright (SIGKILL, the OOM killer, power
 loss, the CLI's second interrupt) can leave `.pbfhogg-tmp-*` staging behind (in the staging directory, when the caller chose one), and a failed rollback or an unsynced
 publication leaves `.pbfhogg-backup-*` on purpose; neither is ever under the
 name the caller chose. A process killed inside publication can also leave a
-backup beside a destination: empty, holding the previous output whole, or
+backup beside a destination (in the staging directory under
+`Staging::DirWithBackups`): empty, holding the previous output whole, or
 holding what a removal had not yet reached; each destination then holds its
 previous output, the new one, or nothing while a backed-up destination is
 between its two renames (the previous output is then in the backup). A group
@@ -258,7 +276,7 @@ dropped, after every sync publication attempted, so a sink cannot interrupt
 durability; while a panic is unwinding nothing is emitted, because a sink
 that panicked then would abort the process, and the next scan reports the
 leftover instead. A previous output whose contents cannot be unlinked stays
-in its `.pbfhogg-backup-*` sibling, possibly partly removed.
+in its `.pbfhogg-backup-*` entry, possibly partly removed.
 
 ## Alternatives considered
 
@@ -271,6 +289,14 @@ in its `.pbfhogg-backup-*` sibling, possibly partly removed.
   and a staging directory without its lock file cannot be told apart from
   one being set up. A caller-chosen staging directory gives a caller the same
   cleanup without any shared namespace.
+- **Backups follow every caller-chosen staging directory** (2026-10-29,
+  for a library harness whose output slots must hold only declared names).
+  Rejected for a single rule: the CLI's `--staging-dir` promises a caller
+  that removing the directory after a killed run loses no previous output,
+  and its callers do remove it unconditionally (brokkr's lease release is a
+  plain recursive removal). Disposing of a run's new, unpublished work does
+  not authorize disposing of the previous output, so the two are separate
+  placements and only `Staging::DirWithBackups` grants the second.
 - **Deterministic backup names, refusing while one exists.** Rejected: a
   backup is never a caller's to clean up, so a computable name buys no
   cleanup, while refusing turns one interrupted publication into a failure

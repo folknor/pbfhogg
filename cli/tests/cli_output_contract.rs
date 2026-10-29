@@ -2568,6 +2568,7 @@ mod killed_in_publication {
         a_file_published_by_link: "cat", None, "force-link-fallback", false;
         a_file_rolled_back_while_linked: "cat", None, "force-link-fallback,after-link", true;
         a_replaced_file: "cat", All, "", false;
+        a_replaced_file_kept_after_a_late_failure: "cat", All, "after-installed:0", true;
         a_group_published_exclusively: "extract --config", None, "", false;
         a_replaced_group: "extract --config", All, "", false;
         a_group_replacing_one_member: "extract --config", Last, "", false;

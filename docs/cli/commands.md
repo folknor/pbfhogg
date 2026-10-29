@@ -466,7 +466,10 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   reported as such: a directory sync that fails after the output was put in
   place is an error that says the output *was* published (naming any backup
   of a replaced output, which is then kept), and a group whose rollback
-  cannot complete names what is left where. The output's directory must
+  cannot complete names what is left where. A single file output that
+  replaced an existing file keeps no copy of the previous version, so its
+  rename is never undone: a failure after it leaves the new output in place
+  and says so. The output's directory must
   exist and be writable, which is checked before any work.
 - Without `--overwrite` publication is exclusive: an output that appears
   while the command runs is not replaced either. On a filesystem with

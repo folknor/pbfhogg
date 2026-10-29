@@ -52,7 +52,7 @@ from the 2026-10-29 session and is recorded nowhere else.
   with the user again, as that procedure requires.
 
 **What to build, in order:** the landing table at the end of this note,
-run as L0, L1, L2, L3, L4, L7, L5, L6. L7 (#36) comes before L5 because
+run as L1, L2, L3, L4, L7, L5, L6. L7 (#36) comes before L5 because
 the concurrent scenarios need a reserving descriptor provider.
 
 L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
@@ -63,7 +63,7 @@ covers is in `docs/cli/commands.md` "digest": beyond brokkr#60's list it
 also hashes exact nanodegree coordinates and the declared prepass fields.
 Its residue is the re-certification, which waits on a harness (L2 onward):
 a certification under `v1` holds for `v1` only.
-- L0 (irreversible unbacked replacement) stands alone.
+- L0 (irreversible unbacked replacement) has landed; see the landing list.
 - L1 is #33 per Decision B.
 - L2, the harness skeleton, needs neither seal nor B.
 - L3 and L4 are the seal (Decision A and C). They are the largest and are
@@ -76,10 +76,13 @@ a certification under `v1` holds for `v1` only.
 - **#32, #33, #34, #35 and #36** are open and map to the landings. #37
   (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
-- **brokkr#58** (library-against-CLI timing on `CLI_COMMAND_START` /
-  `CLI_COMMAND_END`) and **brokkr#59's follow-ups** (refusing `exit: 64` in
-  refusal counterparts, rewording its refusal docs) are with the brokkr
-  developer. Nothing here waits on them.
+- **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
+  `98bddee`):
+  - isolation timing reads the CLI command interval;
+  - refusal counterparts refuse `exit: 64`;
+  - CLI equality accepts digest `v1` and `v2`.
+- **brokkr#61** (digest has no measured brokkr command) is open. Until it
+  lands, the cost of digest `v2` on the success path is unmeasured.
 
 **Practical facts:**
 - **Read the protocol** through `brokkr man library` (the installed
@@ -433,9 +436,8 @@ The settled shape is the following. No brokkr change is needed.
 9. **Unbacked replacement is irreversible.** A lone file replaced by
    rename-over, with no backup, is a commit boundary. A failure after it
    keeps the new generation installed (`installed`) and never rolls back
-   into destruction. This is a pbfhogg fix: the current rollback can
-   destroy the previous generation after an `AfterInstalled` failure.
-   Keeping that behaviour would need a protocol effect for destructive
+   into destruction. Landed as L0 (the rollback used to remove the
+   destination after an `AfterInstalled` failure). Keeping that behaviour would need a protocol effect for destructive
    loss, which is rejected.
 10. **Reads.** `for_each_publication` copies the rows under the log lock
     and calls the visitor afterwards.
@@ -446,7 +448,8 @@ The settled shape is the following. No brokkr change is needed.
     - admission is serialized through completion;
     - cancel decides pending units;
     - effects are a reported result of publication;
-    - unbacked replacement is irreversible.
+    - unbacked replacement is irreversible (ADR-0017 carries it since
+      L0).
 
 **For the implementation spar:** the guard layout for abandonment, the
 retirement order of tickets and permits, allocation and unwind handling,
@@ -548,6 +551,13 @@ its final value is a defect.
   a displaced backup survived is the harness's own assertion.
 - **Generated inputs.** A `hotpath` scenario binds only dataset roles,
   because setup in a profiled run may do no library work.
+- **Isolation scenarios** (brokkr#58): its counterpart must
+  `expect: "output"`, and it may have no generated roles. brokkr rejects
+  both when it reads the describe document. Before `entry_us`, setup must
+  not read dataset contents, start input I/O or build readers or other
+  data derived from the datasets for the call. Opening and preparing the
+  inputs belong inside the call. Under `--bench`, brokkr alternates timed
+  library and CLI runs from a page cache verified cold.
 - **Process policy.** The harness sets its own soft `RLIMIT_NOFILE` per
   plan before library work and never touches SIGPIPE. A panic reaches
   stderr, which fails the run.
@@ -578,10 +588,22 @@ Landed independently, 2026-10-29:
 - `d100ae8f`: `Staging::DirWithBackups`.
 - `ce104e1e`: the CLI command interval (#38).
 - `d2d8836a`: usage errors exit 64.
+- L0, unbacked replacement is irreversible (Decision B item 9): the
+  commit that carries this line. `Installed` records what it displaced
+  (`Displaced::Nothing`, `Backup` or `Unbacked`, observed at the rename);
+  rollback never touches an `Unbacked` install, and publication reports it
+  as `RollbackIncomplete` with a note saying the new output remains
+  published, plus "durability unconfirmed" only when a directory it
+  changed failed to sync. Only the `AfterInstalled` fault reaches it today.
+  ADR-0017 carries the rule; ADR-0019 has no rollback text and its
+  amendment stays with L1. For L1: an `Unbacked` install that is kept is
+  effect `installed`. For L5: a lone replaced file failing after its
+  rename now ends holding the new content, not the seed, so a
+  `seeded-replace` scenario expecting a refusal judged on final state
+  (brokkr#59) must not arm that fault on a lone file.
 
 | # | Landing | Gate |
 |---|---|---|
-| L0 | Unbacked replacement is irreversible: a lone file replaced by rename-over is a commit boundary, so a later failure keeps it installed instead of rolling back into destroying the previous generation. Independent of the rest, and a fix on its own | `brokkr check`, with the `AfterInstalled` fault on a lone replaced file now keeping the new generation |
 | L1 | #33 per Decision B: explicit `bind` on outputs, directories and sets, with command entry points binding at entry; the per-invocation log; admission serialized through completion; effects recorded from namespace transitions; invocation-wide cancel deciding pending units; `for_each_publication`; ADR-0017 and ADR-0019 amendments | `brokkr check`, with tests for: reversed creation and publication order; ordinal order equal to execution order with a hook parked; one row per set; a command failing before it opens its output recording `refused_error`; cancel parked against a decision from both sides; every effect, restored and displaced included, through publication faults; a group with a failing middle member; dropping one set member leaving the set pending |
 | L2 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with an output counterpart, wiring, hotpath features. Seal is reported refused until L4 | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
 | L3 | Decision A's capabilities: control handle, `Call` and `Permit`, the transition word Open-only, census tickets, the pool permit. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: guards and permits back to 0 after every command and drop; a held `PipelinedBlocks` blocked on a caller stream holding a permit and a ticket and no guard; a nested entry minting normally; `Refused(Unticketed)` impossible in a quiescent run |
@@ -593,8 +615,7 @@ Landed independently, 2026-10-29:
 
 ## Out of scope
 
-- brokkr's side, apart from the `v2` digest acceptance L8 paired with
-  (landed, brokkr#60).
-  That includes brokkr#58 (library against CLI timing) and #59's
-  follow-ups.
+- brokkr's side. Everything this design needed from brokkr has landed
+  (brokkr `3c59ce8`, `75dc76f`, `6074751`, `2f407c3`, `98bddee`); brokkr#61
+  is the one open brokkr item.
 - A `crates/` relayout.

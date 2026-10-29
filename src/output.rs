@@ -91,7 +91,9 @@
 //! fails to install, members already installed are rolled back, and a
 //! rollback step that cannot complete keeps the previous output in a
 //! `.pbfhogg-backup-*` entry (a sibling, or in the staging directory under
-//! [`Staging::DirWithBackups`]) and says so in the error.
+//! [`Staging::DirWithBackups`]) and says so in the error. A lone file
+//! replacing an existing one has no backup, so its rename is irreversible:
+//! a failure after it keeps the new output and reports it as not undone.
 
 // This module is the output choke point the crate-root deny points at: the
 // staging, publication, rollback and directory syncs it owns are the calls
@@ -1324,13 +1326,43 @@ enum State {
     /// The old destination was moved to `backup`; the new output is not
     /// installed, so the destination is (as far as we know) empty.
     BackedUp(Backup),
-    /// The new output is at the destination.
+    /// The new output is at the destination; `displaced` says what was there
+    /// before it, which decides whether a rollback can undo it.
     Installed {
-        backup: Option<Backup>,
+        displaced: Displaced,
         identity: Option<Identity>,
     },
     /// Published for good. Backups are removable.
     Committed,
+}
+
+/// What an installation displaced from the destination, as observed when it
+/// installed.
+#[derive(Debug)]
+enum Displaced {
+    /// The destination was absent (an exclusive install, or a replacing one
+    /// that found nothing): removing the new output restores it.
+    Nothing,
+    /// The previous output was moved into a backup first, which restores it.
+    Backup(Backup),
+    /// A lone file renamed over the previous output, which is gone: the
+    /// installation is irreversible, a commit boundary. A later failure
+    /// keeps the new output published and never removes it, which would
+    /// destroy the only generation left.
+    Unbacked,
+}
+
+impl Displaced {
+    /// What a replacing rename displaced. `present` is observed at
+    /// publication, not construction: what the rename just replaced is what
+    /// decides whether removing it would destroy a previous generation.
+    fn after_rename(backup: Option<Backup>, present: bool) -> Self {
+        match backup {
+            Some(backup) => Self::Backup(backup),
+            None if present => Self::Unbacked,
+            None => Self::Nothing,
+        }
+    }
 }
 
 /// How far rolling back an installed member got.
@@ -1578,7 +1610,7 @@ impl Target {
     /// Put the new output at the destination. `use_backup` moves an existing
     /// destination aside first (directories and group members, which may
     /// need restoring); a lone file under `Replace` is replaced in one
-    /// atomic rename instead.
+    /// atomic rename instead, which no rollback can undo.
     ///
     /// `member` is this target's position in its group (0 for a lone
     /// output), which only a test's fault plan reads.
@@ -1642,7 +1674,7 @@ impl Target {
         match attempt {
             Ok(()) => {
                 self.state = State::Installed {
-                    backup: None,
+                    displaced: Displaced::Nothing,
                     identity,
                 };
                 step!(faults, PublishStep::Installed(member));
@@ -1686,7 +1718,7 @@ impl Target {
         match attempt {
             Ok(()) => {
                 self.state = State::Installed {
-                    backup: None,
+                    displaced: Displaced::Nothing,
                     identity,
                 };
                 self.linked = true;
@@ -1740,97 +1772,7 @@ impl Target {
             }
         };
         let backup = if present && use_backup {
-            // Beside the destination unless the caller put backups in its
-            // staging directory (`Staging::DirWithBackups`): a backup can be
-            // the only copy of the previous output, and a caller removes its
-            // staging directory wholesale, so only a caller that accepted
-            // losing it there gets it there.
-            let container = reserve(&self.dest, self.backup_dir.as_deref(), "backup", |path| {
-                fs::create_dir(path)
-            })?;
-            step!(faults, PublishStep::BackupReserved(member));
-            let entry = container.join(self.dest.file_name().unwrap_or_default());
-            let moved = if fault_is!(faults, PublishFault::MoveAside) {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "injected move-aside fault",
-                ))
-            } else if fault_is!(faults, PublishFault::MoveAsideCrossMount) {
-                Err(cross_mount_error())
-            } else {
-                fs::rename(&self.dest, &entry)
-            };
-            if let Err(e) = moved {
-                match fs::remove_dir(&container) {
-                    Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
-                    Err(e) => self.pending.push(format!(
-                        "could not remove the empty backup directory {} after moving {} aside \
-                         failed: {e}; it can be deleted by hand",
-                        container.display(),
-                        self.dest.display()
-                    )),
-                }
-                // A move into a backup in the staging directory crosses from
-                // the destination's directory into it, so a refusal across
-                // mounts there is the staging directory's, typed as at
-                // install, whether or not the empty container went.
-                if self.backup_dir.is_some() && is_cross_device(&e) {
-                    return Err(self.install_refused(e));
-                }
-                return Err(Error::from(e).context(format!(
-                    "cannot move existing output {} aside",
-                    self.dest.display()
-                )));
-            }
-            self.state = State::BackedUp(Backup { container, entry });
-            step!(faults, PublishStep::MovedAside(member));
-            if fault_is!(faults, PublishFault::AfterBackup) {
-                return Err(injected("after backup"));
-            }
-            // The backup is the previous output's only name from here until
-            // the new output is in place, so it is made durable before
-            // anything relies on it: the entry inside its container, then
-            // the container's link in the staging directory when it lives
-            // there, then the vacated name in the destination's directory
-            // (the container's link too when it lives beside the
-            // destination). Each step needs the one before, so the first
-            // failure stops the chain; it is an install failure, and the
-            // rollback restores.
-            if let State::BackedUp(backup) = &self.state {
-                let synced = if fault_is!(faults, PublishFault::BackupSync) {
-                    Err(io::Error::new(
-                        io::ErrorKind::StorageFull,
-                        "injected backup sync fault",
-                    ))
-                } else {
-                    sync_dir(&backup.container, metrics)
-                        .and_then(|()| match self.backup_dir.as_deref() {
-                            Some(_) if fault_is!(faults, PublishFault::BackupLinkSync) => {
-                                Err(io::Error::new(
-                                    io::ErrorKind::StorageFull,
-                                    "injected backup link sync fault",
-                                ))
-                            }
-                            Some(dir) => sync_dir(dir, metrics),
-                            None => Ok(()),
-                        })
-                        .and_then(|()| sync_dir(parent_dir(&self.dest), metrics))
-                };
-                synced.map_err(|e| {
-                    Error::from(e).context(format!(
-                        "cannot make the backup of {} durable before replacing it",
-                        self.dest.display()
-                    ))
-                })?;
-                step!(faults, PublishStep::BackupSynced(member));
-            }
-            match std::mem::replace(&mut self.state, State::Staged) {
-                State::BackedUp(backup) => Some(backup),
-                other => {
-                    self.state = other;
-                    return Err(Error::internal("output backup state lost"));
-                }
-            }
+            Some(self.move_aside(member, faults, metrics)?)
         } else {
             None
         };
@@ -1845,9 +1787,115 @@ impl Target {
             }
             return Err(self.install_refused(e));
         }
-        self.state = State::Installed { backup, identity };
+        let displaced = Displaced::after_rename(backup, present);
+        self.state = State::Installed {
+            displaced,
+            identity,
+        };
         step!(faults, PublishStep::Installed(member));
         Ok(())
+    }
+
+    /// Move the present destination into an exclusively reserved backup
+    /// and make that durable, for a replacement that must stay reversible.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    fn move_aside(
+        &mut self,
+        member: usize,
+        faults: &Faults,
+        metrics: &PublishSync<'_>,
+    ) -> Result<Backup> {
+        // Beside the destination unless the caller put backups in its
+        // staging directory (`Staging::DirWithBackups`): a backup can be
+        // the only copy of the previous output, and a caller removes its
+        // staging directory wholesale, so only a caller that accepted
+        // losing it there gets it there.
+        let container = reserve(&self.dest, self.backup_dir.as_deref(), "backup", |path| {
+            fs::create_dir(path)
+        })?;
+        step!(faults, PublishStep::BackupReserved(member));
+        let entry = container.join(self.dest.file_name().unwrap_or_default());
+        let moved = if fault_is!(faults, PublishFault::MoveAside) {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected move-aside fault",
+            ))
+        } else if fault_is!(faults, PublishFault::MoveAsideCrossMount) {
+            Err(cross_mount_error())
+        } else {
+            fs::rename(&self.dest, &entry)
+        };
+        if let Err(e) = moved {
+            match fs::remove_dir(&container) {
+                Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
+                Err(e) => self.pending.push(format!(
+                    "could not remove the empty backup directory {} after moving {} aside \
+                         failed: {e}; it can be deleted by hand",
+                    container.display(),
+                    self.dest.display()
+                )),
+            }
+            // A move into a backup in the staging directory crosses from
+            // the destination's directory into it, so a refusal across
+            // mounts there is the staging directory's, typed as at
+            // install, whether or not the empty container went.
+            if self.backup_dir.is_some() && is_cross_device(&e) {
+                return Err(self.install_refused(e));
+            }
+            return Err(Error::from(e).context(format!(
+                "cannot move existing output {} aside",
+                self.dest.display()
+            )));
+        }
+        self.state = State::BackedUp(Backup { container, entry });
+        step!(faults, PublishStep::MovedAside(member));
+        if fault_is!(faults, PublishFault::AfterBackup) {
+            return Err(injected("after backup"));
+        }
+        // The backup is the previous output's only name from here until
+        // the new output is in place, so it is made durable before
+        // anything relies on it: the entry inside its container, then
+        // the container's link in the staging directory when it lives
+        // there, then the vacated name in the destination's directory
+        // (the container's link too when it lives beside the
+        // destination). Each step needs the one before, so the first
+        // failure stops the chain; it is an install failure, and the
+        // rollback restores.
+        if let State::BackedUp(backup) = &self.state {
+            let synced = if fault_is!(faults, PublishFault::BackupSync) {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected backup sync fault",
+                ))
+            } else {
+                sync_dir(&backup.container, metrics)
+                    .and_then(|()| match self.backup_dir.as_deref() {
+                        Some(_) if fault_is!(faults, PublishFault::BackupLinkSync) => {
+                            Err(io::Error::new(
+                                io::ErrorKind::StorageFull,
+                                "injected backup link sync fault",
+                            ))
+                        }
+                        Some(dir) => sync_dir(dir, metrics),
+                        None => Ok(()),
+                    })
+                    .and_then(|()| sync_dir(parent_dir(&self.dest), metrics))
+            };
+            synced.map_err(|e| {
+                Error::from(e).context(format!(
+                    "cannot make the backup of {} durable before replacing it",
+                    self.dest.display()
+                ))
+            })?;
+            step!(faults, PublishStep::BackupSynced(member));
+        }
+        match std::mem::replace(&mut self.state, State::Staged) {
+            State::BackedUp(backup) => Ok(backup),
+            other => {
+                self.state = other;
+                Err(Error::internal("output backup state lost"))
+            }
+        }
     }
 
     /// Undo this member's installation. `Some` describes what could not be
@@ -1875,7 +1923,26 @@ impl Target {
                     Some(self.keep_backed_up(backup))
                 }
             }
-            State::Installed { backup, identity } => {
+            // Irreversible: the new output stays, and publication reports it
+            // (after syncing, so the report can say whether it is durable).
+            State::Installed {
+                displaced: Displaced::Unbacked,
+                identity,
+            } => {
+                self.state = State::Installed {
+                    displaced: Displaced::Unbacked,
+                    identity,
+                };
+                None
+            }
+            State::Installed {
+                displaced,
+                identity,
+            } => {
+                let backup = match displaced {
+                    Displaced::Backup(backup) => Some(backup),
+                    Displaced::Nothing | Displaced::Unbacked => None,
+                };
                 let ours = match fs::symlink_metadata(&self.dest) {
                     Ok(meta) => {
                         !meta.file_type().is_symlink()
@@ -1912,7 +1979,10 @@ impl Target {
                                 self.dest.display()
                             ),
                         };
-                        self.state = State::Installed { backup, identity };
+                        self.state = State::Installed {
+                            displaced: backup.map_or(Displaced::Nothing, Displaced::Backup),
+                            identity,
+                        };
                         Some(note)
                     }
                 }
@@ -2002,7 +2072,7 @@ impl Target {
     fn commit(&mut self, member: usize, remove_backup: bool, faults: &Faults) -> Option<PathBuf> {
         let mut kept = None;
         if let State::Installed {
-            backup: Some(backup),
+            displaced: Displaced::Backup(backup),
             ..
         } = std::mem::replace(&mut self.state, State::Committed)
         {
@@ -2226,13 +2296,24 @@ fn publish_all(
         }
         if let Err(error) = result {
             let touched = &mut targets[..=i];
-            let unresolved: Vec<String> = touched
+            let mut unresolved: Vec<String> = touched
                 .iter_mut()
                 .enumerate()
                 .rev()
                 .filter_map(|(member, target)| target.rollback(member, faults))
                 .collect();
-            sync_after_rollback(touched, metrics);
+            let failed = sync_after_rollback(touched, metrics);
+            // An irreversible installation is kept, and is reported as what
+            // the rollback could not undo.
+            for target in touched.iter().rev() {
+                if let State::Installed {
+                    displaced: Displaced::Unbacked,
+                    ..
+                } = target.state
+                {
+                    unresolved.push(kept_irreversible(target, &failed));
+                }
+            }
             if unresolved.is_empty() {
                 return Err(error);
             }
@@ -2297,28 +2378,59 @@ fn publish_all(
 /// that can be done for their durability on an error path. Every sync is
 /// attempted whatever the others answer; nothing renames in between, so a
 /// directory synced for a backup is not synced again.
-fn sync_after_rollback(touched: &[Target], metrics: &PublishSync<'_>) {
+///
+/// Returns the directories whose sync failed, which a kept irreversible
+/// installation needs to say whether it is durable.
+fn sync_after_rollback(touched: &[Target], metrics: &PublishSync<'_>) -> Vec<(PathBuf, io::Error)> {
     let mut synced: Vec<PathBuf> = Vec::new();
+    let mut failed = Vec::new();
     for target in touched {
         if let State::BackedUp(backup)
         | State::Installed {
-            backup: Some(backup),
+            displaced: Displaced::Backup(backup),
             ..
         } = &target.state
         {
             drop(sync_dir(&backup.container, metrics));
             let holder = parent_dir(&backup.container).to_path_buf();
             if !synced.contains(&holder) {
-                drop(sync_dir(&holder, metrics));
+                if let Err(e) = sync_dir(&holder, metrics) {
+                    failed.push((holder.clone(), e));
+                }
                 synced.push(holder);
             }
         }
     }
     for dir in changed_dirs(touched) {
-        if !synced.contains(&dir) {
-            drop(sync_dir(&dir, metrics));
+        if !synced.contains(&dir)
+            && let Err(e) = sync_dir(&dir, metrics)
+        {
+            failed.push((dir, e));
         }
     }
+    failed
+}
+
+/// The report for a lone file whose replacement could not be undone: the
+/// rename over the previous output was irreversible, so the new output was
+/// kept, as durable as a successful publication unless a directory it
+/// changed failed to sync (`failed`, from [`sync_after_rollback`]).
+fn kept_irreversible(target: &Target, failed: &[(PathBuf, io::Error)]) -> String {
+    let mut note = format!(
+        "{}: the previous output was replaced in one rename, without a backup, and cannot be \
+         restored; the new output remains published",
+        target.dest.display()
+    );
+    let mine = failed
+        .iter()
+        .find(|(dir, _)| dir == parent_dir(&target.dest) || *dir == target.source_dir);
+    if let Some((dir, e)) = mine {
+        note.push_str(&format!(
+            ", but its durability across a crash is unconfirmed: syncing {} failed: {e}",
+            dir.display()
+        ));
+    }
+    note
 }
 
 /// Every directory installing `targets` changes, each once, in order: each
@@ -2405,7 +2517,8 @@ impl Output {
     /// says. A caller that owns a private staging directory can remove it
     /// whole once every process using it has stopped, so a run killed
     /// outright leaves no staging where its destination is. A lone file
-    /// never has a backup; as a member of an [`OutputSet`] it does, placed
+    /// never has a backup (replacing an existing file is one irreversible
+    /// rename); as a member of an [`OutputSet`] it does, placed
     /// by `staging` too.
     ///
     /// # Errors
@@ -4399,6 +4512,67 @@ mod tests {
             assert!(others(dir.path(), &[]).is_empty());
         }
 
+        /// A lone file renamed over its previous output has no backup, so
+        /// that rename is a commit boundary: a failure after it keeps the
+        /// new output, names it as what could not be undone, and leaves no
+        /// backup or staging behind. Destroying it would destroy the only
+        /// generation left.
+        #[test]
+        fn a_failure_after_an_unbacked_replacement_keeps_the_new_output() {
+            let dir = scratch();
+            let dest = dir.path().join("out.osm.pbf");
+            fs::write(&dest, b"old").unwrap();
+            let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+            let token = armed(&[PublishFault::AfterInstalled(0)]);
+            stage_under(&out, &token, b"new").unwrap();
+            let err = out.publish(&token).unwrap_err();
+            let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
+                panic!("expected an incomplete rollback, got {err}");
+            };
+            assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+            assert!(
+                unresolved[0].contains("remains published"),
+                "{unresolved:?}"
+            );
+            assert!(!unresolved[0].contains("durability"), "{unresolved:?}");
+            assert_eq!(fs::read(&dest).unwrap(), b"new");
+            assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
+
+            // A restore fault changes nothing: there is nothing to restore,
+            // and the new output is never removed.
+            let dir = scratch();
+            let dest = dir.path().join("out.osm.pbf");
+            fs::write(&dest, b"old").unwrap();
+            let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+            let token = armed(&[PublishFault::AfterInstalled(0), PublishFault::Restore]);
+            stage_under(&out, &token, b"new").unwrap();
+            assert!(out.publish(&token).is_err());
+            assert_eq!(fs::read(&dest).unwrap(), b"new");
+            assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
+        }
+
+        /// Replacing an absent destination displaced nothing, so a failure
+        /// after the rename removes the new output and the error is the
+        /// failure itself.
+        #[test]
+        fn a_failure_after_replacing_nothing_rolls_the_output_back() {
+            let dir = scratch();
+            let dest = dir.path().join("out.osm.pbf");
+            let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+            let token = armed(&[PublishFault::AfterInstalled(0)]);
+            stage_under(&out, &token, b"new").unwrap();
+            let err = out.publish(&token).unwrap_err();
+            assert!(
+                !matches!(
+                    err.kind(),
+                    crate::ErrorKind::Output(OutputError::RollbackIncomplete { .. })
+                ),
+                "{err}"
+            );
+            assert!(!dest.exists());
+            assert!(others(dir.path(), &[]).is_empty());
+        }
+
         #[test]
         fn a_group_failure_rolls_back_installed_members() {
             let dir = scratch();
@@ -5071,6 +5245,24 @@ mod tests {
                     vec![],
                     true,
                     s(&["staged-synced", "installed:0", "dirs-synced"]),
+                ),
+                (
+                    "file, replace, failure after install",
+                    File,
+                    Replace,
+                    vec![true],
+                    vec![F::AfterInstalled(0)],
+                    false,
+                    s(&["staged-synced", "installed:0"]),
+                ),
+                (
+                    "file, replace nothing, failure after install",
+                    File,
+                    Replace,
+                    vec![false],
+                    vec![F::AfterInstalled(0)],
+                    false,
+                    s(&["staged-synced", "installed:0", "uninstalled:0"]),
                 ),
                 (
                     "set, replace",

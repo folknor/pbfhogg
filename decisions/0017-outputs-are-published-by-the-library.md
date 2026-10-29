@@ -131,7 +131,14 @@ output any other way.
   The same holds for `Output::path` after a session finished. Those are
   caller contracts, not enforcement; a directory has no single descriptor
   whose end of stream could be observed.
-- **Publication.** A lone file under `Replace` is one `rename(2)`. Under
+- **Publication.** A lone file under `Replace` is one `rename(2)`. When it
+  replaces an existing file that rename is irreversible, a commit boundary:
+  nothing holds the previous generation, so a failure after it keeps the new
+  output installed and reports it as what could not be undone
+  (`OutputError::RollbackIncomplete`, saying whether its directories
+  synced), and never removes it, which would destroy the only generation
+  left. Replacing an absent destination displaced nothing and is rolled
+  back by removal like any exclusive install. Under
   `Refuse` publication is exclusive: `renameat2(RENAME_NOREPLACE)` (the raw
   syscall, so musl builds have it), falling back for files to `link(2)` and
   never to a check-then-rename; where neither exists the publish is refused

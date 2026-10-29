@@ -880,8 +880,10 @@ pub enum OutputError {
         path: PathBuf,
         entries: Vec<PathBuf>,
     },
-    /// Publishing failed and undoing it failed too. Each entry says what was
-    /// left where; nothing it names was deleted.
+    /// Publishing failed and undoing it failed too, or was impossible (a
+    /// lone file renamed over its previous output, which no backup holds,
+    /// stays published). Each entry says what was left where; nothing it
+    /// names was deleted.
     RollbackIncomplete {
         unresolved: Vec<String>,
         source: Error,

@@ -1,7 +1,7 @@
 use pbfhogg::host::{
     Event, EventKind, Executor, Host, MachineProbe, PageCachePolicy, ProcessActions,
 };
-use pbfhogg::process::FdAllowance;
+use pbfhogg::process::FdReservation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) struct LegacyProcessActions;
@@ -9,11 +9,12 @@ impl ProcessActions for LegacyProcessActions {
     fn cross_thread_alloc_pool(&self) {
         pbfhogg::process::cap_malloc_arenas();
     }
-    fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+    fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         // CLI process policy: keep the raise for this command's lifetime.
         // Embedded callers choose their own ProcessActions; the library must
         // not restore this limit and race other process users (ADR-0016).
-        pbfhogg::process::raise_nofile_to_hard_cap()
+        // One command per process, so a snapshot answer is enough.
+        FdReservation::unreserved(pbfhogg::process::raise_nofile_to_hard_cap())
     }
 }
 /// The CLI's host. `cancel` is the token the signal waiter trips (see

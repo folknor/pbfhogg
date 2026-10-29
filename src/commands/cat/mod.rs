@@ -141,7 +141,8 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     // pin for the run: one new descriptor per distinct path spelling.
     let sources: Vec<InputSource<'a>> = files.iter().map(|&file| file.into()).collect();
     let new_pins = crate::read::input::new_pins(&sources);
-    admit_descriptors(
+    // Held to the end of the run, which is when the pins close.
+    let _reservation = admit_descriptors(
         new_pins,
         &format!(
             "cat holds a file descriptor per distinct input for the whole run: {} input \
@@ -208,28 +209,30 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
 /// new pins, or dedupe's pass-2 sources) plus [`CAT_EXTRA_FDS`], and refuse
 /// the run up front when the host allows fewer. `demand` names what is
 /// held in the refusal. A conservative requirement (the fixed allowance has
-/// slack), and an admission check, not a reservation: the built-in
-/// providers answer from a snapshot of the open descriptors.
+/// slack). The caller holds the returned reservation until those
+/// descriptors are closed; a refusal drops a short grant at once.
 ///
 /// [`CAT_EXTRA_FDS`]: crate::tunables::CAT_EXTRA_FDS
 pub(super) fn admit_descriptors(
     held: usize,
     demand: &str,
     host: &crate::host::Entered<'_>,
-) -> Result<()> {
+) -> Result<crate::process::FdReservation> {
     let wanted = u64::try_from(held)
         .ok()
         .and_then(|n| n.checked_add(crate::tunables::CAT_EXTRA_FDS))
         .ok_or_else(|| Error::invalid_argument(format!("{demand}: more than cat can hold")))?;
-    let allowance = host.process.fd_allowance(wanted);
+    let reservation = host.process.fd_allowance(wanted);
+    let allowance = reservation.allowance();
     if allowance.descriptors < wanted {
+        drop(reservation);
         return Err(Error::invalid_argument(format!(
             "{demand} need {wanted} descriptors, but only {} are allowed ({allowance}); {}",
             allowance.descriptors,
             descriptor_remedy(&allowance, wanted)
         )));
     }
-    Ok(())
+    Ok(reservation)
 }
 
 /// What a refused run's caller can do. A host grant is the host's policy,

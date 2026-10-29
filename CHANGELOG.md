@@ -51,8 +51,25 @@
   command line refused before dispatch, `--help` and `--version` write
   neither. Sidecar phase views of CLI runs gain a leading and a trailing
   segment. See "Sidecar marker FIFO" in `docs/cli/commands.md`.
+- **A reserving descriptor provider for concurrent calls.**
+  `host::FdPool::new(budget, inner)` is a `ProcessActions` to share across
+  the hosts of calls running at once: each descriptor request is granted
+  what is left of one caller-sized budget, up to what it asked for, and
+  returned to the budget when the command is done with those descriptors,
+  so concurrent `cat`, `cat --dedupe` and external `add-locations-to-ways`
+  calls never hold grants summing past it, whatever their timing.
+  `cross_thread_alloc_pool` is forwarded to `inner`.
 
 ### Breaking
+
+- **`ProcessActions::fd_allowance` returns an `FdReservation`.** The new
+  `process::FdReservation` (re-exported from `host`) wraps the
+  `FdAllowance` (read it with `allowance()`) and runs an optional release
+  action when the command drops it: at the end of a `cat` run, across both
+  passes of `cat --dedupe`, at the end of external stage 1, and at once on
+  a refusal. An implementation that answered a snapshot wraps it in
+  `FdReservation::unreserved(allowance)`;
+  `FdReservation::with_release(allowance, release)` gives a reserving one.
 
 - **A sealed invocation admits nothing.** Once `Invocation::seal()` has
   begun, every entry under that invocation returns the new

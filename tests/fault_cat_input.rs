@@ -29,7 +29,7 @@ use std::sync::atomic::Ordering;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::cat::CleanAttrs;
 use pbfhogg::host::ProcessActions;
-use pbfhogg::process::FdAllowance;
+use pbfhogg::process::{FdAllowance, FdReservation};
 use pbfhogg::read::input::PinnedInput;
 use pbfhogg::write::WriteOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -596,9 +596,9 @@ struct Grant {
 
 impl ProcessActions for Grant {
     fn cross_thread_alloc_pool(&self) {}
-    fn fd_allowance(&self, wanted: u64) -> FdAllowance {
+    fn fd_allowance(&self, wanted: u64) -> FdReservation {
         self.asked.lock().expect("requests").push(wanted);
-        FdAllowance::host_grant(wanted - self.short)
+        FdReservation::unreserved(FdAllowance::host_grant(wanted - self.short))
     }
 }
 
@@ -724,8 +724,8 @@ fn a_descriptor_refusal_names_the_callers_remedy() {
     struct Fixed(FdAllowance);
     impl ProcessActions for Fixed {
         fn cross_thread_alloc_pool(&self) {}
-        fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
-            self.0
+        fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+            FdReservation::unreserved(self.0)
         }
     }
     let refusal = |allowance: FdAllowance| {

@@ -116,6 +116,7 @@ mod fault_tags_filter_input;
 mod fault_time_filter_input;
 #[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
 mod fault_uring_writer;
+mod fd_pool;
 mod fixture_helpers;
 mod getid;
 mod getparents;

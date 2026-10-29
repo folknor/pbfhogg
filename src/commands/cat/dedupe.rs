@@ -118,6 +118,23 @@ pub(crate) fn merge_pbf_to<'a, S: Into<InputSource<'a>> + Copy>(
     host: &crate::host::Entered<'_>,
 ) -> Result<MergePbfStats> {
     let sources: Vec<InputSource<'a>> = inputs.iter().map(|&input| input.into()).collect();
+    if sources.is_empty() {
+        return Err(Error::invalid_argument("no input files specified"));
+    }
+    // Every input is opened three times (the indexdata probe, pass 1's
+    // index walk, pass 2's source), so every input is pinned up front. The
+    // pins are held until pass 2 has opened its sources, one per argument
+    // and held for the whole of pass 2, so the run asks for one descriptor
+    // per argument, and holds the reservation here, across both passes.
+    let _reservation = super::admit_descriptors(
+        sources.len(),
+        &format!(
+            "a deduplicating cat holds a file descriptor per input argument through its second pass: {} \
+             input files",
+            sources.len()
+        ),
+        host,
+    )?;
     let plan = plan_merge(&sources, opts, host)?;
     write_merge(plan, output, opts, overrides, host)
 }
@@ -134,30 +151,12 @@ struct MergePlan {
 }
 
 /// Pass 1: check the inputs, index every blob, order the index and find the
-/// overlap runs.
+/// overlap runs. The caller has admitted the descriptors.
 fn plan_merge(
     inputs: &[InputSource<'_>],
     opts: &WriteOptions,
     host: &crate::host::Entered<'_>,
 ) -> Result<MergePlan> {
-    if inputs.is_empty() {
-        return Err(Error::invalid_argument("no input files specified"));
-    }
-
-    // Every input is opened three times (the indexdata probe, pass 1's
-    // index walk, pass 2's source), so every input is pinned up front. The
-    // pins are held until pass 2 has opened its sources, one per argument
-    // and held for the whole of pass 2, so the run asks for one descriptor
-    // per argument.
-    super::admit_descriptors(
-        inputs.len(),
-        &format!(
-            "a deduplicating cat holds a file descriptor per input argument through its second pass: {} \
-             input files",
-            inputs.len()
-        ),
-        host,
-    )?;
     let pins = crate::read::input::pin_sources(inputs, host)?;
 
     // Validate inputs have indexdata

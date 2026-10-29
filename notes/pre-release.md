@@ -57,7 +57,9 @@ profiles and certifies a harness, to a protocol frozen at version 1
   stream) has landed as L4, and `#33` (cancel's linearized outcome, and
   the publication log) as L1.
 - `#35`: the gate's capability ids in `[pbfhogg.library.require]`.
-- `#36`: a reserving descriptor provider for concurrent calls.
+- `#36` (a reserving descriptor provider for concurrent calls,
+  `host::FdPool`) has landed as L7; the harness adopts it with the
+  concurrent scenarios.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
   interval) have landed; `v2` still needs a certification under it.
 

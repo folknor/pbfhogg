@@ -1,7 +1,7 @@
 //! In-process host isolation has no CLI expression, so these tests call the
 //! hidden command entries as well as the public host API.
 use pbfhogg::host::{ProcessActions, Resources};
-use pbfhogg::process::FdAllowance;
+use pbfhogg::process::FdReservation;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering::Relaxed},
@@ -16,9 +16,9 @@ impl ProcessActions for Actions {
     fn cross_thread_alloc_pool(&self) {
         self.alloc.fetch_add(1, Relaxed);
     }
-    fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+    fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         self.fd.fetch_add(1, Relaxed);
-        pbfhogg::process::current_nofile()
+        FdReservation::unreserved(pbfhogg::process::current_nofile())
     }
 }
 fn input(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1079,9 +1079,9 @@ fn concurrent_external_joins_use_distinct_scratch() {
     struct Overlap(std::sync::Barrier);
     impl ProcessActions for Overlap {
         fn cross_thread_alloc_pool(&self) {}
-        fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+        fn fd_allowance(&self, _wanted: u64) -> FdReservation {
             self.0.wait();
-            pbfhogg::process::current_nofile()
+            FdReservation::unreserved(pbfhogg::process::current_nofile())
         }
     }
     let mut host = host;

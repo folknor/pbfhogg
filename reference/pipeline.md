@@ -605,7 +605,12 @@ per argument, caller's pins included, because its second pass opens a
 source per argument from the pins, each pin dropped as its sources open.
 Both ask for a fixed allowance on top (`CAT_EXTRA_FDS`), for the active
 reader, the writer and its ring, and the transient procfs probe, with
-slack: the request is conservative, not an exact minimum.
+slack: the request is conservative, not an exact minimum. The answer is an
+`FdReservation` held to the end of the run (for `cat --dedupe`, across
+both passes) and dropped at once on a refusal, so a reserving provider
+(`host::FdPool`) has its grant back when the descriptors close.
+External `add-locations-to-ways` holds its stage-1 reservation until stage
+1 returns, when its shard files are closed.
 
 The library never raises the open-file limit (ADR-0016), so a library
 caller at a default soft limit of 1024 cannot cat about a thousand files

@@ -634,9 +634,15 @@ pub(super) fn stage1_way_pass(
         DECODE_WORKERS_MIN,
         DECODE_WORKERS_FALLBACK,
     );
-    let fd_budget = host
+    // The request covers stage 1's shard files only, which pass A closes
+    // before it returns (error and unwind included), so the reservation is
+    // held to the end of this function and a reserving host has it back
+    // when stage 1 ends. Later stages' descriptors are not asked for: they
+    // are the caller's outside the grant (see `host::FdPool`).
+    let reservation = host
         .process
         .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + STAGE1_HEADROOM_FDS);
+    let fd_budget = reservation.allowance();
     crate::host::diag!(
         host.diagnostics,
         Developer,
@@ -693,6 +699,7 @@ pub(super) fn stage1_way_pass(
 
     // Build the per-blob mapping (header-only walk - no decompression).
     let node_blob_mapping = build_node_blob_mapping(blob_meta, &host.invocation);
+    drop(reservation);
 
     Ok(Stage1Output {
         total_slots: total_refs,

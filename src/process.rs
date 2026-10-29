@@ -426,6 +426,68 @@ impl std::fmt::Display for FdAllowance {
     }
 }
 
+/// The answer to one [`ProcessActions::fd_allowance`] request: the
+/// [`FdAllowance`] granted, held for as long as the descriptors it covers
+/// are open. Dropping it hands a reserved grant back to the provider that
+/// made it (as [`FdPool`](crate::host::FdPool) does); a snapshot answer
+/// reserves nothing and its drop does nothing.
+///
+/// The library holds each reservation from its request until the
+/// descriptors that request was sized for are closed, error and unwind
+/// paths included, so a reserving provider gets its capacity back when
+/// that work ends, not when the `Host` holding the provider drops.
+///
+/// [`ProcessActions::fd_allowance`]: crate::host::ProcessActions::fd_allowance
+#[must_use = "dropping a reservation releases it; hold it while its descriptors are open"]
+pub struct FdReservation {
+    allowance: FdAllowance,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl FdReservation {
+    /// An answer that reserves nothing, such as a snapshot of the open
+    /// descriptors: its drop has no effect.
+    pub fn unreserved(allowance: FdAllowance) -> Self {
+        Self {
+            allowance,
+            release: None,
+        }
+    }
+
+    /// A grant that runs `release` exactly once, when the reservation drops.
+    pub fn with_release(
+        allowance: FdAllowance,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            allowance,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// What was granted.
+    pub fn allowance(&self) -> FdAllowance {
+        self.allowance
+    }
+}
+
+impl Drop for FdReservation {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for FdReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FdReservation")
+            .field("allowance", &self.allowance)
+            .field("reserved", &self.release.is_some())
+            .finish()
+    }
+}
+
 /// Count the process's open descriptors numbered below `limit`.
 ///
 /// Only numbers below the soft limit compete for new descriptors: after a

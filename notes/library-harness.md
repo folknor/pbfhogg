@@ -51,8 +51,8 @@ from the 2026-10-29 session and is recorded nowhere else.
   with the user again, as that procedure requires.
 
 **What to build, in order:** the landing table at the end of this note,
-run as L1, L2, L3, L4, L7, L5, L6. L7 (#36) comes before L5 because
-the concurrent scenarios need a reserving descriptor provider.
+run as L5, then L6. L7 (#36, the reserving descriptor provider the
+concurrent scenarios need) has landed; see the landing list.
 
 L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
 digest` prints the full form, `xxh128 v2`, in `v1`'s four-line grammar,
@@ -72,8 +72,8 @@ a certification under `v1` holds for `v1` only.
 
 **bz state:**
 - **pbfhogg#31 and #32** are closed by L4.
-- **#34, #35 and #36** are open and map to the landings. #33 (L1) is
-  closed. #37 (L8) is closed; its re-certification is L8's gate below.
+- **#34 and #35** are open and map to the landings. #33 (L1) and #36
+  (L7) are closed. #37 (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
 - **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
   `98bddee`):
@@ -833,12 +833,56 @@ Landed independently, 2026-10-29:
     no scenario cancels after a seal;
   - for L6: brokkr#62 decides whether a claimed stream with repeated
     ordinary names can pass.
+- L7, the reserving descriptor provider (#36): the commit that carries
+  this line. `ProcessActions::fd_allowance` returns an owned
+  `FdReservation` (the `FdAllowance` plus an optional release run on
+  drop); `host::FdPool` is the reserving provider, one `Arc` shared by
+  every host of the concurrent calls, granting `min(wanted, free)` of a
+  fixed caller budget as a host grant. Rulings (sparred):
+  - Release belongs to the reservation the library holds, not to the
+    provider's lifetime: a per-call provider released on `Host` drop
+    exhausts the pool for any caller reusing one `Host`, and the harness
+    drops its host only after the emitters and seal.
+  - Placement: `cat` holds it to the end of the run; `cat --dedupe` holds
+    it in `merge_pbf_to` across both passes (admission moved out of
+    `plan_merge`, which would have released it before pass 2); altw
+    external holds it to the end of stage 1, whose shard files are closed
+    when pass A returns. A refusal drops a short grant at once.
+  - The budget covers the asked-for demand only. Everything else every
+    concurrent call opens (inputs outside a request, outputs' reservation
+    descriptors, scratch, external stages 2 to 4, commands that never ask)
+    is the caller's to fit under the soft limit less the budget, summed
+    over the calls that run at once. The pool never reads the limit or
+    counts descriptors, so grants depend on the budget and outstanding
+    reservations only; first come, first served, never waiting.
+  Gate: `brokkr check` with `src/host.rs`
+  `fd_pool_grants_conserve_the_budget` (grants held at once across
+  threads) and `tests/fd_pool.rs` (a retained host across two cats, held
+  at `CAT_SCAN_START` and whole after each; a short grant refused and a
+  failed run both return theirs; dedupe still charged at
+  `MERGEPBF_PASS2_START`; external capped to one worker by the pool and
+  released by `EXTJOIN_STAGE1_END`, refusing below one worker). No
+  measurement: one request per run, not per blob. Residue for L5:
+  - the harness still gives every call `NoProcessActions`; concurrent-cat
+    shares one `FdPool` across both calls' hosts, sized for both cats'
+    full requests (distinct inputs plus `CAT_EXTRA_FDS` each), reports
+    its budget in each context (a plan integer, so not volatile), and
+    proves overlap by parking, not by thread start order;
+  - the nofile scenarios are single-call on `NoProcessActions` at a
+    lowered soft limit; the harness can only raise today, so lowering
+    (before library work, hard limit untouched, read back and reported,
+    never while calls run) lands with them;
+  - `nofile-cat-refused` at soft 1024 needs about 1100 distinct path
+    spellings: 1000 asks for 1008, which fits when no more than 16
+    descriptors are open, so "about 1000" does not refuse by arithmetic;
+  - `nofile-altw-external`'s three stage-1 workers need fixed resources
+    giving `cpu_cap` of at least 3 (parallelism 5 or more, less the 2
+    reserved), not just the lowered limit.
 
 | # | Landing | Gate |
 |---|---|---|
 | L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
 | L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
-| L7 | #36 reserving descriptor provider (needed by the concurrent scenarios) | per landing |
 | L8 | #37 full-fidelity digest `v2`. Landed: `digest` defaults to `--form full` (`v2`), `--form content` keeps `v1`; brokkr accepts both (brokkr#60). Remaining: certify again once a harness exists | `brokkr check` (passed at landing); `brokkr library --all --dataset denmark`, pending a harness |
 
 ## Out of scope

@@ -1,5 +1,5 @@
 //! Caller-owned process actions and resources for a library invocation.
-pub use crate::process::FdAllowance;
+pub use crate::process::{FdAllowance, FdReservation};
 use std::{num::NonZeroUsize, sync::Arc};
 
 /// Explicit facilities supplied by the caller. There is deliberately no default.
@@ -1620,27 +1620,107 @@ pub trait ProcessActions: Send + Sync {
     /// per-command calls, or document here, per command, why it must not be
     /// capped.
     fn cross_thread_alloc_pool(&self);
-    /// Request permission to hold `wanted` descriptors. The answer is how
-    /// many the run may open on top of those already open in the process.
+    /// Request permission to hold `wanted` descriptors at once. The answer's
+    /// [`allowance`](FdReservation::allowance) is how many the work may open
+    /// on top of those already open in the process; the library holds the
+    /// [`FdReservation`] until the descriptors that request was sized for are
+    /// closed, then drops it.
     ///
-    /// The built-in providers ([`NoProcessActions`], and
-    /// [`process::raise_nofile_to_hard_cap`](crate::process::raise_nofile_to_hard_cap))
-    /// subtract a snapshot count of open descriptors from the soft limit.
-    /// That is an estimate under stable descriptor use, not a reservation:
-    /// two calls probing at once both see the same free descriptors. A host
-    /// running descriptor-heavy calls concurrently returns
-    /// [`FdAllowance::host_grant`] with a share it reserves for the duration
-    /// of the call and releases when the call returns, computing free
-    /// capacity as the limit less the occupied descriptors less the
-    /// reservations not yet opened.
-    fn fd_allowance(&self, wanted: u64) -> FdAllowance;
+    /// The snapshot providers ([`NoProcessActions`], and
+    /// [`process::raise_nofile_to_hard_cap`](crate::process::raise_nofile_to_hard_cap)
+    /// wrapped in [`FdReservation::unreserved`]) subtract a snapshot count of
+    /// open descriptors from the soft limit. That is an estimate under
+    /// stable descriptor use, not a reservation: two calls probing at once
+    /// both see the same free descriptors. A host running descriptor-heavy
+    /// calls concurrently uses [`FdPool`], whose grants come out of one
+    /// budget and return to it when their reservation drops.
+    fn fd_allowance(&self, wanted: u64) -> FdReservation;
 }
 /// Leave process policy unchanged.
 pub struct NoProcessActions;
 impl ProcessActions for NoProcessActions {
     fn cross_thread_alloc_pool(&self) {}
-    fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
-        crate::process::current_nofile()
+    fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+        FdReservation::unreserved(crate::process::current_nofile())
+    }
+}
+
+/// A reserving descriptor provider for a caller running descriptor-heavy
+/// calls concurrently: one budget shared by every `Host` holding this pool,
+/// from which each request is granted `min(wanted, free)` as an
+/// [`FdAllowance::host_grant`], returned to the budget when the request's
+/// [`FdReservation`] drops. Concurrent calls therefore never hold grants
+/// summing to more than the budget, whatever their timing.
+///
+/// The budget is the caller's carve-out of the soft `RLIMIT_NOFILE` for
+/// the descriptors the library asks for, and nothing else. A request
+/// covers only the demand it was sized for: `cat`'s pinned inputs and
+/// `cat --dedupe`'s pass-2 sources (each plus a small fixed headroom),
+/// `add-locations-to-ways --index-type external`'s stage-1 shard files
+/// (released when stage 1 ends). Every other descriptor is the caller's to
+/// keep under the soft limit less the budget, summed over every call that
+/// can run at once: the caller's own, each call's outputs, scratch, inputs
+/// it opens outside a request, later external stages, and the commands
+/// that ask for nothing. The pool never reads the limit or counts open
+/// descriptors, so its grants depend on the budget and the reservations
+/// outstanding alone.
+///
+/// Grants are first come, first served and never wait: a request finding
+/// the budget short is granted what is left, and a command needing all of
+/// its request (`cat`) refuses and drops the grant at once.
+/// `cross_thread_alloc_pool` is forwarded to `inner`.
+pub struct FdPool {
+    state: Arc<FdPoolState>,
+    inner: Arc<dyn ProcessActions>,
+}
+
+struct FdPoolState {
+    budget: u64,
+    free: std::sync::atomic::AtomicU64,
+}
+
+impl FdPool {
+    /// A pool of `budget` descriptors, forwarding the other process
+    /// actions to `inner`.
+    pub fn new(budget: u64, inner: Arc<dyn ProcessActions>) -> Self {
+        Self {
+            state: Arc::new(FdPoolState {
+                budget,
+                free: std::sync::atomic::AtomicU64::new(budget),
+            }),
+            inner,
+        }
+    }
+
+    /// The budget the pool was built with.
+    pub fn budget(&self) -> u64 {
+        self.state.budget
+    }
+
+    /// Descriptors not granted to any outstanding reservation now. A
+    /// snapshot: concurrent requests and releases move it.
+    pub fn available(&self) -> u64 {
+        self.state.free.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl ProcessActions for FdPool {
+    fn cross_thread_alloc_pool(&self) {
+        self.inner.cross_thread_alloc_pool();
+    }
+    fn fd_allowance(&self, wanted: u64) -> FdReservation {
+        use std::sync::atomic::Ordering;
+        let before = self
+            .state
+            .free
+            .update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                free - wanted.min(free)
+            });
+        let taken = wanted.min(before);
+        let state = Arc::clone(&self.state);
+        FdReservation::with_release(FdAllowance::host_grant(taken), move || {
+            state.free.fetch_add(taken, Ordering::AcqRel);
+        })
     }
 }
 /// Per-call resource probes, invoked where the library needs the value.
@@ -1915,6 +1995,63 @@ mod tests {
             executor.install(|| executor.on_worker()),
             "install must run on a worker of the pool"
         );
+    }
+    /// Grants never sum past the budget while held, a short request gets
+    /// what is left, each drop returns exactly its grant, and the other
+    /// process action goes to the inner provider.
+    #[test]
+    fn fd_pool_grants_conserve_the_budget() {
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl ProcessActions for Count {
+            fn cross_thread_alloc_pool(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+                panic!("the pool never forwards a descriptor request")
+            }
+        }
+        let inner = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let pool = FdPool::new(100, Arc::clone(&inner) as Arc<dyn ProcessActions>);
+        pool.cross_thread_alloc_pool();
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let a = pool.fd_allowance(60);
+        let b = pool.fd_allowance(60);
+        let c = pool.fd_allowance(1);
+        assert_eq!(a.allowance(), FdAllowance::host_grant(60));
+        assert_eq!(b.allowance(), FdAllowance::host_grant(40), "what is left");
+        assert_eq!(c.allowance(), FdAllowance::host_grant(0));
+        assert_eq!(pool.available(), 0);
+        drop(b);
+        assert_eq!(pool.available(), 40);
+        drop((a, c));
+        assert_eq!(pool.available(), pool.budget());
+
+        // Every thread holds its grant across a barrier, so all of them are
+        // outstanding at once when the sum is taken.
+        let threads = 16;
+        let barrier = std::sync::Barrier::new(threads);
+        let held = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let grant = pool.fd_allowance(13);
+                    held.fetch_add(
+                        grant.allowance().descriptors,
+                        std::sync::atomic::Ordering::AcqRel,
+                    );
+                    barrier.wait();
+                    assert_eq!(
+                        held.load(std::sync::atomic::Ordering::Acquire),
+                        100,
+                        "outstanding grants take the whole budget, never more"
+                    );
+                    assert_eq!(pool.available(), 0);
+                    barrier.wait();
+                });
+            }
+        });
+        assert_eq!(pool.available(), 100, "every grant came back");
     }
     #[test]
     fn descriptor_allowance_narration() {

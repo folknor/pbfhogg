@@ -132,6 +132,35 @@ pub struct FaultPlan {
     // --- pipelined `PbfWriter` framing (`write::writer`) ---
     /// Sequence number whose framing job panics on the executor.
     pub framing_panic_at: AtomicUsize,
+    /// Sequence number whose framing job parks before it frames (counted in
+    /// `held_framing_jobs`) until a writer waiting for its framing work has
+    /// taken back every dispatch permit but the parked jobs' own (then
+    /// `framing_wait_reached` is set), or the test sets `release_framing`.
+    /// A writer that returns without that wait, or whose wait stops short of
+    /// the parked job's permit, therefore returns while the job is still
+    /// parked, which `held_framing_jobs` shows deterministically.
+    pub hold_framing_at: AtomicUsize,
+    /// Framing jobs currently parked by `hold_framing_at`.
+    pub held_framing_jobs: AtomicU64,
+    /// Framing jobs the producer has dispatched to the executor, counted on
+    /// the producer thread before the spawn.
+    pub framing_jobs_dispatched: AtomicU64,
+    /// Framing jobs whose body ran to its end (a panicking job is not
+    /// counted): the last thing such a job does before it drops what it
+    /// holds and returns its dispatch permit.
+    pub framing_jobs_done: AtomicU64,
+    /// Set when a parked framing job was released by a writer that had
+    /// taken back every permit not held by a parked job.
+    pub framing_wait_reached: AtomicBool,
+    /// Test-side release for a parked framing job (cleanup after the
+    /// assertion).
+    pub release_framing: AtomicBool,
+    /// A bounded framing hook wait expired.
+    pub framing_hook_timed_out: AtomicBool,
+    /// Permits the writer waiting for its framing jobs has taken back so
+    /// far (`MAX`: none is waiting), and how many it needs.
+    framing_wait_taken: AtomicU64,
+    framing_wait_needed: AtomicU64,
 
     // --- output construction (`Output::pbf_writer`) ---
     /// Refuse every output backend as a `PlatformUnsupported` setup error,
@@ -376,6 +405,15 @@ impl FaultPlan {
             uring_panic_at_dispatch: AtomicU64::new(u64::MAX),
             uring_dispatch_count: AtomicU64::new(0),
             framing_panic_at: AtomicUsize::new(usize::MAX),
+            hold_framing_at: AtomicUsize::new(usize::MAX),
+            held_framing_jobs: AtomicU64::new(0),
+            framing_jobs_dispatched: AtomicU64::new(0),
+            framing_jobs_done: AtomicU64::new(0),
+            framing_wait_reached: AtomicBool::new(false),
+            release_framing: AtomicBool::new(false),
+            framing_hook_timed_out: AtomicBool::new(false),
+            framing_wait_taken: AtomicU64::new(u64::MAX),
+            framing_wait_needed: AtomicU64::new(u64::MAX),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),
             diff_shard_panic: AtomicUsize::new(usize::MAX),
@@ -701,6 +739,53 @@ impl FaultPlan {
     /// Whether the pipelined writer's framing job for `seq` panics.
     pub(crate) fn framing_panics_at(&self, seq: usize) -> bool {
         self.framing_panic_at.load(Ordering::Relaxed) == seq
+    }
+
+    // ---- pipelined `PbfWriter` framing barrier ---------------------------
+
+    /// Called by the producer just before it dispatches a framing job.
+    pub(crate) fn on_framing_dispatch(&self) {
+        self.framing_jobs_dispatched.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Called by the framing job for `seq` before it frames.
+    pub(crate) fn on_framing_job(&self, seq: usize) {
+        if seq != self.hold_framing_at.load(Ordering::SeqCst) {
+            return;
+        }
+        self.held_framing_jobs.fetch_add(1, Ordering::SeqCst);
+        self.wait_until(&self.framing_hook_timed_out, || {
+            let taken = self.framing_wait_taken.load(Ordering::SeqCst);
+            let held = self.held_framing_jobs.load(Ordering::SeqCst);
+            if taken != u64::MAX
+                && taken.saturating_add(held) >= self.framing_wait_needed.load(Ordering::SeqCst)
+            {
+                self.framing_wait_reached.store(true, Ordering::SeqCst);
+                return true;
+            }
+            self.release_framing.load(Ordering::SeqCst)
+        });
+        self.held_framing_jobs.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Called by a framing job whose body ran to its end, just before it
+    /// drops what it holds and returns its dispatch permit.
+    pub(crate) fn on_framing_job_done(&self) {
+        self.framing_jobs_done.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Called by a writer waiting for its framing jobs: on entry
+    /// (`taken` 0) and after each permit it takes back, of `needed`.
+    pub(crate) fn on_framing_wait(&self, taken: usize, needed: usize) {
+        self.framing_wait_needed
+            .store(needed as u64, Ordering::SeqCst);
+        self.framing_wait_taken
+            .store(taken as u64, Ordering::SeqCst);
+    }
+
+    /// Called by a writer whose wait for its framing jobs is over.
+    pub(crate) fn after_framing_wait(&self) {
+        self.framing_wait_taken.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// Whether the multi-extract region grid is declined (counted).

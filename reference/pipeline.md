@@ -128,9 +128,11 @@ Only the pipelined iteration methods honour it; the sequential `for_each` and
 | Stage | Thread | Work |
 |-------|--------|------|
 | 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
-| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (32-slot write-ahead), writes to `FileWriter` |
+| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (`WRITE_AHEAD`-slot write-ahead), writes to `FileWriter` |
 
 Every pipelined constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
+
+Stage 1 jobs are detached and the writer thread stops at its first error, so joining it proves nothing about the jobs behind it. Every way a writer ends (`flush`, `Drop`, a write that recovers the writer thread's error) therefore first takes back every dispatch permit and returns them (`WritePipeline::wait_for_framing`): a job returns its permit as its last act, after dropping its invocation, sender and block bytes, so holding all of them means no stage 1 job can still frame, hold the invocation or record a counter (rayon's own bookkeeping and a pool's `panic_handler` may still run). A write after a recovered writer-thread error is refused without dispatching anything.
 
 Output modes:
 - `PbfWriter::to_path()` - buffered I/O

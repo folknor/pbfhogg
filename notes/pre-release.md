@@ -45,39 +45,38 @@ only exists under library use is unverified:
   matching output;
 - no stderr from the library (diagnostics only through `host::Diagnostics`).
 
-Filed as brokkr#46, now that each `Invocation` owns its counters and its
-instrumentation sink (`0370e462` to `0fe60da5`). Undecided: what brokkr
-ships for this. The likely shape is a small harness
-binary depending on pbfhogg as a library, running a scripted sequence of calls
-in one process (sequential and concurrent), with a brokkr subcommand that runs
-it, records walls and stalls per call, and compares its outputs with the CLI's.
-pbfhogg's position is posted on brokkr#46 (2026-10-28): the harness is a
-pbfhogg workspace member, pbfhogg owns the scenario format and exposes a
-describe mode, digest is the equality check. pbfhogg-side work that has to
-land before or with the harness:
+brokkr's side has landed: `brokkr library` builds, runs, verifies, measures,
+profiles and certifies a harness, to a protocol frozen at version 1
+(`brokkr man library`). What remains is pbfhogg's, tracked in bz:
 
-- **FIFO line loss is invisible.** `debug::Line::emit` drops a line on a
-  full FIFO, a gone reader or a refused name with no count anywhere, and
-  brokkr's "incomplete" flag only sees malformed lines, not absent ones. A
-  harness comparing a call's stream against its `for_each_counter` snapshot
-  cannot tell "dropped" from "never emitted". Consider a per-sink dropped-line
-  count the harness can read and report in its artefact.
-- **SIGPIPE on a FIFO whose reader left.** `MarkerFifo` writes to a FIFO; with
-  no reader the write raises SIGPIPE. Rust binaries ignore it by default, but
-  a library host that restored the default disposition dies on its first
-  marker after brokkr closes the read end. Unverified; decide whether the docs
-  must state the requirement (the library may not change signal state,
-  ADR-0016) or whether the write should use a send path that suppresses it.
-- **Harness member wiring.** Add it to the `all`, `consumer` and `musl`
-  sweeps with feature forwarding (keep `minimal` library-only), give it
-  workspace lints, and widen the textlint rules that name the CLI as the
-  only caller of `emit_writer_counters` / `emit_read_counters` to admit a
-  second frontend; the library-only prohibitions (env reads, setrlimit) must
-  not apply to it.
-- **Content blind spots.** `digest`/`diff` content excludes metadata,
-  `visible`, header fields and `LocationsOnWays` coordinates
-  (`src/content.rs`), so altw and cat scenarios need checks of their own
-  beyond digest equality.
+- `#34`: the harness member itself (`pbfhogg-harness`, describe and
+  run modes, the scenarios above, sweep and textlint wiring, the
+  `hotpath` / `hotpath-alloc` features). Blocked on:
+  - `#31`: `Invocation::seal()`, an Open / Draining / Sealed state
+    machine documented as a binding contract;
+  - `#32`: call sinks end their stream with sealing emissions, a
+    terminal record and a per-sink drop count (closes the old "FIFO line
+    loss is invisible" gap);
+  - `#33`: `Invocation::cancel()` returns its linearized outcome
+    against the publication decision.
+- `#35`: the gate's capability ids in `[pbfhogg.library.require]`,
+  after `#34`.
+- `#36`: a reserving descriptor provider for concurrent calls.
+- `#37`: a full-fidelity digest. Until then `digest` content excludes
+  metadata, `visible`, header fields and `LocationsOnWays` coordinates
+  (`src/content.rs`), so altw and cat scenarios need checks of their own.
+- `#38`: the CLI's entry and return marker pair, which brokkr's
+  library-against-CLI timing waits on.
+
+Still open with no ticket: **SIGPIPE on a FIFO whose reader left.**
+`MarkerFifo` writes to a FIFO; with no reader the write raises SIGPIPE.
+Rust binaries ignore it by default, but a library host that restored the
+default disposition dies on its first marker after brokkr closes the read
+end. The harness protocol makes "never reset SIGPIPE" a producer
+obligation, which covers the harness but not other embedders; decide
+whether the library docs must state the requirement (the library may not
+change signal state, ADR-0016) or whether the write should use a send path
+that suppresses it.
 
 ### io_uring on real data
 

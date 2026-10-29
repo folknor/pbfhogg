@@ -38,8 +38,8 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, WritePipeline, drain_permits,
-    record_send_wait, recv_permit, write_accepted, writer_thread,
+    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, WritePipeline, record_send_wait,
+    recv_permit, write_accepted, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
 
@@ -62,11 +62,20 @@ const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output f
 ///
 /// Takes the join handle, so a later `flush()` will not try to join twice; the
 /// error it recovered has already been returned to the caller by then.
+///
+/// This ends the pipeline's useful life, so it records the writer thread's
+/// death for every later write (each then comes straight back here, without
+/// reserving or dispatching anything) and waits for every framing job still
+/// queued or running before it returns ([`WritePipeline::wait_for_framing`]).
+/// Every caller holds proof the receiver is gone - an observed death notice
+/// or a failed send - and no permit of its own.
 fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
     // The failure is consumed here, so a later `flush` can no longer see it.
     if let Some(completion) = &pipeline.completion {
         completion.fail();
     }
+    pipeline.writer_gone.record();
+    pipeline.wait_for_framing();
     match pipeline.join_handle.take() {
         Some(handle) => match handle.join() {
             Ok(Err(e)) => e,
@@ -205,19 +214,23 @@ impl RawPayload<'_> {
 /// Everything per payload happens after the reservation: the byte count
 /// (a walk over the chunks for `Chunks`) before the send timer starts, and
 /// building the item (the copy of a borrowed payload) inside it. A failed
-/// send joins the writer thread and returns its own error.
+/// send joins the writer thread and returns its own error, after giving the
+/// permit back: that path waits for every permit.
 fn send_raw(pipeline: &mut WritePipeline, payload: RawPayload<'_>) -> Result<()> {
-    let (_permit, seq) = reserve(pipeline)?;
+    let (permit, seq) = reserve(pipeline)?;
     payload.count(pipeline.metrics());
     let t_send = crate::counters::Stopwatch::start();
     let sent = pipeline.tx.send(PipelineItem {
         seq,
         data: Ok(payload.into_chunk()),
     });
+    if sent.is_ok() {
+        record_send_wait(t_send, pipeline.metrics());
+    }
+    drop(permit);
     if sent.is_err() {
         return Err(pipeline_send_error(pipeline));
     }
-    record_send_wait(t_send, pipeline.metrics());
     Ok(())
 }
 
@@ -287,6 +300,21 @@ fn framing_panics_at(_cancel: &crate::host::Invocation, _seq: usize) -> bool {
     false
 }
 
+/// Test hooks: a framing job starting and finishing (the fault plan's
+/// `hold_framing_at` and `framing_jobs_done`, see `crate::test_hooks`).
+#[cfg(feature = "test-hooks")]
+fn framing_job_starts(invocation: &crate::host::Invocation, seq: usize) {
+    invocation.faults().on_framing_job(seq);
+}
+#[cfg(not(feature = "test-hooks"))]
+fn framing_job_starts(_invocation: &crate::host::Invocation, _seq: usize) {}
+#[cfg(feature = "test-hooks")]
+fn framing_job_ends(invocation: &crate::host::Invocation) {
+    invocation.faults().on_framing_job_done();
+}
+#[cfg(not(feature = "test-hooks"))]
+fn framing_job_ends(_invocation: &crate::host::Invocation) {}
+
 /// Writes PBF files as a sequence of framed, compressed blobs.
 ///
 /// # Usage
@@ -329,8 +357,8 @@ pub struct PbfWriter<W: Write> {
     /// the public constructors). Checked before every block a write method
     /// accepts, and by the writer thread between `copy_file_range` calls, so
     /// a long queued splice stops too. `flush`, `Drop` and the teardown they
-    /// run (joining the writer thread, draining framing permits) never check
-    /// it, so a cancelled writer still shuts down completely.
+    /// run (waiting for every framing job, joining the writer thread) never
+    /// check it, so a cancelled writer still shuts down completely.
     cancel: crate::host::Invocation,
 }
 
@@ -908,11 +936,21 @@ impl<W: Write> PbfWriter<W> {
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(&self.cancel, seq);
             let invocation = pipeline.invocation.clone();
+            #[cfg(feature = "test-hooks")]
+            invocation.faults().on_framing_dispatch();
             pipeline.executor.spawn(move || {
                 // Bound first so it drops last - the permit is released
                 // after `tx.send` below, and also on the unwind path if any
                 // of the framing work panics. See `PermitGuard`.
                 let _permit = permit;
+                // Every other capture becomes a local declared after the
+                // permit, before anything that can panic, so it drops
+                // before the permit on return and on unwind alike: a writer
+                // holding every permit (`wait_for_framing`) knows no job
+                // still holds its invocation, sender or block bytes.
+                let (tx, writer_gone, invocation, uncompressed, meta) =
+                    (tx, writer_gone, invocation, uncompressed, meta);
+                framing_job_starts(&invocation, seq);
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let metrics = &invocation.metrics().writer;
                 // A scan runs here, on the framing worker, outside the
@@ -952,6 +990,7 @@ impl<W: Write> PbfWriter<W> {
                     writer_gone.record();
                 }
                 record_send_wait(t_send, metrics);
+                framing_job_ends(&invocation);
             });
             self.mark_pending();
             Ok(())
@@ -1072,8 +1111,14 @@ impl<W: Write> PbfWriter<W> {
 
     /// Flush the underlying writer.
     ///
-    /// In pipelined mode, this joins the writer thread and propagates any
-    /// deferred compression or I/O errors.
+    /// In pipelined mode, this waits for every framing job, joins the writer
+    /// thread and propagates any deferred compression or I/O errors. It
+    /// returns, with or without an error, only once none of the writer's
+    /// framing work is left on its executor, so no framing job moves the
+    /// invocation's counters after it
+    /// ([`Invocation::for_each_counter`](crate::host::Invocation::for_each_counter)).
+    /// A write that reports the writer thread's failure, and `Drop`, wait
+    /// the same way.
     ///
     /// `flush` finishes the writer. It does not reopen a direct path: a
     /// pipelined `PbfWriter` never held the output file in the first place
@@ -1120,18 +1165,12 @@ impl<W: Write> PbfWriter<W> {
             // from one whose last framing task died: both close a channel
             // with an empty reorder buffer. See `SeqTotal`.
             pipeline.expected.announce(pipeline.seq);
+            // Every framing job ends before the join, on success and failure
+            // alike: a writer thread that stopped at an error says nothing
+            // about the jobs behind it. See `wait_for_framing`.
+            pipeline.wait_for_framing();
             // Drop sender to signal the writer thread that no more items are coming.
             drop(pipeline.tx);
-            // On a worker of the executor's pool, let the queued framing
-            // closures run before blocking in the join; see `drain_permits`.
-            // Off-worker (every CLI path) this is skipped.
-            if pipeline.executor.on_worker() {
-                drain_permits(
-                    &pipeline.permit_rx,
-                    &pipeline.executor,
-                    &pipeline.invocation.metrics().writer,
-                );
-            }
             if let Some(handle) = pipeline.join_handle.take() {
                 handle
                     .join()
@@ -1295,7 +1334,8 @@ fn named_path(path: &Path, result: Result<PbfWriter<FileWriter>>) -> Result<PbfW
     }
 }
 
-/// Cleanup only: joins the writer thread and reports nothing. A writer that
+/// Cleanup only: waits for every framing job, joins the writer thread and
+/// reports nothing. A writer that
 /// was not [`flush`](PbfWriter::flush)ed may be missing its tail, and `Drop`
 /// cannot report the deferred error. Dropping unflushed on an error return is
 /// allowed: the caller's primary error dominates.
@@ -1312,16 +1352,9 @@ impl<W: Write> Drop for PbfWriter<W> {
         #[cfg(test)]
         let finished = self.finished;
         if let Some(mut pipeline) = self.pipeline.take() {
+            // As in `flush`: every framing job ends before the writer does.
+            pipeline.wait_for_framing();
             drop(pipeline.tx);
-            // As in `flush`: on a worker of the executor's pool the queued
-            // framing closures must run before the join can return.
-            if pipeline.executor.on_worker() {
-                drain_permits(
-                    &pipeline.permit_rx,
-                    &pipeline.executor,
-                    &pipeline.invocation.metrics().writer,
-                );
-            }
             if let Some(handle) = pipeline.join_handle.take() {
                 // Best-effort join. Any I/O error from the writer thread -
                 // including the deferred `sync_all` and (for uring)

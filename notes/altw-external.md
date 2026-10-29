@@ -635,7 +635,7 @@ soft limit of 1024 (the library never raises it) gets
 host, and is refused below 320 available. Consolidated writers would make
 stage 1's descriptor need independent of the worker count, so a library
 caller would run at full width. Measure stage 1 at soft 1024 against the
-raised limit (the harness on brokkr#46 can) before deciding whether this
+raised limit (the library harness, pbfhogg#34, can) before deciding whether this
 matters.
 
 ---

@@ -4,8 +4,9 @@
 The CLI promises it starts no helper process (docs/cli/commands.md, "Names
 pbfhogg leaves behind"); brokkr's lease cleanup relies on it. The hotpath
 dependency starts one, a detached `hotpath-samply`, from its CPU profiler,
-which hotpath 0.30.0 compiles in only under its `hotpath-cpu` feature (the
-spawn is `src/lib_on/functions/cpu/autospawn.rs` in that crate). No pbfhogg
+which the audited hotpath release (AUDITED) compiles in only under its
+`hotpath-cpu` feature (the spawn is `src/lib_on/functions/cpu/autospawn.rs`
+in that crate). No pbfhogg
 feature names it, but a dependency added later could enable it through
 feature unification, which no manifest text shows.
 
@@ -34,9 +35,9 @@ import sys
 SENTINEL = "hotpath-cpu absent"
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 AUDITED = {
-    "hotpath": "0.30.0",
-    "hotpath-macros": "0.30.0",
-    "hotpath-drain": "0.30.0",
+    "hotpath": "0.30.1",
+    "hotpath-macros": "0.30.1",
+    "hotpath-drain": "0.30.1",
 }
 FORBIDDEN = "hotpath-cpu"
 

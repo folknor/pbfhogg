@@ -95,6 +95,8 @@ mod fault_inspect_input;
 #[cfg(feature = "test-hooks")]
 mod fault_parallel_writer;
 #[cfg(feature = "test-hooks")]
+mod fault_pipelined_writer;
+#[cfg(feature = "test-hooks")]
 mod fault_read_pipeline;
 #[cfg(feature = "test-hooks")]
 mod fault_renumber_input;

@@ -253,8 +253,9 @@ pub(super) struct WritePipeline {
     pub(super) join_handle: Option<JoinHandle<Result<()>>>,
     /// Counting-semaphore permit pool bounding in-flight rayon dispatches.
     /// The producer takes a permit ([`recv_permit`]) before spawning on the
-    /// executor; the framing closure `send()`s it back when its work
-    /// completes. See
+    /// executor; the framing closure `send()`s it back as the last thing it
+    /// does, which also makes the pool the writer's barrier on its framing
+    /// jobs ([`wait_for_framing`](Self::wait_for_framing)). See
     /// [`PIPELINE_DISPATCH_PERMITS`] for the memory-bound rationale.
     pub(super) permit_tx: SyncSender<()>,
     pub(super) permit_rx: Receiver<()>,
@@ -415,23 +416,64 @@ pub(super) fn recv_permit(
     result
 }
 
-/// Take back every one of the [`PIPELINE_DISPATCH_PERMITS`] tokens through
-/// [`recv_permit`], which means every framing closure has finished. Stops
-/// early if the pool disconnects.
-///
-/// `flush` and `Drop` call this before joining the writer thread when the
-/// producer is on a worker of the executor's pool: the writer thread is
-/// waiting for items that framing closures queued on that pool are still to
-/// produce, and joining from the pool's only free thread would never let them
-/// run.
-pub(super) fn drain_permits(
-    rx: &Receiver<()>,
-    executor: &crate::host::Executor,
-    metrics: &WriterMetrics,
-) {
-    for _ in 0..PIPELINE_DISPATCH_PERMITS {
-        if recv_permit(rx, executor, metrics).is_err() {
-            break;
+impl WritePipeline {
+    /// Wait until every framing job this pipeline dispatched has ended its
+    /// work: take back every one of the [`PIPELINE_DISPATCH_PERMITS`] tokens
+    /// through [`recv_permit`], then return them all.
+    ///
+    /// The proof is conservation. Every token is in the pool, held by a
+    /// producer-side send, or owned by a framing job's [`PermitGuard`], which
+    /// a job drops after everything else it holds (its invocation, sender and
+    /// block bytes; see `write_osm_data`), on return and on unwind. The
+    /// producer is the only acquirer and the thread running this, so holding
+    /// all of them at once means no job still holds its invocation or bytes
+    /// or can record a counter. That is the whole claim: rayon's own job
+    /// machinery, and a pool's non-aborting `panic_handler` after a framing
+    /// panic, may still be running on the pool. All are taken before any is
+    /// returned (returning each as it arrives could see the same free token
+    /// again and again), and returning them makes the barrier repeatable: a
+    /// `flush` or `Drop` after a failed write runs it again, instantly.
+    ///
+    /// Every way a pipelined writer ends runs this before it joins the writer
+    /// thread - `flush`, `Drop`, and a write that recovers the writer thread's
+    /// error (`pipeline_send_error`). The writer thread stops at its first
+    /// error ([`deliver_in_order`]) and drops its receiver, so joining it
+    /// proves nothing about the jobs still queued behind it; without this they
+    /// would go on framing, and moving the invocation's counters, after the
+    /// writer had returned. Not a cancellation checkpoint (ADR-0019): queued
+    /// work winds down.
+    ///
+    /// On a worker of the executor's pool the wait is cooperative (see
+    /// [`recv_permit`]), so a producer on the pool's only free thread still
+    /// lets the queued jobs run. Off it the wait blocks, and so depends on the
+    /// executor running the jobs independently of this thread, as the join of
+    /// a successful stream always did.
+    pub(super) fn wait_for_framing(&self) {
+        let metrics = self.metrics();
+        let mut taken = 0;
+        #[cfg(feature = "test-hooks")]
+        self.invocation
+            .faults()
+            .on_framing_wait(taken, PIPELINE_DISPATCH_PERMITS);
+        while taken < PIPELINE_DISPATCH_PERMITS {
+            // The pipeline holds `permit_tx`, so the pool never disconnects;
+            // a disconnect could only mean no job is left to wait for.
+            if recv_permit(&self.permit_rx, &self.executor, metrics).is_err() {
+                break;
+            }
+            taken += 1;
+            #[cfg(feature = "test-hooks")]
+            self.invocation
+                .faults()
+                .on_framing_wait(taken, PIPELINE_DISPATCH_PERMITS);
+        }
+        #[cfg(feature = "test-hooks")]
+        self.invocation.faults().after_framing_wait();
+        for _ in 0..taken {
+            // Cannot block: the channel holds `PIPELINE_DISPATCH_PERMITS`
+            // and every token is in this thread's hand. Cannot fail: the
+            // pipeline holds the receiver.
+            self.permit_tx.send(()).ok();
         }
     }
 }

@@ -1485,6 +1485,15 @@
 
 ### Fixed
 
+- **A failed pipelined `PbfWriter` no longer leaves framing work running.**
+  When the writer thread stopped on an error, `flush`, `Drop` and a write
+  that reported the failure returned while blocks already handed to the
+  executor were still being framed, so the invocation's `writer_*` counters
+  kept moving after the writer was gone. Each now waits for that work
+  first, error paths included; off the pool's workers that wait needs the
+  pool to run the work. A framed write after a write already reported the
+  writer thread's failure is now refused instead of returning `Ok`.
+
 - **Every command reads a node block's granularity alike, and
   `apply-changes --locations-on-ways` refuses an out-of-domain joined
   node.** `add-locations-to-ways`, `apply-changes --locations-on-ways` and

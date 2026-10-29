@@ -775,6 +775,17 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Core infrastructure and CLI
 
+- [ ] **A standalone pipelined `PbfWriter` flushes `Ok` after a write
+  already returned its writer thread's error.** `pipeline_send_error`
+  takes the join handle, so a later `flush` finds no thread to join and
+  returns `Ok(())` for the `to_path*` family (tests pin it with
+  `w.flush().unwrap()`); only a writer filling an `Output` stays failed,
+  through its `Completion`. Later writes are refused since the framing
+  barrier landed (2026-10-29), but a caller that ignores one write error
+  and trusts `flush` is told the file is good. Decide whether a recovered
+  failure should make `flush` fail too. Found 2026-10-29 by the framing
+  barrier item's scout.
+
 - [ ] **JSON output and the human text quoting escape different sets.** The
   human text (`diff -v`, `inspect --show`, the inspect report, `inspect
   tags`) goes through `text_quote::Quoted`, which also escapes C1 controls,

@@ -83,15 +83,19 @@ impl MarkerFifo {
     /// The open failure; off Unix, always `Unsupported`.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let file = open_marker_fifo(path)?;
+        // Procfs recovers the true process epoch on Linux. If that probe is
+        // unavailable, zero age plus `Instant` still supplies a monotonic
+        // FIFO timestamp and preserves the wire format. The age is sampled
+        // before the anchor is taken: the other order would count any delay
+        // between the two (a preemption, a slow procfs read) both in the age
+        // and in every later `elapsed()`, so every reading would be late by it.
+        let age_at_anchor = crate::process::micros_since_process_start().unwrap_or(0);
+        let anchor = std::time::Instant::now();
         Ok(Self {
             shared: std::sync::Arc::new(FifoShared {
                 file,
-                anchor: std::time::Instant::now(),
-                // Procfs recovers the true process epoch on Linux. If that
-                // probe is unavailable, zero age plus `Instant` still
-                // supplies a monotonic FIFO timestamp and preserves the wire
-                // format.
-                age_at_anchor: crate::process::micros_since_process_start().unwrap_or(0),
+                anchor,
+                age_at_anchor,
             }),
         })
     }

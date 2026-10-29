@@ -416,6 +416,15 @@ pub enum PageCachePolicy {
 ///   framing work cooperatively, so even a one-thread pool cannot deadlock on
 ///   it. A writer moved between pools mid-stream under `Ambient` is not
 ///   covered by that wait.
+///
+/// Every way a `PbfWriter` ends - `flush`, a write that reports its writer
+/// thread's failure, `Drop` - waits for all the framing work it dispatched,
+/// errors included, so none of it frames, holds the writer's invocation or
+/// moves its counters after the writer is gone (rayon's own bookkeeping, and
+/// a non-aborting `panic_handler` after a framing panic, may still run).
+/// That wait needs the pool to run the work: off the pool's workers it
+/// blocks, so a pool whose every worker waits on the thread ending the writer
+/// never lets it return.
 #[derive(Clone, Debug)]
 pub enum Executor {
     /// The calling thread's rayon pool, or rayon's global pool off any pool.

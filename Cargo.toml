@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli"]
+members = ["cli", "harness"]
 exclude = ["bench/osmpbf-baseline"]
 
 [workspace.dependencies]

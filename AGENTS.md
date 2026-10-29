@@ -166,6 +166,8 @@ Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, prod
 
 CLI-driven integration tests live in the `pbfhogg-cli` package, `cli/tests/cli_*.rs` (modules of `cli/tests/all.rs`), and drive the `pbfhogg` binary via `CliInvoker` (`cli/tests/invoker.rs`). The binary is cargo's `CARGO_BIN_EXE_pbfhogg`, built for that test build with its own features, profile and target; nothing is resolved at run time. Command-table tests take their subcommand lists from `pbfhogg_cli::cli_command()`, the tree production parses, never from `--help` text. `tests/common` is shared: the CLI harness mounts it by `#[path]`.
 
+The third member, **`pbfhogg-harness`** (`harness/`, bin only, `publish = false`), is the library harness `brokkr library` builds and runs (`brokkr man library`). Its unit tests are in the bin; the tests that drive the executable are `harness/tests/all.rs`, under the CLI's promise guard (`cli/tests/guard.rs`, mounted by path).
+
 `cargo clippy --all-targets` at the workspace root lints only the root package. After changing `cli/`, verify with `brokkr check` (the `all`, `consumer` and `musl` sweeps select `pbfhogg-cli`).
 
 ## Architecture

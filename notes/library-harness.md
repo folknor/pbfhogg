@@ -65,9 +65,8 @@ Its residue is the re-certification, which waits on a harness (L2 onward):
 a certification under `v1` holds for `v1` only.
 - L0 (irreversible unbacked replacement) and L1 (#33, Decision B) have
   landed; see the landing list.
-- L2, the harness skeleton, needs no seal; it reads publications through
-  `Invocation::for_each_publication` and the cancel result from
-  `Invocation::cancel`'s `CancelOutcome`.
+- L2, the harness skeleton, has landed; see the landing list. It reports
+  every seal refused until L4.
 - L3 and L4 are the seal (Decision A and C). They are the largest and are
   candidates for a chain under one design document, which is the user's
   call.
@@ -85,6 +84,10 @@ a certification under `v1` holds for `v1` only.
   - CLI equality accepts digest `v1` and `v2`.
 - **brokkr#61** (digest has no measured brokkr command) is open. Until it
   lands, the cost of digest `v2` on the success path is unmeasured.
+- **brokkr#62** (filed at L2) is open: the call-stream defect "a name
+  emitted twice" reads as forbidding repeated ordinary markers and
+  counter samples. It bites only once a call seals and claims its stream
+  (L4, L6).
 
 **Practical facts:**
 - **Read the protocol** through `brokkr man library` (the installed
@@ -637,10 +640,62 @@ Landed independently, 2026-10-29:
   rename now ends holding the new content, not the seed, so a
   `seeded-replace` scenario expecting a refusal judged on final state
   (brokkr#59) must not arm that fault on a lone file.
+- L2, the harness skeleton (Decision E): the commit that carries this
+  line. Member `harness/` (bin only, unit tests in the bin, executable
+  tests in `harness/tests/all.rs` under the CLI's promise guard mounted
+  from `cli/tests/guard.rs`), `repeat-cat`, the wiring, and a per-sink
+  drop count on `CallSink` (`CallSink::dropped`). Gate: `brokkr library
+  repeat-cat --dataset denmark` fails on exactly `a/brokkr.seal` and
+  `b/brokkr.seal`; both `brokkr.cli` results pass under digest `v2`.
+  That expectation holds for a digest-compatible (sorted) input; an
+  unsorted snapshot adds `brokkr.cli` failures. Implementation rulings:
+  - Seal reported `refused` (reason names pbfhogg#31), snapshot null,
+    stream `open` with the sink's real drop count. No `stream` or
+    `covers` declarations until L6, so no `brokkr.stream` result.
+  - Each call gets a fresh `CallSink`, invocation (`with_sink`) and
+    host: `host::Fixed` with the machine's parallelism and no memory
+    figure, `NoProcessActions`, `PageCachePolicy::Keep`,
+    `Executor::Ambient`. Setup starts rayon's global pool before the
+    first call; the context reports its size (`executor_threads`), so
+    `RAYON_NUM_THREADS` cannot pair two workloads. The harness raises
+    soft `RLIMIT_NOFILE` to hard at start (skipping `setrlimit` when
+    already there), refuses if it cannot, and reports the read-back
+    value per call. Nothing volatile (memory, free descriptors) enters
+    a plan or context.
+  - Plans spell every option resolved (compression `zlib:6`, backend
+    `buffered`, every clean flag, every header override), never
+    "default".
+  - Runner order: entry_us, the call (outputs built inside it, staged
+    `DirWithBackups(private dir)`), return_us, the three emitters, the
+    seal attempt, seal_us, the host dropped, the collector closed, then
+    publications and drops read, then the call document. A late
+    diagnostic is counted, never kept, and fails the scenario-level
+    `call-diagnostics-closed` assertion every scenario carries: a
+    tripwire, not the guarantee.
+  - Destinations map to roles by exact path equality with the call's
+    bound outputs; an unmapped one refuses the run. Bindings are checked
+    before any call: exactly the roles, inputs canonical regular files,
+    outputs absent under resolvable parents, no output sharing a
+    resolved path with another role (inputs may share).
+  - `outcome.kind` is a typed match over `ErrorKind` (`other` for a
+    future kind); a future `CancelOutcome` variant refuses the run
+    rather than be misreported.
+  - The request is read by a strict parser (duplicate keys, `-0`,
+    fractions, trailing bytes refused). Refusals exit 2 with
+    `refusal.json` and no output.
+  - The hotpath guard exists only in `--test-harness` with
+    `HOTPATH_OUTPUT_PATH` set and drops after `scenario.json`.
+    `repeat-cat` has two calls, so it is not `hotpath: true`; profiling
+    is first exercised by an L5 single-call scenario.
+  - Residue for L3/L4: replace the seal stub with `seal()`,
+    `with_call_sink` and the stream account (the drop count moves into
+    it). For L5: a `hotpath` scenario's setup may not build generated
+    inputs with library writers. Lateral: `Cargo.lock` is gitignored, so
+    the resolved dependency graph is not part of a measurement's
+    identity.
 
 | # | Landing | Gate |
 |---|---|---|
-| L2 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with an output counterpart, wiring, hotpath features. Seal is reported refused until L4 | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
 | L3 | Decision A's capabilities: control handle, `Call` and `Permit`, the transition word Open-only, census tickets, the pool permit. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: guards and permits back to 0 after every command and drop; a held `PipelinedBlocks` blocked on a caller stream holding a permit and a ticket and no guard; a nested entry minting normally; `Refused(Unticketed)` impossible in a quiescent run |
 | L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier; block-API cost on one matched denmark pair. `brokkr library repeat-cat --dataset denmark` passes |
 | L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
@@ -651,6 +706,6 @@ Landed independently, 2026-10-29:
 ## Out of scope
 
 - brokkr's side. Everything this design needed from brokkr has landed
-  (brokkr `3c59ce8`, `75dc76f`, `6074751`, `2f407c3`, `98bddee`); brokkr#61
-  is the one open brokkr item.
+  (brokkr `3c59ce8`, `75dc76f`, `6074751`, `2f407c3`, `98bddee`); the open
+  brokkr items are listed under bz state above.
 - A `crates/` relayout.

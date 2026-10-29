@@ -128,6 +128,7 @@ impl MarkerFifo {
         CallSink {
             shared: std::sync::Arc::clone(&self.shared),
             id,
+            drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -142,12 +143,13 @@ impl FifoShared {
 impl InstrumentSink for MarkerFifo {
     fn marker(&self, name: &str) {
         let shared = &self.shared;
-        Line::marker(shared.now_us(), None, name).emit(&shared.file);
+        // The process stream keeps no account: a dropped line is gone.
+        let _delivered = Line::marker(shared.now_us(), None, name).emit(&shared.file);
     }
 
     fn counter(&self, name: &str, value: i64) {
         let shared = &self.shared;
-        Line::counter(shared.now_us(), None, name, value).emit(&shared.file);
+        let _delivered = Line::counter(shared.now_us(), None, name, value).emit(&shared.file);
     }
 }
 
@@ -203,10 +205,17 @@ impl CallId {
 /// every `CallSink` of one FIFO shares its descriptor and clock, and its
 /// lines follow the same whole-line and name rules, with the tag counted in
 /// the 512 bytes.
+///
+/// The sink counts every line it dropped ([`dropped`](Self::dropped)): a
+/// name the reader would refuse, a line over 512 bytes, and a write that did
+/// not take the whole line (a full FIFO, a reader gone). The count belongs
+/// to this sink and its clones, not to the FIFO: another call's sink keeps
+/// its own.
 #[derive(Clone)]
 pub struct CallSink {
     shared: std::sync::Arc<FifoShared>,
     id: CallId,
+    drops: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CallSink {
@@ -215,17 +224,39 @@ impl CallSink {
     pub fn id(&self) -> &CallId {
         &self.id
     }
+
+    /// How many lines this sink (any of its clones) has dropped so far,
+    /// saturating at `u64::MAX`. Final once nothing emits through it any
+    /// more.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.drops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count `line` as dropped unless it went out whole. Only a drop touches
+    /// the counter.
+    fn account(&self, delivered: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !delivered {
+            // `Err` only when already saturated, which is where it stays.
+            let _saturated = self
+                .drops
+                .try_update(Relaxed, Relaxed, |n| n.checked_add(1));
+        }
+    }
 }
 
 impl InstrumentSink for CallSink {
     fn marker(&self, name: &str) {
         let shared = &self.shared;
-        Line::marker(shared.now_us(), Some(&self.id), name).emit(&shared.file);
+        self.account(Line::marker(shared.now_us(), Some(&self.id), name).emit(&shared.file));
     }
 
     fn counter(&self, name: &str, value: i64) {
         let shared = &self.shared;
-        Line::counter(shared.now_us(), Some(&self.id), name, value).emit(&shared.file);
+        self.account(
+            Line::counter(shared.now_us(), Some(&self.id), name, value).emit(&shared.file),
+        );
     }
 }
 
@@ -452,14 +483,16 @@ impl Line {
     }
 
     /// Write the assembled line, or drop it whole. Never writes a prefix.
-    fn emit(&self, file: &std::fs::File) {
+    /// Whether the whole line went out.
+    #[must_use]
+    fn emit(&self, file: &std::fs::File) -> bool {
         use std::io::Write;
         if self.overflow {
-            return;
+            return false;
         }
         // Deliberately `write`, not `write_all`: a short write must drop the
         // marker, not resume it mid-line.
-        drop((&*file).write(&self.buf[..self.len]));
+        matches!((&*file).write(&self.buf[..self.len]), Ok(n) if n == self.len)
     }
 }
 
@@ -588,7 +621,7 @@ mod tests {
 
         let scratch = crate::path_guard::tests::scratch();
         let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
-        line.emit(&sink);
+        assert!(!line.emit(&sink), "an overlong line reports a drop");
         assert_eq!(
             sink.metadata().expect("stat sink").len(),
             0,
@@ -605,11 +638,68 @@ mod tests {
         line.push(format_args!("{} PASS1_END\n", 42_u128));
         let scratch = crate::path_guard::tests::scratch();
         let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
-        line.emit(&sink);
+        assert!(line.emit(&sink), "a whole line reports delivery");
         assert_eq!(
             sink.metadata().expect("stat sink").len(),
             b"42 PASS1_END\n".len() as u64
         );
+    }
+
+    /// A call sink counts every line it drops, refused names, overlong lines
+    /// and writes a full FIFO turned away alike; its clones share the count,
+    /// another call's sink keeps its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn call_sinks_count_their_own_drops() {
+        use super::InstrumentSink as _;
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let scratch = crate::path_guard::tests::scratch();
+        let path = scratch.path().join("fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // A reader that never reads keeps the FIFO open for writers.
+        #[allow(clippy::disallowed_methods)]
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("open the read end");
+        let fifo = super::MarkerFifo::open(&path).expect("open the FIFO");
+        let a = fifo.call(super::CallId::new("a").expect("id"));
+        let a2 = a.clone();
+        let b = fifo.call(super::CallId::new("b").expect("id"));
+
+        a.marker("@refused");
+        a2.counter("x=y", 1);
+        a.marker(&"n".repeat(PIPE_BUF));
+        b.marker("DELIVERED");
+        assert_eq!((a.dropped(), a2.dropped(), b.dropped()), (3, 3, 0));
+
+        // Fill the FIFO until the kernel refuses a write, then every line
+        // is turned away.
+        #[allow(clippy::disallowed_methods)]
+        let mut filler = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("open a filler");
+        let chunk = [b'x'; 4096];
+        loop {
+            match filler.write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the FIFO: {e}"),
+            }
+        }
+        // The last bytes may still fit a short line; drain them with
+        // single bytes until even one is refused.
+        while filler.write(b"x").is_ok() {}
+        b.marker("FULL");
+        a2.marker("FULL");
+        assert_eq!((a.dropped(), b.dropped()), (4, 1));
     }
 
     #[cfg(target_os = "linux")]

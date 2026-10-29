@@ -49,24 +49,20 @@ brokkr's side has landed: `brokkr library` builds, runs, verifies, measures,
 profiles and certifies a harness, to a protocol frozen at version 1
 (`brokkr man library`). What remains is pbfhogg's, tracked in bz:
 
-- `#34`: the harness member itself (`pbfhogg-harness`, describe and
-  run modes, the scenarios above, sweep and textlint wiring, the
-  `hotpath` / `hotpath-alloc` features). Blocked on:
-  - `#31`: `Invocation::seal()`, an Open / Draining / Sealed state
-    machine documented as a binding contract;
-  - `#32`: call sinks end their stream with sealing emissions, a
-    terminal record and a per-sink drop count (closes the old "FIFO line
-    loss is invisible" gap).
+- `#34`: the harness member (`pbfhogg-harness`). Its skeleton has
+  landed as L2 of `notes/library-harness.md`: describe and run modes,
+  `repeat-cat`, sweep and textlint wiring, the `hotpath` /
+  `hotpath-alloc` features. Still owed: the other scenarios above, and
+  a real seal, which waits on:
+  - `#31`: `Invocation::seal()` (Decision A of that note);
+  - `#32`: call sinks end their stream with sealing emissions and a
+    terminal record. The per-sink drop count landed with L2.
   `#33` (cancel's linearized outcome, and the publication log) has
-  landed as L1 of `notes/library-harness.md`.
-- `#35`: the gate's capability ids in `[pbfhogg.library.require]`,
-  after `#34`.
+  landed as L1.
+- `#35`: the gate's capability ids in `[pbfhogg.library.require]`.
 - `#36`: a reserving descriptor provider for concurrent calls.
-- `#37`: a full-fidelity digest. Until then `digest` content excludes
-  metadata, `visible`, header fields and `LocationsOnWays` coordinates
-  (`src/content.rs`), so altw and cat scenarios need checks of their own.
-- `#38`: the CLI's entry and return marker pair, which brokkr's
-  library-against-CLI timing waits on.
+- `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
+  interval) have landed; `v2` still needs a certification under it.
 
 Still open with no ticket: **SIGPIPE on a FIFO whose reader left.**
 `MarkerFifo` writes to a FIFO; with no reader the write raises SIGPIPE.

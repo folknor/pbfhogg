@@ -1,0 +1,61 @@
+[package]
+name = "pbfhogg-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The pbfhogg library harness for brokkr's library protocol"
+rust-version.workspace = true
+authors.workspace = true
+# Not published: brokkr builds it from the tree it verifies.
+publish = false
+# Targets are declared, never discovered, as in the other members: a stray
+# file in tests/ or src/bin/ is not a silent extra binary.
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# The harness itself. Its unit tests (the document validators, the strict
+# request reader, the collector) run in the bin's own test target.
+[[bin]]
+name = "pbfhogg-harness"
+path = "src/main.rs"
+
+# Every test that drives the harness executable, as one binary: cargo
+# builds the executable with this test build's features and hands its path
+# as CARGO_BIN_EXE_pbfhogg-harness only to this package's tests.
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[features]
+default = []
+# No-op: the lib dep below always pulls in `pbfhogg/commands`; the feature
+# exists so a sweep can name `commands` for every package it selects.
+commands = []
+# brokkr's --hotpath and --alloc build the harness with these (its library
+# protocol, Profiling a scenario); both forward to the library's features of
+# the same names.
+hotpath = ["pbfhogg/hotpath"]
+hotpath-alloc = ["pbfhogg/hotpath-alloc"]
+linux-direct-io = ["pbfhogg/linux-direct-io"]
+linux-io-uring = ["pbfhogg/linux-io-uring"]
+test-hooks = ["pbfhogg/test-hooks"]
+
+[dependencies]
+pbfhogg = { version = "0.5", path = "..", default-features = false, features = ["commands"] }
+serde_json.workspace = true
+hotpath = "0.30.0"
+# Only to read the ambient executor's effective size for the call context.
+rayon = "1.12.0"
+# getrlimit and setrlimit for the harness's own descriptor policy.
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+zstd = "0.14.0"
+
+[lints]
+workspace = true

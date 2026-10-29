@@ -50,7 +50,7 @@ Placement and tiering are independent axes.
 
 ## Test binaries
 
-Both crates set `autotests = false`; every integration-test target is
+Every package sets `autotests = false`; every integration-test target is
 declared in its `Cargo.toml`. One binary per file made every check
 sweep link and start one harness per file, and a focused `brokkr test
 NAME` list each harness in turn to find one test.
@@ -68,7 +68,12 @@ NAME` list each harness in turn to find one test.
   test files gated on a feature carry the `#[cfg]` on their `mod` line
   in `tests/all.rs`, so it alone shows what drops out of the `minimal`
   sweep; the CLI binary has no such gates, since `pbfhogg-cli` always
-  links the library with `commands`.
+  links the library with `commands`. **`harness/tests/all.rs`** (the
+  `pbfhogg-harness` package) is the third: the tests that drive the
+  library harness executable (`exe.rs`), with `tests/common/` and the
+  promise guard (`cli/tests/guard.rs`, mounted at the crate root so its
+  control test keeps the name `guard::tests::probe`) mounted by path.
+  The harness's own unit tests live in its bin target.
 - **`tests/common/` is shared by path, not by a crate.** Each package
   compiles it with its own features, which carry the same names
   (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
@@ -160,6 +165,9 @@ when the resolved dependency graph, with every workspace feature on,
 enables hotpath's process-starting CPU profiler. `guard::tests` re-runs the test binary under the guard once per
 rule to prove each one fires and that the allowed neighbours do not. A
 test that starts the binary some other way escapes the guard: do not.
+The library harness inherits brokkr's lease the same way and keeps the
+same promise; every child `harness/tests/exe.rs` starts runs under the
+same guard, mounted from `cli/tests/guard.rs`.
 
 ## Validation tiers
 
@@ -461,10 +469,12 @@ exception, not a tier - should not survive across many PRs.
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
   so the library's unit tests never link the integration harness. The CLI
   crate's own unit tests use `test_scratch::scratch()` (`cli/src/test_scratch.rs`),
-  which cannot mount the integration file but has the same body. Every
+  which cannot mount the integration file but has the same body, as does
+  the library harness's (`harness/src/test_scratch.rs`). Every
   test scratch site goes through one of these (enforced by the
   `unit-test-scratch-via-path-guard` textlint in `brokkr.toml`, which covers
-  `src/`, `tests/`, `cli/tests/` and `cli/src/`). Keep the guard
+  `src/`, `tests/`, `cli/tests/`, `cli/src/`, `harness/src/` and
+  `harness/tests/`). Keep the guard
   alive for the fixture lifetime (the `TempDir` drop is the cleanup, so no
   manual `remove_dir_all` is needed). Never use benchmark scratch or
   fixed shared names.

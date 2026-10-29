@@ -33,19 +33,21 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 #                 purely so brokkr can apply `--features commands` to
 #                 both crates).
 #
-# The sweeps that test the CLI select both packages. Every test that
-# drives the `pbfhogg` binary lives in pbfhogg-cli (cli/tests/all.rs),
-# where cargo builds the binary with that test build's features and hands
-# its path as CARGO_BIN_EXE_pbfhogg - so there is no build_packages
-# pre-build and no binary from another sweep to pick up. Both packages
-# declare test-hooks, linux-direct-io and linux-io-uring under the same
-# names, so one feature list serves both. A sweep that must keep the
-# library alone (minimal, geocode-reader) leaves pbfhogg-cli out: its lib
-# dep would turn `commands` back on.
+# The sweeps that test the CLI select the CLI and the library harness
+# too. Every test that drives the `pbfhogg` binary lives in pbfhogg-cli
+# (cli/tests/all.rs), and every test that drives the harness in
+# pbfhogg-harness (harness/tests/all.rs), where cargo builds the binary
+# with that test build's features and hands its path as
+# CARGO_BIN_EXE_<name> - so there is no build_packages pre-build and no
+# binary from another sweep to pick up. Every package declares test-hooks,
+# linux-direct-io, linux-io-uring and commands under the same names, so
+# one feature list serves all three. A sweep that must keep the library
+# alone (minimal, geocode-reader) leaves the other two out: their lib dep
+# would turn `commands` back on.
 
 [[check]]
 name = "all"
-packages = ["pbfhogg", "pbfhogg-cli"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
 # binaries executed directly, budget = tests in flight, defaulting to the L3
@@ -63,7 +65,7 @@ parallel = {}
 
 [[check]]
 name = "consumer"
-packages = ["pbfhogg", "pbfhogg-cli"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 no_default_features = true
 features = ["commands"]
 parallel = {}
@@ -83,8 +85,12 @@ parallel = {}
 # (`check`, `export`, `extract`, `inspect::json`, `geocode_index`) carry
 # a `#[cfg(feature = "commands")]` on their `mod` line in tests/all.rs so
 # they drop out here and still run in full under `all` and `consumer`.
+#
+# Named explicitly rather than left to the workspace's default selection,
+# so a change to the workspace's default members cannot widen it.
 [[check]]
 name = "minimal"
+packages = ["pbfhogg"]
 no_default_features = true
 features = []
 parallel = {}
@@ -103,7 +109,7 @@ parallel = {}
 # x86_64 musl binaries run natively on the glibc host.
 [[check]]
 name = "musl"
-packages = ["pbfhogg", "pbfhogg-cli"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 
@@ -114,12 +120,12 @@ parallel = {}
 # needs at least one doctest carrier that spans the whole workspace. Run
 # through the gate profile only, to keep tier1 fast.
 # pbfhogg-cli's library target is the program, not an API, and sets
-# `doctest = false`, so it is excluded rather than the lane being
-# package-scoped.
+# `doctest = false`, and pbfhogg-harness has no library target at all, so
+# both are excluded rather than the lane being package-scoped.
 [[check]]
 name = "doctests"
 doc_only = true
-test_exclude_packages = ["pbfhogg-cli"]
+test_exclude_packages = ["pbfhogg-cli", "pbfhogg-harness"]
 
 # Compile each workspace member's lib and bins under its own package-mode
 # resolve - the boundary `cargo install pbfhogg-cli` and a downstream
@@ -200,17 +206,17 @@ message = "fault hooks go in pbfhogg::test_hooks (src/test_hooks.rs) as FaultPla
 [[textlint]]
 name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
 region = "code"
 message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
 
 [[textlint]]
 name = "no-stdout-handle"
 pattern = '\bstdout\b'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["cli/src/output.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["cli/src/output.rs", "harness/src/describe_out.rs"]
 region = "code"
-message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
+message = "only cli/src/output.rs (and the harness's describe writer, harness/src/describe_out.rs) acquires stdout; use output::buffered, or have the library take an io::Write"
 
 # Header feature spellings live in `read/block.rs` feature constants. Test
 # sources intentionally spell them when building or checking literal fixtures.
@@ -373,6 +379,13 @@ sweeps = ["doctests"]
 description = "Every sweep unfiltered, doctests, and the coverage audit"
 lanes = ["gate-tests", "doc-twin"]
 certifies = "complete"
+
+# The library harness `brokkr library` builds and runs (`brokkr man
+# library`): the workspace member harness/. No [pbfhogg.library.require]
+# table yet, so `brokkr library --all` refuses until the scenarios declare
+# the capabilities they cover.
+[pbfhogg.library.harness]
+package = "pbfhogg-harness"
 
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.
@@ -1263,16 +1276,18 @@ message = "Process mutations belong to the caller's explicit process toolbox"
 [[textlint]]
 name = "no-child-process-or-descriptor-reset"
 pattern = '\bprocess::(?:Command|Child|Stdio|CommandExt)\b|\buse\s+std::process::\{[^}]*\b(?:Command|CommandExt|Child)\b|\blibc::(?:fork|vfork|exec\w*|posix_spawn\w*|daemon|clone3?|close|close_range|closefrom|dup|dup2|dup3|ioctl)\b|\b(?:F_SETFD|FD_CLOEXEC|FIONBIO)\b|\bfrom_raw_fd\b'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+# The library harness inherits brokkr's lease descriptor just as the CLI
+# does, so it is held to the same promise.
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
 region = "code"
-message = "The CLI promises it starts no other process and leaves inherited descriptors alone (docs/cli/commands.md, Names pbfhogg leaves behind)"
+message = "The CLI promises it starts no other process and leaves inherited descriptors alone (docs/cli/commands.md, Names pbfhogg leaves behind); the library harness keeps the same promise"
 
 # The same promise covers file-status flags. The one F_SETFL clears O_NONBLOCK
 # on a descriptor src/read/input.rs opened itself.
 [[textlint]]
 name = "no-file-status-flag-change"
 pattern = '\bF_SETFL\b'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
 exclude = ["src/read/input.rs"]
 region = "code"
 message = "Only src/read/input.rs changes file-status flags, on descriptors it opened; inherited descriptors keep theirs"
@@ -1327,7 +1342,7 @@ message = "Environment access belongs to the caller"
 [[textlint]]
 name = "cli-command-interval-names-reserved"
 pattern = 'CLI_COMMAND_(?:START|END)'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
 exclude = ["cli/src/host.rs"]
 region = "string"
 message = "CLI_COMMAND_START and CLI_COMMAND_END are the CLI's reserved command-interval markers; only host::CommandInterval emits them"
@@ -1358,10 +1373,10 @@ message = "Library rayon tasks must go through the caller's host::Executor, not 
 [[textlint]]
 name = "no-eprint-macro"
 pattern = '\beprint(?:ln)?!'
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
 exclude = ["cli/src/output.rs"]
 region = "code"
-message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr"
+message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr; the library harness writes nothing to stderr at all"
 
 # Test scratch comes from one implementation, tests/common/scratch.rs:
 # random directories under the gitignored data/test-scratch/, removed when
@@ -1376,9 +1391,9 @@ message = "Library diagnostics must use the caller's Diagnostics handle; the CLI
 [[textlint]]
 name = "unit-test-scratch-via-path-guard"
 pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir|tempfile|NamedTempFile|Builder)\b|\bTempDir::new\b'
-paths = ["src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "cli/src/**/*.rs"]
+paths = ["src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs", "harness/tests/**/*.rs"]
 region = "code"
-message = "Test scratch must come from the shared scratch helper (path_guard::tests::scratch(), common::test_scratch() or the CLI's test_scratch::scratch()), never the system temp dir or a fixed name"
+message = "Test scratch must come from the shared scratch helper (path_guard::tests::scratch(), common::test_scratch(), or the CLI's or the harness's test_scratch::scratch()), never the system temp dir or a fixed name"
 
 # Error propagation (reference/pipeline.md, "Error propagation and
 # provenance"). A typed error keeps its kind and
@@ -1551,13 +1566,14 @@ must_scan = [
 message = "writer counters are an invocation total; emit them only from the end-of-invocation hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
 
 # The hook spelling: a backend calling `emit_writer_counters()` (qualified or
-# imported) re-creates per-writer emission by the other route. Only the CLI's
-# exit path calls it; write/mod.rs defines it.
+# imported) re-creates per-writer emission by the other route. Only the
+# CLI's exit path and the library harness's runner (once per call, after it
+# returns) call it; write/mod.rs defines it.
 [[textlint]]
 name = "writer-counter-hook-called-only-from-the-cli-exit-path"
 pattern = '\bemit_writer_counters\s*\('
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["src/write/mod.rs", "cli/src/lib.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["src/write/mod.rs", "cli/src/lib.rs", "harness/src/runner.rs"]
 region = "code"
 test_code = "skip"
 must_scan = [
@@ -1568,13 +1584,14 @@ must_scan = [
     "src/write/pipeline.rs",
     "src/write/writer.rs",
 ]
-message = "emit_writer_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
+message = "emit_writer_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
 
 # Read-side twin of the writer exit-hook rules. The pool-drop counters are
 # invocation totals, so only the one end-of-invocation hook may emit them; a
 # per-pipeline emission would publish N samples of a total, and the latch
 # would turn the exit call into a no-op after the first. The per-pool emitter
-# is called only by the hook (read/mod.rs); the hook only by the CLI exit path.
+# is called only by the hook (read/mod.rs); the hook only by the CLI exit path
+# and the library harness's runner.
 [[textlint]]
 name = "read-pool-counters-emitted-only-from-the-exit-hook"
 pattern = '\bemit_decompress_pool_counters\s*\('
@@ -1594,8 +1611,8 @@ message = "pool-drop counters are an invocation total; only pbfhogg::read::emit_
 [[textlint]]
 name = "read-counter-hook-called-only-from-the-cli-exit-path"
 pattern = '\bemit_read_counters\s*\('
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["src/read/mod.rs", "cli/src/lib.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["src/read/mod.rs", "cli/src/lib.rs", "harness/src/runner.rs"]
 region = "code"
 test_code = "skip"
 must_scan = [
@@ -1605,7 +1622,7 @@ must_scan = [
     "src/read/decompress.rs",
     "src/scan/classify.rs",
 ]
-message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
+message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
 
 # Presence of the CLI exit-path hook calls, the function-scoped probe_lock
 # open flags, no `as i64` cast inside a `.counter(` call's arguments (which

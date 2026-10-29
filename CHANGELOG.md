@@ -17,6 +17,9 @@
   whitespace, or starts with `@`, or with `%` on the untagged stream; a
   counter name that is empty or holds a newline or `=`). The library's own
   names are unaffected, so the CLI's stream is unchanged.
+  `CallSink::dropped` counts the lines a sink dropped (a refused name, an
+  overlong line, a write a full FIFO turned away), shared by the sink's
+  clones and separate from every other call's.
 - **The CLI marks its command interval on the sidecar FIFO.** With
   `BROKKR_MARKER_FIFO` set, every dispatched command writes one untagged
   `CLI_COMMAND_START` before its subcommand runs and one `CLI_COMMAND_END`

@@ -9,6 +9,8 @@
 //!       no indexdata, integrity violations, element not found)
 //!   2 - the command failed
 //!   3 - a requested platform I/O feature is unavailable at setup
+//!  64 - the command line was refused (clap, or the CLI's own option
+//!       validation), printed by clap
 //!
 //! Before this split every one of those outcomes was `1`, so a caller
 //! could not tell "the files differ" from "the file does not exist".
@@ -23,11 +25,10 @@
 use std::path::Path;
 
 use crate::common::{TestNode, write_test_pbf_sorted};
-use crate::invoker::CliInvoker;
+use crate::invoker::{CliInvoker, EXIT_FAILED, EXIT_USAGE};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ANSWER_NEGATIVE: i32 = 1;
-const EXIT_FAILED: i32 = 2;
 
 fn write_two_nodes(path: &Path, second_lat: i32) {
     write_test_pbf_sorted(
@@ -225,10 +226,140 @@ fn inspect_show_missing_element_is_the_negative_answer() {
         .run();
     assert_eq!(
         code(&malformed),
-        EXIT_FAILED,
-        "an unparseable element spec is a failure; stderr:\n{}",
+        EXIT_USAGE,
+        "an unparseable element spec is a usage error; stderr:\n{}",
         malformed.stderr_str(),
     );
+}
+
+/// The usage-error status is its own: every way the command line is refused
+/// exits 64 in clap's rendering (`runtime_failures_stay_2` is the other
+/// side). brokkr reads the usage status from `SUB --hel --help` and the
+/// flag-support probes from `SUB --FLAG --help`, so those shapes are pinned
+/// too.
+#[test]
+fn usage_errors_exit_64() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_two_nodes(&input, 110_000_000);
+    let input = input.to_str().unwrap();
+    let fresh = dir.path().join("fresh.osm.pbf");
+    let fresh = fresh.to_str().unwrap();
+
+    // (argv, why) - refused as usage errors.
+    let usage: &[(&[&str], &str)] = &[
+        (&[], "no subcommand: clap prints help on stderr"),
+        (&["sort", "--no-such-flag"], "unknown flag"),
+        (&["sort", "--hel", "--help"], "brokkr's control probe"),
+        (
+            &["inspect", "--overwrite", "--help"],
+            "a flag the subcommand lacks",
+        ),
+        (&["sort", input], "a missing required argument"),
+        (&["inspect", input, "--show", "zzz"], "a malformed value"),
+        (
+            &["export", input, "-O"],
+            "a flag rule clap expresses (-O needs -o)",
+        ),
+        (
+            &[
+                "degrade",
+                input,
+                "-o",
+                fresh,
+                "--unsort-intra",
+                "--block-cap",
+                "1",
+            ],
+            "a flag rule the CLI checks before dispatch",
+        ),
+        (
+            &["cat", input, input, "-o", fresh, "--reindex"],
+            "a rule a dispatch arm checks",
+        ),
+        (
+            &["inspect", "tags", input, "=primary"],
+            "an invalid expression, checked in the arm",
+        ),
+    ];
+    for (args, why) in usage {
+        let out = CliInvoker::new().args(*args).run();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            code(&out),
+            EXIT_USAGE,
+            "{why}: {args:?} must exit {EXIT_USAGE}; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Error: "),
+            "{why}: a usage error is printed by clap, not as Error:; stderr:\n{stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{why}: a usage error prints nothing on stdout"
+        );
+    }
+    assert!(
+        !std::path::Path::new(fresh).exists(),
+        "a usage error must not create an output"
+    );
+
+    // Help asked for, and a flag the subcommand has, exit 0.
+    for args in [
+        &["--help"][..],
+        &["--version"],
+        &["sort", "--help"],
+        &["sort", "--overwrite", "--help"],
+        &["sort", "--staging-dir=.", "--help"],
+    ] {
+        let out = CliInvoker::new().args(args).run();
+        assert_eq!(code(&out), EXIT_SUCCESS, "{args:?}: {}", out.stderr_str());
+    }
+}
+
+/// What the command refuses or fails at, once the command line was accepted,
+/// keeps the runtime status and is printed as `Error:`, a value the library
+/// itself refuses included.
+#[test]
+fn runtime_failures_stay_2() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_two_nodes(&input, 110_000_000);
+    let input = input.to_str().unwrap();
+    let existing = dir.path().join("existing.osm.pbf");
+    std::fs::write(&existing, b"occupied").unwrap();
+    let existing = existing.to_str().unwrap();
+    let missing = dir.path().join("missing.osm.pbf");
+    let missing = missing.to_str().unwrap();
+    let fresh = dir.path().join("fresh.osm.pbf");
+    let fresh = fresh.to_str().unwrap();
+
+    // (argv, why) - refused or failed by the command: the runtime status.
+    let runtime: &[(&[&str], &str)] = &[
+        (&["sort", missing, "-o", fresh], "a missing input"),
+        (&["sort", input, "-o", existing], "an existing output"),
+        (
+            &["sort", input, "-o", input, "-O"],
+            "an output aliasing its input",
+        ),
+        (
+            &["renumber", input, "-o", fresh, "--start-id", "0"],
+            "a value the library refuses",
+        ),
+    ];
+    for (args, why) in runtime {
+        let out = CliInvoker::new().args(*args).run();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            code(&out),
+            EXIT_FAILED,
+            "{why}: {args:?} must exit {EXIT_FAILED}; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Error: "),
+            "{why}: a runtime failure is printed as Error:; stderr:\n{stderr}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

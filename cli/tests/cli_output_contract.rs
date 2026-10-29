@@ -2586,8 +2586,9 @@ mod killed_in_publication {
     }
 }
 
-/// `--staging-dir` is checked before any work, and its refusals exit as
-/// usage or output errors that name the flag in their advice.
+/// `--staging-dir` is checked before any work, and its refusals name the
+/// flag in their advice: one that holds the output is an output refusal
+/// (exit 2), one with no output to stage a usage error (exit 64).
 #[test]
 fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
     let dir = crate::common::test_scratch();
@@ -2613,7 +2614,12 @@ fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
         .arg("--staging-dir")
         .arg(dir.path())
         .run();
-    assert_eq!(usage.status.code(), Some(2), "{}", usage.stderr_str());
+    assert_eq!(
+        usage.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
+        "{}",
+        usage.stderr_str()
+    );
     assert!(
         usage.stderr_str().contains("--output"),
         "{}",
@@ -3069,7 +3075,7 @@ fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
             let label = format!("{} -> {name}", producer.label);
             assert_eq!(
                 result.status.code(),
-                Some(2),
+                Some(crate::invoker::EXIT_USAGE),
                 "{label}: {}",
                 result.stderr_str()
             );

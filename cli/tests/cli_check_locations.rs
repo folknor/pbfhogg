@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::invoker::{CliInvoker, CliOutput};
+use crate::invoker::{CliInvoker, CliOutput, EXIT_USAGE};
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -199,7 +199,7 @@ fn agreement_requires_locations() {
         .arg("--agreement")
         .arg(&path)
         .run();
-    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert_eq!(out.status.code(), Some(EXIT_USAGE));
     assert!(
         out.stderr_str()
             .contains("--agreement requires --locations"),
@@ -216,7 +216,7 @@ fn an_id_check_flag_under_locations_names_its_selector() {
     let path = dir.path().join("honest.osm.pbf");
     write_low(&path, true, &NODES, &honest_ways());
     let out = check(&path, &["--full"]);
-    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert_eq!(out.status.code(), Some(EXIT_USAGE));
     let stderr = out.stderr_str();
     assert!(
         stderr.contains("--full applies to the ID check: add --ids"),

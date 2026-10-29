@@ -1425,7 +1425,8 @@ fn policy_holds(fx: &Fx, row: &PolicyRow) -> Result<(), String> {
                 Escape::Rejected(parser_text) => {
                     let (out, text) = run_policy_row(fx, row, &input, &["--force"]);
                     ensure!(
-                        out.status.code() == Some(2) && text.contains(parser_text),
+                        out.status.code() == Some(crate::invoker::EXIT_USAGE)
+                            && text.contains(parser_text),
                         "`--force` must be refused with {parser_text:?}; exit {:?}, output:\n{text}",
                         out.status.code()
                     );

@@ -2,7 +2,7 @@
 //! "Flag rules", "Worker threads" and "Proceeding without indexdata"):
 //!
 //! - A flag the command line itself makes ineffective is refused, as a usage
-//!   error (exit 2), and so is a malformed flag value. Both happen before any
+//!   error (exit 64), and so is a malformed flag value. Both happen before any
 //!   input is opened: every row here names inputs that do not exist, so a
 //!   refusal that waited for the input would report the missing input
 //!   instead.
@@ -18,7 +18,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::invoker::{CliInvoker, CliOutput, subcommand_paths};
+use crate::invoker::{CliInvoker, CliOutput, EXIT_USAGE, subcommand_paths};
 use tempfile::TempDir;
 
 /// In the name of every input that does not exist.
@@ -57,14 +57,19 @@ fn argv(dir: &Path, words: &[&str]) -> Vec<OsString> {
         .collect()
 }
 
-/// A refusal decided by the arguments alone: exit 2, the expected words, and
-/// not a word about the (missing) input.
+/// A refusal decided by the arguments alone: the usage status, printed by
+/// clap rather than as an `Error:` line, the expected words, and not a word
+/// about the (missing) input.
 fn refused_before_input(out: &CliOutput, expect: &str) -> Result<(), String> {
     let stderr = out.stderr_str();
     ensure!(
-        out.status.code() == Some(2),
-        "exit {:?}, wanted 2; stderr:\n{stderr}",
+        out.status.code() == Some(EXIT_USAGE),
+        "exit {:?}, wanted {EXIT_USAGE}; stderr:\n{stderr}",
         out.status.code()
+    );
+    ensure!(
+        !stderr.contains("Error: "),
+        "a usage error is printed by clap, not as Error:; stderr:\n{stderr}"
     );
     ensure!(
         stderr.contains(expect),
@@ -976,7 +981,7 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
         .arg("-o")
         .arg(fx.path("clean-out"))
         .run();
-    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    assert_eq!(out.status.code(), Some(EXIT_USAGE), "{}", out.stderr_str());
 }
 
 /// The sort recipe an unsorted-input refusal prints works as written.

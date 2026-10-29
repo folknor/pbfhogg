@@ -46,20 +46,30 @@ use pbfhogg::{HeaderOverrides, TypeFilter};
 /// (`1`) without swallowing failures (`2`), which the previous
 /// everything-is-`1` scheme made impossible.
 ///
-/// `2` also matches what clap already returns for a usage error, so the
-/// "the invocation did not work" band is contiguous.
+/// `3` splits one cause out of `2`: the host cannot provide a requested I/O
+/// feature (`--direct-io`, `--io-uring`) at setup. Retrying without the
+/// flag is the fix, which no other failure promises.
 ///
-/// `3` splits one cause out of that band: the host cannot provide a
-/// requested I/O feature (`--direct-io`, `--io-uring`) at setup. Retrying
-/// without the flag is the fix, which no other failure promises.
+/// `64` (`EX_USAGE`) is the command line refused before the command
+/// executed: by clap, or by the CLI's own option validation rendered through
+/// clap ([`UsageError`]). It is kept apart from `2` so a caller can tell a
+/// mistyped or malformed command line from a command that ran and refused
+/// or failed: brokkr's refusal counterparts declare `2` and must not be
+/// satisfied by a typo in their argv. What the command itself refuses - a
+/// library `InvalidArgument` included, such as the geocode S2 level bounds -
+/// is `2`: by then the CLI has handed the request over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitStatus {
-    /// `2` - the command failed. Every error path but one lands here.
+    /// `2` - the command failed. Every error path but the two below lands
+    /// here.
     Failed,
     /// `3` - the command failed because a requested platform I/O feature
     /// is unavailable at setup (`ErrorKind::PlatformUnsupported`). The
     /// error, naming the feature, goes to stderr as for `2`.
     PlatformUnsupported,
+    /// `64` - the command line was refused, printed by clap on stderr
+    /// (see [`clap_exit`]).
+    Usage,
 }
 
 impl ExitStatus {
@@ -67,6 +77,7 @@ impl ExitStatus {
         match self {
             Self::Failed => 2,
             Self::PlatformUnsupported => 3,
+            Self::Usage => 64,
         }
     }
 }
@@ -106,11 +117,20 @@ fn accept_outcome(
 }
 
 /// Print a clap error (a usage error, or `--help` / `--version`) to the
-/// stream clap would use and return clap's own exit code for it.
+/// stream clap would use and return its exit status: `0` for what clap
+/// prints on stdout (help and version asked for), [`ExitStatus::Usage`] for
+/// everything it prints on stderr. The split is clap's own stream choice,
+/// not the error kind: help printed because a subcommand or argument is
+/// missing (`DisplayHelpOnMissingArgumentOrSubcommand`) goes to stderr and
+/// is a refusal like any other. clap's own status for those is `2`, which
+/// `pbfhogg` keeps for runtime failures.
 fn clap_exit(err: &clap::Error) -> process::ExitCode {
-    let code = err.exit_code();
     drop(err.print());
-    process::ExitCode::from(u8::try_from(code).unwrap_or(ExitStatus::Failed.code()))
+    if err.use_stderr() {
+        process::ExitCode::from(ExitStatus::Usage.code())
+    } else {
+        process::ExitCode::SUCCESS
+    }
 }
 
 #[derive(Parser)]
@@ -234,7 +254,10 @@ impl OverwriteOutputArg {
 /// A command-line refusal found after clap parsed the arguments: a rule
 /// clap cannot express (one that depends on a flag's value, or on the input
 /// kind sniffed from the file), rendered by clap so it reads like clap's own
-/// errors and exits with clap's usage status.
+/// errors and exits like them, with [`ExitStatus::Usage`]. Raised before
+/// any output is reserved or opened and before any scratch exists, whether
+/// in `validate_command` or while a dispatch arm resolves its options (the
+/// latter inside the CLI command interval).
 #[derive(Debug)]
 struct UsageError(clap::Error);
 
@@ -2472,9 +2495,9 @@ pub fn run() -> process::ExitCode {
     // destructor, including the hotpath guard built two lines up. Use
     // `try_parse` and return instead so the guard is dropped normally.
     // `Error::print` writes to the same stream clap would have used
-    // (stdout for help and version, stderr for a usage error) and
-    // `Error::exit_code` is clap's own code for the case, so neither the
-    // text nor the status a caller sees changes.
+    // (stdout for help and version, stderr for a usage error), so the text
+    // a caller sees is clap's. The status is not: `clap_exit` returns
+    // pbfhogg's usage status, 64, where clap's own exit would return 2.
     //
     // The tree parsed is `cli_command()`, the derived one plus the retired
     // short flags; the matches are kept so a validation step can ask whether
@@ -3338,10 +3361,10 @@ pub fn run() -> process::ExitCode {
             process::ExitCode::from(signals::exit_status(signal))
         }
         // A refusal found by a command's validation step: printed by clap,
-        // with clap's status, exactly like a refusal clap found itself.
+        // with the usage status, exactly like a refusal clap found itself.
         Err(e) if e.is::<UsageError>() => match e.downcast_ref::<UsageError>() {
             Some(UsageError(err)) => clap_exit(err),
-            None => process::ExitCode::from(ExitStatus::Failed.code()),
+            None => process::ExitCode::from(ExitStatus::Usage.code()),
         },
         Err(e) => {
             if output::reader_gone() {
@@ -4068,6 +4091,11 @@ impl IdSources {
             pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
         }
         if id_set.is_empty() {
+            // A runtime failure (exit 2), not a usage error, unlike
+            // tags-filter's empty `-e` file: ID files are input data the
+            // library reads after the output is checked (a malformed ID in
+            // one is a library refusal too), while expressions are the
+            // command line's own request, validated before any output.
             return Err("no IDs: the --id-file and --id-osm-file inputs hold none".into());
         }
         Ok(id_set)

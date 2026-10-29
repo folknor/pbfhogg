@@ -98,10 +98,18 @@ fn capture(mut reader: impl Read) -> Vec<u8> {
 /// namespace setup the host refused; the failed step is added.
 #[cfg(target_os = "linux")]
 pub const NAMESPACE_DENIED: i32 = 100;
+
 /// The exit status base of a [`CliInvoker::bind_mounted`] child whose
 /// namespace setup failed for any other reason; the failed step is added.
 #[cfg(target_os = "linux")]
 pub const NAMESPACE_BROKEN: i32 = 110;
+
+/// The CLI's runtime-failure status (`docs/cli/commands.md`, Exit codes).
+pub const EXIT_FAILED: i32 = 2;
+
+/// The CLI's usage-error status, `EX_USAGE`: the command line was refused
+/// by clap or by the CLI's own option validation.
+pub const EXIT_USAGE: i32 = 64;
 
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.

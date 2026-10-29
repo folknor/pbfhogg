@@ -199,7 +199,7 @@ fn a_quiet_run_keeps_the_error_line() {
         );
     }
     let out = run(&quiet(&fx.args(&["sort"]), true));
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(crate::invoker::EXIT_USAGE));
     assert!(
         !out.stderr.is_empty(),
         "a usage error must be printed under -q"
@@ -309,7 +309,7 @@ fn quiet_inspect_indexed_refuses_json() {
         let out = run(&quiet(&args, leading));
         assert_eq!(
             out.status.code(),
-            Some(2),
+            Some(crate::invoker::EXIT_USAGE),
             "{}: {}",
             place(leading),
             out.stderr_str()

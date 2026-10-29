@@ -64,15 +64,18 @@ ran to completion and whose answer is negative; a command that could not
 run at all exits `2`, so a script can branch on the answer without
 swallowing failures. `3` is the one failure split out of `2`: a
 requested platform I/O feature is unavailable, so the same invocation
-without that flag can succeed. `130` and `143` are interruptions, following
-the shell's `128 + signal` convention.
+without that flag can succeed. `64` (`EX_USAGE`) is a command line refused
+before the command executed, so a mistyped or malformed invocation is never
+mistaken for a command that ran and refused. `130` and `143` are
+interruptions, following the shell's `128 + signal` convention.
 
 | Code | Meaning |
 |------|---------|
 | `0` | Success. |
 | `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (a data blob lacks indexdata; a header-only file is indexed), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
-| `2` | The command failed: missing or unreadable input, an invalid argument combination, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error. `Error: ...` goes to stderr. Argument-parsing errors from clap also land here. |
+| `2` | The command failed or refused: missing or unreadable input, an existing output without `--overwrite`, an output that aliases an input, unsorted or unindexed input it will not take, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error, and a value the command itself refuses once the command line was accepted (the `build-geocode-index` S2 level bounds, a `renumber --start-id` below 1, an `-i`/`-I` ID source holding no ID). `Error: ...` goes to stderr. A command line clap or the CLI refuses is `64`, not `2`. |
 | `3` | The command failed because the host refused a requested I/O feature at setup: `--direct-io` on a filesystem that rejects `O_DIRECT` at open (tmpfs, some overlay and network filesystems) or on a file whose reported direct I/O alignment (`statx` `STATX_DIOALIGN`) is not a power of two or exceeds the direct I/O transfer buffer, or `--io-uring` where the kernel lacks io_uring or `WriteFixed`, a sandbox denies `io_uring_setup`, or `RLIMIT_MEMLOCK` is below the writer's registered buffers. On kernels before 5.12, which also charge the ring itself to `RLIMIT_MEMLOCK`, a low limit can instead fail ring creation with a generic `ENOMEM` that pbfhogg cannot tell apart from kernel resource exhaustion; that case exits `2`. stderr carries `Error: platform feature <feature> unavailable: ...` with `<feature>` `direct-io` or `io-uring` (an `--io-uring` output also opens with `O_DIRECT`, so it can report either). A refused `--direct-io` input reads `Error: platform feature direct-io unavailable: failed to open <path>: Invalid argument (os error 22)`. Failures after setup, including an `EINVAL` or `ENOSPC` mid-run, stay `2`. The code follows the typed error chain, not the message text: it survives added context, `io::Error` carriers, and the thread joins of multi-stage commands, so it holds when the refusal is raised by a worker stage, such as the output writer of the external `add-locations-to-ways` backend (which previously exited `2` for the same refusal). |
+| `64` | Usage error (`EX_USAGE`): the command line was refused before command execution, during argument parsing (an unknown flag, a missing, malformed or conflicting argument, a retired short flag, `--direct-io` or `--io-uring` in a build without the feature, a missing subcommand) or during the CLI's own option validation (the [Flag rules](#flag-rules), malformed expressions whether given on the command line or in an `-e` file, `tags-filter` with an `-e` file holding no expression, malformed positional IDs, an unknown `inspect --get` key, an OSC output name). Printed by clap on stderr, as an `error: ...` diagnostic with a usage line, or as help when a subcommand or argument is missing; never as `Error: ...`. No output is reserved or opened and no scratch directory is created. A missing or unreadable `-e` file is a `2`. `--help` and `--version` exit `0`. Before this status existed, usage errors exited `2`. |
 | `130` | Interrupted by SIGINT (Ctrl-C). See [Interruption](#interruption). |
 | `143` | Interrupted by SIGTERM. See [Interruption](#interruption). |
 
@@ -142,8 +145,12 @@ raised descriptor limit, the capped malloc arenas, input page-cache
 eviction) is applied inside the interval, where the command needs it.
 
 A process writes at most one pair. A command line refused before dispatch
-(a usage error, a flag rule, an alias refusal), `--help` and `--version`
-write neither marker; a run that panics, or exits at once on a second
+(by the argument parser, a flag rule or the alias refusal), `--help` and
+`--version` write neither marker. A usage error found while the subcommand
+resolves its options (an invalid expression for `inspect tags` or `export`,
+malformed positional IDs, an unknown `inspect --get` key, `cat --reindex`
+with several inputs) lies inside the interval like any other refusal, so
+exit `64` does not by itself mean no interval was written. A run that panics, or exits at once on a second
 signal, writes no `CLI_COMMAND_END`. The names are reserved: no library
 phase uses them.
 
@@ -221,7 +228,7 @@ never silently means something new:
 ## Flag rules
 
 - **A flag the command line makes ineffective is refused**, as a usage error
-  (exit `2`, in clap's format), never warned about or ignored: `-O` without
+  (exit `64`, in clap's format), never warned about or ignored: `-O` without
   `-o`, `--force` where nothing would refuse, `--tmp-dir` on a path that
   writes no scratch, `-j` on a path with no worker pool, a PBF-only flag on
   OSC input, and so on. The refusal names the flags involved.
@@ -437,7 +444,7 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   (`merge-changes`, `tags-filter --input-kind osc`, `diff --format osc`). A
   name ending `.osc` is written as plain XML, a name ending `.osc.gz` is
   gzipped, and any other name is refused before any work with a usage error
-  naming both suffixes, exit `2`. The match is case-sensitive (`.OSC` is
+  naming both suffixes, exit `64`. The match is case-sensitive (`.OSC` is
   refused). Every OSC reader here sniffs the gzip magic, so either form is
   read back.
 - **Nothing appears under the output name until the run has succeeded.**
@@ -504,7 +511,7 @@ changed while the run worked), is met at the final rename, and is
 reported as the same staging-directory refusal with the kernel's error
 appended, after the run's outputs were rolled back as for any failed
 publication. `--staging-dir` needs an output: with `export` or a text
-`diff` writing to stdout it is refused as a usage error, exit `2`.
+`diff` writing to stdout it is refused as a usage error, exit `64`.
 Publication syncs both directories a rename changes, the staging side as well
 as the output's directory. Library callers get the same placement and checks
 from `Output::with_staging`, `OutputDir::with_staging`,

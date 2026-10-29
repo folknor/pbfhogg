@@ -28,6 +28,21 @@
 
 ### Breaking
 
+- **Usage errors exit `64` (`EX_USAGE`), not `2`.** A command line refused
+  before the command executes - by the argument parser (an unknown flag, a
+  missing, malformed or conflicting argument, a missing subcommand) or by
+  the CLI's own option validation (the flag rules, malformed expressions or
+  positional IDs, an unknown `inspect --get` key, an OSC output name) - now
+  exits `64`, printed by clap as before. `2` now means only that the command
+  failed or refused at run time (missing input, an existing output, a
+  malformed or unindexed file, a value the command itself refuses), with an
+  `Error: ...` line, so a script or harness that expects a refusal can no
+  longer be satisfied by a typo in its own command line. `--help` and
+  `--version` still exit `0`. This is the contract from here on: see "Exit
+  codes" in `docs/cli/commands.md`. Callers that treat any non-zero status
+  as failure are unaffected; callers that matched `2` for a bad invocation
+  need `64`.
+
 - **`diff -v` detail lines are positioned edit scripts.** A modified way
   used to print only `refs: N -> M nodes`, so a reordered or swapped node
   printed `refs: 3 -> 3 nodes`; it now prints `-ref @i n<id>` /
@@ -341,7 +356,7 @@
   `-b` (`--bbox`), `check -q` (`--quiet`).
 
 - **A flag the command line makes ineffective is refused, not warned about
-  or ignored**, as a usage error (exit `2`) before any input is opened:
+  or ignored**, as a usage error (exit `64`) before any input is opened:
   `-O` without `-o` (`export`, `diff`); `cat --force` without `--type`,
   `--clean` or `--dedupe`; `degrade --force` without a decode-path flag;
   `extract --simple --force`; `tags-filter --force` with `--invert-match` or

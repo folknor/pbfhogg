@@ -2840,7 +2840,13 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
         .arg("-o")
         .arg(&output)
         .run();
-    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    // The block is the data's fault (2); the rest are the command line's (64).
+    assert_eq!(
+        out.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
+        "{}",
+        out.stderr_str()
+    );
     out.assert_stderr_contains("exactly one input");
     for flags in [
         &["--dedupe"][..],
@@ -2857,7 +2863,7 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
             .run();
         assert_eq!(
             out.status.code(),
-            Some(2),
+            Some(crate::invoker::EXIT_USAGE),
             "{flags:?}: {}",
             out.stderr_str()
         );

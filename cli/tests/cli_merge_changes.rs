@@ -713,7 +713,7 @@ fn allow_version_regression_requires_simplify() {
         .run();
     assert_eq!(
         result.status.code(),
-        Some(2),
+        Some(crate::invoker::EXIT_USAGE),
         "expected a usage error; stderr:\n{}",
         result.stderr_str()
     );

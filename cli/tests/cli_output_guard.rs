@@ -344,17 +344,17 @@ fn altw_publishes_through_the_guard() {
     );
 }
 
-/// A usage error keeps clap's own exit code and its own message. The switch
-/// from `Cli::parse` to a fallible parse exists to drop the hotpath guard
-/// on the way out, and must be invisible otherwise - so this is a guard
-/// against the change, not a demonstration of it.
+/// A usage error keeps clap's own message and exits with pbfhogg's usage
+/// status, 64, not clap's 2 (which pbfhogg keeps for runtime failures). The
+/// switch from `Cli::parse` to a fallible parse exists to drop the hotpath
+/// guard on the way out, and leaves the text clap prints untouched.
 #[test]
-fn usage_error_keeps_claps_exit_code_and_message() {
+fn usage_error_keeps_claps_message_and_exits_64() {
     let out = CliInvoker::new().args(["sort", "--no-such-flag"]).run();
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "usage error should exit 2; stderr:\n{}",
+        Some(crate::invoker::EXIT_USAGE),
+        "usage error should exit 64; stderr:\n{}",
         out.stderr_str()
     );
     assert!(

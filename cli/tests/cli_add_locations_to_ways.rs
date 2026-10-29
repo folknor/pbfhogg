@@ -931,7 +931,12 @@ fn altw_external_refuses_force_before_any_input() {
         .arg(dir.path().join("out.osm.pbf"))
         .args(["--index-type", "external", "--force"])
         .run();
-    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    assert_eq!(
+        out.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
+        "stderr:\n{}",
+        out.stderr_str()
+    );
     let stderr = out.stderr_str();
     assert!(
         stderr.contains("--force")

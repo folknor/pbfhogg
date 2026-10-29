@@ -364,7 +364,11 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
         vec!["extract", "input.pbf", "-o", "output.pbf"],
     ] {
         let output = CliInvoker::new().args(&args).run();
-        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(crate::invoker::EXIT_USAGE),
+            "args: {args:?}"
+        );
     }
 }
 

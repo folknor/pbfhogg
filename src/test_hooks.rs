@@ -67,6 +67,28 @@ pub struct FaultPlan {
     decode_gate: Mutex<DecodeGate>,
     decode_gate_cv: Condvar,
 
+    // --- library-built rayon pools (`joined_pool::JoinedPool`) ---
+    /// Index of the pool thread whose spawn fails with an injected I/O error
+    /// (message [`INJECTED_POOL_SPAWN_FAILURE`]), so the build fails with the
+    /// threads below that index already running. Every pool built under the
+    /// token sees it.
+    pub built_pool_spawn_fail_at: AtomicUsize,
+    /// Park every pool thread once its rayon main loop has returned (counted
+    /// in `built_pool_threads_held`) until the test sets
+    /// `release_built_pool_threads` (bounded). An owner that does not join
+    /// its pool therefore returns while a thread is still parked.
+    pub hold_built_pool_threads: AtomicBool,
+    /// Pool threads that reached the park; only ever grows.
+    pub built_pool_threads_held: AtomicU64,
+    /// Test-side release for parked pool threads.
+    pub release_built_pool_threads: AtomicBool,
+    /// Pool threads whose exit hook completed: the last thing a thread's
+    /// main function does. Its thread-local destructors run after it, so
+    /// this counts hook completion, not thread exit.
+    pub built_pool_exit_hooks_done: AtomicU64,
+    /// A bounded pool-thread park expired.
+    pub built_pool_hook_timed_out: AtomicBool,
+
     // --- multi-extract (`commands::extract::multi`) ---
     /// Decline the region grid, so classification runs the linear scan even
     /// at or above the region threshold (the grid-fallback note still fires).
@@ -364,6 +386,10 @@ pub struct InputReplacement {
 /// test can tell it from a genuine platform refusal.
 pub const INJECTED_BACKEND_REFUSAL: &str = "test-hooks: injected output backend refusal";
 
+/// The message of the injected I/O error behind a failed pool-thread spawn
+/// ([`FaultPlan::built_pool_spawn_fail_at`]).
+pub const INJECTED_POOL_SPAWN_FAILURE: &str = "test-hooks: injected pool thread spawn failure";
+
 struct DecodeGate {
     armed_seq: Option<usize>,
     ready: bool,
@@ -387,6 +413,12 @@ impl FaultPlan {
                 released: false,
             }),
             decode_gate_cv: Condvar::new(),
+            built_pool_spawn_fail_at: AtomicUsize::new(usize::MAX),
+            hold_built_pool_threads: AtomicBool::new(false),
+            built_pool_threads_held: AtomicU64::new(0),
+            release_built_pool_threads: AtomicBool::new(false),
+            built_pool_exit_hooks_done: AtomicU64::new(0),
+            built_pool_hook_timed_out: AtomicBool::new(false),
             force_linear_region_grid: AtomicBool::new(false),
             region_grids_declined: AtomicU64::new(0),
             pool_worker_panic: AtomicU64::new(u64::MAX),
@@ -662,6 +694,35 @@ impl FaultPlan {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    // ---- library-built rayon pools ---------------------------------------
+
+    /// Called by `JoinedPool::build` before it spawns pool thread `index`;
+    /// the armed index fails as the OS refusing the thread would.
+    pub(crate) fn on_built_pool_spawn(&self, index: usize) -> std::io::Result<()> {
+        if index == self.built_pool_spawn_fail_at.load(Ordering::SeqCst) {
+            // `WouldBlock`: what a thread spawn refused for resources
+            // (`EAGAIN` from `pthread_create`) reports.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                INJECTED_POOL_SPAWN_FAILURE,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Called by a pool thread after its rayon main loop returns, as the last
+    /// thing its main function does.
+    pub(crate) fn on_built_pool_thread_exit(&self) {
+        if self.hold_built_pool_threads.load(Ordering::SeqCst) {
+            self.built_pool_threads_held.fetch_add(1, Ordering::SeqCst);
+            self.wait_until(&self.built_pool_hook_timed_out, || {
+                self.release_built_pool_threads.load(Ordering::SeqCst)
+            });
+        }
+        self.built_pool_exit_hooks_done
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// Called by a parallel-writer pool worker after it pops an op and

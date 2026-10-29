@@ -464,7 +464,8 @@ where
 ///
 /// 1. **Reader thread**: sequential I/O, reads raw `Blob`s from the file.
 /// 2. **Rayon pool**: parallel decompression (zlib) + protobuf parse, then
-///    the [`DecodeTransform`] on the same worker.
+///    the [`DecodeTransform`] on the same worker. The pool is built for this
+///    run and joined before it returns, thread-local destructors included.
 /// 3. **Main thread**: reorder buffer delivers the transform's results in
 ///    file order to `consume`.
 ///
@@ -564,8 +565,11 @@ where
         // the caller's own parallelism (e.g. geometry processing, tile generation)
         // is not starved by decode work. The global pool is left entirely free,
         // and so is the host's `Executor`: this pool is a dedicated per-read
-        // worker set, which the `Executor` rustdoc names as outside it. Its
-        // workers are not joined on drop, so they may outlive the read.
+        // worker set, which the `Executor` rustdoc names as outside it. It is
+        // a `JoinedPool` owned by this closure: when the closure ends (on
+        // every path) its workers are joined, thread-local destructors
+        // included, so none outlives the read. The scope below waits for this
+        // thread, and so for that join, before `run_pipeline` returns.
         //
         // Thread count rationale:
         //   The pipeline occupies 2 threads beyond this pool: the Stage 1 I/O reader
@@ -602,14 +606,15 @@ where
                     DECODE_WORKERS_FALLBACK,
                 )
             });
-            let decode_pool = match rayon::ThreadPoolBuilder::new()
-                .num_threads(decode_threads)
-                .build()
-            {
+            let decode_pool = match crate::joined_pool::JoinedPool::build(
+                "decode pool",
+                decode_threads,
+                invocation,
+            ) {
                 Ok(pool) => pool,
-                Err(e) => {
-                    let err = crate::error::Error::pool_build("decode pool", e);
-                    // Seq 0 is correct here, not a magic value that can collide
+                Err(err) => {
+                    // The build has joined the threads it spawned. Seq 0 is
+                    // correct here, not a magic value that can collide
                     // with a real item: the pool is built before the loop over
                     // `raw_rx` below, so nothing has been dispatched yet and 0
                     // is legitimately the reorder buffer's first push. Keep the
@@ -618,13 +623,16 @@ where
                     return;
                 }
             };
+            // Rebound after the pool so that on an unwind too the sender drops
+            // (closing the decoded channel) before the pool is joined.
+            let dispatch_tx = dispatch_tx;
             let buffer_pool = DecompressPool::new(invocation);
             let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
             // Tasks borrow the reader's path from this scope: one capture per
             // pipeline, no refcounting per blob.
             let source = source.as_ref();
-            decode_pool.in_place_scope(|task_scope| {
+            decode_pool.pool().in_place_scope(|task_scope| {
                 for (seq, blob_result) in raw_rx {
                     if shutdown.load(Relaxed) {
                         break;
@@ -666,7 +674,11 @@ where
                     }
                 }
             });
-            // dispatch_tx clone drops here
+            // The decoded channel closes once every task clone is gone too;
+            // then the pool's workers are joined (on an unwind, the same two
+            // drops happen in the same order, by declaration order).
+            drop(dispatch_tx);
+            drop(decode_pool);
         });
 
         // Drop the original so the channel closes when all rayon task clones are done
@@ -937,6 +949,100 @@ mod tests {
         let (result, ids) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         result.unwrap();
         assert_eq!(ids, [0, 1, 2]);
+    }
+
+    /// What a decode worker's thread-local holds, torn down when its thread
+    /// exits: it parks (bounded) until the test releases it.
+    struct Teardown(Arc<TeardownState>);
+
+    #[derive(Default)]
+    struct TeardownState {
+        installed: AtomicUsize,
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        release: AtomicBool,
+    }
+
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            self.0.started.fetch_add(1, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !self.0.release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.0.finished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Releases every parked teardown and joins the reading thread on every
+    /// exit path, a failed assertion included.
+    struct ReleaseTeardowns(Arc<TeardownState>, Option<std::thread::JoinHandle<()>>);
+
+    impl Drop for ReleaseTeardowns {
+        fn drop(&mut self) {
+            self.0.release.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.1.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    /// The decode pool is joined before the read returns, thread teardown
+    /// included: a worker parked in a thread-local destructor keeps the call
+    /// from returning until it is released, so nothing a worker's
+    /// thread-locals hold outlives the read.
+    #[test]
+    fn a_decode_worker_tearing_down_holds_the_read() {
+        thread_local! {
+            static TEARDOWN: RefCell<Option<Teardown>> = const { RefCell::new(None) };
+        }
+        let state = Arc::new(TeardownState::default());
+        let worker_state = Arc::clone(&state);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let result = ElementReader::new(Cursor::new(fused_pbf(8)))
+                .unwrap()
+                .decode_threads(2)
+                .for_each_fused_block(
+                    |_| {
+                        TEARDOWN.with_borrow_mut(|slot| {
+                            if slot.is_none() {
+                                worker_state.installed.fetch_add(1, Ordering::SeqCst);
+                                *slot = Some(Teardown(Arc::clone(&worker_state)));
+                            }
+                        });
+                        Ok::<_, crate::Error>(())
+                    },
+                    |()| Ok(()),
+                );
+            let finished_at_return = worker_state.finished.load(Ordering::SeqCst);
+            done_tx.send((result, finished_at_return)).unwrap();
+        });
+        let _release = ReleaseTeardowns(Arc::clone(&state), Some(handle));
+
+        let start = std::time::Instant::now();
+        while state.started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "no decode worker began tearing down"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the read returned while a decode worker was still tearing down"
+        );
+        state.release.store(true, Ordering::SeqCst);
+        let (result, finished_at_return) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        result.unwrap();
+        assert_eq!(
+            finished_at_return,
+            state.installed.load(Ordering::SeqCst),
+            "every decode worker's teardown ends before the read returns"
+        );
     }
 
     #[test]

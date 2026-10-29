@@ -1330,9 +1330,11 @@ message = "Command readers must inherit the caller's host"
 # The library's shared rayon tasks run on the caller's `host::Executor`, never
 # on whatever pool happens to be ambient. Par-iterators cannot be matched by
 # text; each one is wrapped in `executor.install` and checked in review.
-# Dedicated per-call worker sets (a ThreadPoolBuilder pool, std thread scopes)
-# are a separate category this rule does not see; the `Executor` rustdoc
-# lists what runs where.
+# Dedicated per-call worker sets (a library-built rayon pool, std thread
+# scopes) are a separate category this rule does not see; the `Executor`
+# rustdoc lists what runs where. rayon's pool constructors are disallowed in
+# clippy.toml instead, so every library-built pool is a joined
+# `crate::joined_pool::JoinedPool`.
 [[textlint]]
 name = "no-ambient-rayon"
 pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global'

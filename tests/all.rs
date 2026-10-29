@@ -93,6 +93,8 @@ mod fault_getparents_input;
 #[cfg(feature = "test-hooks")]
 mod fault_inspect_input;
 #[cfg(feature = "test-hooks")]
+mod fault_library_pools;
+#[cfg(feature = "test-hooks")]
 mod fault_parallel_writer;
 #[cfg(feature = "test-hooks")]
 mod fault_pipelined_writer;

@@ -190,6 +190,9 @@ pub(crate) mod fadvise;
 pub mod geo;
 pub mod geocode_index; // format is always available; reader requires geocode-reader feature
 pub(crate) mod idset;
+// The one way the library builds a rayon pool: its workers are joined before
+// the call that built it ends.
+pub(crate) mod joined_pool;
 // The one ordered worker pool and its admission gate: every pool that hands
 // results to the calling thread in schedule order bounds them through it.
 pub(crate) mod ordered_pool;

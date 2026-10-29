@@ -1485,6 +1485,18 @@
 
 ### Fixed
 
+- **The rayon pools the library builds for a call are joined before it
+  ends.** The pipelined reader's decode pool and `merge_changes`' pool for
+  `Parallelism::Fixed(n)` used to be dropped without waiting, so their
+  worker threads, and the thread-local state they held, could still be
+  running after the call returned. Every worker has now exited, its
+  thread-local destructors included, before the call returns or unwinds
+  (for `into_blocks_pipelined`, before the iterator's drop returns),
+  including after a pool that failed to build part way. A sink callback
+  (`InstrumentSink`, `DiagnosticSink`) can run on one of those workers;
+  rayon work it submits there, or a thread-local value it creates there,
+  must not wait for the call to end, or the call never ends.
+
 - **A failed pipelined `PbfWriter` no longer leaves framing work running.**
   When the writer thread stopped on an error, `flush`, `Drop` and a write
   that reported the failure returned while blocks already handed to the

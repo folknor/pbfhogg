@@ -72,6 +72,14 @@ If the 4.7× regression didn't flip for the lightest workload
 heavier. Adding to the list of pipelined callers is fine; removing
 from it is not.
 
+**The decode pool is joined.** It is a `joined_pool::JoinedPool`
+(`src/joined_pool.rs`), built per read on the dispatcher thread; every
+worker has exited, thread-local destructors included, before the read
+returns (for `into_blocks_pipelined`, before `PipelinedBlocks`' drop
+returns), on success, error and unwind. A new pipelined caller inherits
+this; rayon's own pool constructors are disallowed in `clippy.toml` for
+the shipped library.
+
 **Admission is bounded.** The decode stage gates spawning decode
 tasks (inside a rayon scope on the private decode pool) behind
 `decode_ahead` admission permits. A permit is released only after the

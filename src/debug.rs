@@ -22,6 +22,16 @@ use crate::tunables::PIPE_BUF;
 /// destructor runs when the last clone of its invocation drops, and must not
 /// panic.
 ///
+/// A callback can run on a worker of a rayon pool the library built for the
+/// call (merge-changes emits from its `Parallelism::Fixed` pool's workers).
+/// Those pools are joined before the call ends, unwinding included (see
+/// [`Executor`](crate::host::Executor)), so whatever a callback leaves behind
+/// on such a worker is finished first: rayon work it submitted to the current
+/// pool (`rayon::spawn`, `rayon::spawn_broadcast` and the like) and the
+/// destruction of thread-local values it created, with everything they own.
+/// None of that may wait for the call to end, or for anything the invoking
+/// thread holds until it does, or the call never ends.
+///
 /// Calls carry no invocation identity: a caller that funnels several
 /// invocations into one collector gives each its own sink that tags what it
 /// forwards ([`CallSink`] does this for the sidecar FIFO). Markers are point-in-time names; counters are `(name, value)`

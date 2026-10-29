@@ -13,8 +13,8 @@
 # crate-wide sweep of its own.
 allow-expect-in-tests = true
 
-# Methods that write, or open for reading, a file by path, and the raw libc
-# byte-moving syscalls (see their group below). The lint is off workspace-wide
+# Methods that write, or open for reading, a file by path, the raw libc
+# byte-moving syscalls and rayon's pool constructors (see their groups below). The lint is off workspace-wide
 # (`disallowed_methods = "allow"` in Cargo.toml) and denied by crate attribute in
 # the shipped code: the whole library (`src/lib.rs`, outside `cfg(test)`) and the
 # CLI (`cli/src/lib.rs`, `cli/src/main.rs`). Examples, benches and integration
@@ -77,6 +77,20 @@ disallowed-methods = [
     # Page-cache advice has one owner, `crate::fadvise::advise`, which handles
     # the off_t range, the platform gate and the failure counter once.
     { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise::advise" },
+    # A rayon pool the library builds is a `crate::joined_pool::JoinedPool`,
+    # whose workers are joined, thread-local destructors included, before the
+    # call that built it ends. rayon's own constructors leave the workers to
+    # exit after the call; `build_scoped` waits only for their main functions.
+    # The global pool is the caller's (ADR-0016). rayon does not re-export
+    # its deprecated `Configuration`, but `ThreadPool::new(Default::default())`
+    # still reaches it, so those constructors are listed too. `output.rs` and
+    # `scratch.rs` allow this lint module-wide for their file calls; they
+    # build no pool.
+    { path = "rayon_core::ThreadPoolBuilder::build", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
+    { path = "rayon_core::ThreadPoolBuilder::build_scoped", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
+    { path = "rayon_core::ThreadPoolBuilder::build_global", reason = "the rayon global pool belongs to the caller (ADR-0016)" },
+    { path = "rayon_core::ThreadPool::new", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
+    { path = "rayon_core::Configuration::build", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
     { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

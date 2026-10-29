@@ -201,22 +201,26 @@ pub(crate) fn merge_changes_to(
     host.invocation
         .counter("merge_changes_total_bytes_in", total_bytes_in);
 
-    // Build a scoped rayon pool when the caller fixed the parallelism.
+    // Build a pool of the call's own when the caller fixed the parallelism.
     // Pool controls par_iter and par_chunks thread count for both the
     // streaming and simplify paths. Under `Auto` the host's executor is used
     // (rayon's ambient pool under `Executor::Ambient`).
     // The streaming path's ordered window spawns onto the same executor its
-    // body is installed on, so the explicit pool is carried as one.
-    let executor = if parallelism.fixed().is_some() {
-        crate::host::Executor::Pool(std::sync::Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(worker_count)
-                .build()
-                .map_err(|e| crate::Error::pool_build("merge-changes worker pool", e))?,
-        ))
-    } else {
-        host.executor.clone()
+    // body is installed on, so the explicit pool is lent as one. It is joined
+    // when `fixed_pool` drops: below on success, on any early return or
+    // unwind otherwise.
+    let fixed_pool = match parallelism.fixed() {
+        Some(_) => Some(crate::joined_pool::JoinedPool::build(
+            "merge-changes worker pool",
+            worker_count,
+            &host.invocation,
+        )?),
+        None => None,
     };
+    let executor = fixed_pool.as_ref().map_or_else(
+        || host.executor.borrowed(),
+        |pool| crate::host::ExecutorRef::Pool(pool.pool()),
+    );
 
     // The one whole-body executor install in the library. Everywhere else
     // `install` wraps only a parallel computation, so that no `PbfWriter`
@@ -238,10 +242,13 @@ pub(crate) fn merge_changes_to(
             )? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, output, is_gz, &executor, cancel)?;
+            let changes_out = write_streaming(inputs, output, is_gz, executor, cancel)?;
             Ok((changes_out, changes_out))
         }
     })?;
+    // Inside the marked span, so `MERGECHANGES_END` comes after the pool's
+    // workers have exited.
+    drop(fixed_pool);
 
     host.invocation
         .counter("merge_changes_changes_out", changes_out);
@@ -574,7 +581,7 @@ fn write_streaming(
     inputs: &[&Path],
     output: &crate::output::Output,
     is_gz: bool,
-    executor: &crate::host::Executor,
+    executor: crate::host::ExecutorRef<'_>,
     cancel: &crate::host::Invocation,
 ) -> Result<u64> {
     cancel.counter(
@@ -707,7 +714,7 @@ type MemberResult = (usize, crate::Result<(Vec<u8>, u64)>);
 /// member still sends its (cancelled) result, so no admitted position goes
 /// unanswered; the scope then waits only for members already running.
 fn emit_members_ordered(
-    executor: &crate::host::Executor,
+    executor: crate::host::ExecutorRef<'_>,
     inputs: &[&Path],
     is_gz: bool,
     window: usize,
@@ -768,7 +775,7 @@ fn emit_members_ordered(
 /// caller is a pool worker (the writer's `recv_permit` shape).
 fn recv_member(
     rx: &std::sync::mpsc::Receiver<MemberResult>,
-    executor: &crate::host::Executor,
+    executor: crate::host::ExecutorRef<'_>,
 ) -> crate::Result<MemberResult> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     let lost = || crate::Error::internal("merge-changes workers exited without a result");

@@ -392,13 +392,25 @@ pub enum PageCachePolicy {
 /// pool, the ordered and classify worker pools, per-stage threads) create
 /// separate worker sets that belong to the call, or to the returned session
 /// such as a block iterator or a writer, rather than scheduling those workers
-/// through this executor; their threads may exit after the call returns. Their
-/// worker counts come from explicit options, resource inputs or fixed
-/// tunables. Pipeline coordinators and consumers may run on the invoking
-/// thread, and may dispatch shared rayon tasks through this executor.
-/// Merge-changes with `Parallelism::Fixed(n)` runs on a dedicated rayon pool
-/// of `n` threads instead of this executor; with `Parallelism::Auto` it uses
-/// this executor.
+/// through this executor. Their worker counts come from explicit options,
+/// resource inputs or fixed tunables. Pipeline coordinators and consumers may
+/// run on the invoking thread, and may dispatch shared rayon tasks through
+/// this executor. Merge-changes with `Parallelism::Fixed(n)` runs on a
+/// dedicated rayon pool of `n` threads instead of this executor; with
+/// `Parallelism::Auto` it uses this executor.
+///
+/// The rayon pools the library builds itself - the pipelined reader's decode
+/// pool and merge-changes' `Fixed(n)` pool - are joined: every one of their
+/// worker threads has exited, thread-local destructors included, before the
+/// call that built them ends (for `ElementReader::into_blocks_pipelined`,
+/// before the returned iterator's drop returns), on success, error and unwind
+/// alike. A caller callback can run on one of those workers, and what it
+/// leaves there is waited for; see [`crate::debug::InstrumentSink`]. The
+/// other dedicated worker sets are `std` threads whose work ends before the
+/// call or session does; those a `std::thread::scope` waits for without an
+/// explicit join are waited for only to the end of their main function, as
+/// that scope does, so their thread-local destructors may still be running
+/// when the call returns.
 ///
 /// `Ambient` uses whatever pool the calling thread is in, or rayon's global
 /// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
@@ -433,24 +445,16 @@ pub enum Executor {
     Pool(Arc<rayon::ThreadPool>),
 }
 impl Executor {
-    /// Run `op` inside the pool (`Ambient`: a direct call).
-    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+    /// This executor, borrowed for one call.
+    pub(crate) fn borrowed(&self) -> ExecutorRef<'_> {
         match self {
-            Self::Ambient => op(),
-            Self::Pool(pool) => pool.install(op),
+            Self::Ambient => ExecutorRef::Ambient,
+            Self::Pool(pool) => ExecutorRef::Pool(pool),
         }
     }
-    /// Run `op` with a scope whose spawned work runs on the pool (`Ambient`:
-    /// `rayon::scope`, i.e. the calling thread's pool, or the global pool off
-    /// any pool). Returns once `op` and everything it spawned has finished.
-    pub(crate) fn scope<'scope, R: Send>(
-        &self,
-        op: impl FnOnce(&rayon::Scope<'scope>) -> R + Send,
-    ) -> R {
-        match self {
-            Self::Ambient => rayon::scope(op),
-            Self::Pool(pool) => pool.scope(op),
-        }
+    /// Run `op` inside the pool (`Ambient`: a direct call).
+    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.borrowed().install(op)
     }
     /// Queue `op` on the pool (`Ambient`: `rayon::spawn`).
     pub(crate) fn spawn(&self, op: impl FnOnce() + Send + 'static) {
@@ -470,6 +474,45 @@ impl Executor {
     /// Run one pending job of the calling worker's pool, if any. `None` off
     /// the pool.
     pub(crate) fn yield_now(&self) -> Option<rayon::Yield> {
+        self.borrowed().yield_now()
+    }
+}
+/// An executor borrowed for one call: the host's [`Executor`], or a pool the
+/// library built for the call
+/// ([`JoinedPool`](crate::joined_pool::JoinedPool)), which can be lent but
+/// never kept. Its methods wait for the work they start (there is no
+/// detached `spawn`); they cannot stop code running inside that work from
+/// submitting detached rayon work of its own.
+#[derive(Clone, Copy)]
+pub(crate) enum ExecutorRef<'a> {
+    /// The calling thread's rayon pool, or rayon's global pool off any pool.
+    Ambient,
+    /// A borrowed pool.
+    Pool(&'a rayon::ThreadPool),
+}
+impl ExecutorRef<'_> {
+    /// Run `op` inside the pool (`Ambient`: a direct call).
+    pub(crate) fn install<R: Send>(self, op: impl FnOnce() -> R + Send) -> R {
+        match self {
+            Self::Ambient => op(),
+            Self::Pool(pool) => pool.install(op),
+        }
+    }
+    /// Run `op` with a scope whose spawned work runs on the pool (`Ambient`:
+    /// `rayon::scope`, i.e. the calling thread's pool, or the global pool off
+    /// any pool). Returns once `op` and everything it spawned has finished.
+    pub(crate) fn scope<'scope, R: Send>(
+        self,
+        op: impl FnOnce(&rayon::Scope<'scope>) -> R + Send,
+    ) -> R {
+        match self {
+            Self::Ambient => rayon::scope(op),
+            Self::Pool(pool) => pool.scope(op),
+        }
+    }
+    /// Run one pending job of the calling worker's pool, if any. `None` off
+    /// the pool.
+    pub(crate) fn yield_now(self) -> Option<rayon::Yield> {
         match self {
             Self::Ambient => rayon::yield_now(),
             Self::Pool(pool) => pool.yield_now(),
@@ -869,6 +912,13 @@ pub enum EventKind {
     Developer,
 }
 /// A sink receives one event per line and may serve concurrent callers.
+///
+/// An event can be delivered on a worker of a rayon pool the library built
+/// for the call, and that pool is joined before the call ends, unwinding
+/// included: rayon work a sink submits to the current pool there, and the
+/// destruction of thread-local values it creates there, must not wait for
+/// the call to end or for anything the invoking thread holds until it does.
+/// [`InstrumentSink`](crate::debug::InstrumentSink) states the same rule.
 pub trait DiagnosticSink: Send + Sync {
     fn event(&self, event: &Event<'_>);
 }

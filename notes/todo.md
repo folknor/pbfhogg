@@ -31,10 +31,17 @@ Picked 2026-07-30, right after the 0.5.0 release.
     (`rayon::current_num_threads()`), the simplify `par_iter` over inputs
     and the `par_chunks` sort would each honour `n` without spawning jobs
     that block pool workers on a permit. Measured-path change.
-  - The pipelined reader's private decode pool drops without joining its
-    workers, so they can outlive the read. If a "no library thread left
-    after the call" promise is ever wanted, build it with rayon's
-    `build_scoped` and measure the per-read cost.
+  - Worker sets run in a `std::thread::scope` without joining their
+    handles (the ordered and classify pools, the read pipeline's stage
+    threads, and other per-stage threads; `parallel_writer` joins its
+    handles and is not one) are waited for only to the end of their main
+    functions: std's scope does not wait for thread-local
+    destructors (found 2026-10-29 while joining the rayon pools, which are
+    now `joined_pool::JoinedPool`s). Harmless today, since no library
+    thread-local records into an invocation and caller code that runs on
+    those threads is rare, but a "no library thread left after the call"
+    promise would need explicit `JoinHandle::join`s there, as
+    `JoinedPool` does.
   - Shape B, considered and not taken: put every CPU worker on a caller
     scheduler, with blocking coordination (pread, bounded channels, reorder
     back-pressure) kept off it and only runnable CPU tasks scheduled. It
@@ -42,9 +49,10 @@ Picked 2026-07-30, right after the 0.5.0 release.
     narrowed `Executor` does not. The old ALTW stage 4 consolidation
     datum (+30 s planet, reverted) concerns a different shape and does
     not settle it.
-  - `no-ambient-rayon` cannot see `ThreadPoolBuilder`, pool-method scopes
-    or `std::thread`; a new dedicated worker set passes lint unreviewed.
-    A rule listing the sanctioned dedicated-pool sites would close that.
+  - `no-ambient-rayon` cannot see pool-method scopes or `std::thread`; a
+    new dedicated `std` worker set passes lint unreviewed. (rayon's pool
+    constructors are disallowed in `clippy.toml` outside
+    `joined_pool::JoinedPool`.)
   - `notes/altw-external.md` points to a "history doc" for the A2
     milestone 1 write-up (the +30 s datum); no such text was found in
     `reference/performance-history.md` or

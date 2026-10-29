@@ -1,6 +1,7 @@
 # Library harness: design and landings
 
-Status: proposed design, revision 3, under spar. Nothing here is built yet.
+Status: proposed design, revision 3, under spar. Only the A4 pool join
+is built.
 
 Written against `reference/technical-implementation-spec.md`. Spawned from
 the bz tickets pbfhogg#30 to #38 (filed by brokkr 2026-10-29) and the
@@ -23,13 +24,18 @@ process), ADR-0017 (outputs are published by the library), ADR-0019
 
 ## Survey: what the code does today
 
-1. **Threads that outlive a call.** Only the rayon pools the library
-   builds itself: the per-read decode pool in `src/read/pipeline.rs` (its
-   comment: workers are not joined on drop, so they may outlive the read)
-   and the merge-changes `Parallelism::Fixed` pool in
-   `src/commands/merge_changes/mod.rs`. The session types
-   (`PipelinedBlocks`, `PbfWriter`, the write pipeline, `parallel_writer`)
-   join their own `std` threads on drop.
+1. **Threads that outlive a call.** The rayon pools the library builds
+   itself (the decode pool, the merge-changes `Parallelism::Fixed` pool)
+   are `joined_pool::JoinedPool`s since 2026-10-29: every worker has
+   exited, thread-local destructors included, before the call ends. The
+   session types (`PipelinedBlocks`, `PbfWriter`, the write pipeline,
+   `parallel_writer`) join their own `std` threads on drop. What is left:
+   worker sets run in a `std::thread::scope` without joining their
+   handles (ordered pool, classify, per-stage threads) are waited for
+   only to the end of their main functions, so their thread-local
+   destructors can still run after the call returns. No library thread-local destructor records into an
+   invocation, so seal is unaffected unless one ever does (see
+   `notes/todo.md`).
 2. **Counters that move after return.** A `PooledBuffer`
    (`src/read/decompress.rs`) holds an `Arc<DecompressPool>`, which holds
    an `Invocation` clone. When the last `Bytes` over it drops, the buffer
@@ -230,12 +236,16 @@ the invocation delivers nothing to any sink.
 
 ### A4: library-built pools join for real
 
-The decode pool and the merge-changes fixed pool are built with rayon's
-`spawn_handler`, which spawns `std` threads and keeps their
-`JoinHandle`s. The owner drops the rayon pool and then joins every
-handle, including after a partial build failure. An `exit_handler` latch
-is not used, because it fires before the worker's stack and thread-locals
-are torn down.
+Landed 2026-10-29 as `src/joined_pool.rs`: a library-built pool's
+threads are gone when the call that built it ends, so seal has none to
+drain. What seal inherits from it:
+- The join waits for rayon's detached work on the pool. A caller callback
+  on one of its workers that submits rayon work, or creates a thread-local
+  whose destructor waits on something after the call, makes the call
+  never end; the `InstrumentSink` and `DiagnosticSink` contracts forbid
+  that. A seal design must not weaken the rule.
+- `build_scoped` and `std::thread::scope` were rejected: scope waits only
+  for a thread's main function, not its thread-local destructors.
 
 ## Decision B: publication decisions and cancel (#33)
 
@@ -427,7 +437,6 @@ baselines are not used, because unrelated tests create threads too.
 | L2 | #33: publication units and their binding state machine, refusal of empty sets, decision-time ordinals, cancel deciding pending units, `installed` out of `publish_all`, `for_each_publication`, ADR-0019 amendment | `brokkr check`, with tests for: reversed creation and publication order; one entry per `OutputSet`; a second member opened under another invocation refused at open; an unwritten output published; a bound unit published under another invocation; cancel parked against a decision from both sides; `Unsynced` and a failed rollback reporting installed; a pending unit dropped; a decided unit dropped; a failed session construction |
 | L3 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with a CLI counterpart and no stream capabilities, `brokkr.toml` table, sweeps, textlints, #24 guards, hotpath features. Seal is reported refused, so brokkr fails each call's `brokkr.seal` and nothing else, while describe, layout, CLI equality and digest get exercised early | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
 | L4 | `src/work.rs`: `Work` contexts and the public-wrapper split across the API, the lease inventory, the lifecycle word with Open only, the user-callback marker, and textlint plus `disallowed_methods` against internal calls of public wrappers. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: calls and leases back to 0 after every command returns and its values drop; a held `PipelinedBlocks` blocked on a caller stream counting one lease and no call; an escaped `FileWriter` and a `RunScratch` each holding a lease; a nested public entry from a callback counting nothing; `brokkr verify all --dataset denmark --variant indexed` |
-| L5 | Library-built pools joined through `spawn_handler` | `brokkr check`, with tests for: a pool worker parked in a thread-local destructor keeping its owning call from returning until released; a partial pool build failure joining the threads already spawned; `brokkr verify all --dataset denmark --variant indexed`; `brokkr cat --dataset denmark --variant indexed --bench` neutral within noise (the join moves pool teardown inside the call) |
 | L6 | #31 and #32 as one contract: Draining, Finalizing and Sealed in the lifecycle word, `SealFromWithin`, `Outstanding`, `with_call_sink` and the tap, the non-`Clone` `CallSink` with its closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, ADR-0020 (the seal contract). The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent seal callers returning one snapshot only after the terminal record; seal from a callback, from the tap, and from a rayon worker with a call in progress refused; seal from a rayon worker with no call allowed; a nested entry while Draining accepted and a fresh one refused; Finalizing refusing a marked thread; the finalize CAS racing a lease retirement and a nested call; an outstanding buffer released and a retry; a held session reported outstanding; a panicking tap; the terminal write dropped; the in-flight emission barrier. `brokkr library repeat-cat --dataset denmark` passes |
 | L7 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once: `brokkr library SCENARIO --dataset denmark` |
 | L8 | #35 capability ids in `[pbfhogg.library.require]` and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
@@ -507,9 +516,6 @@ accounted for by leases. If it wins, #31 is rewritten, not worked around.
   its lease until it ends.
 - **Control operations:** `seal`, `cancel`, `stream_account` and the
   publication log need explicit exemptions from admission.
-- **The L5 bench gate is wrong:** default indexed `cat` takes the
-  zero-decode passthrough. The gate must exercise the decode pool and the
-  fixed merge-changes pool.
 
 ## Out of scope
 

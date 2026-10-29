@@ -1766,6 +1766,34 @@ allocation across the 7 calls entirely to `parse_osc_streaming`;
 no other function showed on the alloc table. The parser was the only
 allocation hotspot pre-parallel.
 
+## Library capability accounting
+
+### Call guards on per-call methods (bygg, 2026-10-29)
+
+The invocation's capability accounting adds success-path work on per-call
+public methods: a call guard (one compare-and-swap to admit, one
+`fetch_sub` to retire, on a padded word) per `BlobReader::next` and per
+`PbfWriter` write method, plus one census-mutex lock at mint and retire per
+block a block API hands its caller. Gated by `brokkr write` (public
+`BlobReader` iteration and decode, rebuilt into blocks written through
+`PbfWriter::write_primitive_block`), denmark `--variant indexed --bench 1
+--compressions none`, cells interleaved. Baseline `--commit 1f2919e4`
+(stored); variant the capability tree on top of `1f2919e4`, measured
+uncommitted with `--force` (forced cells are not stored, so they carry no
+UUID).
+
+| Writer | Baseline pair 1 | Variant pair 1 | Baseline pair 2 | Variant pair 2 | Medians |
+|---|---|---|---|---|---|
+| sync | 6702 ms (`95ba54f2`) | 6499 ms | 6670 ms (`40463eef`) | 6480 ms | 6686 vs 6490 ms |
+| pipelined | 5829 ms (`f621aa90`) | 5846 ms | 5792 ms (`3292831a`) | 5713 ms | 5810 vs 5780 ms |
+
+No cost: the sync arm is faster in both pairs, the pipelined arm within
+noise with mixed signs. No brokkr command issues blocks in bulk (`brokkr
+read --mode pipelined` runs `for_each_pipelined`, which lends elements and
+issues nothing; `build-geocode-index` iterates relation blocks only, through
+an internal route), so the census lock per issued block has no bulk
+measurement; it is one uncontended mutex per block, beside a decode.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.

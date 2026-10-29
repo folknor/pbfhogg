@@ -625,7 +625,7 @@ struct Walk {
     claimed_ways: Schedule,
 }
 
-fn walk(input: &PinnedInput, host: &crate::host::Host) -> Result<Walk> {
+fn walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Walk> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let first = walker
         .next_header()?
@@ -715,6 +715,7 @@ pub fn check_locations<'a>(
     opts: &CheckLocationsOptions,
     host: &crate::host::Host,
 ) -> Result<super::CheckOutcome<LocationsReport>> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation.decided(|| {
         super::CheckOutcome::stop_on_contradiction(check_locations_inner(input, opts, host))
@@ -759,7 +760,7 @@ struct WayBlob {
 fn check_locations_inner(
     input: InputSource<'_>,
     opts: &CheckLocationsOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<LocationsReport> {
     let pin = input.pin(host)?;
     {
@@ -862,7 +863,7 @@ fn prepass(
     cap: usize,
     report: &mut LocationsReport,
     details: &mut Details,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let facts = &walk.prepass.facts;
     let mut seen: Vec<(Kinds, i64, i64)> =
@@ -931,7 +932,7 @@ fn key_refs(
     file: &InputFile,
     ways: &Schedule,
     shards: &KeyShards,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let facts = &ways.facts;
     parallel_scan_blobs_raw(
@@ -1015,7 +1016,7 @@ impl RunCtx<'_> {
         k: usize,
         report: &mut LocationsReport,
         details: &mut Details,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<()> {
         let range = self.plan.ids(k);
         let (first_rank, len) = self.plan.ranks(k);
@@ -1036,7 +1037,7 @@ impl RunCtx<'_> {
         first_rank: u64,
         store: &Store,
         report: &mut LocationsReport,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<()> {
         let mut blobs = Vec::new();
         for (blob, facts) in self.nodes.blobs.iter().zip(&self.nodes.facts) {
@@ -1079,7 +1080,7 @@ impl RunCtx<'_> {
         store: &Store,
         report: &mut LocationsReport,
         details: &mut Details,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<()> {
         let facts = &self.ways.facts;
         let cap = self.cap;

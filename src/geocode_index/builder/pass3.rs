@@ -374,7 +374,7 @@ pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) executor: &'a crate::host::Executor,
     /// Checked once per Stage A chunk and per Stage B sort window: the
     /// chunk boundaries are where this pass already returns to one thread.
-    pub(super) cancel: &'a crate::host::Invocation,
+    pub(super) cancel: &'a crate::host::Recorder,
 }
 
 /// Fused fine + coarse bucketed cell assignment. Returns
@@ -422,7 +422,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         executor,
         cancel,
     } = p;
-    let invocation: &crate::host::Invocation = cancel;
+    let invocation: &crate::host::Recorder = cancel;
     let (street_ways, street_nodes, addr_points, interp_nodes) =
         (*street_ways, *street_nodes, *addr_points, *interp_nodes);
     let street_way_count = *street_way_count;
@@ -740,7 +740,7 @@ fn run_stage_b(
     addr_entries_file: &str,
     interp_entries_file: &str,
     executor: &crate::host::Executor,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<u32> {
     use rayon::prelude::*;
 

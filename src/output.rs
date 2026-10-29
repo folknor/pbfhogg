@@ -420,10 +420,10 @@ struct Faults {
 
 #[cfg(feature = "test-hooks")]
 impl Faults {
-    fn of(invocation: &crate::host::Invocation) -> Self {
+    fn of(invocation: &crate::host::Recorder) -> Self {
         Self {
             armed: invocation.faults().publish_faults(),
-            invocation: invocation.clone(),
+            invocation: invocation.handle().clone(),
         }
     }
 
@@ -443,7 +443,7 @@ struct Faults;
 
 #[cfg(not(feature = "test-hooks"))]
 impl Faults {
-    fn of(_invocation: &crate::host::Invocation) -> Self {
+    fn of(_invocation: &crate::host::Recorder) -> Self {
         Self
     }
 }
@@ -593,7 +593,7 @@ struct PublishSync<'a> {
 }
 
 impl<'a> PublishSync<'a> {
-    fn new(invocation: &'a crate::host::Invocation) -> Self {
+    fn new(invocation: &'a crate::host::Recorder) -> Self {
         Self {
             metrics: &invocation.metrics().writer,
             calls: std::cell::Cell::new(0),
@@ -627,12 +627,12 @@ impl<'a> PublishSync<'a> {
 /// then does not stop it. Markers and counters are best effort: the sidecar
 /// drops one when its pipe is full.
 struct PublishSpan<'a> {
-    invocation: &'a crate::host::Invocation,
+    invocation: &'a crate::host::Recorder,
     sync: &'a PublishSync<'a>,
 }
 
 impl<'a> PublishSpan<'a> {
-    fn start(invocation: &'a crate::host::Invocation, sync: &'a PublishSync<'a>) -> Self {
+    fn start(invocation: &'a crate::host::Recorder, sync: &'a PublishSync<'a>) -> Self {
         invocation.marker("PUBLISH_START");
         Self { invocation, sync }
     }
@@ -2283,7 +2283,7 @@ impl Drop for Target {
 ///    still runs while unwinding, as before).
 fn publish_unit(
     targets: &mut [Target],
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
     unit: &Enlisted,
 ) -> Result<()> {
     use crate::publication::{Decided, Decision};
@@ -2360,26 +2360,29 @@ fn publish_unit(
 /// `RefusedError` otherwise. A unit already decided is left as it was.
 #[derive(Debug)]
 struct Enlisted {
-    invocation: crate::host::Invocation,
+    /// The unit's permit: its drop decides the unit, so it records outside
+    /// any call. Retired only after `Drop::drop` has decided.
+    permit: crate::host::Permit,
     unit: u64,
 }
 
 impl Enlisted {
+    /// The permit first, then the registration, then the guard at once:
+    /// nothing that can unwind runs between enlisting the unit and owning
+    /// its abandonment.
     fn new(invocation: &crate::host::Invocation, destinations: Vec<PathBuf>) -> Self {
-        let unit = invocation.log().enlist(destinations);
-        Self {
-            invocation: invocation.clone(),
-            unit,
-        }
+        let permit = invocation.permit();
+        let unit = permit.log().enlist(destinations);
+        Self { permit, unit }
     }
 }
 
 impl Drop for Enlisted {
     fn drop(&mut self) {
         use crate::publication::Decision;
-        let mut log = self.invocation.log();
+        let mut log = self.permit.log();
         // Read under the log's lock, where `cancel` trips it.
-        let decision = if self.invocation.is_cancelled() {
+        let decision = if self.permit.is_cancelled() {
             Decision::RefusedCancelled
         } else {
             Decision::RefusedError
@@ -2394,7 +2397,7 @@ impl Drop for Enlisted {
 fn execute(
     targets: &mut [Target],
     faults: &Faults,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> Result<()> {
     let sync = PublishSync::new(invocation);
     let metrics = &sync;
@@ -2710,11 +2713,20 @@ impl Output {
     /// writes the output still records that its publication was refused.
     #[must_use]
     pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutput {
+        let _call = invocation.call();
+        self.bind_unissued(invocation).issued()
+    }
+
+    /// [`bind`](Self::bind) for the library's own binding of an output a
+    /// command was handed: the bound value never returns to the caller, so
+    /// it takes no census ticket.
+    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutput {
         let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
         BoundOutput {
             output: self,
             invocation: invocation.clone(),
             unit: Some(unit),
+            ticket: None,
         }
     }
 
@@ -2723,7 +2735,7 @@ impl Output {
         compression: crate::write::compression::Compression,
         header_block_bytes: &[u8],
         backend: crate::write::OutputBackend,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
         use crate::write::OutputBackend;
         use crate::write::writer::PbfWriter;
@@ -2751,7 +2763,7 @@ impl Output {
                             host.executor.clone(),
                             host.diagnostics.clone(),
                             finish,
-                            host.invocation.clone(),
+                            host.invocation.permit(),
                         )
                     }
                     #[cfg(not(feature = "linux-io-uring"))]
@@ -2772,7 +2784,7 @@ impl Output {
                             host.executor.clone(),
                             host.diagnostics.clone(),
                             finish,
-                            host.invocation.clone(),
+                            host.invocation.permit(),
                         )
                     }
                     #[cfg(not(feature = "linux-direct-io"))]
@@ -2790,7 +2802,7 @@ impl Output {
                     host.executor.clone(),
                     host.diagnostics.clone(),
                     finish,
-                    host.invocation.clone(),
+                    host.invocation.permit(),
                 ),
                 OutputBackend::Buffered => PbfWriter::to_path_in(
                     path,
@@ -2799,7 +2811,7 @@ impl Output {
                     host.executor.clone(),
                     host.diagnostics.clone(),
                     finish,
-                    host.invocation.clone(),
+                    host.invocation.permit(),
                 ),
             }
         };
@@ -2884,21 +2896,46 @@ impl Output {
     }
 }
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
+
+    /// The library's own binding, by actual visibility: unreachable from
+    /// outside the crate, so a value bound through it was never issued.
+    pub trait Bind: Sized {
+        type Bound;
+        /// `Internal` is unconstructible outside the crate, so this method,
+        /// though reachable through a public bound, cannot be called there.
+        fn bind_unissued(
+            self,
+            invocation: &crate::host::Invocation,
+            internal: Internal,
+        ) -> crate::Result<Self::Bound>;
+    }
+
+    /// The crate's own key to [`Bind::bind_unissued`].
+    pub struct Internal(pub(super) ());
 }
 
 /// What a command entry point accepts as its file output: an [`Output`],
 /// which it binds to its host's invocation at entry, or a [`BoundOutput`],
 /// which it refuses (invalid argument) unless bound to that invocation.
 /// Sealed.
-pub trait BindOutput: sealed::Sealed {
+pub trait BindOutput: sealed::Sealed + sealed::Bind<Bound = BoundOutput> {
     /// Bind to `invocation`, or check that the output already is.
     ///
     /// # Errors
     /// A [`BoundOutput`] bound to another invocation. It is dropped, which
     /// decides its publication refused in its own invocation's log.
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput>;
+}
+
+/// Bind an output a command was handed, without issuing it: an unbound one
+/// binds to `invocation`, a bound one is checked and keeps its own ticket.
+pub(crate) fn bind_unissued<B: sealed::Bind>(
+    output: B,
+    invocation: &crate::host::Invocation,
+) -> Result<B::Bound> {
+    output.bind_unissued(invocation, sealed::Internal(()))
 }
 
 impl sealed::Sealed for Output {}
@@ -2914,13 +2951,40 @@ impl BindOutput for Output {
 
 impl BindOutput for BoundOutput {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
+        // Admitted on the invocation the output is bound to, which a refusal
+        // decides in: `this` drops, abandoning it, inside that admission.
+        let _call = self.invocation.call();
+        let this = self;
+        refuse_other(&this.invocation, invocation, this.destination())?;
+        Ok(this.issued())
+    }
+}
+
+impl sealed::Bind for Output {
+    type Bound = BoundOutput;
+    fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+        _: sealed::Internal,
+    ) -> Result<BoundOutput> {
+        Ok(Output::bind_unissued(self, invocation))
+    }
+}
+
+impl sealed::Bind for BoundOutput {
+    type Bound = BoundOutput;
+    fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+        _: sealed::Internal,
+    ) -> Result<BoundOutput> {
         refuse_other(&self.invocation, invocation, self.destination())?;
         Ok(self)
     }
 }
 
 /// [`BindOutput`] for a group of files.
-pub trait BindOutputSet: sealed::Sealed {
+pub trait BindOutputSet: sealed::Sealed + sealed::Bind<Bound = BoundOutputSet> {
     /// Bind to `invocation`, or check that the set already is.
     ///
     /// # Errors
@@ -2937,6 +3001,32 @@ impl BindOutputSet for OutputSet {
 
 impl BindOutputSet for BoundOutputSet {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
+        // As `BoundOutput::bind_to`: admitted on the set's own invocation.
+        let _call = self.invocation.call();
+        let this = self;
+        sealed::Bind::bind_unissued(this, invocation, sealed::Internal(()))
+            .map(BoundOutputSet::issued)
+    }
+}
+
+impl sealed::Bind for OutputSet {
+    type Bound = BoundOutputSet;
+    fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+        _: sealed::Internal,
+    ) -> Result<BoundOutputSet> {
+        Ok(OutputSet::bind_unissued(self, invocation))
+    }
+}
+
+impl sealed::Bind for BoundOutputSet {
+    type Bound = BoundOutputSet;
+    fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+        _: sealed::Internal,
+    ) -> Result<BoundOutputSet> {
         let first = self
             .members
             .first()
@@ -2972,9 +3062,22 @@ pub struct BoundOutput {
     /// `None` for a member of a bound set, whose set owns the unit; such a
     /// member is only ever lent.
     unit: Option<Enlisted>,
+    /// The census ticket of an output bound by the caller; `None` for one
+    /// the library bound, and for a set member. After `unit`, so the unit is
+    /// decided before the ticket retires.
+    ticket: Option<crate::host::Ticket>,
 }
 
 impl BoundOutput {
+    /// This output, issued to the caller: one `output` in its census.
+    /// Idempotent, so an output passed back in keeps its one ticket.
+    fn issued(mut self) -> Self {
+        if self.ticket.is_none() {
+            self.ticket = Some(self.invocation.ticket(crate::host::Kind::Output));
+        }
+        self
+    }
+
     /// The path the caller named. Never write here.
     #[must_use]
     pub fn destination(&self) -> &Path {
@@ -3030,6 +3133,20 @@ impl BoundOutput {
         header_block_bytes: &[u8],
         backend: crate::write::OutputBackend,
         host: &crate::host::Host,
+    ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
+        let host = &host.enter();
+        self.pbf_writer_unissued(compression, header_block_bytes, backend, host)
+            .map(crate::write::writer::PbfWriter::issued)
+    }
+
+    /// [`pbf_writer`](Self::pbf_writer) for a command's own output: the
+    /// writer never reaches the caller, so it takes no census ticket.
+    pub(crate) fn pbf_writer_unissued(
+        &self,
+        compression: crate::write::compression::Compression,
+        header_block_bytes: &[u8],
+        backend: crate::write::OutputBackend,
+        host: &crate::host::Entered<'_>,
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
         refuse_other(&self.invocation, &host.invocation, self.destination())?;
         self.output
@@ -3092,11 +3209,8 @@ impl BoundOutput {
         let Some(unit) = self.unit.take() else {
             return Err(Error::internal("a set member was published on its own"));
         };
-        publish_unit(
-            std::slice::from_mut(&mut self.output.target),
-            &self.invocation,
-            &unit,
-        )
+        let call = self.invocation.call();
+        publish_unit(std::slice::from_mut(&mut self.output.target), &call, &unit)
     }
 }
 
@@ -3168,11 +3282,20 @@ impl OutputDir {
     /// Bind to `invocation` for good, as [`Output::bind`].
     #[must_use]
     pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputDir {
+        let _call = invocation.call();
+        let mut bound = self.bind_unissued(invocation);
+        bound.ticket = Some(invocation.ticket(crate::host::Kind::Output));
+        bound
+    }
+
+    /// [`bind`](Self::bind) for the library's own use: no census ticket.
+    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutputDir {
         let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
         BoundOutputDir {
             dir: self,
             invocation: invocation.clone(),
             unit,
+            ticket: None,
         }
     }
 }
@@ -3184,6 +3307,9 @@ pub struct BoundOutputDir {
     dir: OutputDir,
     invocation: crate::host::Invocation,
     unit: Enlisted,
+    /// The census ticket of an output bound by the caller. After `unit`, so
+    /// the unit is decided before the ticket retires.
+    ticket: Option<crate::host::Ticket>,
 }
 
 impl BoundOutputDir {
@@ -3222,9 +3348,10 @@ impl BoundOutputDir {
     /// the swap failed and the previous directory could not be put back (the
     /// error names where it is kept).
     pub fn publish(mut self) -> Result<()> {
+        let call = self.invocation.call();
         publish_unit(
             std::slice::from_mut(&mut self.dir.target),
-            &self.invocation,
+            &call,
             &self.unit,
         )
     }
@@ -3350,6 +3477,12 @@ impl OutputSet {
     /// unit ([`Output::bind`]). Its members are lent, bound, only after.
     #[must_use]
     pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputSet {
+        let _call = invocation.call();
+        self.bind_unissued(invocation).issued()
+    }
+
+    /// [`bind`](Self::bind) for the library's own use: no census ticket.
+    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutputSet {
         let destinations = self
             .members
             .iter()
@@ -3364,10 +3497,12 @@ impl OutputSet {
                     output,
                     invocation: invocation.clone(),
                     unit: None,
+                    ticket: None,
                 })
                 .collect(),
             invocation: invocation.clone(),
             unit,
+            ticket: None,
         }
     }
 }
@@ -3382,6 +3517,20 @@ pub struct BoundOutputSet {
     members: Vec<BoundOutput>,
     invocation: crate::host::Invocation,
     unit: Enlisted,
+    /// The census ticket of a set bound by the caller (one per set: its
+    /// members are only lent). After `unit`, so the set is decided first.
+    ticket: Option<crate::host::Ticket>,
+}
+
+impl BoundOutputSet {
+    /// This set, issued to the caller: one `output` in its census.
+    /// Idempotent.
+    fn issued(mut self) -> Self {
+        if self.ticket.is_none() {
+            self.ticket = Some(self.invocation.ticket(crate::host::Kind::Output));
+        }
+        self
+    }
 }
 
 impl BoundOutputSet {
@@ -3429,7 +3578,8 @@ impl BoundOutputSet {
         for member in self.members.drain(..) {
             targets.push(member.output.target);
         }
-        publish_unit(&mut targets, &self.invocation, &self.unit)
+        let call = self.invocation.call();
+        publish_unit(&mut targets, &call, &self.unit)
     }
 }
 
@@ -3448,7 +3598,7 @@ impl Output {
         compression: crate::write::compression::Compression,
         header_block_bytes: &[u8],
         backend: crate::write::OutputBackend,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
         self.pbf_writer_under(compression, header_block_bytes, backend, host)
     }
@@ -3514,11 +3664,12 @@ mod tests {
     /// The one token these tests write and publish under: publication
     /// refuses an output written under another invocation. Never tripped; a
     /// test that cancels uses a token of its own.
-    fn run_host() -> crate::host::Host {
+    fn run_host() -> crate::host::Entered<'static> {
         crate::host::Host {
             invocation: run_token().clone(),
             ..crate::host::Host::for_tests()
         }
+        .entered_leaked()
     }
 
     fn run_token() -> &'static crate::host::Invocation {
@@ -4287,7 +4438,10 @@ mod tests {
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
         out.publish(&token).unwrap();
-        assert_eq!(token.metrics().writer.sync_all_calls.load(Relaxed), 2);
+        assert_eq!(
+            token.call().metrics().writer.sync_all_calls.load(Relaxed),
+            2
+        );
     }
 
     /// The walk before a backup's recursive removal: something pbfhogg
@@ -4312,7 +4466,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         fs::write(entry.join("old-file"), b"old").unwrap();
         let backup = Backup { container, entry };
-        target.remove_backup(0, &backup, &Faults::of(run_token()));
+        target.remove_backup(0, &backup, &Faults::of(&run_token().call()));
         drop(target);
         assert!(run.exists());
         assert_eq!(fs::read(backup.entry.join("old-file")).unwrap(), b"old");
@@ -4916,7 +5070,7 @@ mod tests {
         fn staged_set(
             dir: &Path,
             overwrite: Overwrite,
-            token: &Invocation,
+            token: &crate::host::Invocation,
         ) -> (OutputSet, PathBuf, PathBuf) {
             let a = dir.join("a.osm.pbf");
             let b = dir.join("b.osm.pbf");

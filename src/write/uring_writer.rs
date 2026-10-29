@@ -163,7 +163,7 @@ struct UringState {
     in_flight: u32,
     /// The invocation whose writer counters the ring's submits, waits and
     /// fsync record into.
-    invocation: crate::host::Invocation,
+    invocation: crate::host::Permit,
 }
 
 impl UringState {
@@ -557,7 +557,7 @@ pub(crate) fn uring_writer_thread(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
@@ -618,7 +618,7 @@ fn uring_init_and_run(
     init_tx: &SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     // Step 1: Declare the buffer pool. It is allocated in step 3, once the
     // output file has reported its direct I/O alignment, but declared here
@@ -710,7 +710,7 @@ fn uring_init_and_run(
         write_offset: 0,
         logical_size: 0,
         in_flight: 0,
-        invocation: cancel.clone(),
+        invocation: cancel.permit(),
     };
 
     // Step 7: Write header, a handoff like any chunk.
@@ -742,7 +742,7 @@ fn uring_init_and_run(
 /// items reap completions without blocking.
 struct UringSink<'a> {
     state: &'a mut UringState,
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
 }
 
 impl UringSink<'_> {

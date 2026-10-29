@@ -111,7 +111,7 @@ pub(crate) fn parallel_writer_thread(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
@@ -127,7 +127,7 @@ fn parallel_writer_thread_inner(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let file = match super::create_backend_file(&path) {
         Ok(f) => f,
@@ -182,7 +182,7 @@ fn run_pool<'scope, 'env>(
     failure: &'scope FirstFailure,
     header_len: u64,
     expected: &SeqTotal,
-    cancel: &'scope crate::host::Invocation,
+    cancel: &'scope crate::host::Recorder,
 ) {
     let mut worker_txs: Vec<SyncSender<WriteOp>> = Vec::with_capacity(POOL_SIZE);
     let mut worker_handles: Vec<ScopedJoinHandle<'scope, ()>> = Vec::with_capacity(POOL_SIZE);
@@ -346,7 +346,7 @@ fn pool_worker(
     rx: Receiver<WriteOp>,
     file: &File,
     failure: &FirstFailure,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) {
     #[cfg(feature = "test-hooks")]
     let _live = cancel.faults().live_pool_worker();
@@ -368,7 +368,7 @@ fn worker_loop(
     rx: &Receiver<WriteOp>,
     file: &File,
     failure: &FirstFailure,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) {
     #[cfg(not(feature = "test-hooks"))]
     let _ = index;
@@ -470,7 +470,7 @@ mod tests {
                 init_tx,
                 &thread_total,
                 crate::write::Finish::Durable,
-                &crate::host::Invocation::new(),
+                &crate::host::Invocation::new().call(),
             )
         });
 

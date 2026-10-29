@@ -43,7 +43,7 @@ pub(super) fn run_pass1(
     input: &PinnedInput,
     direct_io: bool,
     strings: &mut StringPool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<RawAdminRelation>, crate::idset::IdSet)> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
@@ -53,7 +53,7 @@ pub(super) fn run_pass1(
             // The filter believes the claim; a decoded block holding another
             // kind is a lying claim, refused rather than losing its relations.
             .refusing_kind_claims()
-            .for_each_block_pipelined(|block| {
+            .for_each_own_block_pipelined(|block| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(rel) = element {
                         let mut boundary: Option<&str> = None;

@@ -274,8 +274,22 @@ fn run_once(
 ) -> Result<bool, String> {
     let out = crate::common::test_scratch();
     let scratch = crate::common::test_scratch();
+    #[cfg(feature = "test-hooks")]
+    let token = cancel.clone();
     let host = host_with(cancel);
-    match command(inputs, out.path(), scratch.path(), &host) {
+    let result = command(inputs, out.path(), scratch.path(), &host);
+    drop(host);
+    // Every command, whatever its outcome, leaves its invocation with no
+    // call guard, no permit and nothing in its census once it has returned
+    // and everything it handed out is gone.
+    #[cfg(feature = "test-hooks")]
+    {
+        let rest = token.capabilities();
+        if rest != pbfhogg::host::Capabilities::default() {
+            return Err(format!("{name}: capabilities left at rest: {rest:?}"));
+        }
+    }
+    match result {
         Ok(()) => Ok(false),
         Err(e) if e.is_cancelled() => {
             if !entries(out.path()).is_empty() {
@@ -364,6 +378,55 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A command's own outputs, writers and readers are never issued to the
+/// caller: at every checkpoint of every command the census is empty.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn no_command_issues_its_own_values() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let inputs = Inputs::new();
+    let mut failures = Vec::new();
+    for (name, command) in commands() {
+        let token = pbfhogg::host::Invocation::new();
+        let issued = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = std::sync::Arc::clone(&issued);
+        token.on_check(move |_, token| {
+            let c = token.capabilities();
+            seen.fetch_max(c.session + c.writer + c.output + c.buffer, Relaxed);
+        });
+        if let Err(e) = run_once(name, command, &inputs, token) {
+            failures.push(e);
+        }
+        if issued.load(Relaxed) != 0 {
+            failures.push(format!("{name}: issued a value of its own to the census"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A public command reached from inside another (`sort` runs `sort_with`)
+/// is a nested entry: it mints its own call guard while the outer one is
+/// held, so a checkpoint inside it sees two, and both retire.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_nested_entry_mints_its_own_guard() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let inputs = Inputs::new();
+    let token = pbfhogg::host::Invocation::new();
+    let at_first = std::sync::Arc::new(AtomicU64::new(0));
+    let seen = std::sync::Arc::clone(&at_first);
+    token.on_check(move |ordinal, token| {
+        // The first checkpoint is sort_with's, before any writer (whose
+        // methods are entries too) exists.
+        if ordinal == 1 {
+            seen.store(token.capabilities().guards, Relaxed);
+        }
+    });
+    assert_eq!(run_once("sort", sort, &inputs, token.clone()), Ok(false));
+    assert_eq!(at_first.load(Relaxed), 2, "sort and its nested sort_with");
+    assert_eq!(token.capabilities(), pbfhogg::host::Capabilities::default());
 }
 
 /// Publication checks the token once, as its decision. A token tripped after

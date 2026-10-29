@@ -53,7 +53,7 @@ pub(crate) fn payload_path(scratch: &RunScratch, index: usize) -> Result<Scratch
 /// `invocation`.
 pub(crate) fn advise_dontneed_file(
     file: &std::fs::File,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> bool {
     crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::DontNeed, invocation)
 }

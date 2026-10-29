@@ -358,7 +358,7 @@ saturating_counter_value!(u64, usize);
 ///
 /// On non-glibc platforms this is a no-op.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub(crate) fn emit_mallinfo2(invocation: &crate::host::Invocation, prefix: &str) {
+pub(crate) fn emit_mallinfo2(invocation: &crate::host::Recorder, prefix: &str) {
     if !invocation.instrumented() {
         return;
     }
@@ -373,12 +373,12 @@ pub(crate) fn emit_mallinfo2(invocation: &crate::host::Invocation, prefix: &str)
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn emit_mallinfo2(_invocation: &crate::host::Invocation, _prefix: &str) {}
+pub(crate) fn emit_mallinfo2(_invocation: &crate::host::Recorder, _prefix: &str) {}
 
 /// Read the process's cumulative (minor, major) page faults for an
 /// instrumented invocation; `None` when it is not instrumented or the procfs
 /// sample is unavailable.
-pub(crate) fn read_page_faults(invocation: &crate::host::Invocation) -> Option<(u64, u64)> {
+pub(crate) fn read_page_faults(invocation: &crate::host::Recorder) -> Option<(u64, u64)> {
     if !invocation.instrumented() {
         return None;
     }
@@ -403,7 +403,7 @@ pub(crate) fn page_fault_deltas(
 /// `invocation`, or nothing when either sample is missing. The faults are the
 /// process's, between two of this invocation's phase boundaries.
 pub(crate) fn emit_page_fault_deltas(
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
     names: (&str, &str),
     before: Option<(u64, u64)>,
     after: Option<(u64, u64)>,

@@ -158,12 +158,12 @@ fn run(source: Source, path: &Path) -> Outcome {
         Source::Raw => run_raw(path),
         Source::HeaderThenSkip => run_header_then_skip(path),
         Source::Walk => walk_all(
-            HeaderWalker::open(path, &crate::host::Host::for_tests()),
+            HeaderWalker::open(path, &crate::host::Host::entered_for_tests()),
             path,
         ),
         #[cfg(feature = "linux-direct-io")]
         Source::DirectWalk => walk_all(
-            HeaderWalker::open_direct(path, &crate::host::Host::for_tests()),
+            HeaderWalker::open_direct(path, &crate::host::Host::entered_for_tests()),
             path,
         ),
     }
@@ -196,7 +196,7 @@ fn run_skip(path: &Path) -> Outcome {
 /// fixtures here are by construction; the frame layer under test is the same
 /// with the refusal off, as on the public `BlobReader` sources.
 fn file_frames(path: &Path) -> Frames<FileReader> {
-    let host = crate::host::Host::for_tests();
+    let host = crate::host::Host::entered_for_tests();
     let mut frames = Frames::of_input(
         FileReader::buffered_in(path, &host.invocation).unwrap(),
         path,

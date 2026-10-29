@@ -61,7 +61,7 @@ impl BlobTask {
 #[hotpath::measure]
 pub(super) fn build_all_blob_schedules(
     input: &PinnedInput,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     // Its own open, derived from the run's pin, on purpose: this walk's
     // descriptor carries FADV_RANDOM, which is kept off the workers' shared

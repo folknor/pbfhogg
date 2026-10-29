@@ -432,7 +432,7 @@ pub(super) fn run_pass2(
     needed_admin_ways: crate::idset::IdSet,
     referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Pass2Output> {
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
     // Compact rank-indexed coord array. Instead of a 128 GB sparse DenseMmapIndex

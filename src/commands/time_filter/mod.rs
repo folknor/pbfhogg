@@ -96,7 +96,8 @@ pub fn time_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = time_filter_to(
         input.into(),
@@ -118,7 +119,7 @@ pub(crate) fn time_filter_to(
     cutoff_timestamp: i64,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TimeFilterStats> {
     let WriteOptions {
         compression,
@@ -211,7 +212,7 @@ fn time_filter_history(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
     input: &std::path::Path,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> Result<TimeFilterStats> {
     // The pipelined element callback knows no blob, so an order refusal it
     // raises is located with the input.
@@ -363,7 +364,7 @@ fn time_filter_snapshot(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
     compression: Compression,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TimeFilterStats> {
     // Per-blob worker pool; same precedent as cat --clean and
     // check --refs / verify_ids. Post-migration, each blob's BlockBuilder
@@ -1064,7 +1065,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let s = time_filter(
             input,
             staged,

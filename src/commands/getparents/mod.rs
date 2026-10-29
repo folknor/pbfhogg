@@ -70,7 +70,8 @@ pub fn getparents<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = getparents_to(input, &output, ids, opts, write, overrides, host)?;
     output.publish()?;
@@ -86,7 +87,7 @@ pub(crate) fn getparents_to<'a>(
     opts: &GetparentsOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
     let (_, stats) = getparents_dispatched(
         input,
@@ -122,7 +123,8 @@ pub fn getparents_with_min_blobs<'a>(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result =
         getparents_with_min_blobs_to(input, &output, ids, opts, write, overrides, min_blobs, host)?;
@@ -140,7 +142,7 @@ pub(crate) fn getparents_with_min_blobs_to<'a>(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
     getparents_dispatched(input, output, ids, opts, write, overrides, min_blobs, host)
         .map(|(_, stats)| stats)
@@ -158,7 +160,7 @@ fn getparents_dispatched<'a>(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(ScanArm, GetparentsStats)> {
     // Every route opens the input more than once, each open its own open
     // file description: the indexdata probe, the arm estimate (indexed
@@ -190,7 +192,7 @@ pub(crate) fn getparents_with_arm(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     arm: ScanArm,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
     match arm {
         ScanArm::Walker => getparents_walker(input, output, ids, opts, write, overrides, host),
@@ -219,7 +221,7 @@ fn getparents_walker(
     opts: &GetparentsOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
 
@@ -357,7 +359,7 @@ fn getparents_pipelined(
     opts: &GetparentsOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
     let reader = ElementReader::open_in(input, write.direct_reads, host)?
@@ -498,9 +500,10 @@ mod tests {
     /// One host for this module's tests, so a run and the publication of
     /// its output share an invocation (publication refuses another). Never
     /// cancelled and never armed.
-    fn run_host() -> &'static crate::host::Host {
-        static HOST: std::sync::OnceLock<crate::host::Host> = std::sync::OnceLock::new();
-        HOST.get_or_init(crate::host::Host::for_tests)
+    fn run_host() -> &'static crate::host::Entered<'static> {
+        static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =
+            std::sync::OnceLock::new();
+        HOST.get_or_init(crate::host::Host::entered_for_tests)
     }
     use super::{
         FULL_SCAN_ARM_MIN_BLOBS, GetparentsOptions, ScanArm, getparents_dispatched,

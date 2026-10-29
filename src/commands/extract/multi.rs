@@ -41,7 +41,7 @@ pub(super) fn try_extract_multi_single_pass(
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Option<Vec<ExtractStats>>> {
     use std::io::BufWriter;
 
@@ -790,7 +790,7 @@ fn multi_extract_pread_write_nodes<F>(
     block_fn: F,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
     F: Fn(
@@ -879,7 +879,7 @@ struct MultiLocal {
 }
 
 impl MultiLocal {
-    fn new(n: usize, invocation: &crate::host::Invocation) -> Self {
+    fn new(n: usize, invocation: &crate::host::Recorder) -> Self {
         Self {
             read_buf: Vec::new(),
             bbs: (0..n).map(|_| BlockBuilder::new()).collect(),
@@ -976,7 +976,7 @@ struct MultiNodeConsumer<'a> {
     frame_buf: Vec<u8>,
     writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &'a mut [ExtractStats],
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
 }
 
 impl MultiNodeConsumer<'_> {
@@ -1040,7 +1040,7 @@ fn multi_extract_pread_write<F>(
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
     stat_field: fn(&mut ExtractStats) -> &mut u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
     F: Fn(

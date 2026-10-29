@@ -60,7 +60,7 @@ pub struct DiffOptions {
 
 impl DiffOptions {
     /// The shard count this run uses: the fixed count, else one per core.
-    fn shards(&self, host: &crate::host::Host) -> usize {
+    fn shards(&self, host: &crate::host::Entered<'_>) -> usize {
         resolve_shards(self.parallelism, host)
     }
 }
@@ -69,7 +69,7 @@ impl DiffOptions {
 /// count, else one per core the host reports (one when it reports none).
 pub(crate) fn resolve_shards(
     parallelism: crate::host::Parallelism,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> usize {
     parallelism.resolve(|| {
         host.resources
@@ -167,6 +167,7 @@ pub fn diff<'a, 'b>(
     host: &crate::host::Host,
     scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
+    let host = &host.enter();
     host.invocation.check()?;
     let jobs = options.shards(host);
     if jobs > 1 && scratch.is_none() {
@@ -222,6 +223,7 @@ pub fn diff_stats<'a, 'b>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
+    let host = &host.enter();
     host.invocation.check()?;
     // Nothing is printed, so byte-equal blobs may be skipped (see above).
     let options = DiffOptions {
@@ -251,7 +253,7 @@ pub fn diff_stats<'a, 'b>(
 pub(super) fn pin_pair(
     old: InputSource<'_>,
     new: InputSource<'_>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<[PinnedInput; 2]> {
     let pins = crate::read::input::pin_sources(&[old, new], host)?;
     <[PinnedInput; 2]>::try_from(pins)
@@ -282,7 +284,7 @@ fn compare<W: Write>(
     options: &DiffOptions,
     jobs: usize,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DiffStats> {
     let filter = TypeFilter::or_all(options.type_filter);
     let (old_path, new_path) = (old.path(), new.path());
@@ -332,7 +334,7 @@ fn compare<W: Write>(
 }
 
 /// Close the scan: the end marker and the result counters, on every path.
-fn finish_scan(stats: DiffStats, invocation: &crate::host::Invocation) -> DiffStats {
+fn finish_scan(stats: DiffStats, invocation: &crate::host::Recorder) -> DiffStats {
     invocation.marker("DIFF_SCAN_END");
     invocation.counter("diff_common", stats.common);
     invocation.counter("diff_created", stats.created);
@@ -366,7 +368,7 @@ fn diff_block_pair<W: Write>(
     // walker's buffered descriptor at every shard count. Kept as the place
     // the flag reaches once those reads honour it.
     _direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DiffStats> {
     // DIFF_SCAN_START/END and the diff_* result counters are the caller's.
     let walked = shard::walk_pair(old, new, host)?;
@@ -588,7 +590,7 @@ impl<'a, W: Write> sharded::ShardedReport for TextReport<'a, W> {
         Ok((shard.path, shard.sink.stats))
     }
 
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()> {
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Recorder) -> Result<()> {
         match (self.sink.output.as_mut(), self.scratch) {
             (Some(out), Some(scratch)) => {
                 emit_shard_outputs(&mut **out, done, &mut self.sink.stats, scratch, cancel)
@@ -626,7 +628,7 @@ fn emit_shard_outputs(
     outputs: Vec<(Option<crate::scratch::ScratchPath>, DiffStats)>,
     total: &mut DiffStats,
     scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let mut first_err = None;
     for (text_path, stats) in outputs {
@@ -655,7 +657,7 @@ fn append_and_cleanup(
     out: &mut impl Write,
     src: &crate::scratch::ScratchPath,
     scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     // The copy checks the token at every read of the shard file (a shard
     // can hold gigabytes of text, and stdout is not cancellation-aware).
@@ -679,7 +681,7 @@ fn append_and_cleanup(
 /// report the same shadow view.
 fn emit_merge_stats_counters(
     s: &crate::osc::merge_join::BlockPairMergeStats,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) {
     invocation.counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal);
     invocation.counter(
@@ -712,7 +714,7 @@ fn diff_element_stream<W: Write>(
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DiffStats> {
     let pool = crate::osc::merge_join::merge_buffers(&host.invocation);
     let mut old_src =

@@ -280,12 +280,12 @@ pub(crate) struct WillneedPrefetch {
 impl WillneedPrefetch {
     /// Prepare unconditional sliding WILLNEED prefetching for a dispatch
     /// schedule of `invocation`.
-    pub(crate) fn new(schedule: &[ScheduledBlob], invocation: &crate::host::Invocation) -> Self {
+    pub(crate) fn new(schedule: &[ScheduledBlob], invocation: &crate::host::Recorder) -> Self {
         Self {
             ranges: coalesce_willneed_ranges(schedule),
             next_range: 0,
             next_offset: 0,
-            invocation: invocation.clone(),
+            invocation: invocation.handle().clone(),
         }
     }
 
@@ -436,7 +436,7 @@ pub(crate) fn build_classify_schedule<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     claims: KindClaims,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<ScheduledBlob>, InputFile)> {
     let (schedule, file, _skipped) =
         build_classify_schedule_blob_filtered(input, kind_filter, None, claims, host)?;
@@ -452,7 +452,7 @@ pub(crate) fn build_classify_schedule<'a>(
 pub(crate) fn build_classify_schedule_with_claims<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(
     Vec<ScheduledBlob>,
     Vec<Option<crate::blob_meta::BlobIndex>>,
@@ -501,7 +501,7 @@ pub(crate) fn build_classify_schedule_blob_filtered<'a>(
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     claims: KindClaims,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     schedule_walk(input, kind_filter, blob_filter, false, claims, None, host)
 }
@@ -517,7 +517,7 @@ pub(crate) fn build_classify_schedule_blob_filtered_accepting_partial<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     schedule_walk(
         input,
@@ -539,7 +539,7 @@ fn schedule_walk<'a>(
     accept_partial: bool,
     claims: KindClaims,
     mut indexes: Option<&mut Vec<Option<crate::blob_meta::BlobIndex>>>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     let source = input.into();
     let input = source.path();
@@ -633,7 +633,7 @@ fn schedule_walk<'a>(
 pub(crate) fn build_classify_schedules_split<'a>(
     input: impl Into<InputSource<'a>>,
     claims: KindClaims,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(
     Vec<ScheduledBlob>,
     Vec<ScheduledBlob>,
@@ -733,7 +733,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     parallel_classify_phase_abortable(
         input,
@@ -832,7 +832,7 @@ fn next_position(
 /// worker has gone.
 fn recv_checked_recording_wait<T>(
     rx: &std::sync::mpsc::Receiver<T>,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
     wait_ns: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<T>> {
     cancel.check()?;
@@ -861,7 +861,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
     merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     run_unordered_per_blob(
         input,
@@ -931,7 +931,7 @@ fn run_unordered_per_blob<L, R: Send>(
     local: impl Fn() -> L + Sync,
     work: impl Fn(&mut L, usize, &[u8]) -> Result<R> + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     metrics: &UnorderedPoolMetrics,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
@@ -1025,7 +1025,7 @@ fn run_unordered_per_blob<L, R: Send>(
 
 /// Emits an unordered metrics set when dropped: after a run's scope has
 /// joined its threads, whether the run returned or unwound.
-struct EmitOnDrop<'a>(&'a UnorderedPoolMetrics, &'a crate::host::Invocation);
+struct EmitOnDrop<'a>(&'a UnorderedPoolMetrics, &'a crate::host::Recorder);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
@@ -1104,7 +1104,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
     worker_init: impl Fn() -> S + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Sync,
     merge: impl FnMut(usize, R) -> Result<()>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -1185,7 +1185,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(usize, &[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     run_unordered_per_blob(
         input,
@@ -1293,7 +1293,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<()> + Send + Sync,
     mut merge: impl FnMut(S),
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -1486,7 +1486,7 @@ mod tests {
     fn the_decoding_pools_refuse_a_contradicted_kind_claim() {
         let dir = crate::path_guard::tests::scratch();
         let path = write_way_blob_claiming_nodes(dir.path());
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let expected = Some(crate::KindContradiction {
             claimed: crate::ElementKind::Node,
             found: crate::ElementKind::Way,
@@ -1574,7 +1574,7 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
 
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let (nodes, ways, rels, input, _) =
             super::build_classify_schedules_split(&path, super::KindClaims::Refuse, &host).unwrap();
         for schedule in [&nodes, &ways, &rels] {
@@ -1607,9 +1607,13 @@ mod tests {
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
-        let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
-                .unwrap();
+        let (schedule, shared_file) = super::build_classify_schedule(
+            &path,
+            None,
+            UNCHECKED,
+            &crate::host::Host::entered_for_tests(),
+        )
+        .unwrap();
         assert_eq!(
             schedule.len(),
             BLOBS,
@@ -1632,7 +1636,7 @@ mod tests {
                 merged += 1;
                 std::ops::ControlFlow::Break(())
             },
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .unwrap();
 
@@ -1661,7 +1665,7 @@ mod tests {
             |_position, ()| {
                 all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
@@ -1682,9 +1686,13 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
-                .unwrap();
+        let (schedule, shared_file) = super::build_classify_schedule(
+            &path,
+            None,
+            UNCHECKED,
+            &crate::host::Host::entered_for_tests(),
+        )
+        .unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let run = |fail: &(dyn Fn(usize) + Sync)| {
@@ -1707,7 +1715,7 @@ mod tests {
                     |()| {
                         merged.fetch_add(1, Ordering::Relaxed);
                     },
-                    &crate::host::Host::for_tests(),
+                    &crate::host::Host::entered_for_tests(),
                 )
             }));
             (outcome, classified.into_inner())
@@ -1751,7 +1759,7 @@ mod tests {
             |seen| {
                 all.fetch_add(seen, Ordering::Relaxed);
             },
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a clean run classifies every blob");
@@ -1773,7 +1781,7 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let blobs = super::POOL_DESCRIPTOR_CHANNEL_DEPTH + 8;
         let path = write_many_blob_pbf(dir.path(), blobs);
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let (schedule, input) =
             super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), blobs);
@@ -1829,9 +1837,13 @@ mod tests {
         const BLOBS: usize = 40;
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, UNCHECKED, &crate::host::Host::for_tests())
-                .unwrap();
+        let (schedule, shared_file) = super::build_classify_schedule(
+            &path,
+            None,
+            UNCHECKED,
+            &crate::host::Host::entered_for_tests(),
+        )
+        .unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let classified = AtomicUsize::new(0);
@@ -1858,7 +1870,7 @@ mod tests {
                 merged.push(seq);
                 Ok(())
             },
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .unwrap();
         assert_eq!(merged, (0..BLOBS).collect::<Vec<_>>());
@@ -1874,7 +1886,7 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 6;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let (schedule, input) =
             super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), BLOBS);
@@ -1979,7 +1991,7 @@ mod tests {
         assert_eq!(err.byte_offset().map(|o| o.0), Some((1 << 40) - 4), "{err}");
 
         // A cancellation is not a fault of the input.
-        let cancelled = crate::host::Host::for_tests();
+        let cancelled = crate::host::Host::entered_for_tests();
         let err = super::parallel_classify_phase(
             &input,
             &schedule,
@@ -2001,7 +2013,7 @@ mod tests {
     fn willneed_prefetch_defaults_to_coalesced_schedule() {
         let schedule = [ScheduledBlob::at(100, 20), ScheduledBlob::at(144, 5)];
 
-        let prefetch = WillneedPrefetch::new(&schedule, &crate::host::Invocation::new());
+        let prefetch = WillneedPrefetch::new(&schedule, &crate::host::Invocation::new().call());
 
         assert_eq!(prefetch.ranges, vec![(100, 49)]);
         assert_eq!(prefetch.next_range, 0);

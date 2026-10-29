@@ -26,7 +26,7 @@ pub(super) fn collect_relation_member_ids_indexed(
     blob_meta: &[BlobMeta],
     want_nodes: bool,
     want_ways: bool,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<RelationScanOutput> {
     let file = Arc::new(crate::read::input::InputSource::from(input).open()?);
     // Errors are located against the input once, not per blob.

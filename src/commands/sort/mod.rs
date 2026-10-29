@@ -87,7 +87,8 @@ pub fn sort<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     sort_with(
         input,
         output,
@@ -127,7 +128,8 @@ pub fn sort_with<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = sort_to(input, &output, opts, overrides, host)?;
     output.publish()?;
@@ -142,7 +144,7 @@ pub(crate) fn sort_to<'a>(
     output: &crate::output::BoundOutput,
     opts: &SortOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<SortStats> {
     let SortOptions {
         write:
@@ -407,7 +409,7 @@ mod tests {
     }
 
     fn run(input: &Path, output: &Path, direct_reads: bool) -> Vec<u8> {
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let out = crate::output::Output::new(
             output,
             crate::output::Overwrite::Refuse,

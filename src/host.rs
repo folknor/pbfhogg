@@ -65,6 +65,19 @@ pub struct Host {
 /// keys, whichever `Diagnostics` handle it reports through, so several calls
 /// grouped under one invocation report each such diagnostic once between
 /// them, and separate invocations each report their own.
+///
+/// # Control handle
+///
+/// An `Invocation` is the control handle: identity, the token and the reads.
+/// Holding or leaking one keeps nothing open. What records into the
+/// invocation is admitted separately: every public entry that can record (a
+/// command, a method of a library value, `cancel`, the end-of-run emitters)
+/// holds a call guard for its extent, and every value that can record
+/// outside a call (a writer and its threads, a block iterator's pipeline, a
+/// decompression pool kept alive by blocks, a bound output) holds a permit
+/// until its last recording. Values of those kinds handed to the caller are
+/// counted, by kind, in the invocation's census. Admission always succeeds
+/// today; it is what a seal will close.
 #[derive(Clone, Default)]
 pub struct Invocation(Arc<InvocationState>);
 
@@ -102,6 +115,13 @@ struct InvocationState {
     /// The publication log (see [`crate::publication`]). Never held across
     /// anything but its own bookkeeping.
     log: std::sync::Mutex<crate::publication::PublicationLog>,
+    /// The transition word: lifecycle state, live [`Call`] guards and live
+    /// [`Permit`]s in one atomic (see [`word`]). On cache lines of its own:
+    /// a per-call method of a library value mints and retires a guard here.
+    word: crate::counters::Padded<std::sync::atomic::AtomicU64>,
+    /// The census: how many issued values of each [`Kind`] are alive.
+    /// Bookkeeping only; nothing is ever called under it.
+    census: std::sync::Mutex<[u64; Kind::COUNT]>,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -150,49 +170,100 @@ impl Invocation {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Emit the phase marker `name` to the sink, if there is one.
+    /// Admit a public entry: a [`Call`] guard on this invocation for the
+    /// entry's extent. Every recording the entry makes goes through it.
+    /// Nested and internal entries mint their own; the enclosing guard keeps
+    /// the invocation open. Admission always succeeds while the invocation
+    /// has no seal.
     #[inline]
-    pub(crate) fn marker(&self, name: &str) {
-        if self.0.sink.is_some() {
-            self.deliver(|sink| sink.marker(name));
+    pub(crate) fn call(&self) -> Call {
+        Call {
+            rec: Recorder(self.clone()),
+            counted: self.mint(word::GUARD),
         }
     }
 
-    /// Emit counter `name` with `value` to the sink, if there is one. The
-    /// wire value is an `i64`: signed values are sent exactly, unsigned ones
-    /// saturate at `i64::MAX` rather than wrap, so callers pass them as they
-    /// are instead of casting.
-    #[inline]
-    pub(crate) fn counter(&self, name: &str, value: impl crate::debug::CounterValue) {
-        if self.0.sink.is_some() {
-            let value = value.to_counter();
-            self.deliver(|sink| sink.counter(name, value));
+    /// A [`Permit`] for a value that records outside any public call, through
+    /// background work or its own `Drop`. Held past its last recording.
+    pub(crate) fn permit(&self) -> Permit {
+        Permit {
+            rec: Recorder(self.clone()),
+            counted: self.mint(word::PERMIT),
         }
     }
 
-    /// Run `emit` against the sink with its unwinding contained: a sink that
-    /// panics is latched off for the rest of the invocation and the run
-    /// carries on, because instrumentation is observational and may neither
-    /// change a published result nor turn an unwind into an abort. The
-    /// caught payload is forgotten, not dropped: its destructor is caller
-    /// code too and could panic again. An emission already past the latch
-    /// when another thread's panics may still complete; later ones are
-    /// skipped. Panics that do not unwind (`panic = "abort"`, a panicking
-    /// panic hook) cannot be contained.
-    #[cold]
-    #[inline(never)]
-    fn deliver(&self, emit: impl FnOnce(&dyn crate::debug::InstrumentSink)) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some(sink) = self.0.sink.as_deref() else {
-            return;
+    /// A census ticket of `kind` for a value issued to the caller.
+    pub(crate) fn ticket(&self, kind: Kind) -> Ticket {
+        self.census_adjust(kind, true);
+        Ticket {
+            invocation: self.clone(),
+            kind,
+        }
+    }
+
+    /// Count one capability of `unit`'s field into the word. `false` when the
+    /// field is saturated: the sticky flag is set instead and the capability
+    /// is uncounted, so it never decrements.
+    #[inline]
+    fn mint(&self, unit: u64) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        let word = &self.0.word.0;
+        let mut current = word.load(Relaxed);
+        loop {
+            if word::is_full(current, unit) {
+                word.fetch_or(word::SATURATED, Relaxed);
+                return false;
+            }
+            match word.compare_exchange_weak(current, current + unit, AcqRel, Relaxed) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// Retire one counted capability of `unit`'s field. `Release`: every
+    /// recording the capability made happens before the count drops.
+    #[inline]
+    fn retire(&self, unit: u64) {
+        self.0
+            .word
+            .0
+            .fetch_sub(unit, std::sync::atomic::Ordering::Release);
+    }
+
+    fn census_adjust(&self, kind: Kind, up: bool) {
+        let mut census = self
+            .0
+            .census
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = &mut census[kind as usize];
+        *slot = if up {
+            slot.saturating_add(1)
+        } else {
+            slot.saturating_sub(1)
         };
-        if self.0.sink_failed.load(Relaxed) {
-            return;
-        }
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(sink)))
-        {
-            self.0.sink_failed.store(true, Relaxed);
-            std::mem::forget(payload);
+    }
+
+    /// Test hook: the transition word and the census as they stand.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        let current = self.0.word.0.load(std::sync::atomic::Ordering::Acquire);
+        let census = *self
+            .0
+            .census
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Capabilities {
+            guards: word::field(current, word::GUARD),
+            permits: word::field(current, word::PERMIT),
+            saturated: current & word::SATURATED != 0,
+            session: census[Kind::Session as usize],
+            writer: census[Kind::Writer as usize],
+            output: census[Kind::Output as usize],
+            buffer: census[Kind::Buffer as usize],
         }
     }
 
@@ -215,7 +286,8 @@ impl Invocation {
     /// in progress. To cancel one command among several, give each its own
     /// invocation.
     pub fn cancel(&self) -> crate::publication::CancelOutcome {
-        let mut log = self.log();
+        let call = self.call();
+        let mut log = call.log();
         self.0
             .tripped
             .store(true, std::sync::atomic::Ordering::Release);
@@ -223,8 +295,9 @@ impl Invocation {
     }
 
     /// The publication log, poison recovered: no mutation of it can unwind
-    /// half done (see [`crate::publication`]).
-    pub(crate) fn log(&self) -> std::sync::MutexGuard<'_, crate::publication::PublicationLog> {
+    /// half done (see [`crate::publication`]). Private: a mutation goes
+    /// through [`Recorder::log`], a read copies here.
+    fn log_guard(&self) -> std::sync::MutexGuard<'_, crate::publication::PublicationLog> {
         self.0
             .log
             .lock()
@@ -237,7 +310,7 @@ impl Invocation {
     /// publication still running is visited with
     /// [`finished`](crate::publication::Publication::finished) false.
     pub fn for_each_publication(&self, mut visit: impl FnMut(&crate::publication::Publication)) {
-        let rows = self.log().rows();
+        let rows = self.log_guard().rows();
         for row in &rows {
             visit(row);
         }
@@ -297,45 +370,6 @@ impl Invocation {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// The invocation's metric sets, for the recording sites.
-    #[inline]
-    pub(crate) fn metrics(&self) -> &crate::counters::InvocationMetrics {
-        &self.0.metrics
-    }
-
-    /// Claim the once-per-invocation diagnostic `key`: `true` the first time
-    /// any part of this invocation asks (the caller then emits it), `false`
-    /// ever after, and after [`mark_reported`](Self::mark_reported). The
-    /// lock is released before the caller emits, so a slow diagnostic sink
-    /// never holds it.
-    pub(crate) fn first_report(&self, key: &'static str) -> bool {
-        self.0
-            .reported
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key)
-    }
-
-    /// Record that the once-per-invocation diagnostic `key` is already
-    /// covered, so a later `diag_once!` with that key under this invocation
-    /// stays silent. For a command that has just reported the same condition
-    /// in its own, more specific words.
-    pub(crate) fn mark_reported(&self, key: &'static str) {
-        self.first_report(key);
-    }
-
-    /// Serialize one publication of this invocation against any other: the
-    /// guard is held from before the decision until the row is finalized.
-    /// Caller code that runs under it (hooks, the instrument sink) publishing
-    /// under the same invocation is refused as re-entry, never waited on. A
-    /// poisoned lock is recovered: it guards no state, only exclusion.
-    pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.0
-            .publishing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Visit every engine-level counter this invocation has recorded so
     /// far, with the name it is emitted under on the sidecar stream and its
     /// current value: the read pipeline's `pipeline_*`, the worker pools'
@@ -392,6 +426,387 @@ impl Invocation {
     #[must_use]
     pub fn faults(&self) -> &crate::test_hooks::FaultPlan {
         &self.0.faults
+    }
+}
+
+/// The transition word's layout: two bits of lifecycle state (only Open
+/// exists until the invocation can be sealed), a sticky saturation flag, the
+/// live [`Call`] guards and the live [`Permit`]s. A count at its field's
+/// maximum is not incremented: the flag is set and the capability goes
+/// uncounted, so a seal can never mistake a saturated count for a true one.
+mod word {
+    pub(super) const SATURATED: u64 = 1 << 2;
+    const GUARD_SHIFT: u32 = 3;
+    const GUARD_BITS: u32 = 30;
+    const PERMIT_SHIFT: u32 = GUARD_SHIFT + GUARD_BITS;
+    const PERMIT_BITS: u32 = 64 - PERMIT_SHIFT;
+    /// One guard.
+    pub(super) const GUARD: u64 = 1 << GUARD_SHIFT;
+    /// One permit.
+    pub(super) const PERMIT: u64 = 1 << PERMIT_SHIFT;
+
+    const fn shape(unit: u64) -> (u32, u64) {
+        if unit == GUARD {
+            (GUARD_SHIFT, (1 << GUARD_BITS) - 1)
+        } else {
+            (PERMIT_SHIFT, (1 << PERMIT_BITS) - 1)
+        }
+    }
+
+    /// The count in `unit`'s field of `word`.
+    pub(super) const fn field(word: u64, unit: u64) -> u64 {
+        let (shift, max) = shape(unit);
+        (word >> shift) & max
+    }
+
+    /// Whether `unit`'s field of `word` is at its maximum.
+    pub(super) const fn is_full(word: u64, unit: u64) -> bool {
+        field(word, unit) == shape(unit).1
+    }
+
+    #[cfg(test)]
+    pub(super) const fn max(unit: u64) -> u64 {
+        shape(unit).1
+    }
+}
+
+/// The kinds of issued value the census counts: every value of these kinds
+/// that crossed the API boundary to the caller and still exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A block iterator (`PipelinedBlocks`).
+    Session = 0,
+    /// A `PbfWriter`.
+    Writer = 1,
+    /// A bound output (`BoundOutput`, `BoundOutputDir`, `BoundOutputSet`).
+    Output = 2,
+    /// A pooled block handed to the caller.
+    Buffer = 3,
+}
+
+impl Kind {
+    const COUNT: usize = 4;
+}
+
+/// The transition word and census of an invocation, for tests.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Live call guards.
+    pub guards: u64,
+    /// Live permits.
+    pub permits: u64,
+    /// Whether a count saturated.
+    pub saturated: bool,
+    /// Issued block iterators alive.
+    pub session: u64,
+    /// Issued writers alive.
+    pub writer: u64,
+    /// Issued bound outputs alive.
+    pub output: u64,
+    /// Issued pooled blocks alive.
+    pub buffer: u64,
+}
+
+/// The recording interface of an invocation: every mutation of its state
+/// (counters, sink delivery and its failure latch, report-once keys, the
+/// publication log and its execution lock). Reachable only by borrowing a
+/// [`Call`] or a [`Permit`], so the compiler rejects a recorder that holds
+/// neither; the control handle, [`Invocation`], has none of it. Derefs to the
+/// handle for its reads.
+#[repr(transparent)]
+pub(crate) struct Recorder(Invocation);
+
+impl std::ops::Deref for Recorder {
+    type Target = Invocation;
+    #[inline]
+    fn deref(&self) -> &Invocation {
+        &self.0
+    }
+}
+
+impl Recorder {
+    /// The control handle.
+    #[inline]
+    pub(crate) fn handle(&self) -> &Invocation {
+        &self.0
+    }
+
+    /// Emit the phase marker `name` to the sink, if there is one.
+    #[inline]
+    pub(crate) fn marker(&self, name: &str) {
+        if self.0.0.sink.is_some() {
+            self.deliver(|sink| sink.marker(name));
+        }
+    }
+
+    /// Emit counter `name` with `value` to the sink, if there is one. The
+    /// wire value is an `i64`: signed values are sent exactly, unsigned ones
+    /// saturate at `i64::MAX` rather than wrap, so callers pass them as they
+    /// are instead of casting.
+    #[inline]
+    pub(crate) fn counter(&self, name: &str, value: impl crate::debug::CounterValue) {
+        if self.0.0.sink.is_some() {
+            let value = value.to_counter();
+            self.deliver(|sink| sink.counter(name, value));
+        }
+    }
+
+    /// Run `emit` against the sink with its unwinding contained: a sink that
+    /// panics is latched off for the rest of the invocation and the run
+    /// carries on, because instrumentation is observational and may neither
+    /// change a published result nor turn an unwind into an abort. The
+    /// caught payload is forgotten, not dropped: its destructor is caller
+    /// code too and could panic again. An emission already past the latch
+    /// when another thread's panics may still complete; later ones are
+    /// skipped. Panics that do not unwind (`panic = "abort"`, a panicking
+    /// panic hook) cannot be contained.
+    #[cold]
+    #[inline(never)]
+    fn deliver(&self, emit: impl FnOnce(&dyn crate::debug::InstrumentSink)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = &self.0.0;
+        let Some(sink) = state.sink.as_deref() else {
+            return;
+        };
+        if state.sink_failed.load(Relaxed) {
+            return;
+        }
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(sink)))
+        {
+            state.sink_failed.store(true, Relaxed);
+            std::mem::forget(payload);
+        }
+    }
+
+    /// The publication log, poison recovered: no mutation of it can unwind
+    /// half done (see [`crate::publication`]).
+    pub(crate) fn log(&self) -> std::sync::MutexGuard<'_, crate::publication::PublicationLog> {
+        self.0.log_guard()
+    }
+
+    /// The invocation's metric sets, for the recording sites. The borrow is
+    /// the capability's.
+    #[inline]
+    pub(crate) fn metrics(&self) -> &crate::counters::InvocationMetrics {
+        &self.0.0.metrics
+    }
+
+    /// Claim the once-per-invocation diagnostic `key`: `true` the first time
+    /// any part of this invocation asks (the caller then emits it), `false`
+    /// ever after, and after [`mark_reported`](Self::mark_reported). The
+    /// lock is released before the caller emits, so a slow diagnostic sink
+    /// never holds it.
+    pub(crate) fn first_report(&self, key: &'static str) -> bool {
+        self.0
+            .0
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+    }
+
+    /// Record that the once-per-invocation diagnostic `key` is already
+    /// covered, so a later `diag_once!` with that key under this invocation
+    /// stays silent. For a command that has just reported the same condition
+    /// in its own, more specific words.
+    pub(crate) fn mark_reported(&self, key: &'static str) {
+        self.first_report(key);
+    }
+
+    /// Serialize one publication of this invocation against any other: the
+    /// guard is held from before the decision until the row is finalized.
+    /// Caller code that runs under it (hooks, the instrument sink) publishing
+    /// under the same invocation is refused as re-entry, never waited on. A
+    /// poisoned lock is recovered: it guards no state, only exclusion.
+    pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .0
+            .publishing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A public entry's admission: held for the entry's extent, it keeps the
+/// invocation from sealing and lends the [`Recorder`]. Not `Clone`: a
+/// nested entry mints its own with [`Invocation::call`].
+pub(crate) struct Call {
+    rec: Recorder,
+    counted: bool,
+}
+
+impl std::ops::Deref for Call {
+    type Target = Recorder;
+    #[inline]
+    fn deref(&self) -> &Recorder {
+        &self.rec
+    }
+}
+
+impl Drop for Call {
+    #[inline]
+    fn drop(&mut self) {
+        if self.counted {
+            self.rec.0.retire(word::GUARD);
+        }
+    }
+}
+
+/// Permission to record outside a public call, held by a value that records
+/// through background work or its own `Drop`, past its last recording.
+/// Cloning mints another permit.
+pub(crate) struct Permit {
+    rec: Recorder,
+    counted: bool,
+}
+
+impl std::ops::Deref for Permit {
+    type Target = Recorder;
+    #[inline]
+    fn deref(&self) -> &Recorder {
+        &self.rec
+    }
+}
+
+impl Clone for Permit {
+    fn clone(&self) -> Self {
+        self.rec.0.permit()
+    }
+}
+
+impl Drop for Permit {
+    #[inline]
+    fn drop(&mut self) {
+        if self.counted {
+            self.rec.0.retire(word::PERMIT);
+        }
+    }
+}
+
+impl std::fmt::Debug for Permit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Permit").field(&self.rec.0).finish()
+    }
+}
+
+/// One issued value in its invocation's census, retired when the value
+/// ceases to exist.
+pub(crate) struct Ticket {
+    invocation: Invocation,
+    kind: Kind,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.invocation.census_adjust(self.kind, false);
+    }
+}
+
+impl std::fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Ticket").field(&self.kind).finish()
+    }
+}
+
+/// A [`Host`] entered by a public command: the host's facilities, and a
+/// [`Call`] admitting the command in place of the host's control handle.
+/// Inside a command `host.invocation` is that call, so recording compiles
+/// only on an entered host; a helper given a plain `&Host` cannot record.
+/// Derefs to the host it entered, so a nested public command takes it as a
+/// `&Host` and enters again.
+pub(crate) struct Entered<'h> {
+    host: &'h Host,
+    /// The command's admission, shadowing [`Host::invocation`].
+    pub(crate) invocation: Call,
+}
+
+impl std::ops::Deref for Entered<'_> {
+    type Target = Host;
+    #[inline]
+    fn deref(&self) -> &Host {
+        self.host
+    }
+}
+
+impl Host {
+    /// Admit a public command under this host's invocation.
+    #[inline]
+    pub(crate) fn enter(&self) -> Entered<'_> {
+        Entered {
+            host: self,
+            invocation: self.invocation.call(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn calls_and_permits_count_and_retire() {
+        let inv = Invocation::new();
+        let call = inv.call();
+        let permit = call.permit();
+        let again = permit.clone();
+        let c = inv.capabilities();
+        assert_eq!((c.guards, c.permits, c.saturated), (1, 2, false));
+        drop((call, permit, again));
+        assert_eq!(inv.capabilities(), Capabilities::default());
+    }
+
+    #[test]
+    fn tickets_count_by_kind() {
+        let inv = Invocation::new();
+        let a = inv.ticket(Kind::Buffer);
+        let b = inv.ticket(Kind::Writer);
+        let c = inv.capabilities();
+        assert_eq!((c.buffer, c.writer, c.session, c.output), (1, 1, 0, 0));
+        drop((a, b));
+        assert_eq!(inv.capabilities(), Capabilities::default());
+    }
+
+    /// A field at its maximum is not incremented: the sticky flag is set,
+    /// the capability goes uncounted, and retiring every counted one leaves
+    /// the flag in place.
+    #[test]
+    fn saturation_is_sticky_and_uncounted() {
+        use std::sync::atomic::Ordering::Relaxed;
+        for unit in [word::GUARD, word::PERMIT] {
+            let inv = Invocation::new();
+            inv.0.word.0.store(word::max(unit) * unit, Relaxed);
+            assert!(word::is_full(inv.0.word.0.load(Relaxed), unit));
+            let uncounted = if unit == word::GUARD {
+                inv.call().counted
+            } else {
+                inv.permit().counted
+            };
+            assert!(!uncounted);
+            let after = inv.0.word.0.load(Relaxed);
+            assert_eq!(word::field(after, unit), word::max(unit));
+            assert_ne!(after & word::SATURATED, 0);
+            for _ in 0..3 {
+                inv.retire(unit);
+            }
+            let c = inv.capabilities();
+            assert!(c.saturated, "saturation is never cleared");
+            assert_eq!(
+                word::field(inv.0.word.0.load(Relaxed), unit),
+                word::max(unit) - 3
+            );
+        }
+    }
+
+    #[test]
+    fn guard_and_permit_fields_do_not_overlap() {
+        let full = word::max(word::GUARD) * word::GUARD;
+        assert_eq!(word::field(full, word::PERMIT), 0);
+        assert_eq!(full & word::SATURATED, 0);
+        let permits = word::max(word::PERMIT) * word::PERMIT;
+        assert_eq!(word::field(permits, word::GUARD), 0);
+        assert_eq!(permits & word::SATURATED, 0);
     }
 }
 
@@ -814,6 +1229,18 @@ impl Host {
             invocation: Invocation::new(),
         }
     }
+
+    /// [`for_tests`](Self::for_tests), entered: what a unit test hands the
+    /// crate's internal helpers, which take an entered host. The host is
+    /// leaked, so the entry can outlive the expression that made it.
+    pub(crate) fn entered_for_tests() -> Entered<'static> {
+        Self::for_tests().entered_leaked()
+    }
+
+    /// This host, leaked and entered, for a unit test that built its own.
+    pub(crate) fn entered_leaked(self) -> Entered<'static> {
+        Box::leak(Box::new(self)).enter()
+    }
 }
 
 #[cfg(test)]
@@ -1016,7 +1443,7 @@ impl Diagnostics {
     /// later one, and any after [`Invocation::mark_reported`], stays silent.
     pub(crate) fn emit_once(
         &self,
-        invocation: &Invocation,
+        invocation: &Recorder,
         kind: EventKind,
         key: &'static str,
         args: std::fmt::Arguments<'_>,
@@ -1089,11 +1516,11 @@ mod diagnostic_tests {
         let sink = Arc::new(Sink::default());
         let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
         let other = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        let (first, second) = (Invocation::new(), Invocation::new());
+        let (first, second) = (Invocation::new().call(), Invocation::new().call());
         d.emit_once(&first, EventKind::Warning, "key", format_args!("first"));
         d.clone()
             .emit_once(&second, EventKind::Warning, "key", format_args!("second"));
-        let shared = first.clone();
+        let shared = first.handle().clone().call();
         other.emit_once(&shared, EventKind::Warning, "key", format_args!("again"));
         d.emit_once(&second, EventKind::Warning, "key", format_args!("again"));
         assert_eq!(*sink.0.lock().expect("sink"), ["first", "second"]);
@@ -1102,13 +1529,13 @@ mod diagnostic_tests {
     fn a_reported_key_silences_a_later_once_event() {
         let sink = Arc::new(Sink::default());
         let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        let invocation = Invocation::new();
+        let invocation = Invocation::new().call();
         invocation.mark_reported("key");
         d.emit_once(&invocation, EventKind::Note, "key", format_args!("note"));
         d.emit_once(&invocation, EventKind::Note, "other", format_args!("other"));
         // Another invocation is not covered by the first one's report.
         d.emit_once(
-            &Invocation::new(),
+            &Invocation::new().call(),
             EventKind::Note,
             "key",
             format_args!("fresh"),

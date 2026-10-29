@@ -100,7 +100,7 @@ pub(super) struct ScannerConfig<'a> {
 /// will see `Disconnected` on their reads and exit.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> Result<u64> {
+pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_>) -> Result<u64> {
     // Destructure so clippy sees us taking ownership of the channels,
     // which matters: the SyncSenders dropping at scanner exit is what
     // signals end-of-input to the worker pool and drain.
@@ -457,7 +457,9 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
 fn poll_barrier(
     rx: &mpsc::Receiver<()>,
     signalled: bool,
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Host,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Entered<
+        '_,
+    >,
 ) -> Result<()> {
     match rx.try_recv() {
         Ok(()) => Err(crate::Error::internal(
@@ -488,7 +490,7 @@ fn poll_barrier(
 fn wait_for_barrier(
     rx: &mpsc::Receiver<()>,
     #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] at_eof: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_START");
     #[cfg(feature = "test-hooks")]
@@ -518,7 +520,9 @@ fn wait_for_barrier(
 fn send_boundary(
     tx: &mpsc::SyncSender<DrainMessage>,
     last_node_seq: Option<u64>,
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Host,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Entered<
+        '_,
+    >,
 ) -> Result<()> {
     let node_end_seq = last_node_seq.map_or(0, |seq| seq + 1);
     #[cfg(feature = "test-hooks")]

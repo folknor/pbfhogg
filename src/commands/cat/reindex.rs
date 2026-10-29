@@ -61,7 +61,8 @@ pub fn reindex<'a>(
     write: &WriteOptions,
     host: &crate::host::Host,
 ) -> Result<ReindexStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let stats = reindex_to(input.into(), &output, write, host)?;
     output.publish()?;
@@ -72,7 +73,7 @@ fn reindex_to(
     source: InputSource<'_>,
     output: &crate::output::BoundOutput,
     write: &WriteOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ReindexStats> {
     let path = source.path();
     let mut frames = Frames::of_input(

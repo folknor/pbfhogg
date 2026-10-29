@@ -50,7 +50,7 @@ pub(super) fn relation_r1_collect_ids(
     source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     relation_id_set: &mut IdSet,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let counters = StageCounters::new();
     let mut buffers = BlobBuffers::default();
@@ -140,7 +140,7 @@ pub(super) fn relation_r2d_assembly(
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     ids: &RelationIdSpaces<'_>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<R2dResult> {
     let decode_threads = crate::host::sized_workers(
         &*host.resources,

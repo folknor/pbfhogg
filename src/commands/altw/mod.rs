@@ -376,7 +376,8 @@ pub fn add_locations_to_ways<'a>(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = add_locations_to_ways_to(input, &output, options, overrides, host, &scratch)?;
     drop(scratch);
@@ -392,7 +393,7 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     output: &crate::output::BoundOutput,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     options.validate()?;
@@ -588,7 +589,7 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 fn auto_select_backend(
     input: &PinnedInput,
     front: &mut InputFront<'_>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ResolvedBackend> {
     let sorted = front.is_sorted()?;
     let has_index = front.indexed()?;
@@ -683,7 +684,7 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// and not on a later one is refused by the walk.
 fn estimate_sparse_store_bytes(
     input: &PinnedInput,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Option<u64>> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let mut node_count: u64 = 0;
@@ -710,7 +711,7 @@ fn estimate_sparse_store_bytes(
 /// procfs. Unknown memory retains the conservative external fallback
 /// documented in reference/pipeline.md; small input alone cannot establish
 /// that its random-access store fits RAM.
-fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
+fn page_cache_budget_bytes(host: &crate::host::Entered<'_>) -> Option<u64> {
     host.resources
         .memory_available()
         .map(|b| b.saturating_sub(AUTO_ANON_HEADROOM_BYTES))
@@ -780,7 +781,7 @@ pub(super) mod inject_metrics {
 
         /// Emit the four injected-prepass counters. `member_ways` is the
         /// size of the relation member-way IdSet, computed by the caller.
-        pub(super) fn emit(&self, member_ways: u64, invocation: &crate::host::Invocation) {
+        pub(super) fn emit(&self, member_ways: u64, invocation: &crate::host::Recorder) {
             invocation.counter("altw_member_ways", member_ways);
             self.emit_all(invocation);
         }
@@ -853,7 +854,7 @@ pub(super) mod inject_metrics {
     }
 }
 
-fn emit_stats_counters(stats: &Stats, invocation: &crate::host::Invocation) {
+fn emit_stats_counters(stats: &Stats, invocation: &crate::host::Recorder) {
     invocation.counter("altw_nodes_read", stats.nodes_read);
     invocation.counter("altw_nodes_written", stats.nodes_written);
     invocation.counter("altw_nodes_dropped", stats.nodes_dropped);
@@ -892,7 +893,7 @@ fn collect_way_referenced_node_ids(
     input: &PinnedInput,
     _direct_io: bool,
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(IdSet, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
@@ -1011,7 +1012,7 @@ pub(crate) fn collect_relation_member_ids(
     _direct_io: bool,
     want_nodes: bool,
     want_ways: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Option<IdSet>, Option<IdSet>)> {
     // Every relation blob is decoded here, so its claim is held to what it
     // holds: a foreign kind by the pool (`KindClaims::Refuse`), range and
@@ -1086,7 +1087,7 @@ fn write_output_checked(
     write: &WriteOptions,
     indexdata_present: bool,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Stats> {
     // Backstop only: `AltwOptions::validate` refuses `force` with
     // `inject_prepass`, so an unindexed input is refused by the indexdata
@@ -1142,7 +1143,7 @@ fn write_output_decode_all(
     relation_member_node_ids: Option<&IdSet>,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
 
@@ -1331,17 +1332,18 @@ mod tests {
 
     #[test]
     fn route_uses_injected_memory_budget() {
-        let mut host = crate::host::Host::for_tests();
         for (memory, expected) in [
             (Some(32 * GB), ResolvedBackend::Sparse),
             (Some(8 * GB), ResolvedBackend::External),
             (Some(0), ResolvedBackend::External),
             (None, ResolvedBackend::External),
         ] {
+            let mut host = crate::host::Host::for_tests();
             host.resources = std::sync::Arc::new(crate::host::Fixed {
                 parallelism: None,
                 memory_available: memory,
             });
+            let host = host.entered_leaked();
             assert_eq!(
                 route_sorted_indexed(Some(18_750_000_000), super::page_cache_budget_bytes(&host)),
                 expected,

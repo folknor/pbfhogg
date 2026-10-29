@@ -188,7 +188,8 @@ pub fn build_geocode_index(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
-    let output = output.0.bind(&host.invocation);
+    let host = &host.enter();
+    let output = output.0.bind_unissued(&host.invocation);
     host.invocation.check()?;
     let stats = build_geocode_index_to(config, &output, host, scratch)?;
     output.publish()?;
@@ -202,7 +203,7 @@ pub fn build_geocode_index(
 fn build_geocode_index_to(
     config: &BuildConfig,
     output: &crate::output::BoundOutputDir,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
     config.validate()?;
@@ -356,7 +357,7 @@ pub fn index_output_with_staging(
 fn build_generation(
     config: &BuildConfig,
     output_dir: &std::path::Path,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
     // Pass 2a pread worker pool: PrimitiveBlock Vec<u8>s allocated on

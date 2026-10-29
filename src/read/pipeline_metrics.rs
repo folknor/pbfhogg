@@ -108,7 +108,7 @@ impl PipelineMetrics {
 
     /// Emit the invocation totals so far (see the module docs), after every
     /// `run_pipeline` has joined its stages.
-    pub fn emit(&self, invocation: &crate::host::Invocation) {
+    pub fn emit(&self, invocation: &crate::host::Recorder) {
         self.emit_all(invocation);
     }
 }
@@ -172,7 +172,7 @@ impl DecompressPoolMetrics {
 /// Only `crate::read::emit_read_counters` calls this.
 pub(crate) fn emit_decompress_pool_counters(
     metrics: &DecompressPoolMetrics,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) {
     metrics.emit_all(invocation);
 }

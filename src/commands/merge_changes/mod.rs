@@ -148,7 +148,8 @@ pub fn merge_changes(
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_changes_to(
         inputs,
@@ -170,7 +171,7 @@ pub(crate) fn merge_changes_to(
     simplify: bool,
     parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<MergeChangesStats> {
     // Gzip or plain XML is decided by the name the caller chose (never the
     // staging name), and a name that is neither is refused before any work.
@@ -275,7 +276,7 @@ pub(crate) fn merge_changes_to(
 /// observes inputs in sequence order.
 fn build_simplify_stream(
     inputs: &[&Path],
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> crate::Result<ChangeStream> {
     if inputs.len() <= 1 {
         let mut stream = ChangeStream::default();
@@ -324,7 +325,7 @@ fn build_simplify_stream(
 fn parse_one_into_stream(
     path: &Path,
     stream: &mut ChangeStream,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
         cancel.counter("merge_changes_input_bytes", meta.len());
@@ -493,7 +494,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
 fn parse_osc_into(
     path: &Path,
     stream: &mut ChangeStream,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(StreamDest { stream });
     // Deliberately use the shared historical per-file decompression counter.
@@ -579,7 +580,7 @@ fn write_streaming(
     output: &crate::output::BoundOutput,
     is_gz: bool,
     executor: crate::host::ExecutorRef<'_>,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<u64> {
     cancel.counter(
         "merge_changes_buffered_strategy",
@@ -680,7 +681,7 @@ fn write_streaming(
 fn emit_member(
     path: &Path,
     is_gz: bool,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> crate::Result<(Vec<u8>, u64)> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
@@ -715,7 +716,7 @@ fn emit_members_ordered(
     inputs: &[&Path],
     is_gz: bool,
     window: usize,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
     mut drain: impl FnMut(Vec<u8>, u64) -> crate::Result<()> + Send,
 ) -> crate::Result<()> {
     if inputs.is_empty() {
@@ -823,7 +824,7 @@ fn parse_osc_streaming<W: io::Write>(
     writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     count: &mut u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(WriterDest {
         writer,
@@ -905,7 +906,7 @@ fn write_simplified(
     stream: ChangeStream,
     worker_count: usize,
     allow_version_regression: bool,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<usize> {
     cancel.check()?;
     cancel.marker("MERGECHANGES_SIMPLIFY_START");
@@ -1115,7 +1116,7 @@ mod tests {
                     &mut writer,
                     &mut action,
                     &mut count,
-                    &crate::host::Invocation::new(),
+                    &crate::host::Invocation::new().call(),
                 )?;
                 if let Some(action) = action {
                     writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;
@@ -1136,7 +1137,7 @@ mod tests {
                     false,
                     crate::host::Parallelism::from_jobs(jobs),
                     false,
-                    &crate::host::Host::for_tests(),
+                    &crate::host::Host::entered_for_tests(),
                 )?;
                 assert_eq!(
                     std::fs::read(output)?,
@@ -1187,7 +1188,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
         assert!(
@@ -1227,7 +1228,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
         assert!(
@@ -1269,7 +1270,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .unwrap();
         assert_eq!(stats.changes_out, 1);

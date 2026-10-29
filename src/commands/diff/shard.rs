@@ -85,7 +85,7 @@ pub(super) struct WalkedPair {
 pub(super) fn walk_pair<'a, 'b>(
     old_source: impl Into<InputSource<'a>>,
     new_source: impl Into<InputSource<'b>>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<WalkedPair> {
     let old = walk_file(old_source.into(), host)?;
     let new = walk_file(new_source.into(), host)?;
@@ -105,7 +105,7 @@ struct RawWalk {
     file: Arc<std::fs::File>,
 }
 
-fn walk_file(source: InputSource<'_>, host: &crate::host::Host) -> Result<RawWalk> {
+fn walk_file(source: InputSource<'_>, host: &crate::host::Entered<'_>) -> Result<RawWalk> {
     let mut walker = HeaderWalker::open(source, host)?;
     let mut in_file_order: Vec<BlobDesc> = Vec::new();
     let mut has_negative = false;

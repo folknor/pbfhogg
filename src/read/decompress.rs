@@ -39,9 +39,12 @@ thread_local! {
 /// the `Bytes` (and the `PrimitiveBlock` holding slices of it) is dropped.
 pub(crate) struct DecompressPool {
     buffers: Mutex<Vec<Vec<u8>>>,
-    /// The invocation whose `pipeline_decompress_pool_*` counters this pool's
-    /// drops count into, also for a buffer returned after the call ended.
-    invocation: crate::host::Invocation,
+    /// The pool permit of the invocation whose `pipeline_decompress_pool_*`
+    /// counters this pool's drops count into, also for a buffer returned
+    /// after the call ended. Every `PooledBuffer`'s `Arc` to the pool keeps it
+    /// alive until the last buffer has returned and recorded, so no
+    /// per-buffer work touches the invocation's transition word.
+    permit: crate::host::Permit,
 }
 
 impl DecompressPool {
@@ -50,7 +53,7 @@ impl DecompressPool {
     pub fn new(invocation: &crate::host::Invocation) -> Arc<Self> {
         Arc::new(Self {
             buffers: Mutex::new(Vec::new()),
-            invocation: invocation.clone(),
+            permit: invocation.permit(),
         })
     }
 
@@ -72,7 +75,7 @@ impl DecompressPool {
     /// Also enforces a count cap as defense-in-depth.
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
-        let metrics = &self.invocation.metrics().decompress;
+        let metrics = &self.permit.metrics().decompress;
         if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
             metrics.record_oversize_drop(capacity);
             return;
@@ -566,7 +569,7 @@ mod tests {
 
     #[test]
     fn pooled_buffer_reserves_the_requested_capacity() {
-        let pool = DecompressPool::new(&crate::host::Invocation::new());
+        let pool = DecompressPool::new(&crate::host::Invocation::new().call());
         let buffer = Vec::with_capacity(1024);
         let previous_capacity = buffer.capacity();
         pool.put(buffer);
@@ -594,10 +597,19 @@ mod tests {
         pool.put(Vec::with_capacity(
             DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1,
         ));
-        let ours = &ours.metrics().decompress;
+        let ours_call = ours.call();
+        let ours = &ours_call.metrics().decompress;
         assert_eq!(ours.oversize_drops.load(Relaxed), 1);
         assert!(ours.oversize_drop_capacity_bytes.load(Relaxed) > 0);
-        assert_eq!(other.metrics().decompress.oversize_drops.load(Relaxed), 0);
+        assert_eq!(
+            other
+                .call()
+                .metrics()
+                .decompress
+                .oversize_drops
+                .load(Relaxed),
+            0
+        );
     }
 
     /// Build a `WireBlob` whose *decompressed* payload is exactly `payload`.

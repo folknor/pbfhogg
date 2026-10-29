@@ -45,7 +45,7 @@ impl UnindexedFilterNote {
         &mut self,
         blob_result: &crate::error::Result<crate::blob::Blob>,
         diagnostics: &crate::host::Diagnostics,
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) {
         if !self.pending {
             return;
@@ -398,7 +398,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
 fn drain_decoded<T, F>(
     decoded_rx: Receiver<DecodedItem<T>>,
     decode_ahead: usize,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
     consume: &mut F,
 ) -> Result<()>
 where
@@ -505,6 +505,7 @@ where
 #[hotpath::measure]
 pub(crate) fn run_pipeline<R, X, F>(
     mut blob_reader: BlobReader<R>,
+    rec: &crate::host::Recorder,
     decode_thread_count: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
@@ -531,14 +532,18 @@ where
     blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA || refuse_kinds);
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
-    let cancel = blob_reader.cancel_token().clone();
+    // The capability the caller runs the read under (a reader method's call,
+    // a block iterator thread's permit), borrowed by every stage through
+    // teardown. Stage 1 walks without a call of its own, so a read blocked
+    // in a caller's stream holds no admission.
+    let cancel = rec;
     // Borrowed into the decode tasks; the dispatcher closure moves the
     // reference, not the token.
     #[cfg(feature = "test-hooks")]
     let faults = cancel.faults();
     let metrics: &PipelineMetrics = &cancel.metrics().pipeline;
     // The decode pool's buffers count their drops into the same invocation.
-    let invocation = &cancel;
+    let invocation = cancel;
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) =
         sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
@@ -548,7 +553,7 @@ where
     let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
-            for (seq, blob_result) in blob_reader.enumerate() {
+            for (seq, blob_result) in std::iter::from_fn(|| blob_reader.next_blob()).enumerate() {
                 unindexed.observe(&blob_result, &diagnostics, invocation);
                 let t_send = crate::counters::Stopwatch::start();
                 let send_result = raw_tx.send((seq, blob_result));
@@ -687,7 +692,7 @@ where
         drain_decoded(
             decoded_rx,
             pipeline_config.decode_ahead.get(),
-            &cancel,
+            cancel,
             &mut consume,
         )
     });
@@ -705,7 +710,7 @@ where
 /// scope has joined its stages, whether the run returned or unwound. The same
 /// mechanism as the ordered pool engine's and the unordered classify pools'
 /// guards.
-struct EmitOnDrop<'a>(&'a PipelineMetrics, &'a crate::host::Invocation);
+struct EmitOnDrop<'a>(&'a PipelineMetrics, &'a crate::host::Recorder);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {

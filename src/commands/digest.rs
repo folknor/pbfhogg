@@ -196,6 +196,7 @@ pub fn digest<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Digest> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation
         .decided(|| digest_inner(input, form, direct_io, host))
@@ -205,7 +206,7 @@ fn digest_inner(
     input: InputSource<'_>,
     form: Form,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Digest> {
     let path = input.path();
     // The one open of the input. The leading-header rule (domain rule 1) is

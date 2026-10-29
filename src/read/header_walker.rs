@@ -61,7 +61,7 @@ pub(crate) enum ScanArm {
 /// the frame-size mean: only OSMData frame bytes predict OSMData count.
 pub(crate) fn estimate_blob_count<'a>(
     input: impl Into<crate::read::input::InputSource<'a>>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<BlobCountEstimate> {
     let source = input.into();
     let path = source.path();
@@ -333,7 +333,7 @@ impl HeaderWalker {
     /// with [`Self::open_direct`] instead, giving that residency up.
     pub(crate) fn open<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
@@ -390,7 +390,7 @@ impl HeaderWalker<crate::read::direct_reader::DirectPositional> {
     /// (its reads share one aligned scratch buffer).
     pub(crate) fn open_direct<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
@@ -432,7 +432,7 @@ fn stat_size(file: &std::fs::File, path: &Path) -> Result<u64> {
 impl<P: Positional> HeaderWalker<P> {
     /// A walk from the start of `file`, whose size was captured as
     /// `file_size`.
-    fn over(file: Arc<P>, file_size: u64, path: &Path, host: &crate::host::Host) -> Self {
+    fn over(file: Arc<P>, file_size: u64, path: &Path, host: &crate::host::Entered<'_>) -> Self {
         let source = PreadSource {
             file: Arc::clone(&file),
             pos: 0,
@@ -474,16 +474,16 @@ impl<P: Positional> HeaderWalker<P> {
             return;
         }
         self.reported_unindexed_filter = true;
+        // Once per walk, nested under the command that runs the walk.
+        let call = self.frames.cancel_token().call();
         crate::host::diag_once!(
             self.diagnostics,
-            self.frames.cancel_token(),
+            &call,
             Note,
             "reader.filter_without_indexdata",
             "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"
         );
-        self.frames
-            .cancel_token()
-            .counter("schedule_filter_without_indexdata", 1);
+        call.counter("schedule_filter_without_indexdata", 1);
     }
 
     /// The path this walker was opened from. Workers that decode blobs the
@@ -603,7 +603,7 @@ pub(crate) mod tests {
     /// Open a walk of `path` (`O_DIRECT` when `direct`), then grow the file
     /// by a copy of itself or cut its last ten bytes, then walk it.
     fn walk_after_change(path: &std::path::Path, direct: bool, grow: bool) -> super::Result<usize> {
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let intact = std::fs::read(path)?;
         let change = || {
             if grow {
@@ -678,7 +678,7 @@ pub(crate) mod tests {
         }
         let path = dir.path().join("walk.pbf");
         write_index_pattern(&path, &[true, false, true, true, false]);
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         // The fixture is partially indexed on purpose (metas with and without
         // an index); the walks compared here are the transports, not the
         // command-input policy.
@@ -770,7 +770,8 @@ pub(crate) mod tests {
         let host = crate::host::Host {
             diagnostics,
             ..crate::host::Host::for_tests()
-        };
+        }
+        .entered_leaked();
         let mut first = super::HeaderWalker::open(&path, &host).expect("walker");
         first.observe_filter_index(Some(&index));
         assert!(sink.0.lock().expect("sink").is_empty());
@@ -791,7 +792,7 @@ pub(crate) mod tests {
     fn open_preserves_not_found_error_kind() {
         let scratch = crate::path_guard::tests::scratch();
         let missing = scratch.path().join("missing.pbf");
-        let result = super::HeaderWalker::open(&missing, &crate::host::Host::for_tests());
+        let result = super::HeaderWalker::open(&missing, &crate::host::Host::entered_for_tests());
 
         match result {
             Ok(_) => panic!("opening a missing file must fail"),
@@ -849,7 +850,7 @@ pub(crate) mod tests {
     }
 
     fn walk_all(path: &std::path::Path, refusing: bool) -> super::Result<usize> {
-        let mut walker = super::HeaderWalker::open(path, &crate::host::Host::for_tests())?;
+        let mut walker = super::HeaderWalker::open(path, &crate::host::Host::entered_for_tests())?;
         if !refusing {
             walker = walker.accepting_partial_index();
         }
@@ -891,8 +892,8 @@ pub(crate) mod tests {
         // The refusal ends the walk: it does not resume at the next frame.
         let path = dir.path().join("partial-stop.pbf");
         write_index_pattern(&path, &[true, false, true]);
-        let mut walker =
-            super::HeaderWalker::open(&path, &crate::host::Host::for_tests()).expect("walker");
+        let mut walker = super::HeaderWalker::open(&path, &crate::host::Host::entered_for_tests())
+            .expect("walker");
         while let Ok(Some(_)) = walker.next_header() {}
         assert!(walker.next_header().is_err(), "a refused walk resumed");
 
@@ -924,7 +925,8 @@ pub(crate) mod tests {
         let good = std::fs::read(&base).expect("read fixture");
 
         let count_headers = |path: &std::path::Path| -> super::Result<usize> {
-            let mut walker = super::HeaderWalker::open(path, &crate::host::Host::for_tests())?;
+            let mut walker =
+                super::HeaderWalker::open(path, &crate::host::Host::entered_for_tests())?;
             let mut n = 0;
             while walker.next_header()?.is_some() {
                 n += 1;
@@ -995,7 +997,8 @@ pub(crate) mod tests {
         let header_only = dir.path().join("header-only.pbf");
         write_fixture(&header_only, false);
         assert_eq!(
-            estimate_blob_count(&header_only, &crate::host::Host::for_tests()).expect("estimate"),
+            estimate_blob_count(&header_only, &crate::host::Host::entered_for_tests())
+                .expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 0,
                 exact: true,
@@ -1005,7 +1008,8 @@ pub(crate) mod tests {
         let one_block = dir.path().join("one-block.pbf");
         write_fixture(&one_block, true);
         assert_eq!(
-            estimate_blob_count(&one_block, &crate::host::Host::for_tests()).expect("estimate"),
+            estimate_blob_count(&one_block, &crate::host::Host::entered_for_tests())
+                .expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 1,
                 exact: true,
@@ -1018,7 +1022,7 @@ pub(crate) mod tests {
         let dir = crate::path_guard::tests::scratch();
         let empty = dir.path().join("empty.pbf");
         std::fs::File::create(&empty).expect("create empty file");
-        assert!(estimate_blob_count(&empty, &crate::host::Host::for_tests()).is_err());
+        assert!(estimate_blob_count(&empty, &crate::host::Host::entered_for_tests()).is_err());
     }
 
     #[test]
@@ -1058,7 +1062,7 @@ pub(crate) mod tests {
         writer.flush().expect("flush fixture");
 
         let estimate =
-            estimate_blob_count(&mixed, &crate::host::Host::for_tests()).expect("estimate");
+            estimate_blob_count(&mixed, &crate::host::Host::entered_for_tests()).expect("estimate");
         assert!(!estimate.exact);
         let error = estimate.osmdata_blobs.abs_diff(actual_blobs);
         assert!(

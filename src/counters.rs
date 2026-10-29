@@ -113,7 +113,7 @@ macro_rules! counter_set {
 
             /// Emit every counter to `invocation`'s sink, in declaration
             /// order.
-            fn emit_all(&self, invocation: &$crate::host::Invocation) {
+            fn emit_all(&self, invocation: &$crate::host::Recorder) {
                 if invocation.instrumented() {
                     self.for_each(|name, value| invocation.counter(name, value));
                 }
@@ -367,8 +367,9 @@ pub(crate) struct StallGauge {
     start_marker: &'static str,
     end_marker: &'static str,
     depth: std::sync::Mutex<u64>,
-    /// The invocation whose sink receives the span.
-    invocation: crate::host::Invocation,
+    /// The invocation whose sink receives the span: a permit, since a
+    /// guard can end the span from a worker's `Drop`.
+    invocation: crate::host::Permit,
 }
 
 /// RAII exit for [`StallGauge::track`]; decrements depth on drop so
@@ -379,13 +380,13 @@ impl StallGauge {
     pub(crate) fn new(
         start_marker: &'static str,
         end_marker: &'static str,
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) -> Self {
         Self {
             start_marker,
             end_marker,
             depth: std::sync::Mutex::new(0),
-            invocation: invocation.clone(),
+            invocation: invocation.permit(),
         }
     }
 

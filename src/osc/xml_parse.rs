@@ -355,7 +355,7 @@ pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
 /// decompression, or file reads alone for plain XML).
 pub(crate) fn open_osc_reader(
     path: &Path,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> ParseResult<(OscReader, Rc<Cell<u64>>)> {
     let mut file = crate::read::input::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
@@ -381,13 +381,13 @@ pub(crate) fn open_osc_reader(
         Box::new(TimedRead {
             inner: MultiGzDecoder::new(file),
             total: Rc::clone(&total),
-            cancel: cancel.clone(),
+            cancel: cancel.handle().clone(),
         })
     } else {
         Box::new(TimedRead {
             inner: file,
             total: Rc::clone(&total),
-            cancel: cancel.clone(),
+            cancel: cancel.handle().clone(),
         })
     };
     let mut reader = Reader::from_reader(BufReader::new(inner));
@@ -592,7 +592,7 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
 pub(crate) fn parse_osc_path<S: OscSink>(
     path: &Path,
     sink: &mut S,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> ParseResult<()> {
     let (mut reader, decompress_total) = open_osc_reader(path, cancel)?;
     let result = drive_osc(&mut reader, sink, path);

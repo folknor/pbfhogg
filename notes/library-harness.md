@@ -67,13 +67,13 @@ a certification under `v1` holds for `v1` only.
   landed; see the landing list.
 - L2, the harness skeleton, has landed; see the landing list. It reports
   every seal refused until L4.
-- L3 and L4 are the seal (Decision A and C). They are the largest and are
-  candidates for a chain under one design document, which is the user's
-  call.
+- L3, Decision A's capabilities, has landed; see the landing list. L4 is
+  the seal itself (Decision A's states and finalization, and Decision C),
+  a separate item, not a chain.
 
 **bz state:**
-- **pbfhogg#31** still describes the superseded general seal contract.
-  Rewrite it to Decision A when L3 or L4 starts.
+- **pbfhogg#31** was rewritten to Decision A's whole contract at L3; L4
+  closes it.
 - **#32, #34, #35 and #36** are open and map to the landings. #33 (L1) is
   closed. #37 (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
@@ -155,14 +155,16 @@ a certification under `v1` holds for `v1` only.
      records through its writes.
    - `RunScratch` reports diagnostics at cleanup.
    - Bound outputs keep their `Completion` after their writer is gone.
-6. **Access to invocation state.**
+6. **Access to invocation state** (since L3).
    - `Invocation` is `Arc<InvocationState>`, and `InvocationState` is
-     private.
-   - `src/` holds no `Weak` and no `Arc` of a metrics type.
-   - `metrics()` returns a borrow of `&self`.
-   - About 40 internal sites clone the invocation.
-   - `Invocation::deliver` forgets caught panic payloads, so a payload
-     holding an `Invocation` is retained forever.
+     private. The handle carries identity and reads only.
+   - Every mutation is on the crate-private `Recorder`, reached only by
+     borrowing a `Call` or a `Permit`; `metrics()` borrows from that
+     capability. `src/` holds no `Weak` and no `Arc` of a metrics type.
+   - Internal holders store a `Permit` where they record outside a call and
+     the handle where they only read.
+   - The sink's caught panic payloads are forgotten, so a payload holding
+     an `Invocation` (or a permit) is retained forever.
 7. **Generic inputs.** `ElementReader::new` takes any `Read` and no
    `Host`. A `PipelinedBlocks` background thread can block forever in
    `BlobReader::next` on a caller-supplied stream.
@@ -341,6 +343,51 @@ resolved.
   denmark on a command that uses the block API.
 - **Liveness of drop.** Dropping a `PipelinedBlocks` blocked in a caller's
   `Read` still blocks. Document it as the caller's obligation.
+
+**Settled by L3's implementation spar** (what the code does; the items
+above that L3 did not settle are listed as residue in the landing list):
+- **The proof.** `Recorder` (crate-private, never owned outside the
+  capability types, not `Clone`) carries every mutation: `marker`,
+  `counter`, the sink and its latch, `metrics`, the report-once keys, the
+  publication log and execution lock. `Call` and `Permit` deref to it; the
+  handle has none of it. `Diagnostics::emit_once` takes a `Recorder`.
+- **Commands** enter: `let host = &host.enter()` at every public command
+  gives an `Entered` whose `invocation` field is the command's `Call`,
+  shadowing `Host::invocation`; internal helpers take `&Entered`. A nested
+  public command takes the `Entered` as `&Host` and enters again.
+- **The word**: 2 bits state (only Open exists), a sticky saturation bit,
+  30 bits guards, 31 bits permits. A mint at a full field sets the bit and
+  yields an uncounted capability that never decrements. Minting is
+  infallible in L3; L4 makes `call` fallible at the mint sites.
+- **Internal walks never hold a call across a caller's stream.** Public
+  `BlobReader::next` mints; the library's walks use `next_blob` under their
+  enclosing capability, and `run_pipeline` borrows the caller's `Recorder`
+  through teardown. A `PipelinedBlocks` thread holds a permit of its own to
+  its last act; the session holds the census ticket and records nothing.
+- **Cold recordings under read-only holders** (failed `fadvise`, the
+  unrecognised-indexdata warning, the unindexed-filter note) mint a nested
+  call on the spot; every such site runs under an enclosing capability.
+- **Issuance by actual visibility.** Public constructors, `new_in`,
+  `BoundOutput::pbf_writer`, public `bind` and `bind_to`, `PipelinedBlocks`
+  and blocks returned by `next` or passed to the
+  `for_each_block_pipelined` callback are issued; commands bind through
+  `sealed::Bind::bind_unissued`, which takes an unconstructible
+  `sealed::Internal` key, write through `pbf_writer_unissued` and
+  `PbfWriter::with_permit`, and read through `for_each_own_block_pipelined`.
+  An already-bound value keeps its one ticket. `for_each_pipelined` lends
+  elements only and issues nothing.
+- **Admission is on the value's invocation**, and a public method that can
+  tear the value down keeps its call through that teardown (`into_inner`
+  and a refused `bind_to` move `self` into a local declared after the
+  call).
+- **Drop order.** A block's ticket is declared after its buffer, an
+  owner's ticket after its `Enlisted`, a writer's after its permit:
+  recordings and decisions happen before the count retires. `Enlisted`
+  mints its permit, then enlists, then becomes the guard.
+- **The census list** is `session`, `writer`, `output`, `buffer`.
+  `OutputWriter`, `DirWriter`, an idle `ElementReader` or `BlobReader`, a
+  `RunScratch` and the never-issued `FileWriter` hold no permit and no
+  ticket. `OutputWriter`'s `Write` methods record nothing and take no call.
 
 ## Decision B: publication decisions and cancel (#33) (landed as L1)
 
@@ -687,17 +734,42 @@ Landed independently, 2026-10-29:
     `HOTPATH_OUTPUT_PATH` set and drops after `scenario.json`.
     `repeat-cat` has two calls, so it is not `hotpath: true`; profiling
     is first exercised by an L5 single-call scenario.
-  - Residue for L3/L4: replace the seal stub with `seal()`,
+  - Residue for L4 (L3 did not need the stub): replace it with `seal()`,
     `with_call_sink` and the stream account (the drop count moves into
     it). For L5: a `hotpath` scenario's setup may not build generated
     inputs with library writers. Lateral: `Cargo.lock` is gitignored, so
     the resolved dependency graph is not part of a measurement's
     identity.
 
+- L3, Decision A's capabilities: the commit that carries this line. Control
+  handle, `Recorder` behind `Call` and `Permit`, the transition word (Open
+  only), census tickets, the pool permit; admission always succeeds. Its
+  implementation choices are listed under Decision A. Gate: `brokkr check`
+  with `tests/cancel.rs` (capabilities back to zero after every command at
+  every tripped checkpoint; no command issues its own values; sort's nested
+  `sort_with` mints its own guard) and `tests/capabilities.rs` (a block
+  iterator parked in the caller's stream holds a permit and its session
+  ticket and no guard; exhausted, the ticket only; kept blocks the pool's
+  permit and one ticket each; a writer nested in a caller's writer; bound
+  outputs issued once, and decided by a cancel before their counts
+  retire). Cost: one matched denmark pair of `brokkr write` (call guards on
+  `BlobReader::next` and the `PbfWriter` write methods), no cost; numbers in
+  `reference/performance.md`. Residue for L4:
+  - every mint site (`Invocation::call` and `permit`, `Host::enter`, the
+    cold nested mints) becomes fallible or provably nested; the cold
+    sites take a handle today and should borrow their enclosing `Recorder`
+    once refusal exists;
+  - `seal()` reads saturation before the zero counts (saturated refuses);
+  - the publication-ordering obligation: retirement is already `Release`,
+    the finalizing CAS must `Acquire`;
+  - forgotten sink panic payloads that hold a permit veto seal forever, as
+    item 8 says.
+  Lateral: no brokkr command issues blocks in bulk, so the census lock per
+  issued block has no bulk measurement (see `reference/performance.md`).
+
 | # | Landing | Gate |
 |---|---|---|
-| L3 | Decision A's capabilities: control handle, `Call` and `Permit`, the transition word Open-only, census tickets, the pool permit. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: guards and permits back to 0 after every command and drop; a held `PipelinedBlocks` blocked on a caller stream holding a permit and a ticket and no guard; a nested entry minting normally; `Refused(Unticketed)` impossible in a quiescent run |
-| L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier; block-API cost on one matched denmark pair. `brokkr library repeat-cat --dataset denmark` passes |
+| L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, fallible admission at L3's mint sites, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier, with one matched denmark pair if it adds success-path work (L3 measured its own). `brokkr library repeat-cat --dataset denmark` passes |
 | L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
 | L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
 | L7 | #36 reserving descriptor provider (needed by the concurrent scenarios) | per landing |

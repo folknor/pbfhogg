@@ -90,6 +90,7 @@ impl FileReader {
     /// ([`BlobReader::invocation`](crate::BlobReader::invocation)), or the
     /// count lands where nobody reads it. The reader holds no token itself.
     pub fn buffered_in(path: &Path, invocation: &crate::host::Invocation) -> Result<Self> {
+        let _call = invocation.call();
         Self::buffered_from(InputSource::Path(path), invocation)
     }
 
@@ -146,6 +147,7 @@ impl FileReader {
         direct: bool,
         invocation: &crate::host::Invocation,
     ) -> Result<Self> {
+        let _call = invocation.call();
         let source = source.into();
         if direct {
             #[cfg(feature = "linux-direct-io")]
@@ -250,7 +252,7 @@ mod tests {
         std::fs::write(&path, b"bytes").unwrap();
         let before = attempts(Advice::Sequential);
         let _reader =
-            super::FileReader::buffered_in(&path, &crate::host::Invocation::new()).unwrap();
+            super::FileReader::buffered_in(&path, &crate::host::Invocation::new().call()).unwrap();
         assert_eq!(
             attempts(Advice::Sequential),
             before + 1,

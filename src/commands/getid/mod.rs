@@ -265,6 +265,7 @@ pub fn parse_ids_from_pbf<'a>(
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<ElementIds> {
+    let host = &host.enter();
     let mut set = ElementIds::empty();
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
@@ -413,7 +414,8 @@ pub fn getid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
     output.publish()?;
@@ -429,7 +431,7 @@ pub(crate) fn getid_to<'a>(
     opts: &GetidOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     let (_, stats) = getid_dispatched(
         input,
@@ -457,7 +459,7 @@ fn getid_dispatched<'a>(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     // Refused before the input is touched: without `add_referenced` no
     // referenced object is emitted, so there is nothing to strip tags from.
@@ -546,7 +548,8 @@ pub fn removeid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = removeid_to(input, &output, ids, write, overrides, host)?;
     output.publish()?;
@@ -561,7 +564,7 @@ pub(crate) fn removeid_to<'a>(
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     // The probe and the walk each open the input; see `getid_dispatched`.
     let pin = input.into().pin(host)?;
@@ -621,7 +624,7 @@ fn filter_by_id(
     overrides: &HeaderOverrides,
     arm: ScanArm,
     report_found: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     match arm {
         ScanArm::Walker => filter_by_id_walker(
@@ -657,7 +660,7 @@ fn filter_by_id_walker(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
@@ -872,7 +875,7 @@ fn filter_by_id_streaming(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::file_reader::FileReader;
@@ -1028,7 +1031,7 @@ fn getid_with_refs(
     opts: &GetidOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -1556,7 +1559,7 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    fn read_ids(path: &Path, host: &crate::host::Host) -> Vec<i64> {
+    fn read_ids(path: &Path, host: &crate::host::Entered<'_>) -> Vec<i64> {
         let mut found = Vec::new();
         ElementReader::open_in(path, false, host)
             .unwrap()
@@ -1589,7 +1592,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let staged = staged.bind(&host.invocation);
         getid_with_refs(
             &PinnedInput::pin(&input, &host).unwrap(),
@@ -1603,7 +1606,7 @@ mod tests {
         .unwrap();
         staged.publish().unwrap();
         assert_eq!(
-            read_ids(&output, &crate::host::Host::for_tests()),
+            read_ids(&output, &crate::host::Host::entered_for_tests()),
             vec![1, 2, 10]
         );
     }
@@ -1622,7 +1625,7 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("partial.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), false);
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let pin = PinnedInput::pin(&input, &host).unwrap();
         let refused = |label: &str, result: Result<()>| {
             let err = result.expect_err(label);
@@ -1668,7 +1671,11 @@ mod tests {
 
     /// Run the same include-mode query under both arms, assert they emit
     /// identical element sets, and return that common (sorted) ID list.
-    fn ids_from_both_arms(input: &Path, query: &[&str], host: &crate::host::Host) -> Vec<i64> {
+    fn ids_from_both_arms(
+        input: &Path,
+        query: &[&str],
+        host: &crate::host::Entered<'_>,
+    ) -> Vec<i64> {
         let dir = crate::path_guard::tests::scratch();
         let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
         let query = parse_ids(&query).unwrap();
@@ -1708,7 +1715,11 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         assert_eq!(
-            ids_from_both_arms(&input, &["n1", "w10"], &crate::host::Host::for_tests()),
+            ids_from_both_arms(
+                &input,
+                &["n1", "w10"],
+                &crate::host::Host::entered_for_tests()
+            ),
             vec![1, 10]
         );
     }
@@ -1718,7 +1729,10 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
-        assert!(ids_from_both_arms(&input, &["n999"], &crate::host::Host::for_tests()).is_empty());
+        assert!(
+            ids_from_both_arms(&input, &["n999"], &crate::host::Host::entered_for_tests())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1727,7 +1741,7 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], None, true);
         assert_eq!(
-            ids_from_both_arms(&input, &["n2"], &crate::host::Host::for_tests()),
+            ids_from_both_arms(&input, &["n2"], &crate::host::Host::entered_for_tests()),
             vec![2]
         );
     }
@@ -1755,6 +1769,7 @@ mod tests {
             report_found: false,
         };
         let run = |output: &Path, host: &crate::host::Host, direct: bool| {
+            let host = &host.enter();
             let staged = crate::output::Output::new(
                 output,
                 crate::output::Overwrite::Replace,
@@ -1788,7 +1803,7 @@ mod tests {
         for direct in directs {
             write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
             let reference = dir.path().join("reference.pbf");
-            let host = crate::host::Host::for_tests();
+            let host = crate::host::Host::entered_for_tests();
             host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, OPENS + 1);
@@ -1818,7 +1833,7 @@ mod tests {
                     // Other IDs entirely: a run that read any of it would
                     // write different bytes.
                     write_blocks(&replacement, &[1_001, 1_002], Some((1_010, &[1_001])), true);
-                    let host = crate::host::Host::for_tests();
+                    let host = crate::host::Host::entered_for_tests();
                     host.invocation
                         .faults()
                         .force_pin_path_reopen
@@ -1882,7 +1897,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap();
-            let host = crate::host::Host::for_tests();
+            let host = crate::host::Host::entered_for_tests();
             let staged = staged.bind(&host.invocation);
             let (arm, _) = getid_dispatched(
                 &input,
@@ -1898,7 +1913,7 @@ mod tests {
             staged.publish().unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
-                read_ids(&output, &crate::host::Host::for_tests()),
+                read_ids(&output, &crate::host::Host::entered_for_tests()),
                 vec![1, 10]
             );
         }

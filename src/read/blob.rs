@@ -542,6 +542,7 @@ impl<R: Read + Send> BlobReader<R> {
     /// The missing-header error, or the framing error reading the first
     /// blob.
     pub fn leading_header(&mut self) -> Result<Blob> {
+        let _call = self.frames.cancel_token().call();
         match self.next() {
             Some(Ok(blob)) if matches!(blob.get_type(), BlobType::OsmHeader) => Ok(blob),
             Some(Ok(_)) | None => Err(crate::error::new_missing_header_in(self.source())),
@@ -695,6 +696,7 @@ impl BlobReader<FileReader> {
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
+        let host = &host.enter();
         let source = source.into();
         Ok(Self::from_reader(
             FileReader::open_in(source, direct, &host.invocation)?,
@@ -713,7 +715,7 @@ impl BlobReader<FileReader> {
     pub(crate) fn open_in<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
         let mut reader = Self::open_with(source, direct, host)?;
         reader.frames.refuse_partial_index();
@@ -824,6 +826,17 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
     type Item = Result<Blob>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _call = self.frames.cancel_token().call();
+        self.next_blob()
+    }
+}
+
+impl<R: Read + Send> BlobReader<R> {
+    /// [`Iterator::next`] without an admission of its own, for the library's
+    /// walks that already run under one (a command's call, a pipeline
+    /// thread's permit). A background walk must not hold a call across a
+    /// read that can block on the caller's stream.
+    pub(crate) fn next_blob(&mut self) -> Option<Result<Blob>> {
         let frame = match self.next_frame()? {
             Ok(frame) => frame,
             Err(e) => return Some(Err(e)),
@@ -896,6 +909,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// # foo().unwrap();
     /// ```
     pub fn blob_from_offset(&mut self, pos: ByteOffset) -> Result<Blob> {
+        let _call = self.frames.cancel_token().call();
         self.seek(pos)?;
         // A read at an explicit offset is a fresh start, as after `seek_raw`:
         // an earlier failed read must not make `next` stop before reading,
@@ -973,6 +987,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// read can tell that the payload is not all there.
     #[hotpath::measure]
     pub fn next_header_skip_blob(&mut self) -> Option<Result<(BlobHeader, Option<ByteOffset>)>> {
+        let _call = self.frames.cancel_token().call();
         if self.frames.failed() {
             return None;
         }
@@ -1179,7 +1194,7 @@ mod tests {
         let walk_arm = |path: &std::path::Path| -> Result<usize> {
             let mut walker = super::super::header_walker::HeaderWalker::open(
                 path,
-                &crate::host::Host::for_tests(),
+                &crate::host::Host::entered_for_tests(),
             )?;
             let mut count = 0;
             while walker.next_header()?.is_some() {

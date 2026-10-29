@@ -198,7 +198,7 @@ pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i
 pub(super) fn insert_overflow_ids(
     overflow: &mut crate::idset::IdSet,
     ids: Vec<i64>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) {
     #[cfg(feature = "test-hooks")]
     host.invocation

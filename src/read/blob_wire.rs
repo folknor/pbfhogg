@@ -415,9 +415,11 @@ pub(crate) fn warn_unrecognised_indexdata(
     len: usize,
     site: BlobSite<'_>,
 ) {
+    // Cold, and a nested entry under whatever admits the walk.
+    let call = invocation.call();
     crate::host::diag_once!(
         diagnostics,
-        invocation,
+        &call,
         Warning,
         "indexdata.unrecognised_length",
         "BlobHeader.indexdata has an unrecognised length ({len} bytes; \

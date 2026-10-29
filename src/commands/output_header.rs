@@ -237,7 +237,7 @@ pub(crate) fn build(
     inputs: &[HeaderBlock],
     facts: &OutputFacts,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<OutputHeader> {
     let Some(first) = inputs.first() else {
         return Err(Error::invalid_argument(
@@ -342,7 +342,7 @@ pub(crate) fn build_one(
     input: &HeaderBlock,
     facts: &OutputFacts,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<OutputHeader> {
     build(std::slice::from_ref(input), facts, overrides, host)
 }
@@ -402,7 +402,7 @@ pub(crate) fn verbatim(
 /// `cat` keeps every byte of the prepass fields and still cannot vouch for
 /// them, and an output mixing copied and re-encoded ways keeps some inline
 /// coordinates without declaring them.
-fn warn_undeclared(inputs: &[HeaderBlock], declared: Declared, host: &crate::host::Host) {
+fn warn_undeclared(inputs: &[HeaderBlock], declared: Declared, host: &crate::host::Entered<'_>) {
     let dropped: Vec<&str> = [
         (
             declared.locations_on_ways,
@@ -525,7 +525,7 @@ mod tests {
     }
 
     fn built(inputs: &[HeaderBlock], facts: &OutputFacts) -> HeaderBlock {
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let out = build(inputs, facts, &HeaderOverrides::default(), &host).unwrap();
         HeaderBlock::parse_from_bytes(&out.bytes).unwrap()
     }
@@ -688,7 +688,7 @@ mod tests {
         let dropped = built(std::slice::from_ref(&input), &with(Replication::Drop));
         assert_eq!(state(dropped), (None, None, None));
 
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let stamped = HeaderOverrides {
             replication_sequence_number: FieldOverride::Set(8),
             ..Default::default()
@@ -714,7 +714,7 @@ mod tests {
                 .replication_sequence_number(0)
                 .replication_base_url(""),
         );
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let cleared = HeaderOverrides::parse(
             None,
             &[
@@ -802,7 +802,7 @@ mod tests {
     /// An empty input slice is an error, not a panic and not a NaN bbox.
     #[test]
     fn an_empty_input_slice_is_refused() {
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         assert!(
             build(
                 &[],

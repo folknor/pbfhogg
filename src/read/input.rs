@@ -174,6 +174,7 @@ impl<'a> InputSource<'a> {
     /// # Errors
     /// As [`PinnedInput::pin`], for a path.
     pub fn pin(self, host: &crate::host::Host) -> Result<PinnedInput> {
+        let host = &host.enter();
         match self {
             Self::Path(path) => PinnedInput::pin(path, host),
             Self::Pinned(pin) => Ok(pin.clone()),
@@ -312,6 +313,7 @@ impl PinnedInput {
     /// The path cannot be opened or `stat`ed, or names something other than
     /// a regular file; the error names it.
     pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
+        let host = &host.enter();
         #[cfg(feature = "test-hooks")]
         let force_path = host.invocation.faults().forces_pin_path_reopen();
         #[cfg(not(feature = "test-hooks"))]
@@ -320,7 +322,7 @@ impl PinnedInput {
     }
 
     #[cfg(unix)]
-    fn pin_with(path: &Path, host: &crate::host::Host, force_path: bool) -> Result<Self> {
+    fn pin_with(path: &Path, host: &crate::host::Entered<'_>, force_path: bool) -> Result<Self> {
         #[cfg(not(feature = "test-hooks"))]
         let _ = host;
         #[cfg(target_os = "linux")]
@@ -355,7 +357,7 @@ impl PinnedInput {
     }
 
     #[cfg(not(unix))]
-    fn pin_with(path: &Path, host: &crate::host::Host, _force_path: bool) -> Result<Self> {
+    fn pin_with(path: &Path, host: &crate::host::Entered<'_>, _force_path: bool) -> Result<Self> {
         #[cfg(not(feature = "test-hooks"))]
         let _ = host;
         let meta = metadata(path)?;
@@ -553,7 +555,7 @@ pub(crate) fn new_pins(sources: &[InputSource<'_>]) -> usize {
 /// As [`PinnedInput::pin`], for the first path that fails.
 pub(crate) fn pin_sources(
     sources: &[InputSource<'_>],
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<PinnedInput>> {
     let mut pins: Vec<PinnedInput> = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
@@ -670,7 +672,7 @@ mod pin_tests {
     fn procfs_reopen_reads_the_pinned_file_after_a_replace_and_an_unlink() {
         let dir = crate::path_guard::tests::scratch();
         let (input, replacement) = fixture(dir.path());
-        let pin = PinnedInput::pin_with(&input, &Host::for_tests(), false).unwrap();
+        let pin = PinnedInput::pin_with(&input, &Host::entered_for_tests(), false).unwrap();
         if !pin.reopens_through_procfs() {
             // No usable procfs here: the path mode is covered by its own test.
             return;
@@ -704,7 +706,7 @@ mod pin_tests {
     fn path_reopen_refuses_a_replaced_input() {
         let dir = crate::path_guard::tests::scratch();
         let (input, replacement) = fixture(dir.path());
-        let pin = PinnedInput::pin_with(&input, &Host::for_tests(), true).unwrap();
+        let pin = PinnedInput::pin_with(&input, &Host::entered_for_tests(), true).unwrap();
         assert!(!pin.reopens_through_procfs());
         assert_eq!(read_all(pin.open().unwrap()), b"original");
 
@@ -712,10 +714,13 @@ mod pin_tests {
         let err = pin.open().unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
         assert_eq!(err.source_path(), Some(input.as_path()));
-        let err =
-            crate::file_reader::FileReader::open_in(&pin, false, &crate::host::Invocation::new())
-                .err()
-                .unwrap();
+        let err = crate::file_reader::FileReader::open_in(
+            &pin,
+            false,
+            &crate::host::Invocation::new().call(),
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
     }
 
@@ -727,7 +732,8 @@ mod pin_tests {
         let dir = crate::path_guard::tests::scratch();
         let (input, _) = fixture(dir.path());
         for force_path in [false, true] {
-            let pin = PinnedInput::pin_with(&input, &Host::for_tests(), force_path).unwrap();
+            let pin =
+                PinnedInput::pin_with(&input, &Host::entered_for_tests(), force_path).unwrap();
             let mut first = pin.open().unwrap();
             let mut second = pin.open().unwrap();
             let mut byte = [0u8; 1];
@@ -756,7 +762,7 @@ mod pin_tests {
         assert_eq!(input, dotted, "Path equality folds the `.`");
         let paths: [&Path; 5] = [&input, &other, &input, &dotted, &other];
         let sources = paths.map(InputSource::Path);
-        let pins = super::pin_sources(&sources, &Host::for_tests()).unwrap();
+        let pins = super::pin_sources(&sources, &Host::entered_for_tests()).unwrap();
         let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
         assert!(same(0, 2) && same(1, 4));
         assert!(!same(0, 1) && !same(0, 3) && !same(1, 3));
@@ -773,7 +779,7 @@ mod pin_tests {
     fn pin_sources_keeps_caller_pins_apart_from_paths() {
         let dir = crate::path_guard::tests::scratch();
         let (input, _) = fixture(dir.path());
-        let host = Host::for_tests();
+        let host = Host::entered_for_tests();
         let first = PinnedInput::pin(&input, &host).unwrap();
         let second = PinnedInput::pin(&input, &host).unwrap();
         let sources = [
@@ -801,7 +807,7 @@ mod pin_tests {
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let err = PinnedInput::pin(&fifo, &Host::for_tests()).unwrap_err();
+        let err = PinnedInput::pin(&fifo, &Host::entered_for_tests()).unwrap_err();
         assert!(
             matches!(err.kind(), ErrorKind::InvalidArgument { .. }),
             "{err:?}"
@@ -817,7 +823,7 @@ mod pin_tests {
         let dir = crate::path_guard::tests::scratch();
         for force_path in [true, false] {
             let (input, replacement) = fixture(dir.path());
-            let host = Host::for_tests();
+            let host = Host::entered_for_tests();
             host.invocation
                 .faults()
                 .force_pin_path_reopen

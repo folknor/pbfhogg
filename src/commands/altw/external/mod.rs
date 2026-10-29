@@ -635,7 +635,8 @@ pub fn external_join(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     // Every stage's open of the input derives from this pin; see
     // `add_locations_to_ways_to`, which pins the same way.
@@ -713,7 +714,7 @@ pub(crate) fn external_join_in(
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     let (direct_io, force) = (write.direct_reads, write.force);

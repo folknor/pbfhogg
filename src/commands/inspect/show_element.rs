@@ -22,6 +22,7 @@ pub fn show_element_to<W: Write>(
     out: &mut W,
     host: &crate::host::Host,
 ) -> Result<bool> {
+    let host = &host.enter();
     host.invocation
         .decided(|| show_element_inner(path, target_kind, target_id, direct_io, out, host))
 }
@@ -32,7 +33,7 @@ fn show_element_inner<W: Write>(
     target_id: i64,
     direct_io: bool,
     out: &mut W,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<bool> {
     // An inspect description, exempt from the command-input refusal of a
     // partially indexed file: a blob without indexdata is decoded and

@@ -292,28 +292,28 @@ impl BlobMeta {
 /// Test hook: whether the framing closure for `seq` should panic (the
 /// fault plan's `framing_panic_at`, see `crate::test_hooks`).
 #[cfg(feature = "test-hooks")]
-fn framing_panics_at(cancel: &crate::host::Invocation, seq: usize) -> bool {
+fn framing_panics_at(cancel: &crate::host::Recorder, seq: usize) -> bool {
     cancel.faults().framing_panics_at(seq)
 }
 #[cfg(not(feature = "test-hooks"))]
-fn framing_panics_at(_cancel: &crate::host::Invocation, _seq: usize) -> bool {
+fn framing_panics_at(_cancel: &crate::host::Recorder, _seq: usize) -> bool {
     false
 }
 
 /// Test hooks: a framing job starting and finishing (the fault plan's
 /// `hold_framing_at` and `framing_jobs_done`, see `crate::test_hooks`).
 #[cfg(feature = "test-hooks")]
-fn framing_job_starts(invocation: &crate::host::Invocation, seq: usize) {
+fn framing_job_starts(invocation: &crate::host::Recorder, seq: usize) {
     invocation.faults().on_framing_job(seq);
 }
 #[cfg(not(feature = "test-hooks"))]
-fn framing_job_starts(_invocation: &crate::host::Invocation, _seq: usize) {}
+fn framing_job_starts(_invocation: &crate::host::Recorder, _seq: usize) {}
 #[cfg(feature = "test-hooks")]
-fn framing_job_ends(invocation: &crate::host::Invocation) {
+fn framing_job_ends(invocation: &crate::host::Recorder) {
     invocation.faults().on_framing_job_done();
 }
 #[cfg(not(feature = "test-hooks"))]
-fn framing_job_ends(_invocation: &crate::host::Invocation) {}
+fn framing_job_ends(_invocation: &crate::host::Recorder) {}
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
 ///
@@ -359,7 +359,11 @@ pub struct PbfWriter<W: Write> {
     /// a long queued splice stops too. `flush`, `Drop` and the teardown they
     /// run (waiting for every framing job, joining the writer thread) never
     /// check it, so a cancelled writer still shuts down completely.
-    cancel: crate::host::Invocation,
+    cancel: crate::host::Permit,
+    /// The census ticket of a writer issued to the caller; `None` for one the
+    /// library built for itself. Declared after the permit, so it retires
+    /// after the last recording.
+    ticket: Option<crate::host::Ticket>,
 }
 
 impl PbfWriter<FileWriter> {
@@ -382,6 +386,8 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
+        let invocation = crate::host::Invocation::new();
+        let _call = invocation.call();
         named_path(
             path,
             Self::to_path_in(
@@ -391,8 +397,9 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Invocation::new(),
-            ),
+                invocation.permit(),
+            )
+            .map(Self::issued),
         )
     }
 
@@ -405,6 +412,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         host: &crate::host::Host,
     ) -> Result<Self> {
+        let host = &host.enter();
         named_path(
             path,
             Self::to_path_in(
@@ -414,8 +422,9 @@ impl PbfWriter<FileWriter> {
                 host.executor.clone(),
                 host.diagnostics.clone(),
                 Finish::Durable,
-                host.invocation.clone(),
-            ),
+                host.invocation.permit(),
+            )
+            .map(Self::issued),
         )
     }
 
@@ -426,7 +435,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Result<Self> {
         // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
@@ -456,6 +465,8 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
+        let invocation = crate::host::Invocation::new();
+        let _call = invocation.call();
         named_path(
             path,
             Self::to_path_direct_in(
@@ -465,8 +476,9 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Invocation::new(),
-            ),
+                invocation.permit(),
+            )
+            .map(Self::issued),
         )
     }
 
@@ -478,7 +490,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Result<Self> {
         // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
@@ -520,6 +532,8 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
+        let invocation = crate::host::Invocation::new();
+        let _call = invocation.call();
         named_path(
             path,
             Self::to_path_uring_in(
@@ -529,8 +543,9 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Invocation::new(),
-            ),
+                invocation.permit(),
+            )
+            .map(Self::issued),
         )
     }
 
@@ -542,7 +557,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Result<Self> {
         use crate::write::uring_writer;
 
@@ -593,6 +608,8 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
+        let invocation = crate::host::Invocation::new();
+        let _call = invocation.call();
         named_path(
             path,
             Self::to_path_parallel_in(
@@ -602,8 +619,9 @@ impl PbfWriter<FileWriter> {
                 executor,
                 Diagnostics::discard(),
                 Finish::Durable,
-                crate::host::Invocation::new(),
-            ),
+                invocation.permit(),
+            )
+            .map(Self::issued),
         )
     }
 
@@ -614,7 +632,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Result<Self> {
         use crate::write::parallel_writer;
 
@@ -656,7 +674,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         finish: Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let metrics = &cancel.metrics().writer;
@@ -679,7 +697,7 @@ impl<W: Write> PbfWriter<W> {
     fn from_pipeline(
         compression: Compression,
         pipeline: WritePipeline,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Self {
         PbfWriter {
             writer: None,
@@ -692,6 +710,7 @@ impl<W: Write> PbfWriter<W> {
             completion: None,
             output_name: None,
             cancel,
+            ticket: None,
         }
     }
 
@@ -715,10 +734,25 @@ impl<W: Write> PbfWriter<W> {
 
     /// [`PbfWriter::new`] under `invocation`: the writer observes the token
     /// and records its `writer_*` counters into it.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public signature: the writer takes a permit on the token it is handed"
+    )]
     pub fn new_in(
         writer: W,
         compression: Compression,
         invocation: crate::host::Invocation,
+    ) -> Self {
+        let call = invocation.call();
+        Self::with_permit(writer, compression, call.permit()).issued()
+    }
+
+    /// A synchronous writer under a permit, for the library's own use: not
+    /// issued to a caller, so it takes no census ticket.
+    pub(crate) fn with_permit(
+        writer: W,
+        compression: Compression,
+        invocation: crate::host::Permit,
     ) -> Self {
         PbfWriter {
             writer: Some(writer),
@@ -731,6 +765,7 @@ impl<W: Write> PbfWriter<W> {
             completion: None,
             output_name: None,
             cancel: invocation,
+            ticket: None,
         }
     }
 
@@ -820,8 +855,18 @@ impl<W: Write> PbfWriter<W> {
 
     /// The token this writer observes, for a stage that feeds it and checks
     /// the same token at its own consumer.
-    pub(crate) fn cancel_token(&self) -> &crate::host::Invocation {
+    pub(crate) fn cancel_token(&self) -> &crate::host::Recorder {
         &self.cancel
+    }
+
+    /// This writer, issued to the caller: counted in its invocation's census
+    /// as a `writer`. Idempotent, so a value issued twice keeps one ticket.
+    #[must_use]
+    pub(crate) fn issued(mut self) -> Self {
+        if self.ticket.is_none() {
+            self.ticket = Some(self.cancel.ticket(crate::host::Kind::Writer));
+        }
+        self
     }
 
     /// The per-block checkpoint: once the invocation's token is tripped each
@@ -841,6 +886,7 @@ impl<W: Write> PbfWriter<W> {
     /// `header_block_bytes` is a serialized `HeaderBlock` protobuf message,
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
     pub fn write_header(&mut self, header_block_bytes: &[u8]) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self.write_blob("OSMHeader", header_block_bytes);
         let result = self.poison_on_error(result);
         if result.is_ok() {
@@ -858,6 +904,7 @@ impl<W: Write> PbfWriter<W> {
     /// `block_bytes` is produced by [`BlockBuilder::take`](crate::block_builder::BlockBuilder::take).
     #[hotpath::measure]
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_osm_data(Cow::Borrowed(block_bytes), BlobMeta::Scan));
@@ -882,6 +929,7 @@ impl<W: Write> PbfWriter<W> {
     // supported writer operation, including for downstream fixture producers.
     #[hotpath::measure]
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_osm_data(Cow::Borrowed(block_bytes), BlobMeta::Bare));
@@ -1014,6 +1062,7 @@ impl<W: Write> PbfWriter<W> {
     /// In pipelined mode, the data is sent directly to the writer thread
     /// (no rayon task needed since there is no compression work).
     pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_raw_unchecked(raw_framed_bytes));
@@ -1071,6 +1120,7 @@ impl<W: Write> PbfWriter<W> {
     /// owns the bytes and won't need them afterwards (e.g. merge passthrough
     /// with `std::mem::take`).
     pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_raw_owned_unchecked(raw_framed_bytes));
@@ -1093,6 +1143,7 @@ impl<W: Write> PbfWriter<W> {
     /// owned chunks. The writer thread writes each chunk sequentially.
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_raw_chunks_unchecked(chunks));
@@ -1139,6 +1190,7 @@ impl<W: Write> PbfWriter<W> {
     /// but cannot report errors or a missing tail.
     #[hotpath::measure]
     pub fn flush(&mut self) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self.flush_inner();
         if let Some(completion) = &self.completion {
             if result.is_ok() {
@@ -1201,14 +1253,19 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// Returns an invalid-argument error if the writer was consumed by a
     /// pipeline, as every other write method does.
-    pub fn into_inner(mut self) -> Result<W> {
+    pub fn into_inner(self) -> Result<W> {
+        // Held through the writer's own teardown, which can wait for framing
+        // jobs and join its writer thread: `this` is declared after the call,
+        // so it drops first.
+        let _call = self.cancel.call();
+        let mut this = self;
         // The inner writer leaves without end-of-stream finalization, so a
         // writer filling an output can no longer certify it.
-        if let Some(completion) = &self.completion {
+        if let Some(completion) = &this.completion {
             completion.fail();
         }
-        self.mark_finished();
-        self.writer
+        this.mark_finished();
+        this.writer
             .take()
             .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))
     }
@@ -1301,7 +1358,11 @@ impl PbfWriter<BufWriter<File>> {
     ) -> Result<Self> {
         let file = super::create_backend_file(path)?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
-        Ok(Self::new_in(buffered, compression, invocation.clone()))
+        Ok(Self::with_permit(
+            buffered,
+            compression,
+            invocation.permit(),
+        ))
     }
 
     /// Create a synchronous writer that owns a 256 KiB buffered output file.
@@ -1411,6 +1472,7 @@ impl PbfWriter<FileWriter> {
         offset: u64,
         len: u64,
     ) -> Result<()> {
+        let _call = self.cancel.call();
         let result = self
             .check_cancel()
             .and_then(|()| self.write_raw_copy_unchecked(in_file, offset, len));
@@ -1502,7 +1564,7 @@ mod tests {
         // guaranteed to fail without a race to synchronise against.
         drop(rx);
         let handle = std::thread::spawn(move || outcome);
-        let invocation = crate::host::Invocation::new();
+        let invocation = crate::host::Invocation::new().permit();
         PbfWriter::from_pipeline(
             Compression::None,
             WritePipeline::new(
@@ -1722,7 +1784,12 @@ mod tests {
         w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
         w.flush().unwrap();
         assert_eq!(
-            w.invocation().metrics().writer.sync_all_calls.load(Relaxed),
+            w.invocation()
+                .call()
+                .metrics()
+                .writer
+                .sync_all_calls
+                .load(Relaxed),
             1,
             "a completed pipelined write must fsync its output exactly once; \
              FileOutputSink::finish has to call FileWriter::sync, not \
@@ -1735,7 +1802,12 @@ mod tests {
         w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
         w.flush().unwrap();
         assert_eq!(
-            w.invocation().metrics().writer.sync_all_calls.load(Relaxed),
+            w.invocation()
+                .call()
+                .metrics()
+                .writer
+                .sync_all_calls
+                .load(Relaxed),
             1,
             "a completed synchronous path write must fsync its output exactly once"
         );
@@ -1881,7 +1953,7 @@ mod tests {
 
         fn counted<W: std::io::Write>(writer: &PbfWriter<W>) -> u64 {
             writer
-                .invocation()
+                .cancel_token()
                 .metrics()
                 .writer
                 .bytes_written

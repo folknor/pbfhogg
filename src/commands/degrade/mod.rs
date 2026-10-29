@@ -409,7 +409,8 @@ pub fn degrade<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = degrade_to(
         input.into(),
@@ -434,7 +435,7 @@ pub(crate) fn degrade_to(
     block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DegradeStats> {
     if !flags.any() {
         let flag_names = flags.flag_names().join(", ");
@@ -605,7 +606,7 @@ fn degrade_passthrough(
     flags: DegradeFlags,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DegradeStats> {
     // One open, one sequential traversal: the header frame and then every
     // data frame come from this reader, so the run reads exactly one file
@@ -865,7 +866,7 @@ fn degrade_decode_path(
     block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DegradeStats> {
     let WriteOptions {
         compression,
@@ -1047,7 +1048,7 @@ fn select_drop_sets(
     way_schedule: &[crate::scan::classify::ScheduledBlob],
     relation_schedule: &[crate::scan::classify::ScheduledBlob],
     spec: DropSpec,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<DropSets> {
     let mut total = 0_u64;
     let mut heap = BinaryHeap::new();
@@ -1147,7 +1148,7 @@ fn run_kind_phase(
     compression: Compression,
     drop: Option<&FxHashSet<i64>>,
     writer: &mut PbfWriter<FileWriter>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<PhaseStats> {
     let block_cap = cap.get();
 
@@ -1590,7 +1591,7 @@ fn frame_and_write_batch(
 ) -> Result<u64> {
     use rayon::prelude::*;
 
-    let invocation = writer.cancel_token().clone();
+    let invocation = writer.cancel_token().permit();
     let metrics = &invocation.metrics().writer;
     let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch

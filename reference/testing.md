@@ -107,7 +107,8 @@ NAME` list each harness in turn to find one test.
   writers', the read pipeline's and the worker pools' stall counters)
   are not shared: each belongs to the `Invocation` a run is given, so a
   test that needs one run's exact count reads it from its own token
-  (`Invocation::for_each_counter`, or `metrics()` inside the crate),
+  (`Invocation::for_each_counter`, or `metrics()` on a call or permit
+  inside the crate),
   never as a delta of anything another test can move.
   A test that needs anything else here to itself takes a target of its
   own.
@@ -395,6 +396,17 @@ exception, not a tier - should not survive across many PRs.
   neither sweep proves every checkpoint site of a planet run unwinds.
   `CliInvoker::spawn` returns a `RunningCli` that can be signalled and is
   killed on drop.
+- **Capability accounting.** `Invocation::capabilities` (`test-hooks`,
+  doc-hidden) reads the invocation's transition word (live call guards and
+  permits, and whether a count saturated) and its census (issued block
+  iterators, writers, bound outputs and blocks). `tests/cancel.rs` asserts it
+  is back to all zero after every command at every tripped checkpoint, that
+  no command issues its own values, and that a nested public entry mints its
+  own guard; `tests/capabilities.rs` parks a block iterator's pipeline in the
+  caller's `Read` (a stream whose reads off the building thread wait on a
+  channel) and checks the values a caller holds at rest are accounted for.
+  The word's saturation arithmetic is a unit test in `src/host.rs`, on the
+  field helpers with forced boundary values.
 - **Publication hooks.** Publication is not cancellable, so no checkpoint
   lies inside it and the pauses above never land there. Instead it
   announces each namespace step that succeeded (`PublishStep`: a backup

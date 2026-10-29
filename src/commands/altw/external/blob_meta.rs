@@ -78,7 +78,7 @@ pub(super) const EXTERNAL_ORDER: crate::blob_meta::Order = crate::blob_meta::Ord
 pub(super) fn scan_blob_metadata(
     input: &PinnedInput,
     parse_tagdata: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<BlobMeta>> {
     host.invocation.marker("ALTW_BLOB_META_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;

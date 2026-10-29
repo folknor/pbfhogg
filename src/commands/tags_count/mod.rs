@@ -85,6 +85,7 @@ pub fn tags_count<'a>(
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation
         .decided(|| tags_count_inner(input, opts, host))
@@ -93,7 +94,7 @@ pub fn tags_count<'a>(
 fn tags_count_inner(
     input: InputSource<'_>,
     opts: &TagCountOptions<'_>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<TagCount>> {
     // Deliberately reuse tags-filter's expression grammar, including its
     // n/w/r type prefixes. osmium tags-count treats these strings as tag

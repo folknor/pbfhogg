@@ -111,7 +111,8 @@ pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
     output.publish()?;
@@ -127,7 +128,7 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let (direct_io, force) = (write.direct_reads, write.force);
     if files.is_empty() {
@@ -211,7 +212,11 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
 /// providers answer from a snapshot of the open descriptors.
 ///
 /// [`CAT_EXTRA_FDS`]: crate::tunables::CAT_EXTRA_FDS
-pub(super) fn admit_descriptors(held: usize, demand: &str, host: &crate::host::Host) -> Result<()> {
+pub(super) fn admit_descriptors(
+    held: usize,
+    demand: &str,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
     let wanted = u64::try_from(held)
         .ok()
         .and_then(|n| n.checked_add(crate::tunables::CAT_EXTRA_FDS))
@@ -265,7 +270,7 @@ fn descriptor_remedy(allowance: &crate::process::FdAllowance, wanted: u64) -> St
 fn read_header(
     input: &PinnedInput,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<crate::HeaderBlock> {
     let file = input.path();
     let mut frames = Frames::of_input(
@@ -285,7 +290,7 @@ fn read_header(
 fn read_headers(
     files: &[PinnedInput],
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<crate::HeaderBlock>> {
     files
         .iter()
@@ -306,7 +311,7 @@ fn raw_copy_ways(
     headers: &[crate::HeaderBlock],
     direct_io: bool,
     unindexed: Ways,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Ways> {
     let enriched = headers.iter().any(|h| {
         h.has_locations_on_ways() || h.has_way_members_v1() || h.has_shared_node_pins_v1()
@@ -332,7 +337,7 @@ fn cat_output_header(
     headers: &[crate::HeaderBlock],
     ways: Ways,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<OutputHeader> {
     super::output_header::build(headers, &OutputFacts::carry(ways), overrides, host)
 }
@@ -346,7 +351,7 @@ fn cat_passthrough(
     output: &crate::output::BoundOutput,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let direct_io = write.direct_reads;
     // Every payload is copied byte for byte; an unindexed blob's header is
@@ -467,7 +472,7 @@ fn cat_passthrough(
 /// counts them as decoded, which alone does not say their content was
 /// normalised (rebuilt) or dropped (omitted). The note states the rules
 /// that applied, not that each one changed a value in the run's input.
-fn note_reencoded(host: &crate::host::Host, rebuilt: u64, omitted: u64) {
+fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
     if rebuilt > 0 {
         let omitted_clause = if omitted == 0 {
             String::new()
@@ -708,7 +713,7 @@ fn cat_type_passthrough(
     tf: TypeFilter,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
     let direct_io = write.direct_reads;
@@ -974,7 +979,7 @@ fn cat_filtered(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let (compression, direct_io) = (write.compression, write.direct_reads);
     // Per-blob worker pool; same precedent as check --refs / verify_ids.
@@ -1058,7 +1063,7 @@ fn run_filtered_pass(
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(u64, u64)> {
     type PassResult = crate::Result<(Vec<(ElementKind, Vec<u8>)>, u64)>;
     let mut blobs_decoded: u64 = 0;
@@ -1146,7 +1151,7 @@ fn run_filtered_pass(
 struct KindPhase(Option<ElementKind>);
 
 impl KindPhase {
-    fn enter(&mut self, kind: ElementKind, invocation: &crate::host::Invocation) {
+    fn enter(&mut self, kind: ElementKind, invocation: &crate::host::Recorder) {
         if self.0.is_some_and(|open| kind <= open) {
             return;
         }
@@ -1155,7 +1160,7 @@ impl KindPhase {
         self.0 = Some(kind);
     }
 
-    fn close(&mut self, invocation: &crate::host::Invocation) {
+    fn close(&mut self, invocation: &crate::host::Recorder) {
         if let Some(open) = self.0.take() {
             invocation.marker(Self::marker(open, false));
         }

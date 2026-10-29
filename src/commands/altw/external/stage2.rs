@@ -133,7 +133,7 @@ fn prepare_bucket(
     scratch: &RunScratch,
     num_shard_workers: usize,
     loader: &mut LoaderScratch,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> crate::Result<PreparedBucket> {
     loader.data_buf.clear();
     loader.records.clear();
@@ -258,7 +258,7 @@ impl SharedSlotBuckets {
         Error::from(err).context(format!("failed to write slot bucket {path}"))
     }
 
-    pub(super) fn finish(&self, invocation: &crate::host::Invocation) -> Result<()> {
+    pub(super) fn finish(&self, invocation: &crate::host::Recorder) -> Result<()> {
         for (bucket, writer_mutex) in self.writers.iter().enumerate() {
             let mut w = writer_mutex
                 .lock()
@@ -325,7 +325,7 @@ pub(super) fn stage2_node_join(
     input_pbf: &crate::read::input::InputFile,
     node_blob_mapping: &[NodeBlobInfo],
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<u64> {
     let num_workers = crate::host::sized_workers(
         &*host.resources,

@@ -56,7 +56,7 @@ impl StreamingBlocks {
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct_io: bool,
         pool: MergeBuffers,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> crate::error::Result<Self> {
         let mut reader = crate::blob::BlobReader::open_in(source, direct_io, host)?;
         reader.set_parse_indexdata(true);
@@ -564,7 +564,7 @@ impl BlockState {
 pub(crate) type MergeBuffers = std::sync::Arc<crate::blob::DecompressPool>;
 
 /// A fresh, empty [`MergeBuffers`] for one merge of `invocation`.
-pub(crate) fn merge_buffers(invocation: &crate::host::Invocation) -> MergeBuffers {
+pub(crate) fn merge_buffers(invocation: &crate::host::Recorder) -> MergeBuffers {
     crate::blob::DecompressPool::new(invocation)
 }
 
@@ -846,7 +846,7 @@ fn drain_remaining<S: MergeSink>(
     kind: ElementKind,
     sink: &mut S,
     stats: &mut BlockPairMergeStats,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     while let Some(bs) = side.next_decoded()? {
         cancel.check()?;
@@ -1021,7 +1021,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
     skip_equal_blobs: bool,
     sink: &mut S,
     stats: &mut BlockPairMergeStats,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let window = old.window;
     let mut old_decoded: Option<BlockState> = None;

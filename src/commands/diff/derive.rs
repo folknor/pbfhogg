@@ -85,7 +85,8 @@ pub fn derive_changes<'a, 'b>(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = derive_changes_to(
         old.into(),
@@ -116,7 +117,7 @@ pub(crate) fn derive_changes_to(
     increment_version: bool,
     timestamp: Option<u64>,
     parallelism: crate::host::Parallelism,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
     host.invocation.check()?;
@@ -374,7 +375,7 @@ impl super::sharded::ShardedReport for OscReport<'_> {
     /// descriptor, so bytes an inline phase left buffered stay ahead of the
     /// appended ones, and fold the counts into the final sink's, which the
     /// OSC assembly frames from.
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()> {
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Recorder) -> Result<()> {
         let mut first_err = None;
         for shard in done {
             // Once per shard, between appends (the appends themselves are
@@ -422,7 +423,7 @@ impl super::sharded::ShardedReport for OscReport<'_> {
         &mut self,
         kind: ElementKind,
         shards: &[super::shard::Shard],
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) {
         let [shards_name, max_name, min_name] = match kind {
             ElementKind::Node => [
@@ -534,7 +535,7 @@ fn derive_changes_block_pair(
     _direct_io: bool,
     sink: &mut ChangeSink,
     scratch: &crate::scratch::RunScratch,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let walked = super::shard::walk_pair(old, new, host)?;
     if walked.has_negative && jobs > 1 {
@@ -586,7 +587,7 @@ fn derive_changes_element_stream(
     new: &PinnedInput,
     direct_io: bool,
     sink: &mut ChangeSink,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let pool = crate::osc::merge_join::merge_buffers(&host.invocation);
     let mut old_src =
@@ -630,7 +631,7 @@ fn derive_changes_element_stream(
 fn assemble_osc(
     output: &crate::output::BoundOutput,
     sink: &ChangeSink,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     assemble_osc_from_paths(
         output,
@@ -655,7 +656,7 @@ fn assemble_osc_from_paths(
     create_count: u64,
     modify_count: u64,
     delete_count: u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
@@ -847,8 +848,8 @@ mod scratch_tests {
     #[test]
     fn dropping_the_run_scratch_removes_all_sink_fragments() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch =
-            RunScratch::create(dir.path(), &crate::host::Host::for_tests()).expect("scratch");
+        let scratch = RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
+            .expect("scratch");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _sink = ChangeSink::new(&scratch, "", false, None).expect("sink");
             panic!("simulate a failed derive run");

@@ -237,7 +237,7 @@ pub(super) fn run_drain(
     // items). Returning it leaves through the drain's existing error
     // exit (receiver and barrier sender dropped, producers unblocked, both
     // joined by `merge`), the same one a failed output write takes.
-    let cancel = writer.cancel_token().clone();
+    let cancel = writer.cancel_token().permit();
     loop {
         let recv_start = crate::counters::Stopwatch::start();
         let item_opt = if drain_disconnected {
@@ -869,7 +869,7 @@ fn barrier_publish_loc_map(
     cfg: &DrainConfig<'_>,
     state: &mut DrainState,
     counters: &DrainCounters,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> Result<()> {
     invocation.marker("MERGE_DRAIN_BARRIER_START");
 

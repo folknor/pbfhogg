@@ -195,7 +195,7 @@ crate::counters::counter_set! {
 
 /// Emits a metrics set when dropped: after the run's scope has joined its
 /// workers, whether the run returned or unwound.
-struct EmitOnDrop<'a>(&'a OrderedPoolMetrics, &'a crate::host::Invocation);
+struct EmitOnDrop<'a>(&'a OrderedPoolMetrics, &'a crate::host::Recorder);
 
 impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
@@ -605,7 +605,7 @@ impl<T> WorkerShared<'_, T> {
 #[derive(Clone, Copy)]
 pub(crate) struct PoolConfig<'a> {
     pub(crate) window: NonZeroUsize,
-    pub(crate) cancel: &'a crate::host::Invocation,
+    pub(crate) cancel: &'a crate::host::Recorder,
     pub(crate) waits: Waits<'a>,
 }
 
@@ -841,7 +841,7 @@ pub(crate) struct StreamConfig<'a> {
     /// Messages one task's channel holds (its terminal included) before its
     /// worker blocks.
     pub(crate) depth: usize,
-    pub(crate) cancel: &'a crate::host::Invocation,
+    pub(crate) cancel: &'a crate::host::Recorder,
 }
 
 /// A streamed task's way out: its items go to the consumer through it.
@@ -1146,7 +1146,7 @@ mod tests {
     fn run_with(
         n: usize,
         workers: usize,
-        cancel: &crate::host::Invocation,
+        cancel: &crate::host::Recorder,
         work: impl Fn(usize) -> crate::Result<usize> + Sync,
         consumer: &mut impl OrderedConsumer<usize>,
     ) -> crate::Result<()> {
@@ -1175,7 +1175,7 @@ mod tests {
         run_with(
             n,
             workers,
-            &crate::host::Invocation::new(),
+            &crate::host::Invocation::new().call(),
             work,
             &mut ConsumeFn(|_, v| consume(v)),
         )
@@ -1204,7 +1204,7 @@ mod tests {
     fn zero_tasks_still_checks_cancellation() {
         let cancel = crate::host::Invocation::new();
         cancel.cancel();
-        let err = run_with(0, 4, &cancel, Ok, &mut ConsumeFn(|_, _| Ok(()))).unwrap_err();
+        let err = run_with(0, 4, &cancel.call(), Ok, &mut ConsumeFn(|_, _| Ok(()))).unwrap_err();
         assert!(matches!(err.kind(), crate::ErrorKind::Cancelled));
     }
 
@@ -1313,7 +1313,7 @@ mod tests {
             run_with(
                 100,
                 4,
-                &crate::host::Invocation::new(),
+                &crate::host::Invocation::new().call(),
                 |i| {
                     if i == 10 {
                         Err(Error::internal("decode 10 failed"))
@@ -1377,7 +1377,14 @@ mod tests {
         }
         let edges = within_deadline(|| {
             let mut consumer = Consumer(Vec::new());
-            run_with(40, 1, &crate::host::Invocation::new(), Ok, &mut consumer).unwrap();
+            run_with(
+                40,
+                1,
+                &crate::host::Invocation::new().call(),
+                Ok,
+                &mut consumer,
+            )
+            .unwrap();
             consumer.0
         });
         let window = default_window(1).get();
@@ -1415,7 +1422,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: default_window(3),
-                cancel: &crate::host::Invocation::new(),
+                cancel: &crate::host::Invocation::new().call(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1464,7 +1471,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: NonZeroUsize::new(window).unwrap(),
-                cancel: &crate::host::Invocation::new(),
+                cancel: &crate::host::Invocation::new().call(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1742,7 +1749,7 @@ mod tests {
             StreamConfig {
                 window: NonZeroUsize::new(window).unwrap(),
                 depth,
-                cancel: &crate::host::Invocation::new(),
+                cancel: &crate::host::Invocation::new().call(),
             },
             |_| (),
             |(), task, emitter| work(task, emitter),

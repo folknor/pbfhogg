@@ -189,7 +189,7 @@ pub(crate) fn index_inputs(
     inputs: &[PinnedInput],
     policy: &IndexPolicy,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
     #[cfg(not(feature = "linux-direct-io"))]
     if direct_io {
@@ -852,7 +852,7 @@ pub(crate) fn write_plan(
     writer: &mut PbfWriter<FileWriter>,
     dedupe: bool,
     use_copy_range: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<WriteCounts> {
     let mut out = PlanWriter {
         plan,
@@ -1189,7 +1189,7 @@ struct Sweep<'a, 'e> {
     frames: &'a [Frame],
     sources: &'a [InputFile],
     dedupe: bool,
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
     emitter: &'a crate::ordered_pool::Emitter<'e, OwnedBlock, RunCounts>,
 }
 

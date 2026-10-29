@@ -121,7 +121,7 @@ fn build_schedule(
     overrides: &HeaderOverrides,
     keep_untagged_nodes: bool,
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
     host.invocation.marker("ALTW_PASS2_SCHEDULE_WALK_START");
     let mut walker = HeaderWalker::open(input, host)?;
@@ -197,7 +197,7 @@ struct WorkerScratch {
 }
 
 impl WorkerScratch {
-    fn new(invocation: &crate::host::Invocation) -> Self {
+    fn new(invocation: &crate::host::Recorder) -> Self {
         Self {
             read_buf: Vec::new(),
             decompress_buf: Vec::new(),
@@ -356,7 +356,7 @@ pub(super) fn write_output_passthrough(
     inject_metrics: &InjectMetrics,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Stats> {
     let (schedule, header_bytes, shared_file) =
         build_schedule(input, overrides, keep_untagged_nodes, inject_prepass, host)?;
@@ -541,7 +541,7 @@ struct Pass2Consumer<'a> {
     pt_bytes: u64,
     pt_blobs: u64,
     blobs_dispatched: u64,
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
 }
 
 impl Pass2Consumer<'_> {

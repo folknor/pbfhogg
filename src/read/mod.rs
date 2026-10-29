@@ -31,9 +31,10 @@ pub(crate) mod wire_schema;
 /// FIFO framing are unchanged. Inert without a sink on the invocation.
 pub fn emit_read_counters(invocation: &crate::host::Invocation) {
     use std::sync::atomic::Ordering::Relaxed;
-    let metrics = invocation.metrics();
+    let call = invocation.call();
+    let metrics = call.metrics();
     if metrics.read_emitted.swap(true, Relaxed) {
         return;
     }
-    pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress, invocation);
+    pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress, &call);
 }

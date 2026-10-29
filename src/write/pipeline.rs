@@ -181,14 +181,14 @@ pub(crate) struct FileOutputSink {
     finish: super::Finish,
     /// Checked between `copy_file_range` calls of a queued splice; the
     /// writer's counters record into its invocation.
-    cancel: crate::host::Invocation,
+    cancel: crate::host::Permit,
 }
 
 impl FileOutputSink {
     pub(crate) fn new(
         writer: FileWriter,
         finish: super::Finish,
-        cancel: crate::host::Invocation,
+        cancel: crate::host::Permit,
     ) -> Self {
         Self {
             writer,
@@ -273,7 +273,7 @@ pub(super) struct WritePipeline {
     /// and would otherwise succeed) cannot certify the output.
     pub(super) completion: Option<crate::output::Completion>,
     /// The invocation whose writer counters the producer side records into.
-    pub(super) invocation: crate::host::Invocation,
+    pub(super) invocation: crate::host::Permit,
 }
 
 impl WritePipeline {
@@ -284,7 +284,7 @@ impl WritePipeline {
         join_handle: JoinHandle<Result<()>>,
         expected: SeqTotal,
         executor: crate::host::Executor,
-        invocation: crate::host::Invocation,
+        invocation: crate::host::Permit,
     ) -> Self {
         let (permit_tx, permit_rx) = new_permit_pool();
         Self {
@@ -305,7 +305,7 @@ impl WritePipeline {
     /// end-of-stream handshake, and wrap it in a pipeline.
     pub(super) fn spawn<F>(
         executor: crate::host::Executor,
-        invocation: crate::host::Invocation,
+        invocation: crate::host::Permit,
         body: F,
     ) -> Self
     where
@@ -334,7 +334,7 @@ impl WritePipeline {
     pub(super) fn spawn_with_init<F>(
         label: &str,
         executor: crate::host::Executor,
-        invocation: crate::host::Invocation,
+        invocation: crate::host::Permit,
         body: F,
     ) -> Result<Self>
     where

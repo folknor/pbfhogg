@@ -644,7 +644,8 @@ pub fn extract_multi<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
-    let outputs = outputs.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let outputs = crate::output::bind_unissued(outputs, &host.invocation)?;
     host.invocation.check()?;
     if regions.len() != outputs.len() {
         return Err(Error::invalid_argument(format!(
@@ -673,7 +674,7 @@ fn extract_multi_to(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<ExtractStats>> {
     // Try single-pass multi-extract for simple strategy on sorted input. It
     // writes through the synchronous writer whatever the backend, so only the
@@ -842,7 +843,8 @@ pub fn extract<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     // Every pass opens the input again, each through its own open file
     // description (the probes, the schedule walks, the header read, the
@@ -872,7 +874,7 @@ pub(crate) fn extract_to(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
         // A front read of its own, dropped at once: the passes below read

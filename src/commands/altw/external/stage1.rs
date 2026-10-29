@@ -244,7 +244,7 @@ fn shard_error(
 /// Build the way-blob schedule from the shared blob metadata scan.
 pub(super) fn build_way_schedule(
     blob_meta: &[BlobMeta],
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> Vec<WayBlobTask> {
     invocation.marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = crate::counters::Stopwatch::start();
@@ -288,7 +288,7 @@ pub(super) fn stage1_pass_a(
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -552,7 +552,7 @@ pub(super) fn stage1_pass_a(
 #[hotpath::measure]
 pub(super) fn build_node_blob_mapping(
     blob_meta: &[BlobMeta],
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> Vec<NodeBlobInfo> {
     invocation.marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = crate::counters::Stopwatch::start();
@@ -597,7 +597,7 @@ pub(super) fn stage1_way_pass(
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Stage1Output> {
     let schedule = build_way_schedule(blob_meta, &host.invocation);
 

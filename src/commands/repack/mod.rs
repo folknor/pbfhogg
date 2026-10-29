@@ -120,7 +120,8 @@ pub fn repack<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = repack_to(
         input.into(),
@@ -143,7 +144,7 @@ pub(crate) fn repack_to(
     cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<RepackStats> {
     let WriteOptions {
         compression,
@@ -391,7 +392,7 @@ fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
 }
 
 /// Emit per-kind sidecar counters for one `run_kind_phase` result.
-fn emit_phase_counters(kind: ElementKind, s: &PhaseStats, invocation: &crate::host::Invocation) {
+fn emit_phase_counters(kind: ElementKind, s: &PhaseStats, invocation: &crate::host::Recorder) {
     let [blobs, elements, coalesces, worker_full, central, cap_fired] = phase_counter_names(kind);
     invocation.counter(blobs, s.blobs);
     invocation.counter(elements, s.elements);
@@ -416,7 +417,7 @@ fn run_kind_phase(
     compression: Compression,
     preserve_locations: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<PhaseStats> {
     let elements_per_blob = cap.get();
 
@@ -793,7 +794,7 @@ fn frame_and_write_batch(
 ) -> Result<u64> {
     use rayon::prelude::*;
 
-    let invocation = writer.cancel_token().clone();
+    let invocation = writer.cancel_token().permit();
     let metrics = &invocation.metrics().writer;
     let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch

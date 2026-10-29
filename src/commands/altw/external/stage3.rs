@@ -108,7 +108,7 @@ pub(super) fn stage3_slot_reorder(
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
     num_workers: usize,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
@@ -538,7 +538,7 @@ mod tests {
         let router = ConcurrentBlobLocationRouter::new(
             &per_way_rcs,
             vec![worker],
-            &crate::host::Invocation::new(),
+            &crate::host::Invocation::new().call(),
         )
         .expect("router");
         let way_slot_starts = [0];
@@ -559,7 +559,7 @@ mod tests {
             100,
             &integrated,
             1,
-            &crate::host::Invocation::new(),
+            &crate::host::Invocation::new().call(),
         )
         .expect_err("oversized blob must fail classification");
         assert!(err.to_string().contains("blob 0 slot range"));

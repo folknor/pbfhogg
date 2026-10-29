@@ -313,7 +313,7 @@ impl<S> Frames<S> {
     /// diagnostics and cancellation, its errors naming `path`. It refuses a
     /// partially indexed input ([`Self::refuse_partial_index`]); a command
     /// exempt from that policy opts out with [`Self::accept_partial_index`].
-    pub(crate) fn of_input(src: S, path: &Path, host: &crate::host::Host) -> Self {
+    pub(crate) fn of_input(src: S, path: &Path, host: &crate::host::Entered<'_>) -> Self {
         let mut frames = Self::new(src, Some(0), HeaderFields::INDEXES);
         frames.path = Some(Arc::from(path));
         frames.diagnostics = host.diagnostics.clone();

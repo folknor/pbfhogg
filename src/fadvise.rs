@@ -92,7 +92,10 @@ pub(crate) fn advise(
     let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, flag) };
     // `posix_fadvise` returns the error number itself, not -1 and `errno`.
     if rc != 0 {
-        invocation.metrics().fadvise.record_failure(invocation);
+        // Cold: a nested entry under whatever admits the caller (a
+        // command's call, a reader method's, a pipeline thread's permit).
+        let call = invocation.call();
+        call.metrics().fadvise.record_failure(&call);
     }
     true
 }
@@ -141,7 +144,7 @@ impl FadviseMetrics {
     /// like every sidecar counter: a sample the FIFO drops is not repaired.
     #[cfg(target_os = "linux")]
     #[cold]
-    fn record_failure(&self, invocation: &crate::host::Invocation) {
+    fn record_failure(&self, invocation: &crate::host::Recorder) {
         use std::sync::atomic::Ordering::Relaxed;
         let _order = self
             .emit_order

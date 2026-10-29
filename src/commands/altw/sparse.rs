@@ -230,7 +230,7 @@ pub(super) fn build_node_index_sparse(
     _direct_io: bool,
     scratch: &crate::scratch::RunScratch,
     referenced: IdSet,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<SparseArrayIndex> {
     let t_rank = crate::counters::Stopwatch::start();
     let referenced = referenced.into_ranked();
@@ -372,7 +372,7 @@ crate::counters::counter_set! {
 /// ordering, and the matched europe pair confirmed the opposite sign here:
 /// pass-2 disk read -57 %, pass-2 work -11.3 % (2026-07-16, `25cb0df`;
 /// reference/performance.md).
-fn advise_random_store(mmap: &memmap2::MmapMut, invocation: &crate::host::Invocation) {
+fn advise_random_store(mmap: &memmap2::MmapMut, invocation: &crate::host::Recorder) {
     #[cfg(unix)]
     {
         let advised = mmap.advise(memmap2::Advice::Random).is_ok();
@@ -433,7 +433,7 @@ mod tests {
     fn failed_preallocation_leaves_no_file_in_scratch() {
         let dir = crate::path_guard::tests::scratch();
         let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::for_tests())
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
                 .unwrap();
         super::open_anonymous_sparse_file(&scratch, u64::MAX)
             .expect_err("impossible allocation must be rejected");
@@ -454,7 +454,7 @@ mod tests {
     fn successful_allocation_unlinks_the_store() {
         let dir = crate::path_guard::tests::scratch();
         let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::for_tests())
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
                 .unwrap();
         let file = super::open_anonymous_sparse_file(&scratch, 4096).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 4096);

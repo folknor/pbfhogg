@@ -143,7 +143,11 @@ fn publish_negative_node_refs(
 
 /// Emit the negative-ref counter and, when any were skipped, a warning with
 /// the bounded ID sample.
-fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &crate::host::Host) {
+fn report_negative_node_refs(
+    count: &AtomicU64,
+    sample: Mutex<Vec<i64>>,
+    host: &crate::host::Entered<'_>,
+) {
     let negative_count = count.load(Ordering::Relaxed);
     host.invocation
         .counter("geocode_negative_node_refs", negative_count);
@@ -167,7 +171,7 @@ pub(super) fn run_pass1_5(
     max_node_id: i64,
     input: &InputFile,
     needed_admin_ways: &crate::idset::IdSet,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<crate::idset::IdSet> {
     let shared_file = input.file();
     let file_len = shared_file.metadata()?.len();
@@ -366,7 +370,7 @@ pub(super) fn run_pass1_5(
 #[allow(clippy::type_complexity)]
 pub(super) fn build_pass2_schedules(
     input: &PinnedInput,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(
     Vec<ScheduledBlob>, // node_schedule
     Vec<ScheduledBlob>, // way_schedule

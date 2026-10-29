@@ -494,6 +494,7 @@ pub fn check_index<'a>(
     opts: &CheckIndexOptions,
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation
         .decided(|| check_index_inner(input, opts, host))
@@ -502,7 +503,7 @@ pub fn check_index<'a>(
 fn check_index_inner(
     input: InputSource<'_>,
     opts: &CheckIndexOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<IndexReport> {
     let path = input.path();
     let mut frames = Frames::of_input(

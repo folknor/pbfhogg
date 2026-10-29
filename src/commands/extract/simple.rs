@@ -105,7 +105,7 @@ pub(super) fn extract_simple(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     // Check if input is sorted - if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
@@ -136,7 +136,7 @@ fn extract_simple_two_pass(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
         compression,
@@ -284,7 +284,7 @@ fn extract_simple_single_pass(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
         compression,
@@ -661,7 +661,7 @@ fn verify_candidate(
 fn settle_passthrough_candidates(
     node_schedule: &[&BlobDesc],
     verified_nodes: &[Option<u64>],
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Vec<BlobDesc> {
     let mut verified_blobs: u64 = 0;
     let mut demoted_blobs: u64 = 0;
@@ -694,7 +694,7 @@ fn process_extract_pass2_batch(
     clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     type BatchResult = crate::Result<(Vec<OwnedBlock>, ExtractStats)>;
     let results: Vec<BatchResult> = host.executor.install(|| {

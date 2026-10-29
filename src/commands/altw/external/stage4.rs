@@ -191,7 +191,7 @@ struct S4Consumer<'a> {
     passthrough_blobs: u64,
     passthrough_pread_ms: u64,
     passthrough_bytes: u64,
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
 }
 
 impl S4Consumer<'_> {
@@ -318,7 +318,7 @@ pub(super) fn stage4_assembly(
     inject_metrics: &InjectMetrics,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
     let WriteOptions {
@@ -941,7 +941,7 @@ crate::counters::counter_set! {
 impl WayReframeCounters {
     /// Emit the set, then the derived average, which is present only when
     /// at least one way was reframed.
-    fn emit(&self, invocation: &crate::host::Invocation) {
+    fn emit(&self, invocation: &crate::host::Recorder) {
         use std::sync::atomic::Ordering::Relaxed;
         self.emit_all(invocation);
         let total_refs = self.refs_total.load(Relaxed);

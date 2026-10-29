@@ -250,7 +250,7 @@ fn file_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
 /// the run's note. Cold: the kernel path never gets here.
 #[cfg(target_os = "linux")]
 #[cold]
-fn record_fallback(len: u64, err: &io::Error, invocation: &crate::host::Invocation) {
+fn record_fallback(len: u64, err: &io::Error, invocation: &crate::host::Recorder) {
     use std::sync::atomic::Ordering::Relaxed;
     let metrics = &invocation.metrics().writer;
     metrics.copy_range_fallback_ranges.fetch_add(1, Relaxed);
@@ -305,7 +305,7 @@ pub(crate) fn copy_range(
     out: CopyOut<'_>,
     offset: u64,
     len: u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let in_fd = input.file().as_raw_fd();
     let out_fd = out.file().as_raw_fd();
@@ -330,7 +330,7 @@ pub(crate) fn copy_range(
     out: CopyOut<'_>,
     offset: u64,
     len: u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let in_fd = input.file().as_raw_fd();
     let out_fd = out.file().as_raw_fd();
@@ -360,7 +360,7 @@ fn copy_range_with(
     out: CopyOut<'_>,
     mut offset: u64,
     mut len: u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
     mut cfr: impl FnMut(&mut i64, Option<&mut i64>, usize) -> io::Result<usize>,
 ) -> Result<()> {
     let (start, end) = (offset, offset.saturating_add(len));
@@ -444,7 +444,7 @@ pub(crate) fn read_range(
     input: &InputFile,
     mut offset: u64,
     mut len: u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
     sink: &mut impl ReadSink,
 ) -> Result<()> {
     let file = input.file();
@@ -515,7 +515,7 @@ fn copy_range_fallback(
     out: CopyOut<'_>,
     offset: u64,
     len: u64,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let mut sink = Bounce {
         buf: vec![0u8; crate::write::IO_BUF_BYTES],
@@ -576,7 +576,7 @@ mod tests {
         out_at: u64,
         explicit: bool,
     ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
-        let invocation = crate::host::Invocation::new();
+        let invocation = crate::host::Invocation::new().call();
         run_in(
             script,
             input_len,
@@ -597,7 +597,7 @@ mod tests {
         len: u64,
         out_at: u64,
         explicit: bool,
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
         use std::io::{Seek as _, SeekFrom};
         let dir = crate::path_guard::tests::scratch();
@@ -703,7 +703,7 @@ mod tests {
                 libc::EPERM,
                 libc::EINVAL,
             ] {
-                let invocation = crate::host::Invocation::new();
+                let invocation = crate::host::Invocation::new().call();
                 let metrics = &invocation.metrics().writer;
                 // EINTR first: the decision is on the first answer that is
                 // not an interruption. The range is larger than the fallback
@@ -808,7 +808,14 @@ mod tests {
             buf: Vec::new(),
             got: Vec::new(),
         };
-        read_range(&input, 10, 900, &crate::host::Invocation::new(), &mut sink).unwrap();
+        read_range(
+            &input,
+            10,
+            900,
+            &crate::host::Invocation::new().call(),
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(sink.got, bytes[10..910]);
     }
 
@@ -822,8 +829,14 @@ mod tests {
                 buf: Vec::new(),
                 got: Vec::new(),
             };
-            let err =
-                read_range(&input, 0, 50, &crate::host::Invocation::new(), &mut sink).unwrap_err();
+            let err = read_range(
+                &input,
+                0,
+                50,
+                &crate::host::Invocation::new().call(),
+                &mut sink,
+            )
+            .unwrap_err();
             assert!(
                 matches!(err.kind(), ErrorKind::Internal { .. }),
                 "size {size}: {err}"

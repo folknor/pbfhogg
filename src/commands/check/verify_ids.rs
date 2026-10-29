@@ -333,6 +333,7 @@ pub fn verify_ids<'a>(
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
 ) -> Result<super::CheckOutcome<VerifyIdsReport>> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation
         .decided(|| super::CheckOutcome::stop_on_contradiction(verify_ids_inner(input, opts, host)))
@@ -341,7 +342,7 @@ pub fn verify_ids<'a>(
 fn verify_ids_inner(
     input: InputSource<'_>,
     opts: &VerifyIdsOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
     {
         // Both engines open the input twice, each through its own open file
@@ -381,7 +382,7 @@ fn verify_ids_inner(
 /// the transform commands get) because `check` is a validation command with no
 /// `--force`: refusing would make it impossible to validate exactly the
 /// third-party files most in need of validating.
-fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
+fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Entered<'_>) {
     if !indexed {
         crate::host::diag!(
             host.diagnostics,
@@ -402,7 +403,7 @@ fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
 fn verify_ids_streaming_parallel(
     pin: &PinnedInput,
     opts: &VerifyIdsOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
     use crate::Element;
 
@@ -531,7 +532,7 @@ fn verify_single_kind_streaming(
     elem_type: &'static str,
     max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
@@ -672,7 +673,7 @@ impl BlobVerifyResult {
 fn verify_ids_full_parallel(
     pin: &PinnedInput,
     opts: &VerifyIdsOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
     use crate::Element;
 
@@ -854,7 +855,7 @@ fn verify_single_kind_parallel(
     elem_type: &'static str,
     max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
@@ -969,7 +970,11 @@ fn verify_single_kind_parallel(
 /// completion order, so which blob a duplicate is attributed to depends on
 /// it, as it already does for duplicates the atomic setters find; the totals
 /// do not. Test builds count the insertions on the run's token.
-fn settle_overflow(overflow: &mut IdSet, r: &mut BlobVerifyResult, host: &crate::host::Host) {
+fn settle_overflow(
+    overflow: &mut IdSet,
+    r: &mut BlobVerifyResult,
+    host: &crate::host::Entered<'_>,
+) {
     let mut inserted: u64 = 0;
     let duplicates = &mut r.duplicate_ids;
     r.out_of_range_ids.retain(|&id| {

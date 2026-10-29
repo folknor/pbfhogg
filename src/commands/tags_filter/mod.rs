@@ -278,7 +278,8 @@ pub fn tags_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_to(input, &output, opts, overrides, host)?;
     output.publish()?;
@@ -292,7 +293,7 @@ pub(crate) fn tags_filter_to<'a>(
     output: &crate::output::BoundOutput,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterStats> {
     // Options that cannot take effect together are refused before the input
     // is touched, and so is a malformed expression.
@@ -497,7 +498,7 @@ fn tags_filter_single_pass(
     distrust_metadata: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterStats> {
     let WriteOptions {
         compression,
@@ -720,7 +721,7 @@ fn tags_filter_two_pass(
     write: &WriteOptions,
     parallelism: crate::host::Parallelism,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterStats> {
     let jobs = parallelism.fixed();
     let WriteOptions {
@@ -1168,7 +1169,7 @@ fn collect_relation_member_closure(
     included_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
@@ -1297,7 +1298,7 @@ fn collect_way_node_dependencies(
     skip_way_ids: Option<&IdSet>,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
@@ -1368,9 +1369,10 @@ mod tests {
     /// One host for this module's tests, so a run and the publication of
     /// its output share an invocation (publication refuses another). Never
     /// cancelled and never armed.
-    fn run_host() -> &'static crate::host::Host {
-        static HOST: std::sync::OnceLock<crate::host::Host> = std::sync::OnceLock::new();
-        HOST.get_or_init(crate::host::Host::for_tests)
+    fn run_host() -> &'static crate::host::Entered<'static> {
+        static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =
+            std::sync::OnceLock::new();
+        HOST.get_or_init(crate::host::Host::entered_for_tests)
     }
     use super::*;
     use crate::ElementKind;
@@ -1605,7 +1607,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let s = tags_filter(input, staged, &opts, &HeaderOverrides::default(), &host)?;
         let mut elements = Vec::new();
         ElementReader::open_in(&output, false, &host)

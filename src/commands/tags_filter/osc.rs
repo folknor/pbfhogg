@@ -168,7 +168,8 @@ pub fn tags_filter_osc(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_osc_to(input, &output, expression_strs, host)?;
     output.publish()?;
@@ -181,7 +182,7 @@ pub(crate) fn tags_filter_osc_to(
     input: &Path,
     output: &crate::output::BoundOutput,
     expression_strs: &[String],
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterOscStats> {
     crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
@@ -195,7 +196,7 @@ pub(crate) fn tags_filter_osc_to(
 fn parse_and_filter_osc(
     input: &Path,
     expressions: &[Expression],
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<(FilteredOsc, TagsFilterOscStats)> {
     let mut sink = FilterSink {
         filtered: FilteredOsc::new(),

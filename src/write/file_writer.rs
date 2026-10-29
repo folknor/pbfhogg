@@ -30,7 +30,7 @@ use super::metrics::WriterMetrics;
 /// [`PbfWriter::to_path_sync`](crate::writer::PbfWriter::to_path_sync).
 pub struct FileWriter {
     inner: Inner,
-    invocation: crate::host::Invocation,
+    invocation: crate::host::Permit,
 }
 
 enum Inner {
@@ -48,12 +48,12 @@ impl FileWriter {
     /// record there.
     pub(crate) fn buffered_in(
         path: &Path,
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) -> crate::Result<Self> {
         let file = super::create_backend_file(path)?;
         Ok(Self {
             inner: Inner::Buffered(BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file)),
-            invocation: invocation.clone(),
+            invocation: invocation.permit(),
         })
     }
 
@@ -62,11 +62,11 @@ impl FileWriter {
     #[cfg(feature = "linux-direct-io")]
     pub(crate) fn direct_in(
         path: &Path,
-        invocation: &crate::host::Invocation,
+        invocation: &crate::host::Recorder,
     ) -> crate::Result<Self> {
         Ok(Self {
             inner: Inner::Direct(DirectWriter::create(path)?),
-            invocation: invocation.clone(),
+            invocation: invocation.permit(),
         })
     }
 
@@ -234,7 +234,7 @@ mod tests {
     fn flush_pushes_bytes_onward_without_fsyncing() {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
-        let token = crate::host::Invocation::new();
+        let token = crate::host::Invocation::new().call();
         let mut w = FileWriter::buffered_in(&path, &token).unwrap();
         let syncs = || token.metrics().writer.sync_all_calls.load(Relaxed);
 
@@ -271,7 +271,7 @@ mod tests {
     fn sync_on_dev_null_succeeds() {
         let mut w = FileWriter::buffered_in(
             std::path::Path::new("/dev/null"),
-            &crate::host::Invocation::new(),
+            &crate::host::Invocation::new().call(),
         )
         .unwrap();
         w.write_all(b"bytes").unwrap();

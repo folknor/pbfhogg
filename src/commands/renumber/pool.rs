@@ -94,7 +94,7 @@ where
         written: 0,
         orphans: 0,
     };
-    let cancel = writer.cancel_token().clone();
+    let cancel = writer.cancel_token().permit();
     run_ordered(
         n_tasks,
         states,

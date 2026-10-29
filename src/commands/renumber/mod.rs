@@ -193,7 +193,7 @@ macro_rules! stage_counters {
 
             /// Emit every counter under its name for `stage`, in declaration
             /// order.
-            fn emit(&self, stage: Phase, invocation: &crate::host::Invocation) {
+            fn emit(&self, stage: Phase, invocation: &crate::host::Recorder) {
                 self.for_each(stage, |name, value| invocation.counter(name, value));
             }
         }
@@ -391,7 +391,8 @@ pub fn renumber_external<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = renumber_external_to(input, &output, opts, write, overrides, host)?;
     output.publish()?;
@@ -407,7 +408,7 @@ pub(crate) fn renumber_external_to<'a>(
     opts: &RenumberOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<RenumberStats> {
     let WriteOptions {
         compression,

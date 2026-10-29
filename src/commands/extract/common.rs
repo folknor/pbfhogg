@@ -178,7 +178,11 @@ pub(super) fn refuse_blob_foreign_kind(
 /// warning when a candidate failed: either its indexdata bbox claimed a
 /// containment its own payload contradicts, or the payload has a shape no
 /// raw copy can be proved safe for (see [`dense_only_payload`]).
-pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &crate::host::Host) {
+pub(super) fn warn_passthrough_demotions(
+    verified: u64,
+    demoted: u64,
+    host: &crate::host::Entered<'_>,
+) {
     host.invocation
         .counter("extract_passthrough_verified_blobs", verified);
     host.invocation
@@ -199,7 +203,7 @@ pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &cra
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn build_blob_schedule(
     input: &PinnedInput,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<BlobDesc>> {
     build_blob_schedule_with_passthrough(input, None, host)
 }
@@ -214,7 +218,7 @@ pub(super) fn build_blob_schedule(
 pub(super) fn build_blob_schedule_with_passthrough(
     input: &PinnedInput,
     extract_bbox: Option<&crate::BlobBbox>,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<BlobDesc>> {
     host.invocation.marker("EXTRACT_SCHEDULE_SCAN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
@@ -291,7 +295,7 @@ pub(super) fn pread_execute<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
@@ -430,7 +434,7 @@ struct PreadConsumer<'a> {
     frame_read_buf: Vec<u8>,
     writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &'a mut ExtractStats,
-    cancel: &'a crate::host::Invocation,
+    cancel: &'a crate::host::Recorder,
 }
 
 impl PreadConsumer<'_> {
@@ -485,7 +489,7 @@ pub(super) fn pread_write_pass<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
@@ -516,7 +520,7 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>

@@ -52,7 +52,7 @@ Alternative primitives used elsewhere in the codebase:
 
 ## Invariants
 
-**Retention is solved.** `DecompressPool` in `src/read/blob.rs`
+**Retention is solved.** `DecompressPool` in `src/read/decompress.rs`
 (commit `8f6999b`, 2026-03-30) recycles decompression buffers via
 `PooledBuffer::drop` instead of cross-thread freeing. The pool caps
 its buffer count and per-buffer retained capacity

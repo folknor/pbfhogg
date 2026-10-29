@@ -256,6 +256,7 @@ pub fn node_stats<'a>(
     parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation
         .decided(|| node_stats_inner(input, direct_io, force, parallelism, host))
@@ -266,7 +267,7 @@ fn node_stats_inner(
     direct_io: bool,
     force: bool,
     parallelism: crate::host::Parallelism,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<NodeStatsReport> {
     // Two opens, each its own open file description: the probe below, then
     // the schedule walk whose descriptor the classify pool preads. Both are

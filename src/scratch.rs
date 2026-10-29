@@ -130,6 +130,7 @@ impl RunScratch {
     /// `parent` is missing, not a directory, or not writable, or the
     /// directory could not be initialised.
     pub fn create(parent: &Path, host: &Host) -> crate::Result<Self> {
+        let host = &host.enter();
         let parent = if parent.as_os_str().is_empty() {
             Path::new(".")
         } else {

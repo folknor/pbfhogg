@@ -23,7 +23,7 @@ pub(super) fn extract_complete_ways(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
         compression,

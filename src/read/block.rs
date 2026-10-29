@@ -452,6 +452,11 @@ pub struct PrimitiveBlock {
     /// How many elements [`elements`](Self::elements) yields, counted by the
     /// same validation pass.
     element_count: u64,
+    /// The census ticket of a block issued to the caller (`buffer`), set where
+    /// a block leaves the library. Declared after `_buffer`: a pooled buffer
+    /// returns to its pool and records there, under the pool's permit, before
+    /// the ticket retires.
+    ticket: Option<crate::host::Ticket>,
 }
 
 impl std::fmt::Debug for PrimitiveBlock {
@@ -491,7 +496,17 @@ impl PrimitiveBlock {
             block,
             kinds,
             element_count,
+            ticket: None,
         })
+    }
+
+    /// This block, issued to the caller of a block API under `invocation`:
+    /// counted in its census as a `buffer` until it is dropped. Idempotent.
+    pub(crate) fn issued(mut self, invocation: &crate::host::Invocation) -> Self {
+        if self.ticket.is_none() {
+            self.ticket = Some(invocation.ticket(crate::host::Kind::Buffer));
+        }
+        self
     }
 
     /// Refuse this block when `claim` names a kind and the block holds an
@@ -2013,6 +2028,7 @@ mod strict_validation_tests {
             block,
             kinds: crate::element_kind::KindSet::default(),
             element_count: 0,
+            ticket: None,
         }
     }
 

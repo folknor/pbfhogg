@@ -118,7 +118,7 @@ pub(crate) fn drain_batch_results<S>(
     results: Vec<Result<(Vec<OwnedBlock>, S)>>,
     writer: &mut PbfWriter<FileWriter>,
     mut merge: impl FnMut(S),
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let _ = host;
     for result in results {
@@ -405,7 +405,7 @@ pub(crate) fn writer_from_header(
     facts: &output_header::OutputFacts,
     overrides: &HeaderOverrides,
     backend: OutputBackend,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<PbfWriter<FileWriter>> {
     let built = output_header::build_one(header, facts, overrides, host)?;
     writer_from_header_bytes(output, compression, &built.bytes, backend, host)
@@ -430,9 +430,9 @@ pub(crate) fn writer_from_header_bytes(
     compression: Compression,
     header_bytes: &[u8],
     backend: OutputBackend,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<PbfWriter<FileWriter>> {
-    output.pbf_writer(compression, header_bytes, backend, host)
+    output.pbf_writer_unissued(compression, header_bytes, backend, host)
 }
 
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
@@ -484,7 +484,7 @@ pub(crate) fn require_indexdata<'a>(
     direct_io: bool,
     force: bool,
     reason: &str,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<bool> {
     let source = input.into();
     let (present, _) =
@@ -499,7 +499,7 @@ pub(crate) fn indexdata_policy(
     path: &Path,
     force: bool,
     reason: &str,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<bool> {
     if !force && !present {
         return Err(crate::error::new_missing_indexdata(reason)
@@ -556,7 +556,7 @@ pub(crate) fn dispatch_scan_arm<'a>(
     input: impl Into<crate::read::input::InputSource<'a>>,
     has_indexdata: bool,
     min_blobs: u64,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<crate::read::header_walker::ScanArm> {
     use crate::read::header_walker::{ScanArm, choose_scan_arm_at, estimate_blob_count};
     if !has_indexdata {
@@ -589,7 +589,7 @@ pub fn has_indexdata<'a>(
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
     // A library probe with no run to observe: it is never cancelled.
-    let cancel = crate::host::Invocation::new();
+    let cancel = crate::host::Invocation::new().call();
     Ok(probe_first_data_blob(input, direct_io, diagnostics, &cancel)?.0)
 }
 
@@ -602,6 +602,7 @@ pub fn has_indexdata_in<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<bool> {
+    let host = &host.enter();
     Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.invocation)?.0)
 }
 
@@ -618,7 +619,7 @@ pub fn has_tagdata(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    let cancel = crate::host::Invocation::new();
+    let cancel = crate::host::Invocation::new().call();
     Ok(probe_first_data_blob(path, direct_io, diagnostics, &cancel)?.1)
 }
 

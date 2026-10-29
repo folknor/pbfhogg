@@ -100,7 +100,8 @@ pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
-    let output = output.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
     output.publish()?;
@@ -114,7 +115,7 @@ pub(crate) fn merge_pbf_to<'a, S: Into<InputSource<'a>> + Copy>(
     output: &crate::output::BoundOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<MergePbfStats> {
     let sources: Vec<InputSource<'a>> = inputs.iter().map(|&input| input.into()).collect();
     let plan = plan_merge(&sources, opts, host)?;
@@ -137,7 +138,7 @@ struct MergePlan {
 fn plan_merge(
     inputs: &[InputSource<'_>],
     opts: &WriteOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<MergePlan> {
     if inputs.is_empty() {
         return Err(Error::invalid_argument("no input files specified"));
@@ -266,7 +267,7 @@ fn write_merge(
     output: &crate::output::BoundOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<MergePbfStats> {
     let MergePlan {
         inputs,
@@ -407,7 +408,7 @@ mod tests {
         plan_merge(
             &[a.into(), b.into()],
             &WriteOptions::default(),
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .expect("pass 1")
     }
@@ -418,7 +419,7 @@ mod tests {
             crate::output::Overwrite::Refuse,
             &crate::host::Diagnostics::discard(),
         )?;
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let output = output.bind(&host.invocation);
         write_merge(
             plan,
@@ -458,7 +459,7 @@ mod tests {
         let (a, b) = fixtures(dir.path());
         let c = dir.path().join("c.osm.pbf");
         write_fixture_indexed(&c, &[Blob::Nodes(&[3, 4, 5]), Blob::Way(11)], false);
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let opts = |direct_reads| WriteOptions {
             direct_reads,
             force: true,

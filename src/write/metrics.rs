@@ -250,7 +250,7 @@ impl WriterMetrics {
     /// recognise and discard.
     ///
     /// Returns `true` if this call did the emitting.
-    pub fn emit_once(&self, invocation: &crate::host::Invocation) -> bool {
+    pub fn emit_once(&self, invocation: &crate::host::Recorder) -> bool {
         if self.emitted.swap(true, Relaxed) {
             return false;
         }
@@ -259,7 +259,7 @@ impl WriterMetrics {
 
     /// Returns `true` if anything was emitted. Emits one captured snapshot:
     /// the values the all-zero gate checks are the values published.
-    fn emit(&self, invocation: &crate::host::Invocation) -> bool {
+    fn emit(&self, invocation: &crate::host::Recorder) -> bool {
         let mut counters: Vec<(&'static str, u64)> = Vec::new();
         self.for_each(|name, value| counters.push((name, value)));
 
@@ -343,12 +343,12 @@ mod tests {
         // for a reason that has nothing to do with the latch.
         metrics.record_accepted(4096);
         assert!(
-            metrics.emit_once(&crate::host::Invocation::new()),
+            metrics.emit_once(&crate::host::Invocation::new().call()),
             "the first emit_once must be the one that emits"
         );
         for _ in 0..4 {
             assert!(
-                !metrics.emit_once(&crate::host::Invocation::new()),
+                !metrics.emit_once(&crate::host::Invocation::new().call()),
                 "emit_once must not emit a second time; that is exactly the \
                  per-region re-emission it exists to stop"
             );
@@ -365,7 +365,7 @@ mod tests {
     fn an_untouched_metrics_set_emits_nothing() {
         let metrics = super::WriterMetrics::new();
         assert!(
-            !metrics.emit_once(&crate::host::Invocation::new()),
+            !metrics.emit_once(&crate::host::Invocation::new().call()),
             "an all-zero counter set must not be emitted"
         );
         // ...and the gate must be on the values, not a second latch: once
@@ -373,7 +373,7 @@ mod tests {
         let active = super::WriterMetrics::new();
         active.bytes_framed.fetch_add(1, Relaxed);
         assert!(
-            active.emit_once(&crate::host::Invocation::new()),
+            active.emit_once(&crate::host::Invocation::new().call()),
             "a counter set with real activity must still emit"
         );
     }

@@ -46,7 +46,7 @@ fn header_location(path: &Path) -> crate::error::Location {
 pub(crate) fn sorted_and_indexed<'a>(
     source: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<(bool, bool)> {
     let mut front = InputFront::open(source, direct_io, host)?;
     let sorted = front.is_sorted()?;
@@ -76,7 +76,7 @@ impl<'a> InputFront<'a> {
     pub(crate) fn open(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct_io: bool,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
@@ -146,7 +146,7 @@ impl<'a> InputFront<'a> {
         &mut self,
         force: bool,
         reason: &str,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<bool> {
         let present = self.indexed()?;
         super::indexdata_policy(present, self.path, force, reason, host)
@@ -183,7 +183,7 @@ mod tests {
         let mut bytes = frame("OSMHeader", &[0xFF, 0xFF, 0xFF]);
         bytes.extend_from_slice(&frame("OSMData", &[0x00]));
         std::fs::write(&path, bytes).unwrap();
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
 
         let mut front = InputFront::open(&path, false, &host).unwrap();
         let refused = front
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn header_only_is_indexed_and_headerless_is_missing_header() {
         let dir = crate::path_guard::tests::scratch();
-        let host = crate::host::Host::for_tests();
+        let host = crate::host::Host::entered_for_tests();
         let header_only = dir.path().join("header-only.osm.pbf");
         std::fs::write(&header_only, frame("OSMHeader", &[])).unwrap();
         let mut front = InputFront::open(&header_only, false, &host).unwrap();

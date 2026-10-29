@@ -69,6 +69,7 @@ pub fn inspect<'a>(
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation.decided(|| inspect_inner(input, opts, host))
 }
@@ -76,7 +77,7 @@ pub fn inspect<'a>(
 fn inspect_inner(
     input: InputSource<'_>,
     opts: &InspectOptions,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<InspectReport> {
     // A zero-byte or header-less file is the one missing-header error, not an
     // empty report: each scan below refuses it itself, from its own read.
@@ -145,6 +146,7 @@ pub fn inspect_header<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<InspectHeader> {
+    let host = &host.enter();
     let input = input.into();
     host.invocation.decided(|| {
         let reader = crate::ElementReader::open_in(input, direct_io, host)?;
@@ -184,7 +186,7 @@ fn try_index_only_scan(
     show_blocks: bool,
     show_id_ranges: bool,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Option<InspectReport>> {
     let path = input.path();
     let file_name = file_name_of(path);
@@ -355,7 +357,7 @@ fn full_decode_scan(
     show_locations: bool,
     extended: bool,
     direct_io: bool,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<InspectReport> {
     let path = input.path();
     let file_name = file_name_of(path);

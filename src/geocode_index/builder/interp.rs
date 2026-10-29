@@ -146,7 +146,7 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     strings: &StringPool,
     street_level: u8,
     executor: &crate::host::Executor,
-    invocation: &crate::host::Invocation,
+    invocation: &crate::host::Recorder,
 ) -> u32 {
     if interp_ways.is_empty() || addr_points.is_empty() {
         return 0;

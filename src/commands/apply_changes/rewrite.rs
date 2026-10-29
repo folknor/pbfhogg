@@ -85,7 +85,7 @@ fn build_header_bytes(
     header: &crate::HeaderBlock,
     locations_on_ways: bool,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Vec<u8>> {
     // apply-changes requires Sort.Type_then_ID on the base PBF
     // regardless of --locations-on-ways: the upsert slicing in
@@ -176,7 +176,8 @@ pub fn merge<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
-    let output_pbf = output_pbf.bind_to(&host.invocation)?;
+    let host = &host.enter();
+    let output_pbf = crate::output::bind_unissued(output_pbf, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
     output_pbf.publish()?;
@@ -196,7 +197,7 @@ pub(crate) fn merge_to<'a>(
     output_pbf: &crate::output::BoundOutput,
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<MergeStats> {
     // Option refusals first: none of them needs the input.
     opts.validate()?;
@@ -508,7 +509,7 @@ pub(crate) fn merge_to<'a>(
         compression,
         route: worker_route,
         failure: Arc::clone(&failure),
-        cancel: host.invocation.clone(),
+        cancel: host.invocation.permit(),
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,
@@ -717,7 +718,7 @@ mod tests {
             .unwrap(),
             &MergeOptions::default(),
             &HeaderOverrides::default(),
-            &crate::host::Host::for_tests(),
+            &crate::host::Host::entered_for_tests(),
         )
         .err()
         .expect("the base input must not also be the output");

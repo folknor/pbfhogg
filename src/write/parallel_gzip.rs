@@ -124,7 +124,7 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     /// The invocation the `writer_parallel_gzip_*` counters record into, and
     /// whose fault plan (`crate::test_hooks`) the workers and `flush`
     /// consult; the pool has no cancellation of its own.
-    cancel: crate::host::Invocation,
+    cancel: crate::host::Permit,
 }
 
 impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
@@ -156,7 +156,9 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         worker_count: usize,
         cancel: &crate::host::Invocation,
     ) -> Self {
-        let cancel = cancel.clone();
+        // The writer and its threads record outside any call, through
+        // `Drop` too, so they hold permits.
+        let cancel = cancel.permit();
         let chunk_size = chunk_size.max(1);
         let worker_count = worker_count.max(1);
         let raw_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
@@ -917,8 +919,12 @@ mod tests {
     /// back.
     fn roundtrip(bytes: &[u8], chunk_size: usize, workers: usize) -> Vec<u8> {
         let sink: Vec<u8> = Vec::new();
-        let mut gz =
-            ParallelGzipWriter::new(sink, chunk_size, workers, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(
+            sink,
+            chunk_size,
+            workers,
+            &crate::host::Invocation::new().call(),
+        );
         gz.write_all(bytes).unwrap();
         let compressed = gz.finish().unwrap();
         let mut out = Vec::new();
@@ -937,7 +943,7 @@ mod tests {
         // parallel gzip member, so a truly empty stream is
         // unreachable in practice. Document the no-op behaviour here.
         let sink: Vec<u8> = Vec::new();
-        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new().call());
         gz.write_all(&[]).unwrap();
         let compressed = gz.finish().unwrap();
         assert!(
@@ -975,7 +981,7 @@ mod tests {
         // one chunk, and confirm the concatenated output is a single
         // logical stream.
         let sink: Vec<u8> = Vec::new();
-        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new().call());
         for i in 0..5u8 {
             let block = [i; 1024];
             gz.write_all(&block).unwrap();
@@ -996,7 +1002,7 @@ mod tests {
     #[test]
     fn finish_returns_inner_writer() {
         let sink: Vec<u8> = Vec::new();
-        let mut gz = ParallelGzipWriter::new(sink, 4096, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 4096, 2, &crate::host::Invocation::new().call());
         gz.write_all(b"abc").unwrap();
         gz.write_all(b"def").unwrap();
         let bytes = gz.finish().unwrap();
@@ -1012,7 +1018,7 @@ mod tests {
         // Writes that exactly fill chunk_size must ship the chunk and
         // leave `current` empty - not crash on the next write.
         let sink: Vec<u8> = Vec::new();
-        let mut gz = ParallelGzipWriter::new(sink, 128, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 128, 2, &crate::host::Invocation::new().call());
         gz.write_all(&[7u8; 128]).unwrap();
         gz.write_all(&[9u8; 128]).unwrap();
         gz.write_all(&[11u8; 64]).unwrap();
@@ -1088,7 +1094,7 @@ mod tests {
         let sink = ProbeSink::new(40, false);
         let seen = std::sync::Arc::clone(&sink.data);
         let flushes = std::sync::Arc::clone(&sink.flushes);
-        let mut gz = ParallelGzipWriter::new(sink, 1024, 4, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 4, &crate::host::Invocation::new().call());
 
         let payload = [42u8; 4096];
         gz.write_all(&payload).unwrap();
@@ -1126,7 +1132,7 @@ mod tests {
     #[test]
     fn flush_propagates_a_downstream_write_error() {
         let sink = ProbeSink::new(0, true);
-        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new().call());
         gz.write_all(&[7u8; 4096]).unwrap();
         let err = gz.flush().expect_err("flush must report the sink's ENOSPC");
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
@@ -1147,7 +1153,7 @@ mod tests {
     fn flush_with_nothing_buffered_still_reaches_the_inner_writer() {
         let sink = ProbeSink::new(0, false);
         let flushes = std::sync::Arc::clone(&sink.flushes);
-        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Invocation::new().call());
         gz.flush().unwrap();
         assert!(
             flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
@@ -1162,7 +1168,7 @@ mod tests {
     #[test]
     fn interleaved_flushes_preserve_the_stream() {
         let sink: Vec<u8> = Vec::new();
-        let mut gz = ParallelGzipWriter::new(sink, 512, 4, &crate::host::Invocation::new());
+        let mut gz = ParallelGzipWriter::new(sink, 512, 4, &crate::host::Invocation::new().call());
         let mut expected = Vec::new();
         for i in 0..8u8 {
             let block = [i; 700];

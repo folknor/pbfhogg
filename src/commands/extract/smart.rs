@@ -135,7 +135,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     bbox_int: &BboxInt,
     direct_io: bool,
     handler: &mut H,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<Pass1Result> {
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
@@ -488,7 +488,7 @@ pub(super) fn extract_smart(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
         compression,

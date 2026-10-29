@@ -217,7 +217,8 @@ impl<R: Read + Send> ElementReader<R> {
         // This sequential API decodes every OsmData blob and does not apply
         // BlobFilter. It is a blob-level omission based on optional indexdata,
         // not a post-decode element predicate shared by every reader engine.
-        let Self { blob_iter, .. } = self;
+        let Self { mut blob_iter, .. } = self;
+        let _call = blob_iter.cancel_token().call();
 
         // Loop-local decode scratch. `decompress_into` fills `buf` straight from
         // the compressed payload; `std::mem::take` then MOVES that allocation
@@ -238,7 +239,7 @@ impl<R: Read + Send> ElementReader<R> {
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         let source = blob_iter.source().cloned();
 
-        for blob in blob_iter {
+        while let Some(blob) = blob_iter.next_blob() {
             let blob = blob?;
             // Only OsmData carries elements. Unknown extension blobs are
             // skipped without decompression, matching the pipeline pump.
@@ -274,10 +275,23 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        self.for_each_block_pipelined(|block| {
-            block.for_each_element(&mut f);
-            Ok(())
-        })
+        // Only elements reach the caller, borrowed from a block that never
+        // leaves this method, so no block is issued and none takes a ticket.
+        let call = self.blob_iter.cancel_token().call();
+        super::pipeline::run_pipeline(
+            self.blob_iter,
+            &call,
+            self.decode_threads,
+            self.pipeline_config,
+            self.blob_filter,
+            self.resources,
+            self.diagnostics,
+            super::pipeline::Blocks,
+            |block: PrimitiveBlock| {
+                block.for_each_element(&mut f);
+                Ok(())
+            },
+        )
     }
 
     /// Block-level pipelined iteration. Like [`for_each_pipelined`](Self::for_each_pipelined)
@@ -293,12 +307,37 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// # Errors
     /// Returns the first error encountered while parsing the PBF structure.
-    pub fn for_each_block_pipelined<F>(self, f: F) -> Result<()>
+    pub fn for_each_block_pipelined<F>(self, mut f: F) -> Result<()>
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
+        let call = self.blob_iter.cancel_token().call();
+        let handle = call.handle().clone();
         super::pipeline::run_pipeline(
             self.blob_iter,
+            &call,
+            self.decode_threads,
+            self.pipeline_config,
+            self.blob_filter,
+            self.resources,
+            self.diagnostics,
+            super::pipeline::Blocks,
+            // Each block is issued to the caller's closure, which can keep it.
+            |block: PrimitiveBlock| f(block.issued(&handle)),
+        )
+    }
+
+    /// [`for_each_block_pipelined`](Self::for_each_block_pipelined) for the
+    /// library's own consumers: the blocks never reach a caller, so none is
+    /// issued.
+    pub(crate) fn for_each_own_block_pipelined<F>(self, f: F) -> Result<()>
+    where
+        F: FnMut(PrimitiveBlock) -> Result<()>,
+    {
+        let call = self.blob_iter.cancel_token().call();
+        super::pipeline::run_pipeline(
+            self.blob_iter,
+            &call,
             self.decode_threads,
             self.pipeline_config,
             self.blob_filter,
@@ -331,8 +370,11 @@ impl<R: Read + Send> ElementReader<R> {
         X: super::pipeline::DecodeTransform,
         F: FnMut(X::Out) -> Result<()>,
     {
+        // A nested entry: the command calling it holds its own.
+        let call = self.blob_iter.cancel_token().call();
         super::pipeline::run_pipeline(
             self.blob_iter,
+            &call,
             self.decode_threads,
             self.pipeline_config,
             self.blob_filter,
@@ -376,14 +418,23 @@ impl<R: Read + Send> ElementReader<R> {
         let blob_filter = self.blob_filter;
         let resources = self.resources;
         let diagnostics = self.diagnostics;
+        let call = blob_iter.cancel_token().call();
+        // The background thread records outside any call, through its own
+        // teardown, so it runs under a permit it holds to its last act. The
+        // session itself only receives and joins, and records nothing.
+        let permit = call.permit();
+        let invocation = call.handle().clone();
+        let ticket = invocation.ticket(crate::host::Kind::Session);
 
         let handle = std::thread::spawn(move || {
+            let permit = permit;
             let deliver = |block: PrimitiveBlock| {
                 tx.send(Ok(block))
                     .map_err(|_| Error::internal("pipeline consumer dropped"))
             };
             let result = super::pipeline::run_pipeline(
                 blob_iter,
+                &permit,
                 decode_threads,
                 pipeline_config,
                 blob_filter,
@@ -398,12 +449,15 @@ impl<R: Read + Send> ElementReader<R> {
                 drop(tx.send(Err(e)));
             }
             thread_completed.store(true, std::sync::atomic::Ordering::Release);
+            drop(permit);
         });
 
         PipelinedBlocks {
             rx: Some(rx),
             handle: Some(handle),
             completed,
+            invocation,
+            _ticket: ticket,
         }
     }
 
@@ -471,6 +525,7 @@ impl<R: Read + Send> ElementReader<R> {
         ID: Fn() -> T + Sync + Send,
         T: Send,
     {
+        let _call = self.blob_iter.cancel_token().call();
         // `with_blob_filter` configures only the pipelined iteration methods.
         // par_map_reduce maps every decoded element and intentionally disables
         // indexdata parsing; using the optional metadata filter here would make
@@ -766,14 +821,15 @@ const _: () = assert!(
 );
 
 fn pump_blobs<R: Read + Send>(
-    blob_iter: BlobReader<R>,
+    mut blob_iter: BlobReader<R>,
     queue: &BatchQueue,
     budget: &ByteBudget,
     batch_max_blobs: usize,
     batch_max_bytes: u64,
 ) -> Result<()> {
     let mut batch = Batch::new();
-    for blob_result in blob_iter {
+    // Under the method's call; no admission per blob.
+    while let Some(blob_result) = blob_iter.next_blob() {
         // Resolve the read result before consulting shutdown: an obtained
         // read/framing error must propagate and win over any worker decode
         // error, even if a worker signaled shutdown while this blob was read.
@@ -1126,6 +1182,7 @@ impl ElementReader<FileReader> {
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
+        let host = &host.enter();
         Self::with_blobs(BlobReader::open_with(source, direct, host)?, host)
     }
 
@@ -1135,14 +1192,17 @@ impl ElementReader<FileReader> {
     pub(crate) fn open_in<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
-        host: &crate::host::Host,
+        host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
         Self::with_blobs(BlobReader::open_in(source, direct, host)?, host)
     }
 
     /// An element reader over `blob_iter`, opened under `host`: reads the
     /// header blob.
-    fn with_blobs(mut blob_iter: BlobReader<FileReader>, host: &crate::host::Host) -> Result<Self> {
+    fn with_blobs(
+        mut blob_iter: BlobReader<FileReader>,
+        host: &crate::host::Entered<'_>,
+    ) -> Result<Self> {
         let header = read_header_blob(&mut blob_iter)?;
         Ok(Self {
             blob_iter,
@@ -1208,14 +1268,21 @@ pub struct PipelinedBlocks {
     /// "the sender was dropped because the work finished" from "the sender was
     /// dropped because the thread unwound".
     completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The invocation the pipeline runs under: the handle that admits each
+    /// `next` and issues each block it returns.
+    invocation: crate::host::Invocation,
+    /// This session's census ticket. It retires with the session; the
+    /// background thread holds the pipeline's permit itself.
+    _ticket: crate::host::Ticket,
 }
 
 impl Iterator for PipelinedBlocks {
     type Item = Result<PrimitiveBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _call = self.invocation.call();
         match self.rx.as_ref()?.recv() {
-            Ok(item) => Some(item),
+            Ok(item) => Some(item.map(|block| block.issued(&self.invocation))),
             Err(_) => {
                 // The channel closed. On the normal path the pipeline thread
                 // has already sent every block (and any error) and set
@@ -1733,10 +1800,13 @@ mod tests {
                 }
                 thread_completed.store(true, Ordering::Release);
             });
+            let invocation = crate::host::Invocation::new();
             PipelinedBlocks {
                 rx: Some(rx),
                 handle: Some(handle),
                 completed,
+                _ticket: invocation.ticket(crate::host::Kind::Session),
+                invocation,
             }
         };
 

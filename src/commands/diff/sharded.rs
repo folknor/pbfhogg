@@ -39,14 +39,14 @@ pub(super) trait ShardedReport {
     fn finish_shard(shard: Self::Shard) -> Result<Self::Done>;
 
     /// Fold every shard of a phase, in shard order, into the final sink.
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Invocation) -> Result<()>;
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Recorder) -> Result<()>;
 
     /// Observe a phase's plan (sidecar counters).
     fn on_plan(
         &mut self,
         _kind: ElementKind,
         _shards: &[Shard],
-        _invocation: &crate::host::Invocation,
+        _invocation: &crate::host::Recorder,
     ) {
     }
 
@@ -81,7 +81,7 @@ pub(super) fn run<R: ShardedReport>(
     jobs: usize,
     skip_equal_blobs: bool,
     report: &mut R,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<BlockPairMergeStats> {
     if jobs <= 1 || walked.has_negative {
         for file in [&walked.old.file, &walked.new.file] {
@@ -131,7 +131,7 @@ fn run_sharded_phase<R: ShardedReport>(
     shards: &[Shard],
     skip_equal_blobs: bool,
     report: &mut R,
-    host: &crate::host::Host,
+    host: &crate::host::Entered<'_>,
 ) -> Result<BlockPairMergeStats> {
     // Opened on this thread: a failure here stops the phase before any
     // worker starts, and files already created are left for the run
@@ -225,7 +225,7 @@ fn run_shard<S: MergeSink>(
     kind: ElementKind,
     skip_equal_blobs: bool,
     sink: &mut S,
-    cancel: &crate::host::Invocation,
+    cancel: &crate::host::Recorder,
 ) -> Result<BlockPairMergeStats> {
     let mut old_side = BlockPairSide::new(
         &old.file,

@@ -20,6 +20,18 @@
   `CallSink::dropped` counts the lines a sink dropped (a refused name, an
   overlong line, a write a full FIFO turned away), shared by the sink's
   clones and separate from every other call's.
+- **Invocations account for what can still record into them.** Every
+  public entry that can record (a command, a reader, writer or block
+  iterator method, `Invocation::cancel`, the end-of-run emitters) is
+  admitted on its invocation for its extent, and every value that can
+  record outside such a call (a `PbfWriter` and its threads, a
+  `PipelinedBlocks` pipeline, a bound output, the decompression pool behind
+  issued blocks) holds a permit until its last recording; writers, block
+  iterators, bound outputs and blocks handed to the caller are counted by
+  kind. This is the groundwork for sealing an invocation; nothing is
+  refused yet and behaviour is unchanged. With the `test-hooks` feature,
+  `Invocation::capabilities` (doc-hidden) returns the counts as
+  `host::Capabilities`.
 - **The CLI marks its command interval on the sidecar FIFO.** With
   `BROKKR_MARKER_FIFO` set, every dispatched command writes one untagged
   `CLI_COMMAND_START` before its subcommand runs and one `CLI_COMMAND_END`

@@ -3,8 +3,7 @@
 Status:
 - Decisions A (seal) and B (publications and cancel) are settled by
   design spar, 2026-10-29, against the protocol as amended in brokkr
-  `3c59ce8` and `75dc76f`. Their specification obligations go to the
-  implementation spar.
+  `3c59ce8` and `75dc76f`, and both have landed (L1, L3, L4).
 - Decision C (the owned call sink) was argued in the earlier rounds and is
   carried as it stands.
 - The independent prerequisites have landed: `0e5807c7`, `02192dc3`,
@@ -65,16 +64,15 @@ Its residue is the re-certification, which waits on a harness (L2 onward):
 a certification under `v1` holds for `v1` only.
 - L0 (irreversible unbacked replacement) and L1 (#33, Decision B) have
   landed; see the landing list.
-- L2, the harness skeleton, has landed; see the landing list. It reports
-  every seal refused until L4.
-- L3, Decision A's capabilities, has landed; see the landing list. L4 is
-  the seal itself (Decision A's states and finalization, and Decision C),
-  a separate item, not a chain.
+- L2, the harness skeleton, has landed; see the landing list. Since L4 it
+  reports real seals.
+- L3, Decision A's capabilities, and L4, the seal itself (Decision A's
+  states and finalization, and Decision C), have landed; see the landing
+  list. ADR-0020 is the seal's contract.
 
 **bz state:**
-- **pbfhogg#31** was rewritten to Decision A's whole contract at L3; L4
-  closes it.
-- **#32, #34, #35 and #36** are open and map to the landings. #33 (L1) is
+- **pbfhogg#31 and #32** are closed by L4.
+- **#34, #35 and #36** are open and map to the landings. #33 (L1) is
   closed. #37 (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
 - **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
@@ -86,8 +84,9 @@ a certification under `v1` holds for `v1` only.
   lands, the cost of digest `v2` on the success path is unmeasured.
 - **brokkr#62** (filed at L2) is open: the call-stream defect "a name
   emitted twice" reads as forbidding repeated ordinary markers and
-  counter samples. It bites only once a call seals and claims its stream
-  (L4, L6).
+  counter samples. It bites only a call that claims its stream (L6):
+  `repeat-cat` seals and declares no `stream`, and its streams print
+  "pass (not judged)".
 
 **Practical facts:**
 - **Read the protocol** through `brokkr man library` (the installed
@@ -173,10 +172,12 @@ a certification under `v1` holds for `v1` only.
 9. **End-of-run emitters.** `emit_read_counters`, `emit_writer_counters`
    and `report_writer_degradations` are public. A textlint names the CLI
    as their only caller in this repository.
-10. **Sink delivery.**
-    - `Invocation::with_sink` takes any `Arc<dyn InstrumentSink>`.
-    - `CallSink` is `Clone` and unreleased.
-    - `MarkerFifo::call` is infallible.
+10. **Sink delivery** (since L4).
+    - `Invocation::with_sink` takes any `Arc<dyn InstrumentSink>`, with no
+      sealing semantics.
+    - `Invocation::with_call_sink` owns a non-`Clone` `CallSink` and an
+      optional tap; a seal ends the sink's stream.
+    - `MarkerFifo::call` is fallible and issues an id once per FIFO.
     - The CLI writes `CLI_COMMAND_START` / `CLI_COMMAND_END` around its
       dispatch (`ce104e1e`).
 11. **Exit statuses.** Usage errors exit 64, and runtime failures and
@@ -388,6 +389,43 @@ above that L3 did not settle are listed as residue in the landing list):
   `OutputWriter`, `DirWriter`, an idle `ElementReader` or `BlobReader`, a
   `RunScratch` and the never-issued `FileWriter` hold no permit and no
   ticket. `OutputWriter`'s `Write` methods record nothing and take no call.
+
+**Settled by L4's implementation spar** (one codex session, 2026-10-30):
+- **Two mint kinds, by what the minter holds.** `Invocation::call` (from a
+  bare handle) is fallible, `ErrorKind::Sealed` once the state is not
+  Open; `Host::enter` returns a `Result`. `Recorder::call`, `permit` and
+  `ticket` (from a borrowed live capability) are infallible, which is
+  sound because a live counted capability keeps a count above zero and an
+  uncounted one the saturation flag. The handle has no `permit` or
+  `ticket`. `Call::detached` is a call on a fresh invocation nobody else
+  holds (throwaway runs, tests). Cold sites that hold only a handle and
+  return unit skip their recording when refused.
+- **Word.** Open is 0, so the seal is `compare_exchange(0, FINALIZING)`
+  (`AcqRel`/`Acquire`). Saturation is set inside the Open-conditioned
+  exchange, closing the window where a minter that saw a full field set
+  the flag after a seal had won.
+- **The word is the in-flight barrier**; the call sink keeps no in-flight
+  count, only a state load so an impossible late ordinary record is
+  ignored and counted nowhere.
+- **Commit point.** The snapshot (as `Arc<Snapshot>`) is built inside the
+  pre-commit `catch_unwind`; an unwind there stores Failed. Storing it is
+  the commit; after it the stream is ended and Sealed stored on every path.
+  The sealing emissions and the `SealStep::Stream` hook run under a second
+  `catch_unwind` (an unwind there makes the terminal `!failed`); the
+  terminal state is decided before its write, and the write's result only
+  adds to it: whole keeps `N`, a soft drop gives `N + 1`, a hard failure
+  gives `failed` and `N + 1`. Only atomic stores follow (drops, then the
+  state with `Release`).
+- **Surface.** `Output::bind`, `OutputDir::bind`, `OutputSet::bind`,
+  `into_blocks_pipelined` and `PbfWriter::new_in` return `Result`;
+  `BlobReader::next` and `PipelinedBlocks::next` yield `Sealed` once and
+  end. The emitters return unit and do nothing when refused.
+  `stream_account()` is `None` without a call sink. Reserved forms are
+  refused on the tagged stream only (untagged `@@x=1` is a counter named
+  `@x`). The `MarkerFifo::call` registry is per opened FIFO.
+- **`Line::emit`** tells a whole line, a soft drop (overflow, `EAGAIN`,
+  `EINTR`, a short write) and a hard failure apart; any hard failure in the
+  sink's life ends the stream `failed`.
 
 ## Decision B: publication decisions and cancel (#33) (landed as L1)
 
@@ -691,7 +729,8 @@ Landed independently, 2026-10-29:
   line. Member `harness/` (bin only, unit tests in the bin, executable
   tests in `harness/tests/all.rs` under the CLI's promise guard mounted
   from `cli/tests/guard.rs`), `repeat-cat`, the wiring, and a per-sink
-  drop count on `CallSink` (`CallSink::dropped`). Gate: `brokkr library
+  drop count on `CallSink` (`CallSink::dropped`, folded into the stream
+  account at L4). Gate: `brokkr library
   repeat-cat --dataset denmark` fails on exactly `a/brokkr.seal` and
   `b/brokkr.seal`; both `brokkr.cli` results pass under digest `v2`.
   That expectation holds for a digest-compatible (sorted) input; an
@@ -766,10 +805,37 @@ Landed independently, 2026-10-29:
     item 8 says.
   Lateral: no brokkr command issues blocks in bulk, so the census lock per
   issued block has no bulk measurement (see `reference/performance.md`).
+- L4, the seal (Decisions A and C, #31 and #32): the commit that carries
+  this line. `Invocation::seal` with `SealOutcome` / `SealRefusal` /
+  `Census` / `Snapshot`, the four-state word, fallible admission
+  (`ErrorKind::Sealed`, `CancelOutcome::Ended`), `with_call_sink` and the
+  tap, the owned non-`Clone` `CallSink` with its `StreamAccount`, fallible
+  `MarkerFifo::call`, the reserved forms, ADR-0020 (ADR-0019 amended). Its
+  implementation choices are listed under Decision A. The harness reports
+  real seal, snapshot and stream values. Gate: `brokkr check` with
+  `src/host.rs` capability tests (classification, saturation, the exchange
+  racing retirements and nested calls), `src/debug.rs` sink tests (a
+  dropped terminal record, a vanished reader, an unwind before the
+  terminal, ids issued once, reserved forms), `tests/seal.rs` (concurrent
+  sealers refused until the account is frozen, a seal from a callback
+  refused, the in-flight barrier, a panicking tap, a panic before and after
+  the snapshot), `tests/capabilities.rs` (an outstanding buffer released,
+  then a retry) and the harness's `repeat_cat_runs_to_the_protocol` (every
+  snapshot counter's sealing emission and the terminal record on the
+  FIFO); `brokkr library repeat-cat --dataset denmark` passes (both
+  `brokkr.seal` results pass, streams "pass (not judged)"). Cost: one
+  matched denmark pair of `brokkr write`, no cost; numbers in
+  `reference/performance.md`. Residue:
+  - for L5: a tap that holds its own invocation (the cancel scenarios
+    trip it from the tap) forms an `Arc` cycle; hold it in a slot the
+    harness clears after the call, as `tests/seal.rs` does. `cancel_json`
+    still refuses `CancelOutcome::Ended`, which has no protocol spelling;
+    no scenario cancels after a seal;
+  - for L6: brokkr#62 decides whether a claimed stream with repeated
+    ordinary names can pass.
 
 | # | Landing | Gate |
 |---|---|---|
-| L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, fallible admission at L3's mint sites, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier, with one matched denmark pair if it adds success-path work (L3 measured its own). `brokkr library repeat-cat --dataset denmark` passes |
 | L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
 | L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
 | L7 | #36 reserving descriptor provider (needed by the concurrent scenarios) | per landing |

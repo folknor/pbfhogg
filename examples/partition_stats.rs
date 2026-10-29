@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // We need per-blob granularity. Use into_blocks_pipelined and treat each
     // PrimitiveBlock as one blob (which it is - one blob = one block).
-    for block in reader.into_blocks_pipelined() {
+    for block in reader.into_blocks_pipelined()? {
         let block = block?;
         current_blob_refs.clear();
 

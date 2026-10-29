@@ -167,7 +167,7 @@ pub fn diff<'a, 'b>(
     host: &crate::host::Host,
     scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     host.invocation.check()?;
     let jobs = options.shards(host);
     if jobs > 1 && scratch.is_none() {
@@ -223,7 +223,7 @@ pub fn diff_stats<'a, 'b>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     host.invocation.check()?;
     // Nothing is printed, so byte-equal blobs may be skipped (see above).
     let options = DiffOptions {

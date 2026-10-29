@@ -415,8 +415,11 @@ pub(crate) fn warn_unrecognised_indexdata(
     len: usize,
     site: BlobSite<'_>,
 ) {
-    // Cold, and a nested entry under whatever admits the walk.
-    let call = invocation.call();
+    // Cold, and a nested entry under whatever admits the walk, so never
+    // refused there; a sealed invocation reports nothing.
+    let Ok(call) = invocation.call() else {
+        return;
+    };
     crate::host::diag_once!(
         diagnostics,
         &call,

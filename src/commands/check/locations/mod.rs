@@ -715,7 +715,7 @@ pub fn check_locations<'a>(
     opts: &CheckLocationsOptions,
     host: &crate::host::Host,
 ) -> Result<super::CheckOutcome<LocationsReport>> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation.decided(|| {
         super::CheckOutcome::stop_on_contradiction(check_locations_inner(input, opts, host))

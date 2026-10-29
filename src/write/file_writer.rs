@@ -234,7 +234,7 @@ mod tests {
     fn flush_pushes_bytes_onward_without_fsyncing() {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
-        let token = crate::host::Invocation::new().call();
+        let token = crate::host::Call::detached();
         let mut w = FileWriter::buffered_in(&path, &token).unwrap();
         let syncs = || token.metrics().writer.sync_all_calls.load(Relaxed);
 
@@ -271,7 +271,7 @@ mod tests {
     fn sync_on_dev_null_succeeds() {
         let mut w = FileWriter::buffered_in(
             std::path::Path::new("/dev/null"),
-            &crate::host::Invocation::new().call(),
+            &crate::host::Call::detached(),
         )
         .unwrap();
         w.write_all(b"bytes").unwrap();

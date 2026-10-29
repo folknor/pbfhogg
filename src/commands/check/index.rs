@@ -494,7 +494,7 @@ pub fn check_index<'a>(
     opts: &CheckIndexOptions,
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation
         .decided(|| check_index_inner(input, opts, host))

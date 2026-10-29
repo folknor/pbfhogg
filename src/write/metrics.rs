@@ -343,12 +343,12 @@ mod tests {
         // for a reason that has nothing to do with the latch.
         metrics.record_accepted(4096);
         assert!(
-            metrics.emit_once(&crate::host::Invocation::new().call()),
+            metrics.emit_once(&crate::host::Call::detached()),
             "the first emit_once must be the one that emits"
         );
         for _ in 0..4 {
             assert!(
-                !metrics.emit_once(&crate::host::Invocation::new().call()),
+                !metrics.emit_once(&crate::host::Call::detached()),
                 "emit_once must not emit a second time; that is exactly the \
                  per-region re-emission it exists to stop"
             );
@@ -365,7 +365,7 @@ mod tests {
     fn an_untouched_metrics_set_emits_nothing() {
         let metrics = super::WriterMetrics::new();
         assert!(
-            !metrics.emit_once(&crate::host::Invocation::new().call()),
+            !metrics.emit_once(&crate::host::Call::detached()),
             "an all-zero counter set must not be emitted"
         );
         // ...and the gate must be on the values, not a second latch: once
@@ -373,7 +373,7 @@ mod tests {
         let active = super::WriterMetrics::new();
         active.bytes_framed.fetch_add(1, Relaxed);
         assert!(
-            active.emit_once(&crate::host::Invocation::new().call()),
+            active.emit_once(&crate::host::Call::detached()),
             "a counter set with real activity must still emit"
         );
     }

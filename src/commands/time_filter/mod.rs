@@ -96,7 +96,7 @@ pub fn time_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = time_filter_to(

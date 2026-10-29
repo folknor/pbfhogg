@@ -148,7 +148,7 @@ pub fn merge_changes(
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_changes_to(
@@ -1116,7 +1116,7 @@ mod tests {
                     &mut writer,
                     &mut action,
                     &mut count,
-                    &crate::host::Invocation::new().call(),
+                    &crate::host::Call::detached(),
                 )?;
                 if let Some(action) = action {
                     writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;

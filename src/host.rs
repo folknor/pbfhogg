@@ -76,8 +76,19 @@ pub struct Host {
 /// outside a call (a writer and its threads, a block iterator's pipeline, a
 /// decompression pool kept alive by blocks, a bound output) holds a permit
 /// until its last recording. Values of those kinds handed to the caller are
-/// counted, by kind, in the invocation's census. Admission always succeeds
-/// today; it is what a seal will close.
+/// counted, by kind, in the invocation's census.
+///
+/// # Sealing
+///
+/// [`seal`](Self::seal) ends the invocation: it closes admission, takes the
+/// final snapshot of its counters and, for an invocation built with
+/// [`with_call_sink`](Self::with_call_sink), ends the call stream. It never
+/// waits. It refuses while a call is in progress, reports the census while a
+/// value issued to the caller can still record, and once sealed every public
+/// entry under the invocation is refused with
+/// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) (`cancel` returns
+/// [`CancelOutcome::Ended`](crate::publication::CancelOutcome::Ended)).
+/// ADR-0020 is the contract.
 #[derive(Clone, Default)]
 pub struct Invocation(Arc<InvocationState>);
 
@@ -99,9 +110,12 @@ struct InvocationState {
     /// lines of its own (`counters::Padded`), apart from `tripped`.
     metrics: crate::counters::InvocationMetrics,
     /// Where the run's markers and counter samples go, if anywhere.
-    sink: Option<Arc<dyn crate::debug::InstrumentSink>>,
+    sink: SinkSlot,
     /// Set once the sink has panicked: later emissions skip it.
     sink_failed: std::sync::atomic::AtomicBool,
+    /// The snapshot a successful seal took, set once by the finalizing
+    /// thread before it publishes `Sealed` on the word.
+    sealed: std::sync::OnceLock<Arc<Snapshot>>,
     /// The keys of the once-per-invocation diagnostics already reported (or
     /// covered by a more specific report). Touched only where such a
     /// diagnostic is about to be emitted, never on a per-element path.
@@ -122,6 +136,38 @@ struct InvocationState {
     /// The census: how many issued values of each [`Kind`] are alive.
     /// Bookkeeping only; nothing is ever called under it.
     census: std::sync::Mutex<[u64; Kind::COUNT]>,
+}
+
+/// Where an invocation's markers and counter samples go.
+#[derive(Default)]
+enum SinkSlot {
+    /// Nowhere: the run emits nothing.
+    #[default]
+    None,
+    /// A caller's sink, with no sealing semantics.
+    Generic(Arc<dyn crate::debug::InstrumentSink>),
+    /// The invocation's own call sink, which a seal ends, and the caller's
+    /// tap, which sees every ordinary record after the sink and nothing at
+    /// sealing. The tap is latched off on its own when it panics.
+    Call {
+        sink: crate::debug::CallSink,
+        tap: Option<Arc<dyn crate::debug::InstrumentSink>>,
+        tap_failed: std::sync::atomic::AtomicBool,
+    },
+}
+
+/// Run `emit` with its unwinding contained: a panic latches `failed`, and
+/// the caught payload is forgotten, not dropped, since its destructor is
+/// caller code too and could panic again.
+fn contained(failed: &std::sync::atomic::AtomicBool, emit: impl FnOnce()) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if failed.load(Relaxed) {
+        return;
+    }
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(emit)) {
+        failed.store(true, Relaxed);
+        std::mem::forget(payload);
+    }
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -152,7 +198,35 @@ impl Invocation {
     #[must_use]
     pub fn with_sink(sink: Arc<dyn crate::debug::InstrumentSink>) -> Self {
         Self(Arc::new(InvocationState {
-            sink: Some(sink),
+            sink: SinkSlot::Generic(sink),
+            ..InvocationState::default()
+        }))
+    }
+
+    /// A fresh, untripped token that owns `sink`, the call stream of one
+    /// call on a [`MarkerFifo`](crate::debug::MarkerFifo): every marker and
+    /// counter sample of the run goes there, and a successful
+    /// [`seal`](Self::seal) ends the stream with the sealing emissions and
+    /// the terminal record. Its account is
+    /// [`stream_account`](Self::stream_account).
+    ///
+    /// `tap`, if given, sees every ordinary record after the sink, and
+    /// nothing at sealing; a panicking tap is latched off on its own, and the
+    /// sink carries on. The tap is the caller's code under the same rules as
+    /// any [`InstrumentSink`](crate::debug::InstrumentSink). A tap that holds
+    /// this invocation (to cancel it, say) keeps it alive for as long as the
+    /// tap lives: clear what the tap holds once the call is over.
+    #[must_use]
+    pub fn with_call_sink(
+        sink: crate::debug::CallSink,
+        tap: Option<Arc<dyn crate::debug::InstrumentSink>>,
+    ) -> Self {
+        Self(Arc::new(InvocationState {
+            sink: SinkSlot::Call {
+                sink,
+                tap,
+                tap_failed: std::sync::atomic::AtomicBool::new(false),
+            },
             ..InvocationState::default()
         }))
     }
@@ -163,62 +237,200 @@ impl Invocation {
     #[inline]
     #[must_use]
     pub fn instrumented(&self) -> bool {
-        self.0.sink.is_some()
-            && !self
-                .0
-                .sink_failed
-                .load(std::sync::atomic::Ordering::Relaxed)
+        use std::sync::atomic::Ordering::Relaxed;
+        let sink_ok = !self.0.sink_failed.load(Relaxed);
+        match &self.0.sink {
+            SinkSlot::None => false,
+            SinkSlot::Generic(_) => sink_ok,
+            SinkSlot::Call {
+                tap, tap_failed, ..
+            } => sink_ok || (tap.is_some() && !tap_failed.load(Relaxed)),
+        }
+    }
+
+    /// The account of this invocation's call sink: how its stream ended and
+    /// every line it dropped, the terminal record included. `None` for an
+    /// invocation without one ([`new`](Self::new),
+    /// [`with_sink`](Self::with_sink)). The state is
+    /// [`Open`](crate::debug::StreamState::Open) until a successful seal has
+    /// ended the stream, and never changes after that.
+    #[must_use]
+    pub fn stream_account(&self) -> Option<crate::debug::StreamAccount> {
+        match &self.0.sink {
+            SinkSlot::Call { sink, .. } => Some(sink.account()),
+            SinkSlot::None | SinkSlot::Generic(_) => None,
+        }
     }
 
     /// Admit a public entry: a [`Call`] guard on this invocation for the
     /// entry's extent. Every recording the entry makes goes through it.
-    /// Nested and internal entries mint their own; the enclosing guard keeps
-    /// the invocation open. Admission always succeeds while the invocation
-    /// has no seal.
+    /// Refused with [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) once a
+    /// seal has begun. A holder of a capability mints nested ones through its
+    /// [`Recorder`] instead, which cannot be refused.
     #[inline]
-    pub(crate) fn call(&self) -> Call {
-        Call {
-            rec: Recorder(self.clone()),
-            counted: self.mint(word::GUARD),
+    pub(crate) fn call(&self) -> crate::Result<Call> {
+        match self.mint(word::GUARD) {
+            Some(counted) => Ok(Call {
+                rec: Recorder(self.clone()),
+                counted,
+            }),
+            None => Err(crate::error::new_sealed()),
         }
     }
 
-    /// A [`Permit`] for a value that records outside any public call, through
-    /// background work or its own `Drop`. Held past its last recording.
-    pub(crate) fn permit(&self) -> Permit {
-        Permit {
-            rec: Recorder(self.clone()),
-            counted: self.mint(word::PERMIT),
-        }
-    }
-
-    /// A census ticket of `kind` for a value issued to the caller.
-    pub(crate) fn ticket(&self, kind: Kind) -> Ticket {
-        self.census_adjust(kind, true);
-        Ticket {
-            invocation: self.clone(),
-            kind,
-        }
-    }
-
-    /// Count one capability of `unit`'s field into the word. `false` when the
-    /// field is saturated: the sticky flag is set instead and the capability
-    /// is uncounted, so it never decrements.
+    /// Count one capability of `unit`'s field into the word, admitted only
+    /// while the invocation is Open: `None` once a seal has begun. `false`
+    /// when the field is saturated: the sticky flag is set instead, in the
+    /// same Open-conditioned exchange, and the capability is uncounted, so it
+    /// never decrements. A set flag keeps the invocation Open for good (the
+    /// seal's exchange expects it clear), so a minter that finds it already
+    /// set needs no exchange.
     #[inline]
-    fn mint(&self, unit: u64) -> bool {
+    fn mint(&self, unit: u64) -> Option<bool> {
         use std::sync::atomic::Ordering::{AcqRel, Relaxed};
         let word = &self.0.word.0;
         let mut current = word.load(Relaxed);
         loop {
-            if word::is_full(current, unit) {
-                word.fetch_or(word::SATURATED, Relaxed);
-                return false;
+            if current & word::STATE != word::OPEN {
+                return None;
             }
-            match word.compare_exchange_weak(current, current + unit, AcqRel, Relaxed) {
-                Ok(_) => return true,
+            let (next, counted) = if word::is_full(current, unit) {
+                if current & word::SATURATED != 0 {
+                    return Some(false);
+                }
+                (current | word::SATURATED, false)
+            } else {
+                (current + unit, true)
+            };
+            match word.compare_exchange_weak(current, next, AcqRel, Relaxed) {
+                Ok(_) => return Some(counted),
                 Err(seen) => current = seen,
             }
         }
+    }
+
+    /// End the invocation. Never waits and never retries; see ADR-0020.
+    ///
+    /// One exchange takes the invocation from Open, with no call in
+    /// progress, no permit alive and no saturated count, to Finalizing; from
+    /// then on every admission is refused. The thread that made it takes the
+    /// snapshot of the counters ([`for_each_counter`](Self::for_each_counter)
+    /// as owned data), ends the call stream if the invocation owns a
+    /// [`CallSink`](crate::debug::CallSink) (every counter of the snapshot as
+    /// a sealing emission, then the terminal record), and only then marks the
+    /// invocation Sealed and returns [`SealOutcome::Sealed`]. It runs no
+    /// caller code. A later `seal` returns the same snapshot.
+    ///
+    /// Otherwise it says why not, from what it observed, in this order: a
+    /// call in progress ([`SealRefusal::InProgress`], which is what a seal
+    /// from inside a callback of a call gets); another seal finalizing
+    /// ([`SealRefusal::Finalizing`]); a finalization that failed
+    /// ([`SealRefusal::FinalizationFailed`]: a panic before the snapshot was
+    /// taken; the stream stays open and the invocation can never seal); a
+    /// saturated count ([`SealRefusal::Saturated`]); and with permits alive,
+    /// the census: [`SealOutcome::Outstanding`] when values issued to the
+    /// caller are still alive (drop them and seal again),
+    /// [`SealRefusal::Unticketed`] when none is (a permit the caller cannot
+    /// release, such as one inside a leaked value or a forgotten panic
+    /// payload), [`SealRefusal::Busy`] when the census was being updated.
+    pub fn seal(&self) -> SealOutcome {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        // Acquire: every recording of every retired capability (each retired
+        // with `Release`) happens before the snapshot, and a `Sealed` seen on
+        // failure carries the stored snapshot with it.
+        match self
+            .0
+            .word
+            .0
+            .compare_exchange(word::OPEN, word::FINALIZING, AcqRel, Acquire)
+        {
+            Ok(_) => self.finalize(),
+            Err(seen) => self.classify(seen),
+        }
+    }
+
+    /// Why a seal that did not win the exchange did not, from the word it
+    /// observed (see [`seal`](Self::seal) for the order).
+    fn classify(&self, seen: u64) -> SealOutcome {
+        if word::field(seen, word::GUARD) > 0 {
+            return SealOutcome::Refused(SealRefusal::InProgress);
+        }
+        match seen & word::STATE {
+            word::FINALIZING => return SealOutcome::Refused(SealRefusal::Finalizing),
+            word::SEALED => {
+                // Set before `Sealed` was published, and the exchange that
+                // observed `Sealed` acquired it.
+                return match self.0.sealed.get() {
+                    Some(snapshot) => SealOutcome::Sealed(Arc::clone(snapshot)),
+                    None => SealOutcome::Refused(SealRefusal::Finalizing),
+                };
+            }
+            word::FAILED => return SealOutcome::Refused(SealRefusal::FinalizationFailed),
+            _ => {}
+        }
+        if seen & word::SATURATED != 0 {
+            return SealOutcome::Refused(SealRefusal::Saturated);
+        }
+        if word::field(seen, word::PERMIT) == 0 {
+            // A strong exchange from Open with nothing counted cannot fail.
+            return SealOutcome::Refused(SealRefusal::Busy);
+        }
+        let census = match self.0.census.try_lock() {
+            Ok(census) => *census,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return SealOutcome::Refused(SealRefusal::Busy);
+            }
+        };
+        let census = Census {
+            session: census[Kind::Session as usize],
+            writer: census[Kind::Writer as usize],
+            output: census[Kind::Output as usize],
+            buffer: census[Kind::Buffer as usize],
+        };
+        if census.is_empty() {
+            SealOutcome::Refused(SealRefusal::Unticketed)
+        } else {
+            SealOutcome::Outstanding(census)
+        }
+    }
+
+    /// The winning sealer's finalization, in two regions split by one
+    /// commit point. Before it, a panic (the snapshot, a test hook) marks
+    /// the invocation Failed: no sealing record exists, so the stream stays
+    /// open. The commit point stores the prepared snapshot; after it the
+    /// invocation ends Sealed on every path, whatever happens to the stream.
+    fn finalize(&self) -> SealOutcome {
+        use std::sync::atomic::Ordering::Release;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(feature = "test-hooks")]
+            self.0
+                .faults
+                .seal_step(crate::test_hooks::SealStep::Snapshot);
+            let mut counters = Vec::new();
+            self.0
+                .metrics
+                .for_each(|name, value| counters.push((name, value)));
+            Arc::new(Snapshot { counters })
+        }));
+        let snapshot = match prepared {
+            Ok(snapshot) => snapshot,
+            Err(payload) => {
+                std::mem::forget(payload);
+                self.0.word.0.store(word::FAILED, Release);
+                return SealOutcome::Refused(SealRefusal::FinalizationFailed);
+            }
+        };
+        // The commit point. Only this thread sets it, once.
+        drop(self.0.sealed.set(Arc::clone(&snapshot)));
+        if let SinkSlot::Call { sink, .. } = &self.0.sink {
+            sink.close(&snapshot, || {
+                #[cfg(feature = "test-hooks")]
+                self.0.faults.seal_step(crate::test_hooks::SealStep::Stream);
+            });
+        }
+        self.0.word.0.store(word::SEALED, Release);
+        SealOutcome::Sealed(snapshot)
     }
 
     /// Retire one counted capability of `unit`'s field. `Release`: every
@@ -285,8 +497,13 @@ impl Invocation {
     /// Every decision after it refuses. It never waits for a publication
     /// in progress. To cancel one command among several, give each its own
     /// invocation.
+    ///
+    /// Once a seal has begun there is nothing left to cancel: it returns
+    /// [`Ended`](crate::publication::CancelOutcome::Ended) and trips nothing.
     pub fn cancel(&self) -> crate::publication::CancelOutcome {
-        let call = self.call();
+        let Ok(call) = self.call() else {
+            return crate::publication::CancelOutcome::Ended;
+        };
         let mut log = call.log();
         self.0
             .tripped
@@ -429,12 +646,19 @@ impl Invocation {
     }
 }
 
-/// The transition word's layout: two bits of lifecycle state (only Open
-/// exists until the invocation can be sealed), a sticky saturation flag, the
-/// live [`Call`] guards and the live [`Permit`]s. A count at its field's
-/// maximum is not incremented: the flag is set and the capability goes
-/// uncounted, so a seal can never mistake a saturated count for a true one.
+/// The transition word's layout: two bits of lifecycle state, a sticky
+/// saturation flag, the live [`Call`] guards and the live [`Permit`]s. A
+/// count at its field's maximum is not incremented: the flag is set and the
+/// capability goes uncounted, so a seal can never mistake a saturated count
+/// for a true one. Open is zero, so the seal's exchange expects the whole
+/// word to be zero: Open, nothing counted, no saturation.
 mod word {
+    /// The lifecycle state bits.
+    pub(super) const STATE: u64 = 0b11;
+    pub(super) const OPEN: u64 = 0;
+    pub(super) const FINALIZING: u64 = 1;
+    pub(super) const SEALED: u64 = 2;
+    pub(super) const FAILED: u64 = 3;
     pub(super) const SATURATED: u64 = 1 << 2;
     const GUARD_SHIFT: u32 = 3;
     const GUARD_BITS: u32 = 30;
@@ -509,6 +733,145 @@ pub struct Capabilities {
     pub buffer: u64,
 }
 
+/// What [`Invocation::seal`] found.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SealOutcome {
+    /// The invocation is sealed: nothing records into it any more, and this
+    /// is its final snapshot.
+    Sealed(Arc<Snapshot>),
+    /// Values issued to the caller can still record; drop them and seal
+    /// again. The census as the attempt took it.
+    Outstanding(Census),
+    /// Refused, and why.
+    Refused(SealRefusal),
+}
+
+/// Why [`Invocation::seal`] refused. See there for the order the reasons are
+/// checked in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SealRefusal {
+    /// A call under the invocation is in progress (a seal from inside one
+    /// of its callbacks gets this). Retry once it has returned.
+    InProgress,
+    /// Another seal is finalizing the invocation.
+    Finalizing,
+    /// A finalization failed before its snapshot: the invocation can never
+    /// seal, and its stream stays open.
+    FinalizationFailed,
+    /// A capability count saturated, so the counts cannot prove that nothing
+    /// records any more. Never sealable.
+    Saturated,
+    /// Permits are alive with no issued value to account for them: one the
+    /// caller cannot release (a leaked value, a forgotten panic payload).
+    Unticketed,
+    /// The census was being updated; retry.
+    Busy,
+}
+
+impl SealRefusal {
+    /// One line saying why.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::InProgress => "a call under the invocation is in progress",
+            Self::Finalizing => "another seal is finalizing the invocation",
+            Self::FinalizationFailed => {
+                "an earlier seal failed before its snapshot; the invocation can never seal"
+            }
+            Self::Saturated => "a capability count saturated; the invocation can never seal",
+            Self::Unticketed => {
+                "permits are alive with no issued value to account for them (a leaked value)"
+            }
+            Self::Busy => "the census was being updated",
+        }
+    }
+}
+
+impl std::fmt::Display for SealRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// The values issued to the caller that were still alive at a seal attempt,
+/// by kind: block iterators (`session`), writers (`writer`), bound outputs
+/// (`output`) and blocks (`buffer`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Census {
+    /// Issued block iterators alive.
+    pub session: u64,
+    /// Issued writers alive.
+    pub writer: u64,
+    /// Issued bound outputs alive.
+    pub output: u64,
+    /// Issued blocks alive.
+    pub buffer: u64,
+}
+
+impl Census {
+    /// Whether no issued value was alive.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.session == 0 && self.writer == 0 && self.output == 0 && self.buffer == 0
+    }
+
+    /// Visit each kind with a live value, as `(kind, count)`, in a fixed
+    /// order. The kind names are `session`, `writer`, `output`, `buffer`.
+    pub fn for_each_held(&self, mut visit: impl FnMut(&'static str, u64)) {
+        for (kind, n) in [
+            ("session", self.session),
+            ("writer", self.writer),
+            ("output", self.output),
+            ("buffer", self.buffer),
+        ] {
+            if n > 0 {
+                visit(kind, n);
+            }
+        }
+    }
+}
+
+/// A sealed invocation's final counters: every counter
+/// [`Invocation::for_each_counter`] visits, with its value at the seal, in
+/// that order. Names are unique.
+#[derive(Debug)]
+pub struct Snapshot {
+    counters: Vec<(&'static str, u64)>,
+}
+
+impl Snapshot {
+    /// Every counter, as `(name, value)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        self.counters.iter().copied()
+    }
+
+    /// The value of counter `name`, if the snapshot has it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<u64> {
+        self.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
+
+    /// How many counters it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.counters.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(counters: Vec<(&'static str, u64)>) -> Self {
+        Self { counters }
+    }
+}
+
 /// The recording interface of an invocation: every mutation of its state
 /// (counters, sink delivery and its failure latch, report-once keys, the
 /// publication log and its execution lock). Reachable only by borrowing a
@@ -533,10 +896,43 @@ impl Recorder {
         &self.0
     }
 
+    /// A nested [`Call`] under this capability's invocation. Never refused:
+    /// the live capability this recorder is borrowed from keeps the
+    /// invocation Open (a counted one keeps a count above zero, an uncounted
+    /// one the sticky saturation flag, and the seal's exchange needs
+    /// neither).
+    #[inline]
+    pub(crate) fn call(&self) -> Call {
+        Call {
+            rec: Recorder(self.0.clone()),
+            counted: self.0.mint(word::GUARD).unwrap_or(false),
+        }
+    }
+
+    /// A [`Permit`] for a value that records outside any public call, through
+    /// background work or its own `Drop`, minted under this capability (so
+    /// never refused, as [`call`](Self::call)). Held past its last recording.
+    pub(crate) fn permit(&self) -> Permit {
+        Permit {
+            rec: Recorder(self.0.clone()),
+            counted: self.0.mint(word::PERMIT).unwrap_or(false),
+        }
+    }
+
+    /// A census ticket of `kind` for a value issued to the caller under
+    /// this capability.
+    pub(crate) fn ticket(&self, kind: Kind) -> Ticket {
+        self.0.census_adjust(kind, true);
+        Ticket {
+            invocation: self.0.clone(),
+            kind,
+        }
+    }
+
     /// Emit the phase marker `name` to the sink, if there is one.
     #[inline]
     pub(crate) fn marker(&self, name: &str) {
-        if self.0.0.sink.is_some() {
+        if !matches!(self.0.0.sink, SinkSlot::None) {
             self.deliver(|sink| sink.marker(name));
         }
     }
@@ -547,36 +943,45 @@ impl Recorder {
     /// are instead of casting.
     #[inline]
     pub(crate) fn counter(&self, name: &str, value: impl crate::debug::CounterValue) {
-        if self.0.0.sink.is_some() {
+        if !matches!(self.0.0.sink, SinkSlot::None) {
             let value = value.to_counter();
             self.deliver(|sink| sink.counter(name, value));
         }
     }
 
-    /// Run `emit` against the sink with its unwinding contained: a sink that
-    /// panics is latched off for the rest of the invocation and the run
-    /// carries on, because instrumentation is observational and may neither
-    /// change a published result nor turn an unwind into an abort. The
-    /// caught payload is forgotten, not dropped: its destructor is caller
-    /// code too and could panic again. An emission already past the latch
-    /// when another thread's panics may still complete; later ones are
-    /// skipped. Panics that do not unwind (`panic = "abort"`, a panicking
-    /// panic hook) cannot be contained.
+    /// Run `emit` against the sink, and then against the tap if there is
+    /// one, each with its unwinding contained: a sink (or tap) that panics is
+    /// latched off for the rest of the invocation and the run carries on,
+    /// because instrumentation is observational and may neither change a
+    /// published result nor turn an unwind into an abort. The caught payload
+    /// is forgotten, not dropped: its destructor is caller code too and could
+    /// panic again (so a payload holding a capability keeps it alive, and
+    /// vetoes a seal, for good). An emission already past the latch when
+    /// another thread's panics may still complete; later ones are skipped.
+    /// Panics that do not unwind (`panic = "abort"`, a panicking panic hook)
+    /// cannot be contained.
+    ///
+    /// Every emission runs while the capability this recorder is borrowed
+    /// from is alive, and that capability retires with `Release` after it
+    /// returns: so when a seal's exchange succeeds, every callback into the
+    /// sink and the tap has returned, and none can start.
     #[cold]
     #[inline(never)]
-    fn deliver(&self, emit: impl FnOnce(&dyn crate::debug::InstrumentSink)) {
-        use std::sync::atomic::Ordering::Relaxed;
+    fn deliver(&self, emit: impl Fn(&dyn crate::debug::InstrumentSink)) {
         let state = &self.0.0;
-        let Some(sink) = state.sink.as_deref() else {
-            return;
-        };
-        if state.sink_failed.load(Relaxed) {
-            return;
-        }
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(sink)))
-        {
-            state.sink_failed.store(true, Relaxed);
-            std::mem::forget(payload);
+        match &state.sink {
+            SinkSlot::None => {}
+            SinkSlot::Generic(sink) => contained(&state.sink_failed, || emit(sink.as_ref())),
+            SinkSlot::Call {
+                sink,
+                tap,
+                tap_failed,
+            } => {
+                contained(&state.sink_failed, || emit(sink));
+                if let Some(tap) = tap {
+                    contained(tap_failed, || emit(tap.as_ref()));
+                }
+            }
         }
     }
 
@@ -631,10 +1036,31 @@ impl Recorder {
 
 /// A public entry's admission: held for the entry's extent, it keeps the
 /// invocation from sealing and lends the [`Recorder`]. Not `Clone`: a
-/// nested entry mints its own with [`Invocation::call`].
+/// nested entry mints its own with [`Recorder::call`].
 pub(crate) struct Call {
     rec: Recorder,
     counted: bool,
+}
+
+impl Call {
+    /// A call on a fresh invocation of its own, which nothing else can seal:
+    /// for the library's throwaway runs (a probe that reads a header) and for
+    /// tests.
+    pub(crate) fn detached() -> Self {
+        Invocation::new().into_call()
+    }
+}
+
+impl Invocation {
+    /// A call on this invocation, which only this value holds and nobody can
+    /// have sealed.
+    fn into_call(self) -> Call {
+        let counted = self.mint(word::GUARD).unwrap_or(false);
+        Call {
+            rec: Recorder(self),
+            counted,
+        }
+    }
 }
 
 impl std::ops::Deref for Call {
@@ -672,7 +1098,7 @@ impl std::ops::Deref for Permit {
 
 impl Clone for Permit {
     fn clone(&self) -> Self {
-        self.rec.0.permit()
+        self.rec.permit()
     }
 }
 
@@ -731,13 +1157,15 @@ impl std::ops::Deref for Entered<'_> {
 }
 
 impl Host {
-    /// Admit a public command under this host's invocation.
+    /// Admit a public command under this host's invocation: refused with
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) once it has been
+    /// sealed.
     #[inline]
-    pub(crate) fn enter(&self) -> Entered<'_> {
-        Entered {
+    pub(crate) fn enter(&self) -> crate::Result<Entered<'_>> {
+        Ok(Entered {
             host: self,
-            invocation: self.invocation.call(),
-        }
+            invocation: self.invocation.call()?,
+        })
     }
 }
 
@@ -748,7 +1176,7 @@ mod capability_tests {
     #[test]
     fn calls_and_permits_count_and_retire() {
         let inv = Invocation::new();
-        let call = inv.call();
+        let call = inv.call().expect("open");
         let permit = call.permit();
         let again = permit.clone();
         let c = inv.capabilities();
@@ -760,12 +1188,208 @@ mod capability_tests {
     #[test]
     fn tickets_count_by_kind() {
         let inv = Invocation::new();
-        let a = inv.ticket(Kind::Buffer);
-        let b = inv.ticket(Kind::Writer);
+        let call = inv.call().expect("open");
+        let a = call.ticket(Kind::Buffer);
+        let b = call.ticket(Kind::Writer);
+        drop(call);
         let c = inv.capabilities();
         assert_eq!((c.buffer, c.writer, c.session, c.output), (1, 1, 0, 0));
         drop((a, b));
         assert_eq!(inv.capabilities(), Capabilities::default());
+    }
+
+    fn sealed(outcome: &SealOutcome) -> Arc<Snapshot> {
+        match outcome {
+            SealOutcome::Sealed(snapshot) => Arc::clone(snapshot),
+            other => panic!("not sealed: {other:?}"),
+        }
+    }
+
+    /// A seal closes admission for good: a public entry is refused with
+    /// `Sealed`, cancel ends nothing, and a later seal returns the same
+    /// snapshot.
+    #[test]
+    fn a_sealed_invocation_admits_nothing() {
+        let inv = Invocation::new();
+        let first = sealed(&inv.seal());
+        assert_eq!(first.len(), {
+            let mut n = 0;
+            inv.for_each_counter(|_, _| n += 1);
+            n
+        });
+        let refused = inv.call().err().expect("refused");
+        assert!(matches!(refused.kind(), crate::ErrorKind::Sealed));
+        assert_eq!(inv.cancel(), crate::publication::CancelOutcome::Ended);
+        assert!(!inv.is_cancelled(), "a cancel after the seal trips nothing");
+        assert!(Arc::ptr_eq(&first, &sealed(&inv.seal())));
+        assert!(inv.stream_account().is_none(), "no call sink");
+    }
+
+    /// The classification order: a call in progress first, then the
+    /// census once only permits are alive.
+    #[test]
+    fn a_refused_seal_says_why() {
+        let inv = Invocation::new();
+        let call = inv.call().expect("open");
+        let permit = call.permit();
+        let ticket = call.ticket(Kind::Writer);
+        assert!(matches!(
+            inv.seal(),
+            SealOutcome::Refused(SealRefusal::InProgress)
+        ));
+        drop(call);
+        match inv.seal() {
+            SealOutcome::Outstanding(census) => {
+                assert_eq!(
+                    census,
+                    Census {
+                        writer: 1,
+                        ..Census::default()
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(ticket);
+        assert!(matches!(
+            inv.seal(),
+            SealOutcome::Refused(SealRefusal::Unticketed)
+        ));
+        drop(permit);
+        sealed(&inv.seal());
+    }
+
+    /// A saturated count refuses the seal for good, ahead of zero counts.
+    #[test]
+    fn a_saturated_invocation_never_seals() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let inv = Invocation::new();
+        inv.0
+            .word
+            .0
+            .store(word::max(word::GUARD) * word::GUARD, Relaxed);
+        drop(inv.call().expect("open"));
+        inv.0
+            .word
+            .0
+            .fetch_and(!(word::max(word::GUARD) * word::GUARD), Relaxed);
+        assert!(matches!(
+            inv.seal(),
+            SealOutcome::Refused(SealRefusal::Saturated)
+        ));
+        assert!(inv.call().is_ok(), "still open");
+    }
+
+    /// Whether the invocation's state is Open, read with `Acquire`.
+    fn open(inv: &Invocation) -> bool {
+        inv.0.word.0.load(std::sync::atomic::Ordering::Acquire) & word::STATE == word::OPEN
+    }
+
+    /// Nesting step by step: a nested call outlives the call it was minted
+    /// under and still holds the seal off, and so does a permit minted under
+    /// it once both calls are gone (unticketed).
+    #[test]
+    fn a_nested_capability_holds_the_seal_off() {
+        let inv = Invocation::new();
+        let outer = inv.call().expect("open");
+        let nested = outer.call();
+        drop(outer);
+        assert!(matches!(
+            inv.seal(),
+            SealOutcome::Refused(SealRefusal::InProgress)
+        ));
+        let permit = nested.permit();
+        drop(nested);
+        assert!(matches!(
+            inv.seal(),
+            SealOutcome::Refused(SealRefusal::Unticketed)
+        ));
+        let again = permit.clone();
+        drop(permit);
+        assert!(open(&inv), "a cloned permit is minted under the live one");
+        drop(again);
+        sealed(&inv.seal());
+    }
+
+    /// The exchange racing retirements and nested mints. Every worker first
+    /// holds a call, a nested call and a permit at once, and only then is
+    /// the sealer's first attempt is refused as in progress (a rendezvous,
+    /// so the race is not won before any worker minted). Workers then loop
+    /// minting and retiring until a mint is refused or a bound is reached,
+    /// while the sealer retries. Whenever a worker holds a capability it
+    /// reads the state as Open: a live capability excludes the seal. Once
+    /// sealed, nothing is counted and admission is refused.
+    #[test]
+    fn the_seal_exchange_races_retirement_and_nested_calls() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        const WORKERS: usize = 4;
+        for _ in 0..20 {
+            let inv = Invocation::new();
+            let held = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+            let go = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+            let seen_closed = Arc::new(AtomicBool::new(false));
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    let (inv, held, go, seen_closed) = (
+                        inv.clone(),
+                        Arc::clone(&held),
+                        Arc::clone(&go),
+                        Arc::clone(&seen_closed),
+                    );
+                    std::thread::spawn(move || {
+                        let call = inv.call().expect("open before the sealer starts");
+                        let nested = call.call();
+                        let permit = nested.permit();
+                        held.wait();
+                        go.wait();
+                        if !open(&inv) {
+                            seen_closed.store(true, SeqCst);
+                        }
+                        drop((permit, nested, call));
+                        // Bounded, so a sealer that keeps losing the race
+                        // wins once the workers are done.
+                        for _ in 0..5_000 {
+                            let Ok(call) = inv.call() else {
+                                return;
+                            };
+                            let nested = call.call();
+                            let permit = nested.permit();
+                            if !open(&inv) {
+                                seen_closed.store(true, SeqCst);
+                            }
+                            drop((nested, call));
+                            if !open(&inv) {
+                                seen_closed.store(true, SeqCst);
+                            }
+                            drop(permit);
+                        }
+                    })
+                })
+                .collect();
+            held.wait();
+            assert!(
+                matches!(inv.seal(), SealOutcome::Refused(SealRefusal::InProgress)),
+                "every worker holds a call"
+            );
+            go.wait();
+            let snapshot = loop {
+                if let SealOutcome::Sealed(snapshot) = inv.seal() {
+                    break snapshot;
+                }
+                std::hint::spin_loop();
+            };
+            for w in workers {
+                w.join().expect("worker");
+            }
+            assert!(
+                !seen_closed.load(SeqCst),
+                "a capability was alive while the invocation was not Open"
+            );
+            assert!(inv.call().is_err());
+            assert!(Arc::ptr_eq(&snapshot, &sealed(&inv.seal())));
+            let c = inv.capabilities();
+            assert_eq!((c.guards, c.permits), (0, 0));
+        }
     }
 
     /// A field at its maximum is not incremented: the sticky flag is set,
@@ -778,12 +1402,7 @@ mod capability_tests {
             let inv = Invocation::new();
             inv.0.word.0.store(word::max(unit) * unit, Relaxed);
             assert!(word::is_full(inv.0.word.0.load(Relaxed), unit));
-            let uncounted = if unit == word::GUARD {
-                inv.call().counted
-            } else {
-                inv.permit().counted
-            };
-            assert!(!uncounted);
+            assert_eq!(inv.mint(unit), Some(false), "uncounted, and admitted");
             let after = inv.0.word.0.load(Relaxed);
             assert_eq!(word::field(after, unit), word::max(unit));
             assert_ne!(after & word::SATURATED, 0);
@@ -1239,7 +1858,9 @@ impl Host {
 
     /// This host, leaked and entered, for a unit test that built its own.
     pub(crate) fn entered_leaked(self) -> Entered<'static> {
-        Box::leak(Box::new(self)).enter()
+        Box::leak(Box::new(self))
+            .enter()
+            .expect("a fresh host's invocation is open")
     }
 }
 
@@ -1516,11 +2137,11 @@ mod diagnostic_tests {
         let sink = Arc::new(Sink::default());
         let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
         let other = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        let (first, second) = (Invocation::new().call(), Invocation::new().call());
+        let (first, second) = (Call::detached(), Call::detached());
         d.emit_once(&first, EventKind::Warning, "key", format_args!("first"));
         d.clone()
             .emit_once(&second, EventKind::Warning, "key", format_args!("second"));
-        let shared = first.handle().clone().call();
+        let shared = first.handle().clone().call().expect("open");
         other.emit_once(&shared, EventKind::Warning, "key", format_args!("again"));
         d.emit_once(&second, EventKind::Warning, "key", format_args!("again"));
         assert_eq!(*sink.0.lock().expect("sink"), ["first", "second"]);
@@ -1529,13 +2150,13 @@ mod diagnostic_tests {
     fn a_reported_key_silences_a_later_once_event() {
         let sink = Arc::new(Sink::default());
         let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        let invocation = Invocation::new().call();
+        let invocation = Call::detached();
         invocation.mark_reported("key");
         d.emit_once(&invocation, EventKind::Note, "key", format_args!("note"));
         d.emit_once(&invocation, EventKind::Note, "other", format_args!("other"));
         // Another invocation is not covered by the first one's report.
         d.emit_once(
-            &Invocation::new().call(),
+            &Call::detached(),
             EventKind::Note,
             "key",
             format_args!("fresh"),

@@ -69,7 +69,7 @@ pub fn inspect<'a>(
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation.decided(|| inspect_inner(input, opts, host))
 }
@@ -146,7 +146,7 @@ pub fn inspect_header<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<InspectHeader> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation.decided(|| {
         let reader = crate::ElementReader::open_in(input, direct_io, host)?;

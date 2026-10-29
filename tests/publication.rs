@@ -44,7 +44,7 @@ fn stage(out: &BoundOutput, bytes: &[u8]) {
 }
 
 fn staged(path: &Path, invocation: &Invocation) -> BoundOutput {
-    let out = crate::common::out(path).bind(invocation);
+    let out = crate::common::out(path).bind(invocation).expect("open");
     stage(&out, b"new");
     out
 }
@@ -129,7 +129,8 @@ fn one_row_per_set() {
         &pbfhogg::host::Diagnostics::discard(),
     )
     .expect("set")
-    .bind(&invocation);
+    .bind(&invocation)
+    .expect("open");
     for member in set.iter() {
         stage(member, b"new");
     }
@@ -191,7 +192,8 @@ fn dropping_one_set_member_leaves_the_set_pending() {
         &pbfhogg::host::Diagnostics::discard(),
     )
     .expect("set")
-    .bind(&invocation);
+    .bind(&invocation)
+    .expect("open");
     let writer = set.get(0).expect("member").writer().expect("writer");
     drop(writer);
     assert!(rows(&invocation).is_empty());
@@ -221,7 +223,9 @@ fn cancel_decides_pending_units_in_bind_order() {
     assert!(b.publish().expect_err("b").is_cancelled());
     assert!(a.publish().expect_err("a").is_cancelled());
     // Bound after the cancel (unwritten: its writer would refuse too).
-    let late = crate::common::out(dir.path().join("c")).bind(&invocation);
+    let late = crate::common::out(dir.path().join("c"))
+        .bind(&invocation)
+        .expect("open");
     assert!(late.publish().expect_err("late").is_cancelled());
     let rows = rows(&invocation);
     assert_eq!(rows[0].members()[0].destination(), dir.path().join("a"));
@@ -343,7 +347,9 @@ mod faults {
                 invocation.cancel(),
                 CancelOutcome::AfterDecision { authorized: 1 }
             );
-            let pending = crate::common::out(dir.path().join("pending")).bind(&invocation);
+            let pending = crate::common::out(dir.path().join("pending"))
+                .bind(&invocation)
+                .expect("open");
             assert_eq!(
                 invocation.cancel(),
                 CancelOutcome::BeforeDecision { refused: 2 }
@@ -381,7 +387,9 @@ mod faults {
         }
         let overwrite = pbfhogg::Overwrite::Replace;
         let result = if let [path] = paths.as_slice() {
-            let out = crate::common::out_replace(path).bind(&invocation);
+            let out = crate::common::out_replace(path)
+                .bind(&invocation)
+                .expect("open");
             stage(&out, b"new");
             out.publish()
         } else {
@@ -391,7 +399,8 @@ mod faults {
                 &pbfhogg::host::Diagnostics::discard(),
             )
             .expect("set")
-            .bind(&invocation);
+            .bind(&invocation)
+            .expect("open");
             for member in set.iter() {
                 stage(member, b"new");
             }
@@ -498,7 +507,8 @@ mod faults {
                 &pbfhogg::host::Diagnostics::discard(),
             )
             .expect("dir")
-            .bind(&invocation);
+            .bind(&invocation)
+            .expect("open");
             let writer = out.writer().expect("writer");
             std::fs::write(writer.path().join("new"), b"new").expect("new");
             writer.finish();

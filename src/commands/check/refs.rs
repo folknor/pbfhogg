@@ -268,7 +268,7 @@ pub fn check_refs<'a>(
     opts: &CheckRefsOptions,
     host: &crate::host::Host,
 ) -> Result<super::CheckOutcome<RefCheckResult>> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation
         .decided(|| super::CheckOutcome::stop_on_contradiction(check_refs_inner(input, opts, host)))

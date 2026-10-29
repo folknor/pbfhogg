@@ -28,6 +28,7 @@ fn kind_id(kind: &ErrorKind) -> &'static str {
         ErrorKind::External { .. } => "external",
         ErrorKind::Output(_) => "output",
         ErrorKind::Cancelled => "cancelled",
+        ErrorKind::Sealed => "sealed",
         _ => "other",
     }
 }

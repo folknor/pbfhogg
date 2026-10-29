@@ -70,7 +70,7 @@ pub fn getparents<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = getparents_to(input, &output, ids, opts, write, overrides, host)?;
@@ -123,7 +123,7 @@ pub fn getparents_with_min_blobs<'a>(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result =
@@ -590,7 +590,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .expect("stage output");
-        let staged = staged.bind(&run_host().invocation);
+        let staged = staged.bind(&run_host().invocation).expect("open");
         getparents_with_arm(
             &pinned(&input),
             &staged,
@@ -622,7 +622,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("stage output");
-            let staged = staged.bind(&run_host().invocation);
+            let staged = staged.bind(&run_host().invocation).expect("open");
             getparents_with_arm(
                 &pinned(input),
                 &staged,
@@ -801,7 +801,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .expect("stage output");
-        let staged = staged.bind(&run_host().invocation);
+        let staged = staged.bind(&run_host().invocation).expect("open");
         let stats = getparents_with_arm(
             &pinned(input),
             &staged,
@@ -944,7 +944,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("stage output");
-            let staged = staged.bind(&run_host().invocation);
+            let staged = staged.bind(&run_host().invocation).expect("open");
             let (arm, _) = getparents_dispatched(
                 &input,
                 &staged,

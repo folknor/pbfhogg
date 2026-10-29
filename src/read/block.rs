@@ -502,7 +502,7 @@ impl PrimitiveBlock {
 
     /// This block, issued to the caller of a block API under `invocation`:
     /// counted in its census as a `buffer` until it is dropped. Idempotent.
-    pub(crate) fn issued(mut self, invocation: &crate::host::Invocation) -> Self {
+    pub(crate) fn issued(mut self, invocation: &crate::host::Recorder) -> Self {
         if self.ticket.is_none() {
             self.ticket = Some(invocation.ticket(crate::host::Kind::Buffer));
         }

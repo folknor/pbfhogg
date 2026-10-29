@@ -545,7 +545,7 @@ impl Default for CompactDiffOverlay {
 /// conflicts, but only when they do not move the object backwards: see
 /// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
-    parse_osc_file_into_until(path, overlay, &crate::host::Invocation::new().call())
+    parse_osc_file_into_until(path, overlay, &crate::host::Call::detached())
 }
 
 /// [`parse_osc_file_into`] that stops at the next read of the input once

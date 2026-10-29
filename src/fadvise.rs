@@ -93,9 +93,11 @@ pub(crate) fn advise(
     // `posix_fadvise` returns the error number itself, not -1 and `errno`.
     if rc != 0 {
         // Cold: a nested entry under whatever admits the caller (a
-        // command's call, a reader method's, a pipeline thread's permit).
-        let call = invocation.call();
-        call.metrics().fadvise.record_failure(&call);
+        // command's call, a reader method's, a pipeline thread's permit), so
+        // never refused there; a sealed invocation records nothing.
+        if let Ok(call) = invocation.call() {
+            call.metrics().fadvise.record_failure(&call);
+        }
     }
     true
 }

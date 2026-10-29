@@ -120,7 +120,7 @@ pub fn repack<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = repack_to(

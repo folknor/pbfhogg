@@ -256,7 +256,7 @@ pub fn node_stats<'a>(
     parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation
         .decided(|| node_stats_inner(input, direct_io, force, parallelism, host))

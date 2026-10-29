@@ -406,7 +406,19 @@ exception, not a tier - should not survive across many PRs.
   caller's `Read` (a stream whose reads off the building thread wait on a
   channel) and checks the values a caller holds at rest are accounted for.
   The word's saturation arithmetic is a unit test in `src/host.rs`, on the
-  field helpers with forced boundary values.
+  field helpers with forced boundary values, beside the seal's
+  classification and a threaded race of the seal's exchange against
+  retirements and nested mints.
+- **Sealing.** `tests/seal.rs` (`test-hooks`, Unix) seals invocations that
+  own a call sink on a real FIFO drained on a thread, and reads the stream
+  back. `FaultPlan::on_seal_step` parks or unwinds the finalizing thread at
+  a `SealStep` (`Snapshot`, before the commit point; `Stream`, after the
+  sealing emissions and before the terminal record), which is how
+  concurrent sealers, a failed finalization and a failed stream are made
+  deterministic; a tap parked inside an emission shows a seal refused while
+  a callback is in flight. The sink's own endings (a terminal record a full
+  FIFO turned away, a reader gone, an unwind before the terminal) are unit
+  tests in `src/debug.rs`, on a FIFO whose reader never reads.
 - **Publication hooks.** Publication is not cancellable, so no checkpoint
   lies inside it and the pauses above never land there. Instead it
   announces each namespace step that succeeded (`PublishStep`: a backup

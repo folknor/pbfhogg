@@ -474,8 +474,11 @@ impl<P: Positional> HeaderWalker<P> {
             return;
         }
         self.reported_unindexed_filter = true;
-        // Once per walk, nested under the command that runs the walk.
-        let call = self.frames.cancel_token().call();
+        // Once per walk, nested under the command that runs the walk, so
+        // never refused there; a sealed invocation reports nothing.
+        let Ok(call) = self.frames.cancel_token().call() else {
+            return;
+        };
         crate::host::diag_once!(
             self.diagnostics,
             &call,

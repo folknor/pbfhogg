@@ -1794,6 +1794,26 @@ issues nothing; `build-geocode-index` iterates relation blocks only, through
 an internal route), so the census lock per issued block has no bulk
 measurement; it is one uncontended mutex per block, beside a decode.
 
+### Fallible admission (bygg, 2026-10-30)
+
+Sealing makes admission fallible: the guard's compare-and-swap now also
+requires the Open state (a mask and a branch on the word it already
+loaded), and `BlobReader::next` checks its walk's failure latch before it
+admits. The call sink's sealing path keeps no in-flight count: the word
+orders every emission before the seal, so no brokkr CLI command gains
+per-emission work. Same gate as above: `brokkr write`, denmark `--variant
+indexed --bench 1 --compressions none`, cells interleaved. Baseline
+`--commit 62e18608` (stored); variant the sealing tree on top of it,
+measured uncommitted with `--force` (not stored, no UUID).
+
+| Writer | Baseline pair 1 | Variant pair 1 | Baseline pair 2 | Variant pair 2 | Medians |
+|---|---|---|---|---|---|
+| sync | 6415 ms (`66a370df`) | 6468 ms | 6412 ms (`5294bccd`) | 6416 ms | 6414 vs 6442 ms |
+| pipelined | 5724 ms (`e0935539`) | 5753 ms | 5737 ms (`3c12b82f`) | 5679 ms | 5731 vs 5716 ms |
+
+No cost: both arms within half a percent, the pipelined arm with mixed
+signs.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.

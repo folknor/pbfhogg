@@ -61,7 +61,7 @@ pub fn reindex<'a>(
     write: &WriteOptions,
     host: &crate::host::Host,
 ) -> Result<ReindexStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let stats = reindex_to(input.into(), &output, write, host)?;

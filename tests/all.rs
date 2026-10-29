@@ -128,6 +128,8 @@ mod read_paths;
 mod renumber_external;
 mod roundtrip;
 mod roundtrip_invariants;
+#[cfg(all(feature = "test-hooks", unix))]
+mod seal;
 #[cfg(feature = "commands")]
 mod tags_count;
 mod tags_filter_osc;

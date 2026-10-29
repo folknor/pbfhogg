@@ -278,7 +278,7 @@ pub fn tags_filter<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_to(input, &output, opts, overrides, host)?;
@@ -1476,7 +1476,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let staged = staged.bind(&run_host().invocation);
+        let staged = staged.bind(&run_host().invocation).unwrap();
         tags_filter_single_pass(
             &PinnedInput::pin(&input, run_host()).unwrap(),
             &staged,

@@ -6,22 +6,22 @@
 //! Each call, in this order:
 //!
 //! 1. A fresh call sink on the one marker FIFO, tagged with the call id; a
-//!    fresh invocation delivering to it; a fresh host whose diagnostics go
-//!    to the call's own collector. None of this emits anything.
+//!    fresh invocation that owns it (`Invocation::with_call_sink`); a fresh
+//!    host whose diagnostics go to the call's own collector. None of this
+//!    emits anything.
 //! 2. `entry_us`, the call (constructing its outputs and readers inside
 //!    it), `return_us`.
 //! 3. The end-of-run emitters, each once: writer counters, read counters,
 //!    writer degradations.
-//! 4. The seal attempt, then `seal_us`. pbfhogg has no `Invocation::seal`
-//!    yet (pbfhogg#31), so the attempt is reported refused, the snapshot
-//!    null and the stream open, which the protocol requires of a call that
-//!    did not seal.
+//! 4. The seal attempt (`Invocation::seal`), then `seal_us`. A seal ends
+//!    the call stream (its sealing emissions and terminal record) before it
+//!    returns; the census of an outstanding attempt is kept as taken then.
 //! 5. Every value of the call dropped. The library's work does not outlive
 //!    the call that started it (its pools are joined, its writers wait for
 //!    their framing), so once the host is gone nothing of the call can
 //!    still report.
-//! 6. The call's collection closed, its publications and its sink's drop
-//!    count read.
+//! 6. The call's collection closed, its publications and its call sink's
+//!    account (`Invocation::stream_account`) read.
 //! 7. The call document written.
 //!
 //! `scenario.json` is written last, with setup's and the harness's own
@@ -30,9 +30,9 @@
 use crate::diag::Collector;
 use crate::outcome::CallOutcome;
 use crate::protocol::{Outcome, PROTOCOL, ScenarioDecl, Status};
-use pbfhogg::debug::{CallId, MarkerFifo};
+use pbfhogg::debug::{CallId, MarkerFifo, StreamAccount, StreamState};
 use pbfhogg::host::{
-    Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy,
+    Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy, SealOutcome,
 };
 use pbfhogg::{Decision, Effect};
 use serde_json::{Value, json};
@@ -278,7 +278,8 @@ pub(crate) struct CallRecord {
     entry_us: u64,
     return_us: u64,
     seal_us: u64,
-    drops: u64,
+    seal: SealOutcome,
+    stream: StreamAccount,
     context: Value,
     diagnostics: Vec<Value>,
 }
@@ -312,8 +313,11 @@ impl Ctx<'_> {
         id: &'static str,
         body: impl FnOnce(&Host, &CallEnv<'_>) -> pbfhogg::Result<()>,
     ) -> Result<CallRecord, String> {
-        let sink = self.fifo.call(CallId::new(id).map_err(|e| e.report())?);
-        let invocation = Invocation::with_sink(Arc::new(sink.clone()));
+        let sink = self
+            .fifo
+            .call(CallId::new(id).map_err(|e| e.report())?)
+            .map_err(|e| e.report())?;
+        let invocation = Invocation::with_call_sink(sink, None);
         let collector = Arc::new(Collector::new(self.fifo.clone()));
         let host = Host {
             diagnostics: Diagnostics::new(
@@ -339,7 +343,9 @@ impl Ctx<'_> {
         pbfhogg::write::emit_writer_counters(&invocation);
         pbfhogg::read::emit_read_counters(&invocation);
         pbfhogg::write::report_writer_degradations(&host);
-        // The seal attempt: refused until pbfhogg has a seal (pbfhogg#31).
+        // The seal attempt, and its census kept as taken now, although the
+        // call's values are dropped before the document is written.
+        let seal = invocation.seal();
         let seal_us = self.fifo.now_us();
         drop(host);
         let diagnostics = collector
@@ -349,6 +355,9 @@ impl Ctx<'_> {
             .collect();
         self.late.push((id, collector));
         let publications = self.publications(id, &invocation)?;
+        let stream = invocation
+            .stream_account()
+            .ok_or("the call's invocation has no call sink")?;
         Ok(CallRecord {
             id,
             outcome: CallOutcome::of(&result),
@@ -357,7 +366,8 @@ impl Ctx<'_> {
             entry_us,
             return_us,
             seal_us,
-            drops: sink.dropped(),
+            seal,
+            stream,
             context,
             diagnostics,
         })
@@ -438,9 +448,9 @@ impl Ctx<'_> {
             "outcome": record.outcome.to_json(),
             "publications": publications,
             "cancel": cancel_json(record.cancel.as_ref())?,
-            "seal": { "state": "refused", "reason": "pbfhogg has no Invocation::seal yet (pbfhogg#31)" },
-            "snapshot": null,
-            "stream": { "state": "open", "drops": record.drops },
+            "seal": seal_json(&record.seal)?,
+            "snapshot": snapshot_json(&record.seal),
+            "stream": stream_json(record.stream)?,
             "context": record.context,
             "diagnostics": record.diagnostics,
             "assertions": results.iter().map(Outcome::to_json).collect::<Vec<_>>(),
@@ -492,6 +502,53 @@ fn cancel_json(outcome: Option<&pbfhogg::CancelOutcome>) -> Result<Value, String
         Some(C::NoPublicationPending) => json!({ "result": "no_publication_pending" }),
         Some(other) => return Err(format!("no protocol spelling for cancel result {other:?}")),
     })
+}
+
+/// The protocol's `seal`: sealed, outstanding with the census as the
+/// attempt took it, or refused with its reason. A result added to the
+/// non-exhaustive `SealOutcome` refuses the run rather than be misreported.
+fn seal_json(seal: &SealOutcome) -> Result<Value, String> {
+    Ok(match seal {
+        SealOutcome::Sealed(_) => json!({ "state": "sealed" }),
+        SealOutcome::Outstanding(census) => {
+            let mut held = serde_json::Map::new();
+            census.for_each_held(|kind, n| {
+                held.insert(kind.to_owned(), json!(n));
+            });
+            if held.is_empty() {
+                return Err("an outstanding seal reported an empty census".to_owned());
+            }
+            json!({ "state": "outstanding", "held": held })
+        }
+        SealOutcome::Refused(refusal) => json!({ "state": "refused", "reason": refusal.reason() }),
+        other => return Err(format!("no protocol spelling for seal result {other:?}")),
+    })
+}
+
+/// The protocol's `snapshot`: the sealed call's final counters, `null`
+/// otherwise.
+fn snapshot_json(seal: &SealOutcome) -> Value {
+    match seal {
+        SealOutcome::Sealed(snapshot) => {
+            let counters: serde_json::Map<String, Value> = snapshot
+                .iter()
+                .map(|(name, value)| (name.to_owned(), json!(value)))
+                .collect();
+            Value::Object(counters)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// The protocol's `stream`: the call sink's own account.
+fn stream_json(stream: StreamAccount) -> Result<Value, String> {
+    let state = match stream.state {
+        StreamState::Open => "open",
+        StreamState::Sealed => "sealed",
+        StreamState::Failed => "failed",
+        other => return Err(format!("no protocol spelling for stream state {other:?}")),
+    };
+    Ok(json!({ "state": state, "drops": stream.drops }))
 }
 
 fn write_json(path: &Path, doc: &Value) -> Result<(), String> {

@@ -2013,7 +2013,7 @@ mod tests {
     fn willneed_prefetch_defaults_to_coalesced_schedule() {
         let schedule = [ScheduledBlob::at(100, 20), ScheduledBlob::at(144, 5)];
 
-        let prefetch = WillneedPrefetch::new(&schedule, &crate::host::Invocation::new().call());
+        let prefetch = WillneedPrefetch::new(&schedule, &crate::host::Call::detached());
 
         assert_eq!(prefetch.ranges, vec![(100, 49)]);
         assert_eq!(prefetch.next_range, 0);

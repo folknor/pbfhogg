@@ -389,6 +389,7 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
         .custom_flags(libc::O_NONBLOCK)
         .open(&path)
         .expect("read end");
+    enlarge_pipe(&reader);
 
     let fifo = MarkerFifo::open(&path).expect("write end");
     // Drain while the calls write, so a small pipe capacity cannot drop
@@ -410,14 +411,22 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
     });
     let start = fifo.now_us();
     fifo.marker("PROCESS_START");
-    let sizes: Vec<(String, u64)> = std::thread::scope(|scope| {
+    let sizes: Vec<(String, u64, (usize, u64))> = std::thread::scope(|scope| {
         let runs: Vec<_> = [("small", 3_i64), ("large", 40)]
             .into_iter()
             .map(|(id, count)| {
-                let sink = fifo.call(CallId::new(id).expect("call id"));
+                let sink = fifo
+                    .call(CallId::new(id).expect("call id"))
+                    .expect("a fresh id");
                 scope.spawn(move || {
-                    let invocation = pbfhogg::host::Invocation::with_sink(Arc::new(sink));
-                    (id.to_owned(), instrumented_cat(count, invocation))
+                    let invocation = pbfhogg::host::Invocation::with_call_sink(sink, None);
+                    let size = instrumented_cat(count, invocation.clone());
+                    let pbfhogg::host::SealOutcome::Sealed(snapshot) = invocation.seal() else {
+                        panic!("{id}: nothing of the run is left to hold it open");
+                    };
+                    let account = invocation.stream_account().expect("a call sink");
+                    assert_eq!(account.state, pbfhogg::debug::StreamState::Sealed, "{id}");
+                    (id.to_owned(), size, (snapshot.len(), account.drops))
                 })
             })
             .collect();
@@ -425,21 +434,12 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
             .map(|run| run.join().expect("run"))
             .collect()
     });
-    let edge = fifo.call(CallId::new(&"e".repeat(64)).expect("call id"));
-    // The width of the timestamp the line will carry: retry if the clock
-    // crossed a power of ten between sizing and emitting (that attempt's
-    // line is 513 bytes and dropped).
-    for _ in 0..5 {
-        let before = fifo.now_us();
-        let fixed = format!("{before} %{} \n", edge.id().as_str()).len();
-        edge.marker(&"n".repeat(512 - fixed));
-        edge.marker(&"o".repeat(513 - fixed));
-        if fifo.now_us().to_string().len() == before.to_string().len() {
-            break;
-        }
-    }
+    assert!(
+        fifo.call(CallId::new("small").expect("call id")).is_err(),
+        "an id is issued once"
+    );
+    let edge_whole = write_edge_lines(&fifo);
     assert!(fifo.now_us() >= start, "the clock is monotonic");
-    drop(edge);
     drop(fifo);
 
     let text = drain.join().expect("drain");
@@ -454,31 +454,107 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
             .any(|l| l.ends_with(" PROCESS_START") && !l.contains('%'))
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(" %eeee") && l.ends_with('n') && l.len() == 511),
+        !edge_whole
+            || lines
+                .iter()
+                .any(|l| l.contains(" %eeee") && l.ends_with('n') && l.len() == 511),
         "the 512-byte tagged line, newline included, goes out whole"
     );
     assert!(
         !lines.iter().any(|l| l.ends_with('o')),
         "513 bytes must drop"
     );
-    for (id, size) in &sizes {
-        let tag = format!(" %{id} ");
-        let mine: Vec<&str> = lines
-            .iter()
-            .filter_map(|l| l.split_once(&tag).map(|(_, body)| body))
-            .collect();
-        assert_eq!(
-            mine.iter().filter(|b| **b == "CAT_SCAN_START").count(),
-            1,
-            "{id}: {mine:?}"
-        );
-        let written: Vec<&str> = mine
-            .iter()
-            .filter_map(|b| b.strip_prefix("@writer_bytes_written="))
-            .collect();
+    for (id, size, sealed) in &sizes {
+        assert_own_sealed_stream(&lines, id, *size, *sealed);
+    }
+}
+
+/// Write a 512-byte and a 513-byte tagged line on a call of 64-byte id;
+/// whether nothing but the 513-byte lines was dropped.
+#[cfg(unix)]
+fn write_edge_lines(fifo: &pbfhogg::debug::MarkerFifo) -> bool {
+    use pbfhogg::debug::{CallId, InstrumentSink};
+    let edge = fifo
+        .call(CallId::new(&"e".repeat(64)).expect("call id"))
+        .expect("a fresh id");
+    // The width of the timestamp the line will carry: retry if the clock
+    // crossed a power of ten between sizing and emitting (that attempt's
+    // line is 513 bytes and dropped).
+    let mut attempts = 0;
+    for _ in 0..5 {
+        attempts += 1;
+        let before = fifo.now_us();
+        let fixed = format!("{before} %{} \n", edge.id().as_str()).len();
+        edge.marker(&"n".repeat(512 - fixed));
+        edge.marker(&"o".repeat(513 - fixed));
+        if fifo.now_us().to_string().len() == before.to_string().len() {
+            break;
+        }
+    }
+    // Each attempt drops its 513-byte line; any further drop was a full
+    // FIFO, which can take the 512-byte line too.
+    edge.account().drops == attempts
+}
+
+/// Room for every line a test writes into the pipe `end` belongs to, where
+/// the host allows it, so a drain that falls behind does not drop lines. A
+/// refusal leaves the default size.
+#[cfg(unix)]
+fn enlarge_pipe(end: &std::fs::File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: an fcntl on a descriptor the caller owns.
+        let _size = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = end;
+}
+
+/// Call `id`'s stream holds its own markers and `writer_bytes_written`, and
+/// the seal ended it: every snapshot counter as a sealing emission, then the
+/// terminal record, last, with no ordinary record after sealing began.
+/// `sealed` is the snapshot's size and the account's drops; with drops
+/// counted (the FIFO filled), only what no drop excuses is checked.
+fn assert_own_sealed_stream(lines: &[&str], id: &str, size: u64, sealed: (usize, u64)) {
+    let (sealed, drops) = sealed;
+    let tag = format!(" %{id} ");
+    let mine: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.split_once(&tag).map(|(_, body)| body))
+        .collect();
+    let scans = mine.iter().filter(|b| **b == "CAT_SCAN_START").count();
+    let written: Vec<&str> = mine
+        .iter()
+        .filter_map(|b| b.strip_prefix("@writer_bytes_written="))
+        .collect();
+    if drops == 0 {
+        assert_eq!(scans, 1, "{id}: {mine:?}");
         assert_eq!(written, [size.to_string()], "{id}");
+    } else {
+        assert!(scans <= 1, "{id}: {mine:?}");
+        assert!(written.iter().all(|w| *w == size.to_string()), "{id}");
+    }
+    // Whatever was dropped: one terminal record at most, last, carrying the
+    // account, and no ordinary record after a sealing one.
+    let terminals: Vec<&&str> = mine.iter().filter(|b| b.starts_with('!')).collect();
+    assert!(terminals.len() <= 1, "{id}: {mine:?}");
+    if let Some(terminal) = terminals.first() {
+        assert_eq!(**terminal, format!("!sealed drops={drops}"), "{id}");
+        assert_eq!(mine.last(), Some(*terminal), "{id}: {mine:?}");
+    }
+    if let Some(first) = mine.iter().position(|b| b.starts_with("@@")) {
+        assert!(
+            mine[first..]
+                .iter()
+                .all(|b| b.starts_with("@@") || b.starts_with('!')),
+            "{id}: an ordinary record after sealing began"
+        );
+    }
+    if drops == 0 {
+        let emissions = mine.iter().filter(|b| b.starts_with("@@")).count();
+        assert_eq!(emissions, sealed, "{id}");
+        assert_eq!(terminals.len(), 1, "{id}: {mine:?}");
     }
 }
 

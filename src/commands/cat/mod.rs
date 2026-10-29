@@ -111,7 +111,7 @@ pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;

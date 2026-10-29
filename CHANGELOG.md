@@ -16,22 +16,33 @@
   misread (a marker name that is empty, has a newline or trailing
   whitespace, or starts with `@`, or with `%` on the untagged stream; a
   counter name that is empty or holds a newline or `=`). The library's own
-  names are unaffected, so the CLI's stream is unchanged.
-  `CallSink::dropped` counts the lines a sink dropped (a refused name, an
-  overlong line, a write a full FIFO turned away), shared by the sink's
-  clones and separate from every other call's.
-- **Invocations account for what can still record into them.** Every
-  public entry that can record (a command, a reader, writer or block
-  iterator method, `Invocation::cancel`, the end-of-run emitters) is
-  admitted on its invocation for its extent, and every value that can
-  record outside such a call (a `PbfWriter` and its threads, a
-  `PipelinedBlocks` pipeline, a bound output, the decompression pool behind
-  issued blocks) holds a permit until its last recording; writers, block
-  iterators, bound outputs and blocks handed to the caller are counted by
-  kind. This is the groundwork for sealing an invocation; nothing is
-  refused yet and behaviour is unchanged. With the `test-hooks` feature,
-  `Invocation::capabilities` (doc-hidden) returns the counts as
-  `host::Capabilities`.
+  names are unaffected, so the CLI's stream is unchanged. A `CallSink` is
+  not `Clone`: hand it to `Invocation::with_call_sink(sink, tap)`, which
+  owns it (the optional `tap` sees every ordinary record after it). Its
+  account, `Invocation::stream_account()` (or `CallSink::account()`),
+  counts every line it dropped (a refused name, an overlong line, a write a
+  full FIFO turned away) and says how the stream ended. `MarkerFifo::call`
+  returns a `Result` and refuses an id it has already issued; on the call
+  stream a marker name starting `!` and a counter name starting `@` are
+  refused, being the forms that end it.
+- **Invocations can be sealed.** `Invocation::seal()` ends an invocation
+  without waiting (ADR-0020). It returns `host::SealOutcome::Sealed` with a
+  `host::Snapshot` of the final counters, `Outstanding` with a
+  `host::Census` while values handed to the caller (a block iterator, a
+  `PbfWriter`, a bound output, a kept block) are still alive (drop them and
+  seal again), or `Refused` with a `host::SealRefusal`: a call in progress
+  (a seal from inside a callback included), another seal finalizing, and
+  the cases that can never seal. Sealing an invocation built with
+  `with_call_sink` ends its call stream: one `@@name=value` sealing
+  emission per snapshot counter, then the terminal record `!sealed drops=N`
+  (or `!failed drops=N`). Every public entry that can record (a command, a
+  reader, writer or block iterator method, `Invocation::cancel`, the
+  end-of-run emitters) is admitted on its invocation for its extent, and
+  every value that can record outside such a call holds a permit until its
+  last recording; that is what a seal waits on by refusing, never by
+  blocking. With the `test-hooks` feature, `Invocation::capabilities`
+  (doc-hidden) returns the counts as `host::Capabilities`, and
+  `FaultPlan::on_seal_step` observes a seal's finalization.
 - **The CLI marks its command interval on the sidecar FIFO.** With
   `BROKKR_MARKER_FIFO` set, every dispatched command writes one untagged
   `CLI_COMMAND_START` before its subcommand runs and one `CLI_COMMAND_END`
@@ -43,6 +54,16 @@
 
 ### Breaking
 
+- **A sealed invocation admits nothing.** Once `Invocation::seal()` has
+  begun, every entry under that invocation returns the new
+  `ErrorKind::Sealed` and `Invocation::cancel` returns the new
+  `CancelOutcome::Ended`, tripping nothing. So the entries that admit a
+  call on a bare invocation can now fail: `Output::bind`,
+  `OutputDir::bind`, `OutputSet::bind`, `ElementReader::into_blocks_pipelined`
+  and `PbfWriter::new_in` return a `Result`; `BlobReader::next` and
+  `PipelinedBlocks::next` yield the error once and then end. An invocation
+  that is never sealed behaves as before. The end-of-run emitters do
+  nothing under a sealed invocation.
 - **Library outputs are bound to an invocation before work, and every
   publication decision is recorded.** `Output::bind(self, &Invocation)`
   (likewise `OutputDir::bind`, `OutputSet::bind`) returns a `BoundOutput`

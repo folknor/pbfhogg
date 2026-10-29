@@ -1175,7 +1175,7 @@ mod tests {
         run_with(
             n,
             workers,
-            &crate::host::Invocation::new().call(),
+            &crate::host::Call::detached(),
             work,
             &mut ConsumeFn(|_, v| consume(v)),
         )
@@ -1204,7 +1204,8 @@ mod tests {
     fn zero_tasks_still_checks_cancellation() {
         let cancel = crate::host::Invocation::new();
         cancel.cancel();
-        let err = run_with(0, 4, &cancel.call(), Ok, &mut ConsumeFn(|_, _| Ok(()))).unwrap_err();
+        let call = cancel.call().unwrap();
+        let err = run_with(0, 4, &call, Ok, &mut ConsumeFn(|_, _| Ok(()))).unwrap_err();
         assert!(matches!(err.kind(), crate::ErrorKind::Cancelled));
     }
 
@@ -1313,7 +1314,7 @@ mod tests {
             run_with(
                 100,
                 4,
-                &crate::host::Invocation::new().call(),
+                &crate::host::Call::detached(),
                 |i| {
                     if i == 10 {
                         Err(Error::internal("decode 10 failed"))
@@ -1377,14 +1378,7 @@ mod tests {
         }
         let edges = within_deadline(|| {
             let mut consumer = Consumer(Vec::new());
-            run_with(
-                40,
-                1,
-                &crate::host::Invocation::new().call(),
-                Ok,
-                &mut consumer,
-            )
-            .unwrap();
+            run_with(40, 1, &crate::host::Call::detached(), Ok, &mut consumer).unwrap();
             consumer.0
         });
         let window = default_window(1).get();
@@ -1422,7 +1416,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: default_window(3),
-                cancel: &crate::host::Invocation::new().call(),
+                cancel: &crate::host::Call::detached(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1471,7 +1465,7 @@ mod tests {
             &mut shards,
             PoolConfig {
                 window: NonZeroUsize::new(window).unwrap(),
-                cancel: &crate::host::Invocation::new().call(),
+                cancel: &crate::host::Call::detached(),
                 waits: Waits::default(),
             },
             |_| (),
@@ -1749,7 +1743,7 @@ mod tests {
             StreamConfig {
                 window: NonZeroUsize::new(window).unwrap(),
                 depth,
-                cancel: &crate::host::Invocation::new().call(),
+                cancel: &crate::host::Call::detached(),
             },
             |_| (),
             |(), task, emitter| work(task, emitter),

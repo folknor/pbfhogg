@@ -196,7 +196,7 @@ pub fn digest<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Digest> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let input = input.into();
     host.invocation
         .decided(|| digest_inner(input, form, direct_io, host))

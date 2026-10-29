@@ -2370,7 +2370,7 @@ impl Enlisted {
     /// The permit first, then the registration, then the guard at once:
     /// nothing that can unwind runs between enlisting the unit and owning
     /// its abandonment.
-    fn new(invocation: &crate::host::Invocation, destinations: Vec<PathBuf>) -> Self {
+    fn new(invocation: &crate::host::Recorder, destinations: Vec<PathBuf>) -> Self {
         let permit = invocation.permit();
         let unit = permit.log().enlist(destinations);
         Self { permit, unit }
@@ -2711,20 +2711,28 @@ impl Output {
     /// decision (its publication, a cancel, or the bound owner dropped
     /// undecided). Bind before any work, so a run that fails before it
     /// writes the output still records that its publication was refused.
-    #[must_use]
-    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutput {
-        let _call = invocation.call();
-        self.bind_unissued(invocation).issued()
+    ///
+    /// # Errors
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when `invocation` has
+    /// been sealed; the output is dropped unbound.
+    pub fn bind(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
+        let call = invocation.call()?;
+        Ok(self.bind_under(&call).issued(&call))
     }
 
     /// [`bind`](Self::bind) for the library's own binding of an output a
     /// command was handed: the bound value never returns to the caller, so
     /// it takes no census ticket.
-    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutput {
+    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
+        let call = invocation.call()?;
+        Ok(self.bind_under(&call))
+    }
+
+    fn bind_under(self, invocation: &crate::host::Recorder) -> BoundOutput {
         let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
         BoundOutput {
             output: self,
-            invocation: invocation.clone(),
+            invocation: invocation.handle().clone(),
             unit: Some(unit),
             ticket: None,
         }
@@ -2945,7 +2953,7 @@ impl sealed::Sealed for BoundOutputSet {}
 
 impl BindOutput for Output {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
-        Ok(self.bind(invocation))
+        self.bind(invocation)
     }
 }
 
@@ -2953,10 +2961,11 @@ impl BindOutput for BoundOutput {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
         // Admitted on the invocation the output is bound to, which a refusal
         // decides in: `this` drops, abandoning it, inside that admission.
-        let _call = self.invocation.call();
+        // Never refused: the owner's permit keeps that invocation open.
+        let call = self.invocation.call()?;
         let this = self;
         refuse_other(&this.invocation, invocation, this.destination())?;
-        Ok(this.issued())
+        Ok(this.issued(&call))
     }
 }
 
@@ -2967,7 +2976,7 @@ impl sealed::Bind for Output {
         invocation: &crate::host::Invocation,
         _: sealed::Internal,
     ) -> Result<BoundOutput> {
-        Ok(Output::bind_unissued(self, invocation))
+        Output::bind_unissued(self, invocation)
     }
 }
 
@@ -2995,17 +3004,17 @@ pub trait BindOutputSet: sealed::Sealed + sealed::Bind<Bound = BoundOutputSet> {
 
 impl BindOutputSet for OutputSet {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
-        Ok(self.bind(invocation))
+        self.bind(invocation)
     }
 }
 
 impl BindOutputSet for BoundOutputSet {
     fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
         // As `BoundOutput::bind_to`: admitted on the set's own invocation.
-        let _call = self.invocation.call();
+        let call = self.invocation.call()?;
         let this = self;
         sealed::Bind::bind_unissued(this, invocation, sealed::Internal(()))
-            .map(BoundOutputSet::issued)
+            .map(|set| set.issued(&call))
     }
 }
 
@@ -3016,7 +3025,7 @@ impl sealed::Bind for OutputSet {
         invocation: &crate::host::Invocation,
         _: sealed::Internal,
     ) -> Result<BoundOutputSet> {
-        Ok(OutputSet::bind_unissued(self, invocation))
+        OutputSet::bind_unissued(self, invocation)
     }
 }
 
@@ -3071,9 +3080,9 @@ pub struct BoundOutput {
 impl BoundOutput {
     /// This output, issued to the caller: one `output` in its census.
     /// Idempotent, so an output passed back in keeps its one ticket.
-    fn issued(mut self) -> Self {
+    fn issued(mut self, call: &crate::host::Recorder) -> Self {
         if self.ticket.is_none() {
-            self.ticket = Some(self.invocation.ticket(crate::host::Kind::Output));
+            self.ticket = Some(call.ticket(crate::host::Kind::Output));
         }
         self
     }
@@ -3134,7 +3143,7 @@ impl BoundOutput {
         backend: crate::write::OutputBackend,
         host: &crate::host::Host,
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         self.pbf_writer_unissued(compression, header_block_bytes, backend, host)
             .map(crate::write::writer::PbfWriter::issued)
     }
@@ -3209,7 +3218,8 @@ impl BoundOutput {
         let Some(unit) = self.unit.take() else {
             return Err(Error::internal("a set member was published on its own"));
         };
-        let call = self.invocation.call();
+        // Under the unit's own permit, so never refused.
+        let call = unit.permit.call();
         publish_unit(std::slice::from_mut(&mut self.output.target), &call, &unit)
     }
 }
@@ -3280,20 +3290,31 @@ impl OutputDir {
     }
 
     /// Bind to `invocation` for good, as [`Output::bind`].
-    #[must_use]
-    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputDir {
-        let _call = invocation.call();
-        let mut bound = self.bind_unissued(invocation);
-        bound.ticket = Some(invocation.ticket(crate::host::Kind::Output));
-        bound
+    ///
+    /// # Errors
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when `invocation` has
+    /// been sealed.
+    pub fn bind(self, invocation: &crate::host::Invocation) -> Result<BoundOutputDir> {
+        let call = invocation.call()?;
+        let mut bound = self.bind_under(&call);
+        bound.ticket = Some(call.ticket(crate::host::Kind::Output));
+        Ok(bound)
     }
 
     /// [`bind`](Self::bind) for the library's own use: no census ticket.
-    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutputDir {
+    pub(crate) fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+    ) -> Result<BoundOutputDir> {
+        let call = invocation.call()?;
+        Ok(self.bind_under(&call))
+    }
+
+    fn bind_under(self, invocation: &crate::host::Recorder) -> BoundOutputDir {
         let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
         BoundOutputDir {
             dir: self,
-            invocation: invocation.clone(),
+            invocation: invocation.handle().clone(),
             unit,
             ticket: None,
         }
@@ -3348,7 +3369,8 @@ impl BoundOutputDir {
     /// the swap failed and the previous directory could not be put back (the
     /// error names where it is kept).
     pub fn publish(mut self) -> Result<()> {
-        let call = self.invocation.call();
+        // Under the unit's own permit, so never refused.
+        let call = self.unit.permit.call();
         publish_unit(
             std::slice::from_mut(&mut self.dir.target),
             &call,
@@ -3475,32 +3497,44 @@ impl OutputSet {
 
     /// Bind the whole set to `invocation` for good, as one publication
     /// unit ([`Output::bind`]). Its members are lent, bound, only after.
-    #[must_use]
-    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputSet {
-        let _call = invocation.call();
-        self.bind_unissued(invocation).issued()
+    ///
+    /// # Errors
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when `invocation` has
+    /// been sealed.
+    pub fn bind(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
+        let call = invocation.call()?;
+        Ok(self.bind_under(&call).issued(&call))
     }
 
     /// [`bind`](Self::bind) for the library's own use: no census ticket.
-    pub(crate) fn bind_unissued(self, invocation: &crate::host::Invocation) -> BoundOutputSet {
+    pub(crate) fn bind_unissued(
+        self,
+        invocation: &crate::host::Invocation,
+    ) -> Result<BoundOutputSet> {
+        let call = invocation.call()?;
+        Ok(self.bind_under(&call))
+    }
+
+    fn bind_under(self, invocation: &crate::host::Recorder) -> BoundOutputSet {
         let destinations = self
             .members
             .iter()
             .map(|member| member.target.dest.clone())
             .collect();
         let unit = Enlisted::new(invocation, destinations);
+        let handle = invocation.handle();
         BoundOutputSet {
             members: self
                 .members
                 .into_iter()
                 .map(|output| BoundOutput {
                     output,
-                    invocation: invocation.clone(),
+                    invocation: handle.clone(),
                     unit: None,
                     ticket: None,
                 })
                 .collect(),
-            invocation: invocation.clone(),
+            invocation: handle.clone(),
             unit,
             ticket: None,
         }
@@ -3525,9 +3559,9 @@ pub struct BoundOutputSet {
 impl BoundOutputSet {
     /// This set, issued to the caller: one `output` in its census.
     /// Idempotent.
-    fn issued(mut self) -> Self {
+    fn issued(mut self, call: &crate::host::Recorder) -> Self {
         if self.ticket.is_none() {
-            self.ticket = Some(self.invocation.ticket(crate::host::Kind::Output));
+            self.ticket = Some(call.ticket(crate::host::Kind::Output));
         }
         self
     }
@@ -3578,7 +3612,8 @@ impl BoundOutputSet {
         for member in self.members.drain(..) {
             targets.push(member.output.target);
         }
-        let call = self.invocation.call();
+        // Under the unit's own permit, so never refused.
+        let call = self.unit.permit.call();
         publish_unit(&mut targets, &call, &self.unit)
     }
 }
@@ -3604,7 +3639,7 @@ impl Output {
     }
 
     pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation).publish()
+        self.bind(invocation)?.publish()
     }
 }
 
@@ -3619,14 +3654,14 @@ impl OutputDir {
     }
 
     pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation).publish()
+        self.bind(invocation)?.publish()
     }
 }
 
 #[cfg(test)]
 impl OutputSet {
     pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation).publish()
+        self.bind(invocation)?.publish()
     }
 }
 
@@ -3687,7 +3722,8 @@ mod tests {
         let mine = crate::host::Invocation::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard())
             .unwrap()
-            .bind(&mine);
+            .bind(&mine)
+            .unwrap();
         let Err(err) = out.pbf_writer(
             crate::write::compression::Compression::default(),
             &[],
@@ -4285,7 +4321,8 @@ mod tests {
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard())
             .unwrap()
-            .bind(run_token());
+            .bind(run_token())
+            .unwrap();
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
             crate::write::compression::Compression::None,
@@ -4305,7 +4342,8 @@ mod tests {
             &discard(),
         )
         .unwrap()
-        .bind(run_token());
+        .bind(run_token())
+        .unwrap();
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
             crate::write::compression::Compression::None,
@@ -4439,7 +4477,13 @@ mod tests {
         writer.finish().unwrap();
         out.publish(&token).unwrap();
         assert_eq!(
-            token.call().metrics().writer.sync_all_calls.load(Relaxed),
+            token
+                .call()
+                .unwrap()
+                .metrics()
+                .writer
+                .sync_all_calls
+                .load(Relaxed),
             2
         );
     }
@@ -4466,7 +4510,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         fs::write(entry.join("old-file"), b"old").unwrap();
         let backup = Backup { container, entry };
-        target.remove_backup(0, &backup, &Faults::of(&run_token().call()));
+        target.remove_backup(0, &backup, &Faults::of(&run_token().call().unwrap()));
         drop(target);
         assert!(run.exists());
         assert_eq!(fs::read(backup.entry.join("old-file")).unwrap(), b"old");

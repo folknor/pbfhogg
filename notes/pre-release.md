@@ -52,13 +52,10 @@ profiles and certifies a harness, to a protocol frozen at version 1
 - `#34`: the harness member (`pbfhogg-harness`). Its skeleton has
   landed as L2 of `notes/library-harness.md`: describe and run modes,
   `repeat-cat`, sweep and textlint wiring, the `hotpath` /
-  `hotpath-alloc` features. Still owed: the other scenarios above, and
-  a real seal, which waits on:
-  - `#31`: `Invocation::seal()` (Decision A of that note);
-  - `#32`: call sinks end their stream with sealing emissions and a
-    terminal record. The per-sink drop count landed with L2.
-  `#33` (cancel's linearized outcome, and the publication log) has
-  landed as L1.
+  `hotpath-alloc` features. Still owed: the other scenarios above. The
+  seal (`#31`, `#32`: `Invocation::seal()`, and call sinks ending their
+  stream) has landed as L4, and `#33` (cancel's linearized outcome, and
+  the publication log) as L1.
 - `#35`: the gate's capability ids in `[pbfhogg.library.require]`.
 - `#36`: a reserving descriptor provider for concurrent calls.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
@@ -72,7 +69,10 @@ end. The harness protocol makes "never reset SIGPIPE" a producer
 obligation, which covers the harness but not other embedders; decide
 whether the library docs must state the requirement (the library may not
 change signal state, ADR-0016) or whether the write should use a send path
-that suppresses it.
+that suppresses it. Since L4 the stakes are the seal's too: a terminal
+record written after the reader left is where such a host would die, and
+with SIGPIPE ignored the same write is accounted as a hard failure (the
+stream ends `failed`).
 
 ### io_uring on real data
 

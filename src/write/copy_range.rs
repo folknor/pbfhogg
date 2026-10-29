@@ -576,7 +576,7 @@ mod tests {
         out_at: u64,
         explicit: bool,
     ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
-        let invocation = crate::host::Invocation::new().call();
+        let invocation = crate::host::Call::detached();
         run_in(
             script,
             input_len,
@@ -703,7 +703,7 @@ mod tests {
                 libc::EPERM,
                 libc::EINVAL,
             ] {
-                let invocation = crate::host::Invocation::new().call();
+                let invocation = crate::host::Call::detached();
                 let metrics = &invocation.metrics().writer;
                 // EINTR first: the decision is on the first answer that is
                 // not an interruption. The range is larger than the fallback
@@ -808,14 +808,7 @@ mod tests {
             buf: Vec::new(),
             got: Vec::new(),
         };
-        read_range(
-            &input,
-            10,
-            900,
-            &crate::host::Invocation::new().call(),
-            &mut sink,
-        )
-        .unwrap();
+        read_range(&input, 10, 900, &crate::host::Call::detached(), &mut sink).unwrap();
         assert_eq!(sink.got, bytes[10..910]);
     }
 
@@ -829,14 +822,8 @@ mod tests {
                 buf: Vec::new(),
                 got: Vec::new(),
             };
-            let err = read_range(
-                &input,
-                0,
-                50,
-                &crate::host::Invocation::new().call(),
-                &mut sink,
-            )
-            .unwrap_err();
+            let err =
+                read_range(&input, 0, 50, &crate::host::Call::detached(), &mut sink).unwrap_err();
             assert!(
                 matches!(err.kind(), ErrorKind::Internal { .. }),
                 "size {size}: {err}"

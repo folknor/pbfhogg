@@ -4042,7 +4042,7 @@ fn run_export(
     if let Some(output) = output {
         // The input/output alias refusal already ran in
         // `validate_input_output_aliases`, against the destination.
-        let output = output.bind(&host.invocation);
+        let output = output.bind(&host.invocation)?;
         let mut buf = output.writer()?;
         run_export_to(file, &mut buf, options, host)?;
         // The checked flush that lets the output be published.
@@ -4224,7 +4224,7 @@ fn run_diff(
         // dispatch made no scratch directory.
         pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
     } else if let Some(output) = output {
-        let output = output.bind(&host.invocation);
+        let output = output.bind(&host.invocation)?;
         let mut out = output.writer()?;
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
         out.finish()?;
@@ -5107,7 +5107,7 @@ fn run_bench_write(
             let file = std::fs::File::create("/dev/null")?;
             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
             let mut writer =
-                pbfhogg::writer::PbfWriter::new_in(buf, compression, host.invocation.clone());
+                pbfhogg::writer::PbfWriter::new_in(buf, compression, host.invocation.clone())?;
             writer.write_header(&header_bytes)?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;

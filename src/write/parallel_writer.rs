@@ -470,7 +470,7 @@ mod tests {
                 init_tx,
                 &thread_total,
                 crate::write::Finish::Durable,
-                &crate::host::Invocation::new().call(),
+                &crate::host::Call::detached(),
             )
         });
 

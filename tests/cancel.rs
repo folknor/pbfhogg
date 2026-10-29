@@ -437,7 +437,7 @@ fn a_decided_publication_completes() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osm.pbf");
     let host = crate::common::test_host();
-    let output = crate::common::out(&dest).bind(&host.invocation);
+    let output = crate::common::out(&dest).bind(&host.invocation).unwrap();
     let mut writer = output
         .pbf_writer(
             Default::default(),
@@ -473,7 +473,7 @@ fn publication_refuses_once_the_token_is_tripped() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
     let cancel = pbfhogg::host::Invocation::new();
-    let output = crate::common::out(&dest).bind(&cancel);
+    let output = crate::common::out(&dest).bind(&cancel).unwrap();
     let mut writer = output.writer().unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();
@@ -492,7 +492,9 @@ fn publication_refuses_once_the_token_is_tripped() {
 fn a_cancelled_output_writer_cannot_be_published() {
     let dir = crate::common::test_scratch();
     let cancel = pbfhogg::host::Invocation::new();
-    let output = crate::common::out(dir.path().join("out.txt")).bind(&cancel);
+    let output = crate::common::out(dir.path().join("out.txt"))
+        .bind(&cancel)
+        .unwrap();
     let writer = output.writer().unwrap();
     // The writer is no owner: tripping the token decides the output.
     cancel.cancel();
@@ -513,7 +515,7 @@ fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
     let cancel = pbfhogg::host::Invocation::new();
-    let output = crate::common::out(&dest).bind(&cancel);
+    let output = crate::common::out(&dest).bind(&cancel).unwrap();
     cancel
         .faults()
         .arm_publish_fault(pbfhogg::output::PublishFault::DirSync);

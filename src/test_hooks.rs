@@ -353,11 +353,32 @@ pub struct FaultPlan {
     publish_faults: Mutex<Vec<PublishFault>>,
     /// Hears every [`PublishStep`]; see [`on_publish_step`](Self::on_publish_step).
     publish_observer: OnceLock<PublishObserver>,
+
+    // --- sealing (`host::Invocation::seal`) ---
+    /// Hears every [`SealStep`]; see [`on_seal_step`](Self::on_seal_step).
+    seal_observer: OnceLock<SealObserver>,
 }
 
 /// A publication observer; it may block (a test parks the publishing thread
 /// in it until the process is killed).
 type PublishObserver = Box<dyn Fn(PublishStep) + Send + Sync>;
+
+/// A seal observer; it may block or panic.
+type SealObserver = Box<dyn Fn(SealStep) + Send + Sync>;
+
+/// The points of a seal's finalization a test can observe, on the thread
+/// that won the seal's exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SealStep {
+    /// Before the snapshot is taken: a panic here fails the finalization,
+    /// and the stream stays open.
+    Snapshot,
+    /// After the snapshot is committed and every sealing emission written,
+    /// before the terminal record: a panic here ends the stream `failed`,
+    /// and the invocation is sealed regardless.
+    Stream,
+}
 
 /// An armed input replacement and what it observed; see
 /// [`FaultPlan::arm_input_replacement`].
@@ -495,6 +516,24 @@ impl FaultPlan {
             input_replacement: Mutex::new(None),
             publish_faults: Mutex::new(Vec::new()),
             publish_observer: OnceLock::new(),
+            seal_observer: OnceLock::new(),
+        }
+    }
+
+    // ---- sealing ----------------------------------------------------------
+
+    /// Run `observer` on the finalizing thread at every [`SealStep`] of a
+    /// seal of this token's invocation. It may block (concurrent sealers are
+    /// refused meanwhile) or panic (see each step). Set once; a second call
+    /// is ignored.
+    pub fn on_seal_step(&self, observer: impl Fn(SealStep) + Send + Sync + 'static) {
+        drop(self.seal_observer.set(Box::new(observer)));
+    }
+
+    /// Called by the finalizing seal at each step.
+    pub(crate) fn seal_step(&self, step: SealStep) {
+        if let Some(observer) = self.seal_observer.get() {
+            observer(step);
         }
     }
 

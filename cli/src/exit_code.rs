@@ -366,7 +366,7 @@ mod tests {
         )
         .expect("fresh output");
         let cancel = pbfhogg::host::Invocation::new();
-        let output = output.bind(&cancel);
+        let output = output.bind(&cancel).expect("open");
         let _ = cancel.cancel();
         let cancelled = output
             .publish()

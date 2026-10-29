@@ -430,7 +430,7 @@ fn block_iterator_matches_pipelined() {
 
     let mut from_iter = Vec::new();
     let reader = ElementReader::from_path(&path).unwrap();
-    for block_result in reader.into_blocks_pipelined() {
+    for block_result in reader.into_blocks_pipelined().unwrap() {
         let block = block_result.unwrap();
         for element in block.elements() {
             from_iter.push(element_id(&element));
@@ -448,7 +448,7 @@ fn block_iterator_early_drop() {
     write_test_pbf(&path);
 
     let reader = ElementReader::from_path(&path).unwrap();
-    let mut blocks = reader.into_blocks_pipelined();
+    let mut blocks = reader.into_blocks_pipelined().unwrap();
     // Take just the first block and drop the iterator
     let _first = blocks.next();
     drop(blocks);
@@ -467,7 +467,7 @@ fn block_iterator_early_drop_under_pressure() {
             .unwrap()
             .read_ahead(1)
             .decode_ahead(1);
-        let mut blocks = reader.into_blocks_pipelined();
+        let mut blocks = reader.into_blocks_pipelined().unwrap();
         let _first = blocks.next();
         drop(blocks);
         done_tx.send(()).unwrap();
@@ -571,6 +571,7 @@ fn pipelined_block_iterator_matches_sequential_with_tiny_count_bounds() {
         .read_ahead(1)
         .decode_ahead(1)
         .into_blocks_pipelined()
+        .unwrap()
     {
         block
             .unwrap()
@@ -600,7 +601,7 @@ fn early_exit_does_not_read_whole_file() {
             .unwrap()
             .read_ahead(1)
             .decode_ahead(1);
-        let mut blocks = reader.into_blocks_pipelined();
+        let mut blocks = reader.into_blocks_pipelined().unwrap();
         let _first = blocks.next();
         drop(blocks);
         done_tx.send(()).unwrap();
@@ -628,7 +629,7 @@ fn block_type_classification() {
 
     let reader = ElementReader::from_path(&path).unwrap();
     let mut types = Vec::new();
-    for block_result in reader.into_blocks_pipelined() {
+    for block_result in reader.into_blocks_pipelined().unwrap() {
         let block = block_result.unwrap();
         types.push(block.block_type());
     }

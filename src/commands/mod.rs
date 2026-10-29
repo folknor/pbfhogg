@@ -589,7 +589,7 @@ pub fn has_indexdata<'a>(
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
     // A library probe with no run to observe: it is never cancelled.
-    let cancel = crate::host::Invocation::new().call();
+    let cancel = crate::host::Call::detached();
     Ok(probe_first_data_blob(input, direct_io, diagnostics, &cancel)?.0)
 }
 
@@ -602,7 +602,7 @@ pub fn has_indexdata_in<'a>(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<bool> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.invocation)?.0)
 }
 
@@ -619,7 +619,7 @@ pub fn has_tagdata(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    let cancel = crate::host::Invocation::new().call();
+    let cancel = crate::host::Call::detached();
     Ok(probe_first_data_blob(path, direct_io, diagnostics, &cancel)?.1)
 }
 

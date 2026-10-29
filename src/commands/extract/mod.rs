@@ -644,7 +644,7 @@ pub fn extract_multi<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let outputs = crate::output::bind_unissued(outputs, &host.invocation)?;
     host.invocation.check()?;
     if regions.len() != outputs.len() {
@@ -843,7 +843,7 @@ pub fn extract<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     // Every pass opens the input again, each through its own open file

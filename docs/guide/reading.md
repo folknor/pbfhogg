@@ -163,14 +163,14 @@ println!("Total elements: {total}");
 
 ### into_blocks_pipelined - iterator interface
 
-Returns an `Iterator<Item = Result<PrimitiveBlock>>` backed by a background pipeline thread. Supports early exit, zipping two files, and interleaving work. Requires `R: 'static` (`ElementReader<FileReader>` from `from_path` satisfies this).
+Returns an `Iterator<Item = Result<PrimitiveBlock>>` backed by a background pipeline thread (or `ErrorKind::Sealed`, starting nothing, when the reader's invocation has been sealed). Supports early exit, zipping two files, and interleaving work. Requires `R: 'static` (`ElementReader<FileReader>` from `from_path` satisfies this).
 
 ```rust
 use pbfhogg::ElementReader;
 
 let reader = ElementReader::from_path("tests/test.osm.pbf")?;
 
-for block_result in reader.into_blocks_pipelined() {
+for block_result in reader.into_blocks_pipelined()? {
     let block = block_result?;
     println!("Block with {} elements", block.elements().count());
 }

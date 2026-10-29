@@ -50,7 +50,7 @@ pub(crate) struct DecompressPool {
 impl DecompressPool {
     /// Create a new empty pool for `invocation`, wrapped in `Arc` for shared
     /// ownership.
-    pub fn new(invocation: &crate::host::Invocation) -> Arc<Self> {
+    pub fn new(invocation: &crate::host::Recorder) -> Arc<Self> {
         Arc::new(Self {
             buffers: Mutex::new(Vec::new()),
             permit: invocation.permit(),
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn pooled_buffer_reserves_the_requested_capacity() {
-        let pool = DecompressPool::new(&crate::host::Invocation::new().call());
+        let pool = DecompressPool::new(&crate::host::Call::detached());
         let buffer = Vec::with_capacity(1024);
         let previous_capacity = buffer.capacity();
         pool.put(buffer);
@@ -590,26 +590,17 @@ mod tests {
     fn pool_drops_count_into_their_own_invocation() {
         use crate::tunables::DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
         use std::sync::atomic::Ordering::Relaxed;
-        let ours = crate::host::Invocation::new();
-        let other = crate::host::Invocation::new();
+        let ours = crate::host::Call::detached();
+        let other = crate::host::Call::detached();
         let pool = DecompressPool::new(&ours);
         let _other_pool = DecompressPool::new(&other);
         pool.put(Vec::with_capacity(
             DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1,
         ));
-        let ours_call = ours.call();
-        let ours = &ours_call.metrics().decompress;
+        let ours = &ours.metrics().decompress;
         assert_eq!(ours.oversize_drops.load(Relaxed), 1);
         assert!(ours.oversize_drop_capacity_bytes.load(Relaxed) > 0);
-        assert_eq!(
-            other
-                .call()
-                .metrics()
-                .decompress
-                .oversize_drops
-                .load(Relaxed),
-            0
-        );
+        assert_eq!(other.metrics().decompress.oversize_drops.load(Relaxed), 0);
     }
 
     /// Build a `WireBlob` whose *decompressed* payload is exactly `payload`.

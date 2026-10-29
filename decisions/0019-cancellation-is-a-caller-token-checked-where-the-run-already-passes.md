@@ -2,7 +2,8 @@
 
 Date: 2026-10-23
 Status: Accepted (amended 2026-10-29: explicit binding, the publication
-log, invocation-wide cancel)
+log, invocation-wide cancel; amended 2026-10-30: cancel after a seal,
+ADR-0020)
 
 ## Decision
 
@@ -24,7 +25,10 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   `AfterDecision { authorized }` with the latest authorized ordinal when
   nothing was pending (that publication completes regardless), or
   `NoPublicationPending`. Every decision after it refuses. Cancelling one
-  command among several needs separate invocations.
+  command among several needs separate invocations. Once the invocation's
+  seal has begun (ADR-0020) there is nothing left to cancel: `cancel`
+  returns `Ended` and trips nothing, and binding an output to it is refused
+  with `ErrorKind::Sealed`.
 - **Checkpoints sit only where the run already passes**: a blob read or
   dispatched, a result received from a pool, a stage or pass boundary, a
   block or buffer written through an `Output`'s writer, a scratch shard or

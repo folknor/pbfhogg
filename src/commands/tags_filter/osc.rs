@@ -168,7 +168,7 @@ pub fn tags_filter_osc(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_osc_to(input, &output, expression_strs, host)?;

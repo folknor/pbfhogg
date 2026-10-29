@@ -22,7 +22,7 @@ pub fn show_element_to<W: Write>(
     out: &mut W,
     host: &crate::host::Host,
 ) -> Result<bool> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     host.invocation
         .decided(|| show_element_inner(path, target_kind, target_id, direct_io, out, host))
 }

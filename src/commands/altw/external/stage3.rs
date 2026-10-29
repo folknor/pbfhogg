@@ -538,7 +538,7 @@ mod tests {
         let router = ConcurrentBlobLocationRouter::new(
             &per_way_rcs,
             vec![worker],
-            &crate::host::Invocation::new().call(),
+            &crate::host::Call::detached(),
         )
         .expect("router");
         let way_slot_starts = [0];
@@ -559,7 +559,7 @@ mod tests {
             100,
             &integrated,
             1,
-            &crate::host::Invocation::new().call(),
+            &crate::host::Call::detached(),
         )
         .expect_err("oversized blob must fail classification");
         assert!(err.to_string().contains("blob 0 slot range"));

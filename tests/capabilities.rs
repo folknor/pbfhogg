@@ -80,7 +80,8 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
     let mut blocks = pbfhogg::ElementReader::new(stream)
         .unwrap()
         .invocation(invocation.clone())
-        .into_blocks_pipelined();
+        .into_blocks_pipelined()
+        .unwrap();
     parked_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the pipeline reached the caller's stream");
@@ -141,6 +142,63 @@ fn blocks_kept_from_a_callback_are_issued() {
     assert_eq!(invocation.capabilities(), Capabilities::default());
 }
 
+/// A seal while kept blocks are alive reports them as outstanding buffers
+/// and seals nothing; once they are dropped, a retry seals. After that the
+/// invocation admits nothing.
+#[test]
+fn an_outstanding_buffer_released_then_sealed() {
+    use pbfhogg::host::SealOutcome;
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("base.osm.pbf");
+    crate::common::write_base_pbf(&path);
+    let invocation = Invocation::new();
+    let mut kept = Vec::new();
+    pbfhogg::ElementReader::from_path(&path)
+        .unwrap()
+        .invocation(invocation.clone())
+        .for_each_block_pipelined(|block| {
+            kept.push(block);
+            Ok(())
+        })
+        .unwrap();
+    match invocation.seal() {
+        SealOutcome::Outstanding(census) => {
+            let mut held = Vec::new();
+            census.for_each_held(|kind, n| held.push((kind, n)));
+            assert_eq!(held, [("buffer", kept.len() as u64)]);
+        }
+        other => panic!("kept blocks are outstanding: {other:?}"),
+    }
+    assert!(
+        pbfhogg::ElementReader::from_path(&path)
+            .unwrap()
+            .invocation(invocation.clone())
+            .for_each_pipelined(|_| {})
+            .is_ok(),
+        "an outstanding seal closes nothing"
+    );
+    drop(kept);
+    let SealOutcome::Sealed(snapshot) = invocation.seal() else {
+        panic!("released, the retry seals");
+    };
+    let mut counted = 0;
+    invocation.for_each_counter(|name, value| {
+        assert_eq!(snapshot.get(name), Some(value), "{name} is final");
+        counted += 1;
+    });
+    assert_eq!(snapshot.len(), counted);
+    let refused = pbfhogg::ElementReader::from_path(&path)
+        .unwrap()
+        .invocation(invocation.clone())
+        .for_each_pipelined(|_| {})
+        .unwrap_err();
+    assert!(
+        matches!(refused.kind(), pbfhogg::ErrorKind::Sealed),
+        "{refused}"
+    );
+    assert_eq!(invocation.capabilities(), Capabilities::default());
+}
+
 /// A caller's `Write` wrapping an issued writer.
 struct Adapter {
     _inner: pbfhogg::writer::PbfWriter<Vec<u8>>,
@@ -162,12 +220,14 @@ impl Write for Adapter {
 fn a_writer_nested_in_a_callers_writer_is_counted_once_each() {
     let invocation = Invocation::new();
     let compression = pbfhogg::writer::Compression::None;
-    let inner = pbfhogg::writer::PbfWriter::new_in(Vec::new(), compression, invocation.clone());
+    let inner =
+        pbfhogg::writer::PbfWriter::new_in(Vec::new(), compression, invocation.clone()).unwrap();
     let outer = pbfhogg::writer::PbfWriter::new_in(
         Adapter { _inner: inner },
         compression,
         invocation.clone(),
-    );
+    )
+    .unwrap();
     let both = assert_quiescent(&invocation);
     assert_eq!((both.writer, both.permits), (2, 2), "{both:?}");
     let adapter = outer.into_inner().unwrap();
@@ -191,7 +251,9 @@ fn bound_outputs_are_issued_once() {
         ..crate::common::test_host()
     };
 
-    let bound = crate::common::out(dir.path().join("sorted.osm.pbf")).bind(&invocation);
+    let bound = crate::common::out(dir.path().join("sorted.osm.pbf"))
+        .bind(&invocation)
+        .unwrap();
     let c = assert_quiescent(&invocation);
     assert_eq!((c.output, c.permits), (1, 1), "{c:?}");
     pbfhogg::sort::sort(
@@ -204,7 +266,9 @@ fn bound_outputs_are_issued_once() {
     .unwrap();
     assert_eq!(invocation.capabilities(), Capabilities::default());
 
-    let pending = crate::common::out(dir.path().join("never.osm.pbf")).bind(&invocation);
+    let pending = crate::common::out(dir.path().join("never.osm.pbf"))
+        .bind(&invocation)
+        .unwrap();
     let _outcome = invocation.cancel();
     let mut decided = 0;
     invocation.for_each_publication(|row| {

@@ -151,7 +151,7 @@ pub fn export<W: Write>(
     opts: &ExportOptions,
     host: &crate::host::Host,
 ) -> crate::Result<ExportStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     host.invocation.check()?;
     let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {

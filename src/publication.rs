@@ -123,6 +123,9 @@ pub enum CancelOutcome {
     AfterDecision { authorized: u64 },
     /// Nothing was pending and nothing had been authorized.
     NoPublicationPending,
+    /// The invocation is sealed (or a seal is under way): it admits nothing,
+    /// so there was nothing to cancel and nothing was tripped.
+    Ended,
 }
 
 /// The result of one decision attempt on a unit.

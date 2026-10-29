@@ -265,7 +265,7 @@ pub fn parse_ids_from_pbf<'a>(
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<ElementIds> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let mut set = ElementIds::empty();
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
@@ -414,7 +414,7 @@ pub fn getid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
@@ -548,7 +548,7 @@ pub fn removeid<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = removeid_to(input, &output, ids, write, overrides, host)?;
@@ -1593,7 +1593,7 @@ mod tests {
         )
         .unwrap();
         let host = crate::host::Host::entered_for_tests();
-        let staged = staged.bind(&host.invocation);
+        let staged = staged.bind(&host.invocation).unwrap();
         getid_with_refs(
             &PinnedInput::pin(&input, &host).unwrap(),
             &staged,
@@ -1646,6 +1646,7 @@ mod tests {
             )
             .unwrap()
             .bind(&host.invocation)
+            .unwrap()
         };
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
         let opts = GetidOptions {
@@ -1688,7 +1689,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap();
-            let staged = staged.bind(&host.invocation);
+            let staged = staged.bind(&host.invocation).unwrap();
             filter_by_id(
                 &PinnedInput::pin(input, host).unwrap(),
                 &staged,
@@ -1769,7 +1770,7 @@ mod tests {
             report_found: false,
         };
         let run = |output: &Path, host: &crate::host::Host, direct: bool| {
-            let host = &host.enter();
+            let host = &host.enter()?;
             let staged = crate::output::Output::new(
                 output,
                 crate::output::Overwrite::Replace,
@@ -1780,7 +1781,7 @@ mod tests {
                 direct_reads: direct,
                 ..WriteOptions::default()
             };
-            let staged = staged.bind(&host.invocation);
+            let staged = staged.bind(&host.invocation).unwrap();
             let result = getid_dispatched(
                 &input,
                 &staged,
@@ -1898,7 +1899,7 @@ mod tests {
             )
             .unwrap();
             let host = crate::host::Host::entered_for_tests();
-            let staged = staged.bind(&host.invocation);
+            let staged = staged.bind(&host.invocation).unwrap();
             let (arm, _) = getid_dispatched(
                 &input,
                 &staged,

@@ -176,7 +176,7 @@ pub fn merge<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output_pbf = crate::output::bind_unissued(output_pbf, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;

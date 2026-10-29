@@ -238,9 +238,28 @@ fn repeat_cat_runs_to_the_protocol() {
         let doc = run.doc(&format!("calls/{call}.json"));
         assert_eq!(doc["call"], call);
         assert_eq!(doc["outcome"]["status"], "ok");
-        assert_eq!(doc["seal"]["state"], "refused");
-        assert_eq!(doc["stream"]["state"], "open");
-        assert!(doc["snapshot"].is_null() && doc["cancel"].is_null());
+        assert_eq!(doc["seal"]["state"], "sealed", "{doc}");
+        assert_eq!(doc["stream"]["state"], "sealed", "{doc}");
+        assert!(doc["cancel"].is_null());
+        // Every counter of the snapshot has its sealing emission, carrying
+        // its value, and the terminal record agrees with the account.
+        let snapshot = doc["snapshot"]
+            .as_object()
+            .expect("a sealed call's snapshot");
+        assert!(!snapshot.is_empty());
+        let drops = doc["stream"]["drops"].as_u64().expect("drops");
+        if drops == 0 {
+            for (name, value) in snapshot {
+                assert!(
+                    lines.contains(&format!(" %{call} @@{name}={value}\n")),
+                    "no sealing emission for {call} {name}"
+                );
+            }
+            assert!(
+                lines.contains(&format!(" %{call} !sealed drops=0\n")),
+                "no terminal record for {call}"
+            );
+        }
         let (entry, ret, seal) = (&doc["entry_us"], &doc["return_us"], &doc["seal_us"]);
         let (entry, ret, seal) = (entry.as_u64(), ret.as_u64(), seal.as_u64());
         assert!(entry <= ret && ret <= seal && entry.is_some());

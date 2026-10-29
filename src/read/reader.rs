@@ -209,16 +209,21 @@ impl<R: Read + Send> ElementReader<R> {
     /// # foo().unwrap();
     /// ```
     #[hotpath::measure]
-    pub fn for_each<F>(self, mut f: F) -> Result<()>
+    pub fn for_each<F>(self, f: F) -> Result<()>
     where
         F: for<'a> FnMut(Element<'a>),
     {
+        // Admitted first, and the consumed reader and callback moved into
+        // locals declared after the admission, so the caller's `Read` and
+        // closure are destroyed inside it, unwinding included.
+        let _call = self.blob_iter.cancel_token().call()?;
+        let mut f = f;
+        let this = self;
         // `with_blob_filter` configures only the pipelined iteration methods.
         // This sequential API decodes every OsmData blob and does not apply
         // BlobFilter. It is a blob-level omission based on optional indexdata,
         // not a post-decode element predicate shared by every reader engine.
-        let Self { mut blob_iter, .. } = self;
-        let _call = blob_iter.cancel_token().call();
+        let Self { mut blob_iter, .. } = this;
 
         // Loop-local decode scratch. `decompress_into` fills `buf` straight from
         // the compressed payload; `std::mem::take` then MOVES that allocation
@@ -271,21 +276,24 @@ impl<R: Read + Send> ElementReader<R> {
     /// claim: the reader does not check it. History files may repeat an ID for multiple
     /// versions.
     #[hotpath::measure]
-    pub fn for_each_pipelined<F>(self, mut f: F) -> Result<()>
+    pub fn for_each_pipelined<F>(self, f: F) -> Result<()>
     where
         F: for<'a> FnMut(Element<'a>),
     {
         // Only elements reach the caller, borrowed from a block that never
         // leaves this method, so no block is issued and none takes a ticket.
-        let call = self.blob_iter.cancel_token().call();
+        // The reader and callback are destroyed inside the admission.
+        let call = self.blob_iter.cancel_token().call()?;
+        let mut f = f;
+        let this = self;
         super::pipeline::run_pipeline(
-            self.blob_iter,
+            this.blob_iter,
             &call,
-            self.decode_threads,
-            self.pipeline_config,
-            self.blob_filter,
-            self.resources,
-            self.diagnostics,
+            this.decode_threads,
+            this.pipeline_config,
+            this.blob_filter,
+            this.resources,
+            this.diagnostics,
             super::pipeline::Blocks,
             |block: PrimitiveBlock| {
                 block.for_each_element(&mut f);
@@ -307,23 +315,25 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// # Errors
     /// Returns the first error encountered while parsing the PBF structure.
-    pub fn for_each_block_pipelined<F>(self, mut f: F) -> Result<()>
+    pub fn for_each_block_pipelined<F>(self, f: F) -> Result<()>
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        let call = self.blob_iter.cancel_token().call();
-        let handle = call.handle().clone();
+        // The reader and callback are destroyed inside the admission.
+        let call = self.blob_iter.cancel_token().call()?;
+        let mut f = f;
+        let this = self;
         super::pipeline::run_pipeline(
-            self.blob_iter,
+            this.blob_iter,
             &call,
-            self.decode_threads,
-            self.pipeline_config,
-            self.blob_filter,
-            self.resources,
-            self.diagnostics,
+            this.decode_threads,
+            this.pipeline_config,
+            this.blob_filter,
+            this.resources,
+            this.diagnostics,
             super::pipeline::Blocks,
             // Each block is issued to the caller's closure, which can keep it.
-            |block: PrimitiveBlock| f(block.issued(&handle)),
+            |block: PrimitiveBlock| f(block.issued(&call)),
         )
     }
 
@@ -334,7 +344,7 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        let call = self.blob_iter.cancel_token().call();
+        let call = self.blob_iter.cancel_token().call()?;
         super::pipeline::run_pipeline(
             self.blob_iter,
             &call,
@@ -371,7 +381,7 @@ impl<R: Read + Send> ElementReader<R> {
         F: FnMut(X::Out) -> Result<()>,
     {
         // A nested entry: the command calling it holds its own.
-        let call = self.blob_iter.cancel_token().call();
+        let call = self.blob_iter.cancel_token().call()?;
         super::pipeline::run_pipeline(
             self.blob_iter,
             &call,
@@ -402,7 +412,11 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// Requires `R: 'static` because the pipeline runs in a background thread.
     /// [`ElementReader<FileReader>`] satisfies this (the common case).
-    pub fn into_blocks_pipelined(self) -> PipelinedBlocks
+    ///
+    /// # Errors
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when the reader's
+    /// invocation has been sealed; nothing is started.
+    pub fn into_blocks_pipelined(self) -> Result<PipelinedBlocks>
     where
         R: 'static,
     {
@@ -418,13 +432,13 @@ impl<R: Read + Send> ElementReader<R> {
         let blob_filter = self.blob_filter;
         let resources = self.resources;
         let diagnostics = self.diagnostics;
-        let call = blob_iter.cancel_token().call();
+        let call = blob_iter.cancel_token().call()?;
         // The background thread records outside any call, through its own
         // teardown, so it runs under a permit it holds to its last act. The
         // session itself only receives and joins, and records nothing.
         let permit = call.permit();
         let invocation = call.handle().clone();
-        let ticket = invocation.ticket(crate::host::Kind::Session);
+        let ticket = call.ticket(crate::host::Kind::Session);
 
         let handle = std::thread::spawn(move || {
             let permit = permit;
@@ -452,13 +466,13 @@ impl<R: Read + Send> ElementReader<R> {
             drop(permit);
         });
 
-        PipelinedBlocks {
+        Ok(PipelinedBlocks {
             rx: Some(rx),
             handle: Some(handle),
             completed,
             invocation,
             _ticket: ticket,
-        }
+        })
     }
 
     /// Parallel map/reduce. Decodes the PBF structure in parallel, calls the closure `map_op` on
@@ -513,31 +527,30 @@ impl<R: Read + Send> ElementReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
-    pub fn par_map_reduce<MP, RD, ID, T>(
-        mut self,
-        map_op: MP,
-        identity: ID,
-        reduce_op: RD,
-    ) -> Result<T>
+    pub fn par_map_reduce<MP, RD, ID, T>(self, map_op: MP, identity: ID, reduce_op: RD) -> Result<T>
     where
         MP: for<'a> Fn(Element<'a>) -> T + Sync + Send,
         RD: Fn(T, T) -> T + Sync + Send,
         ID: Fn() -> T + Sync + Send,
         T: Send,
     {
-        let _call = self.blob_iter.cancel_token().call();
+        // The reader and closures are destroyed inside the admission,
+        // unwinding included.
+        let _call = self.blob_iter.cancel_token().call()?;
+        let closures = (map_op, identity, reduce_op);
+        let mut this = self;
         // `with_blob_filter` configures only the pipelined iteration methods.
         // par_map_reduce maps every decoded element and intentionally disables
         // indexdata parsing; using the optional metadata filter here would make
         // results depend on indexdata presence and correctness.
         // par_map_reduce never inspects blob.index(); skip the per-blob
         // indexdata copy in the frame pump.
-        self.blob_iter.set_parse_indexdata(false);
+        this.blob_iter.set_parse_indexdata(false);
 
         // Reserve one thread for the frame pump (this thread); the rest decode.
-        let worker_count = self.decode_threads.unwrap_or_else(|| {
+        let worker_count = this.decode_threads.unwrap_or_else(|| {
             crate::host::sized_workers(
-                self.resources.as_ref().map_or(
+                this.resources.as_ref().map_or(
                     &crate::host::MachineProbe as &dyn crate::host::Resources,
                     |r| &*r.0,
                 ),
@@ -548,14 +561,14 @@ impl<R: Read + Send> ElementReader<R> {
         });
 
         par_fold_blobs(
-            self.blob_iter,
+            this.blob_iter,
             worker_count,
             PAR_INFLIGHT_BUDGET,
             PAR_BATCH_MAX_BLOBS,
             PAR_BATCH_MAX_BYTES,
-            map_op,
-            identity,
-            reduce_op,
+            closures.0,
+            closures.1,
+            closures.2,
         )
     }
 }
@@ -609,7 +622,10 @@ where
     );
     let queue = Arc::new(BatchQueue::new());
     let budget = Arc::new(ByteBudget::new(budget_cap));
-    let pool = DecompressPool::new(blob_iter.cancel_token());
+    // Nested under the caller's admission, so never refused there.
+    let call = blob_iter.cancel_token().call()?;
+    let pool = DecompressPool::new(&call);
+    drop(call);
     // Captured once; every worker borrows it to locate decode failures.
     let source = blob_iter.source().cloned();
     let source = source.as_ref();
@@ -1182,7 +1198,7 @@ impl ElementReader<FileReader> {
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         Self::with_blobs(BlobReader::open_with(source, direct, host)?, host)
     }
 
@@ -1260,7 +1276,9 @@ fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<Hea
 ///
 /// Created by [`ElementReader::into_blocks_pipelined`]. The 3-stage pipeline
 /// runs in a background thread; blocks are delivered in file order via a bounded
-/// channel. Dropping this iterator signals the pipeline to shut down promptly.
+/// channel. Dropping this iterator signals the pipeline to shut down promptly,
+/// and waits for it: a pipeline blocked in a `Read` the caller supplied is
+/// waited for until that read returns, which is the caller's to ensure.
 pub struct PipelinedBlocks {
     rx: Option<Receiver<Result<PrimitiveBlock>>>,
     handle: Option<JoinHandle<()>>,
@@ -1280,9 +1298,19 @@ impl Iterator for PipelinedBlocks {
     type Item = Result<PrimitiveBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let _call = self.invocation.call();
+        self.rx.as_ref()?;
+        // Refused only once the invocation sealed, which its pipeline's
+        // permit rules out until the pipeline has finished: what it left
+        // queued is then given up, once, and the iterator ends.
+        let call = match self.invocation.call() {
+            Ok(call) => call,
+            Err(sealed) => {
+                self.rx = None;
+                return Some(Err(sealed));
+            }
+        };
         match self.rx.as_ref()?.recv() {
-            Ok(item) => Some(item.map(|block| block.issued(&self.invocation))),
+            Ok(item) => Some(item.map(|block| block.issued(&call))),
             Err(_) => {
                 // The channel closed. On the normal path the pipeline thread
                 // has already sent every block (and any error) and set
@@ -1800,13 +1828,13 @@ mod tests {
                 }
                 thread_completed.store(true, Ordering::Release);
             });
-            let invocation = crate::host::Invocation::new();
+            let call = crate::host::Call::detached();
             PipelinedBlocks {
                 rx: Some(rx),
                 handle: Some(handle),
                 completed,
-                _ticket: invocation.ticket(crate::host::Kind::Session),
-                invocation,
+                _ticket: call.ticket(crate::host::Kind::Session),
+                invocation: call.handle().clone(),
             }
         };
 
@@ -1841,7 +1869,8 @@ mod tests {
         // with the spurious error asserted above.
         let real = ElementReader::from_path("tests/test.osm.pbf")
             .unwrap()
-            .into_blocks_pipelined();
+            .into_blocks_pipelined()
+            .unwrap();
         let mut blocks = 0;
         for block in real {
             block.expect("a well-formed file must not yield a pipeline error");
@@ -1858,7 +1887,8 @@ mod tests {
         // on the next call.
         let mut partial = ElementReader::from_path("tests/test.osm.pbf")
             .unwrap()
-            .into_blocks_pipelined();
+            .into_blocks_pipelined()
+            .unwrap();
         partial
             .next()
             .expect("at least one block")

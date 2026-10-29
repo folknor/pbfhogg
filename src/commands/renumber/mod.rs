@@ -391,7 +391,7 @@ pub fn renumber_external<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = renumber_external_to(input, &output, opts, write, overrides, host)?;

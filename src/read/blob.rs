@@ -542,7 +542,7 @@ impl<R: Read + Send> BlobReader<R> {
     /// The missing-header error, or the framing error reading the first
     /// blob.
     pub fn leading_header(&mut self) -> Result<Blob> {
-        let _call = self.frames.cancel_token().call();
+        let _call = self.frames.cancel_token().call()?;
         match self.next() {
             Some(Ok(blob)) if matches!(blob.get_type(), BlobType::OsmHeader) => Ok(blob),
             Some(Ok(_)) | None => Err(crate::error::new_missing_header_in(self.source())),
@@ -696,7 +696,7 @@ impl BlobReader<FileReader> {
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         let source = source.into();
         Ok(Self::from_reader(
             FileReader::open_in(source, direct, &host.invocation)?,
@@ -826,7 +826,18 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
     type Item = Result<Blob>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let _call = self.frames.cancel_token().call();
+        if self.frames.failed() {
+            return None;
+        }
+        let _call = match self.frames.cancel_token().call() {
+            Ok(call) => call,
+            Err(sealed) => {
+                // Refused once the invocation sealed: said once, then the
+                // walk ends.
+                self.frames.poison();
+                return Some(Err(sealed));
+            }
+        };
         self.next_blob()
     }
 }
@@ -909,7 +920,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// # foo().unwrap();
     /// ```
     pub fn blob_from_offset(&mut self, pos: ByteOffset) -> Result<Blob> {
-        let _call = self.frames.cancel_token().call();
+        let _call = self.frames.cancel_token().call()?;
         self.seek(pos)?;
         // A read at an explicit offset is a fresh start, as after `seek_raw`:
         // an earlier failed read must not make `next` stop before reading,
@@ -987,10 +998,16 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// read can tell that the payload is not all there.
     #[hotpath::measure]
     pub fn next_header_skip_blob(&mut self) -> Option<Result<(BlobHeader, Option<ByteOffset>)>> {
-        let _call = self.frames.cancel_token().call();
         if self.frames.failed() {
             return None;
         }
+        let _call = match self.frames.cancel_token().call() {
+            Ok(call) => call,
+            Err(sealed) => {
+                self.frames.poison();
+                return Some(Err(sealed));
+            }
+        };
         let header = match self.frames.next_header() {
             Ok(Some(header)) => header,
             Ok(None) => return None,

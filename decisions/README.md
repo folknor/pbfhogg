@@ -191,3 +191,10 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   cancel refuses every pending one and reports whether it came before or
   after a decision. The CLI trips it from SIGINT/SIGTERM and exits 130/143;
   a second signal exits at once.
+- [ADR-0020](0020-an-invocation-is-sealed-by-one-exchange-that-never-waits.md) -
+  `Invocation::seal` ends an invocation by one exchange on its transition
+  word, from Open with no call, permit or saturated count, and never waits:
+  it refuses a call in progress, reports the census of values still issued,
+  and once sealed admits nothing. Finalization runs no caller code: the
+  snapshot, then the owned call sink's sealing emissions and terminal
+  record, then Sealed.

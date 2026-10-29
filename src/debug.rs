@@ -20,7 +20,10 @@ use crate::tunables::PIPE_BUF;
 /// deadlock on those locks). A panic in a callback is contained: the
 /// invocation stops calling that sink and the run carries on. A sink's own
 /// destructor runs when the last clone of its invocation drops, and must not
-/// panic.
+/// panic. Every callback runs inside a call or under a permit of its
+/// invocation, so a seal of that invocation cannot happen while one is
+/// running; a seal attempted from inside a callback is refused as a call in
+/// progress.
 ///
 /// A callback can run on a worker of a rayon pool the library built for the
 /// call (merge-changes emits from its `Parallelism::Fixed` pool's workers).
@@ -67,11 +70,14 @@ pub trait InstrumentSink: Send + Sync {
 /// A line the sidecar reader would reject, misread or alter is dropped
 /// whole rather than written: a marker name that is empty, contains a
 /// newline, ends in whitespace or starts with `@`; on the untagged stream, a
-/// marker name starting with `%` (that prefix means a call tag); a counter
-/// name that is empty or contains a newline or `=`; a line over 512 bytes.
-/// The library's own names never hit these.
+/// marker name starting with `%` (that prefix means a call tag); on the call
+/// stream, the forms reserved for ending it, a marker name starting with `!`
+/// and a counter name starting with `@`; a counter name that is empty or
+/// contains a newline or `=`; a line over 512 bytes. The library's own names
+/// never hit these.
 ///
-/// Cloning is cheap and shares the descriptor and the clock.
+/// Cloning is cheap and shares the descriptor, the clock and the record of
+/// the call ids issued.
 #[derive(Clone)]
 pub struct MarkerFifo {
     shared: std::sync::Arc<FifoShared>,
@@ -81,6 +87,9 @@ struct FifoShared {
     file: std::fs::File,
     anchor: std::time::Instant,
     age_at_anchor: u64,
+    /// Every call id [`MarkerFifo::call`] has issued on this FIFO, kept for
+    /// its life so no id is issued twice.
+    issued: std::sync::Mutex<std::collections::HashSet<CallId>>,
 }
 
 impl MarkerFifo {
@@ -106,6 +115,7 @@ impl MarkerFifo {
                 file,
                 anchor,
                 age_at_anchor,
+                issued: std::sync::Mutex::default(),
             }),
         })
     }
@@ -121,15 +131,34 @@ impl MarkerFifo {
     /// A sink for one invocation that writes this FIFO's call stream,
     /// `<timestamp_us> %<call_id> <name>` and
     /// `<timestamp_us> %<call_id> @<name>=<value>`, through the same
-    /// descriptor and clock. The caller keeps `id` unique among the calls of
-    /// one process run; the reader cannot check that.
-    #[must_use]
-    pub fn call(&self, id: CallId) -> CallSink {
-        CallSink {
+    /// descriptor and clock. Hand it to
+    /// [`Invocation::with_call_sink`](crate::host::Invocation::with_call_sink),
+    /// whose seal ends the stream.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` when `id` was already issued on this FIFO (any clone
+    /// of it), even to a sink since dropped: one id names one stream. Ids
+    /// issued through a separately opened `MarkerFifo` of the same path are
+    /// not seen here; keeping them apart is the caller's.
+    pub fn call(&self, id: CallId) -> crate::Result<CallSink> {
+        let fresh = self
+            .shared
+            .issued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone());
+        if !fresh {
+            return Err(crate::Error::invalid_argument(format!(
+                "call id {} was already issued on this marker FIFO",
+                id.as_str()
+            )));
+        }
+        Ok(CallSink {
             shared: std::sync::Arc::clone(&self.shared),
             id,
-            drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
+            cell: StreamCell::default(),
+        })
     }
 }
 
@@ -144,12 +173,12 @@ impl InstrumentSink for MarkerFifo {
     fn marker(&self, name: &str) {
         let shared = &self.shared;
         // The process stream keeps no account: a dropped line is gone.
-        let _delivered = Line::marker(shared.now_us(), None, name).emit(&shared.file);
+        let _sent = Line::marker(shared.now_us(), None, name).emit(&shared.file);
     }
 
     fn counter(&self, name: &str, value: i64) {
         let shared = &self.shared;
-        let _delivered = Line::counter(shared.now_us(), None, name, value).emit(&shared.file);
+        let _sent = Line::counter(shared.now_us(), None, name, value).emit(&shared.file);
     }
 }
 
@@ -201,22 +230,70 @@ impl CallId {
 }
 
 /// One invocation's sink on a [`MarkerFifo`]'s call stream, made by
-/// [`MarkerFifo::call`]. Give each invocation its own (one id per call);
-/// every `CallSink` of one FIFO shares its descriptor and clock, and its
-/// lines follow the same whole-line and name rules, with the tag counted in
-/// the 512 bytes.
+/// [`MarkerFifo::call`] and owned by the invocation it is handed to
+/// ([`Invocation::with_call_sink`](crate::host::Invocation::with_call_sink)).
+/// Not `Clone`: its stream has one owner, which ends it. Every `CallSink` of
+/// one FIFO shares its descriptor and clock, and its lines follow the same
+/// whole-line and name rules, with the tag counted in the 512 bytes.
 ///
-/// The sink counts every line it dropped ([`dropped`](Self::dropped)): a
-/// name the reader would refuse, a line over 512 bytes, and a write that did
-/// not take the whole line (a full FIFO, a reader gone). The count belongs
-/// to this sink and its clones, not to the FIFO: another call's sink keeps
-/// its own.
-#[derive(Clone)]
+/// The sink keeps its own account ([`account`](Self::account)): every line
+/// it dropped (a name the reader would refuse, a line over 512 bytes, a write
+/// that did not take the whole line: a full FIFO, a reader gone) and how its
+/// stream ended. A successful seal of its invocation ends it: the sink stops
+/// admitting ordinary records, writes `<ts> %<call> @@<name>=<value>` for
+/// every counter of the seal's snapshot (zeros included, values saturated at
+/// `i64::MAX`), then the terminal record `<ts> %<call> !sealed drops=N`, or
+/// `!failed drops=N` once any write of the sink failed outright (not a full
+/// FIFO), `N` the lines dropped before it. A terminal record that does not go
+/// out whole is counted in the account too, so the account is then `N + 1`.
+/// A sink that is never sealed stays open.
 pub struct CallSink {
     shared: std::sync::Arc<FifoShared>,
     id: CallId,
-    drops: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    cell: StreamCell,
 }
+
+/// How a call sink's stream ended, in its [`StreamAccount`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamState {
+    /// Not ended: its invocation has not sealed.
+    Open,
+    /// Ended by a seal, every write of the sink having succeeded or merely
+    /// been turned away by a full FIFO.
+    Sealed,
+    /// Ended by a seal after a write failed outright (the reader gone, say),
+    /// or the ending itself failed.
+    Failed,
+}
+
+/// A call sink's own account: how its stream ended, and every line it
+/// dropped, its terminal record included. Final once the state is not
+/// [`Open`](StreamState::Open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamAccount {
+    /// How the stream ended.
+    pub state: StreamState,
+    /// Lines dropped, saturating at `u64::MAX`.
+    pub drops: u64,
+}
+
+/// The sink's account as it moves. `state` is published with `Release`
+/// after `drops` reaches its final value, so a reader that sees an ended
+/// state reads the final count.
+#[derive(Default)]
+struct StreamCell {
+    state: std::sync::atomic::AtomicU8,
+    drops: std::sync::atomic::AtomicU64,
+    /// A write failed outright at some point.
+    hard_error: std::sync::atomic::AtomicBool,
+}
+
+const CELL_OPEN: u8 = 0;
+const CELL_CLOSING: u8 = 1;
+const CELL_SEALED: u8 = 2;
+const CELL_FAILED: u8 = 3;
 
 impl CallSink {
     /// This sink's call id.
@@ -225,36 +302,100 @@ impl CallSink {
         &self.id
     }
 
-    /// How many lines this sink (any of its clones) has dropped so far,
-    /// saturating at `u64::MAX`. Final once nothing emits through it any
-    /// more.
+    /// The account so far: [`Open`](StreamState::Open) with the lines
+    /// dropped up to now until a seal has ended the stream, then final.
     #[must_use]
-    pub fn dropped(&self) -> u64 {
-        self.drops.load(std::sync::atomic::Ordering::Relaxed)
+    pub fn account(&self) -> StreamAccount {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        let state = match self.cell.state.load(Acquire) {
+            CELL_SEALED => StreamState::Sealed,
+            CELL_FAILED => StreamState::Failed,
+            _ => StreamState::Open,
+        };
+        StreamAccount {
+            state,
+            drops: self.cell.drops.load(Relaxed),
+        }
     }
 
-    /// Count `line` as dropped unless it went out whole. Only a drop touches
-    /// the counter.
-    fn account(&self, delivered: bool) {
+    /// Count one line by how its write went. Only a drop touches the count.
+    fn account_line(&self, sent: Sent) {
         use std::sync::atomic::Ordering::Relaxed;
-        if !delivered {
-            // `Err` only when already saturated, which is where it stays.
-            let _saturated = self
-                .drops
-                .try_update(Relaxed, Relaxed, |n| n.checked_add(1));
+        match sent {
+            Sent::Whole => return,
+            Sent::Dropped => {}
+            Sent::Failed => self.cell.hard_error.store(true, Relaxed),
         }
+        // `Err` only when already saturated, which is where it stays.
+        let _saturated = self
+            .cell
+            .drops
+            .try_update(Relaxed, Relaxed, |n| n.checked_add(1));
+    }
+
+    /// Whether the stream still admits ordinary records. Once a seal has
+    /// begun ending it, an ordinary record is ignored and counted nowhere.
+    /// The invocation's capabilities already keep any ordinary record from
+    /// overlapping a seal; this is a guard, not the barrier.
+    fn open(&self) -> bool {
+        self.cell.state.load(std::sync::atomic::Ordering::Relaxed) == CELL_OPEN
+    }
+
+    /// End the stream with `snapshot`: the sealing emissions, then the
+    /// terminal record, on the sealing thread. `hook` runs after the last
+    /// sealing emission (a test parks or panics there). Never unwinds: an
+    /// unwind before the terminal record is caught, its payload forgotten,
+    /// and the stream ends `!failed`; after the terminal write only atomic
+    /// stores run, so the account always agrees with a terminal record that
+    /// reached the FIFO.
+    pub(crate) fn close(&self, snapshot: &crate::host::Snapshot, hook: impl FnOnce()) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.cell.state.store(CELL_CLOSING, Release);
+        let shared = &self.shared;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (name, value) in snapshot.iter() {
+                let line = Line::sealing(shared.now_us(), &self.id, name, value);
+                self.account_line(line.emit(&shared.file));
+            }
+            hook();
+        }));
+        let unwound = match unwound {
+            Ok(()) => false,
+            Err(payload) => {
+                std::mem::forget(payload);
+                true
+            }
+        };
+        let before = self.cell.drops.load(Relaxed);
+        let failed = unwound || self.cell.hard_error.load(Relaxed);
+        let terminal = Line::terminal(shared.now_us(), &self.id, failed, before);
+        let (failed, drops) = match terminal.emit(&shared.file) {
+            Sent::Whole => (failed, before),
+            Sent::Dropped => (failed, before.saturating_add(1)),
+            Sent::Failed => (true, before.saturating_add(1)),
+        };
+        self.cell.drops.store(drops, Relaxed);
+        self.cell
+            .state
+            .store(if failed { CELL_FAILED } else { CELL_SEALED }, Release);
     }
 }
 
 impl InstrumentSink for CallSink {
     fn marker(&self, name: &str) {
+        if !self.open() {
+            return;
+        }
         let shared = &self.shared;
-        self.account(Line::marker(shared.now_us(), Some(&self.id), name).emit(&shared.file));
+        self.account_line(Line::marker(shared.now_us(), Some(&self.id), name).emit(&shared.file));
     }
 
     fn counter(&self, name: &str, value: i64) {
+        if !self.open() {
+            return;
+        }
         let shared = &self.shared;
-        self.account(
+        self.account_line(
             Line::counter(shared.now_us(), Some(&self.id), name, value).emit(&shared.file),
         );
     }
@@ -262,20 +403,30 @@ impl InstrumentSink for CallSink {
 
 /// Whether the reader takes `name` back verbatim as a marker: it trims the
 /// line, splits off the timestamp (and call tag) once, reads a body starting
-/// `@` as a counter and an untagged payload starting `%` as a tag.
+/// `@` as a counter and an untagged payload starting `%` as a tag. On the
+/// call stream a body starting `!` is a terminal record.
 fn marker_name_ok(name: &str, tagged: bool) -> bool {
     !name.is_empty()
         && !name.contains('\n')
         && !name.ends_with(char::is_whitespace)
         && !name.starts_with('@')
         && (tagged || !name.starts_with('%'))
+        && !(tagged && name.starts_with('!'))
 }
 
 /// Whether the reader takes `name` back verbatim as a counter name: it
-/// splits the body at the first `=`.
-fn counter_name_ok(name: &str) -> bool {
-    !name.is_empty() && !name.contains('\n') && !name.contains('=')
+/// splits the body at the first `=`. On the call stream a body starting
+/// `@@` is a sealing emission.
+fn counter_name_ok(name: &str, tagged: bool) -> bool {
+    !name.is_empty()
+        && !name.contains('\n')
+        && !name.contains('=')
+        && !(tagged && name.starts_with('@'))
 }
+
+/// The protocol's bound on a snapshot counter name, so its sealing emission
+/// fits a FIFO line.
+const SEALING_NAME_MAX: usize = 400;
 
 /// The sidecar FIFO is the caller's instrumentation channel, not an input or
 /// an output; the bare `io::Error` goes back to the caller, which names it.
@@ -444,12 +595,42 @@ impl Line {
 
     fn counter(us: u64, call: Option<&CallId>, name: &str, value: i64) -> Self {
         let mut line = Self::new();
-        if !counter_name_ok(name) {
+        if !counter_name_ok(name, call.is_some()) {
             line.overflow = true;
             return line;
         }
         line.stamp(us, call);
         line.push(format_args!("@{name}={value}\n"));
+        line
+    }
+
+    /// A sealing emission: `<ts> %<call> @@<name>=<value>`, the value
+    /// saturated at `i64::MAX` as the wire carries it. A name the protocol
+    /// refuses (empty, over 400 bytes, holding `=` or a newline) drops the
+    /// line.
+    fn sealing(us: u64, call: &CallId, name: &str, value: u64) -> Self {
+        let mut line = Self::new();
+        if name.is_empty()
+            || name.len() > SEALING_NAME_MAX
+            || name.contains('\n')
+            || name.contains('=')
+        {
+            line.overflow = true;
+            return line;
+        }
+        let value = i64::try_from(value).unwrap_or(i64::MAX);
+        line.stamp(us, Some(call));
+        line.push(format_args!("@@{name}={value}\n"));
+        line
+    }
+
+    /// The terminal record: `<ts> %<call> !sealed drops=N` or
+    /// `!failed drops=N`.
+    fn terminal(us: u64, call: &CallId, failed: bool, drops: u64) -> Self {
+        let mut line = Self::new();
+        let state = if failed { "failed" } else { "sealed" };
+        line.stamp(us, Some(call));
+        line.push(format_args!("!{state} drops={drops}\n"));
         line
     }
 
@@ -483,17 +664,41 @@ impl Line {
     }
 
     /// Write the assembled line, or drop it whole. Never writes a prefix.
-    /// Whether the whole line went out.
+    /// How the write went.
     #[must_use]
-    fn emit(&self, file: &std::fs::File) -> bool {
+    fn emit(&self, file: &std::fs::File) -> Sent {
         use std::io::Write;
         if self.overflow {
-            return false;
+            return Sent::Dropped;
         }
         // Deliberately `write`, not `write_all`: a short write must drop the
         // marker, not resume it mid-line.
-        matches!((&*file).write(&self.buf[..self.len]), Ok(n) if n == self.len)
+        match (&*file).write(&self.buf[..self.len]) {
+            Ok(n) if n == self.len => Sent::Whole,
+            Ok(_) => Sent::Dropped,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Sent::Dropped
+            }
+            Err(_) => Sent::Failed,
+        }
     }
+}
+
+/// How one line's write went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// The whole line went out.
+    Whole,
+    /// Nothing went out, and the descriptor is fine: a refused or overlong
+    /// line, or a full FIFO.
+    Dropped,
+    /// The write failed outright (the reader gone, a bad descriptor).
+    Failed,
 }
 
 impl std::fmt::Write for Line {
@@ -572,12 +777,18 @@ mod tests {
         for name in ["", "a\nb", "END ", "@x", "%x"] {
             assert!(Line::marker(1, None, name).overflow, "untagged {name:?}");
         }
-        for name in ["", "a\nb", "END\t", "@x"] {
+        // On the call stream `!` opens a terminal record and `@@` a sealing
+        // emission, so neither is an ordinary name there.
+        for name in ["", "a\nb", "END\t", "@x", "!sealed drops=0", "!x"] {
             assert!(Line::marker(1, Some(&id), name).overflow, "tagged {name:?}");
         }
         for name in ["", "a=b", "a\n"] {
             assert!(Line::counter(1, None, name, 0).overflow, "counter {name:?}");
         }
+        assert!(Line::counter(1, Some(&id), "@x", 0).overflow, "tagged @x");
+        // Untagged, `@@x=1` is a counter named `@x` and `!x` a marker.
+        assert!(!Line::counter(1, None, "@x", 0).overflow);
+        assert!(!Line::marker(1, None, "!x").overflow);
         // Leading whitespace survives the reader's parse, so it is kept.
         assert!(!Line::marker(1, None, " x").overflow);
         assert!(!Line::counter(1, None, " x ", 0).overflow);
@@ -621,7 +832,11 @@ mod tests {
 
         let scratch = crate::path_guard::tests::scratch();
         let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
-        assert!(!line.emit(&sink), "an overlong line reports a drop");
+        assert_eq!(
+            line.emit(&sink),
+            super::Sent::Dropped,
+            "an overlong line reports a drop"
+        );
         assert_eq!(
             sink.metadata().expect("stat sink").len(),
             0,
@@ -638,21 +853,55 @@ mod tests {
         line.push(format_args!("{} PASS1_END\n", 42_u128));
         let scratch = crate::path_guard::tests::scratch();
         let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
-        assert!(line.emit(&sink), "a whole line reports delivery");
+        assert_eq!(
+            line.emit(&sink),
+            super::Sent::Whole,
+            "a whole line reports delivery"
+        );
         assert_eq!(
             sink.metadata().expect("stat sink").len(),
             b"42 PASS1_END\n".len() as u64
         );
     }
 
-    /// A call sink counts every line it drops, refused names, overlong lines
-    /// and writes a full FIFO turned away alike; its clones share the count,
-    /// another call's sink keeps its own.
+    #[test]
+    fn sealing_and_terminal_lines_follow_the_wire() {
+        let id = super::CallId::new("c").expect("valid id");
+        let line = Line::sealing(7, &id, "writer_bytes", u64::MAX);
+        assert_eq!(
+            &line.buf[..line.len],
+            b"7 %c @@writer_bytes=9223372036854775807\n"
+        );
+        let line = Line::terminal(8, &id, false, 0);
+        assert_eq!(&line.buf[..line.len], b"8 %c !sealed drops=0\n");
+        let line = Line::terminal(8, &id, true, 12);
+        assert_eq!(&line.buf[..line.len], b"8 %c !failed drops=12\n");
+        for name in ["", "a=b", "a\nb", &"n".repeat(super::SEALING_NAME_MAX + 1)] {
+            assert!(Line::sealing(1, &id, name, 0).overflow, "sealing {name:?}");
+        }
+        // The longest name with the longest id and value still fits.
+        let id = super::CallId::new(&"i".repeat(64)).expect("valid id");
+        let name = "n".repeat(super::SEALING_NAME_MAX);
+        assert!(!Line::sealing((1 << 63) - 1, &id, &name, u64::MAX).overflow);
+    }
+
+    /// One id names one stream: a FIFO issues it once, also after the sink
+    /// it went to was dropped.
     #[cfg(target_os = "linux")]
     #[test]
-    fn call_sinks_count_their_own_drops() {
-        use super::InstrumentSink as _;
-        use std::io::Write as _;
+    fn a_call_id_is_issued_once() {
+        let (_scratch, _reader, fifo) = fifo_with_idle_reader();
+        let id = || super::CallId::new("a").expect("id");
+        drop(fifo.call(id()).expect("first"));
+        assert!(fifo.call(id()).is_err());
+        assert!(fifo.clone().call(id()).is_err(), "clones share the record");
+        assert!(fifo.call(super::CallId::new("b").expect("id")).is_ok());
+    }
+
+    /// A FIFO with a reader that never reads, which keeps it open for
+    /// writers.
+    #[cfg(target_os = "linux")]
+    fn fifo_with_idle_reader() -> (tempfile::TempDir, std::fs::File, super::MarkerFifo) {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let scratch = crate::path_guard::tests::scratch();
@@ -660,46 +909,147 @@ mod tests {
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL");
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        // A reader that never reads keeps the FIFO open for writers.
         #[allow(clippy::disallowed_methods)]
-        let _reader = std::fs::OpenOptions::new()
+        let reader = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)
             .expect("open the read end");
         let fifo = super::MarkerFifo::open(&path).expect("open the FIFO");
-        let a = fifo.call(super::CallId::new("a").expect("id"));
-        let a2 = a.clone();
-        let b = fifo.call(super::CallId::new("b").expect("id"));
+        (scratch, reader, fifo)
+    }
 
-        a.marker("@refused");
-        a2.counter("x=y", 1);
-        a.marker(&"n".repeat(PIPE_BUF));
-        b.marker("DELIVERED");
-        assert_eq!((a.dropped(), a2.dropped(), b.dropped()), (3, 3, 0));
-
-        // Fill the FIFO until the kernel refuses a write, then every line
-        // is turned away.
-        #[allow(clippy::disallowed_methods)]
-        let mut filler = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .expect("open a filler");
+    /// Fill `fifo`'s pipe until even one byte is refused.
+    #[cfg(target_os = "linux")]
+    fn fill(fifo: &super::MarkerFifo) {
+        use std::io::Write as _;
+        let mut file = &fifo.shared.file;
         let chunk = [b'x'; 4096];
         loop {
-            match filler.write(&chunk) {
+            match file.write(&chunk) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => panic!("filling the FIFO: {e}"),
             }
         }
-        // The last bytes may still fit a short line; drain them with
-        // single bytes until even one is refused.
-        while filler.write(b"x").is_ok() {}
+        // The last bytes may still fit a short line; take them with single
+        // bytes until even one is refused.
+        while file.write(b"x").is_ok() {}
+    }
+
+    /// A call sink counts every line it drops, refused names, overlong lines
+    /// and writes a full FIFO turned away alike; another call's sink keeps
+    /// its own count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn call_sinks_count_their_own_drops() {
+        use super::InstrumentSink as _;
+        let (_scratch, _reader, fifo) = fifo_with_idle_reader();
+        let a = fifo.call(super::CallId::new("a").expect("id")).expect("a");
+        let b = fifo.call(super::CallId::new("b").expect("id")).expect("b");
+
+        a.marker("@refused");
+        a.counter("x=y", 1);
+        a.marker(&"n".repeat(PIPE_BUF));
+        b.marker("DELIVERED");
+        let drops = |s: &super::CallSink| s.account().drops;
+        assert_eq!((drops(&a), drops(&b)), (3, 0));
+
+        fill(&fifo);
         b.marker("FULL");
-        a2.marker("FULL");
-        assert_eq!((a.dropped(), b.dropped()), (4, 1));
+        a.marker("FULL");
+        assert_eq!((drops(&a), drops(&b)), (4, 1));
+        assert_eq!(a.account().state, super::StreamState::Open);
+    }
+
+    fn snapshot(counters: &[(&'static str, u64)]) -> crate::host::Snapshot {
+        crate::host::Snapshot::for_tests(counters.to_vec())
+    }
+
+    /// A terminal record a full FIFO turned away is counted in the account
+    /// (`N + 1` against the `N` the record would have carried), and the
+    /// stream still ends sealed: nothing failed outright.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_terminal_record_is_counted() {
+        let (_scratch, _reader, fifo) = fifo_with_idle_reader();
+        let sink = fifo.call(super::CallId::new("a").expect("id")).expect("a");
+        fill(&fifo);
+        sink.close(&snapshot(&[("x", 1), ("y", 2)]), || {});
+        let account = sink.account();
+        assert_eq!(account.state, super::StreamState::Sealed);
+        assert_eq!(account.drops, 3, "two sealing emissions and the terminal");
+        // Once ended, an ordinary record is ignored and counted nowhere.
+        super::InstrumentSink::marker(&sink, "LATE");
+        assert_eq!(sink.account(), account);
+    }
+
+    /// A write that fails outright (no reader left) ends the stream
+    /// `failed`, and a terminal record that could not be written is
+    /// counted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vanished_reader_fails_the_stream() {
+        let (_scratch, reader, fifo) = fifo_with_idle_reader();
+        let sink = fifo.call(super::CallId::new("a").expect("id")).expect("a");
+        drop(reader);
+        sink.close(&snapshot(&[("x", 1)]), || {});
+        assert_eq!(
+            sink.account(),
+            super::StreamAccount {
+                state: super::StreamState::Failed,
+                drops: 2,
+            }
+        );
+    }
+
+    /// A hard failure on the terminal write alone (the reader leaves after
+    /// the last sealing emission went out whole) ends the stream `failed`,
+    /// with the terminal counted, though the terminal it tried was
+    /// `!sealed`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_failure_on_the_terminal_alone_fails_the_stream() {
+        let (_scratch, reader, fifo) = fifo_with_idle_reader();
+        let sink = fifo.call(super::CallId::new("a").expect("id")).expect("a");
+        sink.close(&snapshot(&[("x", 1), ("y", 2)]), move || drop(reader));
+        assert_eq!(
+            sink.account(),
+            super::StreamAccount {
+                state: super::StreamState::Failed,
+                drops: 1,
+            }
+        );
+    }
+
+    /// An unwind in the ending (a test hook) is caught: the stream ends
+    /// `!failed` with the drops counted before it, and the account agrees
+    /// with the terminal record that went out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unwind_before_the_terminal_record_ends_the_stream_failed() {
+        use std::io::Read as _;
+        let (_scratch, mut reader, fifo) = fifo_with_idle_reader();
+        let sink = fifo.call(super::CallId::new("a").expect("id")).expect("a");
+        sink.close(&snapshot(&[("x", 1)]), || {
+            std::panic::resume_unwind(Box::new("hook"));
+        });
+        assert_eq!(
+            sink.account(),
+            super::StreamAccount {
+                state: super::StreamState::Failed,
+                drops: 0,
+            }
+        );
+        // Nonblocking: everything written is read, then `WouldBlock`.
+        let mut wire = Vec::new();
+        drop(reader.read_to_end(&mut wire));
+        let wire = String::from_utf8(wire).expect("utf-8");
+        let lines: Vec<&str> = wire
+            .lines()
+            .map(|l| l.split_once(' ').expect("ts").1)
+            .collect();
+        assert_eq!(lines, ["%a @@x=1", "%a !failed drops=0"]);
     }
 
     #[cfg(target_os = "linux")]

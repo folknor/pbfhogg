@@ -174,7 +174,7 @@ impl<'a> InputSource<'a> {
     /// # Errors
     /// As [`PinnedInput::pin`], for a path.
     pub fn pin(self, host: &crate::host::Host) -> Result<PinnedInput> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         match self {
             Self::Path(path) => PinnedInput::pin(path, host),
             Self::Pinned(pin) => Ok(pin.clone()),
@@ -313,7 +313,7 @@ impl PinnedInput {
     /// The path cannot be opened or `stat`ed, or names something other than
     /// a regular file; the error names it.
     pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         #[cfg(feature = "test-hooks")]
         let force_path = host.invocation.faults().forces_pin_path_reopen();
         #[cfg(not(feature = "test-hooks"))]
@@ -714,13 +714,10 @@ mod pin_tests {
         let err = pin.open().unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
         assert_eq!(err.source_path(), Some(input.as_path()));
-        let err = crate::file_reader::FileReader::open_in(
-            &pin,
-            false,
-            &crate::host::Invocation::new().call(),
-        )
-        .err()
-        .unwrap();
+        let err =
+            crate::file_reader::FileReader::open_in(&pin, false, &crate::host::Call::detached())
+                .err()
+                .unwrap();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
     }
 

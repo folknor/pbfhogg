@@ -188,8 +188,8 @@ pub fn build_geocode_index(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
-    let host = &host.enter();
-    let output = output.0.bind_unissued(&host.invocation);
+    let host = &host.enter()?;
+    let output = output.0.bind_unissued(&host.invocation)?;
     host.invocation.check()?;
     let stats = build_geocode_index_to(config, &output, host, scratch)?;
     output.publish()?;

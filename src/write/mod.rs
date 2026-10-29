@@ -48,10 +48,12 @@ pub(crate) mod metrics;
 /// too.
 ///
 /// The counters are the invocation's totals rather than per-writer numbers;
-/// `write::metrics` says why.
+/// `write::metrics` says why. Under a sealed invocation it does nothing: the
+/// seal's snapshot carries the final values.
 pub fn emit_writer_counters(invocation: &crate::host::Invocation) {
-    let call = invocation.call();
-    call.metrics().writer.emit_once(&call);
+    if let Ok(call) = invocation.call() {
+        call.metrics().writer.emit_once(&call);
+    }
 }
 
 /// Report, once each, the ways the writers' output or speed fell short of
@@ -69,9 +71,12 @@ pub fn emit_writer_counters(invocation: &crate::host::Invocation) {
 /// Call after dispatch, beside [`emit_writer_counters`]: the counts are the
 /// same invocation totals (of `host.invocation`) behind the
 /// `writer_tagdata_dropped_oversize` and `writer_copy_range_fallback_*`
-/// counters, reported to `host.diagnostics`.
+/// counters, reported to `host.diagnostics`. Under a sealed invocation it
+/// does nothing.
 pub fn report_writer_degradations(host: &crate::host::Host) {
-    let host = &host.enter();
+    let Ok(host) = &host.enter() else {
+        return;
+    };
     use std::sync::atomic::Ordering::Relaxed;
     let diagnostics = &host.diagnostics;
     let m = &host.invocation.metrics().writer;

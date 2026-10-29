@@ -78,6 +78,13 @@ pub(crate) fn new_cancelled() -> Error {
     new_error(ErrorKind::Cancelled)
 }
 
+/// The error a public entry under a sealed
+/// [`Invocation`](crate::host::Invocation) returns.
+#[cold]
+pub(crate) fn new_sealed() -> Error {
+    new_error(ErrorKind::Sealed)
+}
+
 #[cold]
 pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
     new_error(ErrorKind::MissingFeature(feature))
@@ -496,7 +503,8 @@ impl Error {
             | ErrorKind::InputReplaced
             | ErrorKind::BlobTooLarge { .. }
             | ErrorKind::VersionRegression { .. }
-            | ErrorKind::Cancelled => None,
+            | ErrorKind::Cancelled
+            | ErrorKind::Sealed => None,
         }
     }
 
@@ -730,6 +738,10 @@ pub enum ErrorKind {
     /// because it was asked to, every guard dropped (scratch and output
     /// staging removed) and nothing was published.
     Cancelled,
+    /// The [`Invocation`](crate::host::Invocation) the call would run under
+    /// has been sealed ([`Invocation::seal`](crate::host::Invocation::seal)),
+    /// so it admits nothing more. Nothing was done.
+    Sealed,
 }
 
 /// The decoded contradiction of a blob's indexdata kind claim, carried by
@@ -1329,6 +1341,12 @@ impl fmt::Display for Message<'_> {
                 write!(
                     f,
                     "cancelled: the run stopped before completing and published nothing"
+                )
+            }
+            ErrorKind::Sealed => {
+                write!(
+                    f,
+                    "the invocation has been sealed and admits nothing more; nothing was done"
                 )
             }
             // No CLI flag names here. This is a library `Display` impl and

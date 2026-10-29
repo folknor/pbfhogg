@@ -386,8 +386,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        let invocation = crate::host::Invocation::new();
-        let _call = invocation.call();
+        let invocation = crate::host::Call::detached();
         named_path(
             path,
             Self::to_path_in(
@@ -412,7 +411,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let host = &host.enter();
+        let host = &host.enter()?;
         named_path(
             path,
             Self::to_path_in(
@@ -465,8 +464,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        let invocation = crate::host::Invocation::new();
-        let _call = invocation.call();
+        let invocation = crate::host::Call::detached();
         named_path(
             path,
             Self::to_path_direct_in(
@@ -532,8 +530,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        let invocation = crate::host::Invocation::new();
-        let _call = invocation.call();
+        let invocation = crate::host::Call::detached();
         named_path(
             path,
             Self::to_path_uring_in(
@@ -608,8 +605,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        let invocation = crate::host::Invocation::new();
-        let _call = invocation.call();
+        let invocation = crate::host::Call::detached();
         named_path(
             path,
             Self::to_path_parallel_in(
@@ -729,11 +725,16 @@ impl<W: Write> PbfWriter<W> {
     /// durability is opt-in through [`to_path_sync`](PbfWriter::to_path_sync)
     /// and generic callers do not incur an implicit `fsync`.
     pub fn new(writer: W, compression: Compression) -> Self {
-        Self::new_in(writer, compression, crate::host::Invocation::new())
+        let call = crate::host::Call::detached();
+        Self::with_permit(writer, compression, call.permit()).issued()
     }
 
     /// [`PbfWriter::new`] under `invocation`: the writer observes the token
     /// and records its `writer_*` counters into it.
+    ///
+    /// # Errors
+    /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when `invocation` has
+    /// been sealed.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "public signature: the writer takes a permit on the token it is handed"
@@ -742,9 +743,9 @@ impl<W: Write> PbfWriter<W> {
         writer: W,
         compression: Compression,
         invocation: crate::host::Invocation,
-    ) -> Self {
-        let call = invocation.call();
-        Self::with_permit(writer, compression, call.permit()).issued()
+    ) -> Result<Self> {
+        let call = invocation.call()?;
+        Ok(Self::with_permit(writer, compression, call.permit()).issued())
     }
 
     /// A synchronous writer under a permit, for the library's own use: not
@@ -1356,13 +1357,10 @@ impl PbfWriter<BufWriter<File>> {
         compression: Compression,
         invocation: &crate::host::Invocation,
     ) -> Result<Self> {
+        let call = invocation.call()?;
         let file = super::create_backend_file(path)?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
-        Ok(Self::with_permit(
-            buffered,
-            compression,
-            invocation.permit(),
-        ))
+        Ok(Self::with_permit(buffered, compression, call.permit()))
     }
 
     /// Create a synchronous writer that owns a 256 KiB buffered output file.
@@ -1564,7 +1562,7 @@ mod tests {
         // guaranteed to fail without a race to synchronise against.
         drop(rx);
         let handle = std::thread::spawn(move || outcome);
-        let invocation = crate::host::Invocation::new().permit();
+        let invocation = crate::host::Call::detached().permit();
         PbfWriter::from_pipeline(
             Compression::None,
             WritePipeline::new(
@@ -1786,6 +1784,7 @@ mod tests {
         assert_eq!(
             w.invocation()
                 .call()
+                .unwrap()
                 .metrics()
                 .writer
                 .sync_all_calls
@@ -1804,6 +1803,7 @@ mod tests {
         assert_eq!(
             w.invocation()
                 .call()
+                .unwrap()
                 .metrics()
                 .writer
                 .sync_all_calls

@@ -100,7 +100,7 @@ pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
-    let host = &host.enter();
+    let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
     let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
@@ -420,7 +420,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )?;
         let host = crate::host::Host::entered_for_tests();
-        let output = output.bind(&host.invocation);
+        let output = output.bind(&host.invocation)?;
         write_merge(
             plan,
             &output,
@@ -508,7 +508,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("output");
-            let output = output.bind(&host.invocation);
+            let output = output.bind(&host.invocation).expect("open");
             let stats = write_merge(
                 merge,
                 &output,

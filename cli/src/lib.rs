@@ -2445,7 +2445,7 @@ pub fn run() -> process::ExitCode {
     // inherits the blocked mask.
     // The FIFO open starts no thread; the token must exist, with its sink,
     // before the signal waiter takes a clone of it.
-    let cancel = host::cli_invocation();
+    let (cancel, marker_fifo) = host::cli_invocation();
     if let Err(e) = signals::install(cancel.clone()) {
         host::cli_warning(
             "cli.signals",
@@ -2506,6 +2506,10 @@ pub fn run() -> process::ExitCode {
         paths.refuse_aliases()?;
         let mut leftovers = LeftoverScanner::default();
         paths.scan_leftovers(&mut leftovers, &host);
+        // The command line is accepted: the CLI's command interval opens
+        // here and closes on every return from the dispatch below, before the
+        // end-of-run counters (see `host::CommandInterval`).
+        let _command_interval = host::CommandInterval::open(marker_fifo.as_ref());
         match cli.command {
             Command::Cat {
                 files,

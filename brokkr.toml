@@ -1320,6 +1320,18 @@ paths = ["src/**/*.rs"]
 region = "code"
 message = "Environment access belongs to the caller"
 
+# The CLI's command interval markers are reserved for it: brokkr reads exactly
+# one CLI_COMMAND_START/CLI_COMMAND_END pair per CLI process as the command's
+# span, so no library phase and no other CLI site may spell either name.
+# `cli/src/host.rs` defines them and `CommandInterval` is their one emitter.
+[[textlint]]
+name = "cli-command-interval-names-reserved"
+pattern = 'CLI_COMMAND_(?:START|END)'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["cli/src/host.rs"]
+region = "string"
+message = "CLI_COMMAND_START and CLI_COMMAND_END are the CLI's reserved command-interval markers; only host::CommandInterval emits them"
+
 [[textlint]]
 name = "no-public-reader-in-commands"
 pattern = '\b(?:BlobReader|ElementReader)::(?:open|from_path|from_path_direct|from_path_with_eviction)\b'

@@ -114,6 +114,39 @@ that branch on `1` for the semantic answer are unaffected; callers that
 treat any non-zero as failure are unaffected. Only a caller that read
 `1` as "the command failed" needs to widen to `!= 0`.
 
+## Sidecar marker FIFO
+
+When `BROKKR_MARKER_FIFO` names a FIFO, pbfhogg opens it write-only and
+non-blocking and writes brokkr's sidecar stream to it: the phase markers
+(`<timestamp_us> <name>`) and counters (`<timestamp_us> @<name>=<value>`)
+its commands emit, timestamps in microseconds since process start. A FIFO
+that cannot be opened is a `Warning:` and the run continues without it.
+Every line is written whole or dropped, never partly, so the stream is best
+effort. The variable unset, nothing is written.
+
+The CLI adds one pair of its own, its **command interval**:
+
+- `CLI_COMMAND_START`, once the command line has been parsed and accepted
+  (flag rules, the input/output alias refusal and the leftover scan of
+  [Names pbfhogg leaves behind](#names-pbfhogg-leaves-behind)), immediately
+  before the subcommand is dispatched;
+- `CLI_COMMAND_END`, when the subcommand returns, whether it succeeded,
+  answered negatively, failed (an existing output without `--overwrite`
+  included) or was interrupted, and before the end-of-run counters
+  (`writer_*`, `pipeline_*` and their kin), which follow it.
+
+Between them lie the subcommand's own option handling, the opening of its
+outputs and scratch, every library pass it makes with all of its markers,
+its publication and the summary or report it prints. Process policy (the
+raised descriptor limit, the capped malloc arenas, input page-cache
+eviction) is applied inside the interval, where the command needs it.
+
+A process writes at most one pair. A command line refused before dispatch
+(a usage error, a flag rule, an alias refusal), `--help` and `--version`
+write neither marker; a run that panics, or exits at once on a second
+signal, writes no `CLI_COMMAND_END`. The names are reserved: no library
+phase uses them.
+
 ## Indexdata is believed
 
 Commands that act on blob-level indexdata or tagdata, or on the header's

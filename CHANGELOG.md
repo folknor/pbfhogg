@@ -17,6 +17,14 @@
   whitespace, or starts with `@`, or with `%` on the untagged stream; a
   counter name that is empty or holds a newline or `=`). The library's own
   names are unaffected, so the CLI's stream is unchanged.
+- **The CLI marks its command interval on the sidecar FIFO.** With
+  `BROKKR_MARKER_FIFO` set, every dispatched command writes one untagged
+  `CLI_COMMAND_START` before its subcommand runs and one `CLI_COMMAND_END`
+  when it returns, success or failure, before the end-of-run counters, so
+  a profiler can time the command apart from process start and exit. A
+  command line refused before dispatch, `--help` and `--version` write
+  neither. Sidecar phase views of CLI runs gain a leading and a trailing
+  segment. See "Sidecar marker FIFO" in `docs/cli/commands.md`.
 
 ### Breaking
 

@@ -43,6 +43,7 @@ mod cli_apply_changes_osmium;
 mod cli_cat;
 mod cli_check_index;
 mod cli_check_locations;
+mod cli_command_interval;
 mod cli_defensive_input;
 mod cli_degrade;
 mod cli_derive_changes;

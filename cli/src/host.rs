@@ -30,19 +30,26 @@ pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation) -> Host {
 }
 
 /// The run's invocation: instrumented with the sidecar marker FIFO when
-/// brokkr names one in `BROKKR_MARKER_FIFO`, silent otherwise.
+/// brokkr names one in `BROKKR_MARKER_FIFO`, silent otherwise. The FIFO is
+/// returned too, for the CLI's own [`CommandInterval`] markers.
 ///
 /// The library does not read the environment, so the CLI does, opens the FIFO
 /// and hands the sink to the process's one invocation. A FIFO that cannot be
 /// opened is reported once, here, as a warning: the run continues unprofiled
 /// rather than failing.
-pub(crate) fn cli_invocation() -> pbfhogg::host::Invocation {
+pub(crate) fn cli_invocation() -> (
+    pbfhogg::host::Invocation,
+    Option<pbfhogg::debug::MarkerFifo>,
+) {
     let Some(path) = std::env::var_os("BROKKR_MARKER_FIFO") else {
-        return pbfhogg::host::Invocation::new();
+        return (pbfhogg::host::Invocation::new(), None);
     };
     let path = std::path::PathBuf::from(path);
     match pbfhogg::debug::MarkerFifo::open(&path) {
-        Ok(fifo) => pbfhogg::host::Invocation::with_sink(Arc::new(fifo)),
+        Ok(fifo) => (
+            pbfhogg::host::Invocation::with_sink(Arc::new(fifo.clone())),
+            Some(fifo),
+        ),
         Err(error) => {
             cli_warning(
                 "debug.marker_fifo",
@@ -52,7 +59,62 @@ pub(crate) fn cli_invocation() -> pbfhogg::host::Invocation {
                     path.display()
                 ),
             );
-            pbfhogg::host::Invocation::new()
+            (pbfhogg::host::Invocation::new(), None)
+        }
+    }
+}
+
+/// The reserved process-stream marker opening the CLI's command interval.
+pub(crate) const COMMAND_START: &str = "CLI_COMMAND_START";
+/// The reserved process-stream marker closing the CLI's command interval.
+pub(crate) const COMMAND_END: &str = "CLI_COMMAND_END";
+
+/// The CLI's command interval on the sidecar FIFO's process stream: the
+/// untagged pair [`COMMAND_START`] and [`COMMAND_END`], so a harness can set
+/// a library call's `entry_us`..`return_us` beside the CLI's own span over
+/// the same command instead of the whole process wall.
+///
+/// `run` opens it once, immediately before dispatching the subcommand, after
+/// the command line was parsed and accepted (clap, `validate_command`, the
+/// alias refusal and the leftover scan). It closes when the dispatch
+/// returns, `Ok` or `Err`, a cancelled run and a refusal raised inside the
+/// command (an existing output, a library error) included, and before the
+/// end-of-run counters, which follow [`COMMAND_END`] as they follow a
+/// harness call's `return_us`. So the interval holds the subcommand's own
+/// option resolution, its output and scratch construction, every library
+/// call it makes, any publication the CLI does itself, and the summary or
+/// report it renders; process policy (the descriptor raise, the arena cap,
+/// page-cache eviction) is applied inside it, by the library's hooks.
+///
+/// A process refused before dispatch, or that prints help or the version,
+/// emits neither marker. One that unwinds out of the dispatch emits no
+/// [`COMMAND_END`]: the end means the command returned. A forced exit (a
+/// second signal, SIGKILL) emits none either, and the FIFO drops a line when
+/// it is full, so a reader takes exactly one pair or no interval.
+///
+/// The two names are the CLI's alone: a `brokkr.toml` text rule keeps them
+/// out of the library and every other CLI source.
+pub(crate) struct CommandInterval<'a>(Option<&'a pbfhogg::debug::MarkerFifo>);
+
+impl<'a> CommandInterval<'a> {
+    /// Emit [`COMMAND_START`]; the returned value emits [`COMMAND_END`] when
+    /// it drops. Nothing without a FIFO.
+    pub(crate) fn open(fifo: Option<&'a pbfhogg::debug::MarkerFifo>) -> Self {
+        use pbfhogg::debug::InstrumentSink as _;
+        if let Some(fifo) = fifo {
+            fifo.marker(COMMAND_START);
+        }
+        Self(fifo)
+    }
+}
+
+impl Drop for CommandInterval<'_> {
+    fn drop(&mut self) {
+        use pbfhogg::debug::InstrumentSink as _;
+        if let Some(fifo) = self.0
+            && !std::thread::panicking()
+        {
+            fifo.marker(COMMAND_END);
         }
     }
 }

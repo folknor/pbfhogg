@@ -809,7 +809,7 @@ impl<W: Write> PbfWriter<W> {
 
     /// The invocation this writer observes and records its `writer_*`
     /// counters into: the caller's for a writer built under a host or token
-    /// ([`Output::pbf_writer`](crate::Output::pbf_writer),
+    /// ([`BoundOutput::pbf_writer`](crate::BoundOutput::pbf_writer),
     /// [`PbfWriter::to_path_with`], [`PbfWriter::new_in`]), a fresh one of its
     /// own for the other public constructors, whose counters are then read
     /// from here ([`Invocation::for_each_counter`](crate::host::Invocation::for_each_counter)).
@@ -1130,7 +1130,7 @@ impl<W: Write> PbfWriter<W> {
     /// After successful writes, `flush` checks completion and reports deferred
     /// errors. The public file-backed constructors (`to_path*`,
     /// [`to_path_sync`](PbfWriter::to_path_sync)) also sync the file; a writer
-    /// from [`Output::pbf_writer`](crate::Output::pbf_writer) does not, because
+    /// from [`BoundOutput::pbf_writer`](crate::BoundOutput::pbf_writer) does not, because
     /// the output's publication syncs it (on Linux, a buffered
     /// target that does not support `fsync` - a FIFO, socket or character
     /// device such as `/dev/null` - is not an error); a synchronous writer

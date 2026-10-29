@@ -4042,11 +4042,12 @@ fn run_export(
     if let Some(output) = output {
         // The input/output alias refusal already ran in
         // `validate_input_output_aliases`, against the destination.
-        let mut buf = output.writer(&host.invocation)?;
+        let output = output.bind(&host.invocation);
+        let mut buf = output.writer()?;
         run_export_to(file, &mut buf, options, host)?;
         // The checked flush that lets the output be published.
         buf.finish()?;
-        output.publish(&host.invocation)?;
+        output.publish()?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
@@ -4223,12 +4224,13 @@ fn run_diff(
         // dispatch made no scratch directory.
         pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
     } else if let Some(output) = output {
-        let mut out = output.writer(&host.invocation)?;
+        let output = output.bind(&host.invocation);
+        let mut out = output.writer()?;
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
         out.finish()?;
         // A diff that found differences is a completed answer, not a
         // failure: its output is published like any other.
-        output.publish(&host.invocation)?;
+        output.publish()?;
         stats
     } else {
         // A reader that leaves early stops the diff here, before its verdict

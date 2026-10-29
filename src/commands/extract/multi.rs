@@ -36,7 +36,7 @@ use crate::owned::{dense_node_metadata, element_metadata, relation_members_into}
 pub(super) fn try_extract_multi_single_pass(
     input: &PinnedInput,
     regions: &[Region],
-    outputs: &crate::output::OutputSet,
+    outputs: &crate::output::BoundOutputSet,
     set_bounds: bool,
     compression: Compression,
     direct_io: bool,
@@ -139,7 +139,7 @@ pub(super) fn try_extract_multi_single_pass(
         )?
         .bytes;
         // The session and the writer under the run's one token.
-        let mut w = output.sync_pbf_writer(compression, &host.invocation)?;
+        let mut w = output.sync_pbf_writer(compression)?;
         // The writer names its output in any error it returns.
         w.write_header(&header_bytes)?;
         writers.push(w);

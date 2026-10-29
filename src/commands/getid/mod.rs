@@ -406,16 +406,17 @@ impl GetidStats {
 /// mid-run fails with `InputReplaced`.
 pub fn getid<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -423,7 +424,7 @@ pub fn getid<'a>(
 #[hotpath::measure]
 pub(crate) fn getid_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -450,7 +451,7 @@ pub(crate) fn getid_to<'a>(
 #[allow(clippy::too_many_arguments)]
 fn getid_dispatched<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -539,15 +540,16 @@ fn getid_dispatched<'a>(
 /// is pinned as in [`getid`], with the same refusals.
 pub fn removeid<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = removeid_to(input, &output, ids, write, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -555,7 +557,7 @@ pub fn removeid<'a>(
 #[hotpath::measure]
 pub(crate) fn removeid_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -611,7 +613,7 @@ pub(crate) fn removeid_to<'a>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     include: bool,
     ways: Ways,
@@ -648,7 +650,7 @@ fn filter_by_id(
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_walker(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     include: bool,
     ways: Ways,
@@ -865,7 +867,7 @@ fn filter_by_id_walker(
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_streaming(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -1021,7 +1023,7 @@ fn filter_by_id_streaming(
 #[allow(clippy::too_many_lines)]
 fn getid_with_refs(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -1588,6 +1590,7 @@ mod tests {
         )
         .unwrap();
         let host = crate::host::Host::for_tests();
+        let staged = staged.bind(&host.invocation);
         getid_with_refs(
             &PinnedInput::pin(&input, &host).unwrap(),
             &staged,
@@ -1598,7 +1601,7 @@ mod tests {
             &host,
         )
         .unwrap();
-        staged.publish(&host.invocation).unwrap();
+        staged.publish().unwrap();
         assert_eq!(
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
@@ -1639,6 +1642,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap()
+            .bind(&host.invocation)
         };
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
         let opts = GetidOptions {
@@ -1677,6 +1681,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap();
+            let staged = staged.bind(&host.invocation);
             filter_by_id(
                 &PinnedInput::pin(input, host).unwrap(),
                 &staged,
@@ -1690,7 +1695,7 @@ mod tests {
                 host,
             )
             .unwrap();
-            staged.publish(&host.invocation).unwrap();
+            staged.publish().unwrap();
         }
         let walker_ids = read_ids(&walker, host);
         assert_eq!(walker_ids, read_ids(&full_scan, host));
@@ -1760,6 +1765,7 @@ mod tests {
                 direct_reads: direct,
                 ..WriteOptions::default()
             };
+            let staged = staged.bind(&host.invocation);
             let result = getid_dispatched(
                 &input,
                 &staged,
@@ -1771,7 +1777,7 @@ mod tests {
                 host,
             );
             if result.is_ok() {
-                staged.publish(&host.invocation).unwrap();
+                staged.publish().unwrap();
             }
             result
         };
@@ -1877,6 +1883,7 @@ mod tests {
             )
             .unwrap();
             let host = crate::host::Host::for_tests();
+            let staged = staged.bind(&host.invocation);
             let (arm, _) = getid_dispatched(
                 &input,
                 &staged,
@@ -1888,7 +1895,7 @@ mod tests {
                 &host,
             )
             .unwrap();
-            staged.publish(&host.invocation).unwrap();
+            staged.publish().unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
                 read_ids(&output, &crate::host::Host::for_tests()),

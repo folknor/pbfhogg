@@ -190,7 +190,9 @@ use pbfhogg::{Output, Overwrite};
 
 // Checks the destination and stages it; cleanup trouble goes to the
 // diagnostics given here (`Diagnostics::discard()` to opt out).
-let output = Output::new("output.osm.pbf", Overwrite::Refuse, &host.diagnostics)?;
+let output = Output::new("output.osm.pbf", Overwrite::Refuse, &host.diagnostics)?
+    // Before any work: the invocation now owes this output one decision.
+    .bind(&host.invocation);
 let mut writer = output.pbf_writer(
     Compression::default(),
     &header_bytes,
@@ -199,10 +201,12 @@ let mut writer = output.pbf_writer(
 )?;
 // ... write blocks ...
 writer.flush()?;              // finishes the file; does not fsync
-output.publish(&host.invocation)?; // fsyncs, then renames into place
+output.publish()?;            // decides, fsyncs, then renames into place
 ```
 
-`Output::pbf_writer` opens the output's one writing session: the output is published only if that writer's `flush` succeeded and none of its writes failed. Writing to `Output::path` with a writer of your own is not published at all; for a format that is not PBF use `Output::writer(&host.invocation)`, an `std::io::Write` ended by `OutputWriter::finish`. Both writers observe `host.invocation` on each write (the `PbfWriter` not in its final `flush`), and `publish` refuses a tripped token with `ErrorKind::Cancelled` before it touches anything; once it has started it completes. Publish with the token the writer was opened under: an output written under one invocation and published under another is refused as an invalid argument. Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
+`Output::bind` ties the output to one invocation for good and enlists it in that invocation's publication log; writing and publishing happen on the `BoundOutput` it returns, under that invocation. `BoundOutput::pbf_writer` opens the output's one writing session (refusing a `host` that runs another invocation): the output is published only if that writer's `flush` succeeded and none of its writes failed. Writing to `path()` with a writer of your own is not published at all; for a format that is not PBF use `BoundOutput::writer()`, an `std::io::Write` ended by `OutputWriter::finish`. Both writers observe the invocation on each write (the `PbfWriter` not in its final `flush`), and `publish` refuses a tripped token with `ErrorKind::Cancelled` before it touches anything; once it has decided it completes. Dropping a `BoundOutput` without publishing removes the staging file and records the publication as refused. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` (bound to `host.invocation` at entry) or a `BoundOutput` (refused unless bound to `host.invocation`) and publish it themselves.
+
+Every decision is a row of `host.invocation.for_each_publication(...)`: its ordinal (publications of one invocation run one at a time, in ordinal order), whether it was authorized or refused (cancelled, or for another reason), and for each destination what it did - `None`, `Installed`, `Restored` (the previous output was moved aside and put back after a failure) or `Displaced` (it was moved aside and kept in a backup the error names). `Invocation::cancel` refuses every output still pending and returns a `CancelOutcome` saying whether it came before a decision or after one.
 
 ### to_path - pipelined parallel compression
 

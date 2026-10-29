@@ -627,7 +627,7 @@ pub(super) fn slot_bucket_bounds(
 #[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -635,6 +635,7 @@ pub fn external_join(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     // Every stage's open of the input derives from this pin; see
     // `add_locations_to_ways_to`, which pins the same way.
@@ -652,7 +653,7 @@ pub fn external_join(
         &scratch,
     )?;
     drop(scratch);
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -707,7 +708,7 @@ mod slot_layout_tests {
 pub(crate) fn external_join_in(
     input: &PinnedInput,
     mut front: InputFront<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

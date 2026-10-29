@@ -142,12 +142,13 @@ impl CurrentElem {
 
 pub fn merge_changes(
     inputs: &[&Path],
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     simplify: bool,
     parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = merge_changes_to(
         inputs,
@@ -157,7 +158,7 @@ pub fn merge_changes(
         allow_version_regression,
         host,
     )?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -165,7 +166,7 @@ pub fn merge_changes(
 #[hotpath::measure]
 pub(crate) fn merge_changes_to(
     inputs: &[&Path],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     simplify: bool,
     parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
@@ -530,12 +531,8 @@ impl<W: io::Write> OscWriter<W> {
 }
 
 impl OscWriter<crate::output::OutputWriter> {
-    fn from_output(
-        output: &crate::output::Output,
-        is_gz: bool,
-        cancel: &crate::host::Invocation,
-    ) -> Result<Self> {
-        let buf = output.writer(cancel)?;
+    fn from_output(output: &crate::output::BoundOutput, is_gz: bool) -> Result<Self> {
+        let buf = output.writer()?;
         if is_gz {
             Ok(Self::Gz(Box::new(Writer::new_with_indent(
                 GzEncoder::new(buf, flate2::Compression::fast()),
@@ -579,7 +576,7 @@ impl OscWriter<Vec<u8>> {
 #[hotpath::measure]
 fn write_streaming(
     inputs: &[&Path],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     is_gz: bool,
     executor: crate::host::ExecutorRef<'_>,
     cancel: &crate::host::Invocation,
@@ -595,7 +592,7 @@ fn write_streaming(
         // buffer-and-drain would inflict at single-OSC scale (drain pass
         // is pure overhead when there is no parse to overlap with).
         cancel.marker("MERGECHANGES_WRITE_OPEN_START");
-        let mut writer = OscWriter::from_output(output, is_gz, cancel)?;
+        let mut writer = OscWriter::from_output(output, is_gz)?;
 
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
         let mut root = BytesStart::new("osmChange");
@@ -656,7 +653,7 @@ fn write_streaming(
     let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = output.writer(cancel)?;
+    let mut out = output.writer()?;
     out.write_all(&prelude)?;
     let mut count = 0u64;
     // The per-member drain overlaps this span; DRAIN below is the postlude.
@@ -903,7 +900,7 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
 
 #[hotpath::measure]
 fn write_simplified(
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     is_gz: bool,
     stream: ChangeStream,
     worker_count: usize,
@@ -1009,7 +1006,7 @@ fn write_simplified(
     cancel.marker("MERGECHANGES_DRAIN_START");
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = output.writer(cancel)?;
+    let mut out = output.writer()?;
     out.write_all(&prelude)?;
     for bytes in &all_chunks {
         out.write_all(bytes)?;

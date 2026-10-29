@@ -184,7 +184,7 @@ pub struct FaultPlan {
     framing_wait_taken: AtomicU64,
     framing_wait_needed: AtomicU64,
 
-    // --- output construction (`Output::pbf_writer`) ---
+    // --- output construction (`BoundOutput::pbf_writer`) ---
     /// Refuse every output backend as a `PlatformUnsupported` setup error,
     /// produced as the constructor's result (so the output's failure
     /// bookkeeping runs as for a real refusal). The source error's message

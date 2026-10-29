@@ -56,9 +56,9 @@ profiles and certifies a harness, to a protocol frozen at version 1
     machine documented as a binding contract;
   - `#32`: call sinks end their stream with sealing emissions, a
     terminal record and a per-sink drop count (closes the old "FIFO line
-    loss is invisible" gap);
-  - `#33`: `Invocation::cancel()` returns its linearized outcome
-    against the publication decision.
+    loss is invisible" gap).
+  `#33` (cancel's linearized outcome, and the publication log) has
+  landed as L1 of `notes/library-harness.md`.
 - `#35`: the gate's capability ids in `[pbfhogg.library.require]`,
   after `#34`.
 - `#36`: a reserving descriptor provider for concurrent calls.

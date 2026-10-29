@@ -28,6 +28,29 @@
 
 ### Breaking
 
+- **Library outputs are bound to an invocation before work, and every
+  publication decision is recorded.** `Output::bind(self, &Invocation)`
+  (likewise `OutputDir::bind`, `OutputSet::bind`) returns a `BoundOutput`
+  (`BoundOutputDir`, `BoundOutputSet`) that is the only thing you write and
+  publish: `writer()` and `publish(self)` no longer take a token, and
+  `pbf_writer` refuses a host running another invocation. The unbound
+  values lose `writer`, `pbf_writer` and `publish`. Command entry points
+  take `impl BindOutput` (`impl BindOutputSet` for `extract_multi`): pass an
+  `Output` as before and it is bound to the host's invocation at entry, or a
+  `BoundOutput`, refused as an invalid argument unless bound to the host's.
+  A bound set lends its members as `&BoundOutput`. An `OutputSet` with no
+  members is now refused at construction. Each bound output is decided once,
+  by its publication, by `Invocation::cancel` or by being dropped
+  undecided, and `Invocation::for_each_publication` lists the decisions
+  (`publication::Publication`: ordinal, `Decision`, and per destination an
+  `Effect`: none, installed, restored or displaced). Publications of one
+  invocation now run one at a time from before their decision to the end,
+  `before_publish` hooks included, so their ordinals are their execution
+  order; publishing from such a hook under the same invocation is refused.
+  `Invocation::cancel` returns a `CancelOutcome` (`BeforeDecision`,
+  `AfterDecision`, `NoPublicationPending`) and refuses every output still
+  pending; it is no longer lock-free, so do not call it from a signal
+  handler. The CLI's behaviour is unchanged.
 - **`pbfhogg digest` prints the full form, `xxh128 v2`, by default.** The
   new full form covers the header (bbox, required and optional features as
   sets, writing program, source, replication fields), every element's
@@ -163,16 +186,13 @@
   functions are gone; `debug::MarkerFifo::open` is the sidecar sink, with
   the same wire format and clock. A sink that panics is switched off for
   the rest of its run. The CLI's stream is unchanged.
-- **An output is published under the invocation it was written under.**
-  `Output::publish`, `OutputDir::publish` and `OutputSet::publish` refuse,
-  as an invalid argument and before any hook runs, an output whose writing
-  session was opened under a different `Invocation`; `OutputDir::writer`
-  takes the invocation. `publish_sync_calls` / `publish_sync_ns` now count
-  exactly the publication's own syncs rather than a delta of the run's
-  totals. Publications of one invocation are serialized, so two commands
-  publishing at once under one token no longer interleave their
+- **Publication spans count their own syncs and never interleave.**
+  `publish_sync_calls` / `publish_sync_ns` now count exactly the
+  publication's own syncs rather than a delta of the run's totals, and two
+  commands publishing at once under one token no longer interleave their
   `PUBLISH_START` .. `PUBLISH_END` spans and `publish_sync_*` samples on the
-  invocation's stream; the second waits for the first's syncs.
+  invocation's stream (see the bound-output entry above for how
+  publications of one invocation are ordered).
 - **Once-only diagnostics are once per invocation.** The warnings and
   notes a run reports only once (missing or unrecognised indexdata, writer
   degradations) are keyed on the `Invocation`: each invocation reports its

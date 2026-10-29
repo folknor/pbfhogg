@@ -63,9 +63,11 @@ covers is in `docs/cli/commands.md` "digest": beyond brokkr#60's list it
 also hashes exact nanodegree coordinates and the declared prepass fields.
 Its residue is the re-certification, which waits on a harness (L2 onward):
 a certification under `v1` holds for `v1` only.
-- L0 (irreversible unbacked replacement) has landed; see the landing list.
-- L1 is #33 per Decision B.
-- L2, the harness skeleton, needs neither seal nor B.
+- L0 (irreversible unbacked replacement) and L1 (#33, Decision B) have
+  landed; see the landing list.
+- L2, the harness skeleton, needs no seal; it reads publications through
+  `Invocation::for_each_publication` and the cancel result from
+  `Invocation::cancel`'s `CancelOutcome`.
 - L3 and L4 are the seal (Decision A and C). They are the largest and are
   candidates for a chain under one design document, which is the user's
   call.
@@ -73,8 +75,8 @@ a certification under `v1` holds for `v1` only.
 **bz state:**
 - **pbfhogg#31** still describes the superseded general seal contract.
   Rewrite it to Decision A when L3 or L4 starts.
-- **#32, #33, #34, #35 and #36** are open and map to the landings. #37
-  (L8) is closed; its re-certification is L8's gate below.
+- **#32, #34, #35 and #36** are open and map to the landings. #33 (L1) is
+  closed. #37 (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
 - **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
   `98bddee`):
@@ -132,18 +134,16 @@ a certification under `v1` holds for `v1` only.
    returns to the pool, and an oversize, full or poisoned pool counts a
    `pipeline_decompress_pool_*` drop. The pool stores returned `Vec<u8>`s,
    not live buffers, so there is no cycle.
-3. **The publication decision** is a bare `cancel.check()?` at the top of
-   `Output::publish`, `OutputDir::publish` and `OutputSet::publish`,
-   followed by `publish_all`. `Invocation::publication_lock` serializes one
-   invocation's publications from `PUBLISH_START` to `PUBLISH_END`, after
-   the decision.
-4. **Output binding.**
-   - An output is bound to no invocation at construction (ADR-0019).
-   - Each member's `Completion` records the invocation its writing session
-     opened under.
-   - `OutputSet` members are lent individually, so two members can be
-     opened under different invocations.
-   - An empty `OutputSet` is accepted.
+3. **The publication decision** (L1) is made in `publish_unit`
+   (`src/output.rs`) under the invocation's publication log
+   (`src/publication.rs`), inside the execution lock that runs through
+   completion; `Invocation::cancel` decides pending units under the log.
+4. **Output binding** (L1).
+   - An output is bound to no invocation at construction; `bind` consumes
+     it into a bound owner and enlists it (ADR-0019).
+   - A bound set's members inherit its invocation and are lent as
+     `&BoundOutput`.
+   - An empty `OutputSet` is refused at construction.
    - Placement is `Staging::{Beside, Dir, DirWithBackups}` (`d100ae8f`).
 5. **Holders that escape a call.**
    - Sessions: `PipelinedBlocks`, `PbfWriter`, `OutputWriter`, `DirWriter`.
@@ -339,7 +339,7 @@ resolved.
 - **Liveness of drop.** Dropping a `PipelinedBlocks` blocked in a caller's
   `Read` still blocks. Document it as the caller's obligation.
 
-## Decision B: publication decisions and cancel (#33) (settled)
+## Decision B: publication decisions and cancel (#33) (landed as L1)
 
 Design spar, 2026-10-29. The first proposal (one log per invocation,
 binding at the first writer open, effects read from final `State`) lost
@@ -451,10 +451,37 @@ The settled shape is the following. No brokkr change is needed.
     - unbacked replacement is irreversible (ADR-0017 carries it since
       L0).
 
-**For the implementation spar:** the guard layout for abandonment, the
-retirement order of tickets and permits, allocation and unwind handling,
-the path-by-path transition and fault matrix for effects, and the
-callback re-entry policy.
+**Settled by L1's implementation spar** (what the code does, for the
+items that list left open):
+- **Entry points** take `impl BindOutput` / `impl BindOutputSet` (sealed):
+  an `Output` binds to the host's invocation at entry, a `BoundOutput`
+  bound elsewhere is refused (`InvalidArgument`) and, dropped, decides
+  `refused_error` in its own log. `IndexOutput` stays opaque and unbound;
+  the geocode entry binds it.
+- **Abandonment guard:** an `Enlisted` (invocation, unit id) held only by
+  the bound owner. Its drop runs the one pending-to-decided transition,
+  which is a no-op on a decided unit, so publish needs no forget.
+- **Allocation and unwind:** the pending entry carries the row's members
+  from bind; a decision reserves first, then moves the entry into the row
+  without allocating or calling out, so a poisoned log is recovered.
+  Refused rows are born finished. The authorized execution runs under
+  `catch_unwind`; the row is finalized from the transitions made, then the
+  execution lock is released, then the unwind resumes.
+- **Effects:** per target, three flags set right after each successful
+  syscall and before any step observer: moved aside, put back, new
+  generation at the destination. Installed if the new generation is
+  there, else restored if moved aside and put back, displaced if moved
+  aside only, else none. The fault matrix is in
+  `tests/publication.rs`.
+- **Re-entry:** a publication attempted on the thread executing one of the
+  same invocation (a hook, the sink, a step observer) is refused
+  (`InvalidArgument`, `refused_error`), or keeps its earlier decision if a
+  cancel already made one. Never waited on.
+- **The decision's checkpoint** (`on_check` test hook) runs before any
+  lock; the decision reads the token under the log lock.
+- **Tickets and permits** (L3): the unit is decided before its permit and
+  ticket retire. L1 mints neither; bind, publish, the `Enlisted` drop and
+  `cancel` are the sites L3 gates.
 
 ## Decision C: ending the call stream (#32)
 
@@ -588,8 +615,17 @@ Landed independently, 2026-10-29:
 - `d100ae8f`: `Staging::DirWithBackups`.
 - `ce104e1e`: the CLI command interval (#38).
 - `d2d8836a`: usage errors exit 64.
-- L0, unbacked replacement is irreversible (Decision B item 9): the
-  commit that carries this line. `Installed` records what it displaced
+- L1, Decision B (#33): the commit that carries this line. Bound owners,
+  the per-invocation publication log, admission serialized through
+  completion, invocation-wide cancel with `CancelOutcome`, effects from
+  namespace transitions, `for_each_publication`, ADR-0017 and ADR-0019
+  amended. Its implementation choices are listed under Decision B. For
+  L2 and L5: a row's `members` carry destinations, not roles; the harness
+  maps each destination to its role. For L4: the log is snapshotted by
+  `for_each_publication`'s copy, pure reads into owned data. Residue:
+  none in L1's scope; the L3 capability sites are named under Decision B.
+- L0, unbacked replacement is irreversible (Decision B item 9),
+  `2ffed89c`. `Installed` records what it displaced
   (`Displaced::Nothing`, `Backup` or `Unbacked`, observed at the rename);
   rollback never touches an `Unbacked` install, and publication reports it
   as `RollbackIncomplete` with a note saying the new output remains
@@ -604,7 +640,6 @@ Landed independently, 2026-10-29:
 
 | # | Landing | Gate |
 |---|---|---|
-| L1 | #33 per Decision B: explicit `bind` on outputs, directories and sets, with command entry points binding at entry; the per-invocation log; admission serialized through completion; effects recorded from namespace transitions; invocation-wide cancel deciding pending units; `for_each_publication`; ADR-0017 and ADR-0019 amendments | `brokkr check`, with tests for: reversed creation and publication order; ordinal order equal to execution order with a hook parked; one row per set; a command failing before it opens its output recording `refused_error`; cancel parked against a decision from both sides; every effect, restored and displaced included, through publication faults; a group with a failing middle member; dropping one set member leaving the set pending |
 | L2 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with an output counterpart, wiring, hotpath features. Seal is reported refused until L4 | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
 | L3 | Decision A's capabilities: control handle, `Call` and `Permit`, the transition word Open-only, census tickets, the pool permit. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: guards and permits back to 0 after every command and drop; a held `PipelinedBlocks` blocked on a caller stream holding a permit and a ticket and no guard; a nested entry minting normally; `Refused(Unticketed)` impossible in a quiescent run |
 | L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier; block-API cost on one matched denmark pair. `brokkr library repeat-cat --dataset denmark` passes |

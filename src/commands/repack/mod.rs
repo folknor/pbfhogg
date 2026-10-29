@@ -114,12 +114,13 @@ struct WorkerOutput {
 /// replaced mid-run fails with `InputReplaced` and nothing is published.
 pub fn repack<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     elements_per_blob: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = repack_to(
         input.into(),
@@ -129,7 +130,7 @@ pub fn repack<'a>(
         overrides,
         host,
     )?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -138,7 +139,7 @@ pub fn repack<'a>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn repack_to(
     input: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

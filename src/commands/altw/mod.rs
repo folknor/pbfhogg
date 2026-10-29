@@ -370,16 +370,17 @@ impl Stats {
 /// pinned file, an input replaced mid-run fails with `InputReplaced`.
 pub fn add_locations_to_ways<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = add_locations_to_ways_to(input, &output, options, overrides, host, &scratch)?;
     drop(scratch);
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -388,7 +389,7 @@ pub fn add_locations_to_ways<'a>(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn add_locations_to_ways_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -1074,7 +1075,7 @@ pub(crate) fn collect_relation_member_ids(
 #[allow(clippy::too_many_arguments)]
 fn write_output_checked(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
@@ -1135,7 +1136,7 @@ fn write_output_checked(
 #[allow(clippy::too_many_arguments)]
 fn write_output_decode_all(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,

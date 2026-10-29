@@ -385,15 +385,16 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 /// with `InputReplaced`.
 pub fn renumber_external<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     opts: &RenumberOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = renumber_external_to(input, &output, opts, write, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -402,7 +403,7 @@ pub fn renumber_external<'a>(
 #[hotpath::measure]
 pub(crate) fn renumber_external_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     opts: &RenumberOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

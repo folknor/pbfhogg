@@ -7,13 +7,25 @@
 //!   succeeded.** Constructing an output reserves a hidden staging entry
 //!   (`.pbfhogg-tmp-<pid>-<n>.<name>`) in the destination's directory, or in
 //!   a caller-chosen staging directory ([`Output::with_staging`]); the
-//!   command writes there, and [`Output::publish`] renames it into place
-//!   after the final flush and every post-write check. Dropping an output
-//!   without publishing removes the staging entry, so a failed, cancelled,
-//!   panicking or dropped run leaves nothing at the destination and leaves a
-//!   pre-existing destination byte-identical. A run cancelled before
-//!   [`Output::publish`] decides is refused there; once publication has
-//!   decided it completes (ADR-0019). A process ended without unwinding
+//!   command writes there, and [`BoundOutput::publish`] renames it into
+//!   place after the final flush and every post-write check. Dropping an
+//!   output without publishing removes the staging entry, so a failed,
+//!   cancelled, panicking or dropped run leaves nothing at the destination
+//!   and leaves a pre-existing destination byte-identical. A run cancelled
+//!   before [`BoundOutput::publish`] decides is refused there; once
+//!   publication has decided it completes (ADR-0019).
+//! - **An output is bound to one invocation before work, for good.**
+//!   [`Output::bind`] (and [`OutputDir::bind`], [`OutputSet::bind`])
+//!   consumes the unbound value and enlists it as pending in the
+//!   invocation's publication log ([`crate::publication`]): the invocation
+//!   then owes it exactly one decision, made by its publication, by
+//!   [`Invocation::cancel`](crate::host::Invocation::cancel), or by the
+//!   bound owner being dropped undecided. Writing and publishing happen only
+//!   on the bound value, under that invocation. Publications of one
+//!   invocation are admitted one at a time through completion, so their
+//!   ordinals are their execution order, and each row records what it did
+//!   to every destination (an [`Effect`](crate::publication::Effect)),
+//!   observed from the renames and removals it made. A process ended without unwinding
 //!   (SIGKILL, the OOM killer, power loss, the CLI's second interrupt) skips
 //!   the cleanup and can leave a hidden `.pbfhogg-tmp-*` entry (in the
 //!   staging directory, when there is one), never a partial file under the
@@ -52,8 +64,8 @@
 //!   runs before a replaced output's backup or a directory output's staging
 //!   is removed recursively, and what it finds is kept and reported.
 //! - **Only a finished writing session is published.** Every output is
-//!   written through [`Output::writer`], [`Output::pbf_writer`] or
-//!   [`OutputDir::writer`]; publication refuses an output nobody wrote, or
+//!   written through [`BoundOutput::writer`], [`BoundOutput::pbf_writer`] or
+//!   [`BoundOutputDir::writer`]; publication refuses an output nobody wrote, or
 //!   whose writer was not finished or failed ([`OutputError::Unfinished`]).
 //! - **Trouble that does not fail the run is reported, never dropped.** Every
 //!   output is constructed with a [`Diagnostics`]; cleanup that fails, and
@@ -493,20 +505,17 @@ enum Session {
 /// It also carries the destination's path: the one owner of the output's
 /// identity, so every writer filling it names the same file in an error.
 ///
-/// And it records the invocation the session was opened under, set with the
-/// `Reserved -> Writing` transition under the same lock, so publication can
-/// refuse an output written under one invocation and published under
-/// another (ADR-0019 keeps the token an argument; this makes passing two
-/// different ones loud).
+/// It records no invocation: a session is opened only through a bound output
+/// ([`BoundOutput`], [`BoundOutputDir`]), under the invocation the output was
+/// bound to, so an output cannot be written under one invocation and
+/// published under another. It decides nothing either: abandoning an output
+/// is its bound owner's act, not a writer's.
 #[derive(Clone, Debug)]
 pub(crate) struct Completion(Arc<Mutex<SessionState>>, Arc<Path>);
 
 #[derive(Debug)]
 struct SessionState {
     session: Session,
-    /// The invocation the writing session was opened under; `None` while
-    /// `Reserved`.
-    invocation: Option<crate::host::Invocation>,
 }
 
 impl Completion {
@@ -514,7 +523,6 @@ impl Completion {
         Self(
             Arc::new(Mutex::new(SessionState {
                 session: Session::Reserved,
-                invocation: None,
             })),
             Arc::from(destination),
         )
@@ -522,15 +530,6 @@ impl Completion {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Whether the writing session was opened under `invocation`. An output
-    /// with no session was opened under none.
-    fn written_under(&self, invocation: &crate::host::Invocation) -> bool {
-        self.lock()
-            .invocation
-            .as_ref()
-            .is_some_and(|opened| opened.same_invocation(invocation))
     }
 
     /// The path the caller named for this output.
@@ -542,13 +541,11 @@ impl Completion {
         self.lock().session
     }
 
-    /// `Reserved -> Writing` under `invocation`; a second session on one
-    /// output is an error.
-    fn begin(&self, destination: &Path, invocation: &crate::host::Invocation) -> Result<()> {
+    /// `Reserved -> Writing`; a second session on one output is an error.
+    fn begin(&self, destination: &Path) -> Result<()> {
         let mut state = self.lock();
         if state.session == Session::Reserved {
             state.session = Session::Writing;
-            state.invocation = Some(invocation.clone());
             Ok(())
         } else {
             Err(Error::internal(format!(
@@ -572,9 +569,9 @@ impl Completion {
     }
 }
 
-/// A callback run at the start of publication, before anything is synced or
-/// installed. Exists so a front end can stop its own timer where the work
-/// ends and publication begins.
+/// A callback run at the start of an authorized publication, before anything
+/// is synced or installed. Exists so a front end can stop its own timer where
+/// the work ends and publication begins.
 struct Hook(Box<dyn FnOnce() + Send + Sync>);
 
 impl std::fmt::Debug for Hook {
@@ -618,34 +615,26 @@ impl<'a> PublishSync<'a> {
 /// its [`PublishSync`] tally (repeated publications emit repeated values),
 /// so a reader can tell the syncs publication did from any a writer did.
 ///
-/// The span holds the invocation's publication lock from before
-/// `PUBLISH_START` until after `PUBLISH_END`, so two publications of one
-/// invocation (a caller running two commands at once under one token) run
-/// their spans one after the other: on the stream each `PUBLISH_START` is
-/// followed by its own two counters and `PUBLISH_END` before the next
-/// publication's `PUBLISH_START`. Only the publication spans are made
-/// pairable this way; other phase spans of concurrent calls grouped under
-/// one invocation can still overlap under the same names. Publication has
-/// already made its cancellation decision before it waits for the lock, so a
-/// token tripped while it waits does not stop it. Markers and counters are
-/// best effort: the sidecar drops one when its pipe is full.
+/// The span runs inside the invocation's publication execution lock (taken
+/// by [`publish_unit`] before the decision and released after the row is
+/// finalized), so two publications of one invocation (a caller running two
+/// commands at once under one token) run their spans one after the other:
+/// on the stream each `PUBLISH_START` is followed by its own two counters
+/// and `PUBLISH_END` before the next publication's `PUBLISH_START`. Only the
+/// publication spans are made pairable this way; other phase spans of
+/// concurrent calls grouped under one invocation can still overlap under the
+/// same names. The span starts after the decision, so a token tripped by
+/// then does not stop it. Markers and counters are best effort: the sidecar
+/// drops one when its pipe is full.
 struct PublishSpan<'a> {
     invocation: &'a crate::host::Invocation,
     sync: &'a PublishSync<'a>,
-    /// Released after `drop` has emitted `PUBLISH_END` (fields drop after
-    /// the `Drop` body).
-    _exclusive: std::sync::MutexGuard<'a, ()>,
 }
 
 impl<'a> PublishSpan<'a> {
     fn start(invocation: &'a crate::host::Invocation, sync: &'a PublishSync<'a>) -> Self {
-        let exclusive = invocation.publication_lock();
         invocation.marker("PUBLISH_START");
-        Self {
-            invocation,
-            sync,
-            _exclusive: exclusive,
-        }
+        Self { invocation, sync }
     }
 }
 
@@ -1427,6 +1416,43 @@ struct Target {
     /// which is after every sync publication attempts: sink code never runs
     /// in the middle of making an output durable.
     pending: Vec<String>,
+    /// This publication's namespace transitions so far, each set right
+    /// after its syscall succeeded and before any observer runs, so the
+    /// effect is read from what happened, never reconstructed from cleanup
+    /// state (a restored destination and an untouched one both end
+    /// `Staged`). See [`Self::effect`].
+    moved: Moved,
+}
+
+/// The namespace transitions of one target's publication.
+#[derive(Clone, Copy, Debug, Default)]
+struct Moved {
+    /// The previous generation was renamed out of the destination.
+    aside: bool,
+    /// It was renamed back.
+    put_back: bool,
+    /// The new generation is at the destination (installed by rename or
+    /// link, and not since removed, taken back out or renamed over).
+    new_at_dest: bool,
+}
+
+impl Target {
+    /// What this publication did to the destination, from its transitions.
+    fn effect(&self) -> crate::publication::Effect {
+        use crate::publication::Effect;
+        match self.moved {
+            Moved {
+                new_at_dest: true, ..
+            } => Effect::Installed,
+            Moved {
+                aside: true,
+                put_back: true,
+                ..
+            } => Effect::Restored,
+            Moved { aside: true, .. } => Effect::Displaced,
+            Moved { .. } => Effect::None,
+        }
+    }
 }
 
 impl Target {
@@ -1530,26 +1556,12 @@ impl Target {
             hooks: Vec::new(),
             diagnostics: diagnostics.clone(),
             pending: Vec::new(),
+            moved: Moved::default(),
         })
     }
 
     /// The session is finished, and the staging entry is still the file that
     /// was reserved (so what gets synced is what gets installed).
-    /// The writing session was opened under `invocation` (ADR-0019: the
-    /// publication's token is the run's). Checked after [`Self::check_ready`],
-    /// so an output nobody wrote stays `Unfinished`.
-    fn check_invocation(&self, invocation: &crate::host::Invocation) -> Result<()> {
-        if self.session.written_under(invocation) {
-            Ok(())
-        } else {
-            Err(Error::invalid_argument(format!(
-                "output {} was written under a different invocation than the one publishing \
-                 it; pass the token the run used",
-                self.dest.display()
-            )))
-        }
-    }
-
     fn check_ready(&self) -> Result<()> {
         if self.session.state() != Session::Finished {
             return Err(new_output_error(OutputError::Unfinished {
@@ -1673,6 +1685,7 @@ impl Target {
         };
         match attempt {
             Ok(()) => {
+                self.moved.new_at_dest = true;
                 self.state = State::Installed {
                     displaced: Displaced::Nothing,
                     identity,
@@ -1717,6 +1730,7 @@ impl Target {
         };
         match attempt {
             Ok(()) => {
+                self.moved.new_at_dest = true;
                 self.state = State::Installed {
                     displaced: Displaced::Nothing,
                     identity,
@@ -1787,6 +1801,7 @@ impl Target {
             }
             return Err(self.install_refused(e));
         }
+        self.moved.new_at_dest = true;
         let displaced = Displaced::after_rename(backup, present);
         self.state = State::Installed {
             displaced,
@@ -1847,6 +1862,7 @@ impl Target {
                 self.dest.display()
             )));
         }
+        self.moved.aside = true;
         self.state = State::BackedUp(Backup { container, entry });
         step!(faults, PublishStep::MovedAside(member));
         if fault_is!(faults, PublishFault::AfterBackup) {
@@ -2004,10 +2020,13 @@ impl Target {
 
     /// Rename the previous output back to the destination.
     #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
-    fn restore(&self, member: usize, backup: &Backup, faults: &Faults) -> bool {
+    fn restore(&mut self, member: usize, backup: &Backup, faults: &Faults) -> bool {
         let restored = !fault_is!(faults, PublishFault::RestoreRename)
             && fs::rename(&backup.entry, &self.dest).is_ok();
         if restored {
+            // A file's restore renames over the new generation.
+            self.moved.put_back = true;
+            self.moved.new_at_dest = false;
             step!(faults, PublishStep::Restored(member));
         }
         restored
@@ -2020,13 +2039,14 @@ impl Target {
     /// directory is renamed back into staging first, so it can be taken
     /// out and its previous generation still fail to come back.
     #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
-    fn uninstall(&self, member: usize, backup: Option<&Backup>, faults: &Faults) -> Undone {
+    fn uninstall(&mut self, member: usize, backup: Option<&Backup>, faults: &Faults) -> Undone {
         let taken_out = match (self.shape, backup) {
             (Shape::File, Some(_)) => false,
             (Shape::Dir, _) => fs::rename(&self.dest, &self.write).is_ok(),
             (Shape::File, None) => fs::remove_file(&self.dest).is_ok(),
         };
         if taken_out {
+            self.moved.new_at_dest = false;
             step!(faults, PublishStep::Uninstalled(member));
         }
         match backup {
@@ -2242,22 +2262,140 @@ impl Drop for Target {
     }
 }
 
+/// Admit, decide and execute one publication unit: the one publication
+/// routine behind every shape (Decision B of the library harness design,
+/// ADR-0017 and ADR-0019).
+///
+/// 1. The test-only checkpoint hook runs outside every lock.
+/// 2. A publication attempted from a callback of one this thread is already
+///    executing (a hook, the sink, a step observer) is refused, never
+///    waited on: the execution lock is not reentrant.
+/// 3. The invocation's execution lock is taken and held through the row's
+///    finalization, so ordinal order is execution order.
+/// 4. Readiness is checked (filesystem reads, outside the log's lock), then
+///    the decision is made under the log's lock: a tripped token refuses
+///    (`Cancelled`), a readiness failure refuses with its error, anything
+///    else authorizes. A unit `cancel` decided while this waited stays
+///    decided.
+/// 5. An authorized publication runs to completion with unwinding caught,
+///    its members' effects are written into its row, and only then is the
+///    execution lock released and an unwind resumed (so the targets' cleanup
+///    still runs while unwinding, as before).
+fn publish_unit(
+    targets: &mut [Target],
+    invocation: &crate::host::Invocation,
+    unit: &Enlisted,
+) -> Result<()> {
+    use crate::publication::{Decided, Decision};
+    invocation.checkpoint_hook();
+    {
+        let mut log = invocation.log();
+        if log.reentered() {
+            let decided = log.decide(unit.unit, Decision::RefusedError);
+            drop(log);
+            return Err(match decided {
+                Decided::Earlier(Decision::RefusedCancelled)
+                | Decided::Now {
+                    decision: Decision::RefusedCancelled,
+                    ..
+                } => crate::error::new_cancelled(),
+                _ => Error::invalid_argument(
+                    "an output was published from a callback of a publication in progress \
+                     under the same invocation (a before_publish hook, the instrument sink or \
+                     a step observer); publication cannot be re-entered",
+                ),
+            });
+        }
+    }
+    let exclusive = invocation.publication_lock();
+    let ready = targets.iter().try_for_each(Target::check_ready);
+    let decided = {
+        let mut log = invocation.log();
+        let decision = if invocation.is_cancelled() {
+            Decision::RefusedCancelled
+        } else if ready.is_err() {
+            Decision::RefusedError
+        } else {
+            Decision::Authorized
+        };
+        log.decide(unit.unit, decision)
+    };
+    let ordinal = match decided {
+        Decided::Now {
+            decision: Decision::Authorized,
+            ordinal,
+        } => ordinal,
+        Decided::Now {
+            decision: Decision::RefusedCancelled,
+            ..
+        }
+        | Decided::Earlier(Decision::RefusedCancelled) => {
+            return Err(crate::error::new_cancelled());
+        }
+        Decided::Now {
+            decision: Decision::RefusedError,
+            ..
+        } => return ready,
+        Decided::Earlier(_) => {
+            return Err(Error::internal("an output's publication was decided twice"));
+        }
+    };
+    let faults = Faults::of(invocation);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute(targets, &faults, invocation)
+    }));
+    invocation
+        .log()
+        .finish(ordinal, targets.iter().map(Target::effect));
+    drop(exclusive);
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// A unit enlisted in its invocation's publication log, held by the bound
+/// owner (never by a writer or a set member). Dropping it decides the unit
+/// if it is still pending: `RefusedCancelled` once the token is tripped,
+/// `RefusedError` otherwise. A unit already decided is left as it was.
+#[derive(Debug)]
+struct Enlisted {
+    invocation: crate::host::Invocation,
+    unit: u64,
+}
+
+impl Enlisted {
+    fn new(invocation: &crate::host::Invocation, destinations: Vec<PathBuf>) -> Self {
+        let unit = invocation.log().enlist(destinations);
+        Self {
+            invocation: invocation.clone(),
+            unit,
+        }
+    }
+}
+
+impl Drop for Enlisted {
+    fn drop(&mut self) {
+        use crate::publication::Decision;
+        let mut log = self.invocation.log();
+        // Read under the log's lock, where `cancel` trips it.
+        let decision = if self.invocation.is_cancelled() {
+            Decision::RefusedCancelled
+        } else {
+            Decision::RefusedError
+        };
+        let _ = log.decide(self.unit, decision);
+    }
+}
+
 /// Install every member, rolling back on the first failure, then commit and
-/// sync. The one publication routine behind every shape. Every sync records
-/// into the publishing invocation's writer set, and the span's markers go to
-/// its sink.
-fn publish_all(
+/// sync: an authorized publication's execution. Every sync records into the
+/// publishing invocation's writer set, and the span's markers go to its sink.
+fn execute(
     targets: &mut [Target],
     faults: &Faults,
     invocation: &crate::host::Invocation,
 ) -> Result<()> {
-    // Every member is ready, and was written under the publishing
-    // invocation, before anything runs, so a refusal leaves the hooks unrun
-    // and every destination untouched.
-    for target in targets.iter() {
-        target.check_ready()?;
-        target.check_invocation(invocation)?;
-    }
     let sync = PublishSync::new(invocation);
     let metrics = &sync;
     // The caller's timers stop here: the work is done, and what follows is
@@ -2482,11 +2620,13 @@ fn sync_dir(_dir: &Path, _sync: &PublishSync<'_>) -> io::Result<()> {
 /// One output file.
 ///
 /// Construct it before any work: [`Output::new`] applies the destination
-/// rules and reserves the staging file. Write it through exactly one writing
-/// session - [`Output::pbf_writer`] for a PBF, [`Output::writer`] for
-/// anything else - finish that writer, then [`Output::publish`]. Library
-/// command entry points take an `Output` by value and publish it themselves
-/// once they have succeeded.
+/// rules and reserves the staging file. An `Output` is bound to no
+/// invocation; [`bind`](Self::bind) it to one, which enlists it in that
+/// invocation's publication log, and write and publish the
+/// [`BoundOutput`]. Library command entry points take an `Output` (bound to
+/// the host's invocation at entry) or a `BoundOutput` (refused unless bound
+/// to the host's invocation) and publish it themselves once they have
+/// succeeded.
 #[derive(Debug)]
 pub struct Output {
     target: Target,
@@ -2554,8 +2694,8 @@ impl Output {
 
     /// The staging file, for reading back what was written (its size, say).
     /// It exists (empty) from construction until publication or drop. Write
-    /// it only through [`writer`](Self::writer) or
-    /// [`pbf_writer`](Self::pbf_writer): publication refuses an output no
+    /// it only through [`BoundOutput::writer`] or
+    /// [`BoundOutput::pbf_writer`]: publication refuses an output no
     /// writing session finished, and bytes written past a session are not
     /// part of what it certified.
     #[must_use]
@@ -2563,24 +2703,22 @@ impl Output {
         &self.target.write
     }
 
-    /// Open the output's single writing session as a pipelined [`PbfWriter`]
-    /// on `backend`, with `header_block_bytes` (a serialized `HeaderBlock`,
-    /// as [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build)
-    /// makes) already written. The session finishes when the writer's
-    /// [`flush`](PbfWriter::flush) succeeds; any error the writer reports
-    /// fails it for good. The writer does not `fsync` at its end of stream:
-    /// [`publish`](Self::publish) does.
-    ///
-    /// # Errors
-    /// The output already has a writing session; `backend` needs a feature
-    /// that is not compiled in; the staging file cannot be opened or the
-    /// header written. The session is failed in each case.
-    ///
-    /// The writer observes `host.invocation`: once it is tripped every write
-    /// method returns `ErrorKind::Cancelled` (failing the session), and the
-    /// writer thread stops a queued `copy_file_range` splice between kernel
-    /// calls.
-    pub fn pbf_writer(
+    /// Bind the output to `invocation` for good: enlist it as pending in the
+    /// invocation's publication log, which from now on owes it exactly one
+    /// decision (its publication, a cancel, or the bound owner dropped
+    /// undecided). Bind before any work, so a run that fails before it
+    /// writes the output still records that its publication was refused.
+    #[must_use]
+    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutput {
+        let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
+        BoundOutput {
+            output: self,
+            invocation: invocation.clone(),
+            unit: Some(unit),
+        }
+    }
+
+    fn pbf_writer_under(
         &self,
         compression: crate::write::compression::Compression,
         header_block_bytes: &[u8],
@@ -2589,7 +2727,7 @@ impl Output {
     ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
         use crate::write::OutputBackend;
         use crate::write::writer::PbfWriter;
-        let completion = self.begin_write(&host.invocation)?;
+        let completion = self.begin_write()?;
         let path = self.path();
         let finish = crate::write::Finish::Deferred;
         // A test can make every backend refuse as a platform would; the
@@ -2680,21 +2818,8 @@ impl Output {
         self.target.overwrite
     }
 
-    /// Open the output's single writing session for a writer that is not a
-    /// `PbfWriter`: the staging file, truncated, behind an [`OutputWriter`]
-    /// whose [`finish`](OutputWriter::finish) is the one checked flush.
-    /// [`publish`](Self::publish) refuses an output whose writer was never
-    /// finished.
-    ///
-    /// The writer observes `cancel` (the invocation's token) at every buffer
-    /// it passes to the file and in `finish`; a tripped token fails the
-    /// session with `ErrorKind::Cancelled`.
-    ///
-    /// # Errors
-    /// The output already has a writing session, or the staging file cannot
-    /// be opened (the error names the destination).
-    pub fn writer(&self, cancel: &crate::host::Invocation) -> Result<OutputWriter> {
-        let completion = self.begin_write(cancel)?;
+    fn writer_under(&self, cancel: &crate::host::Invocation) -> Result<OutputWriter> {
+        let completion = self.begin_write()?;
         match fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -2718,27 +2843,21 @@ impl Output {
         }
     }
 
-    /// Start the output's writing session, under `invocation`, for a writer
-    /// that opens [`path`](Self::path) itself (the PBF backends). The returned
-    /// lease is finished by that writer's successful end of stream; until
-    /// then, and after any failure, publication refuses the output, and it
-    /// refuses publication under any other invocation.
-    fn begin_write(&self, invocation: &crate::host::Invocation) -> Result<Completion> {
-        self.target.session.begin(&self.target.dest, invocation)?;
+    /// Start the output's writing session for a writer that opens
+    /// [`path`](Self::path) itself (the PBF backends). The returned lease is
+    /// finished by that writer's successful end of stream; until then, and
+    /// after any failure, publication refuses the output.
+    fn begin_write(&self) -> Result<Completion> {
+        self.target.session.begin(&self.target.dest)?;
         Ok(self.target.session.clone())
     }
 
-    /// Open the output's single writing session as a synchronous
-    /// [`PbfWriter`](crate::write::writer::PbfWriter) over the staging file
-    /// (256 KiB buffered, compressing on the caller), under `invocation`. As
-    /// [`pbf_writer`](Self::pbf_writer), the writer does not `fsync`;
-    /// publication does. The session and the writer share the one token.
-    pub(crate) fn sync_pbf_writer(
+    fn sync_pbf_writer_under(
         &self,
         compression: crate::write::compression::Compression,
         invocation: &crate::host::Invocation,
     ) -> Result<crate::write::writer::PbfWriter<std::io::BufWriter<fs::File>>> {
-        let completion = self.begin_write(invocation)?;
+        let completion = self.begin_write()?;
         match crate::write::writer::PbfWriter::to_staged_file(self.path(), compression, invocation)
         {
             Ok(writer) => Ok(writer.with_completion(completion)),
@@ -2749,49 +2868,234 @@ impl Output {
         }
     }
 
-    /// Run `hook` when publication starts, before anything is synced or
-    /// installed (and before the `PUBLISH_START` marker). A front end uses
-    /// it to stop a wall-clock timer where the work ends: the sync and the
-    /// rename that follow are not part of the work being timed. Hooks run in
-    /// the order added; every member of a group runs its hooks before any of
-    /// them syncs. A hook must not fail; a panic unwinds before any
-    /// destination was touched.
+    /// Run `hook` when an authorized publication starts, after its decision
+    /// and before anything is synced or installed (and before the
+    /// `PUBLISH_START` marker). A front end uses it to stop a wall-clock
+    /// timer where the work ends: the sync and the rename that follow are
+    /// not part of the work being timed. Hooks run in the order added; every
+    /// member of a group runs its hooks before any of them syncs. A hook
+    /// must not fail and must not publish under the same invocation (that is
+    /// refused as re-entry); a panic unwinds before any destination was
+    /// touched, and the publication's row records nothing done.
     #[must_use]
     pub fn before_publish(mut self, hook: impl FnOnce() + Send + Sync + 'static) -> Self {
         self.target.hooks.push(Hook(Box::new(hook)));
         self
     }
+}
 
-    /// Sync the staging file and rename it into place. Call only after the
-    /// writer has been finished and every check on the output has passed; an
-    /// output no writing session finished (none was opened, or it is open or
-    /// failed) is refused ([`OutputError::Unfinished`]) before anything is
-    /// synced or installed.
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// What a command entry point accepts as its file output: an [`Output`],
+/// which it binds to its host's invocation at entry, or a [`BoundOutput`],
+/// which it refuses (invalid argument) unless bound to that invocation.
+/// Sealed.
+pub trait BindOutput: sealed::Sealed {
+    /// Bind to `invocation`, or check that the output already is.
     ///
-    /// `cancel` is the invocation's token, and checking it is the publication
-    /// decision, the first thing publication does: a token tripped by then
-    /// refuses the output (`ErrorKind::Cancelled`; the output drops and its
-    /// staging entry is removed, nothing is installed). Once the decision is
-    /// taken publication runs to completion whatever happens to the token,
-    /// and its result - success, [`OutputError::Unsynced`], a refusal - is
-    /// authoritative. Publication observes only the token passed here; the
-    /// command entry points pass the token their work ran under, and an
-    /// output whose writing session was opened under a different invocation
-    /// is refused (invalid argument) before any hook runs or anything is
-    /// synced. A tripped token is reported as `Cancelled` first, whatever
-    /// session it is passed with.
+    /// # Errors
+    /// A [`BoundOutput`] bound to another invocation. It is dropped, which
+    /// decides its publication refused in its own invocation's log.
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput>;
+}
+
+impl sealed::Sealed for Output {}
+impl sealed::Sealed for BoundOutput {}
+impl sealed::Sealed for OutputSet {}
+impl sealed::Sealed for BoundOutputSet {}
+
+impl BindOutput for Output {
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
+        Ok(self.bind(invocation))
+    }
+}
+
+impl BindOutput for BoundOutput {
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutput> {
+        refuse_other(&self.invocation, invocation, self.destination())?;
+        Ok(self)
+    }
+}
+
+/// [`BindOutput`] for a group of files.
+pub trait BindOutputSet: sealed::Sealed {
+    /// Bind to `invocation`, or check that the set already is.
+    ///
+    /// # Errors
+    /// A [`BoundOutputSet`] bound to another invocation, which is dropped
+    /// and so decided refused in its own invocation's log.
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet>;
+}
+
+impl BindOutputSet for OutputSet {
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
+        Ok(self.bind(invocation))
+    }
+}
+
+impl BindOutputSet for BoundOutputSet {
+    fn bind_to(self, invocation: &crate::host::Invocation) -> Result<BoundOutputSet> {
+        let first = self
+            .members
+            .first()
+            .map_or_else(PathBuf::new, |m| m.destination().to_path_buf());
+        refuse_other(&self.invocation, invocation, &first)?;
+        Ok(self)
+    }
+}
+
+fn refuse_other(
+    bound: &crate::host::Invocation,
+    wanted: &crate::host::Invocation,
+    dest: &Path,
+) -> Result<()> {
+    if bound.same_invocation(wanted) {
+        Ok(())
+    } else {
+        Err(Error::invalid_argument(format!(
+            "output {} is bound to a different invocation than the one running the command",
+            dest.display()
+        )))
+    }
+}
+
+/// An [`Output`] bound to one invocation for good ([`Output::bind`]): the
+/// owner of its publication. Its writing session opens under that
+/// invocation, and [`publish`](Self::publish) decides under it, so neither
+/// can be done under another. Dropping it undecided decides it refused.
+#[derive(Debug)]
+pub struct BoundOutput {
+    output: Output,
+    invocation: crate::host::Invocation,
+    /// `None` for a member of a bound set, whose set owns the unit; such a
+    /// member is only ever lent.
+    unit: Option<Enlisted>,
+}
+
+impl BoundOutput {
+    /// The path the caller named. Never write here.
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        self.output.destination()
+    }
+
+    /// The staging file; see [`Output::path`].
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.output.path()
+    }
+
+    /// The overwrite intent this output was built with.
+    #[must_use]
+    pub fn overwrite(&self) -> Overwrite {
+        self.output.overwrite()
+    }
+
+    /// The invocation it is bound to.
+    #[must_use]
+    pub fn invocation(&self) -> &crate::host::Invocation {
+        &self.invocation
+    }
+
+    /// As [`Output::before_publish`].
+    #[must_use]
+    pub fn before_publish(mut self, hook: impl FnOnce() + Send + Sync + 'static) -> Self {
+        self.output = self.output.before_publish(hook);
+        self
+    }
+
+    /// Open the output's single writing session as a pipelined [`PbfWriter`]
+    /// on `backend`, with `header_block_bytes` (a serialized `HeaderBlock`,
+    /// as [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build)
+    /// makes) already written. The session finishes when the writer's
+    /// [`flush`](PbfWriter::flush) succeeds; any error the writer reports
+    /// fails it for good. The writer does not `fsync` at its end of stream:
+    /// [`publish`](Self::publish) does.
+    ///
+    /// The writer observes the bound invocation: once it is tripped every
+    /// write method returns `ErrorKind::Cancelled` (failing the session),
+    /// and the writer thread stops a queued `copy_file_range` splice between
+    /// kernel calls.
+    ///
+    /// # Errors
+    /// `host` runs another invocation (invalid argument); the output already
+    /// has a writing session; `backend` needs a feature that is not compiled
+    /// in; the staging file cannot be opened or the header written. The
+    /// session is failed in each of the last three.
+    pub fn pbf_writer(
+        &self,
+        compression: crate::write::compression::Compression,
+        header_block_bytes: &[u8],
+        backend: crate::write::OutputBackend,
+        host: &crate::host::Host,
+    ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
+        refuse_other(&self.invocation, &host.invocation, self.destination())?;
+        self.output
+            .pbf_writer_under(compression, header_block_bytes, backend, host)
+    }
+
+    /// Open the output's single writing session for a writer that is not a
+    /// `PbfWriter`: the staging file, truncated, behind an [`OutputWriter`]
+    /// whose [`finish`](OutputWriter::finish) is the one checked flush.
+    /// [`publish`](Self::publish) refuses an output whose writer was never
+    /// finished.
+    ///
+    /// The writer observes the bound invocation at every buffer it passes to
+    /// the file and in `finish`; a tripped token fails the session with
+    /// `ErrorKind::Cancelled`.
+    ///
+    /// # Errors
+    /// The output already has a writing session, or the staging file cannot
+    /// be opened (the error names the destination).
+    pub fn writer(&self) -> Result<OutputWriter> {
+        self.output.writer_under(&self.invocation)
+    }
+
+    /// Open the output's single writing session as a synchronous
+    /// [`PbfWriter`](crate::write::writer::PbfWriter) over the staging file
+    /// (256 KiB buffered, compressing on the caller), under the bound
+    /// invocation. As [`pbf_writer`](Self::pbf_writer), the writer does not
+    /// `fsync`; publication does.
+    pub(crate) fn sync_pbf_writer(
+        &self,
+        compression: crate::write::compression::Compression,
+    ) -> Result<crate::write::writer::PbfWriter<std::io::BufWriter<fs::File>>> {
+        self.output
+            .sync_pbf_writer_under(compression, &self.invocation)
+    }
+
+    /// Sync the staging file and rename it into place, under the bound
+    /// invocation. Call only after the writer has been finished and every
+    /// check on the output has passed.
+    ///
+    /// The decision comes first, under the invocation's publication log,
+    /// with every earlier publication of the invocation finished: a tripped
+    /// token refuses (`ErrorKind::Cancelled`), an output no writing session
+    /// finished (none was opened, or it is open or failed) is refused
+    /// ([`OutputError::Unfinished`]), and either way nothing is synced or
+    /// installed and the staging entry is removed. An authorized publication
+    /// runs to completion whatever happens to the token, and its result -
+    /// success, [`OutputError::Unsynced`], a refusal - is authoritative. Its
+    /// row in [`Invocation::for_each_publication`](crate::host::Invocation::for_each_publication)
+    /// records the decision and what it did to the destination.
     ///
     /// # Errors
     /// The destination rules are re-applied first; under
     /// [`Overwrite::Refuse`] a destination that appeared meanwhile is
     /// refused exclusively. [`OutputError::Unsynced`] means the output *was*
-    /// published and only the directory sync failed.
-    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
-        cancel.check()?;
-        publish_all(
-            std::slice::from_mut(&mut self.target),
-            &Faults::of(cancel),
-            cancel,
+    /// published and only the directory sync failed. Publishing from a
+    /// callback of a publication in progress under the same invocation is
+    /// an invalid argument.
+    pub fn publish(mut self) -> Result<()> {
+        let Some(unit) = self.unit.take() else {
+            return Err(Error::internal("a set member was published on its own"));
+        };
+        publish_unit(
+            std::slice::from_mut(&mut self.output.target),
+            &self.invocation,
+            &unit,
         )
     }
 }
@@ -2861,39 +3165,67 @@ impl OutputDir {
         &self.target.dest
     }
 
+    /// Bind to `invocation` for good, as [`Output::bind`].
+    #[must_use]
+    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputDir {
+        let unit = Enlisted::new(invocation, vec![self.target.dest.clone()]);
+        BoundOutputDir {
+            dir: self,
+            invocation: invocation.clone(),
+            unit,
+        }
+    }
+}
+
+/// An [`OutputDir`] bound to one invocation for good ([`OutputDir::bind`]),
+/// as [`BoundOutput`].
+#[derive(Debug)]
+pub struct BoundOutputDir {
+    dir: OutputDir,
+    invocation: crate::host::Invocation,
+    unit: Enlisted,
+}
+
+impl BoundOutputDir {
+    /// The directory the caller named. Never write here.
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        self.dir.destination()
+    }
+
+    /// The invocation it is bound to.
+    #[must_use]
+    pub fn invocation(&self) -> &crate::host::Invocation {
+        &self.invocation
+    }
+
     /// Open the output's single writing session: the staging directory to
-    /// fill, and the [`DirWriter::finish`] that lets it be published. The
-    /// session is opened under `invocation`, and publication refuses it
-    /// under any other.
+    /// fill, and the [`DirWriter::finish`] that lets it be published.
     ///
     /// # Errors
     /// The output already has a writing session.
-    pub fn writer(&self, invocation: &crate::host::Invocation) -> Result<DirWriter> {
-        self.target.session.begin(&self.target.dest, invocation)?;
+    pub fn writer(&self) -> Result<DirWriter> {
+        let target = &self.dir.target;
+        target.session.begin(&target.dest)?;
         Ok(DirWriter {
-            path: self.target.write.clone(),
-            completion: self.target.session.clone(),
+            path: target.write.clone(),
+            completion: target.session.clone(),
         })
     }
 
     /// Swap the staging directory into place. An existing destination is
     /// moved to a backup first (made durable before the swap) and restored
-    /// if the swap fails. Refused before anything is synced or installed
-    /// unless a [`DirWriter`] was finished.
-    ///
-    /// `cancel` is checked once, as the publication decision, exactly as in
-    /// [`Output::publish`].
+    /// if the swap fails. Decided exactly as [`BoundOutput::publish`].
     ///
     /// # Errors
-    /// As [`Output::publish`]; [`OutputError::RollbackIncomplete`] if the
-    /// swap failed and the previous directory could not be put back (the
+    /// As [`BoundOutput::publish`]; [`OutputError::RollbackIncomplete`] if
+    /// the swap failed and the previous directory could not be put back (the
     /// error names where it is kept).
-    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
-        cancel.check()?;
-        publish_all(
-            std::slice::from_mut(&mut self.target),
-            &Faults::of(cancel),
-            cancel,
+    pub fn publish(mut self) -> Result<()> {
+        publish_unit(
+            std::slice::from_mut(&mut self.dir.target),
+            &self.invocation,
+            &self.unit,
         )
     }
 }
@@ -2914,9 +3246,10 @@ impl OutputSet {
     /// member reporting to `diagnostics`.
     ///
     /// # Errors
-    /// Any member's [`Output::new`] error, or
+    /// Any member's [`Output::new`] error;
     /// [`OutputError::Collision`] when two destinations name one file (the
-    /// same canonical directory and name, or an existing hard link).
+    /// same canonical directory and name, or an existing hard link); an
+    /// invalid argument for no destinations at all.
     pub fn files<I, P>(
         destinations: I,
         overwrite: Overwrite,
@@ -2952,6 +3285,12 @@ impl OutputSet {
             .into_iter()
             .map(|path| normalize(path.as_ref()))
             .collect::<Result<Vec<_>>>()?;
+        // A publication covers at least one destination.
+        if paths.is_empty() {
+            return Err(Error::invalid_argument(
+                "an output set needs at least one member",
+            ));
+        }
         let mut planned: Vec<(PathBuf, Option<Identity>)> = Vec::with_capacity(paths.len());
         for path in &paths {
             let parent = fs::canonicalize(parent_dir(path)).map_err(|e| {
@@ -3007,29 +3346,137 @@ impl OutputSet {
         self.members.iter()
     }
 
-    /// Publish every member: recheck all, install each, and on a failure
-    /// roll back the members already installed.
-    ///
-    /// `cancel` is checked once for the whole group, as its publication
-    /// decision, before any member's hook runs or anything is installed;
-    /// after it the group publishes (or rolls back) to completion.
-    ///
-    /// # Errors
-    /// As [`Output::publish`], plus [`OutputError::RollbackIncomplete`]
-    /// naming every member whose previous state could not be restored.
-    pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
-        cancel.check()?;
-        let mut targets: Vec<Target> = Vec::with_capacity(self.members.len());
-        for member in self.members.drain(..) {
-            targets.push(member.into_target());
+    /// Bind the whole set to `invocation` for good, as one publication
+    /// unit ([`Output::bind`]). Its members are lent, bound, only after.
+    #[must_use]
+    pub fn bind(self, invocation: &crate::host::Invocation) -> BoundOutputSet {
+        let destinations = self
+            .members
+            .iter()
+            .map(|member| member.target.dest.clone())
+            .collect();
+        let unit = Enlisted::new(invocation, destinations);
+        BoundOutputSet {
+            members: self
+                .members
+                .into_iter()
+                .map(|output| BoundOutput {
+                    output,
+                    invocation: invocation.clone(),
+                    unit: None,
+                })
+                .collect(),
+            invocation: invocation.clone(),
+            unit,
         }
-        publish_all(&mut targets, &Faults::of(cancel), cancel)
     }
 }
 
+/// An [`OutputSet`] bound to one invocation for good ([`OutputSet::bind`]):
+/// one publication unit, whose members inherit its invocation and are lent
+/// as `&BoundOutput` only. A member's writer finishing, failing or being
+/// dropped is session state: only the set decides, by its publication or
+/// by being dropped undecided.
+#[derive(Debug)]
+pub struct BoundOutputSet {
+    members: Vec<BoundOutput>,
+    invocation: crate::host::Invocation,
+    unit: Enlisted,
+}
+
+impl BoundOutputSet {
+    /// Number of members.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether the set has no members (never: an empty set is refused at
+    /// construction).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Member `index`, borrowed.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&BoundOutput> {
+        self.members.get(index)
+    }
+
+    /// The members in order, borrowed.
+    pub fn iter(&self) -> impl Iterator<Item = &BoundOutput> {
+        self.members.iter()
+    }
+
+    /// The invocation it is bound to.
+    #[must_use]
+    pub fn invocation(&self) -> &crate::host::Invocation {
+        &self.invocation
+    }
+
+    /// Publish every member as one publication: decided once for the whole
+    /// group, exactly as [`BoundOutput::publish`], before any member's hook
+    /// runs or anything is installed; then recheck all, install each, and
+    /// on a failure roll back the members already installed. The row has
+    /// one effect per member.
+    ///
+    /// # Errors
+    /// As [`BoundOutput::publish`], plus [`OutputError::RollbackIncomplete`]
+    /// naming every member whose previous state could not be restored.
+    pub fn publish(mut self) -> Result<()> {
+        let mut targets: Vec<Target> = Vec::with_capacity(self.members.len());
+        for member in self.members.drain(..) {
+            targets.push(member.output.target);
+        }
+        publish_unit(&mut targets, &self.invocation, &self.unit)
+    }
+}
+
+/// Unit-test shorthands for the filesystem mechanics of publication, which
+/// predate binding: a session opened on the unbound value, and a
+/// publication that binds at the last moment. Tests of the publication log
+/// itself use the bound API.
+#[cfg(test)]
 impl Output {
-    fn into_target(self) -> Target {
-        self.target
+    pub(crate) fn writer(&self, invocation: &crate::host::Invocation) -> Result<OutputWriter> {
+        self.writer_under(invocation)
+    }
+
+    pub(crate) fn pbf_writer(
+        &self,
+        compression: crate::write::compression::Compression,
+        header_block_bytes: &[u8],
+        backend: crate::write::OutputBackend,
+        host: &crate::host::Host,
+    ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
+        self.pbf_writer_under(compression, header_block_bytes, backend, host)
+    }
+
+    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
+        self.bind(invocation).publish()
+    }
+}
+
+#[cfg(test)]
+impl OutputDir {
+    pub(crate) fn writer(&self, _invocation: &crate::host::Invocation) -> Result<DirWriter> {
+        self.target.session.begin(&self.target.dest)?;
+        Ok(DirWriter {
+            path: self.target.write.clone(),
+            completion: self.target.session.clone(),
+        })
+    }
+
+    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
+        self.bind(invocation).publish()
+    }
+}
+
+#[cfg(test)]
+impl OutputSet {
+    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
+        self.bind(invocation).publish()
     }
 }
 
@@ -3079,25 +3526,41 @@ mod tests {
         TOKEN.get_or_init(crate::host::Invocation::new)
     }
 
-    /// Publication under an invocation other than the session's is refused
-    /// before any hook runs or anything is synced, and the staging entry is
-    /// removed with the output.
+    /// An output bound to one invocation is refused by a command running
+    /// another, and by a PBF writer opened with another's host; the refused
+    /// one is decided `refused_error` in its own invocation's log and its
+    /// staging entry removed.
     #[test]
-    fn publication_under_another_invocation_is_refused() {
+    fn an_output_bound_to_another_invocation_is_refused() {
         let dir = scratch();
-        let ran = Arc::new(Mutex::new(false));
-        let flag = Arc::clone(&ran);
+        let mine = crate::host::Invocation::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard())
             .unwrap()
-            .before_publish(move || *flag.lock().unwrap() = true);
-        stage(&out, b"data").unwrap();
-        let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
+            .bind(&mine);
+        let Err(err) = out.pbf_writer(
+            crate::write::compression::Compression::default(),
+            &[],
+            crate::write::OutputBackend::Buffered,
+            &run_host(),
+        ) else {
+            panic!("a host running another invocation is refused");
+        };
         assert!(
             matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
             "{err}"
         );
-        assert!(!*ran.lock().unwrap(), "no hook may run");
-        assert!(!dir.path().join("out").exists());
+        let err = out.bind_to(run_token()).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
+            "{err}"
+        );
+        let mut rows = Vec::new();
+        mine.for_each_publication(|row| rows.push(row.clone()));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].decision(),
+            crate::publication::Decision::RefusedError
+        );
         assert_eq!(others(dir.path(), &[]), Vec::<String>::new());
     }
 
@@ -3432,7 +3895,7 @@ mod tests {
             out.writer(run_token()).is_err(),
             "a second writer would truncate the first"
         );
-        assert!(out.begin_write(run_token()).is_err());
+        assert!(out.begin_write().is_err());
         drop(first);
     }
 
@@ -3504,7 +3967,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let completion = out.begin_write(run_token()).unwrap();
+        let completion = out.begin_write().unwrap();
         let mut writer = crate::write::writer::PbfWriter::to_staged_file(
             out.path(),
             Default::default(),
@@ -3663,13 +4126,15 @@ mod tests {
         // `PbfWriter` dropped unflushed would trip its own test assertion, so
         // the bare lease stands in for it).
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let lease = out.begin_write(run_token()).unwrap();
+        let lease = out.begin_write().unwrap();
         let err = out.publish(run_token()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         drop(lease);
         assert!(!dest.exists());
 
-        let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = Output::new(&dest, Overwrite::Refuse, &discard())
+            .unwrap()
+            .bind(run_token());
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
             crate::write::compression::Compression::None,
@@ -3679,7 +4144,7 @@ mod tests {
         )
         .unwrap();
         writer.flush().unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert!(dest.exists());
         // Finishing is terminal: a flush that already failed is never
         // certified by a second one.
@@ -3688,7 +4153,8 @@ mod tests {
             Overwrite::Refuse,
             &discard(),
         )
-        .unwrap();
+        .unwrap()
+        .bind(run_token());
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
             crate::write::compression::Compression::None,
@@ -3697,9 +4163,9 @@ mod tests {
             &host,
         )
         .unwrap();
-        out.target.session.fail();
+        out.output.target.session.fail();
         writer.flush().unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 

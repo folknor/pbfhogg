@@ -90,12 +90,13 @@ struct PendingGroup {
 /// published.
 pub fn time_filter<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     cutoff_timestamp: i64,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = time_filter_to(
         input.into(),
@@ -105,7 +106,7 @@ pub fn time_filter<'a>(
         overrides,
         host,
     )?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -113,7 +114,7 @@ pub fn time_filter<'a>(
 #[hotpath::measure]
 pub(crate) fn time_filter_to(
     input: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     cutoff_timestamp: i64,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

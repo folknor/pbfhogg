@@ -104,16 +104,17 @@ impl CatStats {
 /// the run holds, is refused before any input is read.
 pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
     files: &[S],
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -121,7 +122,7 @@ pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
 #[hotpath::measure]
 pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     files: &[S],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
     write: &WriteOptions,
@@ -342,7 +343,7 @@ fn cat_output_header(
 
 fn cat_passthrough(
     files: &[PinnedInput],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -703,7 +704,7 @@ fn check_tags<'t>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn cat_type_passthrough(
     files: &[PinnedInput],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     tf: TypeFilter,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -968,7 +969,7 @@ fn dense_meta<'a>(
 /// this history no longer describes a live hazard there.
 fn cat_filtered(
     files: &[PinnedInput],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     tf: TypeFilter,
     clean: &CleanAttrs,
     write: &WriteOptions,

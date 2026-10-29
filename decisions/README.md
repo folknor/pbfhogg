@@ -174,8 +174,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
 - [ADR-0017](0017-outputs-are-published-by-the-library.md) - Every output
   is a `pbfhogg::output` value: refused before any work if it exists
   without overwrite permission or is a symlink, written to a staging
-  sibling, and published (exclusively under `Refuse`, with group rollback)
-  by the library entry point that owns it.
+  sibling, bound to one invocation, and published (exclusively under
+  `Refuse`, with group rollback) by the library entry point that owns it;
+  every publication reports what it did to each destination.
 - [ADR-0018](0018-scratch-is-one-run-directory-and-leftovers-are-reported.md) -
   Scratch is one exclusively created, flock-guarded per-run directory owned
   by the entry point; `--tmp-dir` chooses where; leftovers of crashed runs
@@ -185,6 +186,8 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   A run stops early only through the caller's `Invocation` token, checked where
   the run already passes (blob dispatch, pool receives, stage boundaries,
   output writes, the publication decision), and ends like a failure:
-  nothing published, staging and scratch removed, `Cancelled` returned. The
-  CLI trips it from SIGINT/SIGTERM and exits 130/143; a second signal exits
-  at once.
+  nothing published, staging and scratch removed, `Cancelled` returned.
+  Each bound output is decided once in the invocation's publication log;
+  cancel refuses every pending one and reports whether it came before or
+  after a decision. The CLI trips it from SIGINT/SIGTERM and exits 130/143;
+  a second signal exits at once.

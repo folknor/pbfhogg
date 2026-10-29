@@ -86,28 +86,38 @@ output any other way.
   where an `EXDEV` out of a caller-chosen staging directory is reported as
   the same `StagingDir` refusal carrying the kernel's error, and ends the
   publication like any failed install.
-- **Library entry points take the output by value and are its only
-  publisher.** `sort(input, output: Output, ...)` writes through a borrowing
-  engine (`sort_to(input, &output, ...)`) and calls `output.publish(&host.invocation)` as its
-  last step, after every post-write gate (the altw missing-locations check
-  runs before publication). Engines that dispatch to other engines
-  (`extract_multi` to `extract_to`, altw to the external join, derive to its
-  parallel driver) pass the borrow; publication authority cannot be borrowed
-  because `publish` takes `self`. Every PBF backend - buffered, `O_DIRECT`,
-  `io_uring`, parallel - writes the staging file through
-  `Output::pbf_writer` (public, so a library caller gets the same
+- **An output is bound to one invocation, and its bound owner is its only
+  publisher.** `Output::bind(self, &Invocation)` (and `OutputDir::bind`,
+  `OutputSet::bind`) consumes the unbound value into a `BoundOutput`
+  (`BoundOutputDir`, `BoundOutputSet`) and enlists it in the invocation's
+  publication log (ADR-0019). Library entry points take the output by value -
+  unbound, which they bind to the host's invocation at entry, or bound, which
+  they refuse unless it is bound to the host's - and publish it themselves.
+  `sort(input, output, ...)` writes through a borrowing engine
+  (`sort_to(input, &output, ...)`, which takes `&BoundOutput`) and calls
+  `output.publish()` as its last step, after every post-write gate (the altw
+  missing-locations check runs before publication). Engines that dispatch to
+  other engines (`extract_multi` to `extract_to`, altw to the external join,
+  derive to its parallel driver) pass the borrow; publication authority
+  cannot be borrowed because `publish` takes `self`. Every PBF backend -
+  buffered, `O_DIRECT`, `io_uring`, parallel - writes the staging file through
+  `BoundOutput::pbf_writer` (public, so a library caller gets the same
   session-bearing writer the commands use); non-PBF writers (OSC, diff text,
-  export) get an `OutputWriter` from `Output::writer` and end it with
+  export) get an `OutputWriter` from `BoundOutput::writer` and end it with
   `OutputWriter::finish`, the one checked flush (dropping a `BufWriter`
   swallows its last write error); a directory output is filled through
-  `OutputDir::writer`'s `DirWriter`.
+  `BoundOutputDir::writer`'s `DirWriter`. A bound set lends its members as
+  `&BoundOutput`, so each member gets its writer while the set alone
+  publishes. Dropping a bound owner undecided decides it refused; a writer
+  or a set member finishing, failing or being dropped is session state and
+  decides nothing. An `OutputSet` needs at least one member.
 - **One writing session per output, and publication needs it finished.**
   The session is `Reserved -> Writing -> Finished`, with `Failed` terminal and
-  never overwritten by a later success. `Output::pbf_writer`,
-  `Output::writer` and `OutputDir::writer` each open it under the run's
-  invocation (a second session is refused, so two writers cannot truncate
-  each other), and `publish` refuses a session opened under an invocation
-  other than its own (ADR-0019). A PBF writer holds a
+  never overwritten by a later success. `BoundOutput::pbf_writer`,
+  `BoundOutput::writer` and `BoundOutputDir::writer` each open it under the
+  bound invocation (a second session is refused, so two writers cannot
+  truncate each other; a `pbf_writer` given a host running another
+  invocation is refused). A PBF writer holds a
   lease that its first fully successful end-of-stream `flush` finishes; any
   error any of its write methods returns, from wherever in the method (a
   scan, a permit, framing, the write, a send that recovered the writer
@@ -116,13 +126,14 @@ output any other way.
   certify the output; a finished writer accepts no further writes. An
   `OutputWriter` fails the session on any failed `write` or `flush` (an
   interruption, which wrote nothing, aside). `publish` checks every member
-  first and refuses anything but a `Finished` session with
-  `OutputError::Unfinished`, before any hook runs and before anything is
-  synced or installed: nothing in the crate publishes an output it did not
-  write, so an output nobody opened a writer on is refused too: writing to
-  `Output::path` without a session is never published. The check runs
-  before the `before_publish` hooks and again after them, since a hook is
-  caller code that can fail a session.
+  as part of its decision and refuses anything but a `Finished` session with
+  `OutputError::Unfinished` (a `refused_error` decision), before any hook
+  runs and before anything is synced or installed: nothing in the crate
+  publishes an output it did not write, so an output nobody opened a writer
+  on is refused too: writing to `Output::path` without a session is never
+  published. The check runs before the `before_publish` hooks and again
+  after them, since a hook is caller code that can fail a session; a failure
+  there ends an authorized publication that changed nothing.
   It also refuses a staging entry that is no longer the file, or the
   directory, reserved, a symlink put in its place included
   (`OutputError::StagingReplaced`). A `DirWriter`'s `finish` certifies the
@@ -205,18 +216,19 @@ output any other way.
   no scratch, which is the cheaper leftover.
   The publication span is `PUBLISH_START` .. `PUBLISH_END` (the end marker on
   every return, best effort like every marker: the sidecar drops one when its
-  pipe is full). Publications of one invocation are serialized: each holds
-  the invocation's publication lock from before `PUBLISH_START` until after
-  `PUBLISH_END`, so on the invocation's stream every span's
-  `publish_sync_calls` / `publish_sync_ns` lie inside that span alone, even
-  when a caller runs several commands at once under one token. The lock is
-  taken after the cancellation decision and the `before_publish` hooks, so a
-  token tripped while a publication waits does not stop it.
+  pipe is full). Publications of one invocation are admitted one at a time
+  through completion: each takes the invocation's execution lock before its
+  decision and holds it through the hooks, the span and the recording of its
+  effects, so ordinal order is execution order and on the invocation's stream
+  every span's `publish_sync_calls` / `publish_sync_ns` lie inside that span
+  alone, even when a caller runs several commands at once under one token.
+  A publication waiting for the lock is still undecided, so a cancel arriving
+  meanwhile refuses it; once decided, a token tripped later does not stop it.
   Everything before `PUBLISH_START` is the run's work. An
   in-process timer that must not include publication stops in
-  `Output::before_publish`, a hook that runs at the start of publication before
-  anything is synced or installed and not at all when publication is refused up
-  front: `bench-merge`'s `elapsed_ms` is captured there, and the geocode
+  `Output::before_publish`, a hook that runs at the start of an authorized
+  publication before anything is synced or installed and not at all when
+  publication is refused: `bench-merge`'s `elapsed_ms` is captured there, and the geocode
   builder's profiler span covers `build_geocode_index_to`, not the publishing
   wrapper. A caller's process-wide profiler (the CLI's `pbfhogg::main` hotpath
   guard) spans the whole process by definition and includes publication.
@@ -249,12 +261,31 @@ follows a link), and so is another process creating entries inside a
 directory destination while it is published: the walk before every
 recursive removal narrows that window and does not close it. Nothing makes a
 group visible to readers atomically. A cancelled run (ADR-0019) is a failed
-run here: `publish(&Invocation)` takes the token as an argument and refuses a
-tripped one before anything is checked, synced or installed, and once that
-decision is made publication completes; `Output::writer(&Invocation)` (on each
-buffer flush and in `finish`) and the PBF writer (on each write method, not
-in its end-of-stream `flush`) observe the token, so a run cancelled mid-write
-fails its session. A process killed outright (SIGKILL, the OOM killer, power
+run here: `publish` decides under the bound invocation and refuses a tripped
+one before anything is synced or installed, and once that decision is made
+publication completes; `BoundOutput::writer` (on each buffer flush and in
+`finish`) and the PBF writer (on each write method, not in its end-of-stream
+`flush`) observe the token, so a run cancelled mid-write fails its session.
+
+**Effects are a reported result of publication.** Each decided publication
+is one row in its invocation's log (`Invocation::for_each_publication`):
+its ordinal, its decision, and for every destination it covers, in member
+order, what it did to that destination relative to just before it -
+`none` (as it was, a rollback to absence included), `installed` (the new
+generation is there, a rollback that could not remove it included),
+`restored` (the previous generation was moved aside and put back) or
+`displaced` (it was moved aside and not put back; the error names the
+backup holding it). The effect is recorded from the namespace transitions
+the publication made - each successful move aside, install, restore,
+removal or taking back out, noted right after its syscall and before any
+observer runs - never reconstructed from cleanup state, where a restored
+destination and an untouched one look alike. So a refused publication is
+`none` throughout; a kept irreversible replacement is `installed`; a
+directory taken back out whose previous generation failed to return is
+`displaced`, and one that displaced nothing is `none`; members after a
+group's failing one are `none`; an `Unsynced` publication is `installed`.
+A publication that unwinds (a panicking hook or observer) still has its row
+finalized from the transitions it made before the unwind resumes. A process killed outright (SIGKILL, the OOM killer, power
 loss, the CLI's second interrupt) can leave `.pbfhogg-tmp-*` staging behind (in the staging directory, when the caller chose one), and a failed rollback or an unsynced
 publication leaves `.pbfhogg-backup-*` on purpose; neither is ever under the
 name the caller chose. A process killed inside publication can also leave a

@@ -273,14 +273,15 @@ impl TagsFilterOptions<'_> {
 /// mid-run fails with `InputReplaced`.
 pub fn tags_filter<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_to(input, &output, opts, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -288,7 +289,7 @@ pub fn tags_filter<'a>(
 #[hotpath::measure]
 pub(crate) fn tags_filter_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -490,7 +491,7 @@ fn filter_block_parallel(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn tags_filter_single_pass(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     expressions: &[Expression],
     invert: bool,
     distrust_metadata: bool,
@@ -711,7 +712,7 @@ fn filter_block_pass2(
 #[allow(clippy::too_many_lines)]
 fn tags_filter_two_pass(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     expressions: &[Expression],
     invert: bool,
     distrust_metadata: bool,
@@ -1473,6 +1474,7 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
+        let staged = staged.bind(&run_host().invocation);
         tags_filter_single_pass(
             &PinnedInput::pin(&input, run_host()).unwrap(),
             &staged,
@@ -1484,7 +1486,7 @@ mod tests {
             run_host(),
         )
         .unwrap();
-        staged.publish(&run_host().invocation).unwrap();
+        staged.publish().unwrap();
         let mut ids = Vec::new();
         ElementReader::open_in(&output, false, run_host())
             .unwrap()

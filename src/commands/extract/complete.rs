@@ -17,7 +17,7 @@ use super::{ExtractStats, Region};
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_complete_ways(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,

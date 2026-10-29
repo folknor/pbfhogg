@@ -579,10 +579,11 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
 /// Two publications of one invocation, at once: each `PUBLISH_START` is
 /// followed by its own `publish_sync_calls`, `publish_sync_ns` and
 /// `PUBLISH_END` before the other publication's span begins, so a stream
-/// reader can pair every sample with its span. Both runs are held at their
-/// `before_publish` hooks until both are there, and the sink holds the first
-/// span open, so without the invocation's publication lock the two spans
-/// interleave on the stream.
+/// reader can pair every sample with its span. Both runs start together, and
+/// the sink holds the first span open, so without the invocation's
+/// publication execution lock the two spans interleave on the stream. The
+/// lock is taken before the decision, so the `before_publish` hooks (which
+/// run after it) never overlap either.
 #[test]
 fn concurrent_publications_of_one_invocation_do_not_interleave() {
     let sink = Arc::new(PublishOrder {
@@ -596,15 +597,24 @@ fn concurrent_publications_of_one_invocation_do_not_interleave() {
     );
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
-    let at_hooks = Arc::new(std::sync::Barrier::new(2));
+    let at_start = Arc::new(std::sync::Barrier::new(2));
+    let in_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     std::thread::scope(|scope| {
         for name in ["a.pbf", "b.pbf"] {
-            let at_hooks = Arc::clone(&at_hooks);
+            let at_start = Arc::clone(&at_start);
+            let (in_hook, overlapped) = (Arc::clone(&in_hook), Arc::clone(&overlapped));
             let (host, base, output) = (&host, &base, dir.path().join(name));
             scope.spawn(move || {
+                use std::sync::atomic::Ordering::SeqCst;
                 let output = crate::common::out(output).before_publish(move || {
-                    at_hooks.wait();
+                    if in_hook.swap(true, SeqCst) {
+                        overlapped.store(true, SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    in_hook.store(false, SeqCst);
                 });
+                at_start.wait();
                 pbfhogg::cat::cat(
                     &[base],
                     output,
@@ -618,6 +628,10 @@ fn concurrent_publications_of_one_invocation_do_not_interleave() {
             });
         }
     });
+    assert!(
+        !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+        "two before_publish hooks of one invocation ran at once"
+    );
     let events = sink.events.lock().expect("events");
     let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
     let span = [

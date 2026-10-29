@@ -399,7 +399,7 @@ impl HeaderOverrides {
 /// in and `backend` asks for them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn writer_from_header(
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     compression: Compression,
     header: &crate::HeaderBlock,
     facts: &output_header::OutputFacts,
@@ -420,13 +420,13 @@ pub(crate) fn writer_from_header(
 /// `PbfWriter::to_path_parallel`, which lifts the ~1.5 GB/s NVMe single-thread
 /// write ceiling.
 ///
-/// Takes the run's [`Output`](crate::output::Output) rather than a path: every
-/// backend writes the staging file, and only the command's single publication
-/// owner renames it into place. The writer is
-/// [`Output::pbf_writer`](crate::output::Output::pbf_writer): it holds the
+/// Takes the run's [`BoundOutput`](crate::output::BoundOutput) rather than a
+/// path: every backend writes the staging file, and only the command's single
+/// publication owner renames it into place. The writer is
+/// [`BoundOutput::pbf_writer`](crate::output::BoundOutput::pbf_writer): it holds the
 /// output's writing session and leaves the `fsync` to publication.
 pub(crate) fn writer_from_header_bytes(
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     compression: Compression,
     header_bytes: &[u8],
     backend: OutputBackend,

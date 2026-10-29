@@ -301,7 +301,7 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consum
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage4_assembly(
     input: &crate::read::input::PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     // The input's header, from the run's one front read; stage 4 does not
     // reopen the input for it.
     header: &crate::HeaderBlock,

@@ -171,14 +171,15 @@ fn build_header_bytes(
 pub fn merge<'a>(
     base_pbf: impl Into<InputSource<'a>>,
     osc_file: &Path,
-    output_pbf: crate::output::Output,
+    output_pbf: impl crate::output::BindOutput,
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
+    let output_pbf = output_pbf.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
-    output_pbf.publish(&host.invocation)?;
+    output_pbf.publish()?;
     Ok(result)
 }
 
@@ -192,7 +193,7 @@ pub fn merge<'a>(
 pub(crate) fn merge_to<'a>(
     base_pbf: impl Into<InputSource<'a>>,
     osc_file: &Path,
-    output_pbf: &crate::output::Output,
+    output_pbf: &crate::output::BoundOutput,
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,

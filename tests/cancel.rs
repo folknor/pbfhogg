@@ -374,7 +374,7 @@ fn a_decided_publication_completes() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osm.pbf");
     let host = crate::common::test_host();
-    let output = crate::common::out(&dest);
+    let output = crate::common::out(&dest).bind(&host.invocation);
     let mut writer = output
         .pbf_writer(
             Default::default(),
@@ -389,12 +389,18 @@ fn a_decided_publication_completes() {
     drop(writer);
     let cancel = host.invocation.clone();
     let tripped = host.invocation.clone();
+    let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = std::sync::Arc::clone(&outcome);
     output
-        .before_publish(move || tripped.cancel())
-        .publish(&cancel)
+        .before_publish(move || *seen.lock().unwrap() = Some(tripped.cancel()))
+        .publish()
         .expect("a decided publication runs to completion");
     assert!(cancel.is_cancelled());
     assert!(dest.is_file());
+    assert_eq!(
+        *outcome.lock().unwrap(),
+        Some(pbfhogg::CancelOutcome::AfterDecision { authorized: 1 })
+    );
 }
 
 /// The decision refuses an output whose token was tripped before
@@ -403,13 +409,16 @@ fn a_decided_publication_completes() {
 fn publication_refuses_once_the_token_is_tripped() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
-    let output = crate::common::out(&dest);
     let cancel = pbfhogg::host::Invocation::new();
-    let mut writer = output.writer(&cancel).unwrap();
+    let output = crate::common::out(&dest).bind(&cancel);
+    let mut writer = output.writer().unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();
-    cancel.cancel();
-    let err = output.publish(&cancel).expect_err("refused");
+    assert_eq!(
+        cancel.cancel(),
+        pbfhogg::CancelOutcome::BeforeDecision { refused: 1 }
+    );
+    let err = output.publish().expect_err("refused");
     assert!(err.is_cancelled(), "{err}");
     assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
 }
@@ -419,22 +428,17 @@ fn publication_refuses_once_the_token_is_tripped() {
 #[test]
 fn a_cancelled_output_writer_cannot_be_published() {
     let dir = crate::common::test_scratch();
-    let output = crate::common::out(dir.path().join("out.txt"));
     let cancel = pbfhogg::host::Invocation::new();
-    let writer = output.writer(&cancel).unwrap();
+    let output = crate::common::out(dir.path().join("out.txt")).bind(&cancel);
+    let writer = output.writer().unwrap();
+    // The writer is no owner: tripping the token decides the output.
     cancel.cancel();
     let err = writer.finish().expect_err("finish observes the token");
     assert!(err.is_cancelled(), "{err}");
     let err = output
-        .publish(&pbfhogg::host::Invocation::new())
-        .expect_err("a failed session is not published");
-    assert!(
-        matches!(
-            err.kind(),
-            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Unfinished { .. })
-        ),
-        "{err}"
-    );
+        .publish()
+        .expect_err("a cancelled output is not published");
+    assert!(err.is_cancelled(), "{err}");
     assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
 }
 
@@ -445,18 +449,20 @@ fn a_cancelled_output_writer_cannot_be_published() {
 fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
     let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
-    let output = crate::common::out(&dest);
     let cancel = pbfhogg::host::Invocation::new();
+    let output = crate::common::out(&dest).bind(&cancel);
     cancel
         .faults()
         .arm_publish_fault(pbfhogg::output::PublishFault::DirSync);
-    let mut writer = output.writer(&cancel).unwrap();
+    let mut writer = output.writer().unwrap();
     std::io::Write::write_all(&mut writer, b"data").unwrap();
     writer.finish().unwrap();
     let tripped = cancel.clone();
     let err = output
-        .before_publish(move || tripped.cancel())
-        .publish(&cancel)
+        .before_publish(move || {
+            tripped.cancel();
+        })
+        .publish()
         .expect_err("the injected directory sync failure");
     assert!(!err.is_cancelled(), "{err}");
     assert!(

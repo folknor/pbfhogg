@@ -99,7 +99,7 @@ fn classify_block_simple(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_simple(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -130,7 +130,7 @@ pub(super) fn extract_simple(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_two_pass(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -278,7 +278,7 @@ fn extract_simple_two_pass(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_single_pass(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,

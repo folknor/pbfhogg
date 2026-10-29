@@ -82,11 +82,12 @@ pub(crate) fn omitted_clause(omitted: u64) -> String {
 /// `InputReplaced`.
 pub fn sort<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
+    let output = output.bind_to(&host.invocation)?;
     sort_with(
         input,
         output,
@@ -121,14 +122,15 @@ pub struct SortOptions {
 /// [`sort`] with every option: see [`SortOptions`].
 pub fn sort_with<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     opts: &SortOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = sort_to(input, &output, opts, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -137,7 +139,7 @@ pub fn sort_with<'a>(
 #[hotpath::measure]
 pub(crate) fn sort_to<'a>(
     input: impl Into<InputSource<'a>>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     opts: &SortOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,

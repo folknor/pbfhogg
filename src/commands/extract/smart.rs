@@ -482,7 +482,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn extract_smart(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,

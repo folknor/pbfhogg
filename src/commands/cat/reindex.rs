@@ -57,19 +57,20 @@ impl ReindexStats {
 /// the format's header-size limit even without its tagdata.
 pub fn reindex<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     write: &WriteOptions,
     host: &crate::host::Host,
 ) -> Result<ReindexStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let stats = reindex_to(input.into(), &output, write, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(stats)
 }
 
 fn reindex_to(
     source: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     write: &WriteOptions,
     host: &crate::host::Host,
 ) -> Result<ReindexStats> {

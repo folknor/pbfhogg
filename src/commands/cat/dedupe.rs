@@ -95,14 +95,15 @@ impl MergePbfStats {
 /// limit; the refusal says what the caller can change.
 pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
     inputs: &[S],
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -110,7 +111,7 @@ pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
 #[hotpath::measure]
 pub(crate) fn merge_pbf_to<'a, S: Into<InputSource<'a>> + Copy>(
     inputs: &[S],
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -262,7 +263,7 @@ fn plan_merge(
 /// offset.
 fn write_merge(
     merge: MergePlan,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -417,12 +418,14 @@ mod tests {
             crate::output::Overwrite::Refuse,
             &crate::host::Diagnostics::discard(),
         )?;
+        let host = crate::host::Host::for_tests();
+        let output = output.bind(&host.invocation);
         write_merge(
             plan,
             &output,
             &WriteOptions::default(),
             &HeaderOverrides::default(),
-            &crate::host::Host::for_tests(),
+            &host,
         )
     }
 
@@ -504,6 +507,7 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("output");
+            let output = output.bind(&host.invocation);
             let stats = write_merge(
                 merge,
                 &output,
@@ -512,7 +516,7 @@ mod tests {
                 &host,
             )
             .expect("pass 2");
-            output.publish(&host.invocation).expect("publish");
+            output.publish().expect("publish");
             (
                 (stats.nodes, stats.ways, stats.relations),
                 (stats.blobs_rewritten, stats.duplicates_removed),

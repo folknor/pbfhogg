@@ -366,9 +366,10 @@ mod tests {
         )
         .expect("fresh output");
         let cancel = pbfhogg::host::Invocation::new();
-        cancel.cancel();
+        let output = output.bind(&cancel);
+        let _ = cancel.cancel();
         let cancelled = output
-            .publish(&cancel)
+            .publish()
             .expect_err("a tripped token refuses publication");
         assert!(cancelled.is_cancelled());
         assert!(is_cancelled(&cancelled));

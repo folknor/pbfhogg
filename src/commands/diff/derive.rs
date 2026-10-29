@@ -77,7 +77,7 @@ impl DeriveChangesStats {
 pub fn derive_changes<'a, 'b>(
     old: impl Into<InputSource<'a>>,
     new: impl Into<InputSource<'b>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
@@ -85,6 +85,7 @@ pub fn derive_changes<'a, 'b>(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = derive_changes_to(
         old.into(),
@@ -98,7 +99,7 @@ pub fn derive_changes<'a, 'b>(
         &scratch,
     )?;
     drop(scratch);
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -110,7 +111,7 @@ pub fn derive_changes<'a, 'b>(
 pub(crate) fn derive_changes_to(
     old: InputSource<'_>,
     new: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
@@ -627,7 +628,7 @@ fn derive_changes_element_stream(
 /// directly to the underlying parallel gzip writer (not through the XML
 /// writer).
 fn assemble_osc(
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     sink: &ChangeSink,
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -647,7 +648,7 @@ fn assemble_osc(
 /// element counts; [`assemble_osc`] passes the run's sink's.
 #[allow(clippy::too_many_arguments)]
 fn assemble_osc_from_paths(
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     creates_path: &Path,
     modifies_path: &Path,
     deletes_path: &Path,
@@ -673,7 +674,7 @@ fn assemble_osc_from_paths(
     // Output can also be on a different filesystem from host-selected scratch.
     // A statvfs snapshot would not reserve capacity against concurrent writers;
     // propagate actual output write failures rather than promise a preflight.
-    let buf = output.writer(&host.invocation)?;
+    let buf = output.writer()?;
 
     // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
     // At planet scale (~45 GB of XML across the three temp files) that's

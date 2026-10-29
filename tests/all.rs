@@ -121,6 +121,7 @@ mod merge_pbf;
 mod non_indexed_parity;
 mod osc_parser_parity;
 mod proptests;
+mod publication;
 mod read_paths;
 mod renumber_external;
 mod roundtrip;

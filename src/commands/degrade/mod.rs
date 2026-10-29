@@ -402,13 +402,14 @@ impl DegradeStats {
 /// nothing is published.
 pub fn degrade<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = degrade_to(
         input.into(),
@@ -419,7 +420,7 @@ pub fn degrade<'a>(
         overrides,
         host,
     )?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -428,7 +429,7 @@ pub fn degrade<'a>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn degrade_to(
     input: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
@@ -600,7 +601,7 @@ fn passthrough_header_bytes(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough(
     source: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     flags: DegradeFlags,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -859,7 +860,7 @@ impl UnsortKindState {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
     input: InputSource<'_>,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,

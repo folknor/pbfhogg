@@ -164,13 +164,14 @@ impl TagsFilterOscStats {
 /// - `delete`: all deletes are forwarded unconditionally.
 pub fn tags_filter_osc(
     input: &Path,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     let result = tags_filter_osc_to(input, &output, expression_strs, host)?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -178,7 +179,7 @@ pub fn tags_filter_osc(
 #[hotpath::measure]
 pub(crate) fn tags_filter_osc_to(
     input: &Path,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
@@ -186,7 +187,7 @@ pub(crate) fn tags_filter_osc_to(
     let expressions = parse_expressions(expression_strs)?;
     host.invocation.marker("TAGSFILTEROSC_START");
     let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.invocation)?;
-    write_filtered_osc(output, &filtered, &host.invocation)?;
+    write_filtered_osc(output, &filtered)?;
     host.invocation.marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
@@ -397,14 +398,10 @@ fn finalize_current(
     }
 }
 
-fn write_filtered_osc(
-    output: &crate::output::Output,
-    filtered: &FilteredOsc,
-    cancel: &crate::host::Invocation,
-) -> Result<()> {
+fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOsc) -> Result<()> {
     // Framing follows the output name, the rule every OSC producer shares
     // (`crate::osc::output_is_gzip`); the name was vetted before any work.
-    let out = output.writer(cancel)?;
+    let out = output.writer()?;
     let sink = if crate::osc::output_is_gzip(output.destination())? {
         OscByteSink::Gz(Box::new(GzEncoder::new(out, flate2::Compression::fast())))
     } else {

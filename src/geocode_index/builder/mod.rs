@@ -188,9 +188,10 @@ pub fn build_geocode_index(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
+    let output = output.0.bind(&host.invocation);
     host.invocation.check()?;
     let stats = build_geocode_index_to(config, &output, host, scratch)?;
-    output.0.publish(&host.invocation)?;
+    output.publish()?;
     Ok(stats)
 }
 
@@ -200,7 +201,7 @@ pub fn build_geocode_index(
 #[hotpath::measure]
 fn build_geocode_index_to(
     config: &BuildConfig,
-    output: &IndexOutput,
+    output: &crate::output::BoundOutputDir,
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
@@ -211,7 +212,7 @@ fn build_geocode_index_to(
     // build never truncates the files an already-open Reader has mapped,
     // and the previous index survives every failure. The writer is finished
     // only once the build returned with every file it wrote closed.
-    let writer = output.0.writer(&host.invocation)?;
+    let writer = output.writer()?;
     // Every failure of the build names the index it was building; a file
     // the failure is about is named beneath this.
     let stats = build_generation(config, writer.path(), host, &scratch).map_err(|e| {

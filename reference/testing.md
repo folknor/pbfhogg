@@ -392,8 +392,16 @@ exception, not a tier - should not survive across many PRs.
   announces each namespace step that succeeded (`PublishStep`: a backup
   reserved, the previous output moved aside, a member installed or
   linked, a rollback step, a backup removed, the directory syncs done) to
-  the token's publication observer, from the publishing thread with no
-  lock held. The CLI, built with `test-hooks`, reads
+  the token's publication observer, from the publishing thread, holding
+  only the invocation's publication execution lock (so an observer must not
+  publish under the same invocation: that is refused as re-entry). The
+  effect a step implies is recorded before the observer runs, so an
+  observer that panics still leaves a truthful publication row. The
+  publication log's own contract (ordinals, decisions, cancel outcomes,
+  effects through every fault, re-entry, an unwinding observer) is tested
+  through the public API in `tests/publication.rs`, parking at a
+  `before_publish` hook or an `on_check` checkpoint and releasing over a
+  channel within a bounded wait. The CLI, built with `test-hooks`, reads
   `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>,...` (faults spelled as
   `PublishFault` parses them; a bad spelling exits 101, as does a trace
   or ready file that cannot be written),

@@ -636,7 +636,7 @@ fn parse_extract_geometry(
 pub fn extract_multi<'a>(
     input: impl Into<InputSource<'a>>,
     regions: &[Region],
-    outputs: crate::output::OutputSet,
+    outputs: impl crate::output::BindOutputSet,
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -644,6 +644,7 @@ pub fn extract_multi<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
+    let outputs = outputs.bind_to(&host.invocation)?;
     host.invocation.check()?;
     if regions.len() != outputs.len() {
         return Err(Error::invalid_argument(format!(
@@ -658,7 +659,7 @@ pub fn extract_multi<'a>(
     let stats = extract_multi_to(
         &pin, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    outputs.publish(&host.invocation)?;
+    outputs.publish()?;
     Ok(stats)
 }
 
@@ -666,7 +667,7 @@ pub fn extract_multi<'a>(
 fn extract_multi_to(
     input: &PinnedInput,
     regions: &[Region],
-    outputs: &crate::output::OutputSet,
+    outputs: &crate::output::BoundOutputSet,
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -832,7 +833,7 @@ fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header
 #[allow(clippy::too_many_arguments)]
 pub fn extract<'a>(
     input: impl Into<InputSource<'a>>,
-    output: crate::output::Output,
+    output: impl crate::output::BindOutput,
     region: &Region,
     strategy: ExtractStrategy,
     set_bounds: bool,
@@ -841,6 +842,7 @@ pub fn extract<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
+    let output = output.bind_to(&host.invocation)?;
     host.invocation.check()?;
     // Every pass opens the input again, each through its own open file
     // description (the probes, the schedule walks, the header read, the
@@ -854,7 +856,7 @@ pub fn extract<'a>(
     let result = extract_to(
         &pin, &output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    output.publish(&host.invocation)?;
+    output.publish()?;
     Ok(result)
 }
 
@@ -863,7 +865,7 @@ pub fn extract<'a>(
 #[hotpath::measure]
 pub(crate) fn extract_to(
     input: &PinnedInput,
-    output: &crate::output::Output,
+    output: &crate::output::BoundOutput,
     region: &Region,
     strategy: ExtractStrategy,
     set_bounds: bool,

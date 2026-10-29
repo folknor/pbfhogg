@@ -202,6 +202,7 @@ pub mod output;
 pub(crate) mod owned;
 #[doc(hidden)]
 pub mod path_guard;
+pub mod publication;
 pub mod read;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
@@ -237,8 +238,12 @@ pub use error::{
     BlobError, Error, ErrorKind, KindContradiction, OutputError, OversizePart, Result,
     StagingProblem, Unresolved,
 };
-pub use output::{Output, OutputDir, OutputSet, Overwrite, Staging};
+pub use output::{
+    BindOutput, BindOutputSet, BoundOutput, BoundOutputDir, BoundOutputSet, Output, OutputDir,
+    OutputSet, Overwrite, Staging,
+};
 pub use owned::{ParseTypeFilterError, TypeFilter};
+pub use publication::{CancelOutcome, Decision, Effect, Publication, PublishedMember};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,
     MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,

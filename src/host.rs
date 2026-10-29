@@ -93,11 +93,15 @@ struct InvocationState {
     /// covered by a more specific report). Touched only where such a
     /// diagnostic is about to be emitted, never on a per-element path.
     reported: std::sync::Mutex<std::collections::HashSet<&'static str>>,
-    /// Held across one publication's span (`PUBLISH_START` to `PUBLISH_END`
-    /// and the syncs and installs between), so two publications of one
-    /// invocation never overlap and each span's `publish_sync_*` samples are
-    /// its own on the stream.
+    /// The publication execution lock: held by one publication from before
+    /// its decision until its row is finalized (hooks, `PUBLISH_START` to
+    /// `PUBLISH_END`, the syncs, installs and rollback between), so the
+    /// publications of one invocation run one after the other in ordinal
+    /// order and each span's `publish_sync_*` samples are its own.
     publishing: std::sync::Mutex<()>,
+    /// The publication log (see [`crate::publication`]). Never held across
+    /// anything but its own bookkeeping.
+    log: std::sync::Mutex<crate::publication::PublicationLog>,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -193,12 +197,59 @@ impl Invocation {
     }
 
     /// Request cancellation. Every run observing this token (or a clone)
-    /// stops at its next checkpoint. Idempotent, lock-free and safe to call
-    /// from any thread.
-    pub fn cancel(&self) {
+    /// stops at its next checkpoint. Permanent, and safe to call from any
+    /// thread (not from a signal handler: it takes the publication log's
+    /// lock, which nothing holds for longer than its bookkeeping).
+    ///
+    /// Cancellation is invocation-wide. Under the publication log it trips
+    /// the token and decides every output still pending (bound and not yet
+    /// decided) [`RefusedCancelled`](crate::publication::Decision::RefusedCancelled),
+    /// in bind order, and says what it found:
+    /// [`BeforeDecision`](crate::publication::CancelOutcome::BeforeDecision)
+    /// with the first ordinal it refused,
+    /// [`AfterDecision`](crate::publication::CancelOutcome::AfterDecision)
+    /// with the latest authorized one when nothing was pending (that
+    /// publication completes regardless), or
+    /// [`NoPublicationPending`](crate::publication::CancelOutcome::NoPublicationPending).
+    /// Every decision after it refuses. It never waits for a publication
+    /// in progress. To cancel one command among several, give each its own
+    /// invocation.
+    pub fn cancel(&self) -> crate::publication::CancelOutcome {
+        let mut log = self.log();
         self.0
             .tripped
             .store(true, std::sync::atomic::Ordering::Release);
+        log.cancel()
+    }
+
+    /// The publication log, poison recovered: no mutation of it can unwind
+    /// half done (see [`crate::publication`]).
+    pub(crate) fn log(&self) -> std::sync::MutexGuard<'_, crate::publication::PublicationLog> {
+        self.0
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Visit every publication this invocation has decided, in ordinal
+    /// order. The rows are copied under the log's lock and visited after it
+    /// is released, so the visitor may call back into the library. A
+    /// publication still running is visited with
+    /// [`finished`](crate::publication::Publication::finished) false.
+    pub fn for_each_publication(&self, mut visit: impl FnMut(&crate::publication::Publication)) {
+        let rows = self.log().rows();
+        for row in &rows {
+            visit(row);
+        }
+    }
+
+    /// Run the test-only checkpoint hook without reading the token: the
+    /// publication decision reads the token under the log's lock, and a
+    /// hook that cancels must not run there.
+    #[inline]
+    pub(crate) fn checkpoint_hook(&self) {
+        #[cfg(feature = "test-hooks")]
+        self.run_hook();
     }
 
     /// Whether cancellation has been requested. An `Acquire` load: whatever
@@ -274,11 +325,10 @@ impl Invocation {
     }
 
     /// Serialize one publication of this invocation against any other: the
-    /// guard is held from before `PUBLISH_START` until after `PUBLISH_END`.
-    /// Caller code that runs under it (the instrument sink) must not publish
-    /// under the same invocation, which its contract already forbids. A
-    /// poisoned lock is recovered: it guards no state, only the span's
-    /// exclusion.
+    /// guard is held from before the decision until the row is finalized.
+    /// Caller code that runs under it (hooks, the instrument sink) publishing
+    /// under the same invocation is refused as re-entry, never waited on. A
+    /// poisoned lock is recovered: it guards no state, only exclusion.
     pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.0
             .publishing

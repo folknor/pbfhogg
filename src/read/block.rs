@@ -224,6 +224,15 @@ impl HeaderBlock {
         })
     }
 
+    /// The bounding box as stored: (left, right, top, bottom) in
+    /// nanodegrees, exactly as the wire holds them.
+    pub(crate) fn raw_bbox(&self) -> Option<(i64, i64, i64, i64)> {
+        self.header
+            .bbox
+            .as_ref()
+            .map(|b| (b.left, b.right, b.top, b.bottom))
+    }
+
     /// Returns a list of required features that a parser needs to implement to parse the following
     /// [`PrimitiveBlock`]s.
     pub fn required_features(&self) -> &[String] {

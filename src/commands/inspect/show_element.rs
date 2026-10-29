@@ -174,8 +174,8 @@ fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io:
         {
             writeln!(out, "  uid: {uid}")?;
         }
-        if claims.user {
-            write_user(out, info.user().ok())?;
+        if let Some(user) = claims.user {
+            write_user(out, user.ok())?; // ok-deliberate: a bad index prints the invalid marker
         }
     }
     Ok(())

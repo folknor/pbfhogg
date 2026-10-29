@@ -1138,6 +1138,22 @@ impl From<DefaultTypeArg> for ElementKind {
     }
 }
 
+/// `digest --form`: which canonical form the report is in.
+#[derive(Clone, Copy, ValueEnum)]
+enum DigestForm {
+    Full,
+    Content,
+}
+
+impl From<DigestForm> for pbfhogg::digest::Form {
+    fn from(arg: DigestForm) -> Self {
+        match arg {
+            DigestForm::Full => Self::Full,
+            DigestForm::Content => Self::Content,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum ExportFormatArg {
     Geojsonseq,
@@ -1653,19 +1669,24 @@ enum Command {
         #[command(flatten)]
         io: DirectIoArg,
     },
-    /// Print a digest of a PBF's element content.
+    /// Print a digest of a PBF, in full (default) or content form.
     ///
-    /// Two files get the same digest exactly when `diff --suppress-common`
-    /// reports them identical, whatever their encoding (compression, blob
-    /// boundaries, dense or plain nodes, indexdata). Prints `xxh128 v1 HEX`,
-    /// then `node|way|relation COUNT HEX` per kind. Refuses, printing
-    /// nothing, any input on which diff's answer is not a function of
-    /// element content: unsorted, out-of-order or duplicate IDs, mixed
-    /// blocks, partial or inaccurate indexdata, unresolvable string
-    /// references.
+    /// `--form full` (`v2`): two files get the same digest exactly when they
+    /// have the same header and the same elements field for field, metadata,
+    /// way coordinates and declared prepass fields included. `--form
+    /// content` (`v1`): exactly when `diff --suppress-common` reports them
+    /// identical. Either is independent of compression, blob boundaries,
+    /// string-table order and indexdata. Prints `xxh128 vN HEX`, then
+    /// `node|way|relation COUNT HEX` per kind. Refuses, printing nothing,
+    /// unsorted input, out-of-order or duplicate IDs, mixed blocks, partial
+    /// or inaccurate indexdata and unresolvable string references, and in
+    /// the full form malformed declared prepass fields.
     Digest {
         /// Input PBF file
         file: PathBuf,
+        /// Canonical form: `full` (v2) or `content` (v1, diff's equality)
+        #[arg(long, value_enum, default_value_t = DigestForm::Full)]
+        form: DigestForm,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -2855,8 +2876,8 @@ pub fn run() -> process::ExitCode {
                     )
                 }
             },
-            Command::Digest { file, io } => {
-                let digest = pbfhogg::digest::digest(&file, io.direct_io, &host)?;
+            Command::Digest { file, form, io } => {
+                let digest = pbfhogg::digest::digest(&file, form.into(), io.direct_io, &host)?;
                 let mut out = output::buffered();
                 digest.write_report(&mut out)?;
                 out.flush()?;

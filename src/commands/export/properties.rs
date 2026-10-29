@@ -1,48 +1,9 @@
 use std::collections::HashSet;
 
-use crate::{DenseNodeInfo, Info};
+/// Export prints the crate's one reading of element metadata.
+pub(super) use crate::read::claims::MetaClaims;
 
 use super::ExportOptions;
-
-pub(super) struct MetaView<'a> {
-    version: Option<i32>,
-    timestamp_millis: Option<i64>,
-    changeset: Option<i64>,
-    uid: Option<i32>,
-    user: Option<crate::Result<&'a str>>,
-    visible: Option<bool>,
-}
-
-impl<'a> MetaView<'a> {
-    pub(super) fn from_info(info: &Info<'a>) -> Self {
-        Self {
-            // A version of 0 is how PBF writers spell "no version"; the other
-            // fields keep their own presence.
-            version: info.claimed_version(),
-            timestamp_millis: info.milli_timestamp(),
-            changeset: info.changeset(),
-            uid: info.uid(),
-            user: info.user(),
-            visible: info.visible_opt(),
-        }
-    }
-
-    /// `None` when the slot claims no metadata: a negative version, or the
-    /// all-zero padding slot of a node without metadata in a block whose
-    /// other nodes carry it. See `DenseNodeInfo::claims` for how a version-0
-    /// slot's fields are read.
-    pub(super) fn from_dense(info: &'a DenseNodeInfo<'a>) -> Option<Self> {
-        let claims = info.claims()?;
-        Some(Self {
-            version: claims.version,
-            timestamp_millis: claims.milli_timestamp,
-            changeset: claims.changeset,
-            uid: claims.uid,
-            user: claims.user.then(|| info.user()),
-            visible: claims.visible,
-        })
-    }
-}
 
 fn push_json_string(buf: &mut String, value: &str) -> crate::Result<()> {
     let encoded = serde_json::to_string(value)
@@ -66,7 +27,7 @@ pub(super) fn write_properties<'a, T>(
     id: i64,
     object_type: &str,
     tags: T,
-    meta: Option<&MetaView<'a>>,
+    meta: Option<&MetaClaims<'a>>,
     opts: &ExportOptions,
 ) -> crate::Result<()>
 where
@@ -97,7 +58,7 @@ where
                 push_name(buf, &mut first, "@version")?;
                 write!(buf, "{value}").ok();
             }
-            if let Some(millis) = meta.timestamp_millis {
+            if let Some(millis) = meta.milli_timestamp {
                 push_name(buf, &mut first, "@timestamp")?;
                 let seconds = millis.div_euclid(1000);
                 push_json_string(buf, &crate::commands::format_epoch_secs(seconds))?;

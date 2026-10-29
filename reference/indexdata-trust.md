@@ -20,8 +20,11 @@ acts on these claims cites it.
 
 Out of scope: the header's feature declarations (`LocationsOnWays`,
 `pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`). They are believed too
-and no command verifies them; their meaning is owned by the "Output header"
-section of the [CLI reference](../docs/cli/commands.md#output-header).
+and no command verifies what they claim; their meaning is owned by the "Output
+header" section of the [CLI reference](../docs/cli/commands.md#output-header).
+`digest --form full` checks only the shape of the two prepass payloads a
+header declares (one well-formed payload per way blob, one bit per ref) and
+refuses a malformed one, since it hashes them.
 
 ## The ruling
 

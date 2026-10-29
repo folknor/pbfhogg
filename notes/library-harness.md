@@ -1,7 +1,14 @@
 # Library harness: design and landings
 
-Status: proposed design, revision 3, under spar. Only the A4 pool join
-is built.
+Status:
+- Decisions A (seal) and B (publications and cancel) are settled by
+  design spar, 2026-10-29, against the protocol as amended in brokkr
+  `3c59ce8` and `75dc76f`. Their specification obligations go to the
+  implementation spar.
+- Decision C (the owned call sink) was argued in the earlier rounds and is
+  carried as it stands.
+- The independent prerequisites have landed: `0e5807c7`, `02192dc3`,
+  `d100ae8f`, `ce104e1e` and `d2d8836a`.
 
 Written against `reference/technical-implementation-spec.md`. Spawned from
 the bz tickets pbfhogg#30 to #38 (filed by brokkr 2026-10-29) and the
@@ -10,379 +17,507 @@ release gate "Library use is verified" in `notes/pre-release.md`.
 The binding contract is brokkr's library harness protocol, version 1:
 `brokkr man library`, source `~/Programs/brokkr/docs/commands/library.md`,
 with its invariants in `~/Programs/brokkr/reference/library-internals.md`.
-pbfhogg ADRs that bind this work: ADR-0016 (the library does not own the
-process), ADR-0017 (outputs are published by the library), ADR-0019
-(cancellation is a caller token checked where the run already passes).
+Version 1 has never been used, so it is amended in place, with no new
+protocol number. Its harness rules beyond library.md are in bz brokkr#59.
+pbfhogg ADRs that bind this work:
+- ADR-0016: the library does not own the process.
+- ADR-0017: outputs are published by the library.
+- ADR-0019: cancellation is a caller token checked where the run already
+  passes.
+
+## Handoff: building this through the loops
+
+For an orchestrator picking this up cold. Everything in this section came
+from the 2026-10-29 session and is recorded nowhere else.
+
+**Standing rulings from the user:**
+- **brokkr first.** pbfhogg never works around a weakness in brokkr's
+  design. If the better fix is in brokkr, stop, write it up (bz in project
+  brokkr, or a reply for the brokkr developer), and wait for it to land.
+- **Protocol v1 is amended in place,** with no new protocol number: it has
+  never been used.
+- **Design passes settle shape only.** Every "for the implementation
+  spar" list and obligations list below is input to the implementer's
+  spar, not to another design pass. Do not reopen Decisions A or B in
+  design without new evidence.
+- **Measure as little as possible.** A benchmark is needed only when a
+  change adds work on a success path, and then it is one matched pair on
+  denmark (`--variant indexed --bench 1`, interleaved against a
+  `--commit` baseline), never planet. A cost above noise comes back to the
+  user instead of landing.
+- **The roster** used for `orchestrate resolve spar`: a Sonnet scout
+  (harness subagent), an Opus implementer (harness subagent), a Sonnet
+  green agent, and a codex spar partner on profile `read`, the only
+  read-only codex profile. One item per implementer. Confirm the roster
+  with the user again, as that procedure requires.
+
+**What to build, in order:** the landing table at the end of this note,
+run as L0, L1, L2, L3, L4, L7, L5, L6. L7 (#36) comes before L5 because
+the concurrent scenarios need a reserving descriptor provider.
+
+L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
+digest` prints the full form, `xxh128 v2`, in `v1`'s four-line grammar,
+and `--form content` keeps `v1` (diff's equality, which brokkr#8's verify
+cache needs). brokkr accepts both since brokkr#60 (`98bddee`). What `v2`
+covers is in `docs/cli/commands.md` "digest": beyond brokkr#60's list it
+also hashes exact nanodegree coordinates and the declared prepass fields.
+Its residue is the re-certification, which waits on a harness (L2 onward):
+a certification under `v1` holds for `v1` only.
+- L0 (irreversible unbacked replacement) stands alone.
+- L1 is #33 per Decision B.
+- L2, the harness skeleton, needs neither seal nor B.
+- L3 and L4 are the seal (Decision A and C). They are the largest and are
+  candidates for a chain under one design document, which is the user's
+  call.
+
+**bz state:**
+- **pbfhogg#31** still describes the superseded general seal contract.
+  Rewrite it to Decision A when L3 or L4 starts.
+- **#32, #33, #34, #35 and #36** are open and map to the landings. #37
+  (L8) is closed; its re-certification is L8's gate below.
+- **#30 and #38** are closed.
+- **brokkr#58** (library-against-CLI timing on `CLI_COMMAND_START` /
+  `CLI_COMMAND_END`) and **brokkr#59's follow-ups** (refusing `exit: 64` in
+  refusal counterparts, rewording its refusal docs) are with the brokkr
+  developer. Nothing here waits on them.
+
+**Practical facts:**
+- **Read the protocol** through `brokkr man library` (the installed
+  binary). Do not read brokkr's working tree while its developer is
+  editing it, and tell spar partners the same.
+- **The CLI contract document** is `docs/cli/commands.md`.
+  `reference/cli-reference.md` does not exist.
+- **`review` prompts** sent through `echo` must avoid backticks, quotes,
+  braces and other shell-special characters, or the permission matcher
+  refuses the call. Write long material into a file and point the partner
+  at it.
+- **Scratch for scouts, implementer reports and the rulings ledger** goes
+  in `.agents/` (git-ignored). Use `rm -f` there, because a plain `rm`
+  prompts.
+- **Exit statuses:** usage errors are 64, runtime failures and refusals
+  2, `check` violations 1, platform refusals 3, cancellation 130 and 143.
+  A harness refusal counterpart declares `exit: 2`.
 
 ## Settled
 
-- The harness is a new workspace member `harness/` (package and bin
-  `pbfhogg-harness`, `publish = false`) beside `cli/`. The repo is not
-  converted to a `crates/` layout.
-- Nothing works around brokkr through `Cargo.toml` (no `default-members`).
-  Packages are selected by brokkr's sweeps.
+- **The member.** The harness is a new workspace member `harness/`
+  (package and bin `pbfhogg-harness`, `publish = false`) beside `cli/`.
+  The repo is not converted to a `crates/` layout.
+- **Nothing works around brokkr through `Cargo.toml`** (no
+  `default-members`). Packages are selected by brokkr's sweeps.
+- **brokkr first.** pbfhogg does not work around weaknesses in brokkr's
+  design. Where the better fix is in brokkr, it lands there first.
+- **Design passes settle shape only.** Specification gaps go to the
+  implementation spar.
 
 ## Survey: what the code does today
 
-1. **Threads that outlive a call.** The rayon pools the library builds
-   itself (the decode pool, the merge-changes `Parallelism::Fixed` pool)
-   are `joined_pool::JoinedPool`s since 2026-10-29: every worker has
-   exited, thread-local destructors included, before the call ends. The
-   session types (`PipelinedBlocks`, `PbfWriter`, the write pipeline,
-   `parallel_writer`) join their own `std` threads on drop. What is left:
-   worker sets run in a `std::thread::scope` without joining their
-   handles (ordered pool, classify, per-stage threads) are waited for
-   only to the end of their main functions, so their thread-local
-   destructors can still run after the call returns. No library thread-local destructor records into an
-   invocation, so seal is unaffected unless one ever does (see
-   `notes/todo.md`).
+1. **Library work does not outlive its owner.**
+   - Library-built rayon pools are `joined_pool::JoinedPool`s
+     (`02192dc3`): every worker has exited, thread-local destructors
+     included, before the call ends.
+   - Every pipelined `PbfWriter` ending waits for its framing jobs
+     (`0e5807c7`).
+   - Sessions join their own threads on drop.
+   - The residue: `std::thread::scope` worker sets are waited for only to
+     the end of their main functions, so their thread-local destructors
+     can trail a call. No library thread-local records into an invocation
+     (`notes/todo.md` "Executor residue").
 2. **Counters that move after return.** A `PooledBuffer`
    (`src/read/decompress.rs`) holds an `Arc<DecompressPool>`, which holds
    an `Invocation` clone. When the last `Bytes` over it drops, the buffer
    returns to the pool, and an oversize, full or poisoned pool counts a
-   `pipeline_decompress_pool_*` drop into the invocation.
-3. **The publication decision.** It is a bare `cancel.check()?` at the
-   top of `Output::publish`, `OutputDir::publish` and `OutputSet::publish`,
-   followed by `publish_all`. Publications of one invocation are
-   serialized by `Invocation::publication_lock` from `PUBLISH_START` to
-   `PUBLISH_END`, which is taken after the decision.
-4. **Output binding.** An output is bound to no invocation at
-   construction (ADR-0019: outputs are built before a run's token need
-   exist). Each member's `Completion` records the invocation its writing
-   session opened under, at the `Reserved -> Writing` transition.
-   `OutputSet` members are lent out individually through `get` and `iter`,
-   so two members can be opened under different invocations. An empty
-   `OutputSet` is accepted, and so is publishing it. `publish` on an output
-   nobody wrote refuses `Unfinished`.
+   `pipeline_decompress_pool_*` drop. The pool stores returned `Vec<u8>`s,
+   not live buffers, so there is no cycle.
+3. **The publication decision** is a bare `cancel.check()?` at the top of
+   `Output::publish`, `OutputDir::publish` and `OutputSet::publish`,
+   followed by `publish_all`. `Invocation::publication_lock` serializes one
+   invocation's publications from `PUBLISH_START` to `PUBLISH_END`, after
+   the decision.
+4. **Output binding.**
+   - An output is bound to no invocation at construction (ADR-0019).
+   - Each member's `Completion` records the invocation its writing session
+     opened under.
+   - `OutputSet` members are lent individually, so two members can be
+     opened under different invocations.
+   - An empty `OutputSet` is accepted.
+   - Placement is `Staging::{Beside, Dir, DirWithBackups}` (`d100ae8f`).
 5. **Holders that escape a call.**
    - Sessions: `PipelinedBlocks`, `PbfWriter`, `OutputWriter`, `DirWriter`.
      `ElementReader` is `Clone`.
-   - `PbfWriter::into_inner` returns `W`, which on the synchronous path
-     can be a `FileWriter` whose later writes record writer metrics.
-   - `RunScratch` escapes `create(host)` and reports diagnostics at
-     cleanup.
+   - `PbfWriter::into_inner` returns `W`, which can be a `FileWriter` that
+     records through its writes.
+   - `RunScratch` reports diagnostics at cleanup.
    - Bound outputs keep their `Completion` after their writer is gone.
-6. **About 40 internal sites clone the invocation** (`write/writer.rs`,
-   `output.rs`, `write/parallel_gzip.rs`, `read/decompress.rs`,
-   `read/input.rs`, `osc/xml_parse.rs` and others).
+6. **Access to invocation state.**
+   - `Invocation` is `Arc<InvocationState>`, and `InvocationState` is
+     private.
+   - `src/` holds no `Weak` and no `Arc` of a metrics type.
+   - `metrics()` returns a borrow of `&self`.
+   - About 40 internal sites clone the invocation.
+   - `Invocation::deliver` forgets caught panic payloads, so a payload
+     holding an `Invocation` is retained forever.
 7. **Generic inputs.** `ElementReader::new` takes any `Read` and no
-   `Host`; it carries its own default token, and `.invocation(inv)`
-   rebinds it. A `PipelinedBlocks` background thread can block forever in
+   `Host`. A `PipelinedBlocks` background thread can block forever in
    `BlobReader::next` on a caller-supplied stream.
 8. **Executors outside a Host.** `PbfWriter::to_path` takes an
-   `Executor` directly, under a fresh invocation of its own, and its drop
-   drains permits cooperatively when run on that executor's worker.
+   `Executor` directly, under a fresh invocation of its own.
 9. **End-of-run emitters.** `emit_read_counters`, `emit_writer_counters`
    and `report_writer_degradations` are public. A textlint names the CLI
-   as their only caller in this repository; it cannot constrain external
-   callers.
-10. **Sink delivery.** `Invocation::with_sink` takes any
-    `Arc<dyn InstrumentSink>`; nothing stops two invocations sharing one.
-    `Invocation::deliver` wraps each callback in `catch_unwind` and
-    latches the sink off after a panic. `CallSink` is `Clone`, unreleased
-    (387daff5), and `MarkerFifo::call` is infallible.
-11. **Certification.** brokkr certifies only when every scenario passed
-    and every required capability passed
-    (`~/Programs/brokkr/src/pbfhogg/library/certify.rs`). Its digest parser
-    accepts `xxh128 v1` only
-    (`~/Programs/brokkr/src/pbfhogg/library/digest.rs`).
+   as their only caller in this repository.
+10. **Sink delivery.**
+    - `Invocation::with_sink` takes any `Arc<dyn InstrumentSink>`.
+    - `CallSink` is `Clone` and unreleased.
+    - `MarkerFifo::call` is infallible.
+    - The CLI writes `CLI_COMMAND_START` / `CLI_COMMAND_END` around its
+      dispatch (`ce104e1e`).
+11. **Exit statuses.** Usage errors exit 64, and runtime failures and
+    refusals exit 2 (`d2d8836a`). brokkr requires a counterpart's `exit`,
+    from 2 to 127.
+12. **Certification.** brokkr certifies only when every scenario passed
+    and every required capability passed. Its digest parser accepts
+    `xxh128 v1` and `v2` (brokkr#60) and treats a version mismatch
+    between the library and CLI reports as a defect.
 
-## Decision A: `Invocation::seal()`
+## Decision A: `Invocation::seal()` (settled)
 
-What #31 asks for: Open, Draining and Sealed states. `seal()` is callable
-from any clone. It closes admission, then drains the admitted calls and
-the workers they own, without ever waiting for executor pool threads. It
-refuses with no state change (`SealFromWithin`) when called from a worker
-of a pool the drain needs, or from inside an admitted operation or a
-callback. It has no deadline of its own. With caller-held blocks
-outstanding it returns `Outstanding(n)` and stays Draining, so it can be
-retried. The final snapshot exists only once Sealed.
+Spar rounds 4 to 7, 2026-10-29, one codex session. This supersedes ticket
+#31's general contract, so #31 is rewritten to it rather than worked
+around.
 
-### Candidates
+### Candidates and why this one
 
-- **A1, the ticket as written:** counters for admitted operations,
-  workers and blocks, an admission guard at every public entry, workers
-  counted through `exit_handler`. Wrong: completeness rests on an
-  inventory, and `exit_handler` fires before a worker is torn down.
-- **A2, kinds by holder type** (revision 2): a `Call` or `Held` token
-  chosen by what holds it. Wrong: one reader or writer runs under either
-  kind depending on what drives it. A `PipelinedBlocks` background thread
-  calling `BlobReader::next` minted a `Call`, so seal waited on a caller
-  stream that would never close.
-- **A3, seal only observes.** Rejected: work admitted after the snapshot
-  changes it.
-- **A4, the proposal:** kinds by what drives the work, explicit internal
-  contexts, and one atomic lifecycle word.
+- **#31 as written** (Draining, waiting on calls and workers,
+  `SealFromWithin`, refusal on rayon workers) built a drain for work that
+  no longer outlives its owner (survey 1). Every waiting hazard came with
+  it: a lost wakeup, starvation, deadlock on executor workers, nested
+  admission and a callback marker.
+- **Seal by unique ownership** (`seal(self)` plus `Arc::try_unwrap`) lost
+  for three reasons:
+  - a forgotten panic payload holding a handle vetoes it forever;
+  - a handle count is not the protocol's census ("every value the caller
+    still held, each counted once");
+  - a failed `Weak` upgrade cannot tell sealed apart from dropped.
+- **No library seal** gives no guarantee of final values and nothing to
+  end the call stream.
+- **Chosen: three separate roles and a seal that never waits.** Identity
+  and control, permission to record, and the census each get their own
+  mechanism.
 
-### A4: what counts
+### The design
 
-A **call** is one outermost public entry in progress: a public function
-or a public method on a library value, from entry to return. Nothing
-else is a call: not a background thread, not a job, not a destructor,
-and not a public function the library calls internally (internal code
-does not go through the public wrappers; see below).
+1. **Control handle.** `Invocation` is a cloneable handle carrying
+   identity, the lifecycle status (Open, Finalizing, Sealed, Failed, held
+   in the state) and the reads: `for_each_counter`,
+   `for_each_publication` and `stream_account`. Holding one, or leaking
+   one, never blocks seal. A read copies under its lock and calls the
+   caller's visitor after releasing it.
+2. **Capabilities gate every mutation.** Every mutation of invocation
+   state needs a `&Call` or a `&Permit` whose borrow lifetime is tied to
+   it. That covers:
+   - counters;
+   - sink delivery and its failure latch;
+   - report-once keys;
+   - publication decisions, effects and abandonment;
+   - cancellation's changes to the publication log;
+   - deferred emitters.
 
-A **lease** is everything else that can still change the invocation
-after the calls that made it returned. Each of these holds exactly one
-lease, from creation to drop:
-- a session (`PipelinedBlocks`, `PbfWriter`, `OutputWriter`, `DirWriter`,
-  each `ElementReader` bound to the invocation and each clone of one);
-- a live `PooledBuffer`;
-- a bound output unit (Decision B), until it is published or dropped;
-- a `FileWriter` that escaped through `into_inner`;
-- a `RunScratch`.
+   The compiler rejects a recorder without one, and that is the proof.
+3. **Call guards.** Every public entry that can record takes a `Call` for
+   its extent: commands, methods on library values, trait methods such as
+   `Write::write` on a library writer, the end-of-run emitters, and
+   `cancel`.
+   - Minting is one CAS that requires Open and increments the count in the
+     same step.
+   - It is refused in Finalizing, Sealed and Failed (`ErrorKind::Sealed`;
+     `cancel` returns `CancelOutcome::Ended`).
+   - Nested and internal entries simply mint, since their enclosing
+     capability keeps the state Open. There is no callback marker and no
+     public-wrapper split.
+   - A call under invocation A that reaches a value bound to B mints on B.
+4. **Permits.** A value holds a permit exactly when it can record outside
+   a public call, through background work or its own `Drop`, and holds it
+   past its last recording and callback. Internal values hold permits
+   too.
+   - A `DecompressPool` holds one permit for its life. Every
+     `PooledBuffer`'s existing `Arc` to its pool keeps that permit alive
+     until the last buffer has returned and recorded. This adds no
+     per-blob work on the invocation word.
+5. **Census tickets** follow the protocol's `held` population. One ticket
+   is minted per issued value identity: when a value the census covers
+   first crosses the API boundary to the caller, returned or passed to a
+   caller callback that can keep it. It retires when that value ceases to
+   exist.
+   - Nesting by the caller is irrelevant, so an issued `OutputWriter`
+     inside an issued `PbfWriter` is two values.
+   - Internally built values get none.
+   - Buffers get a `buffer` ticket only when a block escapes: at receipt
+     in `next`, or before caller code in a block-callback API. This is an
+     explicit escape policy in the internal core.
+   - Tickets are counted under one census mutex, which is bookkeeping
+     only: no recording, callbacks, joins, generic destructors or other
+     locks.
+6. **One transition word.** One `AtomicU64` packs the state, the guard
+   count and the permit total, and the counts saturate into refusal.
+   `seal()` makes one strong `compare_exchange` from Open with guards and
+   permits both 0 to Finalizing. On failure it classifies the word it
+   observed, in this order:
+   1. guards above 0: `Refused(InProgress)`;
+   2. Finalizing: `Refused(Finalizing)`;
+   3. Sealed: the stored result;
+   4. Failed: `Refused(FinalizationFailed)`;
+   5. permits above 0: the census under `try_lock`, which is
+      `Outstanding(census)` with any ticket live, `Refused(Unticketed)`
+      with none, and `Refused(Busy)` on contention.
 
-The background threads and jobs of a session run under its lease and
-mint nothing of their own.
+   Seal never waits and never retries.
+7. **Finalization runs no caller code.** The CAS winner runs these steps
+   in order:
+   1. Takes the snapshot and freezes the publication log, as pure reads
+      into owned data. A panic here sets Failed: no sealing record has
+      been written, so the stream stays `open` and seal reports `refused`.
+   2. Ends the owned `CallSink`'s stream (Decision C).
+   3. Freezes the stream account.
+   4. Only then publishes Sealed with the stored result.
 
-The `L4` survey completes this list: every type that holds an
-`Invocation`, its metrics, a `Diagnostics` from an invocation's `Host`, or
-a `Completion`, and can outlive the call that made it. The compiler finds
-the first two once the field type changes (below); the last two are
-found by grep and recorded in the landing.
+   Concurrent sealers get `Refused(Finalizing)` throughout, so no caller
+   ever sees a successful seal with an open stream. After the snapshot,
+   the invocation is sealed whatever happens to the stream: a failed
+   stream on a sealed invocation is legal in the protocol and reads as
+   unevaluated.
+8. **Leaking is local.** A leaked control handle vetoes nothing. A leaked
+   permit vetoes seal and is reported truthfully: under its kind if
+   ticketed, otherwise as `Refused(Unticketed)`.
 
-### A4: explicit internal contexts
+Against #31: "callable from any clone" holds. "Closes admission" holds,
+by the Open CAS. "Drains calls and workers" is replaced by "refuses while
+calls are in progress", because the library owns no asynchronous work
+that outlives its owner. "Refuses from within" is `Refused(InProgress)`.
+"Outstanding, retryable" is `Outstanding(census)`.
 
-- Library internals never hold the public `Invocation`. They take a
-  crate-private context, `&Work`.
-  - `Work::Call` is lent by an outermost public wrapper for the extent of
-    its call.
-  - `Work::Lease` is the lease of the session or value the code runs
-    under.
-- `metrics()`, `marker()`, `counter()`, the library's own `check()` and
-  sink delivery are methods on `Work`, never on `Invocation`.
-- Every public function and public method is a thin wrapper over an
-  internal implementation that takes `&Work`. The wrapper enters the call
-  (below), and library code calls the implementations, never the public
-  wrappers. That is what keeps a command's internal construction of a
-  `PbfWriter`, or a background `BlobReader::next`, from counting as a
-  call. A textlint checks that `src/` calls no public wrapper; clippy's
-  `disallowed_methods` names each one.
-- Minting a lease needs a `&Work`, so a lease can be minted only under a
-  call in progress or under another live lease.
+### Obligations for the implementation spar
 
-### A4: the user-callback marker
+These are specification gaps the design pass recorded rather than
+resolved.
 
-The one place a thread-local is still needed is caller code that runs
-inside a call: an `ElementReader` closure, a sink, a `DiagnosticSink`, a
-custom `Read` or `Write`. Every such callback runs under a thread-local
-marker naming the invocation. The marker is used twice:
-- An outermost public entry made on a thread that carries the marker is
-  a nested call. It counts nothing new and is not refused while Draining,
-  because the call around it is still in progress.
-- `seal()` on a marked thread is refused with `SealFromWithin`.
+- **Committing to the terminal record.** Everything that can panic is
+  prepared before the terminal write. After the terminal record is
+  written, accounting and publication of the result go through
+  operations that cannot unwind, and the terminal state is never changed
+  afterwards. A missing terminal record is counted only if it really is
+  missing.
+- **Publication ordering.** Retiring a call or permit publishes its writes
+  before decrementing (Release), and the finalizing CAS acquires them
+  (Acquire), including through the decrement sequence by which the
+  finalizer observes zero. The census mutex does not order unticketed
+  recorders.
+- **Ticket identity.** A consuming builder that returns the same value
+  mints no second ticket. An already-ticketed inner value returned keeps
+  its ticket. An unbound output gets its registration point when it binds.
+  Retirement covers consuming operations and unwind.
+- **Destructor discipline.**
+  - A capability lives through `Drop::drop` and all later field
+    destruction.
+  - A local moved out (`PbfWriter::drop` takes its pipeline out) carries
+    its own capability.
+  - Each child that records independently owns a permit.
+  - A partly built value holds its permit before its first recording or
+    dispatch.
+  - Retirement and finalization use private administrative authority.
+  - The mutation interface is unreachable from the control handle,
+    cached metric references, publication-log accessors and raw atomics.
+- **The census list.** Confirm `session`, `writer`, `output` and `buffer`
+  against the criterion. No permit and no ticket go to values that record
+  only through methods: an idle `ElementReader`, a `FileWriter` whose
+  drop-flush bypasses its metrics, a `DirWriter`, a `RunScratch`.
+- **Cost.** The block APIs gain one census-mutex lock per escaped block at
+  mint and at retire. When built, this is gated by one matched pair on
+  denmark on a command that uses the block API.
+- **Liveness of drop.** Dropping a `PipelinedBlocks` blocked in a caller's
+  `Read` still blocks. Document it as the caller's obligation.
 
-The library's own threads carry no marker, because library code never
-re-enters through public wrappers.
+## Decision B: publication decisions and cancel (#33) (settled)
 
-### A4: one lifecycle word
+Design spar, 2026-10-29. The first proposal (one log per invocation,
+binding at the first writer open, effects read from final `State`) lost
+on four points, each verified:
+- **Two members of an unbound set** opened under different invocations
+  have no common lock to arbitrate which one binds.
+- **Binding at the first writer open** misses a command that fails or is
+  cancelled before opening its output.
+- **Ordinal order is not filesystem order.** `publication_lock` is taken
+  after the decision and the hooks, in `PublishSpan::start`.
+- **Effects cannot be reconstructed from cleanup state.** A restored
+  target and an untouched one both end `Staged`. And a lone file replaced
+  without a backup, then rolled back, destroys the previous generation,
+  which no protocol effect can describe.
 
-`InvocationState` gains one `AtomicU64` packing the state (Open,
-Draining, Finalizing, Sealed), the call count and the lease count. Every
-transition is one CAS on that word:
-- **Enter a call:** state Open, then calls + 1. On a marked thread
-  (nested) nothing changes and the entry proceeds. Otherwise, in
-  Draining, Finalizing or Sealed it is refused with a new
-  `ErrorKind::Sealed`.
-- **Leave a call:** calls - 1, and notify when the count reaches 0.
-- **Mint a lease:** leases + 1. Allowed in Open or Draining only; a
-  `&Work` exists in Draining only under a live call or lease, so no
-  minting reaches Finalizing.
-- **Retire a lease:** leases - 1, after the value's last recording and
-  callback (a returning buffer records its pool metrics, and then
-  retires).
-- **Begin sealing:** Open to Draining.
-- **Finalize:** Draining to Finalizing, only when calls = 0 and
-  leases = 0, checked in the same CAS. This removes the
-  observe-then-claim race.
+The settled shape is the following. No brokkr change is needed.
 
-### A4: `seal()`
+1. **Binding is explicit and consumes the owner.**
+   - `Output::bind(self, &Invocation) -> BoundOutput`, with the same for
+     `OutputDir` and `OutputSet`. Members of a set are lent only after
+     the whole set is bound, and inherit its invocation, which cannot
+     change.
+   - Construction can still come before the invocation exists, as
+     ADR-0019 requires.
+   - Two invocations cannot compete for one unit, because binding happens
+     on an owned value.
+   - Command entry points bind their outputs to the host's invocation at
+     entry.
+2. **Pending means enlisted.** Binding registers the unit as pending in
+   its invocation's log: "this invocation has accepted responsibility for
+   deciding this publication". It also mints the unit's permit and its
+   `output` census ticket (Decision A). Opening a writer changes only
+   session state.
+3. **The log** is one mutex per invocation holding plain data: decided
+   rows, the pending set and the next ordinal. It owns no outputs. It
+   never covers hooks, sink delivery, filesystem operations or generic
+   destruction.
+4. **`BoundOutput::publish(self)`** uses the invocation it stores and
+   mints a `Call` on it, so publishing under the wrong token cannot be
+   written. A command handed an output bound to an invocation other than
+   its `Host`'s still refuses it (`InvalidArgument`).
+5. **Admission is serialized through completion.** In order:
+   1. take the invocation's publication execution lock, held until the
+      publication finishes;
+   2. under the log lock, decide (tripped: `refused_cancelled`; a
+      readiness refusal: `refused_error`; otherwise `authorized`), take the
+      next ordinal and release the log lock;
+   3. run the hooks and the publication;
+   4. record the effects in the row and release the execution lock.
 
-1. **Refuse** with `SealFromWithin`, changing nothing, when the calling
-   thread carries this invocation's marker. Also refuse when the thread
-   is a rayon worker (`rayon::current_thread_index().is_some()`) and the
-   call count is above 0. Waiting there could starve work that needs the
-   worker's pool, and no inventory of the pools that work needs is
-   complete:
-   - under `Executor::Ambient` the pool is chosen at submission;
-   - an executor handed straight to `PbfWriter::to_path` passes through no
-     `Host`.
+   So ordinal order is execution order within an invocation. Ordinal
+   order for a role shared across invocations is the harness's rule
+   (brokkr#59). `cancel` takes only the log lock, so it can decide pending
+   units while an authorized publication runs. Whether a callback may
+   re-enter publication is policy for the implementation spar.
+6. **`cancel()` is invocation-wide**, as ADR-0019 already allows (a token
+   for a group meant to stop together). Under a `Call` and the log lock it
+   sets `tripped`, then answers:
+   - pending units exist: it decides each `refused_cancelled` in bind
+     order and returns `BeforeDecision { refused: k }` with the first;
+   - none pending, but some unit authorized: `AfterDecision { authorized: k }`
+     with the latest;
+   - otherwise `NoPublicationPending`.
 
-   With no call in progress seal never waits, so it is allowed on any
-   thread. This is a deliberate narrowing of the supported calling
-   contexts. The protocol is compatible with it: a refusal is reported as
-   `seal: refused`.
-2. **Close admission:** Open to Draining. Calls now only end, so the
-   count only falls and seal cannot be starved.
-3. **Drain:** wait (condvar, no deadline) until calls = 0.
-4. **Finalize:** try the finalize CAS.
-   - If leases are still above 0, return `Outstanding(n)` and stay
-     Draining. The protocol's `outstanding_blocks` field reports `n`.
-     Retrying starts at step 3.
-   - If another thread is Finalizing, wait until Sealed and return its
-     snapshot.
-   - If the CAS wins: take the snapshot (immutable, behind an `Arc`), end
-     the call stream (Decision C), then store Sealed, notify and return.
+   K is one witness among the units it refused, not a summary of every
+   concurrent command; the protocol checks only K and the refused suffix.
+   Cancelling one command among several needs separate invocations.
+7. **Abandonment is owned by the publication owner,** not by the shared
+   `Completion`.
+   - Dropping a bound owner that is still pending decides it
+     (`refused_error`, or `refused_cancelled` if tripped), then retires its
+     permit and ticket.
+   - Dropping one set member does not abandon the set, and surviving
+     writers do not become the owner.
+   - Responsibility moves into `publish_all` and covers every early
+     return and unwind.
+8. **Effects are recorded from namespace transitions**, each successful
+   rename or removal, and finalized after publication or rollback. They
+   are never reconstructed from cleanup state:
 
-While Draining a caller can only drop what it holds: every public entry,
-the methods of its held sessions included, is refused, while drops
-retire leases as usual. So `Outstanding` means "you still hold these;
-drop them and retry". A writer not finished before seal cannot be
-finished after it: dropping it abandons its output, decided
-`refused_error`. This is the contract: seal ends the invocation.
+   | Path | Effect |
+   |---|---|
+   | readiness, recheck or staged-sync failure before the namespace changes | none |
+   | new generation removed, destination absent beforehand | none |
+   | previous generation moved aside and put back | restored |
+   | previous generation kept privately, destination absent | displaced |
+   | new generation remains after a failed rollback | installed |
+   | completed installation, `Unsynced` included | installed |
 
-From Finalizing on, nothing is admitted, marked or not, and once Sealed
-the invocation delivers nothing to any sink.
+   A directory `TakenOut` with a backup is displaced, and without one it
+   is none. A group gets an independent result for every member, untouched
+   members after the failing one included. Every member of a refused
+   decision is none.
+9. **Unbacked replacement is irreversible.** A lone file replaced by
+   rename-over, with no backup, is a commit boundary. A failure after it
+   keeps the new generation installed (`installed`) and never rolls back
+   into destruction. This is a pbfhogg fix: the current rollback can
+   destroy the previous generation after an `AfterInstalled` failure.
+   Keeping that behaviour would need a protocol effect for destructive
+   loss, which is rejected.
+10. **Reads.** `for_each_publication` copies the rows under the log lock
+    and calls the visitor afterwards.
+11. **Contract.** Amend ADR-0019 and ADR-0017:
+    - explicit binding before work, with an immutable bound identity;
+    - the decision includes readiness and is made under the unit's own
+      invocation;
+    - admission is serialized through completion;
+    - cancel decides pending units;
+    - effects are a reported result of publication;
+    - unbacked replacement is irreversible.
 
-### A4: library-built pools join for real
-
-Landed 2026-10-29 as `src/joined_pool.rs`: a library-built pool's
-threads are gone when the call that built it ends, so seal has none to
-drain. What seal inherits from it:
-- The join waits for rayon's detached work on the pool. A caller callback
-  on one of its workers that submits rayon work, or creates a thread-local
-  whose destructor waits on something after the call, makes the call
-  never end; the `InstrumentSink` and `DiagnosticSink` contracts forbid
-  that. A seal design must not weaken the rule.
-- `build_scoped` and `std::thread::scope` were rejected: scope waits only
-  for a thread's main function, not its thread-local destructors.
-
-## Decision B: publication decisions and cancel (#33)
-
-**B1, the ticket's CAS word,** loses to B2 because B2 also has to carry
-the publication log.
-
-**B2, a mutex-guarded log per invocation (proposed).**
-
-- **Units.** One publication unit per `Output`, `OutputDir` or
-  `OutputSet`; an `OutputSet` creates one unit and shares it with its
-  members. An empty `OutputSet` is refused at construction
-  (`InvalidArgument`), since it would be a publication of nothing.
-- **Binding.** A unit is Unbound, then Bound(invocation). The first
-  writing session opened on any member binds it; a lease (Decision A) is
-  minted then. A session opened under another invocation is refused at
-  open, before anything is written (`InvalidArgument`). So every member
-  of a set, and every write of an output, is under one invocation, and
-  the unit is pending in exactly that invocation's log.
-- **Ordinals are assigned at decision**, so ordinal order is decision
-  order.
-- **The decision** happens at the top of `publish`. It is made in the
-  unit's own log if the unit is bound, otherwise in the log of the
-  invocation passed to `publish`.
-  - A bound unit published under another invocation is decided
-    `refused_error` in its own log. The token passed does not decide it;
-    the unit's own token does.
-  - Otherwise, under the log lock: tripped gives `refused_cancelled`; a
-    readiness refusal (`check_ready`, such as `Unfinished` for an output
-    nobody wrote) gives `refused_error`; anything else is `authorized`.
-  - A unit `cancel` already decided returns `Cancelled` without a new
-    entry.
-- **`cancel()`** takes the log lock and sets `tripped`. Then:
-  - If any unit is pending (bound and undecided), cancel decides every one
-    `refused_cancelled` on the spot, assigning ordinals in the order they
-    were bound, and returns `BeforeDecision { refused: k }` with the first
-    of them.
-  - Otherwise it returns `AfterDecision { authorized: k }` for the latest
-    authorized unit, if there is one.
-  - Otherwise `NoPublicationPending`.
-
-  Every later decision sees `tripped` and refuses, so everything after
-  `k` is refused. Checkpoints keep their relaxed load of `tripped`.
-- **Dropped units.** A unit dropped while still pending is decided at
-  drop: `refused_error`, or `refused_cancelled` if tripped. A decided
-  unit keeps its decision. The drop then retires the unit's lease.
-- **`installed`** is reported by `publish_all`, not inferred from the
-  result. It is true when any new generation is visible at any
-  destination when publication returns, so `Unsynced` is installed, and
-  so is a rollback that left a member installed. `false` means no
-  destination changed.
-- **`Invocation::for_each_publication`** hands the harness its
-  `publications` array.
-- **Contract:** amend ADR-0019. The decision now includes the readiness
-  refusals and is taken under the unit's own invocation, cancel decides
-  pending units, and binding moves from the member to the unit.
+**For the implementation spar:** the guard layout for abandonment, the
+retirement order of tickets and permits, allocation and unwind handling,
+the path-by-path transition and fault matrix for effects, and the
+callback re-entry policy.
 
 ## Decision C: ending the call stream (#32)
 
-- **C1, generic sink plus harness-driven end.** Wrong: `with_sink` takes
-  any `Arc<dyn InstrumentSink>`, so nothing proves which invocation a sink
-  belongs to.
-- **C2, a `sealed` hook on `InstrumentSink`** (revision 2). Wrong for the
-  same reason: a shared sink, a forwarding sink inheriting the no-op, or a
-  direct call to the public hook all break identity.
-- **C3, the invocation owns its call sink (proposed).**
+- **C3, the invocation owns its call sink.**
   - `Invocation::with_call_sink(CallSink, tap: Option<Arc<dyn InstrumentSink>>)`
-    takes the `CallSink` by value. `CallSink` is no longer `Clone`, so
-    exactly one invocation owns each one, by construction.
-  - The tap is a caller observer that sees every ordinary marker and
-    counter after the sink has taken it. It gets nothing at sealing, and
-    a panicking tap is latched off on its own. The cancel scenarios trip
-    their token from the tap, so no forwarding sink stands between the
-    invocation and its `CallSink`.
-  - `Invocation::stream_account()` returns the sink's `{state, drops}`
-    for the artefact.
-  - Generic `with_sink` stays for other sinks, which have no sealing
-    semantics.
-
-  **Ending the stream.** The finalizing seal thread is the only one that
-  can end it, and it runs the steps in order:
-  1. Flip the sink's cell from Open to Closing.
-  2. Wait for in-flight ordinary emissions to reach 0. An ordinary
-     emission holds the in-flight count across its whole path (name
-     validation, drop accounting, stamping, writing), released on every
-     path including unwind.
+    takes a non-`Clone` `CallSink` by value.
+  - The tap sees every ordinary record after the sink. It gets nothing at
+    sealing, and a panicking tap is latched off on its own. The cancel
+    scenarios trip their token from the tap.
+  - Generic `with_sink` stays for sinks without sealing semantics.
+  - The rejected alternatives, a generic sink with a harness-driven end
+    and a `sealed` hook on `InstrumentSink`, cannot prove which invocation
+    a sink belongs to.
+- **Ending the stream** runs on the finalizing seal thread (Decision A
+  item 7), in order:
+  1. Flip the sink from Open to Closing.
+  2. Wait for in-flight ordinary emissions to finish. Each holds the
+     in-flight count across validation, drop accounting, stamping and
+     writing, released on every path.
   3. Write every `@@name=value` line from the snapshot (saturated to
      `i64::MAX`, zeros included).
   4. Write the terminal record: `!sealed drops=N`, or `!failed drops=N`
-     after a hard write error (anything but `EAGAIN`).
-  5. Freeze the account as Closed.
+     after a hard write error.
+  5. Freeze the account.
 
-  More rules:
-  - **Identity.** The `MarkerFifo` shared state refuses an id it has
-    already issued, so `MarkerFifo::call` becomes fallible.
-  - **The terminal write.** If it is dropped, the account counts it:
-    `drops` is N + 1, while the lost record said N, as library.md
-    specifies.
-  - **A panic.** This is library code, not a caller callback, so the
-    `sink_failed` latch does not apply. If a panic happens anyway, it is
-    contained, the account is frozen as `failed` and a drop is counted for
-    the missing terminal record. The stream then reads as unevaluated,
-    never as a false pass.
-  - **After Closed,** ordinary attempts are ignored and counted nowhere.
-  - **Drops.** `Line::emit` reports a drop. Refused names count as drops
-    while Open. The reserved forms (a tagged marker starting `!`, a
-    counter name starting `@`) are refused.
+  Once the account is Closed, ordinary attempts are ignored and counted
+  nowhere.
+- **Identity.** `MarkerFifo::call` becomes fallible and refuses an id it
+  has already issued.
+- **Drops.** A dropped terminal record is counted in the account (N + 1
+  against the record's N). `Line::emit` reports a drop, and refused names
+  count while Open. The reserved forms (a tagged marker starting `!`, a
+  counter name starting `@`) are refused.
 
 ## Decision D: end-of-run counter emission order
 
-The ticket's order: the call returns; the harness calls
-`emit_writer_counters`, `emit_read_counters` and
-`report_writer_degradations`; then it seals and takes the snapshot.
-These emitters become public wrappers like any other: each is a call, so
-it is refused once Draining begins. Counters emitted before the drain can
-be below final, which the protocol allows (only an ordinary counter
-above its final value is a defect). Proposed: keep the ticket's order.
+The call returns; the harness calls `emit_writer_counters`,
+`emit_read_counters` and `report_writer_degradations` (each a `Call`);
+then it seals. Counters emitted before the snapshot can be below their
+final values, which the protocol allows: only an ordinary counter above
+its final value is a defect.
 
 ## Decision E: the harness member
 
-- **`harness/src/protocol.rs`:** typed describe, request, artefact and
-  refusal documents. Every number is a JSON integer, and long text is cut
-  at a character boundary with `truncated`.
+- **`harness/src/protocol.rs`:** typed documents per `brokkr man library`.
+  Every number is a JSON integer, and long text is cut at a character
+  boundary with `truncated`.
 - **`harness/src/runner.rs`:** per call, in order:
-  1. A fresh `Invocation::with_call_sink(call_sink, tap)` and a
-     collecting `DiagnosticSink`.
-  2. `entry_us`, then the call, then `return_us`. The call spans
-     everything it does: `entry_us` is taken before its outputs and
-     readers are constructed.
+  1. A fresh `Invocation::with_call_sink(call_sink, tap)`, and a
+     collecting `DiagnosticSink` that stamps each event's `at_us` from
+     `now_us()`.
+  2. `entry_us` (before the call's outputs and readers are constructed),
+     then the call, then `return_us`.
   3. The end-of-run emitters (Decision D).
-  4. `seal()`, then `seal_us`.
-  5. Into the call document: the snapshot,
-     `Invocation::stream_account()`, the publications, the cancel result
-     and the context.
+  4. `seal()`, then `seal_us`. The census is kept as taken at this
+     attempt.
+  5. Drop every value of the call, and wait for every callback
+     attributable to it.
+  6. Close and snapshot the call's diagnostics.
+  7. Write the call document: the snapshot, `stream_account()`, the
+     publications, the cancel result and the context.
 
-  Exit 0, 1 or 2 from the results.
+  Setup's and the harness's own diagnostics go in `scenario.json`. Exit
+  0, 1 or 2 from the results.
 - **`harness/src/scenarios/`:** one file per family behind a `Scenario`
-  trait (describe, plan, setup, run, assert). From #34 item 6:
+  trait (describe, plan, setup, run, assert):
 
   | Scenario | What it does |
   |---|---|
@@ -394,141 +529,72 @@ above its final value is a defect). Proposed: keep the ticket's order.
   | `nofile-cat-refused` | about 1000 generated inputs at soft 1024 |
   | `nofile-altw-external` | completes with three stage-1 workers |
   | `error-path` | a bad input gives an error outcome and no stderr |
+  | `seeded-replace` | a `seeded: true` output replaced, and one refused under `Overwrite::Refuse` |
   | `isolation-cat` | one call, with `hotpath` and `isolation` set |
 
-- **CLI counterparts.** A `cli` counterpart is declared only for a call
-  whose plan expects an `ok` outcome and an installed PBF output. brokkr
-  requires the library output to exist as a regular file and the replay
-  to exit 0, and it has no expected-refusal mode.
-- **Staging and scratch.** Every output a call constructs takes
-  `Staging::DirWithBackups(private_dir)`, the `--private-dir` brokkr passes,
-  and every `RunScratch` is created in it. Then nothing a publication
-  creates lands in `roles/` (brokkr's layout check refuses any undeclared
-  entry there): staging entries and the backups of replaced directory roles
-  and group members all live in the private directory. A displaced
-  publication's kept backup goes with brokkr's release of that directory,
-  as the protocol's `displaced` effect says; whether it survived until then
-  is the harness's own assertion to make, before the call document is
-  written. `Staging::Dir` would leave such a backup in `roles/`.
+- **CLI counterparts.**
+  - `expect: "output"` for calls expected to publish.
+  - `expect: "refusal"` for refused or failing calls, with a required
+    `exit` (2: pbfhogg's runtime refusal; never 64, a usage error). A
+    cancelled call gets none.
+  - `overwrite` is declared per counterpart.
+- **Harness rules from brokkr#59:**
+  - no call publishes content identical to its role's seed;
+  - publications that share a role run in ordinal order, rollback
+    included.
+- **Staging and scratch.** Every output takes
+  `Staging::DirWithBackups(private_dir)`, and every `RunScratch` is
+  created in the private directory, so nothing lands in `roles/`. Whether
+  a displaced backup survived is the harness's own assertion.
 - **Generated inputs.** A `hotpath` scenario binds only dataset roles,
-  because setup in a profiled run may do no library work. Non-profiled
-  scenarios may generate fixtures with the library during setup.
+  because setup in a profiled run may do no library work.
 - **Process policy.** The harness sets its own soft `RLIMIT_NOFILE` per
   plan before library work and never touches SIGPIPE. A panic reaches
-  stderr through the default hook, which fails the run, and brokkr keeps
-  the evidence.
+  stderr, which fails the run.
 - **Profiling.** The `hotpath` and `hotpath-alloc` features forward to the
   library. The guard exists only in `--test-harness` with
-  `HOTPATH_OUTPUT_PATH` set, and is dropped after seal and before
-  returning from `main` (never `process::exit`). The counting allocator
-  lives in `harness/src/main.rs`.
+  `HOTPATH_OUTPUT_PATH` set, and is dropped after seal, before returning
+  from `main`. The counting allocator lives in `harness/src/main.rs`.
 - **Wiring:**
   - `[pbfhogg.library.harness]` in `brokkr.toml`;
   - the member selected by the `all`, `consumer` and `musl` sweeps;
-  - the emitter textlints widened to admit `harness/`;
+  - the emitter textlints widened to admit it;
   - the #24 guards (no child process or descriptor reset, no file status
     flag change, the test-only seccomp guard) extended to `harness/`;
   - the library-only bans (env reads, setrlimit) not applied to it.
-- **Tests.** Each scenario runs in-process against generated fixtures, so
-  the suite still passes with an empty `data/`. brokkr remains the
-  protocol validator.
+- **Tests.** Scenarios run in-process against generated fixtures, so the
+  suite still passes with an empty `data/`.
 
 ## Landings, in order
 
-Every landing that changes a lifecycle carries deterministic tests for
-it, built on `test-hooks` parking points and placed per
-`reference/testing.md`. `verify` proves output parity and cannot see a
-lifecycle bug, so these tests are each landing's real gate. Thread-count
-baselines are not used, because unrelated tests create threads too.
+Every landing that changes a lifecycle carries deterministic tests built
+on `test-hooks` parking points, placed per `reference/testing.md`.
+Measure only where a change adds work on a success path, with one matched
+pair on denmark.
+
+Landed independently, 2026-10-29:
+- `0e5807c7`: framing jobs waited for at every writer ending.
+- `02192dc3`: joined library pools.
+- `d100ae8f`: `Staging::DirWithBackups`.
+- `ce104e1e`: the CLI command interval (#38).
+- `d2d8836a`: usage errors exit 64.
 
 | # | Landing | Gate |
 |---|---|---|
-| L1 | #30 clock-anchor fix, stale notes, hotpath 0.30.1 audit pin (done, uncommitted) | `brokkr check` |
-| L2 | #33: publication units and their binding state machine, refusal of empty sets, decision-time ordinals, cancel deciding pending units, `installed` out of `publish_all`, `for_each_publication`, ADR-0019 amendment | `brokkr check`, with tests for: reversed creation and publication order; one entry per `OutputSet`; a second member opened under another invocation refused at open; an unwritten output published; a bound unit published under another invocation; cancel parked against a decision from both sides; `Unsynced` and a failed rollback reporting installed; a pending unit dropped; a decided unit dropped; a failed session construction |
-| L3 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with a CLI counterpart and no stream capabilities, `brokkr.toml` table, sweeps, textlints, #24 guards, hotpath features. Seal is reported refused, so brokkr fails each call's `brokkr.seal` and nothing else, while describe, layout, CLI equality and digest get exercised early | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
-| L4 | `src/work.rs`: `Work` contexts and the public-wrapper split across the API, the lease inventory, the lifecycle word with Open only, the user-callback marker, and textlint plus `disallowed_methods` against internal calls of public wrappers. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: calls and leases back to 0 after every command returns and its values drop; a held `PipelinedBlocks` blocked on a caller stream counting one lease and no call; an escaped `FileWriter` and a `RunScratch` each holding a lease; a nested public entry from a callback counting nothing; `brokkr verify all --dataset denmark --variant indexed` |
-| L6 | #31 and #32 as one contract: Draining, Finalizing and Sealed in the lifecycle word, `SealFromWithin`, `Outstanding`, `with_call_sink` and the tap, the non-`Clone` `CallSink` with its closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, ADR-0020 (the seal contract). The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent seal callers returning one snapshot only after the terminal record; seal from a callback, from the tap, and from a rayon worker with a call in progress refused; seal from a rayon worker with no call allowed; a nested entry while Draining accepted and a fresh one refused; Finalizing refusing a marked thread; the finalize CAS racing a lease retirement and a nested call; an outstanding buffer released and a retry; a held session reported outstanding; a panicking tap; the terminal write dropped; the in-flight emission barrier. `brokkr library repeat-cat --dataset denmark` passes |
-| L7 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once: `brokkr library SCENARIO --dataset denmark` |
-| L8 | #35 capability ids in `[pbfhogg.library.require]` and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
-| L9 | #38 CLI entry and return marker pair; #36 reserving descriptor provider | per landing |
-| L10 | #37 full-fidelity digest: a `v2` canonical version. Cross-repo, landing together with brokkr's acceptance of `v2`; until then brokkr fails every counterpart naming the version. A stronger equality can fail a scenario, and certification requires every scenario to pass, so certify again after it lands | `brokkr check`; `brokkr library --all --dataset denmark` certifies again |
-
-## Parked after spar round 3 (2026-10-29)
-
-Work is parked here: what belongs in brokkr gets fixed there first.
-Protocol v1 has never been used, so it is amended in place, with no new
-protocol number.
-
-### brokkr changes, first
-
-1. **Expected-refusal counterparts.** CLI equality requires the replay to
-   exit 0 and the library output to exist. A refused, cancelled or failing
-   call therefore has no counterpart, and `nofile-cat-refused` and
-   `error-path` lose the check that matters most: that the CLI refuses the
-   same input and publishes nothing. Needed: a counterpart mode that
-   expects a non-zero exit and an absent output.
-2. **`seal.outstanding_blocks`.** The field is named for blocks, but what
-   it counts is every held value: sessions, bound outputs and escaped
-   writers. Rename it to a count of held values.
-3. **`publications[].installed`.** A boolean cannot describe a failed
-   rollback. An old destination can be moved to backup, installation can
-   fail and restoration can fail, so no new generation is visible and yet
-   the destination changed. Needed: a richer per-publication effect, such
-   as none, new generation installed, or destination damaged.
-4. **The diagnostics boundary.** library.md does not say up to when a
-   call document's `diagnostics` must be complete. A `SummaryWriter` or an
-   unbound `Output` dropped after seal can still report. State the
-   boundary (captured up to `seal_us`), or require nothing after it.
-5. **Drop "Protocol 1 is final"** from `docs/commands/library.md` and
-   `reference/library-internals.md`. Nothing has produced v1 yet.
-
-### Ticket #31's shape, not yet sparred
-
-Most of round 3's difficulty comes from #31's general contract rather
-than from what protocol v1 needs: seal callable from any thread and any
-clone, concurrent sealers, waiting with no deadline, nested admission
-while Draining, refusal on rayon workers. The protocol needs only that
-the snapshot is final, the sink ended, and held values are reported. A
-narrower seal deserves an argument of its own: no waiting on calls in
-progress (`InProgress` is a refusal), with asynchronous library work
-accounted for by leases. If it wins, #31 is rewritten, not worked around.
-
-### pbfhogg design defects found in round 3 (verified)
-
-- **The rayon refusal is checked before admission closes:** a call can be
-  admitted between the check and the Open to Draining CAS. The refusal
-  must be decided on the same observed word as the close.
-- **Trait dispatch reaches public wrappers:** `FileOutputSink` writes
-  through `FileWriter`'s public `Write`, and generic `W: Write` paths do
-  the same. Internal cores or context-bearing adapters are needed for
-  trait operations. `Clone` on `ElementReader` and `BlobReader` cannot
-  return `Sealed`; choose removing it, a fallible clone, or allowing it
-  while Draining.
-- **The callback marker:** a callback under a lease has no surrounding
-  call, so a nested entry must borrow the enclosing `Work`, not just an
-  identity. Implicit caller code needs the marker too: `Display` through
-  `write_fmt`, generic `R::clone`, and the destructors of generic `R` and
-  `W` fields, which needs deliberate field teardown.
-- **Diagnostics have no provenance:** `SummaryWriter`, and an unbound
-  `Output`'s cleanup report, reach the sink after seal. Distinguish
-  detached diagnostics from invocation-bound ones.
-- **Lost wake:** the lifecycle word needs a mutex handshake with the
-  condvar (or a validated park) for both waits, plus Acquire ordering
-  before the snapshot.
-- **Binding needs explicit ownership rules:**
-  - Bound and pending must be one linearization point.
-  - A lock order is needed across unit, `Completion`, log and lease.
-  - The log must not own the units it observes, or abandonment can
-    never happen.
-  - Abandonment is tied to the publication owner's drop.
-- **Liveness:** dropping a `PipelinedBlocks` blocked in a caller's `Read`
-  blocks too. Document the caller's obligation, or let detached work keep
-  its lease until it ends.
-- **Control operations:** `seal`, `cancel`, `stream_account` and the
-  publication log need explicit exemptions from admission.
+| L0 | Unbacked replacement is irreversible: a lone file replaced by rename-over is a commit boundary, so a later failure keeps it installed instead of rolling back into destroying the previous generation. Independent of the rest, and a fix on its own | `brokkr check`, with the `AfterInstalled` fault on a lone replaced file now keeping the new generation |
+| L1 | #33 per Decision B: explicit `bind` on outputs, directories and sets, with command entry points binding at entry; the per-invocation log; admission serialized through completion; effects recorded from namespace transitions; invocation-wide cancel deciding pending units; `for_each_publication`; ADR-0017 and ADR-0019 amendments | `brokkr check`, with tests for: reversed creation and publication order; ordinal order equal to execution order with a hook parked; one row per set; a command failing before it opens its output recording `refused_error`; cancel parked against a decision from both sides; every effect, restored and displaced included, through publication faults; a group with a failing middle member; dropping one set member leaving the set pending |
+| L2 | Harness skeleton: member, describe and run modes, runner, `repeat-cat` with an output counterpart, wiring, hotpath features. Seal is reported refused until L4 | `brokkr check`; `brokkr library`; `brokkr library repeat-cat --dataset denmark`, which fails on exactly the `brokkr.seal` results |
+| L3 | Decision A's capabilities: control handle, `Call` and `Permit`, the transition word Open-only, census tickets, the pool permit. Admission always succeeds, so behaviour does not change | `brokkr check`, with tests for: guards and permits back to 0 after every command and drop; a held `PipelinedBlocks` blocked on a caller stream holding a permit and a ticket and no guard; a nested entry minting normally; `Refused(Unticketed)` impossible in a quiescent run |
+| L4 | #31 and #32 as one contract: the seal states and classification, finalization order, `with_call_sink` and the tap, the non-`Clone` `CallSink` closing sequence and drop counts, fallible `MarkerFifo::call`, the reserved forms refused, and an ADR for the seal contract. The harness reports real seal and stream values | `brokkr check`, with tests for: concurrent sealers refused until the account is frozen; seal from a callback refused; the CAS racing a retirement and a nested call; an outstanding buffer released, then a retry; a panic before and after the snapshot; a panicking tap; a dropped terminal record; the in-flight emission barrier; block-API cost on one matched denmark pair. `brokkr library repeat-cat --dataset denmark` passes |
+| L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
+| L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
+| L7 | #36 reserving descriptor provider (needed by the concurrent scenarios) | per landing |
+| L8 | #37 full-fidelity digest `v2`. Landed: `digest` defaults to `--form full` (`v2`), `--form content` keeps `v1`; brokkr accepts both (brokkr#60). Remaining: certify again once a harness exists | `brokkr check` (passed at landing); `brokkr library --all --dataset denmark`, pending a harness |
 
 ## Out of scope
 
-- brokkr's side, apart from the `v2` digest acceptance L10 pairs with.
-  That includes brokkr#58 (library against CLI timing).
+- brokkr's side, apart from the `v2` digest acceptance L8 paired with
+  (landed, brokkr#60).
+  That includes brokkr#58 (library against CLI timing) and #59's
+  follow-ups.
 - A `crates/` relayout.

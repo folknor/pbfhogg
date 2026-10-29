@@ -22,7 +22,7 @@ The binary is called `pbfhogg`. Requires the Rust version named by `rust-version
 | `tags-filter` | Filter elements by tag expressions (PBF or OSC input) |
 | `export` | Stream tagged nodes/ways to GeoJSON or GeoJSONSeq |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
-| `digest` | Print a digest of a PBF's element content, equal for files `diff` finds identical |
+| `digest` | Print an encoding-independent digest of a PBF: header, elements and metadata (`--form full`, default), or element content equal for files `diff` finds identical (`--form content`) |
 | `getid` | Extract or remove elements by ID |
 | `getparents` | Find ways/relations referencing given IDs |
 | `apply-changes` | Apply OSC diff to a sorted PBF with blob passthrough |

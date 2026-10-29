@@ -172,28 +172,55 @@ impl Blob {
     }
 
     fn way_members_parts(&self) -> Option<(u32, &[u8])> {
-        let data = self.header.waymembers.as_deref()?;
-        if data.first().copied()? != 1 {
-            return None;
+        // The lossy accessors answer "no usable bitmap" for a malformed
+        // payload; `way_members_checked` tells the two apart.
+        self.way_members_checked().ok().flatten() // ok-deliberate: malformed is no bitmap here
+    }
+
+    /// The field-5 payload as (encoded way count, bitmap), `Ok(None)` when
+    /// the blob carries none (or field-5 parsing was off), and `Err` when it
+    /// carries one that is malformed: a version other than 1, a count varint
+    /// that is unterminated or does not fit a `u32`, or a bitmap whose length
+    /// is not `ceil(count / 8)`.
+    pub(crate) fn way_members_checked(&self) -> Result<Option<(u32, &[u8])>> {
+        let Some(data) = self.header.waymembers.as_deref() else {
+            return Ok(None);
+        };
+        let malformed = |why: &str| {
+            Err(Error::invalid_data(format!(
+                "malformed pbfhogg.WayMembers-v1 payload in BlobHeader field 5: {why}"
+            )))
+        };
+        match data.first() {
+            Some(1) => {}
+            Some(v) => return malformed(&format!("version {v}, not 1")),
+            None => return malformed("empty"),
         }
-        let mut value = 0u32;
-        let mut shift = 0u32;
+        // A u32 varint is at most five bytes, and its fifth carries only the
+        // top four bits: anything more is a count that does not fit.
+        let mut value = 0u64;
         let mut end = None;
-        for (i, byte) in data[1..].iter().copied().enumerate() {
-            if shift >= 32 {
-                return None;
-            }
-            value |= u32::from(byte & 0x7f) << shift;
+        for (i, byte) in data[1..].iter().copied().take(5).enumerate() {
+            value |= u64::from(byte & 0x7f) << (7 * i);
             if byte & 0x80 == 0 {
                 end = Some(i + 2);
                 break;
             }
-            shift += 7;
         }
-        let end = end?;
-        let bitmap = data.get(end..)?;
-        let expected = usize::try_from(u64::from(value).div_ceil(8)).ok()?; // ok-deliberate: unrepresentable is no bitmap
-        (bitmap.len() == expected).then_some((value, bitmap))
+        let Some(end) = end else {
+            return malformed("unterminated way count");
+        };
+        let Ok(count) = u32::try_from(value) else {
+            return malformed("way count does not fit 32 bits");
+        };
+        let bitmap = &data[end..];
+        if usize::try_from(u64::from(count).div_ceil(8)) != Ok(bitmap.len()) {
+            return malformed(&format!(
+                "{} bitmap byte(s) for {count} way(s)",
+                bitmap.len()
+            ));
+        }
+        Ok(Some((count, bitmap)))
     }
 
     /// Tries to decode the blob to a [`HeaderBlock`]. This operation might involve an expensive
@@ -1697,6 +1724,25 @@ mod tests {
             blob_with_waymembers(Some(vec![0x01, 0x80])).way_members(),
             None
         );
+        // A count of 2^32 + 1, whose fifth varint byte carries bits past 32:
+        // a parser that drops them reads 1 and accepts the one-byte bitmap.
+        let overflow = blob_with_waymembers(Some(vec![0x01, 0x81, 0x80, 0x80, 0x80, 0x10, 0x01]));
+        assert_eq!(overflow.way_members(), None);
+        assert!(overflow.way_members_checked().is_err());
+        // The checked parser tells absent from malformed.
+        assert!(matches!(
+            blob_with_waymembers(None).way_members_checked(),
+            Ok(None)
+        ));
+        assert!(
+            blob_with_waymembers(Some(vec![0x02, 1, 0x00]))
+                .way_members_checked()
+                .is_err()
+        );
+        assert!(matches!(
+            blob_with_waymembers(Some(vec![0x01, 9, 0xFF, 0x01])).way_members_checked(),
+            Ok(Some((9, [0xFF, 0x01])))
+        ));
     }
 
     /// D8 count-gap fixture: a hand-built blob whose field-5 preamble declares

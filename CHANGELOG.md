@@ -28,6 +28,32 @@
 
 ### Breaking
 
+- **`pbfhogg digest` prints the full form, `xxh128 v2`, by default.** The
+  new full form covers the header (bbox, required and optional features as
+  sets, writing program, source, replication fields), every element's
+  metadata with its presence (version, millisecond timestamp, changeset,
+  uid, user, `visible`), exact nanodegree coordinates, `LocationsOnWays` way
+  coordinates, and the `pbfhogg.SharedNodePins-v1` / `pbfhogg.WayMembers-v1`
+  fields of each way where the header declares them. Two files get the same
+  `v2` digest exactly when they have the same header and the same elements
+  field for field; it stays independent of compression, blob boundaries,
+  string-table order, granularity and indexdata. The header folds into the
+  first line only, so the report keeps its four-line shape. The previous
+  digest, whose equality is `diff --suppress-common`'s, is `--form content`
+  and still prints `xxh128 v1` unchanged: a stored `v1` digest compares
+  with `digest --form content`, never with the new default. The full form
+  also refuses a declared prepass payload that is malformed (a way blob
+  without a well-formed field-5 payload counting its ways, a pin bitmap that
+  is not one bit per ref). Library: `digest::digest` takes a
+  `digest::Form`, returns `digest::Digest` (was `ContentDigest`), whose
+  `form` names the version `write_report` prints; `CANONICAL_VERSION` is
+  gone in favour of `Form::version`.
+- **A versionless dense node no longer claims an empty user name.** A
+  `DenseInfo` slot with version 0 whose user index points at an empty string
+  other than index 0 used to count as claiming that empty name, so `export
+  --metadata` printed `"@user":""` for it depending on where the writer put
+  the empty string. The name is now judged by what it resolves to, as for
+  index 0.
 - **Usage errors exit `64` (`EX_USAGE`), not `2`.** A command line refused
   before the command executes - by the argument parser (an unknown flag, a
   missing, malformed or conflicting argument, a missing subcommand) or by

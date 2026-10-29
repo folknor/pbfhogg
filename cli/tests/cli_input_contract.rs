@@ -1306,7 +1306,7 @@ const POLICY: &[PolicyRow] = &[
         label: "digest",
         build: digest,
         exit: &[0],
-        policy: Policy::Verifies("xxh128 v1"),
+        policy: Policy::Verifies("xxh128 v2"),
     },
     PolicyRow {
         label: "check --index",

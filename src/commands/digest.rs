@@ -1,12 +1,26 @@
-//! Element-content digest of a PBF: `pbfhogg digest`.
+//! Digest of a PBF: `pbfhogg digest`, in one of two canonical forms.
 //!
-//! Two PBFs that the digest accepts get the same digest exactly when
-//! `pbfhogg diff --suppress-common` reports them identical, barring a 128-bit
-//! hash collision. The digest is independent of encoding: compression, blob
-//! boundaries, dense versus plain nodes, string-table order, granularity,
-//! header fields and indexdata presence all leave it unchanged. What it
-//! covers is defined in one place, [`crate::content`], which is also what
-//! every `diff` path compares with.
+//! - **[`Form::Content`] (`v1`).** Two PBFs that the digest accepts get the
+//!   same content digest exactly when `pbfhogg diff --suppress-common`
+//!   reports them identical, barring a 128-bit hash collision. It is
+//!   independent of encoding: compression, blob boundaries, dense versus
+//!   plain nodes, string-table order, granularity, header fields, metadata
+//!   and indexdata presence all leave it unchanged. What it covers is
+//!   defined in one place, [`crate::content`], which is also what every
+//!   `diff` path compares with.
+//! - **[`Form::Full`] (`v2`).** Content plus everything a writer states
+//!   about it: metadata with its presence, `visible`, exact coordinates,
+//!   `LocationsOnWays` way coordinates, the declared prepass fields and the
+//!   header fields (folded into the first line). Two accepted files get the
+//!   same full digest exactly when they have the same header and the same
+//!   elements field for field, as [`crate::content`] "The full form"
+//!   defines; still independent of compression, blob boundaries,
+//!   string-table order, granularity and indexdata. It is no `diff`
+//!   relation: it is for checking that two writers of one operation agree.
+//!
+//! A version number names one canonical form and is never reused: a change
+//! to either form's definition or serialization takes the next unused
+//! number, so a stored report is only compared with one of the same version.
 //!
 //! # The domain
 //!
@@ -14,7 +28,9 @@
 //! optimised paths are sound, so the digest refuses everything else: it
 //! returns an error and prints nothing. Refusal is the safe direction for a
 //! cache built on the digest - it falls back to running the real
-//! comparison. Accepted inputs satisfy all of:
+//! comparison. Both forms accept the same inputs, except that the full form
+//! also refuses malformed declared prepass fields (rule 5). Accepted inputs
+//! satisfy all of:
 //!
 //! 1. **Envelope.** The first blob is an `OsmHeader` that decodes and claims
 //!    `Sort.Type_then_ID` (diff refuses unsorted input). No later blob is an
@@ -35,6 +51,12 @@
 //!    one on which diff can disagree with its own content.
 //! 4. **References.** Every string-table reference the decoder exposes
 //!    resolves: tag keys and values, member roles, and metadata user names.
+//! 5. **Declared prepass fields (full form only).** Where the header
+//!    declares `pbfhogg.WayMembers-v1`, every way blob carries a well-formed
+//!    field-5 payload whose way count is the block's and whose padding bits
+//!    are clear. Where it declares `pbfhogg.SharedNodePins-v1`, every pin
+//!    bitmap a way carries is one bit per ref, rounded up to whole bytes,
+//!    with no bit past the last ref. Undeclared payloads are not read.
 //!
 //! The promise is "refuses input that fails the validation above", not
 //! "refuses every corrupt file". In particular a file truncated exactly at a
@@ -42,22 +64,27 @@
 //!
 //! # Output
 //!
-//! [`ContentDigest::write_report`] prints one line naming the algorithm and
-//! the canonical-form version, then one line per element kind with its count
-//! and the digest of that kind alone:
+//! [`Digest::write_report`] prints one line naming the algorithm and the
+//! form's version, then one line per element kind with its count and the
+//! digest of that kind alone:
 //!
 //! ```text
-//! xxh128 v1 <32 hex digits>
+//! xxh128 v<N> <32 hex digits>
 //! node <count> <32 hex digits>
 //! way <count> <32 hex digits>
 //! relation <count> <32 hex digits>
 //! ```
 //!
-//! Each digest is XXH3-128 over the canonical record stream
-//! ([`crate::content::write_record`]) of the elements it covers, in file
-//! order. [`CANONICAL_VERSION`] changes whenever that stream or the content
-//! definition changes, so a stored digest is only ever compared with one of
-//! the same version.
+//! Each kind digest is XXH3-128 over the form's record stream
+//! ([`crate::content::write_record`] or
+//! [`crate::content::write_full_record`]) of that kind's elements, in file
+//! order. The first line's digest is, for the content form, XXH3-128 over
+//! every element's record in file order; for the full form, XXH3-128 over
+//! [`FULL_DOMAIN`], the header record
+//! ([`crate::content::write_header_record`]), then for node, way and
+//! relation in that order the kind byte, the count as u64 LE and the kind
+//! digest as u128 LE. So in the full form a header difference moves the
+//! first line alone.
 
 use std::io::Write;
 use std::path::Path;
@@ -67,7 +94,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::blob::{Blob, BlobType};
 use crate::blob_meta::BlobIndex;
-use crate::content::write_record;
+use crate::content::{Prepass, write_full_record, write_header_record, write_record};
 use crate::error::{Error, Location};
 use crate::read::input::InputSource;
 use crate::read::pipeline::DecodeTransform;
@@ -78,9 +105,43 @@ use super::Result;
 /// The hash algorithm, as printed on the first report line.
 pub const ALGORITHM: &str = "xxh128";
 
-/// Version of the canonical form: the content definition plus the record
-/// serialization. Bump it with any change to either.
-pub const CANONICAL_VERSION: u32 = 1;
+/// The bytes the full form's first-line hash starts with, so it can never
+/// be mistaken for a hash over a record stream.
+pub const FULL_DOMAIN: &[u8] = b"pbfhogg-digest-v2\0";
+
+/// A canonical form of the digest: what it covers and how it is
+/// serialized. Each form has its own version number, printed on the first
+/// report line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Form {
+    /// Element content, the equality `diff --suppress-common` reports
+    /// (`v1`).
+    Content,
+    /// Content, metadata, way coordinates, declared prepass fields and the
+    /// header (`v2`).
+    Full,
+}
+
+impl Form {
+    /// The version the report names. A number is never reused: changing a
+    /// form's definition or serialization gives it the next unused one.
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        match self {
+            Form::Content => 1,
+            Form::Full => 2,
+        }
+    }
+
+    /// The form's name, as `digest --form` spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Form::Content => "content",
+            Form::Full => "full",
+        }
+    }
+}
 
 /// Element count and digest for one element kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,20 +150,23 @@ pub struct KindDigest {
     pub hash: u128,
 }
 
-/// The digest of a PBF's element content.
+/// The digest of a PBF in one form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContentDigest {
-    /// Digest over every element, nodes then ways then relations.
+pub struct Digest {
+    /// The form it was computed in, whose version the report prints.
+    pub form: Form,
+    /// The first report line's digest: every element (content form), or the
+    /// header and the three kind digests (full form).
     pub all: u128,
     pub nodes: KindDigest,
     pub ways: KindDigest,
     pub relations: KindDigest,
 }
 
-impl ContentDigest {
+impl Digest {
     /// Write the report: the algorithm line, then one line per kind.
     pub fn write_report(&self, w: &mut impl Write) -> std::io::Result<()> {
-        writeln!(w, "{ALGORITHM} v{CANONICAL_VERSION} {:032x}", self.all)?;
+        writeln!(w, "{ALGORITHM} v{} {:032x}", self.form.version(), self.all)?;
         for (name, kind) in [
             ("node", self.nodes),
             ("way", self.ways),
@@ -114,7 +178,7 @@ impl ContentDigest {
     }
 }
 
-/// Compute the element-content digest of `input`, or refuse it.
+/// Compute the digest of `input` in `form`, or refuse it.
 ///
 /// Returns an error, and no digest, for unreadable input and for any input
 /// outside the domain described in the module documentation.
@@ -128,44 +192,79 @@ impl ContentDigest {
 #[hotpath::measure]
 pub fn digest<'a>(
     input: impl Into<InputSource<'a>>,
+    form: Form,
     direct_io: bool,
     host: &crate::host::Host,
-) -> Result<ContentDigest> {
+) -> Result<Digest> {
     let input = input.into();
     host.invocation
-        .decided(|| digest_inner(input, direct_io, host))
+        .decided(|| digest_inner(input, form, direct_io, host))
 }
 
 fn digest_inner(
     input: InputSource<'_>,
+    form: Form,
     direct_io: bool,
     host: &crate::host::Host,
-) -> Result<ContentDigest> {
+) -> Result<Digest> {
     let path = input.path();
     // The one open of the input. The leading-header rule (domain rule 1) is
     // the reader's: it refuses a file whose first blob is not an OsmHeader,
     // and any later OsmHeader blob.
     let reader = ElementReader::open_in(input, direct_io, host)?;
-    if !reader.header().is_sorted() {
+    let header = reader.header();
+    if !header.is_sorted() {
         return Err(crate::error::new_unsorted(
             "the header does not claim Sort.Type_then_ID; digest covers sorted input only, \
              as diff does.",
         )
         .locate(Location::in_file(path)));
     }
+    let full = match form {
+        Form::Content => None,
+        Form::Full => {
+            let mut header_record = Vec::new();
+            write_header_record(header, &mut header_record)
+                .map_err(|e| e.locate(Location::in_file(path)))?;
+            Some(Full {
+                header_record,
+                prepass: Prepass {
+                    pins: header.has_shared_node_pins_v1(),
+                },
+                way_members: header.has_way_members_v1(),
+            })
+        }
+    };
+    let transform = DigestTransform {
+        full: full.as_ref().map(|f| (f.prepass, f.way_members)),
+    };
+    // Field 5 is read only where it is authoritative and asked for.
+    let reader = reader.parsing_way_members(full.as_ref().is_some_and(|f| f.way_members));
 
     host.invocation.marker("DIGEST_SCAN_START");
-    let mut state = DigestState::new(Arc::from(path));
-    reader.for_each_fused_blob(DigestTransform, |summary| state.absorb(summary))?;
-    let digest = state.finish();
+    let mut state = DigestState::new(Arc::from(path), full.is_none());
+    reader.for_each_fused_blob(transform, |summary| state.absorb(summary))?;
+    let digest = state.finish(form, full.as_ref().map(|f| f.header_record.as_slice()));
     host.invocation.marker("DIGEST_SCAN_END");
     Ok(digest)
+}
+
+/// What the full form knows from the header before the scan.
+struct Full {
+    header_record: Vec<u8>,
+    prepass: Prepass,
+    /// `pbfhogg.WayMembers-v1` is declared.
+    way_members: bool,
 }
 
 /// The decode-worker side of the pass: refuses a blob of unknown type
 /// (domain rule 1) and summarizes each data blob with its indexdata and
 /// provenance, which the ordered consumer checks.
-struct DigestTransform;
+struct DigestTransform {
+    /// `None` for the content form; the full form's prepass declarations
+    /// and whether `pbfhogg.WayMembers-v1` is declared.
+    full: Option<(Prepass, bool)>,
+}
 
 impl DecodeTransform for DigestTransform {
     type Out = BlockSummary;
@@ -191,15 +290,82 @@ impl DecodeTransform for DigestTransform {
                 ))));
             }
         }
+        let records = match self.full {
+            None => Records::Content,
+            Some((prepass, declared)) => Records::Full {
+                prepass,
+                way_members: declared.then(|| blob.way_members_checked()),
+            },
+        };
         Some(decode().and_then(|block| {
             Ok(BlockSummary {
                 index: blob.index(),
                 blob: blob.blob_index(),
                 offset: blob.offset(),
-                content: summarize_block(block)?,
+                content: summarize_block(block, records)?,
             })
         }))
     }
+}
+
+/// A blob's field-5 payload as (encoded way count, bitmap).
+type WayMembers<'b> = (u32, &'b [u8]);
+
+/// Which records a block's elements are serialized as.
+enum Records<'b> {
+    Content,
+    Full {
+        prepass: Prepass,
+        /// `Some` where the header declares `pbfhogg.WayMembers-v1`: the
+        /// blob's checked field-5 payload, `None` inside when the blob
+        /// carries none. Judged only for a way block.
+        way_members: Option<crate::Result<Option<WayMembers<'b>>>>,
+    },
+}
+
+/// The way-membership bit of the way at `ordinal` in its blob (domain rule
+/// 5). Bits are LSB-first in block order, as the producer writes them.
+fn way_member_bit(payload: Option<(u32, &[u8])>, ordinal: u64) -> crate::Result<bool> {
+    let Some((count, bitmap)) = payload else {
+        return Err(Error::invalid_data(
+            "the header declares pbfhogg.WayMembers-v1 but this way blob carries no field-5 \
+             payload",
+        ));
+    };
+    if ordinal >= u64::from(count) {
+        return Err(Error::invalid_data(format!(
+            "the field-5 payload counts {count} way(s) but the block holds more"
+        )));
+    }
+    let byte = usize::try_from(ordinal / 8)
+        .ok() // ok-deliberate: an index past usize is past the bitmap
+        .and_then(|i| bitmap.get(i))
+        .copied()
+        .unwrap_or(0);
+    Ok(byte & (1 << (ordinal % 8)) != 0)
+}
+
+/// After a way block: the payload counted exactly the block's ways and set
+/// no padding bit (domain rule 5).
+fn check_way_member_tail(payload: Option<(u32, &[u8])>, ways: u64) -> crate::Result<()> {
+    let Some((count, bitmap)) = payload else {
+        return Ok(());
+    };
+    if u64::from(count) != ways {
+        return Err(Error::invalid_data(format!(
+            "the field-5 payload counts {count} way(s) but the block holds {ways}"
+        )));
+    }
+    let used = count % 8;
+    if used != 0
+        && let Some(&last) = bitmap.last()
+        && last >> used != 0
+    {
+        return Err(Error::invalid_data(
+            "the field-5 payload sets a bit past its last way",
+        ));
+    }
+    Ok(())
 }
 
 /// What one data blob contributes, computed on a decode worker.
@@ -253,8 +419,26 @@ fn block_kind(block_type: BlockType) -> crate::Result<Option<ElementKind>> {
 /// Runs on the decode workers. Takes the block by value because the fused
 /// pipeline hands ownership to its transform.
 #[allow(clippy::needless_pass_by_value)]
-fn summarize_block(block: PrimitiveBlock) -> crate::Result<Option<BlockContent>> {
+fn summarize_block(
+    block: PrimitiveBlock,
+    records: Records<'_>,
+) -> crate::Result<Option<BlockContent>> {
     let classified = block_kind(block.block_type())?;
+    // The full form's per-block inputs. A way block in a file declaring
+    // pbfhogg.WayMembers-v1 needs its field-5 payload (domain rule 5).
+    let full = match records {
+        Records::Content => None,
+        Records::Full {
+            prepass,
+            way_members,
+        } => {
+            let payload = match way_members {
+                Some(checked) if classified == Some(ElementKind::Way) => Some(checked?),
+                _ => None,
+            };
+            Some((prepass, payload))
+        }
+    };
     let mut content: Option<BlockContent> = None;
     for element in block.elements() {
         let kind = element_kind(&element);
@@ -285,12 +469,24 @@ fn summarize_block(block: PrimitiveBlock) -> crate::Result<Option<BlockContent>>
                 c.last_id,
             )));
         }
-        write_record(&element, id, &mut c.records)
-            .map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
+        let written = match full {
+            None => write_record(&element, id, &mut c.records),
+            Some((prepass, payload)) => {
+                let member = match payload {
+                    Some(p) if kind == ElementKind::Way => way_member_bit(p, c.count).map(Some),
+                    _ => Ok(None),
+                };
+                member.and_then(|m| write_full_record(&element, id, prepass, m, &mut c.records))
+            }
+        };
+        written.map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
         c.last_id = id;
         c.min_id = c.min_id.min(id);
         c.max_id = c.max_id.max(id);
         c.count += 1;
+    }
+    if let Some((_, Some(payload))) = full {
+        check_way_member_tail(payload, content.as_ref().map_or(0, |c| c.count))?;
     }
     Ok(content)
 }
@@ -328,16 +524,18 @@ struct DigestState {
     path: Arc<Path>,
     /// Kind and ID of the last element seen.
     last: Option<(ElementKind, i64)>,
-    all: Xxh3,
+    /// The content form's first-line hash over every record; `None` for the
+    /// full form, whose first line is computed from the kind digests.
+    all: Option<Xxh3>,
     kinds: [(u64, Xxh3); 3],
 }
 
 impl DigestState {
-    fn new(path: Arc<Path>) -> Self {
+    fn new(path: Arc<Path>, hash_all_records: bool) -> Self {
         Self {
             path,
             last: None,
-            all: Xxh3::new(),
+            all: hash_all_records.then(Xxh3::new),
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
         }
     }
@@ -377,7 +575,9 @@ impl DigestState {
             }
         }
         self.last = Some((content.kind, content.last_id));
-        self.all.update(&content.records);
+        if let Some(all) = &mut self.all {
+            all.update(&content.records);
+        }
         let (count, hasher) = &mut self.kinds[usize::from(content.kind.ordinal())];
         *count += content.count;
         hasher.update(&content.records);
@@ -414,17 +614,79 @@ impl DigestState {
         Ok(())
     }
 
-    fn finish(self) -> ContentDigest {
-        let [nodes, ways, relations] = self.kinds;
-        let kind = |(count, hasher): (u64, Xxh3)| KindDigest {
+    /// The digest. `header_record` is the full form's, `None` for the
+    /// content form.
+    fn finish(self, form: Form, header_record: Option<&[u8]>) -> Digest {
+        let [nodes, ways, relations] = self.kinds.map(|(count, hasher)| KindDigest {
             count,
             hash: hasher.digest128(),
+        });
+        let all = match (self.all, header_record) {
+            (Some(all), _) => all.digest128(),
+            (None, header) => {
+                let mut all = Xxh3::new();
+                all.update(FULL_DOMAIN);
+                all.update(header.unwrap_or_default());
+                for (kind, d) in [
+                    (ElementKind::Node, nodes),
+                    (ElementKind::Way, ways),
+                    (ElementKind::Relation, relations),
+                ] {
+                    all.update(&[kind_byte(kind)]);
+                    all.update(&d.count.to_le_bytes());
+                    all.update(&d.hash.to_le_bytes());
+                }
+                all.digest128()
+            }
         };
-        ContentDigest {
-            all: self.all.digest128(),
-            nodes: kind(nodes),
-            ways: kind(ways),
-            relations: kind(relations),
+        Digest {
+            form,
+            all,
+            nodes,
+            ways,
+            relations,
         }
+    }
+}
+
+/// The kind byte the record streams use, for the full form's first line.
+fn kind_byte(kind: ElementKind) -> u8 {
+    match kind {
+        ElementKind::Node => crate::content::KIND_NODE,
+        ElementKind::Way => crate::content::KIND_WAY,
+        ElementKind::Relation => crate::content::KIND_RELATION,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_way_member_tail, way_member_bit};
+
+    /// Bits are LSB-first in block order; the payload must count exactly
+    /// the block's ways and leave its padding clear.
+    #[test]
+    fn way_member_bits_and_tail() {
+        let bitmap = [0b1000_0001u8, 0b0000_0001];
+        let payload = Some((9, &bitmap[..]));
+        let bits: Vec<bool> = (0..9)
+            .map(|i| way_member_bit(payload, i).unwrap_or_else(|e| panic!("{e}")))
+            .collect();
+        assert_eq!(
+            bits,
+            [true, false, false, false, false, false, false, true, true]
+        );
+        assert!(
+            way_member_bit(payload, 9).is_err(),
+            "more ways than counted"
+        );
+        assert!(way_member_bit(None, 0).is_err(), "declared but absent");
+        assert!(check_way_member_tail(payload, 9).is_ok());
+        assert!(check_way_member_tail(payload, 8).is_err(), "fewer ways");
+        let padded = [0u8, 0b0000_0010];
+        assert!(
+            check_way_member_tail(Some((9, &padded[..])), 9).is_err(),
+            "a padding bit set"
+        );
+        assert!(check_way_member_tail(Some((8, &[0xFF][..])), 8).is_ok());
     }
 }

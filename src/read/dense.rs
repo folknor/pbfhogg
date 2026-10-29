@@ -394,6 +394,11 @@ impl<'a> DenseNodeInfo<'a> {
     ///   zeros there). So each other field is claimed only by a value no
     ///   padding holds: timestamp non-zero, changeset and uid positive, a
     ///   user name other than the empty string, `visible` only when false.
+    ///   The user name is judged by what it resolves to, not by its index:
+    ///   index 0 (the empty string the format reserves) is unclaimed without
+    ///   a lookup, and any other index is resolved and claimed only when the
+    ///   name is non-empty, so the claim does not depend on where a writer
+    ///   put the empty string in its table.
     ///   The same tests as libosmium's `detect_available_metadata`. A real
     ///   versionless node with a zero field (an anonymous `uid` 0, say)
     ///   loses that field on output; on the wire it cannot be told apart.
@@ -404,16 +409,16 @@ impl<'a> DenseNodeInfo<'a> {
     ///   the conversions that re-encode a dense node drop such a slot too,
     ///   so printing and rewriting agree.
     ///
-    /// Computed only where an output prints metadata; the dense iterator
+    /// Computed only where an output reads metadata; the dense iterator
     /// and the re-encoding conversions do not call it.
-    pub(crate) fn claims(&self) -> Option<DenseClaims> {
+    pub(crate) fn claims(&self) -> Option<DenseClaims<'a>> {
         if self.version >= 1 {
             return Some(DenseClaims {
                 version: Some(self.version),
                 milli_timestamp: Some(self.milli_timestamp()),
                 changeset: Some(self.changeset),
                 uid: Some(self.uid),
-                user: true,
+                user: Some(self.user()),
                 visible: Some(self.visible),
             });
         }
@@ -421,28 +426,35 @@ impl<'a> DenseNodeInfo<'a> {
             return None;
         }
         let milli_timestamp = self.milli_timestamp();
+        let user = match self.user_sid {
+            0 => None,
+            _ => match self.user() {
+                Ok("") => None,
+                resolved => Some(resolved),
+            },
+        };
         Some(DenseClaims {
             version: None,
             milli_timestamp: (milli_timestamp != 0).then_some(milli_timestamp),
             changeset: (self.changeset > 0).then_some(self.changeset),
             uid: (self.uid > 0).then_some(self.uid),
-            user: self.user_sid != 0,
+            user,
             visible: (!self.visible).then_some(false),
         })
     }
 }
 
 /// The metadata fields one dense slot claims; see [`DenseNodeInfo::claims`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DenseClaims {
+#[derive(Clone, Debug)]
+pub(crate) struct DenseClaims<'a> {
     pub(crate) version: Option<i32>,
     pub(crate) milli_timestamp: Option<i64>,
     pub(crate) changeset: Option<i64>,
     pub(crate) uid: Option<i32>,
-    /// Whether a user name is claimed. Resolve it with
-    /// [`DenseNodeInfo::user`], which can fail on a corrupt string table;
-    /// a bool keeps that lookup out of callers that only count.
-    pub(crate) user: bool,
+    /// The claimed user name, already resolved. A bad string index is an
+    /// `Err` value here, not a failed claim: each output decides what a
+    /// corrupt name means for it (refuse, or print a marker).
+    pub(crate) user: Option<Result<&'a str>>,
     pub(crate) visible: Option<bool>,
 }
 

@@ -1,11 +1,15 @@
 //! CLI-driven tests for `pbfhogg digest`, and for the `diff` behaviour its
-//! contract depends on.
+//! content form depends on.
 //!
-//! The contract: on every input the digest accepts, two files get the same
-//! digest exactly when `diff --suppress-common` reports them identical, on
-//! every diff path; everything else is refused with no digest printed. The
-//! agreement test below is the drift alarm - it fails if diff's notion of
-//! element equality and the digest's canonical form ever disagree.
+//! The content form's contract: on every input the digest accepts, two
+//! files get the same `--form content` digest exactly when
+//! `diff --suppress-common` reports them identical, on every diff path;
+//! everything else is refused with no digest printed. The agreement test
+//! below is the drift alarm - it fails if diff's notion of element equality
+//! and the content form ever disagree.
+//!
+//! The full form (the default) is pinned field by field further down: every
+//! field it covers moves it, every encoding property it does not leaves it.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
@@ -25,9 +29,13 @@ use pbfhogg::MemberId;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The digest report lines, or the failed run.
-fn digest(path: &Path) -> Result<Vec<String>, CliOutput> {
-    let out = CliInvoker::new().arg("digest").arg(path).run();
+/// The report lines in `form` (`None`: the default), or the failed run.
+fn digest_in(path: &Path, form: Option<&str>) -> Result<Vec<String>, CliOutput> {
+    let mut cli = CliInvoker::new().arg("digest");
+    if let Some(form) = form {
+        cli = cli.arg("--form").arg(form);
+    }
+    let out = cli.arg(path).run();
     if !out.status.success() {
         return Err(out);
     }
@@ -52,7 +60,16 @@ fn digest(path: &Path) -> Result<Vec<String>, CliOutput> {
 }
 
 fn digest_ok(path: &Path) -> Vec<String> {
-    digest(path).unwrap_or_else(|out| {
+    digest_ok_in(path, Some("content"))
+}
+
+/// The full-form report, asked for by default.
+fn full_ok(path: &Path) -> Vec<String> {
+    digest_ok_in(path, None)
+}
+
+fn digest_ok_in(path: &Path, form: Option<&str>) -> Vec<String> {
+    digest_in(path, form).unwrap_or_else(|out| {
         panic!(
             "digest of {} failed (exit {:?}); stderr:\n{}",
             path.display(),
@@ -62,17 +79,30 @@ fn digest_ok(path: &Path) -> Vec<String> {
     })
 }
 
-/// Assert the digest refuses `path`: non-zero exit and no digest line.
+/// Assert the digest refuses `path` in both forms: non-zero exit and no
+/// digest line.
 fn assert_refused(path: &Path, why: &str) {
-    let out = CliInvoker::new().arg("digest").arg(path).run();
-    assert!(
-        !out.status.success(),
-        "digest must refuse {why}; it printed:\n{}",
+    for form in ["content", "full"] {
+        assert_refused_in(path, form, why);
+    }
+}
+
+fn assert_refused_in(path: &Path, form: &str, why: &str) {
+    let out = CliInvoker::new()
+        .arg("digest")
+        .arg("--form")
+        .arg(form)
+        .arg(path)
+        .run();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "digest --form {form} must refuse {why}; it printed:\n{}",
         out.stdout_str()
     );
     assert!(
         !out.stdout_str().contains("xxh128 "),
-        "a refused digest must print no digest line ({why}); stdout:\n{}",
+        "a refused digest must print no digest line ({form}, {why}); stdout:\n{}",
         out.stdout_str()
     );
 }
@@ -649,6 +679,407 @@ fn many_blocks_agree_with_parallel_diff() {
     write_multi_block_test_pbf(&b, &nodes, &[], &[], 50);
     assert_eq!(diff_code(&a, &b, Some(4)), Some(0));
     assert_eq!(digest_ok(&a), digest_ok(&b));
+}
+
+// ---------------------------------------------------------------------------
+// The full form
+// ---------------------------------------------------------------------------
+
+/// Everything the full form covers that the content form does not, as one
+/// fixture: metadata on each kind, inline way coordinates, header fields.
+#[derive(Clone)]
+struct FullFixture {
+    node_meta: Option<TestMeta>,
+    way_meta: Option<TestMeta>,
+    relation_meta: Option<TestMeta>,
+    /// `Some` writes way 10 with inline coordinates and declares
+    /// `LocationsOnWays`.
+    locations: Option<Vec<(i32, i32)>>,
+    bbox: Option<(f64, f64, f64, f64)>,
+    source: Option<&'static str>,
+    program: Option<&'static str>,
+    replication: Option<(i64, i64, &'static str)>,
+    features: Vec<&'static str>,
+}
+
+fn meta() -> TestMeta {
+    TestMeta {
+        version: 3,
+        timestamp: 1_700_000_000,
+        changeset: 42,
+        uid: 7,
+        user: "mapper",
+        visible: true,
+    }
+}
+
+fn full_fixture() -> FullFixture {
+    FullFixture {
+        node_meta: Some(meta()),
+        way_meta: Some(meta()),
+        relation_meta: Some(meta()),
+        locations: Some(vec![(100, 200), (110, 210), (120, 220)]),
+        bbox: Some((9.0, 54.0, 13.0, 58.0)),
+        source: Some("a source"),
+        program: None,
+        replication: Some((1_700_000_000, 4914, "https://example.org/replication")),
+        features: vec![],
+    }
+}
+
+/// Write `f`: nodes 1 to 3, way 10 over them, relation 20, sorted, with
+/// indexdata when `indexed`, one element per block when `one_per_block`.
+fn write_full(path: &Path, f: &FullFixture, indexed: bool, one_per_block: bool) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let to_meta = |m: &TestMeta| Metadata {
+        version: m.version,
+        timestamp: m.timestamp,
+        changeset: m.changeset,
+        uid: m.uid,
+        user: m.user,
+        visible: m.visible,
+    };
+    let mut hb = HeaderBuilder::new().sorted();
+    if let Some((l, b, r, t)) = f.bbox {
+        hb = hb.bbox(l, b, r, t);
+    }
+    if let Some(s) = f.source {
+        hb = hb.source(s);
+    }
+    if let Some(p) = f.program {
+        hb = hb.writing_program(p);
+    }
+    if let Some((ts, seq, url)) = f.replication {
+        hb = hb
+            .replication_timestamp(ts)
+            .replication_sequence_number(seq)
+            .replication_base_url(url);
+    }
+    if f.locations.is_some() {
+        hb = hb.optional_feature(pbfhogg::HeaderBlock::LOCATIONS_ON_WAYS);
+    }
+    for feature in &f.features {
+        hb = hb.optional_feature(*feature);
+    }
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer.write_header(&hb.build().unwrap()).unwrap();
+
+    let mut bb = BlockBuilder::new();
+    let flush = |bb: &mut BlockBuilder, writer: &mut PbfWriter<_>| {
+        if let Some(bytes) = bb.take().unwrap() {
+            if indexed {
+                writer.write_primitive_block(bytes).unwrap();
+            } else {
+                writer.write_primitive_block_no_indexdata(bytes).unwrap();
+            }
+        }
+    };
+    let node_meta = f.node_meta.as_ref().map(to_meta);
+    for (id, lat, lon, tags) in [
+        (1, 100, 200, vec![("name", "a")]),
+        (2, 110, 210, vec![]),
+        (3, 120, 220, vec![("barrier", "gate")]),
+    ] {
+        let m = (id == 1).then_some(node_meta.as_ref()).flatten();
+        bb.add_node(id, lat, lon, tags, m);
+        if one_per_block {
+            flush(&mut bb, &mut writer);
+        }
+    }
+    flush(&mut bb, &mut writer);
+    let way_meta = f.way_meta.as_ref().map(to_meta);
+    let refs = [1, 2, 3];
+    match &f.locations {
+        Some(locs) => {
+            bb.add_way_with_locations(10, [("highway", "primary")], &refs, locs, way_meta.as_ref());
+        }
+        None => bb.add_way(10, [("highway", "primary")], &refs, way_meta.as_ref()),
+    }
+    flush(&mut bb, &mut writer);
+    let relation_meta = f.relation_meta.as_ref().map(to_meta);
+    bb.add_relation(
+        20,
+        [("type", "route")],
+        &[MemberData {
+            id: MemberId::Way(10),
+            role: "",
+        }],
+        relation_meta.as_ref(),
+    );
+    flush(&mut bb, &mut writer);
+    writer.flush().unwrap();
+}
+
+/// Plain `digest` is the full form, `v2`; `--form content` is `v1`.
+#[test]
+fn the_default_form_is_full_v2() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("full.osm.pbf");
+    write_full(&path, &full_fixture(), true, false);
+    let full = full_ok(&path);
+    assert!(full[0].starts_with("xxh128 v2 "), "{}", full[0]);
+    assert_eq!(full, digest_ok_in(&path, Some("full")));
+    let content = digest_ok(&path);
+    assert!(content[0].starts_with("xxh128 v1 "), "{}", content[0]);
+    for (f, c) in full[1..].iter().zip(&content[1..]) {
+        let count = |line: &str| line.split(' ').nth(1).map(str::to_owned);
+        assert_eq!(count(f), count(c), "the forms count the same elements");
+        assert_ne!(f, c, "the forms hash different records");
+    }
+}
+
+/// Every field the full form adds moves it, and moves only the lines it
+/// should: element fields their kind's line and the first, header fields
+/// the first line alone. The content form sees none of them.
+#[test]
+fn full_digest_moves_with_every_field_it_covers() {
+    type Mutate = fn(&mut FullFixture);
+    // (name, the kind line that moves: None for a header field)
+    let variants: Vec<(&str, Option<usize>, Mutate)> = vec![
+        ("node version", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().version = 4;
+        }),
+        ("node timestamp", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().timestamp += 1;
+        }),
+        ("node changeset", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().changeset = 43;
+        }),
+        ("node uid", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().uid = 8;
+        }),
+        ("node user", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().user = "other";
+        }),
+        ("node visible", Some(1), |f| {
+            f.node_meta.as_mut().unwrap().visible = false;
+        }),
+        ("node metadata dropped", Some(1), |f| f.node_meta = None),
+        ("way version", Some(2), |f| {
+            f.way_meta.as_mut().unwrap().version = 4;
+        }),
+        ("way visible", Some(2), |f| {
+            f.way_meta.as_mut().unwrap().visible = false;
+        }),
+        ("way metadata dropped", Some(2), |f| f.way_meta = None),
+        ("way coordinate", Some(2), |f| {
+            f.locations.as_mut().unwrap()[1].0 += 1;
+        }),
+        ("relation user", Some(3), |f| {
+            f.relation_meta.as_mut().unwrap().user = "";
+        }),
+        ("relation uid zero", Some(3), |f| {
+            f.relation_meta.as_mut().unwrap().uid = 0;
+        }),
+        ("header bbox", None, |f| {
+            f.bbox = Some((9.0, 54.0, 13.0, 57.0));
+        }),
+        ("header bbox dropped", None, |f| f.bbox = None),
+        ("header source", None, |f| f.source = None),
+        ("header writing program", None, |f| {
+            f.program = Some("other/1");
+        }),
+        ("header replication", None, |f| {
+            f.replication = Some((1_700_000_001, 4914, "https://example.org/replication"));
+        }),
+        ("header sequence", None, |f| {
+            f.replication = Some((1_700_000_000, 4915, "https://example.org/replication"));
+        }),
+        ("header base url", None, |f| {
+            f.replication = Some((1_700_000_000, 4914, "https://example.org/other"));
+        }),
+        ("header optional feature", None, |f| {
+            f.features = vec!["Extra"];
+        }),
+    ];
+
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_full(&base, &full_fixture(), true, false);
+    let (base_full, base_content) = (full_ok(&base), digest_ok(&base));
+    for (i, (name, kind_line, mutate)) in variants.iter().enumerate() {
+        let mut f = full_fixture();
+        mutate(&mut f);
+        let path = dir.path().join(format!("variant-{i}.osm.pbf"));
+        write_full(&path, &f, true, false);
+        let full = full_ok(&path);
+        assert_ne!(full[0], base_full[0], "{name}: the first line must move");
+        for line in 1..4 {
+            assert_eq!(
+                full[line] != base_full[line],
+                *kind_line == Some(line),
+                "{name}: line {line} is {} / was {}",
+                full[line],
+                base_full[line]
+            );
+        }
+        assert_eq!(
+            digest_ok(&path),
+            base_content,
+            "{name}: the content form must not see it"
+        );
+        assert_eq!(
+            diff_code(&base, &path, None),
+            Some(0),
+            "{name}: diff ignores it"
+        );
+    }
+}
+
+/// The full form ignores what is encoding: indexdata, blob boundaries, and
+/// the order and repetition of header feature declarations.
+#[test]
+fn full_digest_is_independent_of_encoding() {
+    let dir = crate::common::test_scratch();
+    let mut f = full_fixture();
+    f.features = vec!["B", "A"];
+    let indexed = dir.path().join("indexed.osm.pbf");
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    let blocky = dir.path().join("blocky.osm.pbf");
+    let reordered = dir.path().join("reordered.osm.pbf");
+    write_full(&indexed, &f, true, false);
+    write_full(&unindexed, &f, false, false);
+    write_full(&blocky, &f, true, true);
+    let mut g = f.clone();
+    g.features = vec!["A", "B", "A"];
+    write_full(&reordered, &g, true, false);
+
+    let want = full_ok(&indexed);
+    assert_eq!(want, full_ok(&unindexed), "indexdata presence");
+    assert_eq!(want, full_ok(&blocky), "blob boundaries");
+    assert_eq!(want, full_ok(&reordered), "feature order and repetition");
+}
+
+/// The prepass fields are covered per way, so the two altw backends, which
+/// cut their way blobs alike here but run different engines, agree on the
+/// full digest; and a declared WayMembers-v1 file whose way blob lost its
+/// field-5 payload is refused by the full form, which reads it, and not by
+/// the content form, which does not.
+#[test]
+fn full_digest_covers_declared_prepass_fields() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let nodes: Vec<TestNode> = (1..=12)
+        .map(|id| {
+            node(
+                id,
+                550_000_000 + i32::try_from(id).unwrap() * 1_000,
+                120_000_000,
+                vec![],
+            )
+        })
+        .collect();
+    let ways = vec![
+        way(10, vec![1, 2, 3], vec![]),
+        way(11, vec![2, 4, 5, 6, 7, 8, 9, 10, 11, 12], vec![]),
+    ];
+    let relations = vec![TestRelation {
+        id: 20,
+        members: vec![member(MemberId::Way(10), "outer")],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    crate::common::write_indexed_pbf(&input, &nodes, &ways, &relations);
+    // The same ways, with the relation holding way 11 instead of way 10:
+    // only the membership bits of the way records differ.
+    let moved_input = dir.path().join("moved-input.osm.pbf");
+    let moved_relations = vec![TestRelation {
+        id: 20,
+        members: vec![member(MemberId::Way(11), "outer")],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    crate::common::write_indexed_pbf(&moved_input, &nodes, &ways, &moved_relations);
+
+    let altw_of = |input: &Path, name: &str, backend: &str, inject: bool| {
+        let out = dir
+            .path()
+            .join(format!("{name}-{backend}-{inject}.osm.pbf"));
+        let mut cli = CliInvoker::new()
+            .arg("add-locations-to-ways")
+            .arg(input)
+            .arg("-o")
+            .arg(&out)
+            .arg("--index-type")
+            .arg(backend);
+        if inject {
+            cli = cli.arg("--inject-prepass");
+        }
+        let run = cli.run();
+        assert!(run.status.success(), "{backend}: {}", run.stderr_str());
+        out
+    };
+    let altw = |backend: &str, inject: bool| altw_of(&input, "base", backend, inject);
+    let sparse = altw("sparse", true);
+    let external = altw("external", true);
+    let plain = altw("sparse", false);
+
+    assert_eq!(full_ok(&sparse), full_ok(&external), "backend parity");
+    assert_ne!(
+        full_ok(&sparse)[2],
+        full_ok(&plain)[2],
+        "the declared prepass fields are in the way records"
+    );
+    assert_eq!(
+        digest_ok(&sparse),
+        digest_ok(&plain),
+        "content ignores them"
+    );
+
+    // A membership bit's value is hashed, not only its presence.
+    let moved = altw_of(&moved_input, "moved", "sparse", true);
+    assert_ne!(full_ok(&sparse)[2], full_ok(&moved)[2], "membership bit");
+    assert_eq!(digest_ok(&sparse)[2], digest_ok(&moved)[2]);
+
+    let bytes = std::fs::read(&sparse).unwrap();
+    let way_blob = pbfhogg::BlobReader::from_path(&sparse)
+        .unwrap()
+        .position(|blob| match blob.unwrap().decode().unwrap() {
+            pbfhogg::BlobDecode::OsmData(block) => block
+                .elements()
+                .any(|e| matches!(e, pbfhogg::Element::Way(_))),
+            _ => false,
+        })
+        .expect("a way blob");
+
+    // Rebuilding the way blob's BlobHeader drops its field-5 payload.
+    let stripped = mutate_blob_header_indexdata(&bytes, way_blob, |_| {});
+    let path = dir.path().join("stripped.osm.pbf");
+    std::fs::write(&path, &stripped).unwrap();
+    assert_refused_in(&path, "full", "a declared field-5 payload missing");
+    digest_ok(&path);
+
+    // A pin bit's value is hashed: with WayMembers-v1 no longer declared
+    // (so the dropped field 5 is not read), flipping one valid pin bit of
+    // way 11 (bitmap 01 00, ten refs) moves the way line alone.
+    let undeclared = mutate_blob_payload(&stripped, 0, |header| {
+        let feature = b"pbfhogg.WayMembers-v1";
+        let mut needle = vec![0x2A, u8::try_from(feature.len()).unwrap()];
+        needle.extend_from_slice(feature);
+        let at = find(header, &needle).expect("the WayMembers-v1 declaration");
+        header.drain(at..at + needle.len());
+    });
+    let repinned = mutate_blob_payload(&undeclared, way_blob, |block| {
+        let at = find(block, &[0xA2, 0x01, 0x02, 0x01, 0x00]).expect("way 11's pin field");
+        block[at + 3] = 0x03;
+    });
+    let (a, b) = (
+        dir.path().join("undeclared.osm.pbf"),
+        dir.path().join("repinned.osm.pbf"),
+    );
+    std::fs::write(&a, undeclared).unwrap();
+    std::fs::write(&b, repinned).unwrap();
+    let (fa, fb) = (full_ok(&a), full_ok(&b));
+    assert_ne!(fa[2], fb[2], "pin bit");
+    assert_eq!((&fa[1], &fa[3]), (&fb[1], &fb[3]));
+    assert_eq!(digest_ok(&a), digest_ok(&b));
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------

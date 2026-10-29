@@ -227,7 +227,13 @@ fn geocode(
 }
 
 fn digest(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
-    pbfhogg::digest::digest(&i.path("base.osm.pbf"), false, host).map(drop)
+    pbfhogg::digest::digest(
+        &i.path("base.osm.pbf"),
+        pbfhogg::digest::Form::Full,
+        false,
+        host,
+    )
+    .map(drop)
 }
 
 fn commands() -> Vec<(&'static str, Command)> {

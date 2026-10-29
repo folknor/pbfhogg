@@ -1421,7 +1421,10 @@ Inputs holding any negative ID always run as one shard, whatever `-j` says: shar
 
 ### digest
 
-Print a digest of a PBF's element content. Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical (barring a 128-bit hash collision), whatever their encoding: compression, blob boundaries, dense or plain nodes, string-table order, header fields and indexdata presence do not change it, and neither does metadata, which diff ignores. Element content is defined once, in `src/content.rs`, for both commands.
+Print a digest of a PBF, in one of two canonical forms. Both are independent of compression, blob boundaries, string-table order, granularity and offsets, and indexdata presence. They differ in what they cover, and so in the equality they answer:
+
+- **`--form full` (the default, `v2`).** Two files the command accepts get the same digest exactly when they have the same header and the same elements field for field (barring a 128-bit hash collision). It covers element content as below, with coordinates as exact nanodegrees, plus each element's metadata claims (version, millisecond timestamp, changeset, uid, user and `visible`, each claimed or not, as every metadata output reads them: a plain element's field is claimed when present on the wire, so an absent timestamp, uid or user differs from a present zero or empty one and an absent `visible` from an explicit `true`; a version of 0 or below is never a claim; a dense node's versionless slot claims only values padding cannot hold, a non-zero timestamp, a positive changeset or uid, a non-empty user, `visible` false), `LocationsOnWays` way coordinates wherever a way carries them, the `pbfhogg.SharedNodePins-v1` pins and `pbfhogg.WayMembers-v1` membership of each way where the header declares those features (and only there: they are authoritative nowhere else), and the header: bbox, required and optional features (each as a set, so order and repetition do not matter), writing program, source and the three replication fields, each with its presence. It is no `diff` relation: it is for checking that two writers of one operation agree, metadata and header included. A dense node and a plain one with the same metadata digest alike, except where the two encodings cannot say the same thing (a dense versioned node claims every metadata field).
+- **`--form content` (`v1`).** Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical: element content only (node coordinates in decimicrodegrees and tags, way tags and refs, relation tags and members), so dense or plain nodes, header fields, metadata and way coordinates do not change it, as diff ignores them. Element content is defined once, in `src/content.rs`, for both commands.
 
 ```
 pbfhogg digest [OPTIONS] <FILE>
@@ -1429,26 +1432,29 @@ pbfhogg digest [OPTIONS] <FILE>
 
 | Flag | Description |
 |------|-------------|
+| `--form <FORM>` | Canonical form: `full` (default, `v2`) or `content` (`v1`, diff's equality) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 Output, on stdout:
 
 ```
-xxh128 v1 <32 hex digits>
+xxh128 v<N> <32 hex digits>
 node <count> <32 hex digits>
 way <count> <32 hex digits>
 relation <count> <32 hex digits>
 ```
 
-The first line names the algorithm and the canonical-form version; the version changes whenever the content definition or its serialization does, so a stored digest is only comparable with one of the same version. The per-kind lines digest each kind alone, so a mismatch shows which kind differs.
+The first line names the algorithm and the form's version. A version names one canonical form and is never reused: a change to a form's definition or serialization gives it a new number, so a stored digest is only comparable with one of the same version. The per-kind lines digest each kind alone, so a mismatch shows which kind differs. In the full form the header is folded into the first line only, so a first line that differs while every kind line matches is a header difference.
 
-The command refuses, exiting non-zero and printing no digest line, any input on which diff's answer is not a function of element content:
+The command refuses, in either form, exiting non-zero and printing no digest line, any input on which diff's answer is not a function of element content:
 
 - no `OsmHeader` as the first blob, a second `OsmHeader`, or a blob of unknown type;
 - a header that does not claim `Sort.Type_then_ID`;
 - a data block that is mixed-kind (or classified as one kind while holding another), kinds out of node, way, relation order, or IDs that do not strictly ascend within a kind (duplicates included);
 - indexdata on some data blobs and not others, or indexdata whose kind, minimum ID, maximum ID or count disagrees with its block, or on an empty block;
 - a tag, role or metadata user name whose string-table index does not resolve.
+
+The full form also refuses malformed prepass fields its header declares: under `pbfhogg.WayMembers-v1`, a way blob without a well-formed field-5 payload, or whose payload counts other than the block's ways or sets a bit past the last; under `pbfhogg.SharedNodePins-v1`, a way pin bitmap that is not one bit per ref rounded up to whole bytes, or that pins a position past the last ref.
 
 A refusal is the safe answer for a cache keyed on the digest: fall back to the real comparison. The promise is "refuses input failing these checks", not "refuses every corrupt file": a file cut off exactly at a blob boundary is a valid shorter file.
 

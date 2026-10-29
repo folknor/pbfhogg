@@ -14,7 +14,7 @@ use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{Element, ElementReader};
 
 use geometry::{WayGeom, collect_coords, is_area_way, write_point, write_way_geometry};
-use properties::{MetaView, write_properties};
+use properties::{MetaClaims, write_properties};
 use writer::FeatureWriter;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -188,7 +188,7 @@ pub fn export<W: Write>(
                 }
                 write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
                 let info = node.info();
-                let meta = MetaView::from_info(&info);
+                let meta = MetaClaims::from_info(&info);
                 write_properties(&mut properties, node.id(), "node", tags, Some(&meta), opts)
                     .and_then(|()| {
                         writer.write_feature_geometry_props(&geometry, &properties)?;
@@ -212,7 +212,7 @@ pub fn export<W: Write>(
                     return;
                 }
                 write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
-                let meta = node.info().and_then(MetaView::from_dense);
+                let meta = node.info().and_then(MetaClaims::from_dense);
                 write_properties(
                     &mut properties,
                     node.id(),
@@ -253,7 +253,7 @@ pub fn export<W: Write>(
                     return;
                 }
                 let info = way.info();
-                let meta = MetaView::from_info(&info);
+                let meta = MetaClaims::from_info(&info);
                 write_properties(&mut properties, way.id(), "way", tags, Some(&meta), opts)
                     .and_then(|()| {
                         writer.write_feature_geometry_props(&geometry, &properties)?;

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use pbfhogg::ErrorKind;
-use pbfhogg::digest::ContentDigest;
+use pbfhogg::digest::{Digest, Form};
 
 use crate::common::adversarial::{locate_blobs, mutate_blob_header_indexdata};
 use crate::common::{TestNode, write_multi_block_test_pbf};
@@ -27,8 +27,8 @@ fn write_fixture(path: &Path) {
     write_multi_block_test_pbf(path, &nodes, &[], &[], 1);
 }
 
-fn digest(path: &Path) -> pbfhogg::Result<ContentDigest> {
-    pbfhogg::digest::digest(path, false, &crate::common::test_host())
+fn digest(path: &Path) -> pbfhogg::Result<Digest> {
+    pbfhogg::digest::digest(path, Form::Full, false, &crate::common::test_host())
 }
 
 /// The fixture with the indexdata of `stripped` blobs made unreadable (an

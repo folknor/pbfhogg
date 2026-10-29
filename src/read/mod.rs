@@ -1,6 +1,7 @@
 pub mod blob;
 pub(crate) mod blob_wire;
 pub mod block;
+pub(crate) mod claims;
 pub(crate) mod columnar;
 pub(crate) mod decompress;
 pub mod dense;

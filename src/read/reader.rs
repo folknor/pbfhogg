@@ -161,6 +161,16 @@ impl<R: Read + Send> ElementReader<R> {
         &self.header
     }
 
+    /// Parse each blob header's `pbfhogg.WayMembers-v1` payload (field 5),
+    /// so [`crate::blob::Blob::way_members`] answers for the blobs this
+    /// reader delivers. Off by default: the payload is authoritative only in
+    /// a file whose header declares it, which a caller decides from
+    /// [`Self::header`] before switching it on.
+    pub(crate) fn parsing_way_members(mut self, enable: bool) -> Self {
+        self.blob_iter.set_parse_waymembers(enable);
+        self
+    }
+
     /// Decodes the PBF structure sequentially on the calling thread - no background I/O,
     /// no rayon, no channels. Elements are delivered in file order, which is canonical
     /// OSM ID order when [`header().is_sorted()`](HeaderBlock::is_sorted) is `true` and

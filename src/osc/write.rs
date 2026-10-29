@@ -413,11 +413,7 @@ fn write_dense_node_xml<W: std::io::Write>(
             claims.milli_timestamp,
             claims.changeset,
             claims.uid,
-            if claims.user {
-                Some(info.user()?)
-            } else {
-                None
-            },
+            claims.user.transpose()?,
         );
     }
 

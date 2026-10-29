@@ -16,7 +16,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use pbfhogg::digest::ContentDigest;
+use pbfhogg::digest::{Digest, Form};
 use pbfhogg::read::input::{InputSource, PinnedInput};
 
 use crate::common::{TestNode, write_multi_block_test_pbf};
@@ -47,12 +47,12 @@ fn run<'a>(
     input: impl Into<InputSource<'a>>,
     direct: bool,
     host: &pbfhogg::host::Host,
-) -> pbfhogg::Result<ContentDigest> {
-    pbfhogg::digest::digest(input, direct, host)
+) -> pbfhogg::Result<Digest> {
+    pbfhogg::digest::digest(input, Form::Full, direct, host)
 }
 
 /// The unreplaced input's digest, under a host of its own.
-fn expected(input: &Path) -> ContentDigest {
+fn expected(input: &Path) -> Digest {
     run(input, false, &crate::common::test_host()).expect("the unreplaced input")
 }
 

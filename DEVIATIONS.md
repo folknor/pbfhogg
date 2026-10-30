@@ -720,3 +720,15 @@ This matches the refusal of a `PrimitiveGroup` carrying two `DenseNodes`
 messages. No producer emits either shape, keeping the last occurrence silently
 lost the earlier copy's fields, and a merge would be code for a case nobody
 produces.
+
+## inspect --extended: metadata coverage at the edges of fileinfo
+
+The metadata census uses the value tests of `osmium fileinfo -e`
+(libosmium's `detect_available_metadata`) on every object, plain and dense,
+whatever its version. It differs only at the edges: a user index past the
+string table counts as no user where libosmium refuses the file; timestamps
+are judged in milliseconds, not truncated seconds; a user name is non-empty by
+byte length, not by its first byte; versions and changesets libosmium refuses
+are accepted and judged by value; an empty input reports `(none)` for "All
+objects have"; and the timestamp range ignores zero timestamps. CORRECTNESS.md
+"Metadata coverage in inspect --extended" gives the rule.

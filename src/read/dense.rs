@@ -399,7 +399,9 @@ impl<'a> DenseNodeInfo<'a> {
     ///   a lookup, and any other index is resolved and claimed only when the
     ///   name is non-empty, so the claim does not depend on where a writer
     ///   put the empty string in its table.
-    ///   The same tests as libosmium's `detect_available_metadata`. A real
+    ///   The timestamp, changeset, uid and user tests are the value tests of
+    ///   libosmium's `detect_available_metadata` (`visible` is not among
+    ///   them). A real
     ///   versionless node with a zero field (an anonymous `uid` 0, say)
     ///   loses that field on output; on the wire it cannot be told apart.
     ///   Non-zero fields survive, which is what an apply-changes element

@@ -159,7 +159,8 @@ encoding is left alone; outputs that print metadata read it instead:
   alike: OSC from `diff --format osc` (creates, modifies and deletes, so a
   metadata-less node no longer deletes as `version="0"`, or `version="1"` under
   `--increment-version`), the text diff's `vN`, `inspect --show`, the
-  `inspect --extended` metadata census and `export --metadata`. `Info::claimed_version()` and
+  `inspect --extended` metadata census (which counts a version only when it is
+  1 or more) and `export --metadata`. `Info::claimed_version()` and
   `DenseNodeInfo::claimed_version()` are the public form of the rule; `version()`
   still returns the raw value.
 - **The other fields of an `Info`** keep their own presence, zeros included.
@@ -167,14 +168,47 @@ encoding is left alone; outputs that print metadata read it instead:
   packed column cannot mark one slot absent. Version 1 or more: every field is
   present as decoded. Negative: no metadata (the Osmosis rule above). Version 0:
   a field counts only with a value no padding slot holds - non-zero timestamp,
-  positive changeset and uid, a non-empty user, `visible` false - the same tests
-  as libosmium's `detect_available_metadata`. So the padding slot prints nothing,
-  and a real versionless node keeps its non-zero fields. A zero field in such a
-  slot (an anonymous `uid` 0, say) is dropped: on the wire it cannot be told
-  apart from padding.
+  positive changeset and uid, a non-empty user, `visible` false (the first four
+  are the value tests of libosmium's `detect_available_metadata`). So the
+  padding slot prints nothing, and a real versionless node keeps its non-zero
+  fields. A zero field in such a slot (an anonymous `uid` 0, say) is dropped: on
+  the wire it cannot be told apart from padding.
 
 Re-encoding is unaffected: the conversions that feed a rewrite keep a version-0
 slot and its fields as they are, and drop only `-1` slots.
+
+The `inspect --extended` metadata census follows only the version rule above.
+It counts, it does not print, so its other fields follow the next section.
+
+## Metadata coverage in inspect --extended
+
+The census ("All objects have" / "Some objects have", JSON `metadata`, `-g
+metadata.*`) counts the objects whose field carries an available value, as
+`osmium fileinfo -e` does through libosmium's `detect_available_metadata`. Each
+field is judged on its own value, on plain `Info` and every `DenseInfo` slot
+alike and whatever the version: version 1 or more, timestamp non-zero, changeset
+and uid positive, a user name that resolves to a non-empty string. Field
+presence does not count: a plain `Info` carrying uid 0 or an empty user name has
+no uid or user here, although the printing outputs above show them. The Osmosis
+`-1` slot is not skipped: its version fails the test by value, and a real
+timestamp, changeset, uid or user it carries still counts, as in libosmium.
+The data timestamp range is fed by every non-zero timestamp the census counts.
+
+Boundaries against `fileinfo`, all deliberate:
+
+- **Unresolvable user index:** an index past the string table counts as no
+  user (libosmium refuses the file). "No" therefore means "not established":
+  the census cannot tell empty names from broken references.
+- **Timestamps are judged in milliseconds:** a sub-second non-zero timestamp
+  counts; libosmium truncates to whole seconds first.
+- **User names:** "non-empty" is byte length; a name starting with NUL counts
+  (libosmium tests the first byte).
+- **Values libosmium refuses** (version below -1, changeset below -1 or at
+  least 2^32-1) are accepted by pbfhogg and judged by the same tests.
+- **Empty input:** with no objects, "All objects have" is `(none)`; fileinfo
+  reports every field.
+- **Timestamp range** excludes zero; fileinfo's first timestamp becomes the
+  epoch when any object lacks one.
 
 ## Null Island ambiguity in coordinate indexes
 

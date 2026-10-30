@@ -5,8 +5,8 @@ use std::path::Path;
 
 use super::super::Result;
 use super::types::{
-    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, classify_block,
-    update_extended_for_element,
+    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, UserNames,
+    classify_block, update_extended_for_element,
 };
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
@@ -512,6 +512,7 @@ fn scan_block(block: &crate::block::PrimitiveBlock, state: &mut ScanState) -> (B
 
     let need_metadata = state.extended.is_some();
     if need_metadata {
+        let users = UserNames::of(block);
         for element in block.elements() {
             block_elements += 1;
             let (n, w, r) = state.process_element(&element);
@@ -519,7 +520,7 @@ fn scan_block(block: &crate::block::PrimitiveBlock, state: &mut ScanState) -> (B
             has_ways |= w;
             has_relations |= r;
             if let Some(ref mut ext) = state.extended {
-                update_extended_for_element(ext, &element);
+                update_extended_for_element(ext, &element, &users);
             }
         }
     } else {

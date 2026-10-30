@@ -522,72 +522,135 @@ impl ScanState {
     }
 }
 
-/// Update extended stats for a single element. Separate function to avoid
-/// inflating cognitive complexity in `process_element`.
-pub(super) fn update_extended_for_element(ext: &mut ExtendedStats, element: &Element<'_>) {
+// The census counts the objects whose field carries an available value -
+// osmium fileinfo's coverage, the value tests of libosmium's
+// `detect_available_metadata` - not field presence and not the claims model
+// that governs printing. Each field is judged on its own value, for plain
+// `Info` and every dense slot alike, whatever the version: version >= 1,
+// timestamp non-zero in milliseconds, changeset and uid positive, a user name
+// that resolves to a non-empty string. Padding (all zeros) and the Osmosis -1
+// sentinel fail every test by value, so neither needs a branch of its own; a
+// -1 slot's real timestamp, uid or user still counts, as in libosmium. A user
+// index that does not resolve counts as no user: the census reports only what
+// it established. CORRECTNESS.md "Metadata coverage in inspect --extended"
+// states the rule and its boundaries against fileinfo.
+
+/// Which user string indices of one block name a user. Built once per block
+/// from the string table, so the per-element test is a bounds check and a
+/// scan of the (almost always empty) list of empty entries other than index 0,
+/// with no string-table load per element (resolving each name instead was a
+/// measured slowdown of planet `inspect --extended`; see
+/// reference/performance.md).
+pub(super) struct UserNames {
+    len: usize,
+    /// Indices whose string is empty. Index 0 is held separately because the
+    /// format reserves it as the empty string and every table has it.
+    zero_empty: bool,
+    other_empty: Vec<usize>,
+}
+
+impl UserNames {
+    pub(super) fn of(block: &crate::block::PrimitiveBlock) -> Self {
+        let len = block.string_table_len();
+        let mut zero_empty = false;
+        let mut other_empty = Vec::new();
+        for i in 0..len {
+            if block.string_table_entry(i).is_some_and(str::is_empty) {
+                if i == 0 {
+                    zero_empty = true;
+                } else {
+                    other_empty.push(i);
+                }
+            }
+        }
+        Self {
+            len,
+            zero_empty,
+            other_empty,
+        }
+    }
+
+    /// Whether `sid` resolves to a non-empty name in this block.
+    fn names(&self, sid: i32) -> bool {
+        let Ok(sid) = usize::try_from(sid) else {
+            return false;
+        };
+        if sid >= self.len {
+            return false;
+        }
+        if sid == 0 {
+            return !self.zero_empty;
+        }
+        !self.other_empty.contains(&sid)
+    }
+}
+
+pub(super) fn update_extended_for_element(
+    ext: &mut ExtendedStats,
+    element: &Element<'_>,
+    users: &UserNames,
+) {
     ext.metadata.total += 1;
     match *element {
         Element::DenseNode(ref dn) => {
             ext.data_bbox.update(dn.nano_lat(), dn.nano_lon());
-            update_extended_dense_node(ext, dn);
+            update_extended_dense_node(ext, dn, users);
         }
         Element::Node(ref n) => {
             ext.data_bbox.update(n.nano_lat(), n.nano_lon());
-            update_extended_info(ext, &n.info());
+            update_extended_info(ext, &n.info(), users);
         }
-        Element::Way(ref w) => update_extended_info(ext, &w.info()),
-        Element::Relation(ref r) => update_extended_info(ext, &r.info()),
+        Element::Way(ref w) => update_extended_info(ext, &w.info(), users),
+        Element::Relation(ref r) => update_extended_info(ext, &r.info(), users),
     }
 }
 
-fn update_extended_dense_node(ext: &mut ExtendedStats, dn: &crate::DenseNode<'_>) {
-    // Presence by value, as libosmium's `detect_available_metadata` reads
-    // it: a dense slot cannot mark a field absent. A negative version (the
-    // Osmosis -1 sentinel) is a slot with no metadata at all; 0 is a slot
-    // with no version - which is also what a node without metadata gets in
-    // a block whose other nodes carry it - whose other fields count only
-    // where non-zero, so padding counts as nothing.
-    if let Some(info) = dn.info()
-        && info.version() >= 0
-    {
-        if info.claimed_version().is_some() {
-            ext.metadata.has_version += 1;
-        }
-        let ts = info.milli_timestamp();
-        if ts != 0 {
-            ext.metadata.has_timestamp += 1;
-            ext.update_timestamp(ts);
-        }
-        if info.changeset() > 0 {
-            ext.metadata.has_changeset += 1;
-        }
-        if info.uid() > 0 {
-            ext.metadata.has_uid += 1;
-        }
-        if info.raw_user_sid() > 0 {
-            ext.metadata.has_user += 1;
-        }
+fn update_extended_dense_node(
+    ext: &mut ExtendedStats,
+    dn: &crate::DenseNode<'_>,
+    users: &UserNames,
+) {
+    if let Some(info) = dn.info() {
+        let user = users.names(info.raw_user_sid());
+        count_metadata(
+            ext,
+            info.version(),
+            info.milli_timestamp(),
+            info.changeset(),
+            info.uid(),
+            user,
+        );
     }
 }
 
-fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>) {
-    if info.claimed_version().is_some() {
-        ext.metadata.has_version += 1;
-    }
-    if let Some(ts) = info.milli_timestamp()
-        && ts != 0
-    {
-        ext.metadata.has_timestamp += 1;
-        ext.update_timestamp(ts);
-    }
-    if info.changeset().is_some() {
-        ext.metadata.has_changeset += 1;
-    }
-    if info.uid().is_some() {
-        ext.metadata.has_uid += 1;
-    }
-    if info.raw_user_sid().is_some() {
-        ext.metadata.has_user += 1;
+fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>, users: &UserNames) {
+    let user = info.raw_user_sid().is_some_and(|sid| users.names(sid));
+    count_metadata(
+        ext,
+        info.version().unwrap_or(0),
+        info.milli_timestamp().unwrap_or(0),
+        info.changeset().unwrap_or(0),
+        info.uid().unwrap_or(0),
+        user,
+    );
+}
+
+fn count_metadata(
+    ext: &mut ExtendedStats,
+    version: i32,
+    milli_timestamp: i64,
+    changeset: i64,
+    uid: i32,
+    user: bool,
+) {
+    let m = &mut ext.metadata;
+    m.has_version += u64::from(version >= 1);
+    m.has_changeset += u64::from(changeset > 0);
+    m.has_uid += u64::from(uid > 0);
+    m.has_user += u64::from(user);
+    if milli_timestamp != 0 {
+        m.has_timestamp += 1;
+        ext.update_timestamp(milli_timestamp);
     }
 }
 
@@ -705,6 +768,135 @@ fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64>
     }
     values.sort_unstable();
     Some(values[values.len() / 2])
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{ExtendedStats, UserNames, update_extended_for_element};
+    use crate::block_builder::{BlockBuilder, Metadata};
+    use crate::{Element, PrimitiveBlock};
+
+    fn meta(version: i32, timestamp: i64, changeset: i64, uid: i32, user: &str) -> Metadata<'_> {
+        Metadata {
+            version,
+            timestamp,
+            changeset,
+            uid,
+            user,
+            visible: true,
+        }
+    }
+
+    fn block_of(build: impl FnOnce(&mut BlockBuilder)) -> PrimitiveBlock {
+        let mut builder = BlockBuilder::new();
+        build(&mut builder);
+        let bytes = builder.take().expect("encode").expect("bytes").to_vec();
+        PrimitiveBlock::from_vec(bytes).expect("parse")
+    }
+
+    /// (total, version, timestamp, changeset, uid, user)
+    fn counts(ext: &ExtendedStats) -> (u64, u64, u64, u64, u64, u64) {
+        let m = &ext.metadata;
+        (
+            m.total,
+            m.has_version,
+            m.has_timestamp,
+            m.has_changeset,
+            m.has_uid,
+            m.has_user,
+        )
+    }
+
+    /// Plain `Info` counts values, not field presence: a present zero
+    /// changeset or uid and an explicit empty user name are not available
+    /// metadata, and a version below 1 is not a version.
+    #[test]
+    fn plain_info_counts_values_not_presence() {
+        let block = block_of(|b| {
+            b.add_way(1, [], &[1, 2], Some(&meta(1, 0, 0, 0, "")));
+            b.add_way(2, [], &[1, 2], Some(&meta(0, 5, 7, 9, "alice")));
+        });
+        let mut ext = ExtendedStats::new();
+        let users = UserNames::of(&block);
+        for element in block.elements() {
+            if let Element::Way(ref w) = element {
+                let info = w.info();
+                if w.id() == 1 {
+                    assert_eq!(info.changeset(), Some(0), "fixture keeps a present zero");
+                    assert_eq!(info.uid(), Some(0), "fixture keeps a present zero");
+                    assert!(
+                        info.raw_user_sid().is_some_and(|s| s > 0),
+                        "empty name at a nonzero index"
+                    );
+                    assert_eq!(info.user().expect("user").expect("resolves"), "");
+                }
+            }
+            update_extended_for_element(&mut ext, &element, &users);
+        }
+        assert_eq!(counts(&ext), (2, 1, 1, 1, 1, 1));
+        assert_eq!((ext.min_timestamp, ext.max_timestamp), (5000, 5000));
+    }
+
+    /// Every dense slot is judged by value whatever its version: an empty
+    /// name at a nonzero index is no user, padding counts nothing, and an
+    /// Osmosis -1 slot keeps its real timestamp, changeset, uid and user.
+    #[test]
+    fn dense_slots_count_values_whatever_the_version() {
+        let block = block_of(|b| {
+            b.add_node(1, 0, 0, [], Some(&meta(3, 0, 0, 0, "")));
+            b.add_node(2, 0, 0, [], None);
+            b.add_node(3, 0, 0, [], Some(&meta(-1, 11, 13, 17, "bob")));
+        });
+        let mut ext = ExtendedStats::new();
+        let users = UserNames::of(&block);
+        for element in block.elements() {
+            let Element::DenseNode(ref dn) = element else {
+                panic!("expected dense nodes");
+            };
+            let info = dn.info().expect("dense info");
+            match dn.id() {
+                1 => {
+                    assert!(info.raw_user_sid() > 0, "empty name at a nonzero index");
+                    assert_eq!(info.user().expect("resolves"), "");
+                }
+                3 => {
+                    assert_eq!(info.version(), -1, "fixture keeps the sentinel");
+                    assert_eq!((info.changeset(), info.uid()), (13, 17));
+                }
+                _ => {}
+            }
+            update_extended_for_element(&mut ext, &element, &users);
+        }
+        assert_eq!(counts(&ext), (3, 1, 1, 1, 1, 1));
+        assert_eq!((ext.min_timestamp, ext.max_timestamp), (11_000, 11_000));
+    }
+
+    /// A user index past the string table is not an established name: it
+    /// counts as no user, so one broken and one good name give "some" but
+    /// not "all".
+    #[test]
+    fn unresolvable_user_is_not_counted() {
+        let block = block_of(|b| {
+            b.add_node(1, 0, 0, [], Some(&meta(1, 1, 1, 1, "carol")));
+            b.add_node(2, 0, 0, [], Some(&meta(1, 1, 1, 1, "dave")));
+        });
+        let mut ext = ExtendedStats::new();
+        let users = UserNames::of(&block);
+        for element in block.elements() {
+            let Element::DenseNode(mut dn) = element else {
+                panic!("expected dense nodes");
+            };
+            if dn.id() == 2 {
+                dn.set_test_user_sid(i32::MAX);
+            }
+            update_extended_for_element(&mut ext, &Element::DenseNode(dn), &users);
+        }
+        let m = &ext.metadata;
+        assert_eq!(m.has_user, 1);
+        assert!(m.some_have(m.has_user));
+        assert!(!m.all_have(m.has_user));
+        assert!(m.all_have(m.has_uid));
+    }
 }
 
 #[cfg(test)]

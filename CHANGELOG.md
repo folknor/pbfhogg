@@ -196,6 +196,11 @@ never left partial, and the library no longer touches process state.
 
 ### Fixed
 
+- `inspect --extended` metadata coverage counts fields carrying a value, as
+  `osmium fileinfo -e` does: a present uid 0, changeset 0 or empty user name
+  (which pbfhogg's own writer stores for anonymous users) no longer reports
+  that field as available, and an Osmosis `-1` dense slot's real timestamp,
+  uid and user now count.
 - Commands that decode a blob refuse one whose indexdata is false instead of
   answering from the claim.
 - `sort` and `cat --dedupe` no longer write unsorted output stamped sorted.

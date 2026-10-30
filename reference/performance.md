@@ -1262,6 +1262,29 @@ wait is 0.5 %. The memory is the 30 workers' transient decode storage
 summaries: the permit window holds summaries, which are small (tens of KB at
 most, under `--locations`).
 
+### inspect --extended metadata census by value (bygg, 2026-10-30)
+
+The census judges each user name by what it resolves to. Resolving the name
+per element (a string-table load for every object) cost about 5 % on planet
+`--extended`; precomputing, once per block, which string indices are empty
+removes the per-element load. Matched interleaved `--bench 1` cells,
+baselines stored at `9a2c0275` via `--commit HEAD`, variants unstored
+`--force` cells on that tree plus the change:
+
+| cell | wall |
+|---|---:|
+| baseline `ae2927ba` | 41.76 s |
+| per-element resolve | 43.82 s |
+| baseline `dd1d937c` | 42.07 s |
+| per-element resolve | 43.97 s |
+| per-block empty-index table | 42.31 s |
+| baseline `ee5cc078` | 42.36 s |
+| per-block empty-index table | 42.59 s |
+
+The per-block table is within noise (+0.6 % against the adjacent baseline in
+both pairs); phase split identical (29.3 avg cores, same disk read). It
+landed; the per-element resolve did not.
+
 ### Decode buffers sized from the blob and recycled (bygg, 2026-10-30)
 
 The pread decode workers asked the per-worker `DecompressPool` for

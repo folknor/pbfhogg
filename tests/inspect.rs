@@ -513,6 +513,62 @@ fn inspect_extended() {
     assert!(json["metadata"]["some_objects"]["version"].is_boolean());
 }
 
+/// The metadata census reports fields carrying a value, the way
+/// `osmium fileinfo -e` does: a node written with version 1 and an empty
+/// user, zero uid and zero changeset has a version and nothing else, so only
+/// the way's values make "some" true, and JSON and `-g` agree.
+#[test]
+fn inspect_extended_metadata_counts_values() {
+    use crate::common::TestMeta;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("meta.osm.pbf");
+    crate::common::write_test_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: Some(TestMeta::default()),
+        }],
+        &[TestWay {
+            id: 2,
+            refs: vec![1],
+            tags: vec![],
+            meta: Some(TestMeta {
+                timestamp: 1_700_000_000,
+                changeset: 5,
+                uid: 7,
+                user: "erin",
+                ..TestMeta::default()
+            }),
+        }],
+        &[],
+    );
+    let mut opts = inspect_opts(false, false);
+    opts.extended = true;
+    let report =
+        pbfhogg::inspect::inspect(&input, &opts, &crate::common::test_host()).expect("inspect");
+    let json = report.to_json(None);
+    for field in ["version", "timestamp", "changeset", "uid", "user"] {
+        let all = field == "version";
+        assert_eq!(json["metadata"]["all_objects"][field], all, "all {field}");
+        assert_eq!(
+            json["metadata"]["some_objects"][field], true,
+            "some {field}"
+        );
+        let yes_no = |b: bool| Some(if b { "yes" } else { "no" }.to_string());
+        assert_eq!(
+            report.get_value(&format!("metadata.all_objects.{field}")),
+            yes_no(all)
+        );
+        assert_eq!(
+            report.get_value(&format!("metadata.some_objects.{field}")),
+            yes_no(true)
+        );
+    }
+}
+
 #[test]
 fn inspect_get_value() {
     let dir = crate::common::test_scratch();

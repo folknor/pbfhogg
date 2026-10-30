@@ -387,8 +387,9 @@ runs `validate_groups_strict`, then iterates `Element`s with per-node info
 structs and `keys_vals` rescans. One fused pass over the decompressed bytes:
 read block parameters first (protobuf field order is free); tight
 min/max/first/last loops over the id and coordinate columns; dense metadata
-in one lockstep loop (a negative-version slot suppresses that slot's other
-fields while its deltas still feed later slots); one `keys_vals` delimiter
+in one lockstep loop (every slot judged by value whatever its version, user
+names through a per-block table of empty string indices, per CORRECTNESS.md
+"Metadata coverage in inspect --extended"); one `keys_vals` delimiter
 walk for tagged-node counts; plain Info parsed once; refs and members
 checked for structure only; the stringtable UTF-8 check in a borrowed pass.
 Validation is fused, not dropped: inspect keeps refusing every file it
@@ -396,7 +397,6 @@ refuses today. Traps: wrapping delta and scaling semantics (scaling raw
 extrema is not equivalent under negative scales), repeated packed segments,
 mixed-group iteration order, all-or-none dense info. Risk: a second wire
 walker beside block.rs, so share varint, packed iteration and group framing.
-Settle WRK-050 before its differential tests bless current behaviour.
 
 ### WRK-041: One scanner for every decoding inspect mode
 
@@ -417,16 +417,6 @@ design document first.
 ---
 
 ## Correctness
-
-### WRK-050: The metadata census is not libosmium's detect_available_metadata
-
-The code comment and CORRECTNESS.md say it is. Dense user coverage tests
-`raw_user_sid() > 0`, but a positive sid can resolve to an empty string;
-plain changeset, uid and user count field presence, including zero or empty
-values; suppressing negative-version dense slots is a pbfhogg policy
-(libosmium normalizes -1 and still decodes the other columns). No test
-exercises the census on real metadata: the only fixture uses `meta: None`.
-A codex finding, not independently re-checked.
 
 ### WRK-105: OSC sinks disagree on children of a deleted object
 

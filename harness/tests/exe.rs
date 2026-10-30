@@ -462,6 +462,19 @@ fn nofile_cat_is_refused_at_soft_1024() {
 }
 
 #[test]
+fn nofile_multi_extract_is_refused_with_few_descriptors_free() {
+    let (run, _) = scenario_passes(
+        "nofile-multi-extract-refused",
+        false,
+        &["out-a", "out-b"],
+        &[],
+    );
+    let doc = run.doc("calls/a.json");
+    assert_eq!(doc["context"]["rlimit_nofile_soft"], 1024);
+    assert_eq!(doc["outcome"]["kind"], "invalid_argument");
+}
+
+#[test]
 fn nofile_altw_external_runs_three_workers() {
     let (run, _) = scenario_passes("nofile-altw-external", true, &["out"], &[]);
     assert_eq!(run.doc("calls/a.json")["context"]["parallelism"], 8);

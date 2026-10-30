@@ -9,6 +9,7 @@ pub mod cat;
 #[cfg(feature = "commands")]
 pub mod check;
 pub mod degrade;
+pub(crate) mod descriptors;
 pub mod diff;
 pub mod digest;
 #[cfg(feature = "commands")]

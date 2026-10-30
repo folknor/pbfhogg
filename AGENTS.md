@@ -153,6 +153,7 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 ## Benchmarking Rules
 - **Ignore performance differences below 2-3 %.** They are noise for every decision here: not a regression to fix, not a win to claim, not a reason to run more cells. Do not chase them with extra benchmark runs or code-layout tweaks (`#[inline]` attributes and the like).
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.
+- **Never run `brokkr verify` on any dataset larger than germany.** Planet, europe and north-america are bench-only; correctness on real data is checked on denmark and germany.
 - Multiple benchmark runs in an optimization workflow: run sequentially, report between runs.
 - **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.
 - **Interleave matched A/B cells.** `--bench N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--bench 3` cells are still confounded. Alternate `--bench 1` cells, compare medians, and check sign consistency across pairs.

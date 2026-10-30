@@ -58,6 +58,7 @@ pub(crate) fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(cancel::CancelCat::PRE_DECISION),
         Box::new(cancel::CancelCat::POST_DECISION),
         Box::new(nofile::NofileCatRefused),
+        Box::new(nofile::NofileMultiExtractRefused),
         Box::new(nofile::NofileAltwExternal),
         Box::new(error_path::ErrorPath),
         Box::new(seeded_replace::SeededReplace),

@@ -4455,6 +4455,15 @@ fn run_extract_config(
     // after the early ones were extracted. A --staging-dir is checked against
     // every output's directory before any member is reserved. (It was
     // scanned with the command's other locations.)
+    //
+    // Building the set opens a staging descriptor per region, before
+    // `extract_multi` asks the host for the descriptors its run holds. The
+    // CLI's process policy raises the soft open-file limit to the hard one
+    // whenever a command asks and never restores it, so ask here first: a
+    // config with more regions than the default soft limit leaves room for
+    // then fails only past the hard limit. The answer is a snapshot that
+    // reserves nothing; the library's own admission decides the run.
+    drop(host.process.fd_allowance(slots.len() as u64));
     let outputs = pbfhogg::OutputSet::files_with_staging(
         slots.iter().map(|slot| &slot.output),
         overwrite,

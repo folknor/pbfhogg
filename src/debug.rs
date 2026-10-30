@@ -81,6 +81,13 @@ pub trait InstrumentSink: Send + Sync {
 /// contains a newline or `=`; a line over 512 bytes. The library's own names
 /// never hit these.
 ///
+/// A write to a FIFO whose reader has gone raises `SIGPIPE`. Rust programs
+/// ignore it by default, and the write then fails with `EPIPE`, which drops
+/// the line (on a call stream, ending it `failed`). A host that restores the
+/// default disposition is killed by its first write after the reader
+/// closes, so a program using this sink must keep `SIGPIPE` ignored. The
+/// library does not change signal state (ADR-0016).
+///
 /// Cloning is cheap and shares the descriptor, the clock and the record of
 /// the call ids issued.
 #[derive(Clone)]

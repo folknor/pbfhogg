@@ -1,25 +1,17 @@
 # pbfhogg TODO
 
-## 0.6.0 headline items
+## 0.6.0: what is left before the release
 
-Picked 2026-07-30, right after the 0.5.0 release.
+- [ ] **The regressions the planet RAM pass found**, recorded in
+  [notes/pre-release.md](pre-release.md) "Planet RAM pass against the
+  README table". The library-use gate is certified; everything else that
+  stood in the 0.6.0 list moved to 0.7.0 below.
 
-- [ ] **Release gates for library use** (raised 2026-10-26): library use
-  verified by brokkr and per-invocation instrumentation. Tracked, with their open design
-  questions, in [notes/pre-release.md](pre-release.md) "Release gates",
-  together with the measurement campaign that comes before the release.
+## 0.7.0 items (moved from the 0.6.0 list on 2026-10-30)
 
-- [ ] **CHANGELOG Unreleased narrates intermediate states** (found
-  2026-10-28): the block spans everything since v0.5.0, but many entries
-  describe a change against an API that was itself added inside the
-  block (renames of things 0.5.0 never had, "used to" sentences about
-  unreleased behaviour). The Host, Cancel/Invocation, marker FIFO,
-  `OnceKeys` and `emit_counter` cluster was rewritten to net change against
-  v0.5.0 on 2026-10-28; the rest of the block has not been audited. Before
-  the release, check each entry's "before" against `git show v0.5.0:...`
-  and fold or delete entries whose subject 0.5.0 never shipped (for
-  example the `FileReader::open` / `FileWriter::buffered` removals and the
-  `Host::scratch_parent` removal need that check).
+Picked for 0.6.0 on 2026-07-30, right after the 0.5.0 release; deferred
+when 0.6.0 was cut down to the library gate, multi-extract descriptor
+admission and the regressions.
 
 - [ ] **`Executor` residue** (decided 2026-10-28): `host::Executor` was
   narrowed to the library's shared rayon tasks (writer framing, command
@@ -58,17 +50,6 @@ Picked 2026-07-30, right after the 0.5.0 release.
     `reference/performance-history.md` or
     `notes/altw-optimization-history.md`.
 
-- [ ] **Multi-region extract has no descriptor admission** (found
-  2026-10-28, from the cat admission decision): only `cat`, `cat --dedupe`
-  and altw external stage 1 ask `ProcessActions::fd_allowance`. A
-  multi-output `extract --config` holds descriptors per region (each file
-  output keeps its reservation's descriptor until publication, ADR-0017,
-  beside its writer's) and asks for nothing, so a library caller at a
-  default soft limit of 1024 with enough regions fails with EMFILE partway
-  instead of being refused up front; the CLI hides it only when it happens
-  to raise the limit first, which extract's path does not. Count what one
-  region holds, then either admit up front as cat does or record why not.
-
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
   `pbfhogg export --format geoparquet`: stream tagged nodes and
@@ -78,71 +59,12 @@ Picked 2026-07-30, right after the 0.5.0 release.
   orchestrate spec loop before implementation. Supersedes the parked
   GeoPackage idea under Milestone 3.
 
-- [ ] **Cross-repo: brokkr has no `check-index` subcommand.** Every
-  pbfhogg CLI command is normally reachable as a brokkr subcommand, which
-  is what gives it a timed run, a `--bench` row in `.brokkr/results.db`,
-  a sidecar phase profile, `--snapshot` addressing into the dataset
-  graph, and a place in `brokkr suite pbfhogg`. `check --index` is new in
-  0.6.0 and has none of that. The symptom here: it is the most expensive
-  read-only command in the tool - it decompresses every OSMData blob in
-  the file, so it costs roughly a full `cat --clean` pass - and there is
-  currently no way to measure that cost, watch it across commits, or run
-  it against a registered snapshot rather than a hand-typed path. It also
-  cannot join the release-gate suite, so a regression that made the
-  verifier slower, or made it stop looking at blobs, would not show up in
-  any tracked number.
-
-  What brokkr would have to ship: a `check-index` subcommand mapping to
-  `pbfhogg check --index <input>`, with the standard `--dataset` /
-  `--variant` / `--snapshot` resolution the other read-only consumers
-  already get, and an entry in the `pbfhogg` suite. It needs no new
-  measurement machinery - the command already emits `CHECK_INDEX_START` /
-  `CHECK_INDEX_END` markers, so `--bench` and `brokkr sidecar
-  --durations` would work the day the subcommand exists. One wrinkle for
-  whoever writes it: `check --index` exits 1 when it finds a lying blob,
-  which is a successful run reporting a negative answer, not a failed
-  command - a runner that treats any nonzero exit as failure would record
-  a corrupt-file benchmark as a broken build. That is the same exit-code
-  concern as the item above, reached from the other direction.
-
-  What was done here instead: the command was exercised by hand against
-  the real Denmark files (the 464 MB v1-indexdata extract among them) and
-  by the CLI integration tests in `cli/tests/cli_check_index.rs`, which cover
-  the honest, corrupt, unreadable and unindexable cases plus both exit
-  codes. What remains merely disclosed: there is no recorded timing for
-  `check --index` at any scale, and no automated run of it over a
-  dataset larger than a test fixture.
-
-- [ ] **`renumber` and the geocode-index builder size an eager bitset from
-  unverified indexdata `max_id`.** ADR-0013's second consequence - anything
-  sized from unverified metadata must survive that metadata being wrong - is
-  met in `check` (`id_alloc_bound`, `src/commands/check/mod.rs`) and `repack`
-  (`with_element_cap_prealloc`), but two pre-existing consumers still trust
-  the claim at allocation time: `renumber` takes
-  `max(schedule.max_id)` straight from each blob's indexdata
-  (`src/commands/renumber/schedule.rs`, consumed at
-  `src/commands/renumber/mod.rs` `node_id_set.pre_allocate(max_node_id)`)
-  and the geocode builder does the same in
-  `src/geocode_index/builder/pass1_5.rs`. `IdSet::pre_allocate` populates
-  every chunk eagerly (required for lock-free `set_atomic`), so a blob
-  header claiming `max_id` near `i64::MAX` buys an exabyte-scale
-  allocation and the OOM killer before a single element is decoded -
-  the same denial-of-service shape `id_alloc_bound` closed in `check`.
-
-  Why the `check` fix does not transplant: `check` may clamp because an
-  ID beyond the bound is a *reportable input property* there. For
-  renumber the bitset is a functional requirement - every real node ID
-  must land in it - and an honest file may legitimately be small yet
-  carry a huge sparse ID, so a file-length-derived clamp would reject or
-  panic on legal input. Note the flip side already exists today: that
-  same honest sparse-huge-ID file already OOMs these commands with
-  truthful metadata. Closing both ends means an index-structure change
-  (e.g. lazily-populated chunks behind a lock-free publication scheme,
-  or a sign-off two-level map), not a bound. Until then the exposure is:
-  adversarial or corrupt indexdata can OOM `renumber` and
-  `build-geocode-index` at startup; `check --index` detects such a file
-  first. Found at the close pass of the transform-commands hunt,
-  confidence high (code-read, both call sites verified unclamped).
+- [ ] **Cross-repo, filed in bz: `brokkr#64`** (a `check-index`
+  subcommand, so `check --index` gets bench rows, a sidecar profile,
+  `--snapshot` addressing and a suite entry) **and `brokkr#65`** (record
+  pbfhogg exit 1 as a negative answer, not a failed run). Until #64 lands
+  there is no recorded timing for `check --index` at any scale; it is
+  covered by `cli/tests/cli_check_index.rs` and by hand on Denmark.
 
 - [ ] **GeoJSON export v2**
   ([notes/geojson-export-design.md](geojson-export-design.md)):
@@ -154,7 +76,7 @@ Picked 2026-07-30, right after the 0.5.0 release.
   Milestone 3 / Multi-extract): per-region way/relation ID tracking,
   N x ~3 GB memory budget (~10 regions on a 30 GB host).
 
-## CLI surface redesign (deferred past 0.6.0, to the release after it)
+## CLI surface redesign (deferred past 0.6.0, to 0.7.0)
 
 Planned as one coherent CLI-surface cleanup for 0.6.0, then pushed back a
 release. Every item here is a breaking or user-visible CLI change; do them
@@ -502,19 +424,9 @@ notes carry a CLOSED/STATUS header pointing back here.
   actually on the io_uring path. **Blocked on host config first**:
   RLIMIT_MEMLOCK soft limit is 8 MB, io_uring preflight needs >= 16 MB
   (limits.conf change + re-login), which also blocks the sort
-  `--io-uring` re-pin.
-
-  **Release-gate consequence, 2026-08-20.** The same limit means the
-  io_uring writer cannot be exercised on real data on this host at all,
-  and the write-path bug hunt landed three changes inside it that
-  therefore have compile-and-unit coverage only: the `Drop` teardown
-  drain (`drain_best_effort`), the `NUM_BUFS <= 64` compile-time
-  assertion, and `OutputChunk::CopyRange` carrying an `Arc<File>`
-  instead of a `RawFd`. `brokkr check` and `brokkr verify all` are both
-  green, but neither runs a `--io-uring` variant, so whoever owns the
-  release gate should run one `--io-uring` command on a host with the
-  raised limit before shipping. Nothing about the changes is
-  host-specific; the gap is coverage, not suspicion.
+  `--io-uring` re-pin. For one session, `sudo prlimit --pid <claude pid>
+  --memlock=67108864:67108864` from another terminal raises it for every
+  command run after.
 - **libdeflate at planet apply-changes** (formerly write-path plan item
   2b). The sync-mode 1.92x compression win is measured and banked
   (`2cd6ed6`); the pipelined null result was Denmark-scale only, where
@@ -1135,18 +1047,6 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
-## Ignored tests
-
-- [ ] **`sort_overlapping_blobs_uring` (`cli/tests/cli_sort.rs`) is
-  `#[ignore]`d for an io_uring writer bug on small outputs** that no
-  entry here described any more. Unverified whether it still
-  reproduces: the io_uring writer cannot run on the bench host
-  (`RLIMIT_MEMLOCK`, see the release-gate entry below), and
-  `roundtrip_uring_tiny_output` now covers a sub-page output. Run it
-  on a host with the raised limit; un-ignore it or describe the bug.
-  When it is un-ignored, also drop its by-name entry from the `full`
-  profile's skip list in brokkr.toml.
-
 ## Planet-scale validation coverage
 
 README's planet table is the source of truth for "this command runs
@@ -1155,44 +1055,6 @@ of the reachable gaps as bench runs (produces
 `.brokkr/results.db` entries that get promoted into the README once
 they land). This section tracks the remaining axes and dataset gaps
 that are not currently driven by `overnight.sh`.
-
-### Release gate: the io_uring writer is unexercised on real data
-
-Read this before signing off a release. `brokkr check` and
-`brokkr verify all` are green; `brokkr check` selects the io_uring tests
-but they skip on this host, and `verify all` runs no `--io-uring` variant, so
-green does not mean the io_uring output backend was executed. It cannot be
-executed on this host at all: the writer registers 64 x 256 KB = 16 MB of
-buffers and the host's `RLIMIT_MEMLOCK` soft limit is 8 MB, so the
-preflight refuses before a single SQE is submitted. Three changes landed
-inside `src/write/uring_writer.rs` during the write-path bug hunt with
-compile-time and unit coverage only - the `Drop` teardown drain
-(`drain_best_effort`), the `NUM_BUFS <= 64` assertion against the six-bit
-mask in `ud_buf_idx`, and `OutputChunk::CopyRange` carrying an `Arc<File>`
-instead of a `RawFd`. The October 2026 hygiene drain added more
-with the same coverage: passthrough copies under io_uring read straight into
-the registered buffers through a `ReadSink` impl in `write/copy_range.rs`
-(`bd2de78d`), every pipelined backend delivers through the shared
-`pipeline::deliver_in_order` loop (`7abba0df`), the CopyRange loop accepts
-a short pread as progress (`1dd2ea09`), and the buffer pool is allocated
-after the output open (`ea17fd86`). Close the gap on a host whose limit is
-raised: the io_uring tests by name with `brokkr test <name> --sweep all`
-(add `-p pbfhogg-cli` for the CLI ones), confirming no `Skipping:` line -
-they are tier 1 and skip on a typed refusal, and `brokkr check` hides a
-passing test's output, so a green check does not prove the ring was used -
-the ignored
-`sort_overlapping_blobs_uring` by name (see "Ignored tests"; neither the
-gate nor `full` runs it), and `--io-uring` runs
-that take a passthrough copy as well as fresh blocks (plain `cat`, sort, or
-apply-changes on its splice route), since a command writing only fresh
-blocks never reaches `ReadSink`. `uring_writer_refuses_non_regular_targets`
-(tests/roundtrip.rs) is no evidence either way: ring creation and the
-fixed-write probe precede its target check (a refusal there skips), but the
-buffer registration this host's limit refuses comes after it, so here it
-asserts the not-a-file refusal without ever registering a buffer. Do not raise the limit from inside a work
-session; it is a host-configuration change. Full entry, with the other work
-the same limit blocks, under "Deferred with explicit triggers" at the top
-of this file.
 
 ### 1.0 blockers (planet OOM or RSS-exceeds-ceiling)
 

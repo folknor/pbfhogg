@@ -632,6 +632,22 @@ fn parse_extract_geometry(
 /// [`PinnedInput`]): a path is pinned here, a caller's pin is used as it is.
 /// Where a later open cannot reach the pinned file, an input replaced
 /// mid-run fails with `InputReplaced`.
+///
+/// The simple strategy without cleaning reads the input once and holds a
+/// writer per region for the whole scan, so before the input is pinned the
+/// run asks the host for those descriptors (`ProcessActions::fd_allowance`),
+/// plus the pin and a fixed allowance; the other strategies run one region
+/// at a time and ask for the pin and the allowance alone. The library never
+/// raises the open-file limit: a caller extracting more regions than its
+/// soft `RLIMIT_NOFILE` leaves room for raises the limit itself, has its
+/// `ProcessActions` grant more, or extracts fewer regions per call. Each
+/// output's staging descriptor is the caller's, opened when it built
+/// `outputs`.
+///
+/// # Errors
+/// Besides read, decode and write failures: a region count unequal to the
+/// output count, an input that is not a regular file, or a host that allows
+/// fewer descriptors than the run holds, refused before the input is read.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_multi<'a>(
     input: impl Into<InputSource<'a>>,
@@ -654,14 +670,63 @@ pub fn extract_multi<'a>(
             regions.len()
         )));
     }
+    let source: InputSource<'a> = input.into();
+    // Held to the end of the run, past the pin and every writer: declared
+    // before the pin, so it drops after it.
+    let _reservation = admit_multi_descriptors(source, regions.len(), strategy, clean, host)?;
     // One pin for the run: the single-pass attempt and, when it declines or
     // is not tried, every region's extract open the input again through it.
-    let pin = input.into().pin(host)?;
+    let pin = source.pin(host)?;
     let stats = extract_multi_to(
         &pin, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
     outputs.publish()?;
     Ok(stats)
+}
+
+/// Ask the host for the descriptors a multi-region run opens and holds, and
+/// refuse it up front when allowed fewer, before the input is pinned or
+/// read. The route that can take the single pass (simple strategy, nothing
+/// cleaned) holds one synchronous writer per region for the whole scan, so
+/// it asks for one per region; the route is chosen only after the input's
+/// header is read, so an input that turns out unsorted is still asked for
+/// the single pass's count. Every other strategy runs one region at a time,
+/// closing each region's descriptors before the next, so it asks for no
+/// per-region count. Both add the new pin (none for a caller's pin) and
+/// [`EXTRACT_MULTI_EXTRA_FDS`]. The outputs' staging descriptors were opened
+/// when the caller built the set and are already counted as open.
+///
+/// [`EXTRACT_MULTI_EXTRA_FDS`]: crate::tunables::EXTRACT_MULTI_EXTRA_FDS
+fn admit_multi_descriptors(
+    source: InputSource<'_>,
+    regions: usize,
+    strategy: ExtractStrategy,
+    clean: &CleanAttrs,
+    host: &crate::host::Entered<'_>,
+) -> Result<crate::process::FdReservation> {
+    let single_pass = matches!(strategy, ExtractStrategy::Simple) && !clean.any();
+    let writers = if single_pass { regions } else { 0 };
+    let new_pins = crate::read::input::new_pins(&[source]);
+    let what = if single_pass {
+        format!(
+            "a single-pass multi-region extract holds a writer per region for the whole \
+             scan: {regions} regions ({writers} writers, {new_pins} input to pin)"
+        )
+    } else {
+        format!(
+            "a multi-region extract runs one region at a time: {regions} regions \
+             ({new_pins} input to pin)"
+        )
+    };
+    super::descriptors::admit(
+        &super::descriptors::Demand {
+            held: writers.saturating_add(new_pins),
+            extra: crate::tunables::EXTRACT_MULTI_EXTRA_FDS,
+            what: &what,
+            fewer: "extract fewer regions per call",
+        },
+        host,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

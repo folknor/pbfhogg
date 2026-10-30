@@ -218,49 +218,15 @@ pub(super) fn admit_descriptors(
     demand: &str,
     host: &crate::host::Entered<'_>,
 ) -> Result<crate::process::FdReservation> {
-    let wanted = u64::try_from(held)
-        .ok()
-        .and_then(|n| n.checked_add(crate::tunables::CAT_EXTRA_FDS))
-        .ok_or_else(|| Error::invalid_argument(format!("{demand}: more than cat can hold")))?;
-    let reservation = host.process.fd_allowance(wanted);
-    let allowance = reservation.allowance();
-    if allowance.descriptors < wanted {
-        drop(reservation);
-        return Err(Error::invalid_argument(format!(
-            "{demand} need {wanted} descriptors, but only {} are allowed ({allowance}); {}",
-            allowance.descriptors,
-            descriptor_remedy(&allowance, wanted)
-        )));
-    }
-    Ok(reservation)
-}
-
-/// What a refused run's caller can do. A host grant is the host's policy,
-/// which no process limit changes; a probed allowance is the process's soft
-/// limit, which the caller (never the library) may raise up to the hard
-/// limit when that is known to leave room.
-fn descriptor_remedy(allowance: &crate::process::FdAllowance, wanted: u64) -> String {
-    let Some(probe) = allowance.probe else {
-        return "grant more descriptors from the host's ProcessActions::fd_allowance, or \
-                cat fewer files per call"
-            .to_owned();
-    };
-    let already_open = probe.soft_limit.saturating_sub(allowance.descriptors);
-    let needed_limit = already_open.saturating_add(wanted);
-    let raise = match probe.hard_limit {
-        Some(hard) if hard >= needed_limit && hard > probe.soft_limit => format!(
-            "raise the process's soft open-file limit to at least {needed_limit} (ulimit -n, \
-             or setrlimit in an embedding program; the hard limit {hard} allows it)"
-        ),
-        Some(hard) if hard < needed_limit => format!(
-            "the run needs an open-file limit of at least {needed_limit}, above the hard \
-             limit {hard}; raise the hard limit"
-        ),
-        _ => "raise the process's soft open-file limit (ulimit -n, or setrlimit in an \
-              embedding program)"
-            .to_owned(),
-    };
-    format!("{raise}, close other descriptors, or cat fewer files per call")
+    super::descriptors::admit(
+        &super::descriptors::Demand {
+            held,
+            extra: crate::tunables::CAT_EXTRA_FDS,
+            what: demand,
+            fewer: "cat fewer files per call",
+        },
+        host,
+    )
 }
 
 // ---------------------------------------------------------------------------

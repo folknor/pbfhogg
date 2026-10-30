@@ -612,6 +612,23 @@ both passes) and dropped at once on a refusal, so a reserving provider
 External `add-locations-to-ways` holds its stage-1 reservation until stage
 1 returns, when its shard files are closed.
 
+A multi-region `extract` (`extract_multi`) admits the same way, through
+the same helper (`commands::descriptors::admit`), once its output set is
+bound and before its input is pinned. The simple strategy without cleaning
+may take the single pass, which holds a synchronous writer per region for
+the whole scan, so it asks for one descriptor per region; the route is
+known only after the input's header is read, so an input that then falls
+back to one pass per region was still asked for the single pass's count.
+The other strategies run one region at a time, closing each region's
+descriptors before the next, and ask for no per-region count. Both add
+the new pin and a fixed allowance (`EXTRACT_MULTI_EXTRA_FDS`), and hold
+the reservation past the pin and every writer. Each output's staging
+descriptor (ADR-0017) is opened when the caller builds the `OutputSet`,
+before the call, so the probe already counts it as open and the request
+leaves it out; the CLI asks its process policy to raise the soft limit
+before it builds the set. A single-region `extract` asks for nothing: its
+peak is the same fixed handful whatever its arguments.
+
 The library never raises the open-file limit (ADR-0016), so a library
 caller at a default soft limit of 1024 cannot cat about a thousand files
 in one call, which it could before cat pinned, when it held one input at a

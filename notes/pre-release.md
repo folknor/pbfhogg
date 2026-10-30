@@ -22,91 +22,145 @@ next.
 
 ## Release gates
 
-### Library use is verified (cross-repo, certified)
+### Status
 
-Certified: `brokkr library --all --dataset denmark` certifies on the clean
-tree of the commit that landed `#39` (every scenario passed, every required
-capability passed; the record is under `.brokkr/library-certifications/`
-on bygg). A later change that
-breaks a scenario reopens this gate; rerun the sweep before a release.
+The library-use gate is certified (`brokkr library --all --dataset denmark`
+at `627883d7`: 12/12 scenarios, 17/17 capabilities). io_uring is exercised
+on real data and its writer fixed. Multi-region extract admits its
+descriptors. What still stands between here and 0.6.0 is the regressions in
+"Planet RAM pass against the README table" below. Every other item of the
+old 0.6.0 list (GeoParquet, GeoJSON v2, multi-extract v2, the `Executor`
+residue, `brokkr#64` and `brokkr#65`) moved to `notes/todo.md` "0.7.0
+items", as did the CLI surface redesign.
 
-brokkr runs the `pbfhogg` binary, one command per process. Before the
-harness, nothing drove the library the way an embedding caller would; the
-harness now checks every behaviour below that only exists under library use:
+---
 
-- several calls in one process, one after another and concurrently: whether
-  their outputs match the CLI's, whether any process-global state still leaks
-  between them, and that each call's counters (`Invocation::for_each_counter`)
-  and instrumentation stream (its own `debug::InstrumentSink`) are its own;
-- a caller-supplied `Host`: `Resources` figures instead of the machine probe,
-  the page-cache policy, the executor, a caller tripping its `Invocation`;
-- a process whose soft fd limit nobody raised (the CLI raises it; the
-  library may not, ADR-0016). Decided 2026-10-28: cat keeps its held pins
-  and refuses up front when the limit is short, naming the remedy
-  (reference/pipeline.md "One input, one file, across passes" says why);
-  altw external stage 1 runs fewer shard workers (three at soft 1024) and
-  refuses below 320 available. The harness checks both: a library cat of
-  ~1000 distinct inputs at soft 1024 is refused before anything is read,
-  publishing nothing, and altw external at soft 1024 completes with
-  matching output;
-- no stderr from the library (diagnostics only through `host::Diagnostics`).
+## Planet RAM pass against the README table (2026-10-30)
 
-brokkr's side has landed: `brokkr library` builds, runs, verifies, measures,
-profiles and certifies a harness, to a protocol frozen at version 1
-(`brokkr man library`). What remains is pbfhogg's, tracked in bz:
+The blocker question: is every command still RAM-safe at planet on a
+28-ish GB host? Answer: **yes.** No measured command comes near the ceiling;
+the highest peak is `inspect --tags -j 16` at 17.5 GB, unchanged from the
+README.
 
-- `#34`: the harness member (`pbfhogg-harness`) has landed: its skeleton
-  as L2 of `notes/library-harness.md`, every scenario of the list above
-  as L5 (the seal, `#31` and `#32`, as L4; `#33` as L1), and the proof
-  that writer framing runs on a caller's `Executor::Pool`
-  (`executor.caller-pool.v1`, through the counter
-  `writer_payload_framed_on_executor_items`). Closed.
-- `#35` has landed as L6: `[pbfhogg.library.require]` in `brokkr.toml`
-  is this gate's applied form, and `brokkr library --all --dataset
-  denmark` is its check.
-- `#39` covered the last two required capabilities: `page-cache-keep`
-  proves a call on `PageCachePolicy::Keep` asks for no input eviction
-  (the invocation counter `fadvise_input_evictions`, with an `Evict` call
-  as the contrast), and `concurrent-cat` judges each call's sealed
-  snapshot against its own workload. Closed.
-- `#36` (a reserving descriptor provider for concurrent calls,
-  `host::FdPool`) has landed as L7, and `concurrent-cat` uses it.
-- `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
-  interval) have landed; every counterpart now compares under `v2`, and
-  the certification that closes this gate is also `v2`'s.
+Setup: host bygg (Ryzen 9 9950X3D2, 16c/32t, 30.5 GiB, 29.1 GiB available),
+pbfhogg `627883d7`, one `--bench 1` cell per command after `fstrim`, input
+`planet-20260223-with-indexdata.osm.pbf`. Peak anon RSS is the sidecar's
+`anon` max. The README table was measured on a Ryzen 9 5900X (12c/24t), so
+wall times are not comparable across the two columns (bygg is the faster
+host) and are listed for reference only. Pool-heavy commands run more
+workers on bygg, which accounts for part of every small RSS increase below;
+no row has been checked against a v0.5.0 cell on bygg. The brokkr dev's
+installs and runs went through the machine lock between some cells; that
+does not affect RSS.
 
-Still open with no ticket: **SIGPIPE on a FIFO whose reader left.**
-`MarkerFifo` writes to a FIFO; with no reader the write raises SIGPIPE.
-Rust binaries ignore it by default, but a library host that restored the
-default disposition dies on its first marker after brokkr closes the read
-end. The harness protocol makes "never reset SIGPIPE" a producer
-obligation, which covers the harness but not other embedders; decide
-whether the library docs must state the requirement (the library may not
-change signal state, ADR-0016) or whether the write should use a send path
-that suppresses it. Since L4 the stakes are the seal's too: a terminal
-record written after the reader left is where such a host would die, and
-with SIGPIPE ignored the same write is accounted as a hard failure (the
-stream ends `failed`).
+| Command | Peak anon, bygg | README | Wall, bygg | README wall | UUID |
+|---|---:|---:|---:|---:|---|
+| `inspect --tags -j 16` | 17.5 GB | 17.5 GB | 1m40s | 2m50s | `7855f2a4` |
+| `build-geocode-index` | 13.4 GB | ~25 GB | 5m20s | 5m47s | `c261bd3c` |
+| `add-locations-to-ways --index-type external` | 10.7 GB | 12.0 GB | 5m21s | 9m52s | `13668dda` |
+| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) | 10.3 GB | 9.4 GB | 10m53s | 14m44s | `4babae4d` |
+| `extract --smart` (`-25,34,45,72`) | 8.2 GB | 11.17 GB | 2m20s | 4m28s | `d015bbe4` |
+| `cat --dedupe` | **7.57 GB** | 1.4 GB | 53m43s | 2h13m | `d271f04f` |
+| `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
+| `extract --complete` (`-25,34,45,72`) | 5.27 GB | 4.7 GB | 2m02s | 3m42s | `ce0bdcc0` |
+| `apply-changes --locations-on-ways` (4913, keep-untagged base) ² | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
+| `extract --simple` (`-25,34,45,72`) | 3.52 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
+| `renumber` | 3.19 GB | 3.3 GB | 2m00s | 3m11s | `ce4acd6a` |
+| `apply-changes` (4913, `zstd:1`) | 3.1 GB | 2.4 GB | 2m07s | 4m29s | `f2b8beed` |
+| `tags-filter w/highway=primary` (two-pass) | 2.84 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
+| `check --ids --full` | 2.47 GB | 2.22 GB | 34s | 1m10s | `f6ba05d4` |
+| `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
+| `cat --clean version` | 1.24 GB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
+| `time-filter` (cutoff 2024-01-01) | 1.16 GB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
+| `merge-changes` (4914..4920, 7 OSCs) | **895 MB** | 2 MB | 30s | 54s | `f24c29af` |
+| `getparents` | 705 MB | 506 MB | 13s | 22s | `dd453b3f` |
+| `tags-filter -R highway=primary` | 659 MB | 688 MB | 38s | 52s | `55f84dee` |
+| `diff --format osc -j 16` (base vs 20260411) | 653 MB | 634 MB | 4m11s | 4m54s | `607cd897` |
+| `check --ids` | 646 MB | 504 MB | 31s | 57s | `4edab6b2` |
+| `inspect --nodes -j 16` | 425 MB | 410 MB | 31s | 56.8s | `b1fc3106` |
+| `getid --invert` | 58 MB | 102 MB | 56s | 1m31s | `7ee6c776` |
+| `inspect --extended` | 26 MB | 34 MB | **13m22s** | 13m41s | `9b49e8fb` |
+| `getid` | ~13 MB ¹ | 27 MB | short ¹ | 6.1s | `67d66e4e` |
+| `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
+| `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
+| `cat --type way` | 10 MB | 10 MB | 30s | 45s | `3d4a36a8` |
+| `merge-changes` (4913, 1 OSC) | 1.6 MB | 2 MB | 24s | 44s | `bf6db512` |
+| `inspect` | <1 MB ¹ | 5 MB | short ¹ | 6.5s | `3ec07278` |
+| `tags-filter -i w/highway=primary` ³ | 7.49 GB | 7.0 GB | 5m16s | 7m57s | `9bf96ab2` |
+| `diff -j 16` (text, base vs 20260411) ³ | 605 MB | 586 MB | 3m04s | 3m48s | `f9fa4f6f` |
 
-### io_uring on real data
+¹ Too short for the 100 ms sampler (three samples); approximate.
+² The README row for this one was measured on a 9950X3D2 like bygg, so it
+is the one row whose walls compare directly.
+³ Measured later the same day on brokkr `a8605c879`, after its fixes for
+brokkr#67 (long flag spellings) and brokkr#68 (text diff written to scratch
+with `-o`); every other row ran on the morning's brokkr build.
 
-`notes/todo.md` "Release gate: the io_uring writer is unexercised on real
-data" holds this gate and now also names the drain's io_uring changes that
-have never run end to end (the `ReadSink` passthrough read in
-`write/copy_range.rs`, the shared ordered-delivery loop, the short-pread
-acceptance, the pool allocated after the output open) and what run reaches
-them. Before this edit it only partly covered them: it asked for "one
-`--io-uring` command", which need not take a passthrough copy and so need not
-touch `ReadSink`. The bench host's `RLIMIT_MEMLOCK` refuses io_uring
-(ADR-0014); the run needs a host with a raised limit, and the limit is not
-raised from inside a work session.
+### What moved
 
-### Other 0.6.0 items
+- **`cat --dedupe`: 5.4x the memory for 2.5x the speed.** The drain moved it
+  onto sort's engine, which sweeps overlap runs on worker threads and holds
+  up to min(window, workers) sweep heaps plus window x 4 re-encoded blocks;
+  planet merged with itself puts every blob in an overlap run, so this is
+  the worst case. A design trade, not a leak: the maintainer decides whether
+  to keep it or cap it.
+- **`merge-changes` with 7 OSCs: 895 MB against 2 MB.** The 1-OSC run is
+  still 1.6 MB, so it is the multi-input path (members re-emitted in input
+  order, at most one in flight per worker, each an inflated daily OSC). The
+  README's 2 MB conflicts with notes/todo.md's account of the old path as
+  holding every re-emitted input in memory, so the old figure itself may be
+  wrong; one v0.5.0 cell would settle which.
+- **Moderate RSS increases, all pool-heavy commands:** `cat --clean` +65 %,
+  `time-filter` +43 %, `getparents` +39 %, `apply-changes` +30 %,
+  `check --ids` +28 %, `extract --simple` +17 %, `extract --complete` +12 %,
+  `check --ids --full` +11 %, `multi-extract --simple` +10 %, `tags-filter`
+  two-pass +9 %. Part of each is bygg's worker count; code and host are not
+  separated.
+- **RSS down:** `build-geocode-index` (the README's ~25 GB was probably total
+  RSS; bygg's total including file-backed mmaps is 18.8 GB), `multi-extract
+  --smart`, `extract --smart`, external altw, `sort` and `cat`.
+- **Runtime lead: `inspect --extended`.** A single-threaded decode that should
+  gain most from bygg's faster cores, it ran 13m22s against the README's
+  13m41s while every other row ran 10-60 % faster. Points at a slowdown in
+  the sequential decode path. Every other wall is uninformative about the
+  2-7 % band, because bygg is the faster host.
 
-`notes/todo.md` "0.6.0 headline items" holds the rest (GeoParquet export,
-the two brokkr cross-repo checks on exit code 1 and the missing `check-index`
-subcommand, the `renumber` / geocode eager bitset, GeoJSON v2, multi-extract
-v2). The CLI surface redesign is deferred past 0.6.0.
+### Handoff, 2026-10-30
+
+What a session picking this up needs that is not written elsewhere:
+
+- **The release is not cut.** CHANGELOG.md's section is headed
+  `## 0.6.0 - 2026-10-30`; set the real date when it ships. Both
+  `Cargo.toml`s still say 0.5.0. The 0.6.0 section was rewritten to net
+  change against v0.5.0, one line per entry; keep it that terse.
+- **Next step is the regressions above, chased with subagents** (the
+  maintainer's call). Not matched v0.5.0-against-HEAD pairs: the "measurement
+  campaign" section further down plans those and is superseded for this
+  purpose; its cell list and reading notes still hold as reference.
+- **brokkr state.** Filed and answered today: brokkr#64 (check-index
+  subcommand), #67 (long flag spellings; Denmark `verify all` passes on the
+  fix), #68 (text diff to scratch), #69 (walls no longer on a 100 ms grid,
+  confirmed on `a8605c879`), #70 (typo). Open: **#65**, exit 1 accepted as
+  an answer for diff and check commands. Until it lands, a `--commit` cell
+  at a pbfhogg older than 0.6.0 that exits 1 may be a failure stored as an
+  answer (before 0.6.0, 1 also meant failure): read such a cell's stderr
+  before trusting its row. Stored short-run rows from before brokkr
+  `a8605c879` carry up to ~100 ms of wall error.
+- **Reading a cell cheaply:** `brokkr sidecar <uuid> --stat anon` gives peak
+  anon RSS (fields: rss, anon, file, hwm, ...); the full `--human` table is
+  long on altw and multi-extract.
+- **io_uring on bygg** needs memlock raised for the session (see the
+  deferred io_uring item in notes/todo.md); the writer tests skip otherwise.
+- **Filing in brokkr's bz from here:** the Bash hook rejects a command that
+  names brokkr together with a redirect, a pipe or backticks, so pass the
+  body with `-b '...'` in single quotes and no backticks.
+- **Never `brokkr verify` above germany** (AGENTS.md).
+
+### README host
+
+The maintainer may move the README table to bygg. The bygg columns above are
+a draft of it; its walls would need best-of-N cells on a quiet host first,
+and the regressed rows re-measuring after their fixes.
 
 ---
 

@@ -12,6 +12,19 @@
 //! ran before any input was acquired. No counterpart: the CLI raises its
 //! soft limit whenever a command asks, so it would not refuse.
 //!
+//! `nofile-multi-extract-refused`: the call first opens read-only
+//! descriptors on its private directory until 8 remain free under the soft
+//! limit (an embedding process near its limit), then builds two outputs
+//! (two staging descriptors, leaving 6) and runs a simple two-region
+//! extract of a missing path, which asks for 11: a writer per region, the
+//! pin and an allowance of 8. Refused before the input is pinned, by the
+//! same argument as the refused cat (a not-found error would have come
+//! first otherwise, and `MULTI_EXTRACT_START` is never passed), and both
+//! members of the set are decided refused with no effect. The fillers stand
+//! in for many regions: the brokkr protocol binds output roles one by one,
+//! so the scenario shrinks the free count rather than growing the region
+//! count. No counterpart, as for cat.
+//!
 //! `nofile-altw-external`: the external join at fixed parallelism 8 (a CPU
 //! cap of 6 stage-1 workers) is held to 3 by the descriptor allowance,
 //! `(available - 64) / 256`, and completes. That needs between 832 and
@@ -156,6 +169,156 @@ impl Markers {
             .iter()
             .any(|n| n == name)
     }
+}
+
+pub(crate) struct NofileMultiExtractRefused;
+
+/// Descriptors left free under the soft limit when the call starts building
+/// its outputs: the two staging descriptors take two, leaving six, under
+/// the eleven the single-pass extract asks for (two writers, one pin, an
+/// allowance of eight).
+const MULTI_FREE: u64 = 8;
+
+/// The two output roles of the refused multi-extract.
+const MULTI_OUTPUTS: [&str; 2] = ["out-a", "out-b"];
+
+impl Scenario for NofileMultiExtractRefused {
+    fn decl(&self) -> ScenarioDecl {
+        ScenarioDecl {
+            id: "nofile-multi-extract-refused",
+            description: "single-pass two-region extract of a missing path with 8 descriptors free under soft RLIMIT_NOFILE 1024, refused up front",
+            deadline_s: 120,
+            hotpath: false,
+            isolation: false,
+            calls: vec![CallDecl {
+                id: "a",
+                label: "extract --simple of a missing path into out-a and out-b with 8 descriptors free",
+                cli: None,
+                stream: STREAM_SEALED,
+            }],
+            roles: vec![
+                RoleDecl::output("out-a", "a"),
+                RoleDecl::output("out-b", "a"),
+            ],
+            assertions: vec![AssertionDecl {
+                id: "a.refused",
+                call: Some("a"),
+                covers: &["nofile.multi-extract-refused.v1"],
+            }],
+        }
+    }
+
+    fn plan(&self) -> Value {
+        json!({
+            "schedule": { "order": ["a"], "concurrency": "sequential",
+                          "invocation": "one per call", "host": "one per call" },
+            "setup": { "generated": [], "rayon_global_pool": "started before the first call" },
+            "process": process_json(self.nofile()),
+            "calls": { "a": {
+                "command": "extract",
+                "input": "absent.osm.pbf in the call's private directory, never created",
+                "outputs": MULTI_OUTPUTS,
+                "regions": "one bbox per output, 12.4,55.6,12.7,55.8",
+                "strategy": "simple",
+                "set_bounds": false,
+                "clean": super::clean_json(false),
+                "write": write_json(),
+                "header_overrides": overrides_json(),
+                "output_policy": output_policy_json("refuse"),
+                "descriptors_free": format!(
+                    "{MULTI_FREE} under the soft limit before the outputs are built, the rest \
+                     held by the call's own opens of its private directory"
+                ),
+                "host": host_json(&json!("machine"), &json!("ambient"), &json!("none")),
+            } },
+        })
+    }
+
+    fn nofile(&self) -> Nofile {
+        Nofile::Soft(SOFT)
+    }
+
+    fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
+        let markers = Arc::new(Markers(Mutex::new(Vec::new())));
+        let mut spec = CallSpec::plain("a");
+        spec.tap = Some(Arc::clone(&markers) as Arc<dyn Tap>);
+        let mut missing_exists = false;
+        let mut filled = None;
+        let record = ctx.call(spec, |host, env| {
+            let dir = env.private_dir();
+            let missing = dir.join(MISSING);
+            missing_exists = !super::absent(&missing);
+            // Held to the end of the call: every descriptor but MULTI_FREE
+            // under the soft limit.
+            let fillers = fill_descriptors(dir, MULTI_FREE)?;
+            filled = Some(fillers.len());
+            let outputs = pbfhogg::OutputSet::files_with_staging(
+                MULTI_OUTPUTS.iter().map(|role| env.binding(role)),
+                pbfhogg::Overwrite::Refuse,
+                pbfhogg::Staging::DirWithBackups(dir),
+                &host.diagnostics,
+            )?;
+            let bbox = pbfhogg::extract::parse_bbox("12.4,55.6,12.7,55.8")?;
+            let regions: Vec<pbfhogg::extract::Region> = MULTI_OUTPUTS
+                .iter()
+                .map(|_| pbfhogg::extract::Region::Bbox(bbox))
+                .collect();
+            let result = pbfhogg::extract::extract_multi(
+                missing.as_path(),
+                &regions,
+                outputs,
+                pbfhogg::extract::ExtractStrategy::Simple,
+                false,
+                &CLEAN_NONE,
+                &WRITE,
+                &overrides(),
+                host,
+            );
+            drop(fillers);
+            result.map(drop)
+        })?;
+        let outs_absent = MULTI_OUTPUTS
+            .iter()
+            .all(|role| super::absent(ctx.binding(role)));
+        let scanned = markers.saw("MULTI_EXTRACT_START");
+        let refused_row = matches!(
+            record.publications.as_slice(),
+            [p] if p.ordinal == 1
+                && p.decision == Decision::RefusedError
+                && p.members == [("out-a", Effect::None), ("out-b", Effect::None)]
+        );
+        let ok = record.outcome.error().is_some_and(|(kind, message)| {
+            // The count itself: two writers, one pin and the allowance of
+            // eight, so a request without the per-region writers fails.
+            kind == "invalid_argument" && message.contains("need 11 descriptors")
+        }) && refused_row
+            && outs_absent
+            && !scanned
+            && !missing_exists;
+        let detail = format!(
+            "{}, outputs absent {outs_absent}, MULTI_EXTRACT_START passed {scanned}, \
+             missing input existed {missing_exists}, filler descriptors {filled:?}",
+            account(&record)
+        );
+        ctx.finish_call(&record, &[Outcome::judge("a.refused", ok, detail)])?;
+        Ok(Vec::new())
+    }
+}
+
+/// Open read-only descriptors on `dir` until only `free` remain under the
+/// soft limit, counting the open ones in `/proc/self/fd` (less the one the
+/// count itself holds). Opens nothing when fewer are free already.
+fn fill_descriptors(dir: &std::path::Path, free: u64) -> pbfhogg::Result<Vec<std::fs::File>> {
+    let entries = std::fs::read_dir("/proc/self/fd")?
+        .count()
+        .saturating_sub(1);
+    let open = u64::try_from(entries).unwrap_or(u64::MAX);
+    let target = SOFT.saturating_sub(free);
+    let mut fillers = Vec::new();
+    for _ in open..target {
+        fillers.push(std::fs::File::open(dir)?);
+    }
+    Ok(fillers)
 }
 
 pub(crate) struct NofileAltwExternal;

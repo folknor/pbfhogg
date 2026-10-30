@@ -1105,6 +1105,56 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
     assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
 }
 
+/// A single-pass multi-extract holds a writer per region beside each
+/// region's staging descriptor, so a config with more regions than the
+/// open-file limit leaves room for is refused up front, naming the counts
+/// and the remedy, with nothing published and no staging file left behind.
+/// At a limit of 64, 40 regions' staging descriptors fit, but their 40
+/// writers on top do not: without the admission the run fails with EMFILE
+/// partway through the writers instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn multi_extract_refuses_more_regions_than_the_descriptor_limit_holds() {
+    const REGIONS: usize = 40;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts: Vec<String> = (0..REGIONS)
+        .map(|i| format!(r#"{{ "output": "r{i}.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }}"#))
+        .collect();
+    let config_json = format!(
+        r#"{{ "directory": "{}", "extracts": [{}] }}"#,
+        dir.path().display(),
+        extracts.join(", ")
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .open_file_limit(64)
+        .assert_failure();
+    result.assert_stderr_contains("need 49 descriptors");
+    result.assert_stderr_contains("extract fewer regions per call");
+    for i in 0..REGIONS {
+        assert!(
+            !dir.path().join(format!("r{i}.osm.pbf")).exists(),
+            "region {i} was published"
+        );
+    }
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with(".pbfhogg-tmp-"))
+        .collect();
+    assert!(strays.is_empty(), "staging file leaked: {strays:?}");
+}
+
 #[test]
 fn multi_extract_two_bbox_regions() {
     let dir = crate::common::test_scratch();

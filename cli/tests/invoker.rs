@@ -197,6 +197,35 @@ impl CliInvoker {
         self
     }
 
+    /// Cap the child's open-file limit at `limit` (`RLIMIT_NOFILE`, soft and
+    /// hard both, never above the current hard limit), so its own raise to
+    /// the hard limit cannot lift it: a fixed descriptor budget for tests of
+    /// up-front descriptor admission. Lowering a limit needs no privilege
+    /// and reaches only the child, so the test binary's own limit is
+    /// untouched.
+    #[cfg(target_os = "linux")]
+    pub fn open_file_limit(mut self, limit: u64) -> Self {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions (`getrlimit`, `setrlimit`).
+        unsafe {
+            self.cmd.pre_exec(move || {
+                let mut current: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let capped = limit.min(current.rlim_max);
+                current.rlim_cur = capped;
+                current.rlim_max = capped;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &current) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
     /// Run the child in a private user and mount namespace in which
     /// `target` is a bind mount of `source`: the same device, another
     /// mount. Nothing is mounted outside the child. Setup that fails ends

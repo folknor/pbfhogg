@@ -620,6 +620,21 @@ pub(crate) const CAT_EXTRA_FDS: u64 = 8;
 // Filtering and extract
 // ---------------------------------------------------------------------------
 
+/// Descriptors a multi-region `extract` asks the host for beyond its
+/// per-region count (one held writer per region on the single-pass route)
+/// and its new input pin. It covers, at worst, one region's extract on the
+/// sequential route (the writer's own open of the output's staging path, the
+/// io_uring ring when that backend is chosen, and the up-to-three input
+/// descriptors a strategy holds at once: a header reader, a classify input
+/// and a walker), or on the single-pass route the shared input descriptor
+/// the classify and write phases pread through, the sortedness probe that
+/// closes before the writers open, and the pin's transient procfs check,
+/// with slack over each. Every output's staging descriptor is opened when
+/// the caller builds the output set, before the call, so it is already
+/// counted as open and not asked for. Recheck this when a strategy or
+/// output backend starts holding more.
+pub(crate) const EXTRACT_MULTI_EXTRA_FDS: u64 = 8;
+
 /// Number of decoded blocks collected before unsorted pass-2 dispatches them
 /// to rayon.
 pub(crate) const EXTRACT_SIMPLE_BATCH_SIZE: usize = 64;

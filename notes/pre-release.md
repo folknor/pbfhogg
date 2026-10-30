@@ -66,7 +66,7 @@ does not affect RSS.
 | `apply-changes --locations-on-ways` (4913, keep-untagged base) ² | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
 | `extract --simple` (`-25,34,45,72`) ⁷ | 3.09 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
 | `renumber` | 3.19 GB | 3.3 GB | 2m00s | 3m11s | `ce4acd6a` |
-| `apply-changes` (4913, `zstd:1`) ⁷ | 2.97 GB | 2.4 GB | 2m07s | 4m29s | `f2b8beed` |
+| `apply-changes` (4913, `zstd:1`) ⁸ | 2.36 GB | 2.4 GB | 2m05s | 4m29s | unstored |
 | `tags-filter w/highway=primary` (two-pass) ⁷ | 2.57 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
 | `check --ids --full` | 2.47 GB | 2.22 GB | 34s | 1m10s | `f6ba05d4` |
 | `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
@@ -112,6 +112,10 @@ unchanged per work phase and left as stored). The RSS-pass peaks were
 cat 1.24 GB, time-filter 1.16 GB, getparents 705 MB, check `--ids`
 646 MB, apply-changes 3.1 GB, extract `--simple` 3.52 GB, tags-filter
 two-pass 2.84 GB, inspect `--extended` 571 MB.
+⁸ Re-measured after the rewrite started framing each output block as it
+completes (a `--force` cell on `5bfa37ab` plus the change, so not stored);
+the RSS-pass cell was `f2b8beed`, 3.12 GB and 2m07s, and 2.97 GB after
+the decode-buffer change.
 
 ### What moved
 
@@ -142,11 +146,16 @@ two-pass 2.84 GB, inspect `--extended` 571 MB.
   30 vs 22 workers), so those rows grew with bygg's worker count, not code;
   the extract rows compare different bboxes (README `-10,35,32,72`, bygg
   `-25,34,45,72`); multi-extract is about 4 % in consistent units, not
-  10 %. What still sits above the README: apply-changes (overlay, drain
-  reorder and pwrite queue, notes/pool-rss-growth.md) and cat `--clean`
-  (994 MB against 750 MB); not re-measured: check `--ids --full`,
+  10 %. What still sits above the README: cat `--clean` (994 MB against
+  750 MB); not re-measured: check `--ids --full`,
   extract `--complete`, multi-extract `--simple`, which share the changed
   decode path.
+- **`apply-changes`: resolved.** The workers held every raw output block
+  of a blob (about 27 at planet) until the whole blob was rewritten; each
+  block is now framed as it completes: 2.36 GB peak anon and 2m05s on
+  bygg, against 2.97 GB (see reference/performance.md, "apply-changes
+  frames each block as it completes"). The allocator hook was tried and
+  is not requested: twenty times the wall.
 - **RSS down:** `build-geocode-index` (the README's ~25 GB was probably total
   RSS; bygg's total including file-backed mmaps is 18.8 GB), `multi-extract
   --smart`, `extract --smart`, external altw, `sort` and `cat`.

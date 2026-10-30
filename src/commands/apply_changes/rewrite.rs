@@ -368,6 +368,10 @@ pub(crate) fn merge_to<'a>(
         );
     }
 
+    // Framed output is allocated on the workers and freed on the drain and
+    // pwrite threads, the pattern `cross_thread_alloc_pool` describes, but
+    // apply-changes deliberately does not request it: see that hook's doc.
+
     let writer_setup_start = crate::counters::Stopwatch::start();
     // Apply-changes' output pass is writer-bound at default compression, so
     // an unspecified (buffered) backend becomes the parallel writer.

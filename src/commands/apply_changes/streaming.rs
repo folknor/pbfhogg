@@ -858,9 +858,42 @@ fn handle_candidate(
 
     let t_rewrite = crate::counters::Stopwatch::start();
     // The rewrite's own walk: on a precise-check hit the walk above stopped
-    // at the hit, so this is the complete one, ended before any block is
-    // framed or sent.
+    // at the hit, so this is the complete one, ended before any frame is
+    // sent.
     let mut rewrite_walk = blob_walk(claim.as_ref());
+    // P1.5: frame each output block in-line via per-thread scratch so the
+    // drain side can `write_raw_owned` without the writer's
+    // `rayon::spawn`-per-block dispatch (which was the dominant
+    // contributor to `writer_pipeline_send_wait_ns` at planet). Each block
+    // is framed as soon as the rewrite completes it, so only one block's raw
+    // bytes are resident at a time; the frames stay in this worker until the
+    // walk has ended below. A framing error therefore can outrank a later
+    // walk refusal of the same blob; either way the run fails unpublished.
+    let mut framed_chunks: Vec<Vec<u8>> = Vec::new();
+    let mut frame_ns: u64 = 0;
+    let mut frame_sink = |owned: OwnedBlock| -> Result<()> {
+        let t_frame = crate::counters::Stopwatch::start();
+        let OwnedBlock {
+            bytes: block_bytes,
+            index,
+            tagdata,
+            way_members,
+        } = owned;
+        let indexdata = index.serialize();
+        let parts = frame_blob_pipelined(
+            &block_bytes,
+            compression,
+            Some(&indexdata),
+            tagdata.as_deref(),
+            way_members.as_deref(),
+            metrics,
+        )?;
+        // The raw block is freed before its frame is copied out.
+        drop(block_bytes);
+        framed_chunks.push(parts.into_vec());
+        frame_ns += t_frame.elapsed_ns();
+        Ok(())
+    };
     let output = rewrite_block_parallel(
         &block,
         diff,
@@ -871,9 +904,14 @@ fn handle_candidate(
         probe,
         refresh_scratch,
         &mut rewrite_walk,
+        &mut frame_sink,
     )?;
     rewrite_walk.finish()?;
-    t_rewrite.record_ns(&counters.rewrite_ns);
+    counters.rewrite_ns.fetch_add(
+        t_rewrite.elapsed_ns().saturating_sub(frame_ns),
+        Ordering::Relaxed,
+    );
+    counters.frame_ns.fetch_add(frame_ns, Ordering::Relaxed);
     counters
         .loc_refreshed_ways
         .fetch_add(output.refresh.ways, Ordering::Relaxed);
@@ -883,32 +921,6 @@ fn handle_candidate(
     counters
         .loc_deleted_node_refs
         .fetch_add(output.refresh.deleted_refs, Ordering::Relaxed);
-
-    // P1.5: frame each output block in-line via per-thread scratch so the
-    // drain side can `write_raw_owned` without the writer's
-    // `rayon::spawn`-per-block dispatch (which was the dominant
-    // contributor to `writer_pipeline_send_wait_ns` at planet).
-    let t_frame = crate::counters::Stopwatch::start();
-    let mut framed_chunks: Vec<Vec<u8>> = Vec::with_capacity(output.blocks.len());
-    for OwnedBlock {
-        bytes: block_bytes,
-        index,
-        tagdata,
-        way_members,
-    } in output.blocks
-    {
-        let indexdata = index.serialize();
-        let parts = frame_blob_pipelined(
-            &block_bytes,
-            compression,
-            Some(&indexdata),
-            tagdata.as_deref(),
-            way_members.as_deref(),
-            metrics,
-        )?;
-        framed_chunks.push(parts.into_vec());
-    }
-    t_frame.record_ns(&counters.frame_ns);
 
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
     send_drain(

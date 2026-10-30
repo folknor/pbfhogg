@@ -27,18 +27,24 @@ is what is left.
 
 ## Remaining
 
-1. **apply-changes (2.97 GB vs README 2.4 GB).** `CompactDiffOverlay`
-   (575 MB, never reclaims superseded records, notes/todo.md), the drain's
-   `BTreeMap` reorder with no bound (415 MB high water; a real bound needs
-   ordered admission before dispatch with permits held through delivery,
-   per the comment in drain.rs), and the pwrite queue (16 x 8 ops, priced
-   at 800 KB per op in tunables against a measured 1.8 MB p50 frame).
+1. **apply-changes: closed at 2.36 GB** (per-block framing; see
+   reference/performance.md). What is left resident is the overlay
+   (575 MB, never reclaims superseded records), the drain reorder (415 MB
+   high water, no admission bound) and the 256-slot drain channel, whose
+   occupancy no counter measures. The pwrite queue claim was wrong: the
+   1.8 MB p50 is passthrough input frames only (the `blob_sizes`
+   histogram skips rewritten output); rewrite ops average 146 KB framed.
+   Do not request the allocator hook here: measured at twenty times the
+   wall (entry 3).
 2. **cat `--clean` (994 MB vs README 750 MB).** Peak is now in the
    relations phase; the 64-task window holds framed vectors, and each
    worker builds a fresh `BlockBuilder` per blob and copies frames with
    `into_vec`.
-3. **Hook coverage by ownership pattern.** getparents, extract,
-   tags-filter, apply-changes and inspect do not call
+3. **Hook coverage by ownership pattern.** apply-changes is settled:
+   not requested, recorded in the hook's doc (2606 s vs 125 s, kernel
+   bound, mechanism unverified - worth understanding, since the same
+   policy serves the other pool commands). getparents, extract,
+   tags-filter and inspect do not call
    `cross_thread_alloc_pool`, though some free on another thread than they
    allocate (writer-pool framing). They showed no regression, but per the
    hook's stated condition the call should follow the ownership pattern,

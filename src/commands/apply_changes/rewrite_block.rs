@@ -1,7 +1,7 @@
 //! Per-block rewrite loop: walks a decoded `PrimitiveBlock`, applies the OSC
 //! diff overlay element-by-element, interleaves inline upsert creates at
-//! their sorted positions, and flushes the results into owned blocks for the
-//! main thread to hand to the pipelined writer.
+//! their sorted positions, and hands each completed owned block to the
+//! worker's framing sink as it is flushed.
 
 use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
@@ -21,9 +21,9 @@ use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
-/// Output from `rewrite_block_parallel`: serialized blocks + local stats.
+/// Output from `rewrite_block_parallel`: local stats. The blocks went to the
+/// caller's sink as they were completed.
 pub(super) struct RewriteOutput {
-    pub(super) blocks: Vec<OwnedBlock>,
     pub(super) stats: MergeStats,
     /// Inline-coordinate refresh counts for the block's surviving base ways
     /// (all zero without `--locations-on-ways`).
@@ -69,8 +69,8 @@ fn emit_create_local(
     Ok(())
 }
 
-/// Rewrite a block in parallel: same element-by-element logic as `rewrite_block`,
-/// but flushes to local `Vec<Vec<u8>>` instead of `PbfWriter`. Interleaves
+/// Rewrite one decoded base block on a worker, handing each completed output
+/// block to `sink` rather than a `PbfWriter`. Interleaves
 /// upserts at their sorted positions within the block - IDs that match base
 /// elements are modifications (handled by normal element processing); IDs that
 /// don't match are creates (emitted by the cursor).
@@ -84,6 +84,14 @@ fn emit_create_local(
 /// Every base element is observed by `walk`, a fresh one, so the block's
 /// order and claim are checked over all of it; the caller ends the walk once
 /// this returns. Nothing written here has left the worker by then.
+///
+/// Each completed block is handed to `sink` right after the element or
+/// create that completed it, in output order, so a blob's raw output is
+/// never resident all at once: a planet input blob holds some 200k elements
+/// and becomes ~27 output blocks, and accumulating them all before framing
+/// held each worker's whole raw output beside its framed copy. The sink
+/// frames into worker-local storage; nothing it produces may leave the
+/// worker before the caller has ended the walk.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -96,7 +104,21 @@ pub(super) fn rewrite_block_parallel(
     probe: &StaleProbe,
     scratch: &mut RefreshScratch,
     walk: &mut BlobWalk<'_>,
+    sink: &mut dyn FnMut(OwnedBlock) -> Result<()>,
 ) -> Result<RewriteOutput> {
+    // Completed blocks wait here only until the next `hand_off`: one element
+    // or create can complete at most a couple (capacity check, then a
+    // pre-seed flush).
+    fn hand_off(
+        output: &mut Vec<OwnedBlock>,
+        sink: &mut dyn FnMut(OwnedBlock) -> Result<()>,
+    ) -> Result<()> {
+        for block in output.drain(..) {
+            sink(block)?;
+        }
+        Ok(())
+    }
+
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
     let mut upsert_cursor: usize = 0;
@@ -127,6 +149,7 @@ pub(super) fn rewrite_block_parallel(
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
+            hand_off(&mut output, sink)?;
         }
         // Skip modification IDs (handled below by normal element processing)
         if upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] == elem_id {
@@ -198,6 +221,7 @@ pub(super) fn rewrite_block_parallel(
                 }
             }
         }
+        hand_off(&mut output, sink)?;
     }
 
     // Emit remaining upserts after the last element (trailing creates)
@@ -205,13 +229,14 @@ pub(super) fn rewrite_block_parallel(
         let cid = inline_upserts[upsert_cursor];
         upsert_cursor += 1;
         emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
+        hand_off(&mut output, sink)?;
     }
 
     // Flush remaining elements in the BlockBuilder
     flush_local(bb, &mut output)?;
+    hand_off(&mut output, sink)?;
 
     Ok(RewriteOutput {
-        blocks: output,
         stats,
         refresh: base_writes.tally,
     })

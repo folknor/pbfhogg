@@ -1642,6 +1642,17 @@ pub trait ProcessActions: Send + Sync {
     /// this once from the CLI's `main` as process policy and drop the
     /// per-command calls, or document here, per command, why it must not be
     /// capped.
+    ///
+    /// Not requested, on measurement:
+    /// - apply-changes. Its framed output is allocated on the workers and
+    ///   freed on the drain and pwrite threads, but on planet (OSC 4913,
+    ///   `zstd:1`, 30 workers, bygg, uncommitted on `5bfa37ab` with blocks
+    ///   framed as the rewrite completes them) requesting it took the run
+    ///   from 125.1 s to 2606 s, nearly all of it kernel time, for a peak
+    ///   anon of 2,252 MB against 2,364 MB without. The measurement does not
+    ///   isolate either glibc setting, and the mechanism is unverified
+    ///   (reference/performance.md, "apply-changes frames each block as it
+    ///   completes").
     fn cross_thread_alloc_pool(&self);
     /// Request permission to hold `wanted` descriptors at once. The answer's
     /// [`allowance`](FdReservation::allowance) is how many the work may open

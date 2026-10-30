@@ -178,6 +178,9 @@ never left partial, and the library no longer touches process state.
   extract `--simple` 3.52 to 3.09 GB, at unchanged wall. The CLI now also
   pins glibc's `M_MMAP_THRESHOLD` at 32 MiB where it caps malloc arenas; an
   embedding `ProcessActions` chooses its own policy.
+- `apply-changes` frames each rewritten block as it completes instead of
+  holding a whole input blob's output: planet daily diff peak RSS 2.97 to
+  2.36 GB at unchanged wall.
 - `tags-count -e` skips blobs on the tag index.
 - A blob over the format's size limits is refused at write time, and an
   oversize tag index is dropped instead of failing the write.

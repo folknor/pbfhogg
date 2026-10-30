@@ -185,7 +185,8 @@ Best results per dataset.
 Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
 North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
 rewritten blobs. All variants under 600 MB RSS.
-Planet (87 GB, daily diff): 86% rewrite, 1.8 GB RSS.
+Planet (87 GB, daily diff): 86% rewrite. Current peak memory is in
+"apply-changes frames each block as it completes" below.
 
 io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
@@ -1305,6 +1306,33 @@ What is left in the larger peaks is not decode storage: apply-changes'
 overlay (575 MB), unbounded drain reorder (415 MB high water) and pwrite
 queue; the persistent ID sets of extract, tags-filter and check
 `--ids --full`.
+
+### apply-changes frames each block as it completes (bygg, 2026-10-30)
+
+A planet input blob holds about 200k elements and is rewritten into about
+27 output blocks (8,000 elements each). The workers built all of them as
+raw `OwnedBlock`s and framed them only after the whole blob was rewritten,
+so each of the 30 workers held a blob's whole raw output beside its framed
+copy. Now the rewrite hands each block to a framing sink as soon as the
+builder completes it (after each element or create), so one block's raw
+bytes are resident at a time. The frames still stay on the worker until
+the blob's walk has ended.
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, 30 workers. The variant is an unstored `--force`
+cell on `5bfa37ab` plus the change.
+
+| cell | wall | peak anon | streaming cores |
+|---|---:|---:|---|
+| `f2b8beed` (`627883d7`, stored) | 127.1 s | 3,123 MB | 27.7 |
+| `5bfa37ab` (unstored, previous section) | - | 2,965 MB | streaming 120.4 s |
+| `5bfa37ab` + per-block framing | 125.1 s | 2,364 MB | user 28.1, kernel 1.2 |
+| the same + `cross_thread_alloc_pool` | 2606 s | 2,252 MB | user 3.3, kernel 23.3 |
+
+The last row is why apply-changes does not request the CLI's allocator
+hook (two arenas plus the pinned 32 MiB mmap threshold): twenty times the
+wall, nearly all of it kernel time, for 112 MB less peak. The cell does
+not isolate either setting and the mechanism is unverified.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 

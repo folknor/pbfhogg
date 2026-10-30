@@ -26,7 +26,7 @@ Tests go where they couple least.
   that has the feature; `brokkr check` hides a passing test's output,
   skip line included. There is no platform module or profile;
   a platform test with a known bug is `#[ignore]`d and skipped by name
-  in the `full` profile (as `sort_overlapping_blobs_uring` is).
+  in the `full` profile.
 - **Stable-API integration tests** in `tests/<topic>.rs` (e.g.
   `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
@@ -301,9 +301,7 @@ files.
   a development host, raise the limit system-wide in
   `/etc/security/limits.conf` (`@<your-group> - memlock unlimited`)
   and log in again; `brokkr check` then runs them (confirm with a
-  named `brokkr test`, since check hides skip lines), and
-  `brokkr test -p pbfhogg-cli sort_overlapping_blobs_uring` runs the
-  ignored one.
+  named `brokkr test`, since check hides skip lines).
 - Fault-injection tests are neither `#[ignore]`d nor serial: their
   faults ride on the invocation's cancellation token, so they are
   ordinary modules of the `all` binaries and run with

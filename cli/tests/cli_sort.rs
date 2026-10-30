@@ -1124,13 +1124,8 @@ mod backends {
         }
     }
 
-    /// Ignored for a known bug, and also skipped by name in the `full`
-    /// profile (which includes ignored tests), so a host that can run
-    /// io_uring does not turn that gate red on it. Run it by name to
-    /// re-verify: `brokkr test -p pbfhogg-cli sort_overlapping_blobs_uring`.
     #[cfg(feature = "linux-io-uring")]
     #[test]
-    #[ignore = "pre-existing io_uring writer bug for small outputs; not re-verified on a host that can run io_uring"]
     fn sort_overlapping_blobs_uring() {
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");

@@ -451,9 +451,21 @@ impl UringState {
 /// completions outstanding, but no time bound on obtaining them. If repeated
 /// submit errors exhaust the retry cap, cleanup remains best-effort and the
 /// field-order fallback above still applies; this is not guaranteed quiescence.
+///
+/// After the drain the buffers are unregistered explicitly. The same deferred
+/// exit work is what unpins them on close, and until it runs the pages stay
+/// charged against the user's locked memory: writers opened one after another
+/// in one process (or by the same user) then refuse at `register_buffers` with
+/// ENOMEM under a limit that holds one writer comfortably. Unregistering a
+/// quiet ring unpins synchronously. Its error is ignored: on a ring that did
+/// not quiesce it fails or waits on the outstanding requests, and close
+/// remains the fallback.
 impl Drop for UringState {
     fn drop(&mut self) {
         self.drain_best_effort();
+        if self.in_flight == 0 && self.ring.submitter().unregister_buffers().is_err() {
+            // Close unpins them later; see above.
+        }
     }
 }
 

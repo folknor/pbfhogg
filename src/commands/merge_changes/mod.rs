@@ -3,6 +3,8 @@
 //! Default mode preserves the full change stream in input order.
 //! `--simplify` keeps only the last change per object (type + id).
 
+mod stream;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::io::{self, Write};
@@ -146,6 +148,7 @@ pub fn merge_changes(
     simplify: bool,
     parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
+    scratch: crate::scratch::RunScratch,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
     let host = &host.enter()?;
@@ -157,8 +160,10 @@ pub fn merge_changes(
         simplify,
         parallelism,
         allow_version_regression,
+        &scratch,
         host,
     )?;
+    drop(scratch);
     output.publish()?;
     Ok(result)
 }
@@ -171,6 +176,7 @@ pub(crate) fn merge_changes_to(
     simplify: bool,
     parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
+    scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
 ) -> Result<MergeChangesStats> {
     // Gzip or plain XML is decided by the name the caller chose (never the
@@ -244,7 +250,15 @@ pub(crate) fn merge_changes_to(
             )? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, output, is_gz, executor, cancel)?;
+            let changes_out = write_streaming(
+                inputs,
+                output,
+                is_gz,
+                worker_count,
+                executor,
+                scratch,
+                cancel,
+            )?;
             Ok((changes_out, changes_out))
         }
     })?;
@@ -531,33 +545,10 @@ impl<W: io::Write> OscWriter<W> {
     }
 }
 
-impl OscWriter<crate::output::OutputWriter> {
-    fn from_output(output: &crate::output::BoundOutput, is_gz: bool) -> Result<Self> {
-        let buf = output.writer()?;
-        if is_gz {
-            Ok(Self::Gz(Box::new(Writer::new_with_indent(
-                GzEncoder::new(buf, flate2::Compression::fast()),
-                b' ',
-                2,
-            ))))
-        } else {
-            Ok(Self::Plain(Writer::new_with_indent(buf, b' ', 2)))
-        }
-    }
-
-    fn finish(self) -> Result<()> {
-        let buf = match self {
-            Self::Gz(w) => w.into_inner().finish()?,
-            Self::Plain(w) => w.into_inner(),
-        };
-        buf.finish()
-    }
-}
-
 impl OscWriter<Vec<u8>> {
-    /// In-memory `OscWriter` for parallel-drain workers. Each worker
-    /// emits its OSC's XML into its own `Vec<u8>` buffer (gz-encoded if
-    /// `is_gz`); the ordered drain appends worker buffers in input order.
+    /// In-memory `OscWriter` for encoding workers. Each batch is emitted
+    /// into its own `Vec<u8>` buffer (gz-encoded if `is_gz`); the ordered
+    /// drain appends the buffers in input and batch order.
     /// Multi-member gzip is valid: the resulting output file is the
     /// concatenation of self-contained gzip streams, decoded as the
     /// concatenation of their decompressed contents.
@@ -579,92 +570,33 @@ fn write_streaming(
     inputs: &[&Path],
     output: &crate::output::BoundOutput,
     is_gz: bool,
+    readers: usize,
     executor: crate::host::ExecutorRef<'_>,
+    scratch: &crate::scratch::RunScratch,
     cancel: &crate::host::Recorder,
 ) -> Result<u64> {
-    cancel.counter(
-        "merge_changes_buffered_strategy",
-        i64::from(inputs.len() > 1),
-    );
-    if inputs.len() <= 1 {
-        // N <= 1: no parallelism available. Use the original serial
-        // streaming path that emits XML during parse - one-pass, no
-        // buffer-and-drain cost. Avoids the regression a forced
-        // buffer-and-drain would inflict at single-OSC scale (drain pass
-        // is pure overhead when there is no parse to overlap with).
-        cancel.marker("MERGECHANGES_WRITE_OPEN_START");
-        let mut writer = OscWriter::from_output(output, is_gz)?;
-
-        writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-        let mut root = BytesStart::new("osmChange");
-        root.push_attribute(("version", "0.6"));
-        writer.write_event(Event::Start(root))?;
-        cancel.marker("MERGECHANGES_WRITE_OPEN_END");
-
-        let mut open_action: Option<Action> = None;
-        let mut count = 0u64;
-        for path in inputs {
-            if let Ok(meta) = std::fs::metadata(path) {
-                cancel.counter("merge_changes_input_bytes", meta.len());
-            }
-            let count_before = count;
-            cancel.marker("MERGECHANGES_PARSE_START");
-            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
-            cancel.marker("MERGECHANGES_PARSE_END");
-            cancel.counter("merge_changes_changes_per_osc", count - count_before);
-        }
-
-        if let Some(prev) = open_action {
-            writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
-        cancel.marker("MERGECHANGES_WRITE_FINISH_START");
-        writer.finish()?;
-        cancel.marker("MERGECHANGES_WRITE_FINISH_END");
-        return Ok(count);
-    }
-
-    // N > 1: parallel-drain. Each worker runs the full per-input pipeline
-    // (parse + XML re-emit + gzip-compress) into its own in-memory buffer.
-    // The prelude (XML decl + osmChange opening) is written as its own gzip
-    // member, the ordered drain appends worker buffers in input order (also
-    // self-contained gzip members), and the postlude (osmChange closing) is
-    // written as its own gzip member. Multi-member gzip is valid; on
-    // decompress the members concatenate to produce the full XML document.
-    //
-    // Why this beats parallel-parse + serial-drain (commit 43dd620,
-    // UUID 07ee92ee, 235.8 s wall): the serial drain pass at planet
-    // 7-OSC was 223 s, dominated by per-change `quick_xml::Writer`
-    // emit cost (single-thread XML serialization of 26.3 M changes).
-    // Moving the re-emit + gzip onto the worker threads parallelizes
-    // that 223 s across the same N rayon workers already doing parse.
     for path in inputs {
         if let Ok(meta) = std::fs::metadata(path) {
             cancel.counter("merge_changes_input_bytes", meta.len());
         }
     }
-
-    // Bounded ordered window: at most one member per pool worker is alive
-    // between emit and drain, and the head member is written as soon as it
-    // and its predecessors are done, so workers never idle behind a batch
-    // barrier and memory does not grow with the input count. One huge input
-    // remains unbounded; this is a member-count bound, not a byte budget.
-    // Each input keeps its own writer and member boundary, so output bytes
-    // are identical to collecting every member first.
-    let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
     let mut out = output.writer()?;
     out.write_all(&prelude)?;
-    let mut count = 0u64;
-    // The per-member drain overlaps this span; DRAIN below is the postlude.
+    // The ordered drain overlaps this span; DRAIN below is the postlude.
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_START");
-    emit_members_ordered(executor, inputs, is_gz, window, cancel, |bytes, n| {
-        out.write_all(&bytes)?;
-        count += n;
-        cancel.counter("merge_changes_changes_per_osc", n);
-        Ok(())
-    })?;
+    let count = stream::run(
+        &stream::Plan {
+            inputs,
+            is_gz,
+            readers,
+            executor,
+            scratch,
+            cancel,
+        },
+        &mut out,
+    )?;
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
     cancel.marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
@@ -676,124 +608,30 @@ fn write_streaming(
     Ok(count)
 }
 
-/// One input's self-contained output member: parse, XML re-emit and (under
-/// gzip) compression into an in-memory buffer, closing any open action.
-fn emit_member(
+/// One batch's self-contained output member: replay the recorded callbacks
+/// into the owned sink, re-emit XML and (under gzip) compress into an
+/// in-memory buffer, opening and closing the batch's own action sections.
+fn encode_batch(
+    batch: &crate::osc::xml_parse::LexBatch,
     path: &Path,
     is_gz: bool,
-    cancel: &crate::host::Recorder,
 ) -> crate::Result<(Vec<u8>, u64)> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
-    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
+    {
+        let mut sink = OwnedSink::new(WriterDest {
+            writer: &mut writer,
+            open_action: &mut open_action,
+            count: &mut count,
+        });
+        batch.replay(&mut sink, path)?;
+    }
     if let Some(prev) = open_action {
         writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
     }
     let bytes = writer.into_inner()?;
     Ok((bytes, count))
-}
-
-type MemberResult = (usize, crate::Result<(Vec<u8>, u64)>);
-
-/// Emit every input's member on `executor`'s pool and hand them to `drain`
-/// in input order, with at most `window` members alive at once.
-///
-/// The same admission-credit shape as `scan::classify`'s ordered classify
-/// phase: input `k` is spawned only once `k < drained + window`, so a slow
-/// head input stalls admission rather than letting finished members pile
-/// up behind it, and the in-flight positions stay distinct modulo the
-/// ring. The drain runs on a pool worker and waits cooperatively, running
-/// queued members itself, so a one-thread pool cannot deadlock. Returns the
-/// first error received.
-///
-/// Cancellation: each member's parse stops at its next input read, and the
-/// drain checks the token after every member it receives. Every spawned
-/// member still sends its (cancelled) result, so no admitted position goes
-/// unanswered; the scope then waits only for members already running.
-fn emit_members_ordered(
-    executor: crate::host::ExecutorRef<'_>,
-    inputs: &[&Path],
-    is_gz: bool,
-    window: usize,
-    cancel: &crate::host::Recorder,
-    mut drain: impl FnMut(Vec<u8>, u64) -> crate::Result<()> + Send,
-) -> crate::Result<()> {
-    if inputs.is_empty() {
-        return Ok(());
-    }
-    let window = window.clamp(1, inputs.len());
-    let (tx, rx) = std::sync::mpsc::channel::<MemberResult>();
-    // `move`: the body may run on a pool worker, and a borrowed Receiver
-    // is not Send.
-    executor.scope(move |scope| {
-        let spawn = |position: usize| {
-            let tx = tx.clone();
-            let path = inputs[position];
-            scope.spawn(move |_| {
-                // A panicking member must still answer its position, or the
-                // drain would wait for it forever.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_member(path, is_gz, cancel)
-                }))
-                .unwrap_or_else(|payload| {
-                    Err(
-                        crate::error::panic_error("merge-changes worker", payload.as_ref())
-                            .context(format!("while merging {}", path.display())),
-                    )
-                });
-                drop(tx.send((position, result)));
-            });
-        };
-        let mut pending: Vec<Option<(Vec<u8>, u64)>> = (0..window).map(|_| None).collect();
-        let mut dispatched = 0;
-        while dispatched < window {
-            spawn(dispatched);
-            dispatched += 1;
-        }
-        let mut next = 0;
-        while next < inputs.len() {
-            let (position, result) = recv_member(&rx, executor)?;
-            cancel.check()?;
-            pending[position % window] = Some(result?);
-            while let Some((bytes, n)) = pending[next % window].take() {
-                drain(bytes, n)?;
-                next += 1;
-                if dispatched < inputs.len() {
-                    spawn(dispatched);
-                    dispatched += 1;
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Receive one member, running queued pool jobs while waiting when the
-/// caller is a pool worker (the writer's `recv_permit` shape).
-fn recv_member(
-    rx: &std::sync::mpsc::Receiver<MemberResult>,
-    executor: crate::host::ExecutorRef<'_>,
-) -> crate::Result<MemberResult> {
-    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-    let lost = || crate::Error::internal("merge-changes workers exited without a result");
-    loop {
-        match rx.try_recv() {
-            Ok(item) => return Ok(item),
-            Err(TryRecvError::Disconnected) => return Err(lost()),
-            Err(TryRecvError::Empty) => match executor.yield_now() {
-                Some(rayon::Yield::Executed) => {}
-                Some(rayon::Yield::Idle) => {
-                    match rx.recv_timeout(crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT) {
-                        Ok(item) => return Ok(item),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return Err(lost()),
-                    }
-                }
-                None => return rx.recv().map_err(|_| lost()),
-            },
-        }
-    }
 }
 
 /// Pre-build the XML prelude (`<?xml ?><osmChange version="0.6">`) as
@@ -816,24 +654,6 @@ fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
     writer.into_inner()
-}
-
-#[hotpath::measure]
-fn parse_osc_streaming<W: io::Write>(
-    path: &Path,
-    writer: &mut OscWriter<W>,
-    open_action: &mut Option<Action>,
-    count: &mut u64,
-    cancel: &crate::host::Recorder,
-) -> Result<()> {
-    let mut sink = OwnedSink::new(WriterDest {
-        writer,
-        open_action,
-        count,
-    });
-    // Deliberately use the shared historical per-file decompression counter.
-    // Command-specific names or accumulation would break brokkr comparisons.
-    parse_osc_path(path, &mut sink, cancel)
 }
 
 fn emit_change<W: io::Write>(
@@ -1079,25 +899,49 @@ mod tests {
         Ok(())
     }
 
-    // Reconstruct the previous all-results-at-once byte sequence independently
-    // of admission order, including empty inputs and action transitions. The
-    // one-thread pool exercises the drain's cooperative wait (window 1).
+    fn run_scratch(dir: &Path) -> crate::scratch::RunScratch {
+        crate::scratch::RunScratch::create(dir, &crate::host::Host::entered_for_tests()).unwrap()
+    }
+
+    /// Every `id="N"` in document order.
+    fn ids_in(xml: &str) -> Vec<i64> {
+        xml.split(" id=\"")
+            .skip(1)
+            .map(|rest| rest[..rest.find('"').unwrap()].parse().unwrap())
+            .collect()
+    }
+
+    // Inputs large enough to cut into several batches each, so later inputs
+    // spill and are copied back, plus an empty input and action transitions
+    // inside one input. The output must hold every change in input order,
+    // and its bytes must not depend on the worker count: batch boundaries
+    // come from the batch byte target alone. The one-thread pool exercises
+    // the coordinator's cooperative wait.
     #[test]
-    fn ordered_window_preserves_buffered_member_bytes() -> crate::Result<()> {
+    fn batched_merge_keeps_input_order_and_is_jobs_independent() -> crate::Result<()> {
         let scratch = crate::path_guard::tests::scratch();
+        let per_input = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 40;
         let mut paths = Vec::new();
-        for i in 0..5 {
+        let mut expected_ids = Vec::new();
+        for i in 0..5_i64 {
             let path = scratch.path().join(format!("input-{i}.osc"));
-            let body = if i == 2 {
-                String::new()
-            } else {
-                format!(
-                    "<create><node id=\"{}\" lat=\"1\" lon=\"2\"/></create>\
-                     <delete><way id=\"{}\"/></delete>",
-                    i + 1,
-                    i + 10,
-                )
-            };
+            let mut body = String::new();
+            if i != 2 {
+                body.push_str("<create>");
+                for k in 0..i64::try_from(per_input)
+                    .map_err(|e| crate::Error::internal(e.to_string()))?
+                {
+                    let id = i * 10_000_000 + k;
+                    body.push_str(&format!(
+                        "<node id=\"{id}\" lat=\"1\" lon=\"2\"><tag k=\"n\" v=\"{k}\"/></node>"
+                    ));
+                    expected_ids.push(id);
+                }
+                body.push_str("</create><delete>");
+                let id = i * 10_000_000 + 9_999_999;
+                body.push_str(&format!("<way id=\"{id}\"/></delete>"));
+                expected_ids.push(id);
+            }
             std::fs::write(
                 &path,
                 format!("<osmChange version=\"0.6\">{body}</osmChange>"),
@@ -1106,28 +950,11 @@ mod tests {
         }
         let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
         for is_gz in [false, true] {
-            let mut expected = build_prelude_bytes(is_gz)?;
-            for path in &inputs {
-                let mut writer = OscWriter::new_buf(is_gz);
-                let mut action = None;
-                let mut count = 0;
-                parse_osc_streaming(
-                    path,
-                    &mut writer,
-                    &mut action,
-                    &mut count,
-                    &crate::host::Call::detached(),
-                )?;
-                if let Some(action) = action {
-                    writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;
-                }
-                expected.extend(writer.into_inner()?);
-            }
-            expected.extend(build_postlude_bytes(is_gz)?);
+            let mut first: Option<Vec<u8>> = None;
             for jobs in [1, 2, 8] {
                 let name = if is_gz { "out.osc.gz" } else { "out.osc" };
                 let output = scratch.path().join(name);
-                merge_changes(
+                let stats = merge_changes(
                     &inputs,
                     crate::output::Output::new(
                         &output,
@@ -1137,13 +964,26 @@ mod tests {
                     false,
                     crate::host::Parallelism::from_jobs(jobs),
                     false,
+                    run_scratch(scratch.path()),
                     &crate::host::Host::entered_for_tests(),
                 )?;
-                assert_eq!(
-                    std::fs::read(output)?,
-                    expected,
-                    "jobs={jobs}, gzip={is_gz}"
-                );
+                assert_eq!(stats.changes_out, expected_ids.len() as u64);
+                let bytes = std::fs::read(output)?;
+                let xml = if is_gz {
+                    use std::io::Read;
+                    let mut xml = String::new();
+                    flate2::read::MultiGzDecoder::new(bytes.as_slice()).read_to_string(&mut xml)?;
+                    xml
+                } else {
+                    String::from_utf8(bytes.clone())
+                        .map_err(|e| crate::Error::internal(e.to_string()))?
+                };
+                assert!(xml.ends_with("</osmChange>"), "jobs={jobs}, gzip={is_gz}");
+                assert_eq!(ids_in(&xml), expected_ids, "jobs={jobs}, gzip={is_gz}");
+                match &first {
+                    None => first = Some(bytes),
+                    Some(f) => assert_eq!(&bytes, f, "jobs={jobs}, gzip={is_gz}"),
+                }
             }
         }
         Ok(())
@@ -1188,6 +1028,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
+            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
@@ -1228,6 +1069,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
+            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
@@ -1270,6 +1112,7 @@ mod tests {
             false,
             crate::host::Parallelism::from_jobs(1),
             false,
+            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .unwrap();

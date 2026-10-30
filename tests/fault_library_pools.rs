@@ -189,6 +189,7 @@ fn merge_changes_fixed_pool_is_joined_before_it_returns() {
             false,
             pbfhogg::Parallelism::from_jobs(2),
             false,
+            crate::common::scratch_in(dir.path()),
             &host,
         )
     })
@@ -213,6 +214,7 @@ fn merge_changes_partial_build_failure_joins_the_spawned_threads() {
             false,
             pbfhogg::Parallelism::from_jobs(3),
             false,
+            crate::common::scratch_in(dir.path()),
             &host,
         )
     })

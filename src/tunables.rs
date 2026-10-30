@@ -8,11 +8,11 @@
 //! sizes, `MAX_BLOB_DATASIZE`-style format limits, compact record offsets,
 //! header feature strings). Those stay beside the code that encodes them.
 //!
-//! Merge-changes has no section of its own: its tunables are the worker triple
-//! and the idle `recv_timeout` below. Its chunking rule (one chunk per worker)
-//! and the `inputs.len() <= 1` switch between the buffered and streaming
-//! strategies select different gzip member layouts, which makes them output
-//! contract facts rather than tunables, so they stay in `merge_changes`.
+//! Merge-changes has no section of its own: its tunables are the worker
+//! triple, the streaming batch size and in-flight budget, and the idle
+//! `recv_timeout` below. The simplify path's chunking rule (one chunk per
+//! worker) selects its gzip member layout, which makes it an output contract
+//! fact rather than a tunable, so it stays in `merge_changes`.
 //!
 //! Public tunables (`pub const`) are re-exported from the path they were
 //! public at, so no public path changed.
@@ -91,6 +91,25 @@ pub(crate) const MERGE_CHANGES_WORKERS_MIN: usize = 1;
 
 /// Merge-changes worker count when the host reports no parallelism.
 pub(crate) const MERGE_CHANGES_WORKERS_FALLBACK: usize = 8;
+
+/// Raw element bytes (tag content before entity decoding, as the OSC reader
+/// copies it) at which a merge-changes reader seals a batch for encoding.
+/// Every sealed batch becomes its own gzip member (or plain fragment) with
+/// its own action sections, so changing it changes the output bytes but
+/// never the changes or their order; nothing about the host or `-j` does
+/// either. Small enough to spread one input over the pool, large enough
+/// that member and section overhead stays negligible.
+pub(crate) const MERGE_CHANGES_BATCH_BYTES: usize = 512 * 1024;
+
+/// Raw element bytes admitted to merge-changes encoding and not yet written
+/// to the output or a spill file, summed over every input. Credit is taken
+/// when a reader seals a batch and returned when the coordinator writes the
+/// encoded member, so resident batch memory is a bounded multiple of this
+/// (the lexical batch, its descriptors and the encoded member it becomes),
+/// plus one batch under construction per reader. 64 MiB keeps 30+ workers
+/// fed with 512 KiB batches while staying far below the old whole-output
+/// residency.
+pub(crate) const MERGE_CHANGES_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cores left out of the gzip worker count of the derive-changes OSC
 /// assembler. The count comes from host parallelism, not from `-j`.

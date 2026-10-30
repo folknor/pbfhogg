@@ -530,7 +530,7 @@ staging-directory refusal.
 
 ## Scratch files
 
-`add-locations-to-ways`, `diff` (text other than `-j 1` or `--quiet`, and `--format osc`) and `build-geocode-index` write
+`add-locations-to-ways`, `diff` (text other than `-j 1` or `--quiet`, and `--format osc`), `merge-changes` (several inputs, without `--simplify`) and `build-geocode-index` write
 scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
@@ -596,7 +596,7 @@ to own cleanup is to give each run directories of its own. When both `--staging-
 `--tmp-dir` are given, pbfhogg creates every staging entry under `--staging-dir` and all run
 scratch under `--tmp-dir`. They may be one directory: staging entries and run directories have
 distinct names, and a directory named by both is scanned once. `--tmp-dir` exists only on the
-commands that make run scratch (`add-locations-to-ways`, `diff`, `build-geocode-index`); every
+commands that make run scratch (`add-locations-to-ways`, `diff`, `merge-changes`, `build-geocode-index`); every
 other command makes none, and `--staging-dir` alone holds everything disposable it leaves.
 After every process using those directories has stopped, the caller
 may remove them, provided they are private to the run, dedicated to its disposable state, and
@@ -1749,7 +1749,10 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--simplify` | Keep only the last change per object (type + id) |
 | `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
-| `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)). Sizes both the per-input parse fan-out (capped by input count) and the simplify path's chunk fan-out. |
+| `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)). Sizes the encoding pool and the cap on inputs read at once, and the simplify path's chunk fan-out. |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read, after the output is checked. Default: the output's directory. Without `--simplify`, output produced for a later input while an earlier one is still being written is held there, so it can approach the output's size |
+
+Without `--simplify`, each input is read once, in order of the command line, and cut into batches of whole changes that are encoded in parallel. Every batch becomes its own gzip member (or plain fragment) with its own `<create>`/`<modify>`/`<delete>` sections, so a section can be split into adjacent sections of the same action; the changes and their order are unchanged, and the bytes do not depend on `-j` or the host.
 
 ### build-geocode-index
 

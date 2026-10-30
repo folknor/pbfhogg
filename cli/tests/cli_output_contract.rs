@@ -455,7 +455,7 @@ const ROWS: &[Row] = &[
         label: "merge-changes",
         build: merge_changes,
         kind: Kind::File,
-        tmp_dir: false,
+        tmp_dir: true,
         ok_codes: &[0],
         gaps: &[],
     },
@@ -1807,7 +1807,13 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         "no pause observed a populated staging entry ({count} checkpoints, pauses at {ks:?})"
     );
     ensure!(
-        !row.tmp_dir || row.label == SPARSE_ALTW_LABEL || scratch_seen,
+        // merge-changes spills only output produced for a later input while an
+        // earlier one is unfinished; this table runs it on one input, which
+        // makes its run directory and never writes into it.
+        !row.tmp_dir
+            || row.label == SPARSE_ALTW_LABEL
+            || row.command == "merge-changes"
+            || scratch_seen,
         "no pause observed scratch payload in the run directory ({count} checkpoints, pauses \
          at {ks:?})"
     );

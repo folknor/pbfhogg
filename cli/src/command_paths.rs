@@ -270,11 +270,15 @@ impl CommandPaths {
                 paths.staging.clone_from(&output.staging_dir);
             }
             Command::MergeChanges {
-                changes, output, ..
+                changes,
+                output,
+                tmp,
+                ..
             } => {
                 paths.inputs.clone_from(changes);
                 paths.outputs.push(file(&output.output));
                 paths.staging.clone_from(&output.staging_dir);
+                paths.scratch = Some(ScratchSite::new(tmp, Some(&output.output)));
             }
             Command::BuildGeocodeIndex {
                 file: input,

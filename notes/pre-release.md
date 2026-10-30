@@ -72,7 +72,7 @@ does not affect RSS.
 | `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
 | `cat --clean version` | 1.24 GB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
 | `time-filter` (cutoff 2024-01-01) | 1.16 GB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
-| `merge-changes` (4914..4920, 7 OSCs) | **895 MB** | 2 MB | 30s | 54s | `f24c29af` |
+| `merge-changes` (4914..4920, 7 OSCs) ⁶ | 286 MB | 2 MB | 9.9s | 54s | unstored |
 | `getparents` | 705 MB | 506 MB | 13s | 22s | `dd453b3f` |
 | `tags-filter -R highway=primary` | 659 MB | 688 MB | 38s | 52s | `55f84dee` |
 | `diff --format osc -j 16` (base vs 20260411) | 653 MB | 634 MB | 4m11s | 4m54s | `607cd897` |
@@ -84,7 +84,7 @@ does not affect RSS.
 | `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
 | `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
 | `cat --type way` | 10 MB | 10 MB | 30s | 45s | `3d4a36a8` |
-| `merge-changes` (4913, 1 OSC) | 1.6 MB | 2 MB | 24s | 44s | `bf6db512` |
+| `merge-changes` (4913, 1 OSC) ⁶ | 53 MB | 2 MB | 2.7s | 44s | unstored |
 | `inspect` | <1 MB ¹ | 5 MB | short ¹ | 6.5s | `3ec07278` |
 | `tags-filter -i w/highway=primary` ³ | 7.49 GB | 7.0 GB | 5m16s | 7m57s | `9bf96ab2` |
 | `diff -j 16` (text, base vs 20260411) ³ | 605 MB | 586 MB | 3m04s | 3m48s | `f9fa4f6f` |
@@ -101,6 +101,11 @@ was `d271f04f`, 7.57 GB and 53m43s.
 ⁵ Re-measured after the full-decode scan moved onto the decode pipeline (a
 `--force` cell on `13ec0927` plus the change, so not stored); the RSS-pass
 cell was `9b49e8fb`, 26 MB and 13m22s.
+⁶ Re-measured after the streaming path moved to lexical batches with spill
+(a `--force` cell on `418739bd` plus the change, so not stored); the
+RSS-pass cells were `f24c29af` (895 MB, 30 s) and `bf6db512` (1.6 MB,
+24 s). The README's merge-changes rows (2 MB) no longer hold for either
+cell and need refreshing with the rest of the table.
 
 ### What moved
 
@@ -108,12 +113,12 @@ cell was `9b49e8fb`, 26 MB and 13m22s.
   a borrowed-cursor merge with worker-side framing: 5m10s and 1.46 GB peak
   anon on bygg, against the row's 53m43s and 7.57 GB (see
   reference/performance.md, "borrowed-cursor sweep").
-- **`merge-changes` with 7 OSCs: 895 MB against 2 MB.** The 1-OSC run is
-  still 1.6 MB, so it is the multi-input path (members re-emitted in input
-  order, at most one in flight per worker, each an inflated daily OSC). The
-  README's 2 MB conflicts with notes/todo.md's account of the old path as
-  holding every re-emitted input in memory, so the old figure itself may be
-  wrong; one v0.5.0 cell would settle which.
+- **`merge-changes`: resolved.** The streaming path reads each input once
+  into lexical batches encoded on the pool, with output for later inputs
+  spilled to scratch: 7-OSC 9.9 s / 286 MB against 30 s / 895 MB, 1-OSC
+  2.7 s / 53 MB against 24 s / 1.6 MB (see reference/performance.md,
+  "Streaming path on lexical batches with spill"). The 2 MB README figure
+  for 7 OSCs was a splice of two builds (notes/merge-changes-memory.md).
 - **Moderate RSS increases, all pool-heavy commands:** `cat --clean` +65 %,
   `time-filter` +43 %, `getparents` +39 %, `apply-changes` +30 %,
   `check --ids` +28 %, `extract --simple` +17 %, `extract --complete` +12 %,

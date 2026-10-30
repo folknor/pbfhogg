@@ -142,7 +142,7 @@ fn apply_changes(
 fn merge_changes(
     i: &Inputs,
     out: &Path,
-    _: &Path,
+    scratch: &Path,
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<()> {
     let osc = i.path("change.osc");
@@ -152,6 +152,7 @@ fn merge_changes(
         false,
         pbfhogg::Parallelism::from_jobs(2),
         false,
+        pbfhogg::scratch::RunScratch::create(scratch, host)?,
         host,
     )
     .map(drop)

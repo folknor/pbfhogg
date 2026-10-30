@@ -67,6 +67,7 @@ fn merge_verdict(input: &Path, out: &Path) -> Verdict {
         false,
         pbfhogg::Parallelism::from_jobs(1),
         false,
+        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())
@@ -80,6 +81,7 @@ fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
         true,
         pbfhogg::Parallelism::from_jobs(1),
         false,
+        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())
@@ -300,6 +302,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
         false,
         pbfhogg::Parallelism::from_jobs(1),
         false,
+        crate::common::scratch_in(dir.path()),
         &crate::common::test_host(),
     )
     .unwrap();
@@ -397,6 +400,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             false,
             pbfhogg::Parallelism::from_jobs(1),
             false,
+            crate::common::scratch_in(dir.path()),
             &crate::common::test_host(),
         )
         .expect("a re-emit path never interprets these, so it has nothing to refuse");
@@ -455,6 +459,7 @@ fn re_emit_sinks_escape_user_data_identically() {
         false,
         pbfhogg::Parallelism::from_jobs(1),
         false,
+        crate::common::scratch_in(dir.path()),
         &crate::common::test_host(),
     )
     .unwrap();
@@ -530,6 +535,7 @@ fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
         true,
         pbfhogg::Parallelism::from_jobs(1),
         false,
+        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())

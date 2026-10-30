@@ -603,6 +603,169 @@ pub(crate) fn parse_osc_path<S: OscSink>(
 }
 
 // ---------------------------------------------------------------------------
+// Lexical batches: the driver's callbacks, recorded for replay elsewhere
+//
+// A reader thread drives the document (tokenizing, framing, every structural
+// check above) and records each callback's raw tag content instead of
+// interpreting it. A worker then replays a batch into a real sink. No XML is
+// parsed out of its document context: the replayed tags are exactly the ones
+// the driver framed, and attribute decoding needs nothing from the document
+// beyond the tag itself (predefined entities and character references only).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum LexOp {
+    Begin(OscAction, ElementKind),
+    Tag,
+    Nd,
+    Member,
+    End,
+}
+
+struct LexEvent {
+    op: LexOp,
+    start: usize,
+    end: usize,
+    name_len: usize,
+}
+
+/// A run of recorded driver callbacks, whole elements only.
+#[derive(Default)]
+pub(crate) struct LexBatch {
+    text: String,
+    events: Vec<LexEvent>,
+}
+
+impl LexBatch {
+    /// Recorded tag bytes, the unit batches are cut and budgeted by.
+    pub(crate) fn bytes(&self) -> usize {
+        self.text.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn push(&mut self, op: LexOp, e: Option<&quick_xml::events::BytesStart<'_>>) {
+        let start = self.text.len();
+        let name_len = e.map_or(0, |e| {
+            self.text.push_str(e);
+            e.name().into_inner().len()
+        });
+        self.events.push(LexEvent {
+            op,
+            start,
+            end: self.text.len(),
+            name_len,
+        });
+    }
+
+    /// Replay the recorded callbacks into `sink`, locating failures exactly
+    /// as [`drive_osc`] does: interpreting the input is the input's fault,
+    /// an emitting `end_element` is the output's.
+    pub(crate) fn replay<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
+        for ev in &self.events {
+            let e = quick_xml::events::BytesStart::from_content(
+                &self.text[ev.start..ev.end],
+                ev.name_len,
+            );
+            match ev.op {
+                LexOp::Begin(action, kind) => sink.begin_element(action, kind, &e),
+                LexOp::Tag => sink.tag(&e),
+                LexOp::Nd => sink.nd(&e),
+                LexOp::Member => sink.member(&e),
+                LexOp::End => {
+                    end_element(sink, path)?;
+                    continue;
+                }
+            }
+            .map_err(|err| input_fault(path, err))?;
+        }
+        Ok(())
+    }
+}
+
+/// Sink that records callbacks into [`LexBatch`]es and hands each batch to
+/// `seal` once it reaches `target` bytes, always at an element end. Call
+/// [`LexSink::finish`] after a successful drive to seal the remainder.
+/// `halted` is asked at every callback; once it answers true the sink
+/// refuses, so a reader stops recording promptly when its consumer has
+/// given up, even inside one huge element.
+pub(crate) struct LexSink<F, H> {
+    batch: LexBatch,
+    target: usize,
+    seal: F,
+    halted: H,
+}
+
+impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> LexSink<F, H> {
+    pub(crate) fn new(target: usize, seal: F, halted: H) -> Self {
+        Self {
+            batch: LexBatch::default(),
+            target,
+            seal,
+            halted,
+        }
+    }
+
+    fn record(
+        &mut self,
+        op: LexOp,
+        e: Option<&quick_xml::events::BytesStart<'_>>,
+    ) -> ParseResult<()> {
+        if (self.halted)() {
+            return Err(Error::internal(
+                "OSC reading stopped after a failure elsewhere",
+            ));
+        }
+        self.batch.push(op, e);
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> ParseResult<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        (self.seal)(std::mem::take(&mut self.batch))
+    }
+}
+
+impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> OscSink for LexSink<F, H> {
+    /// Sealing hands the batch on (and may wait for room); its failure is
+    /// not a fault of the input.
+    const END_ELEMENT_EMITS: bool = true;
+
+    fn begin_element(
+        &mut self,
+        action: OscAction,
+        kind: ElementKind,
+        e: &quick_xml::events::BytesStart<'_>,
+    ) -> ParseResult<()> {
+        self.record(LexOp::Begin(action, kind), Some(e))
+    }
+
+    fn tag(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
+        self.record(LexOp::Tag, Some(e))
+    }
+
+    fn nd(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
+        self.record(LexOp::Nd, Some(e))
+    }
+
+    fn member(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
+        self.record(LexOp::Member, Some(e))
+    }
+
+    fn end_element(&mut self) -> ParseResult<()> {
+        self.record(LexOp::End, None)?;
+        if self.batch.bytes() >= self.target {
+            (self.seal)(std::mem::take(&mut self.batch))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The compact-overlay sink (apply-changes)
 // ---------------------------------------------------------------------------
 

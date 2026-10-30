@@ -83,7 +83,7 @@ never left partial, and the library no longer touches process state.
   to (`evict_page_cache(true)`).
 - `PbfWriter::to_path*` take an `Executor`, `write_raw_copy` takes an
   `&InputFile`, and `into_inner` returns a `Result`.
-- Scratch-using commands take a `RunScratch`.
+- Scratch-using commands take a `RunScratch`, `merge_changes` included.
 - Removed: `IndexedReader`, `IdRanges`, `IdSet::count_below` and
   `count_in_range`, `BlockBuilder::with_element_cap`,
   `HeaderBuilder::from_header`, `PrimitiveBlock::new`, `inspect::show_element`,
@@ -167,8 +167,11 @@ never left partial, and the library no longer touches process state.
 - Passthrough copies fall back to userspace wherever the kernel refuses
   `copy_file_range`.
 - Warnings start with `Warning:` and notes with `Note:`.
-- `merge-changes` with several inputs streams them instead of holding them in
-  memory.
+- `merge-changes` (without `--simplify`) cuts every input into batches
+  encoded in parallel, one input or many, and keeps output for later inputs
+  in scratch instead of memory: planet 7-OSC 30 s / 895 MB to 10 s / 286 MB,
+  1-OSC 24 s to 2.7 s. It takes `--tmp-dir`, and the output has one gzip
+  member and action section run per batch (same changes, same order).
 - `tags-count -e` skips blobs on the tag index.
 - A blob over the format's size limits is refused at write time, and an
   oversize tag index is dropped instead of failing the write.

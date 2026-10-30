@@ -1658,14 +1658,36 @@ the default) and **simplify** (`--simplify`, builds an in-memory
 overlay then writes the latest change per object via a `BTreeMap`
 dedupe).
 
-The 1-OSC vs N-OSC axis is the load-bearing distinction: a single OSC
-measures fixed setup + per-OSC parse + per-OSC write; an N-OSC squash
-measures the N inputs' work plus a merge/write tail. **The parallel
-shape only fires when N > 1**, and the 1-OSC fast path keeps the
-original serial streaming pipeline (parse + emit + gzip interleaved on
-one thread) so single-OSC walls are unchanged.
+### Streaming path on lexical batches with spill (bygg, 2026-10-30)
 
-### Streaming-path planet 7-OSC: 5.0× speedup (commit `99057fa`, plantasjen)
+The streaming path no longer makes one whole input the unit of work. One
+reader thread per input (capped by the worker count, started in input
+order) drives the OSC driver and records each element's raw tags into
+batches of `MERGE_CHANGES_BATCH_BYTES`; pool workers replay a batch into
+the owned sink, re-emit XML and gzip it as its own member; one
+coordinator writes each member as soon as it is next in order for its
+input, the head input's to the output and later inputs' to a spill file
+in the run scratch, copied into the output when that input becomes the
+head. A byte ledger (`MERGE_CHANGES_INFLIGHT_BYTES`) bounds admitted
+batches. The single-input run takes the same path and is no longer
+serial.
+
+| Cell | Baseline (commit `627883d7`) | This change (`418739bd` + change, `--force`) |
+|---|---|---|
+| planet 7-OSC `--osc-range 4914..4920` | 30.0 s, peak anon 895 MB (`f24c29af`) | **9.9 s, peak anon 286 MB** (an earlier cell of the same design before review fixes: 10.0 s, 304 MB) |
+| planet 1-OSC `--osc-seq 4913` | 24.0 s, peak anon 1.6 MB (`bf6db512`) | **2.74 s, peak anon 53 MB** |
+
+Same change counts as the baselines (26,261,540 and 4,305,714). The
+7-OSC output is 965.1 MB against 962 MB (one gzip member per batch).
+Spill: about 787 MB written for inputs 2-7 and copied back. The readers
+spent 15.6 s summed waiting for credit
+(`merge_changes_credit_wait_ns`), so the 64 MiB budget binds at planet;
+whether a larger budget buys wall is not measured. The 1-OSC peak rises
+from a single-threaded stream to the batch working set, accepted.
+
+The sections below record the earlier whole-input shapes.
+
+### Streaming-path planet 7-OSC: 5.0× speedup (commit `99057fa`, plantasjen, superseded)
 
 | Stage | UUID | Wall | vs serial baseline |
 |---|---|---:|---:|
@@ -1687,19 +1709,9 @@ member. Multi-member gzip is valid (osmium, osmosis, gzip CLI,
 `MultiGzDecoder` all support it); output decompresses to the
 concatenation of all members.
 
-Since the measurement below, emission runs through a bounded ordered
-window instead of collecting every member first: input `k` is admitted
-only once `k` is less than the number of members already written plus
-the pool's thread count, and each member is written as soon as it and
-its predecessors are done. At most one member per pool thread is
-alive, so memory no longer grows with the number of inputs (one huge
-input is still held whole). Output bytes are identical. When the input
-count is at most the thread count, as in the 7-OSC planet cell on a
-24-thread host, every input is admitted at once and the shape matches
-the run below except that member writes overlap the emit phase:
-`MERGECHANGES_PARALLEL_EMIT` now spans the per-member writes, and
-`MERGECHANGES_DRAIN` covers only the postlude and flush. Not yet
-re-benched.
+A later bounded window over whole-input members still held every
+admitted input's compressed output in memory, so with fewer inputs than
+threads peak memory was about the output size (895 MB in `f24c29af`).
 
 Phase breakdown of the 54.7 s `b6e964cc` run:
 

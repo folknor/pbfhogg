@@ -2068,8 +2068,9 @@ enum Command {
         /// is kept in input order and no version is compared.
         #[arg(long, requires = "simplify")]
         allow_version_regression: bool,
-        // Sizes both the per-input parse fan-out (capped by input count) and
-        // the simplify path's `write_simplified` chunk fan-out.
+        // Sizes the encoding pool and the concurrent reader cap (capped by
+        // input count), and the simplify path's `write_simplified` chunk
+        // fan-out.
         #[arg(
             short = 'j',
             long = "jobs",
@@ -2079,6 +2080,8 @@ enum Command {
             help = JOBS_HELP
         )]
         jobs: pbfhogg::Parallelism,
+        #[command(flatten)]
+        tmp: TmpDirArg,
     },
     /// Validate PBF file integrity (IDs + referential integrity; opt-in
     /// blob metadata and inline way locations)
@@ -3220,14 +3223,22 @@ pub fn run() -> process::ExitCode {
                 simplify,
                 allow_version_regression,
                 jobs,
-            } => run_merge_changes(
-                &changes,
-                output.open(&host)?,
-                simplify,
-                jobs,
-                allow_version_regression,
-                &host,
-            ),
+                tmp: _,
+            } => {
+                // The output is checked before the scratch directory is made,
+                // so a missing output directory reports the output.
+                let output = output.open(&host)?;
+                let scratch = paths.create_scratch(&host)?;
+                run_merge_changes(
+                    &changes,
+                    output,
+                    simplify,
+                    jobs,
+                    allow_version_regression,
+                    scratch,
+                    &host,
+                )
+            }
             Command::Check {
                 file,
                 ids,
@@ -4866,6 +4877,7 @@ fn run_merge_changes(
     simplify: bool,
     jobs: pbfhogg::Parallelism,
     allow_version_regression: bool,
+    scratch: pbfhogg::scratch::RunScratch,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
@@ -4875,6 +4887,7 @@ fn run_merge_changes(
         simplify,
         jobs,
         allow_version_regression,
+        scratch,
         host,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("merge_changes.summary"))?;

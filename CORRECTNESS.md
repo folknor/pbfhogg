@@ -402,6 +402,17 @@ rewritten through the sweep like an overlapping blob - which also drops any
 exact duplicates inside it - rather than copied through under the sorted
 stamp.
 
+**The sweep reads a believed blob in order and refuses a descent.** The
+overlap sweep (`src/commands/blob_merge/sweep.rs`) merges borrowed cursors
+and emits each blob's elements in the order it reads them, so a blob placed
+in an overlap run on its believed claim whose IDs descend internally is
+refused as `Unsorted` when the descent is read, where the earlier owned-heap
+sweep silently reordered it. Only a blob pass 1 scanned and flagged
+internally unsorted (or restructured) is sorted before it is merged. Of two
+copies equal in (type, id, version) the one from the earliest input, then
+the earliest frame in that input, survives; a dropped copy is still
+validated (its user name and member roles resolved) as a written one is.
+
 **Residual - precondition on the header claim, and its repair:** By default
 a file whose header claims `Sort.Type_then_ID` while its blobs are
 internally unsorted is passed through undetected. That file already violates

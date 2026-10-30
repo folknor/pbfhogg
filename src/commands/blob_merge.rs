@@ -14,20 +14,20 @@
 //! run is copied through (coalesced into one `copy_file_range` per contiguous
 //! stretch of one input where the output can splice, or reframed with a
 //! scanned index where its own is missing or false), and each overlap run is
-//! decoded and merged through a binary heap and re-encoded.
+//! decoded, merged by a k-way merge over borrowed cursors (`sweep.rs`) and
+//! re-encoded.
 //!
-//! Overlap runs are swept on worker threads and stream their blocks to the
-//! write loop in run order, through a bounded channel per run and an
-//! admission window over the runs (see [`write_plan`] for the memory bound
-//! and the shutdown protocol). A run is one serial sweep however large, so a
-//! single giant overlap component streams rather than being held whole.
+//! Overlap runs are swept on worker threads, which frame their own blocks
+//! and stream them to the write loop in run order, through a bounded channel
+//! per run and an admission window over the runs (see [`write_plan`] for the
+//! memory bound and the shutdown protocol). A run is one serial sweep however
+//! large, so a single giant overlap component streams rather than being held
+//! whole.
 //!
 //! The commands differ only in their [`IndexPolicy`] and in whether the sweep
 //! drops exact duplicates; their markers, counters and diagnostic keys stay
 //! in the command modules.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::os::unix::fs::FileExt as _;
 
 use crate::Element;
@@ -36,16 +36,11 @@ use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
 use crate::blob_meta::{
-    BboxClaim, BlobIndex, IdTally, TagIndex, try_scan_block_ids_and_tags,
-    try_scan_block_ids_checked, try_scan_block_tags,
+    BboxClaim, BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
+    try_scan_block_tags,
 };
-use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
-use crate::owned::{
-    OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
-    write_single_node_local, write_single_relation_local, write_single_way_local,
-};
 use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
 use crate::read::input::{InputFile, PinnedInput};
 use crate::writer::PbfWriter;
@@ -830,13 +825,19 @@ struct RunCounts {
 /// one serial loop and no thread starts. Otherwise each run is one task of a
 /// streamed ordered pool ([`crate::ordered_pool::run_ordered_streams`]):
 /// runs are swept on worker threads (sized as the decode pools are), each
-/// sending its blocks as the builder fills them through a channel of
+/// framing its own blocks and sending them, packed into chunks of at most
+/// [`OVERLAP_RUN_CHUNK_BYTES`], through a channel of
 /// [`OVERLAP_RUN_CHANNEL_DEPTH`] messages, while this thread writes the
-/// entries in order, a run's blocks as they arrive. At most `window` runs
+/// entries in order, a run's chunks as they arrive. At most `window` runs
 /// ([`OVERLAP_RUN_WINDOW_PER_WORKER`] per worker) are issued ahead of the
-/// one being written. Memory: at most `window x depth` blocks buffered plus
-/// one blocked send per worker, beside each active sweep's heap (bounded by
-/// its run's overlap depth; up to `min(window, workers)` heaps at once).
+/// one being written. Memory: at most `window x depth` chunks buffered (a
+/// frame larger than a chunk travels alone) plus one chunk being built per
+/// worker, beside each active sweep's open cursors (see `sweep.rs`: decoded
+/// blocks of its live overlap, sparse tails demoted past
+/// [`SWEEP_PINNED_BYTES`]; up to `min(window, workers)` sweeps at once).
+///
+/// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
+/// [`SWEEP_PINNED_BYTES`]: crate::tunables::SWEEP_PINNED_BYTES
 /// Progress, shutdown and the failure order are the pool's; the first error
 /// met in run order is returned, unless a worker panicked, which the join
 /// re-raises. Its stall counters (`ordered_pool_*_wait_ns`) are this pass's:
@@ -852,8 +853,12 @@ pub(crate) fn write_plan(
     writer: &mut PbfWriter<FileWriter>,
     dedupe: bool,
     use_copy_range: bool,
+    compression: crate::writer::Compression,
     host: &crate::host::Entered<'_>,
 ) -> Result<WriteCounts> {
+    // The writer's invocation, whose framing counters the sweeps record into
+    // now that they frame their own blocks.
+    let writer_invocation = writer.cancel_token().permit();
     let mut out = PlanWriter {
         plan,
         sources,
@@ -870,6 +875,10 @@ pub(crate) fn write_plan(
         cursor: 0,
     };
     if !plan.runs.is_empty() {
+        // Frames are allocated on the sweep workers and freed on the writer
+        // thread: cap the allocator arenas, as the other cross-thread pools do.
+        host.process.cross_thread_alloc_pool();
+        let metrics = &writer_invocation.metrics().writer;
         let workers = crate::host::sized_workers(
             &*host.resources,
             crate::tunables::DECODE_WORKERS_RESERVED,
@@ -892,15 +901,18 @@ pub(crate) fn write_plan(
             |_| Vec::new(),
             |frame_buf: &mut Vec<u8>, k, emitter| {
                 let run = &plan.runs[k];
-                Sweep {
+                sweep::Sweep {
                     entries: &plan.entries[run.start..run.end],
                     frames: &plan.frames,
                     sources,
+                    kind: run.kind,
                     dedupe,
                     cancel: &host.invocation,
                     emitter,
+                    compression: &compression,
+                    metrics,
                 }
-                .run_kind(run.kind, frame_buf)
+                .run(frame_buf)
             },
             &mut out,
         )?;
@@ -973,7 +985,7 @@ impl PlanWriter<'_> {
     }
 }
 
-impl crate::ordered_pool::StreamConsumer<OwnedBlock, RunCounts> for PlanWriter<'_> {
+impl crate::ordered_pool::StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter<'_> {
     fn before_task(&mut self, k: usize) -> Result<()> {
         let start = self.plan.runs[k].start;
         self.passthrough_until(start)?;
@@ -983,8 +995,8 @@ impl crate::ordered_pool::StreamConsumer<OwnedBlock, RunCounts> for PlanWriter<'
         self.copy.flush(self.writer, self.sources, &mut self.counts)
     }
 
-    fn item(&mut self, _k: usize, block: OwnedBlock) -> Result<()> {
-        self.writer.write_primitive_block_owned(block)
+    fn item(&mut self, _k: usize, chunk: sweep::Chunk) -> Result<()> {
+        self.writer.write_raw_chunks(chunk)
     }
 
     fn finish_task(&mut self, k: usize, emitted: RunCounts) -> Result<()> {
@@ -1140,254 +1152,8 @@ fn frame_parts(frame: &[u8]) -> Result<(&[u8], &[u8])> {
 // The sweep
 // ---------------------------------------------------------------------------
 
-/// Identity of an owned element in the sweep: OSM ID order, and for
-/// `cat --dedupe` an exact duplicate is equal (type, id, version).
-///
-/// Absent metadata is version 0, the same mapping the `Owned*` `Ord` impls
-/// use and libosmium's default version. That is element identity only; it is
-/// unrelated to the OSC writers' rule that an absent version is not printed
-/// as 0. An "exact duplicate" is equal in (type, id, version) and nothing
-/// else: coordinates, tags, members and the rest of the metadata are not
-/// compared, and the heap gives no input-order guarantee for which of two
-/// such elements survives.
-trait SweepElement: Ord {
-    fn id(&self) -> i64;
-    fn version(&self) -> i32;
-}
-
-impl SweepElement for OwnedNode {
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn version(&self) -> i32 {
-        self.metadata.as_ref().map_or(0, |m| m.version)
-    }
-}
-
-impl SweepElement for OwnedWay {
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn version(&self) -> i32 {
-        self.metadata.as_ref().map_or(0, |m| m.version)
-    }
-}
-
-impl SweepElement for OwnedRelation {
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn version(&self) -> i32 {
-        self.metadata.as_ref().map_or(0, |m| m.version)
-    }
-}
-
-/// One overlap run's sweep, on its worker: its entries, the inputs, and the
-/// run's way out to the write loop.
-struct Sweep<'a, 'e> {
-    entries: &'a [BlobEntry],
-    frames: &'a [Frame],
-    sources: &'a [InputFile],
-    dedupe: bool,
-    cancel: &'a crate::host::Recorder,
-    emitter: &'a crate::ordered_pool::Emitter<'e, OwnedBlock, RunCounts>,
-}
-
-impl Sweep<'_, '_> {
-    /// Sweep the run, as `kind`, handing each block to the write loop as it
-    /// fills.
-    ///
-    /// The extraction closures take only `kind`'s elements from each frame, and
-    /// that is what lets a restructured frame (several kinds in one block) give
-    /// each of its entries just its own kind's share.
-    fn run_kind(&self, kind: ElementKind, frame_buf: &mut Vec<u8>) -> Result<RunCounts> {
-        match kind {
-            ElementKind::Node => self.run(
-                |e, heap| {
-                    match e {
-                        Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn)?)),
-                        Element::Node(n) => heap.push(Reverse(read_node(n)?)),
-                        _ => {}
-                    }
-                    Ok(())
-                },
-                write_single_node_local,
-                frame_buf,
-            ),
-            ElementKind::Way => self.run(
-                |e, heap| {
-                    if let Element::Way(w) = e {
-                        heap.push(Reverse(read_way(w)?));
-                    }
-                    Ok(())
-                },
-                write_single_way_local,
-                frame_buf,
-            ),
-            ElementKind::Relation => self.run(
-                |e, heap| {
-                    if let Element::Relation(r) = e {
-                        heap.push(Reverse(read_relation(r)?));
-                    }
-                    Ok(())
-                },
-                write_single_relation_local,
-                frame_buf,
-            ),
-        }
-    }
-
-    /// The sweep's cooperative stop: the run cancelled, or abandoned (the
-    /// write loop has returned, or a thread unwound), so nothing it still
-    /// produces can be written. An abandoned sweep's error is never
-    /// delivered as the run's: the run has already ended.
-    fn checkpoint(&self) -> Result<()> {
-        self.cancel.check()?;
-        if self.emitter.abandoned() {
-            return Err(Error::internal(
-                "overlap run abandoned: its write loop is gone",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Before each blob, emit every element below the blob's first ID; push
-    /// the blob's elements; at the end, drain the heap. One `BlockBuilder`
-    /// for the run, flushed at its end.
-    ///
-    /// The heap holds every element of the run not yet below the next blob's
-    /// first ID, so it is bounded by the run's overlap width, not by the
-    /// input: one blob whose range spans a kind's whole ID space makes it the
-    /// whole kind. That is inherent to an in-memory sweep merge - it must
-    /// hold whatever overlaps the current position - and bounding it would
-    /// take an external merge. Streaming bounds only what the sweep has
-    /// already re-encoded.
-    ///
-    /// [`checkpoint`](Self::checkpoint) runs before each blob is read and
-    /// after every [`SWEEP_CHECKPOINT_REMOVALS`] heap removals (duplicate
-    /// discards included), so neither a growing heap nor its final drain
-    /// runs on unchecked: at most that many removals, or one blob's read and
-    /// decode, pass between checks. That bounds work, not wall time.
-    ///
-    /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
-    fn run<T: SweepElement>(
-        &self,
-        mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>) -> Result<()>,
-        mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> Result<()>,
-        frame_buf: &mut Vec<u8>,
-    ) -> Result<RunCounts> {
-        let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
-        let mut bb = BlockBuilder::new();
-        let mut filled: Vec<OwnedBlock> = Vec::new();
-        let mut counts = RunCounts::default();
-        let mut removals = 0_usize;
-        let mut write = |elem: &T, counts: &mut RunCounts| -> Result<()> {
-            write_elem(elem, &mut bb, &mut filled)?;
-            counts.elements += 1;
-            filled
-                .drain(..)
-                .try_for_each(|block| self.emitter.send(block))
-        };
-
-        for entry in self.entries {
-            // Once per blob, before it is read: a pathological input can put
-            // most of a file into one run, swept on one worker, and a run
-            // whose heap only grows writes nothing until it drains.
-            self.checkpoint()?;
-            let below = crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id);
-            while heap
-                .peek()
-                .is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt())
-            {
-                self.pop_one(&mut heap, &mut counts, &mut removals, &mut write)?;
-            }
-            let frame = &self.frames[entry.frame];
-            let source = &self.sources[frame.source];
-            let block = read_block(source, frame, frame_buf)?;
-            // A believed header claim routed this blob to this kind's sweep
-            // and placed it in the run: an element of another kind would be
-            // dropped by the extraction, and an ID outside the claimed range
-            // breaks the order the pops before each blob rely on (one below
-            // the claimed minimum is pushed after larger IDs were written,
-            // one above the claimed maximum after the run is written past a
-            // following passthrough's first ID). So the claim must be exact
-            // for what the push loop sees, checked before the next blob's
-            // pops write anything. A scanned entry's index came from the
-            // payload, not a claim, and a restructured frame is read per kind
-            // on purpose.
-            let believed = !entry.index_scanned;
-            if believed {
-                block
-                    .refuse_foreign_kind(Some(entry.index.kind))
-                    .map_err(|e| source.locate_at(frame.file_offset, e))?;
-            }
-            let mut tally = IdTally::default();
-            for element in block.elements() {
-                if believed {
-                    tally.add(element_id(&element));
-                }
-                extract(&element, &mut heap).map_err(|e| source.locate_at(frame.file_offset, e))?;
-            }
-            if believed {
-                tally
-                    .refuse_inexact(&entry.index)
-                    .map_err(|e| source.locate_at(frame.file_offset, e))?;
-            }
-        }
-        while !heap.is_empty() {
-            self.pop_one(&mut heap, &mut counts, &mut removals, &mut write)?;
-        }
-        drop(write);
-        crate::commands::flush_local(&mut bb, &mut filled)?;
-        filled
-            .into_iter()
-            .try_for_each(|block| self.emitter.send(block))?;
-        Ok(counts)
-    }
-
-    /// Pop and write the smallest element; under dedupe, then drop every
-    /// element equal to it in (id, version). Every removal counts toward
-    /// the next [`checkpoint`](Self::checkpoint).
-    fn pop_one<T: SweepElement>(
-        &self,
-        heap: &mut BinaryHeap<Reverse<T>>,
-        counts: &mut RunCounts,
-        removals: &mut usize,
-        write: &mut impl FnMut(&T, &mut RunCounts) -> Result<()>,
-    ) -> Result<()> {
-        let Some(Reverse(elem)) = heap.pop() else {
-            return Ok(());
-        };
-        self.count_removal(removals)?;
-        write(&elem, counts)?;
-        if self.dedupe {
-            let (id, version) = (elem.id(), elem.version());
-            while heap
-                .peek()
-                .is_some_and(|Reverse(e)| e.id() == id && e.version() == version)
-            {
-                heap.pop();
-                counts.duplicates += 1;
-                self.count_removal(removals)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// One heap removal; a checkpoint on every
-    /// [`SWEEP_CHECKPOINT_REMOVALS`]th.
-    ///
-    /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
-    fn count_removal(&self, removals: &mut usize) -> Result<()> {
-        *removals += 1;
-        if *removals >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS {
-            *removals = 0;
-            self.checkpoint()?;
-        }
-        Ok(())
-    }
-}
-
+// The sweep itself lives in `sweep.rs`: a borrowed k-way cursor merge.
+mod sweep;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -332,6 +332,7 @@ pub(crate) fn sort_to<'a>(
         &mut writer,
         false,
         backend.supports_copy_range(),
+        compression,
         host,
     )?;
     host.invocation.marker("SORT_WRITE_LOOP_END");

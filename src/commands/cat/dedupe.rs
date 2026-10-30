@@ -301,6 +301,7 @@ fn write_merge(
         &mut writer,
         true,
         opts.backend.supports_copy_range(),
+        opts.compression,
         host,
     )?;
     host.invocation.marker("MERGEPBF_WRITE_LOOP_END");

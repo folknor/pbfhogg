@@ -552,18 +552,30 @@ pub(crate) const CORRUPT_INDEXDATA_INFLATION: i64 = 1_000_000;
 /// Overlap runs admitted ahead of the write loop per sweep worker: run `k`
 /// is handed to a worker only while `k < drained + window`, with the window
 /// this times the worker count. Two keeps every worker fed while the run at
-/// the head drains. With [`OVERLAP_RUN_CHANNEL_DEPTH`] it bounds the
-/// re-encoded output buffered between the sweeps and the writer at
-/// `window x depth` blocks, where the earlier collect-every-run shape held
-/// all of it, which on `cat --dedupe` of a file with itself is the whole
-/// output.
+/// the head drains. With [`OVERLAP_RUN_CHANNEL_DEPTH`] and
+/// [`OVERLAP_RUN_CHUNK_BYTES`] it bounds the framed output buffered between
+/// the sweeps and the writer at `window x depth` chunks.
 pub(crate) const OVERLAP_RUN_WINDOW_PER_WORKER: usize = 2;
 
-/// Blocks one overlap run's sweep may have encoded ahead of the write loop
+/// Chunks one overlap run's sweep may have framed ahead of the write loop
 /// before its worker parks. A run of a single giant overlap component (two
 /// regional extracts whose ID ranges interleave) therefore streams through
 /// the writer instead of being held whole.
 pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
+
+/// Allocation capacity of framed blobs a sweep packs into one chunk before
+/// sending it; a frame larger than this travels alone. Sized so a typical
+/// run (two dense planet blobs merged, about 2 MB compressed) completes in a
+/// chunk or two without parking behind the write loop, which is what lets
+/// later runs proceed while the head drains; not otherwise measured.
+pub(crate) const OVERLAP_RUN_CHUNK_BYTES: usize = 2 << 20;
+
+/// Decoded block bytes one overlap sweep may pin before it demotes mostly
+/// consumed cursors (less than an eighth of their elements left) to owned
+/// tails, releasing their blocks. Two dense planet blobs pin about 20 MB, so
+/// ordinary runs never demote; a run with many sparse tails stops pinning
+/// whole blocks for a few elements each. Not measured.
+pub(crate) const SWEEP_PINNED_BYTES: usize = 64 << 20;
 
 /// Heap removals (emitted elements and dropped duplicates alike) an overlap
 /// sweep makes between two checks of cancellation and abandonment, beside

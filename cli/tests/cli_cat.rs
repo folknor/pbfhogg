@@ -1579,6 +1579,62 @@ fn cat_dedupe_refuses_a_decoded_overlap_blob_its_claimed_range_misdescribes() {
     }
 }
 
+/// Of two copies equal in (id, version), the one from the earlier input
+/// survives, whichever order the inputs come in.
+#[test]
+fn cat_dedupe_keeps_the_earliest_inputs_copy() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let write = |name: &str, lat: i32| {
+        let path = dir.path().join(name);
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 10, 10, [], None);
+        bb.add_node(5, lat, 50, [], None);
+        bb.add_node(9, 90, 90, [], None);
+        let nodes = bb.take().expect("take").expect("block").to_vec();
+        write_raw_block_pbf(&path, true, &[], &[(true, nodes)]);
+        path
+    };
+    let a = write("a.osm.pbf", 111);
+    let b = write("b.osm.pbf", 222);
+    for (inputs, lat) in [
+        ([a.as_path(), b.as_path()], 111),
+        ([b.as_path(), a.as_path()], 222),
+    ] {
+        let output = dir.path().join(format!("out-{lat}.osm.pbf"));
+        let out = run_dedupe(&inputs, &output);
+        assert!(out.status.success(), "{}", out.stderr_str());
+        let c = read_all_elements_with_coords(&output);
+        let ids: Vec<i64> = c.nodes.iter().map(|n| n.0).collect();
+        assert_eq!(ids, vec![1, 5, 9]);
+        assert_eq!(c.nodes[1].1, lat, "node 5 must come from the first input");
+    }
+}
+
+/// A blob believed sorted under its header that descends internally is
+/// refused when the merge reads it, not silently reordered or written out
+/// of order.
+#[test]
+fn cat_dedupe_refuses_a_believed_blob_that_descends() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [], None);
+    bb.add_node(9, 90, 90, [], None);
+    bb.add_node(5, 50, 50, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&input, true, &[], &[(true, nodes)]);
+
+    let out = run_dedupe(&[&input, &input], &output);
+    assert!(!out.status.success(), "dedupe published a wrong answer");
+    out.assert_stderr_contains("internally out of order");
+    assert!(!output.exists(), "a refused dedupe published output");
+}
+
 /// The counterpart: the honest file dedupes and keeps the way.
 #[test]
 fn cat_dedupe_keeps_the_way_when_the_claim_is_honest() {

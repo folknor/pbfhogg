@@ -87,7 +87,8 @@ failure order are the full schedule's. `commands::blob_merge` (sort,
 `cat --dedupe`) streams each overlap run's blocks before the run finishes,
 so it is not one result per task; it runs on the engine's streamed entry
 point, `run_ordered_streams`. There each task has its own channel (an
-overlap run's `OVERLAP_RUN_CHANNEL_DEPTH` blocks), and the consumer
+overlap run's `OVERLAP_RUN_CHANNEL_DEPTH` chunks of frames the sweep
+compressed itself, each at most `OVERLAP_RUN_CHUNK_BYTES`), and the consumer
 dispatches: it issues a task by making its channel and queueing the sender
 on a FIFO job queue, at most a window of tasks ahead of the one it is
 reading, so no gate is involved. Its result send and receive waits go to
@@ -238,17 +239,20 @@ shares (`src/commands/blob_merge.rs`).
    header's claim.
 2. Non-overlapping, intra-sorted blobs: raw passthrough, coalesced into
    one `copy_file_range` per contiguous stretch of an input where the
-   output can splice. Overlapping or intra-unsorted blobs: decode → binary
-   heap merge → re-encode, one sweep per run: an overlap component (a
-   kind-bounded group of blobs whose ranges chain together), or one
-   internally unsorted blob that overlaps nothing. Runs are
-   swept on worker threads and stream their blocks to the write loop in
-   run order through a bounded channel per run, with an admission window
-   of `OVERLAP_RUN_WINDOW_PER_WORKER` runs per worker, so the re-encoded
-   output buffered is bounded whatever the input. A sweep's heap is not:
-   it holds whatever overlaps the current position, which one blob
-   spanning a kind's whole ID range makes the whole kind; bounding that
-   would take an external merge.
+   output can splice. Overlapping or intra-unsorted blobs: decode → k-way
+   merge over borrowed cursors (one per opened blob, a small heap of
+   cursor heads, elements of one ID emitted as a group ordered by version)
+   → re-encode → frame on the sweep's worker, one sweep per run: an overlap
+   component (a kind-bounded group of blobs whose ranges chain together),
+   or one internally unsorted blob that overlaps nothing. Runs are swept on
+   worker threads and stream framed chunks to the write loop in run order
+   through a bounded channel per run, with an admission window of
+   `OVERLAP_RUN_WINDOW_PER_WORKER` runs per worker, so the output buffered
+   is bounded whatever the input. A sweep's open cursors are not: they pin
+   the decoded blocks of whatever overlaps the current position, which one
+   blob spanning a kind's whole ID range makes the whole kind; past
+   `SWEEP_PINNED_BYTES` mostly consumed cursors are demoted to owned tails,
+   and bounding a dense overlap would take an external merge.
 
 ### export
 

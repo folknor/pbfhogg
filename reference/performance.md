@@ -914,6 +914,19 @@ suite; the rest still carry their older commit in the Notes column.
 > `ordered_pool_job_lock` plus `ordered_pool_job_recv` sweep workers idle
 > for want of an issued run.
 
+> **`cat --dedupe` planet with itself, borrowed-cursor sweep (2026-10-30,
+> bygg).** Baseline `d271f04f` (`627883d7`, owned-element heap sweep,
+> 4-block channel per run): **53m43s, peak anon 7.57 GB**, 3.2 avg cores,
+> `ordered_pool_result_send_wait_ns` 88,527 s (about 27 of 30 workers
+> parked behind the write loop holding their heaps). Variant (the commit
+> after `42ea567f`, which replaced the heap with a k-way merge over
+> borrowed cursors and framed each run's blocks on its own worker, sent in
+> 2 MiB chunks), measured uncommitted with `--force` so not stored:
+> **5m10s (310.6 s), peak anon 1.46 GB**, write loop at 27.3 avg cores,
+> result send wait 0, result recv wait 303 s (the write loop now waits on
+> the sweeps). 10.4x faster and 5.2x less peak anon. Same plan on both
+> (50,816 two-blob runs, 0 passthrough). No fstrim before the variant cell.
+
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
 > (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day.

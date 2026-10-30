@@ -60,7 +60,7 @@ does not affect RSS.
 | `add-locations-to-ways --index-type external` | 10.7 GB | 12.0 GB | 5m21s | 9m52s | `13668dda` |
 | `multi-extract --simple -c` (5 regions, `-10,35,32,72`) | 10.3 GB | 9.4 GB | 10m53s | 14m44s | `4babae4d` |
 | `extract --smart` (`-25,34,45,72`) | 8.2 GB | 11.17 GB | 2m20s | 4m28s | `d015bbe4` |
-| `cat --dedupe` | **7.57 GB** | 1.4 GB | 53m43s | 2h13m | `d271f04f` |
+| `cat --dedupe` ⁴ | 1.46 GB | 1.4 GB | 5m10s | 2h13m | unstored |
 | `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
 | `extract --complete` (`-25,34,45,72`) | 5.27 GB | 4.7 GB | 2m02s | 3m42s | `ce0bdcc0` |
 | `apply-changes --locations-on-ways` (4913, keep-untagged base) ² | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
@@ -95,15 +95,16 @@ is the one row whose walls compare directly.
 ³ Measured later the same day on brokkr `a8605c879`, after its fixes for
 brokkr#67 (long flag spellings) and brokkr#68 (text diff written to scratch
 with `-o`); every other row ran on the morning's brokkr build.
+⁴ Re-measured after the borrowed-cursor sweep landed (a `--force` cell on
+the parent `42ea567f` plus the change, so not stored); the RSS-pass cell
+was `d271f04f`, 7.57 GB and 53m43s.
 
 ### What moved
 
-- **`cat --dedupe`: 5.4x the memory for 2.5x the speed.** The drain moved it
-  onto sort's engine, which sweeps overlap runs on worker threads and holds
-  up to min(window, workers) sweep heaps plus window x 4 re-encoded blocks;
-  planet merged with itself puts every blob in an overlap run, so this is
-  the worst case. A design trade, not a leak: the maintainer decides whether
-  to keep it or cap it.
+- **`cat --dedupe`: resolved.** The owned-element heap sweep is replaced by
+  a borrowed-cursor merge with worker-side framing: 5m10s and 1.46 GB peak
+  anon on bygg, against the row's 53m43s and 7.57 GB (see
+  reference/performance.md, "borrowed-cursor sweep").
 - **`merge-changes` with 7 OSCs: 895 MB against 2 MB.** The 1-OSC run is
   still 1.6 MB, so it is the multi-input path (members re-emitted in input
   order, at most one in flight per worker, each an inflated daily OSC). The

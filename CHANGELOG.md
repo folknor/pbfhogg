@@ -134,7 +134,12 @@ never left partial, and the library no longer touches process state.
   default path and `-q` skip byte-equal blob pairs.
 - `cat --dedupe` runs on `sort`'s engine (header walk, `copy_file_range`
   passthrough, parallel merge), and `sort` streams its overlap output instead
-  of buffering it.
+  of buffering it. Overlapping blobs are merged without copying elements:
+  planet merged with itself takes 5m10s and 1.46 GB peak anon on a 16-core
+  host, against 53m43s and 7.57 GB before.
+- In `sort` and `cat --dedupe` overlaps, the earliest input's copy of a
+  duplicate survives, and a blob claimed sorted that descends internally is
+  refused instead of reordered.
 - Default Linux builds use `copy_file_range`, readahead hints and external
   scratch eviction without needing the `linux-direct-io` or `linux-io-uring`
   feature.

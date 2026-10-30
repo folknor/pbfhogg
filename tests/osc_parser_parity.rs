@@ -173,6 +173,100 @@ fn every_consumer_reads_plain_and_gzipped_osc() {
     assert_all_accept(dir.path(), &lying_gz, "gzip bytes named .osc");
 }
 
+/// The driver tracked one section and one open object, not the hierarchy:
+/// a node nested in a way replaced the sink's current element, a section
+/// nested anywhere overwrote the action, an unknown wrapper's `<nd>` was
+/// routed into the enclosing way, and any root name passed. Each is a
+/// silent wrong answer, so every consumer refuses each the same way.
+#[test]
+fn every_consumer_refuses_a_misplaced_element() {
+    let dir = crate::common::test_scratch();
+    let wrap = |body: &str| {
+        format!("<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">{body}</osmChange>")
+    };
+    let node = r#"<node id="1" lat="1.0" lon="2.0" version="1"/>"#;
+    let cases = [
+        (
+            "object in object",
+            wrap(&format!(
+                r#"<create><way id="2" version="1"><nd ref="1"/>{node}</way></create>"#
+            )),
+        ),
+        (
+            "section in section",
+            wrap(&format!("<modify><create>{node}</create></modify>")),
+        ),
+        (
+            "section in object",
+            wrap(
+                r#"<modify><node id="1" lat="1.0" lon="2.0" version="1"><delete/></node></modify>"#,
+            ),
+        ),
+        (
+            "unknown in section",
+            wrap(&format!("<create><note/>{node}</create>")),
+        ),
+        (
+            "unknown in object",
+            wrap(r#"<create><way id="2" version="1"><ext><nd ref="1"/></ext></way></create>"#),
+        ),
+        (
+            "nd in node",
+            wrap(
+                r#"<create><node id="1" lat="1.0" lon="2.0" version="1"><nd ref="3"/></node></create>"#,
+            ),
+        ),
+        (
+            "child of leaf",
+            wrap(
+                r#"<create><way id="2" version="1"><tag k="a" v="b"><nd ref="1"/></tag></way></create>"#,
+            ),
+        ),
+        (
+            "child of root-level unknown",
+            wrap(&format!("<ext><create>{node}</create></ext>")),
+        ),
+        ("nested root", wrap("<osmChange/>")),
+        (
+            "wrong root",
+            format!(
+                "<?xml version=\"1.0\"?>\n<osm version=\"0.6\"><create>{node}</create><osmChange/></osm>"
+            ),
+        ),
+        ("element after root", format!("{}<create/>", wrap(""))),
+    ];
+    for (case, xml) in cases {
+        let input = dir.path().join("misplaced.osc");
+        std::fs::write(&input, xml).unwrap();
+        assert_all_refuse(dir.path(), &input, "is not allowed", case);
+    }
+}
+
+/// What the hierarchy still admits: libosmium's `bbox` / `bounds` in ways
+/// and relations, an unrecognised leaf under the root, self-closing
+/// sections, and an empty document.
+#[test]
+fn every_consumer_admits_the_tolerated_hierarchy() {
+    let dir = crate::common::test_scratch();
+    let xml = r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <bounds minlat="0" minlon="0" maxlat="1" maxlon="1"/>
+  <note>text</note>
+  <create/>
+  <create>
+    <node id="1" lat="1.0" lon="2.0" version="1"/>
+    <way id="2" version="1"><bbox/><nd ref="1"/><tag k="a" v="b"></tag></way>
+  </create>
+</osmChange>"#;
+    let input = dir.path().join("tolerated.osc");
+    std::fs::write(&input, xml).unwrap();
+    assert_all_accept(dir.path(), &input, "tolerated");
+
+    let empty = dir.path().join("empty.osc");
+    std::fs::write(&empty, "<osmChange version=\"0.6\"/>").unwrap();
+    assert_all_accept(dir.path(), &empty, "empty");
+}
+
 /// A complete gzip member with no closing `</osmChange>` is a truncated
 /// download, and treating it as a whole document silently drops every
 /// change after the cut while reporting success. Two of the three

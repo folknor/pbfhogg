@@ -49,6 +49,12 @@ never left partial, and the library no longer touches process state.
 - Input that used to be read partly or silently misread is refused: malformed
   elements and dense arrays, a `Blob` with two payload fields or a wrong
   `raw_size`, zero-length frames, truncated or malformed OSC.
+- OSC input must follow the change-file element hierarchy (`<osmChange>`
+  root, sections holding objects, objects holding `tag` / `nd` / `member` /
+  `bbox`); a misplaced element, such as an object nested in another, a
+  section inside a section, or an unknown element inside an object, is
+  refused instead of silently misreading the change. See the OSC section of
+  `CORRECTNESS.md`.
 - `apply-changes` no longer copies the base's replication timestamp and
   sequence number, and `renumber` writes no replication state.
 - The writing program is now `pbfhogg/<version>`.

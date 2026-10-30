@@ -1758,6 +1758,23 @@ spent 15.6 s summed waiting for credit
 whether a larger budget buys wall is not measured. The 1-OSC peak rises
 from a single-threaded stream to the batch working set, accepted.
 
+### OSC driver enforces the element hierarchy (bygg, 2026-10-30)
+
+The OSC driver now tracks a fixed-depth level (root, section, object,
+leaf) and refuses misplaced elements; the `End` arm pops by level instead
+of classifying the closing name. Matched interleaved `--bench 1` cells on
+bygg, baseline clean `b1f522f7` (stored), variant `b1f522f7` + change
+(`--force`, unstored):
+
+| Cell | Baseline | Variant |
+|---|---|---|
+| merge-changes planet 7-OSC, pair 1 | 9.886 s (`05f37130`) | 9.921 s |
+| merge-changes planet 7-OSC, pair 2 | 9.900 s (`6d76714f`) | 9.914 s |
+| tags-filter `--input-kind osc` planet 4913 | 6.205 s (`9e459dcd`) | 6.008 s |
+
+All deltas are inside noise (+0.4 %, +0.1 %, -3.2 %); the hierarchy check
+costs nothing measurable on the reader-thread-bound merge path.
+
 The sections below record the earlier whole-input shapes.
 
 ### Streaming-path planet 7-OSC: 5.0× speedup (commit `99057fa`, plantasjen, superseded)

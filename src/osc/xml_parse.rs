@@ -10,9 +10,12 @@
 //! at all. Two code paths answering the same question differently is the
 //! recurring defect in this codebase; the answer is one machine.
 //!
-//! [`drive_osc`] owns the *framing*: gzip sniffing, section tracking,
-//! element nesting, self-closing elements, child routing, and the
-//! end-of-document completeness check. An [`OscSink`] owns the *data*:
+//! [`drive_osc`] owns the *framing*: gzip sniffing, the element hierarchy
+//! (root, sections, objects, their children; anything misplaced is
+//! refused), self-closing elements, child routing, and the end-of-document
+//! completeness check. Text, comments and processing instructions are
+//! ignored wherever they appear; this is a hierarchy check, not XML
+//! validation beyond what quick-xml does. An [`OscSink`] owns the *data*:
 //! what an element turns into once the framing has identified it.
 
 use std::cell::Cell;
@@ -66,7 +69,9 @@ impl OscAction {
 /// per element, followed by zero or more `tag` / `nd` / `member` calls
 /// (already filtered to the kinds that can carry them), followed by
 /// exactly one `end_element`. A self-closing element gets `begin_element`
-/// immediately followed by `end_element`.
+/// immediately followed by `end_element`. The sequence is balanced on
+/// success; when the driver fails (a misplaced element, truncation, a sink
+/// error) the last element may be left begun and never ended.
 pub(crate) trait OscSink {
     /// Whether `end_element` emits the finished element (serializes or
     /// writes it), so that a failure there is the output's and not a fault
@@ -408,30 +413,72 @@ fn action_for(name: &str) -> Option<OscAction> {
     }
 }
 
+/// Where in the document hierarchy the driver stands. Every level has a
+/// fixed parent, so the hierarchy needs no stack: the section action and
+/// the open element kind sit in [`DriveState`]'s fixed slots while a
+/// deeper level is open. quick-xml's default `check_end_names` (with
+/// unmatched ends refused) guarantees every `End` closes the innermost
+/// open `Start`, which is what makes popping by level sound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    /// Before the root element.
+    Doc,
+    /// Inside `<osmChange>`.
+    Root,
+    /// An unrecognised element directly under the root (`<bounds>`, for
+    /// instance): tolerated as a leaf, ignored, and refused if it has
+    /// element children.
+    Other,
+    /// Inside `<create>` / `<modify>` / `<delete>`.
+    Section,
+    /// Inside a `<node>` / `<way>` / `<relation>`.
+    Element,
+    /// Inside a non-self-closing child of an element (`<tag>`, `<nd>`,
+    /// `<member>`, `<bbox>` / `<bounds>`), which may not have element
+    /// children.
+    Leaf,
+    /// The root has closed; the document is whole.
+    Done,
+}
+
 struct DriveState {
-    section: Option<OscAction>,
-    open: Option<ElementKind>,
-    saw_root_end: bool,
+    level: Level,
+    section: OscAction,
+    open: ElementKind,
 }
 
 /// The root element name, whose close proves the document is whole.
 const ROOT: &str = "osmChange";
 
-/// Route a `tag` / `nd` / `member` child to the sink, if one can carry it.
-fn route_child<S: OscSink>(
+/// Refuse an element the OSC hierarchy does not allow where it appears.
+/// The grammar follows libosmium's section and object-child structure
+/// (`xml_input_format.hpp`): sections only under the root, only objects in
+/// sections, only `tag`, `nd` (ways), `member` (relations) and `bbox` /
+/// `bounds` (ways, relations) in objects, and no element children below
+/// that. Before this, a nested object replaced the sink's current element
+/// and an unknown wrapper's descendants were routed into the enclosing
+/// object - silent wrong answers, not tolerance.
+#[cold]
+fn misplaced(name: &str, parent: &str) -> Error {
+    Error::invalid_data(format!(
+        "OSC element <{name}> is not allowed {parent}; refusing a document whose \
+         structure the change cannot be read from"
+    ))
+}
+
+/// Route an object's child (`level == Element`) to the sink, or refuse it.
+fn handle_element_child<S: OscSink>(
     name: &str,
     e: &quick_xml::events::BytesStart<'_>,
-    state: &DriveState,
+    kind: ElementKind,
     sink: &mut S,
 ) -> ParseResult<()> {
-    let Some(kind) = state.open else {
-        return Ok(());
-    };
-    match name {
-        "tag" => sink.tag(e),
-        "nd" if kind == ElementKind::Way => sink.nd(e),
-        "member" if kind == ElementKind::Relation => sink.member(e),
-        _ => Ok(()),
+    match (name, kind) {
+        ("tag", _) => sink.tag(e),
+        ("nd", ElementKind::Way) => sink.nd(e),
+        ("member", ElementKind::Relation) => sink.member(e),
+        ("bbox" | "bounds", ElementKind::Way | ElementKind::Relation) => Ok(()),
+        _ => Err(misplaced(name, &format!("inside <{}>", kind.as_str()))),
     }
 }
 
@@ -465,51 +512,107 @@ fn handle_open<S: OscSink>(
     let name = e.name();
     let name = name.as_ref();
 
-    // `<osmChange version="0.6"/>` is a complete, valid, empty change
-    // document - it opens and closes in one event, so it never produces
-    // an `End` and the completeness check below would otherwise call it
-    // truncated.
-    if is_empty && name == ROOT {
-        state.saw_root_end = true;
-        return Ok(());
-    }
-
-    if let Some(action) = action_for(name) {
-        // A self-closing `<create/>` opens and closes in one event.
-        state.section = if is_empty { None } else { Some(action) };
-        return Ok(());
-    }
-
-    if let Some(kind) = ElementKind::from_name(name) {
-        // An element outside a section is malformed OSC. The compact
-        // parser used to treat it as a create and put it in the overlay;
-        // merge-changes errored for self-closing elements and silently
-        // dropped non-self-closing ones. All three answers were
-        // different, and only refusing is defensible - we cannot know
-        // whether the producer meant to create, modify or delete it.
-        let action = state
-            .section
-            .ok_or_else(|| {
-                Error::invalid_data(format!(
-                    "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
-                 refusing to guess which change it was meant to be",
-                    kind.as_str(),
-                    parse_i64_attr(e, "id")
-                        .map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
-                ))
-            })
-            .map_err(|e| input_fault(path, e))?;
-        sink.begin_element(action, kind, e)
-            .map_err(|e| input_fault(path, e))?;
-        if is_empty {
-            end_element(sink, path)?;
-        } else {
-            state.open = Some(kind);
+    // A self-closing element is admitted by exactly the rules a `Start`
+    // is, then closes in the same event, so the level never moves for it.
+    match state.level {
+        Level::Element => {
+            // The hot arm: every tag / nd / member of every object.
+            handle_element_child(name, e, state.open, sink).map_err(|e| input_fault(path, e))?;
+            if !is_empty {
+                state.level = Level::Leaf;
+            }
         }
-        return Ok(());
+        Level::Section => {
+            let Some(kind) = ElementKind::from_name(name) else {
+                return Err(input_fault(
+                    path,
+                    misplaced(name, &format!("inside <{}>", state.section.tag())),
+                ));
+            };
+            sink.begin_element(state.section, kind, e)
+                .map_err(|e| input_fault(path, e))?;
+            if is_empty {
+                end_element(sink, path)?;
+            } else {
+                state.open = kind;
+                state.level = Level::Element;
+            }
+        }
+        Level::Root => {
+            if let Some(action) = action_for(name) {
+                if !is_empty {
+                    state.section = action;
+                    state.level = Level::Section;
+                }
+            } else if let Some(kind) = ElementKind::from_name(name) {
+                // An element outside a section is malformed OSC. The
+                // compact parser used to treat it as a create and put it in
+                // the overlay; merge-changes errored for self-closing
+                // elements and silently dropped non-self-closing ones. All
+                // three answers were different, and only refusing is
+                // defensible - we cannot know whether the producer meant to
+                // create, modify or delete it.
+                return Err(input_fault(
+                    path,
+                    Error::invalid_data(format!(
+                        "OSC {} {} appears outside any <create>, <modify> or <delete> \
+                         section; refusing to guess which change it was meant to be",
+                        kind.as_str(),
+                        parse_i64_attr(e, "id")
+                            .map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
+                    )),
+                ));
+            } else if name == ROOT {
+                return Err(input_fault(path, misplaced(name, "inside <osmChange>")));
+            } else if !is_empty {
+                state.level = Level::Other;
+            }
+        }
+        Level::Doc => {
+            if name != ROOT {
+                return Err(input_fault(
+                    path,
+                    misplaced(name, "as the document root (expected <osmChange>)"),
+                ));
+            }
+            // `<osmChange version="0.6"/>` is a complete, valid, empty
+            // change document.
+            state.level = if is_empty { Level::Done } else { Level::Root };
+        }
+        Level::Leaf => {
+            return Err(input_fault(
+                path,
+                misplaced(name, "inside a <tag>, <nd>, <member> or <bbox>"),
+            ));
+        }
+        Level::Other => {
+            return Err(input_fault(
+                path,
+                misplaced(name, "inside an unrecognised element"),
+            ));
+        }
+        Level::Done => {
+            return Err(input_fault(path, misplaced(name, "after </osmChange>")));
+        }
     }
+    Ok(())
+}
 
-    route_child(name, e, state, sink).map_err(|e| input_fault(path, e))
+/// Close the innermost open element. quick-xml has already matched the
+/// name against its `Start`, so the level alone says what closes.
+fn handle_close<S: OscSink>(state: &mut DriveState, sink: &mut S, path: &Path) -> ParseResult<()> {
+    state.level = match state.level {
+        Level::Leaf => Level::Element,
+        Level::Element => {
+            end_element(sink, path)?;
+            Level::Section
+        }
+        Level::Section | Level::Other => Level::Root,
+        Level::Root => Level::Done,
+        // Unreachable with matched end names: nothing is open.
+        Level::Doc | Level::Done => state.level,
+    };
+    Ok(())
 }
 
 /// Drive one OSC document read from `path` through `reader` into `sink`.
@@ -523,9 +626,9 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
     path: &Path,
 ) -> ParseResult<()> {
     let mut state = DriveState {
-        section: None,
-        open: None,
-        saw_root_end: false,
+        level: Level::Doc,
+        section: OscAction::Create,
+        open: ElementKind::Node,
     };
     let mut buf = Vec::new();
 
@@ -533,18 +636,7 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => handle_open(e, false, &mut state, sink, path)?,
             Ok(Event::Empty(ref e)) => handle_open(e, true, &mut state, sink, path)?,
-            Ok(Event::End(ref e)) => {
-                let name = e.name();
-                let name = name.as_ref();
-                if action_for(name).is_some() {
-                    state.section = None;
-                } else if ElementKind::from_name(name).is_some() && state.open.is_some() {
-                    end_element(sink, path)?;
-                    state.open = None;
-                } else if name == ROOT {
-                    state.saw_root_end = true;
-                }
-            }
+            Ok(Event::End(_)) => handle_close(&mut state, sink, path)?,
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(e) => {
@@ -571,7 +663,7 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
     // the partial document as the whole change stream - apply-changes
     // wrote a partially-applied PBF and reported success. Only the
     // closing tag proves the document is whole.
-    if !state.saw_root_end {
+    if state.level != Level::Done {
         return Err(input_fault(
             path,
             Error::invalid_data(

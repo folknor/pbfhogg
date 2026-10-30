@@ -237,6 +237,27 @@ project rule that a command must not report success having done something
 other than what was asked. The escape hatch exists because replaying a
 change stream backwards is a legitimate, if rare, thing to want.
 
+## OSC input: the root level is stricter than libosmium
+
+pbfhogg's OSC reader follows libosmium's section and object-child structure
+(sections only under the root, only objects in sections, only `tag`, `nd`,
+`member` and `bbox` / `bounds` in objects; see CORRECTNESS.md), but refuses
+three things libosmium's XML reader accepts at the root level:
+
+- **An object directly under `<osmChange>`**, outside any `<create>`,
+  `<modify>` or `<delete>` section. libosmium reads it as a plain object;
+  pbfhogg cannot know which change it was meant to be and refuses rather than
+  guess.
+- **A root other than `<osmChange>`.** libosmium also accepts `<osm>`, which
+  is a data file, not a change file.
+- **A root-level element with element children**, such as a `<changeset>`
+  carrying `<tag>` or `<discussion>` children. libosmium parses changesets
+  (and osmium's `apply-changes` / `merge-changes` then ignore them); pbfhogg
+  has no changeset model, tolerates an unrecognised root-level element only as
+  a childless leaf, and refuses any element nested inside it rather than
+  silently discard structured content. A childless `<changeset/>` or
+  `<bounds/>` is accepted and ignored.
+
 ## derive-changes: changes are decided by content, not version
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in

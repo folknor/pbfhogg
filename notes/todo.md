@@ -1022,7 +1022,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 
 - [ ] **apply-changes** (plan note `apply-changes-opportunities.md` deleted 2026-07-13, content absorbed here; git history has the full record) - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget). **Note closed 2026-07-13** - its remaining items are tracked here now:
   - [x] ~~**#15 document zstd:1 as the internal-pipeline recommendation**~~ - DONE (found landed 2026-07-13): README.md and reference/performance.md both carry the `--compression zstd:1` recommendation for pipelines that skip osmium interop.
-  - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; the scaffolding that used to sit in `src/write/raw_passthrough.rs` was deleted 2026-08-20, analysis preserved in [notes/per-group-raw-passthrough.md](per-group-raw-passthrough.md)). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
+  - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; the scaffolding that used to sit in `src/write/raw_passthrough.rs` was deleted 2026-08-20; the per-group passthrough analysis is in this file's raw passthrough section). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
   - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
   - Open questions preserved from the note: actual overlap-blob ratio under larger OSCs (re-measure if input diffs grow; governs worker-pool load); byte-budget reorder capacity sizing (current setting works at planet; revisit on RSS/stall signals); scanner HeaderWalker vs worker throughput balance (no signal it's an issue).
 
@@ -1214,7 +1214,7 @@ Known to work, no performance question open, but not in the results DB:
   blob with "no heap reservation until elements are added", but
   `BlockBuilder::new` preallocates its ten dense vectors at the 8000-element
   cap (about 0.5 MB). Fix the comments, or the preallocation, with the
-  encode-side recycling item in notes/pool-rss-growth.md.
+  encode-side recycling item in notes/pre-release.md (WRK-020).
 - [ ] **A cold schedule header walk costs ~6 s at planet (found
   2026-10-30).** Cells that run without the headers in page cache spend
   about 6 s per schedule walk (getparents, check `--ids`, time-filter, cat,
@@ -1364,7 +1364,7 @@ still fully decode and re-encode via BlockBuilder. Of these:
   2026-04-18 (shadow counter, commit `a5c6854` reverted in `0ef4107`,
   UUID `8c786794` at `w/highway=primary` on planet) and 0 / 50,364
   pass-2 blobs qualified. The load-bearing pin is the comment block
-  at the pass-2 worker in `src/commands/tags_filter.rs`.
+  at the pass-2 worker in `src/commands/tags_filter/mod.rs`.
 - **renumber / time-filter**: every element is modified, so raw
   passthrough does not apply - the win here is write-path throughput
   instead.
@@ -1376,13 +1376,27 @@ consumer - `frame_raw_block` in `src/write/raw_passthrough.rs`, the
 `PrimitiveBlock::raw_group_bytes` / `raw_stringtable_bytes` /
 `block_scalars` / `group_count` accessors, and the `WireBlock::raw_stringtable`
 / `raw_proto` accessors underneath them - all behind blanket or per-item
-`allow(dead_code)`. They were deleted on 2026-08-20; the analysis they
-carried, which is the part with value, is preserved in
-[notes/per-group-raw-passthrough.md](per-group-raw-passthrough.md):
-the string-table-index problem any consumer has to solve, the two viable
-output shapes, and the two shadow-counter measurements (0 / 50,364 and
-0 / 32,835 qualifying blobs at planet scale) that put the idea on the
-shelf. Shadow-count at group granularity before writing any code.
+`allow(dead_code)`. They were deleted on 2026-08-20 (`fb079ac5`).
+
+The design question any consumer has to solve is mixing raw and
+re-encoded groups in one output blob: raw groups carry the original
+string-table indices, `BlockBuilder` issues fresh ones. Two viable
+shapes: a string-table-aligned re-encode (copy the original `StringTable`
+whole and re-encode partial groups against its indices, a different write
+path, one output blob per input blob), or split output (raw-only and
+re-encoded groups as separate blobs, both paths exist, but it doubles the
+boundary-blob count).
+
+Two shadow-counter measurements at planet scale put the idea on the
+shelf: tags-filter, 0 of 50,364 pass-2 blobs all-included (above), and
+multi-extract (2026-04-20, UUID `dad573cb`, 5-region `--config --simple`),
+0 of 32,835 node blobs qualifying, pinned in
+`src/commands/extract/multi.rs` `try_extract_multi_single_pass`. Both are
+structural: blobs are ID-sorted and OSM IDs are chronological, not
+geographic or tag-coherent, so an 8,000-element blob scatters in both
+dimensions. A group is smaller, so its qualifying fraction is not
+automatically zero; shadow-count at group granularity on a real workload
+before writing any code.
 
 ### Write-path throughput
 

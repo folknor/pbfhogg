@@ -455,6 +455,16 @@ every other extension selects PBF. This is detection, not a promise of bzip2
 decoding. No BOM or whitespace skipping, or new ambiguous-format refusal, is
 part of this contract. The help text retains the extension-default description.
 
+Every OSC consumer enforces one element hierarchy, in one driver: the root is
+`<osmChange>`; under it, `<create>` / `<modify>` / `<delete>` sections and
+unrecognised leaf elements (ignored; any element inside one is refused);
+sections contain only `node`, `way` and `relation`; an object contains only
+`tag`, `nd` (ways), `member` (relations) and `bbox` / `bounds` (ways and
+relations, ignored); those children contain no elements; nothing follows the
+root. Anything else is refused, naming the misplaced element. This follows
+libosmium's section and object-child structure; the root-level differences are
+in DEVIATIONS.md. Text and comments are ignored wherever they appear.
+
 The owned OSC sinks (`merge-changes` and `tags-filter --input-kind osc`)
 deliberately parse version but pass timestamp, changeset, uid and visible through
 as normalized XML attribute text without native-value validation. They do not

@@ -2206,6 +2206,21 @@ germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
 | Merge (Germany, 4.5 GB) | Mixed | Neutral |
 | Cat passthrough (planet) | Sequential I/O | +5% slower |
 | ALTW (europe) | Memory latency (mmap faults) | +2% slower |
+| `cat --dedupe` self-merge (planet) | CPU (sweep), every frame read twice | +16% slower with a direct pass 2 (see below) |
+
+`cat --dedupe` direct pass 2 (bygg, planet self-merge, 2026-10-30, change
+on top of `83c3cce1`). With `--direct-io`, HEAD (pass 2 buffered) cell
+`ef8f68ee` 265.6 s against an uncommitted direct-pass-2 cell 306.9 s: the
+write loop reads 175.7 GB from the device instead of 86.5 GB, because the
+self-merge reads each frame once per argument and a direct read gets no
+page-cache reuse; average cores 28.1 vs 27.5. The cost is the requested
+transport on a doubled-input benchmark shape. The buffered default path
+(one branch per frame read) was checked with interleaved `--bench 1`
+cells: HEAD `d83a5389` 304.9 s and `1afa4e81` 297.7 s against uncommitted
+261.1 s and 259.4 s, identical device reads (86.6 vs 86.5 GB in the write
+loop) and pass 1; the gap sits in the CPU-bound write loop and the later
+HEAD direct-io cell `ef8f68ee` ran that same buffered pass 2 in 251.7 s,
+so it is drift between cells, not the change, and is not claimed.
 
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads

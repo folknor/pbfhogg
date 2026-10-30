@@ -67,7 +67,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::rc::Rc;
 
-use super::{BlobEntry, Frame, RunCounts, element_id, read_block};
+use super::{BlobEntry, Frame, FrameBuf, RunCounts, Sources, element_id, read_block};
 use crate::blob_meta::IdTally;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Result;
@@ -78,7 +78,6 @@ use crate::owned::{
     write_single_relation_local, write_single_way_local,
 };
 use crate::read::block::BlockElementsIter;
-use crate::read::input::InputFile;
 use crate::write::metrics::WriterMetrics;
 use crate::writer::{Compression, frame_blob_pipelined};
 use crate::{Element, ElementKind, PrimitiveBlock};
@@ -90,7 +89,7 @@ pub(super) type Chunk = Vec<Vec<u8>>;
 pub(super) struct Sweep<'a, 'e> {
     pub(super) entries: &'a [BlobEntry],
     pub(super) frames: &'a [Frame],
-    pub(super) sources: &'a [InputFile],
+    pub(super) sources: &'a Sources,
     pub(super) kind: ElementKind,
     pub(super) dedupe: bool,
     pub(super) cancel: &'a crate::host::Recorder,
@@ -557,7 +556,7 @@ impl Sweep<'_, '_> {
     /// runs unchecked.
     ///
     /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
-    pub(super) fn run(&self, frame_buf: &mut Vec<u8>) -> Result<RunCounts> {
+    pub(super) fn run(&self, frame_buf: &mut FrameBuf) -> Result<RunCounts> {
         let mut counts = RunCounts::default();
         let mut out = Output {
             bb: BlockBuilder::new(),
@@ -615,7 +614,7 @@ impl Sweep<'_, '_> {
     }
 
     /// Read and decode one entry's frame and open a cursor on it.
-    fn open(&self, entry: &BlobEntry, frame: &Frame, frame_buf: &mut Vec<u8>) -> Result<Cursor> {
+    fn open(&self, entry: &BlobEntry, frame: &Frame, frame_buf: &mut FrameBuf) -> Result<Cursor> {
         let source = &self.sources[frame.source];
         let block = read_block(source, frame, frame_buf)?;
         // A believed header claim routed this blob to this kind's sweep and

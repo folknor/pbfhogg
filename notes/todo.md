@@ -167,9 +167,10 @@ together so the surface changes once.
   Where the flag is honoured it is often only for the header read and the
   first-blob indexdata probe: sort and `cat --dedupe` (the front read and
   the pass 1 header walk, which `HeaderWalker::open_direct` reads
-  `O_DIRECT`; pass 2 reads buffered: its splice paths copy from the same
-  descriptor at unaligned offsets, so honouring it under `--io-uring` needs
-  a second descriptor per input), renumber (header only), repack and degrade's
+  `O_DIRECT`; pass 2 reads `O_DIRECT` too, except when the output splices
+  frames it copies through - `--io-uring` with any passthrough frame - where
+  the splice needs the buffered descriptor and a direct sweep beside it
+  would need a second descriptor per input), renumber (header only), repack and degrade's
   decode path (the classify pools pread through a buffered shared fd),
   time-filter's snapshot path, tags-filter's two-pass mode (pass 1, the
   relation closure, the way dependencies and pass 2 pread through walker

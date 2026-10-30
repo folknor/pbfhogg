@@ -1933,8 +1933,8 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
 | check --locations | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored, with a note (parallel unaligned preads) |
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
-| cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
-| sort | Yes | Yes | Yes (R+W) | Yes | |
+| cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path; with `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |
+| sort | Yes | Yes | Yes (R+W) | Yes | With `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |
 | repack | Yes | Yes | Yes (R+W) | Yes | Re-encode at configurable elements-per-blob cap |
 | degrade | Yes | Yes | Yes (R+W) | Yes | Adversarial PBF generator (--unsort / --strip-locations / --strip-indexdata / --drop-ids) |
 | renumber | Yes | Yes | Yes (R+W) | - | |

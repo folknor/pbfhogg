@@ -499,8 +499,9 @@ fn dedupe_reads_only_the_pinned_inputs() {
 }
 
 /// The probes, header reads and body readers open `O_DIRECT` when asked to,
-/// through the pin's own direct open (the schedule walk and dedupe's pass-2
-/// sources stay buffered).
+/// through the pin's own direct open (the schedule walk stays buffered, and
+/// so do dedupe's pass-2 sources here, the default output splicing the
+/// frames this plan copies through).
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_inputs() {

@@ -143,6 +143,11 @@ never left partial, and the library no longer touches process state.
   of buffering it. Overlapping blobs are merged without copying elements:
   planet merged with itself takes 5m10s and 1.46 GB peak anon on a 16-core
   host, against 53m43s and 7.57 GB before.
+- `cat --dedupe --direct-io` and `sort --direct-io` read their second pass
+  `O_DIRECT` too, so the run no longer fills the page cache. With
+  `--io-uring` as well, the second pass stays buffered whenever a blob is
+  copied through unchanged. Merging a file with itself is slower this way
+  (every blob is read from the device twice).
 - `inspect`'s full-decode modes (`--extended`, `--locations`,
   `--distrust-metadata`, and any report on an unindexed file) decode on every
   core: planet `--extended` takes 41 s against 13m22s on a 16-core host, at

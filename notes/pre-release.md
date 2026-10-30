@@ -335,9 +335,18 @@ The per-run chunk bound is `window x depth x max(OVERLAP_RUN_CHUNK_BYTES,
 largest frame)`. A frame near the 32 MiB format limit (`--compression none`
 on a huge block) travels alone and is not otherwise budgeted.
 
-### WRK-032: Dedupe pass 2 ignores --direct-io
+### WRK-032: Dedupe pass 2 buffered under --direct-io --io-uring
 
-Pass 2 reads frames through buffered `InputFile` even under `--direct-io`.
+Pass 2 (sort and `cat --dedupe`) now reads `O_DIRECT` under `--direct-io`
+unless the output splices and the plan copies some frame through
+(`blob_merge::open_sources`). That case - `--direct-io --io-uring` with any
+passthrough - still reads the sweep buffered. Closing it needs a second,
+direct descriptor per argument for the sweep beside the buffered one the
+splice uses, which changes the descriptor grant (`CAT_EXTRA_FDS`, the
+`FdPool` doc, the open-count tests in `tests/fault_cat_input.rs` and
+`tests/fd_pool.rs`); or a per-source choice (direct only for inputs with
+no copied frame). Belongs with the deferred `--direct-io` reach redesign in
+`notes/todo.md`.
 
 ### WRK-033: A sweep test at planet blob density
 

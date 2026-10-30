@@ -318,7 +318,8 @@ pub(crate) fn sort_to<'a>(
     let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
     host.invocation.marker("SORT_WRITER_SETUP_END");
 
-    let sources = blob_merge::open_sources(vec![pin])?;
+    let sources =
+        blob_merge::open_sources(vec![pin], &plan, direct_io, backend.supports_copy_range())?;
     host.invocation
         .counter("sort_overlap_runs", plan.runs.len());
 
@@ -326,15 +327,7 @@ pub(crate) fn sort_to<'a>(
     // SORT_WRITE_LOOP spans both (the separate SORT_OVERLAP_PARALLEL phase of
     // the earlier collect-then-write shape no longer exists).
     host.invocation.marker("SORT_WRITE_LOOP_START");
-    let counts = blob_merge::write_plan(
-        &plan,
-        &sources,
-        &mut writer,
-        false,
-        backend.supports_copy_range(),
-        compression,
-        host,
-    )?;
+    let counts = blob_merge::write_plan(&plan, &sources, &mut writer, false, compression, host)?;
     host.invocation.marker("SORT_WRITE_LOOP_END");
 
     host.invocation

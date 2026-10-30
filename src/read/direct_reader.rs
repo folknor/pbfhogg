@@ -333,6 +333,11 @@ impl AlignedScratch {
         Self { align, alloc: None }
     }
 
+    /// The alignment its allocations keep.
+    pub(crate) fn align(&self) -> usize {
+        self.align
+    }
+
     /// The first `len` bytes, growing the allocation to hold them.
     fn slice_mut(&mut self, len: usize) -> io::Result<&mut [u8]> {
         let held = self.alloc.map_or(0, |(_, layout)| layout.size());
@@ -385,10 +390,28 @@ pub(crate) fn read_aligned(
     offset: u64,
     align: usize,
     scratch: &mut AlignedScratch,
-    mut pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
 ) -> io::Result<()> {
     if out.is_empty() {
         return Ok(());
+    }
+    let read = read_aligned_in(out.len(), offset, align, scratch, pread)?;
+    out.copy_from_slice(read);
+    Ok(())
+}
+
+/// [`read_aligned`] without the copy out: the `len` bytes at `offset`,
+/// borrowed from `scratch` where the aligned read left them. Same reads,
+/// same termination, same errors.
+pub(crate) fn read_aligned_in(
+    len: usize,
+    offset: u64,
+    align: usize,
+    scratch: &mut AlignedScratch,
+    mut pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<&[u8]> {
+    if len == 0 {
+        return Ok(&[]);
     }
     debug_assert!(align.is_power_of_two() && align == scratch.align);
     let overflow = || io::Error::new(io::ErrorKind::InvalidInput, "direct read range overflows");
@@ -396,7 +419,7 @@ pub(crate) fn read_aligned(
     let start = offset & !(align64 - 1);
     // offset - start < align, a usize.
     let lead = usize::try_from(offset - start).map_err(|_| overflow())?;
-    let need = lead.checked_add(out.len()).ok_or_else(overflow)?;
+    let need = lead.checked_add(len).ok_or_else(overflow)?;
     let span = need
         .checked_add(align - 1)
         .map(|n| n & !(align - 1))
@@ -423,8 +446,7 @@ pub(crate) fn read_aligned(
         }
         have = base + n;
     }
-    out.copy_from_slice(&buf[lead..need]);
-    Ok(())
+    Ok(&buf[lead..need])
 }
 
 /// An `O_DIRECT` file read by position: any byte range at any offset, read

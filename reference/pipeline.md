@@ -254,6 +254,18 @@ shares (`src/commands/blob_merge.rs`).
    `SWEEP_PINNED_BYTES` mostly consumed cursors are demoted to owned tails,
    and bounding a dense overlap would take an external merge.
 
+Under `--direct-io` both passes read `O_DIRECT`: pass 1 through
+`HeaderWalker::open_direct`, pass 2 through one direct descriptor per
+argument, each reading thread holding its own aligned scratch. The one
+exception is a run whose output splices (`--io-uring`, or a library
+backend that supports copy-range) and whose plan copies at least one frame
+through: the splice copies from the source descriptor at unaligned
+offsets, so that run's pass 2 reads buffered rather than holding a second
+descriptor per argument (`open_sources` makes the choice and the copy
+permission together). A self-merge reads every frame twice, which a
+buffered pass 2 serves the second time from the page cache and a direct
+one reads again from the device.
+
 ### export
 
 Single sequential `ElementReader::for_each` pass, no parallelism. Rejects

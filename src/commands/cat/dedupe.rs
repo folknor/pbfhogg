@@ -293,17 +293,15 @@ fn write_merge(
     let mut writer =
         writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
-    let sources = blob_merge::open_sources(inputs)?;
-    host.invocation.marker("MERGEPBF_WRITE_LOOP_START");
-    let counts = blob_merge::write_plan(
+    let sources = blob_merge::open_sources(
+        inputs,
         &plan,
-        &sources,
-        &mut writer,
-        true,
+        opts.direct_reads,
         opts.backend.supports_copy_range(),
-        opts.compression,
-        host,
     )?;
+    host.invocation.marker("MERGEPBF_WRITE_LOOP_START");
+    let counts =
+        blob_merge::write_plan(&plan, &sources, &mut writer, true, opts.compression, host)?;
     host.invocation.marker("MERGEPBF_WRITE_LOOP_END");
     // Input blobs, not output blocks: a rewritten blob is counted once
     // however many runs its kinds joined, and a run emits its own blocks.
@@ -444,10 +442,11 @@ mod tests {
         (&frames[entry.frame], rewrite)
     }
 
-    /// `--direct-io` reaches pass 1: every input is walked `O_DIRECT` (the
-    /// count is of direct walks, which the indexdata probe never opens), an
-    /// unindexed input's payloads read through it, and the plan and the
-    /// merge are the buffered run's.
+    /// `--direct-io` reaches both passes: every input is walked `O_DIRECT`
+    /// (the count is of direct walks, which the indexdata probe never
+    /// opens), an unindexed input's payloads read through it, pass 2 reads
+    /// its frames direct on an output that cannot splice, and the plan and
+    /// the merge are the buffered run's.
     #[cfg(feature = "linux-direct-io")]
     #[test]
     fn direct_reads_walk_every_input_direct_in_pass_1() {
@@ -500,7 +499,7 @@ mod tests {
             "the unindexed input's payloads were scanned"
         );
 
-        let merged = |merge, name: &str| {
+        let merged = |merge, opts: &WriteOptions, name: &str| {
             let path = dir.path().join(name);
             let output = crate::output::Output::new(
                 path.clone(),
@@ -509,14 +508,8 @@ mod tests {
             )
             .expect("output");
             let output = output.bind(&host.invocation).expect("open");
-            let stats = write_merge(
-                merge,
-                &output,
-                &WriteOptions::default(),
-                &HeaderOverrides::default(),
-                &host,
-            )
-            .expect("pass 2");
+            let stats = write_merge(merge, &output, opts, &HeaderOverrides::default(), &host)
+                .expect("pass 2");
             output.publish().expect("publish");
             (
                 (stats.nodes, stats.ways, stats.relations),
@@ -524,9 +517,13 @@ mod tests {
                 std::fs::read(&path).expect("read merged"),
             )
         };
+        let direct_pass2 = WriteOptions {
+            backend: crate::write::OutputBackend::Direct,
+            ..opts(true)
+        };
         assert_eq!(
-            merged(direct, "direct.osm.pbf"),
-            merged(buffered, "buffered.osm.pbf")
+            merged(direct, &direct_pass2, "direct.osm.pbf"),
+            merged(buffered, &WriteOptions::default(), "buffered.osm.pbf")
         );
     }
 
@@ -543,7 +540,7 @@ mod tests {
     }
 
     // The two failure cases drive pass 2's frame reads (`read_block` for an
-    // overlap run, `read_frame` for a passthrough blob) over a real pass-1
+    // overlap run, `FrameBuf::read` for a passthrough blob) over a real pass-1
     // plan rather than `write_merge` itself: an error return drops pass 2's
     // `PbfWriter` unflushed, which this crate's unit-test builds assert
     // against (see the writer's `Drop`).
@@ -569,20 +566,39 @@ mod tests {
         bytes[payload..end].fill(0xff);
         std::fs::write(&b, &bytes).expect("corrupt B");
 
-        let sources = blob_merge::open_sources(merge.inputs.clone()).expect("open inputs");
-        let err = match blob_merge::read_block(&sources[entry.source], entry, &mut Vec::new()) {
-            Ok(_) => panic!("a corrupt blob must fail pass 2"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err.kind(), crate::ErrorKind::WireFormat { .. }),
-            "expected the Blob decode failure, got {err:?}"
-        );
-        assert_eq!(err.source_path(), Some(b.as_path()));
-        assert_eq!(
-            err.byte_offset(),
-            Some(crate::ByteOffset(entry.file_offset))
-        );
+        for direct in pass2_transports(dir.path()) {
+            let sources =
+                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, false)
+                    .expect("open inputs");
+            assert_eq!(sources.direct(), direct);
+            let mut buf = blob_merge::FrameBuf::default();
+            let err = match blob_merge::read_block(&sources[entry.source], entry, &mut buf) {
+                Ok(_) => panic!("a corrupt blob must fail pass 2"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.kind(), crate::ErrorKind::WireFormat { .. }),
+                "direct {direct}: expected the Blob decode failure, got {err:?}"
+            );
+            assert_eq!(err.source_path(), Some(b.as_path()));
+            assert_eq!(
+                err.byte_offset(),
+                Some(crate::ByteOffset(entry.file_offset))
+            );
+        }
+    }
+
+    /// The pass-2 transports this host can run: buffered, plus direct where
+    /// the build and the scratch filesystem allow it.
+    fn pass2_transports(dir: &std::path::Path) -> Vec<bool> {
+        #[cfg_attr(not(feature = "linux-direct-io"), allow(unused_mut))]
+        let mut transports = vec![false];
+        #[cfg(feature = "linux-direct-io")]
+        if crate::test_support::direct_reads_supported(dir, "the direct pass-2 read") {
+            transports.push(true);
+        }
+        let _ = dir;
+        transports
     }
 
     /// A passthrough frame that is gone when pass 2 re-reads it (the input
@@ -603,19 +619,31 @@ mod tests {
             .expect("truncate B at the relation frame");
         drop(file);
 
-        let sources = blob_merge::open_sources(merge.inputs.clone()).expect("open inputs");
-        let err = match blob_merge::read_frame(&sources[entry.source], entry, &mut Vec::new()) {
-            Ok(()) => panic!("a missing frame must fail pass 2"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err.kind(), crate::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
-            "expected the frame read to hit end of file, got {err:?}"
-        );
-        assert_eq!(err.source_path(), Some(b.as_path()));
-        assert_eq!(
-            err.byte_offset(),
-            Some(crate::ByteOffset(entry.file_offset))
-        );
+        for direct in pass2_transports(dir.path()) {
+            let sources =
+                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, false)
+                    .expect("open inputs");
+            assert_eq!(sources.direct(), direct);
+            // This plan copies a frame through, so an output that splices
+            // keeps the buffered descriptor the copy needs.
+            let splicing =
+                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, true)
+                    .expect("open inputs");
+            assert!(!splicing.direct(), "a direct source would meet a splice");
+            let mut buf = blob_merge::FrameBuf::default();
+            let err = match buf.read(&sources[entry.source], entry) {
+                Ok(_) => panic!("a missing frame must fail pass 2"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.kind(), crate::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+                "direct {direct}: expected the frame read to hit end of file, got {err:?}"
+            );
+            assert_eq!(err.source_path(), Some(b.as_path()));
+            assert_eq!(
+                err.byte_offset(),
+                Some(crate::ByteOffset(entry.file_offset))
+            );
+        }
     }
 }

@@ -563,6 +563,15 @@ impl Plan {
     pub(crate) fn blobs_total(&self) -> u64 {
         self.frames.len() as u64 + self.omitted
     }
+
+    /// Whether some entry is copied through unchanged, the one kind of
+    /// entry pass 2 splices when the output can (see `passthrough_until`).
+    pub(crate) fn has_copyable_passthrough(&self) -> bool {
+        self.entries
+            .iter()
+            .zip(&self.rewrite)
+            .any(|(entry, &rewrite)| !rewrite && self.frames[entry.frame].reindex.is_none())
+    }
 }
 
 /// Order the entries by (kind, first key), find the overlap runs and fold
@@ -773,19 +782,133 @@ fn overlap_components(entries: &[BlobEntry]) -> Vec<(usize, usize)> {
 /// `cat --dedupe` asks the host for. The walk's descriptions are closed by
 /// now; these are fresh ones.
 ///
-/// They are buffered whatever `--direct-io` says: pass 2 has never honoured
-/// the flag. The splicing backends (`--io-uring` among them, which
-/// `--direct-io` does not turn off) copy from these descriptors at unaligned
-/// frame offsets, so there a direct pass 2 needs a second descriptor per
-/// input beside the one the copy uses, which changes what the run asks the
-/// host for; only on a backend that cannot splice could one direct
-/// descriptor serve.
-pub(crate) fn open_sources(inputs: Vec<PinnedInput>) -> Result<Vec<InputFile>> {
-    let mut sources = Vec::with_capacity(inputs.len());
+/// `direct_reads` (`--direct-io`) opens them `O_DIRECT` unless pass 2 will
+/// splice: `splice` is whether the output can (`supports_copy_range`), and
+/// it will exactly when some entry is a copied passthrough
+/// ([`Plan::has_copyable_passthrough`]). A splice copies from the source
+/// descriptor at unaligned frame offsets, which an `O_DIRECT` descriptor
+/// cannot serve, and a second descriptor per argument beside it would change
+/// what the run asks the host for. So a direct run that splices (an
+/// `--io-uring` output with frames to copy through, or a library caller
+/// pairing direct reads with a splicing backend) reads pass 2 buffered;
+/// every other direct run reads it direct, one descriptor per argument
+/// either way. The choice and the copy permission are made here together,
+/// so a direct source never reaches the copy path.
+pub(crate) fn open_sources(
+    inputs: Vec<PinnedInput>,
+    plan: &Plan,
+    direct_reads: bool,
+    splice: bool,
+) -> Result<Sources> {
+    let copies = splice && plan.has_copyable_passthrough();
+    let direct = direct_reads && !copies && cfg!(feature = "linux-direct-io");
+    let mut files = Vec::with_capacity(inputs.len());
     for pin in inputs {
-        sources.push(InputFile::open(&pin)?);
+        files.push(Source::open(&pin, direct)?);
     }
-    Ok(sources)
+    Ok(Sources {
+        files,
+        use_copy_range: splice && !direct,
+    })
+}
+
+/// Pass 2's inputs, one per argument, and whether passthrough may splice
+/// from them.
+pub(crate) struct Sources {
+    files: Vec<Source>,
+    use_copy_range: bool,
+}
+
+impl Sources {
+    /// Whether pass 2 reads its inputs `O_DIRECT`.
+    #[cfg(test)]
+    pub(crate) fn direct(&self) -> bool {
+        self.files.iter().any(|f| f.align.is_some())
+    }
+}
+
+impl std::ops::Index<usize> for Sources {
+    type Output = Source;
+    fn index(&self, i: usize) -> &Source {
+        &self.files[i]
+    }
+}
+
+/// One pass-2 input: the open file, and its direct I/O alignment when it was
+/// opened `O_DIRECT`.
+pub(crate) struct Source {
+    input: InputFile,
+    #[cfg_attr(
+        not(feature = "linux-direct-io"),
+        allow(dead_code, reason = "always None without direct reads")
+    )]
+    align: Option<usize>,
+}
+
+impl Source {
+    fn open(pin: &PinnedInput, direct: bool) -> Result<Self> {
+        #[cfg(feature = "linux-direct-io")]
+        if direct {
+            let (file, align) = pin.open_direct()?;
+            return Ok(Self {
+                input: InputFile::from_parts(std::sync::Arc::new(file), pin.path().into()),
+                align: Some(align),
+            });
+        }
+        let _ = direct;
+        Ok(Self {
+            input: InputFile::open(pin)?,
+            align: None,
+        })
+    }
+
+    /// Locate a failure at byte `offset` of this input.
+    #[cold]
+    pub(crate) fn locate_at(&self, offset: u64, err: Error) -> Error {
+        self.input.locate_at(offset, err)
+    }
+}
+
+/// A frame read buffer, one per thread that reads frames: a plain buffer
+/// for buffered sources and an aligned scratch for direct ones (remade when
+/// a source's alignment differs from the one it was made for).
+#[derive(Default)]
+pub(crate) struct FrameBuf {
+    buf: Vec<u8>,
+    #[cfg(feature = "linux-direct-io")]
+    scratch: Option<crate::read::direct_reader::AlignedScratch>,
+}
+
+impl FrameBuf {
+    /// Re-read a complete frame from its input. A frame that no longer reads
+    /// (the input changed between the passes) fails located at the input and
+    /// the frame's offset.
+    pub(crate) fn read(&mut self, source: &Source, frame: &Frame) -> Result<&[u8]> {
+        #[allow(clippy::cast_possible_truncation)]
+        let len = frame.frame_len as usize;
+        #[cfg(feature = "linux-direct-io")]
+        if let Some(align) = source.align {
+            use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
+            use std::os::unix::fs::FileExt as _;
+            let scratch = match &mut self.scratch {
+                Some(s) if s.align() == align => s,
+                slot => slot.insert(AlignedScratch::new(align)),
+            };
+            let file = source.input.file();
+            return read_aligned_in(len, frame.file_offset, align, scratch, |dst, at| {
+                file.read_at(dst, at)
+            })
+            .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)));
+        }
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        source
+            .input
+            .file()
+            .read_exact_at(&mut self.buf, frame.file_offset)
+            .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))?;
+        Ok(&self.buf)
+    }
 }
 
 /// What pass 2 did.
@@ -818,8 +941,8 @@ struct RunCounts {
 /// Pass 2: write the plan in order to `writer`.
 ///
 /// `dedupe` drops, inside overlap runs, an element whose (id, version)
-/// equals the one just emitted. `use_copy_range` is whether the output can
-/// splice (`OutputBackend::supports_copy_range`).
+/// equals the one just emitted. Passthrough splices when `sources` allows
+/// it (see [`open_sources`]).
 ///
 /// With no overlap runs (an already-sorted input: production `sort`) this is
 /// one serial loop and no thread starts. Otherwise each run is one task of a
@@ -849,10 +972,9 @@ struct RunCounts {
 #[hotpath::measure]
 pub(crate) fn write_plan(
     plan: &Plan,
-    sources: &[InputFile],
+    sources: &Sources,
     writer: &mut PbfWriter<FileWriter>,
     dedupe: bool,
-    use_copy_range: bool,
     compression: crate::writer::Compression,
     host: &crate::host::Entered<'_>,
 ) -> Result<WriteCounts> {
@@ -863,7 +985,7 @@ pub(crate) fn write_plan(
         plan,
         sources,
         writer,
-        use_copy_range,
+        use_copy_range: sources.use_copy_range,
         // Counted per frame by the plan: a blob holding several kinds is
         // rewritten in several runs but is one blob.
         counts: WriteCounts {
@@ -871,7 +993,7 @@ pub(crate) fn write_plan(
             ..WriteCounts::default()
         },
         copy: CopyRun::default(),
-        frame_buf: Vec::new(),
+        frame_buf: FrameBuf::default(),
         cursor: 0,
     };
     if !plan.runs.is_empty() {
@@ -898,8 +1020,8 @@ pub(crate) fn write_plan(
                 depth: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
                 cancel: &host.invocation,
             },
-            |_| Vec::new(),
-            |frame_buf: &mut Vec<u8>, k, emitter| {
+            |_| FrameBuf::default(),
+            |frame_buf: &mut FrameBuf, k, emitter| {
                 let run = &plan.runs[k];
                 sweep::Sweep {
                     entries: &plan.entries[run.start..run.end],
@@ -932,7 +1054,7 @@ pub(crate) fn write_plan(
 /// copy) in plan order, each overlap run's blocks at its position.
 struct PlanWriter<'a> {
     plan: &'a Plan,
-    sources: &'a [InputFile],
+    sources: &'a Sources,
     writer: &'a mut PbfWriter<FileWriter>,
     use_copy_range: bool,
     counts: WriteCounts,
@@ -941,7 +1063,7 @@ struct PlanWriter<'a> {
     /// file, cutting the syscall count from O(blobs) to O(1). Mirrors the
     /// contiguous-range coalescer in apply_changes.
     copy: CopyRun,
-    frame_buf: Vec<u8>,
+    frame_buf: FrameBuf,
     /// The next plan entry to write.
     cursor: usize,
 }
@@ -1023,7 +1145,7 @@ impl CopyRun {
         &mut self,
         frame: &Frame,
         writer: &mut PbfWriter<FileWriter>,
-        sources: &[InputFile],
+        sources: &Sources,
         counts: &mut WriteCounts,
     ) -> Result<()> {
         match &mut self.0 {
@@ -1047,11 +1169,11 @@ impl CopyRun {
     fn flush(
         &mut self,
         writer: &mut PbfWriter<FileWriter>,
-        sources: &[InputFile],
+        sources: &Sources,
         counts: &mut WriteCounts,
     ) -> Result<()> {
         if let Some((source, start, end)) = self.0.take() {
-            writer.write_raw_copy(&sources[source], start, end - start)?;
+            writer.write_raw_copy(&sources[source].input, start, end - start)?;
             counts.copy_range_calls += 1;
         }
         Ok(())
@@ -1066,16 +1188,16 @@ impl CopyRun {
 fn write_passthrough(
     frame: &Frame,
     reindex: Option<&Reindex>,
-    source: &InputFile,
+    source: &Source,
     writer: &mut PbfWriter<FileWriter>,
-    frame_buf: &mut Vec<u8>,
+    frame_buf: &mut FrameBuf,
 ) -> Result<()> {
-    read_frame(source, frame, frame_buf)?;
+    let frame_bytes = frame_buf.read(source, frame)?;
     match reindex {
-        None => writer.write_raw(frame_buf)?,
+        None => writer.write_raw(frame_bytes)?,
         Some(reindex) => {
             let mut header_buf = Vec::new();
-            let reframed = frame_parts(frame_buf)
+            let reframed = frame_parts(frame_bytes)
                 .and_then(|(header, blob)| {
                     crate::commands::cat::reindex::reframe_preserving(
                         header,
@@ -1106,29 +1228,14 @@ fn count_passthrough(entry: &BlobEntry, counts: &mut WriteCounts) {
     }
 }
 
-/// Re-read a complete frame from its input. A frame that no longer reads
-/// (the input changed between the passes) fails located at the input and
-/// the frame's offset.
-pub(crate) fn read_frame(source: &InputFile, frame: &Frame, buf: &mut Vec<u8>) -> Result<()> {
-    #[allow(clippy::cast_possible_truncation)]
-    let len = frame.frame_len as usize;
-    buf.clear();
-    buf.resize(len, 0);
-    source
-        .file()
-        .read_exact_at(buf, frame.file_offset)
-        .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))
-}
-
 /// Re-read and decode an overlap-run entry's frame, a read or decode
 /// failure located at its input and frame offset.
 pub(crate) fn read_block(
-    source: &InputFile,
+    source: &Source,
     frame: &Frame,
-    buf: &mut Vec<u8>,
+    buf: &mut FrameBuf,
 ) -> Result<crate::PrimitiveBlock> {
-    read_frame(source, frame, buf)?;
-    frame_parts(buf)
+    frame_parts(buf.read(source, frame)?)
         .and_then(|(_, blob)| decode_blob_to_primitiveblock(blob))
         .map_err(|e| source.locate_at(frame.file_offset, e))
 }

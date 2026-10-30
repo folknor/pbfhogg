@@ -1215,7 +1215,7 @@ impl ElementReader<FileReader> {
 
     /// An element reader over `blob_iter`, opened under `host`: reads the
     /// header blob.
-    fn with_blobs(
+    pub(crate) fn with_blobs(
         mut blob_iter: BlobReader<FileReader>,
         host: &crate::host::Entered<'_>,
     ) -> Result<Self> {
@@ -1255,16 +1255,16 @@ impl ElementReader<FileReader> {
 /// Consumes the first blob from the reader. Returns an error if there are no blobs
 /// or the first blob is not an `OsmHeader`.
 fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<HeaderBlock> {
-    match blob_iter.next() {
-        Some(Ok(blob)) => match blob
-            .decode()
-            .map_err(|e| blob.locate_error(blob_iter.source(), e))?
-        {
-            BlobDecode::OsmHeader(header) => Ok(*header),
-            _ => Err(new_missing_header_in(blob_iter.source())),
-        },
-        Some(Err(e)) => Err(e),
-        None => Err(new_missing_header_in(blob_iter.source())),
+    // `leading_header` judges the first frame's type before parsing its
+    // body, so a file opening with a data blob is header-less even when
+    // that blob is corrupt.
+    let blob = blob_iter.leading_header()?;
+    match blob
+        .decode()
+        .map_err(|e| blob.locate_error(blob_iter.source(), e))?
+    {
+        BlobDecode::OsmHeader(header) => Ok(*header),
+        _ => Err(new_missing_header_in(blob_iter.source())),
     }
 }
 

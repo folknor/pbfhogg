@@ -893,3 +893,173 @@ fn show_element_quotes_and_escapes_text() {
         "unexpected output: {rel:?}"
     );
 }
+
+/// One raw frame: length prefix, a `BlobHeader` naming `blob_type` and
+/// declaring the body's size, then `body` verbatim.
+fn raw_frame(blob_type: &str, body: &[u8]) -> Vec<u8> {
+    assert!(
+        blob_type.len() < 128 && body.len() < 128,
+        "single-byte varints only"
+    );
+    let mut header = vec![0x0a, u8::try_from(blob_type.len()).expect("len")];
+    header.extend_from_slice(blob_type.as_bytes());
+    header.extend_from_slice(&[0x18, u8::try_from(body.len()).expect("len")]);
+    let mut frame = u32::try_from(header.len())
+        .expect("len")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(body);
+    frame
+}
+
+fn full_decode_opts(extended: bool) -> pbfhogg::inspect::InspectOptions {
+    pbfhogg::inspect::InspectOptions {
+        show_blocks: true,
+        show_id_ranges: true,
+        show_locations: false,
+        extended,
+        distrust_metadata: true,
+        direct_io: false,
+    }
+}
+
+/// The length of a PBF's first frame, read from its `BlobHeader`'s
+/// datasize field.
+fn first_frame_len(bytes: &[u8]) -> usize {
+    let header_len = u32::from_be_bytes(bytes[..4].try_into().expect("prefix")) as usize;
+    let header = &bytes[4..4 + header_len];
+    let mut pos = 0;
+    let mut datasize = None;
+    while pos < header.len() {
+        let tag = header[pos];
+        pos += 1;
+        let mut value = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = header[pos];
+            pos += 1;
+            value |= usize::from(b & 0x7f) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        match tag & 7 {
+            0 if tag >> 3 == 3 => datasize = Some(value),
+            0 => {}
+            2 => pos += value,
+            other => panic!("unexpected wire type {other}"),
+        }
+    }
+    4 + header_len + datasize.expect("datasize")
+}
+
+/// The full-decode scan describes the file as it is: an unknown frame is
+/// skipped opaque, so a body that is not a `Blob` message does not fail it.
+#[test]
+fn full_decode_skips_an_unknown_frame_without_parsing_its_body() {
+    let dir = crate::common::test_scratch();
+    let clean = dir.path().join("clean.osm.pbf");
+    write_simple_pbf(&clean);
+    let bytes = std::fs::read(&clean).expect("read");
+    let split = first_frame_len(&bytes);
+    let mut spliced = bytes[..split].to_vec();
+    spliced.extend(raw_frame("x-vendor", &[0xff, 0xff, 0xff, 0xff]));
+    spliced.extend_from_slice(&bytes[split..]);
+    let input = dir.path().join("spliced.osm.pbf");
+    std::fs::write(&input, spliced).expect("write");
+
+    for extended in [false, true] {
+        let json = pbfhogg::inspect::inspect(
+            &input,
+            &full_decode_opts(extended),
+            &crate::common::test_host(),
+        )
+        .expect("inspect")
+        .to_json(None);
+        assert_eq!(json["elements"]["nodes"], 3, "extended {extended}");
+        assert_eq!(json["elements"]["ways"], 2);
+        assert_eq!(json["elements"]["relations"], 1);
+    }
+}
+
+/// A file opening with a data frame is header-less, whatever that frame's
+/// body holds: the type is judged before the body is parsed or decoded.
+#[test]
+fn full_decode_refuses_a_corrupt_leading_data_frame_as_header_less() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("headless.osm.pbf");
+    std::fs::write(&input, raw_frame("OSMData", &[0xff, 0xff, 0xff])).expect("write");
+    for extended in [false, true] {
+        let Err(err) = pbfhogg::inspect::inspect(
+            &input,
+            &full_decode_opts(extended),
+            &crate::common::test_host(),
+        ) else {
+            panic!("extended {extended}: a header-less file was described");
+        };
+        assert!(
+            matches!(err.kind(), pbfhogg::ErrorKind::MissingHeader),
+            "extended {extended}: {err}"
+        );
+    }
+}
+
+/// Node blocks with the given IDs, one block per slice.
+fn write_node_id_blocks(path: &std::path::Path, blocks: &[&[i64]]) {
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    let mut writer = PbfWriter::to_path(
+        path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("create writer");
+    let mut bb = BlockBuilder::new();
+    for ids in blocks {
+        for &id in *ids {
+            bb.add_node(id, 1_000, 2_000, std::iter::empty::<(&str, &str)>(), None);
+        }
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
+}
+
+/// Blobs summarized apart and folded in order give the serial answer: ID
+/// order is judged across blob boundaries (a repeated ID at a boundary
+/// breaks it), and blocks are numbered in file order.
+#[test]
+fn full_decode_judges_id_order_across_blob_boundaries() {
+    let dir = crate::common::test_scratch();
+    let cases: [(&[&[i64]], bool); 4] = [
+        (&[&[1, 2], &[3, 4], &[5]], true),
+        (&[&[1, 2], &[2, 3]], false),
+        (&[&[1, 5], &[3, 9]], false),
+        (&[&[2, 1], &[3]], false),
+    ];
+    for (i, (blocks, ordered)) in cases.iter().enumerate() {
+        let input = dir.path().join(format!("case{i}.osm.pbf"));
+        write_node_id_blocks(&input, blocks);
+        let json =
+            pbfhogg::inspect::inspect(&input, &full_decode_opts(true), &crate::common::test_host())
+                .expect("inspect")
+                .to_json(Some(0));
+        let count: usize = blocks.iter().map(|b| b.len()).sum();
+        assert_eq!(json["elements"]["nodes"], count, "case {i}");
+        assert_eq!(
+            json["data"]["objects_ordered"], *ordered,
+            "case {i}: {json}"
+        );
+        let detail = json["blocks_detail"].as_array().expect("detail");
+        assert_eq!(detail.len(), blocks.len(), "case {i}");
+        for (n, block) in detail.iter().enumerate() {
+            assert_eq!(block["number"], n + 1, "case {i}");
+            assert_eq!(block["elements"], blocks[n].len(), "case {i}");
+        }
+    }
+}

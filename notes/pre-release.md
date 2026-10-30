@@ -79,7 +79,7 @@ does not affect RSS.
 | `check --ids` | 646 MB | 504 MB | 31s | 57s | `4edab6b2` |
 | `inspect --nodes -j 16` | 425 MB | 410 MB | 31s | 56.8s | `b1fc3106` |
 | `getid --invert` | 58 MB | 102 MB | 56s | 1m31s | `7ee6c776` |
-| `inspect --extended` | 26 MB | 34 MB | **13m22s** | 13m41s | `9b49e8fb` |
+| `inspect --extended` ⁵ | 571 MB | 34 MB | 41s | 13m41s | unstored |
 | `getid` | ~13 MB ¹ | 27 MB | short ¹ | 6.1s | `67d66e4e` |
 | `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
 | `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
@@ -98,6 +98,9 @@ with `-o`); every other row ran on the morning's brokkr build.
 ⁴ Re-measured after the borrowed-cursor sweep landed (a `--force` cell on
 the parent `42ea567f` plus the change, so not stored); the RSS-pass cell
 was `d271f04f`, 7.57 GB and 53m43s.
+⁵ Re-measured after the full-decode scan moved onto the decode pipeline (a
+`--force` cell on `13ec0927` plus the change, so not stored); the RSS-pass
+cell was `9b49e8fb`, 26 MB and 13m22s.
 
 ### What moved
 
@@ -120,11 +123,13 @@ was `d271f04f`, 7.57 GB and 53m43s.
 - **RSS down:** `build-geocode-index` (the README's ~25 GB was probably total
   RSS; bygg's total including file-backed mmaps is 18.8 GB), `multi-extract
   --smart`, `extract --smart`, external altw, `sort` and `cat`.
-- **Runtime lead: `inspect --extended`.** A single-threaded decode that should
-  gain most from bygg's faster cores, it ran 13m22s against the README's
-  13m41s while every other row ran 10-60 % faster. Points at a slowdown in
-  the sequential decode path. Every other wall is uninformative about the
-  2-7 % band, because bygg is the faster host.
+- **`inspect --extended`: resolved.** The serial full-decode scan now runs
+  on the ordered decode pipeline, summarizing each blob on a worker: 41.4 s
+  and 571 MB peak anon on bygg, against the row's 13m22s and 26 MB (see
+  reference/performance.md, "inspect full-decode scan on the decode
+  pipeline"). The memory rise is the open trade: it is the pool-heavy
+  worker term notes/pool-rss-growth.md describes. Every other wall is
+  uninformative about the 2-7 % band, because bygg is the faster host.
 
 ### Handoff, 2026-10-30
 

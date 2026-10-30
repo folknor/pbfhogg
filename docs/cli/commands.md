@@ -683,7 +683,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked (to verify every blob's indexdata against its payload, use `check --index`). A header-only file (no data blobs) is indexed; a file without a leading OSMHeader is an error (exit 2), not a "no" |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
-| `-j, --jobs <N>` | Worker threads for `--nodes` (see [Worker threads](#worker-threads)). **Requires `--nodes`**: no other inspect mode has a worker pool, so passing it elsewhere is an error rather than a no-op. |
+| `-j, --jobs <N>` | Worker threads for `--nodes` (see [Worker threads](#worker-threads)). **Requires `--nodes`**: passing it elsewhere is an error rather than a no-op. The full-decode modes (`--extended`, `--locations`, `--distrust-metadata`, a report on an unindexed file) decode on the read pipeline's own pool, sized from the machine, which `-j` does not set. |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |

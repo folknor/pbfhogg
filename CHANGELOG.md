@@ -137,6 +137,13 @@ never left partial, and the library no longer touches process state.
   of buffering it. Overlapping blobs are merged without copying elements:
   planet merged with itself takes 5m10s and 1.46 GB peak anon on a 16-core
   host, against 53m43s and 7.57 GB before.
+- `inspect`'s full-decode modes (`--extended`, `--locations`,
+  `--distrust-metadata`, and any report on an unindexed file) decode on every
+  core: planet `--extended` takes 41 s against 13m22s on a 16-core host, at
+  about 570 MB peak anon instead of 26 MB. Unknown blobs are skipped without
+  parsing their body.
+- A file whose first blob is not an OSMHeader is refused as header-less
+  before that blob is decoded.
 - In `sort` and `cat --dedupe` overlaps, the earliest input's copy of a
   duplicate survives, and a blob claimed sorted that descends internally is
   refused instead of reordered.

@@ -1241,6 +1241,26 @@ large-scale wall is unmeasured. Full arc and the reverted sibling
 experiments (batched pipeline, byte knobs) in
 `reference/performance-history.md` "Env-gated read-path batch".
 
+### inspect full-decode scan on the decode pipeline (bygg, 2026-10-30)
+
+`inspect --extended` (and every other full-decode inspect mode) used to
+decode, validate and fold every element on the calling thread. It now runs
+on the ordered read pipeline: each data blob is summarized on a decode
+worker into a per-blob scan state, folded in file order on the consumer.
+Planet (`planet-20260223-with-indexdata`), `--bench 1`:
+
+| cell | commit | wall | peak anon | avg cores |
+|---|---|---:|---:|---:|
+| baseline `9b49e8fb` | `627883d7` | 13m22s | 26 MB | 1.0 |
+| parallel scan (unstored `--force` cell) | landing commit, tree at `13ec0927` + change | **41.4 s** | 571 MB | 29.3 |
+
+The run is worker bound: the dispatcher spends 96 % of wall waiting for
+an admission permit (`pipeline_decode_admit`), the decoded-channel send
+wait is 0.5 %. The memory is the 30 workers' transient decode storage
+(decompress buffers, offset tables, allocator retention), not retained
+summaries: the permit window holds summaries, which are small (tens of KB at
+most, under `--locations`).
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

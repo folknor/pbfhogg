@@ -9,9 +9,7 @@ use super::types::{
     update_extended_for_element,
 };
 use crate::ElementKind;
-use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
-use crate::file_reader::FileReader;
-use crate::read::frame::Frames;
+use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::read::header_walker::HeaderWalker;
 use crate::read::input::{InputSource, PinnedInput};
 
@@ -347,7 +345,7 @@ pub(super) fn extract_header_metadata(header: &crate::HeaderBlock) -> HeaderMeta
 }
 
 // ---------------------------------------------------------------------------
-// Full decode scan (original path)
+// Full decode scan: parallel per-blob summaries, folded in file order
 // ---------------------------------------------------------------------------
 
 fn full_decode_scan(
@@ -362,68 +360,64 @@ fn full_decode_scan(
     let path = input.path();
     let file_name = file_name_of(path);
 
-    let reader = FileReader::open_in(input, direct_io, &host.invocation)?;
+    // One open, one sequential read (a FIFO works). A description: exempt
+    // from the partial-index refusal (it counts the indexed blobs instead),
+    // and unknown frames are skipped without parsing their body. The leading
+    // header is required, judged by frame type before any body is parsed;
+    // a later header is refused by the frame walk.
+    let blobs = crate::blob::BlobReader::open_in(input, direct_io, host)?
+        .accepting_partial_index()
+        .skipping_unknown_frames();
+    let reader = crate::ElementReader::with_blobs(blobs, host)?;
     // The size of the file this reader opened, not of whatever the path
     // names by now: a stat of the path is a second resolution of it.
     let file_size = reader
-        .metadata()
+        .file_metadata()
         .map_err(|e| crate::Error::from(e).context(format!("failed to stat {}", path.display())))?
         .len();
-    let mut frames = Frames::of_input(reader, path, host);
-    // A description, exempt from the partial-index refusal (it counts the
-    // indexed blobs instead).
-    frames.accept_partial_index();
-    let mut saw_header = false;
-    let mut decompress_buf = Vec::new();
-    let mut header_meta = HeaderMeta::default();
+    let header_meta = extract_header_metadata(reader.header());
 
-    // Indexdata tracking
     let mut indexed_blobs = 0u64;
     let mut total_data_blobs = 0u64;
-
     let mut accum = BlockAccum::new(show_blocks);
-    let mut block_number = 0u64;
     let mut state = ScanState::new(show_id_ranges, show_locations, extended);
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = frames.next_raw()? {
-        // This scan is the file's only reader: it refuses a file that does
-        // not open with an OsmHeader itself.
-        if !saw_header && frame.blob_type != BlobKind::OsmHeader {
-            return Err(crate::error::new_missing_header(path));
+    // Every data blob is decoded and summarized on the decode workers; the
+    // summaries are folded here in file order, which is all the order-bound
+    // parts of the report (ID monotonicity, block numbers, the ordering
+    // summary, the block list) need.
+    let transform = SummarizeBlob {
+        show_id_ranges,
+        show_locations,
+        extended,
+    };
+    reader.for_each_fused_blob(transform, |summary: BlobSummary| {
+        total_data_blobs += 1;
+        indexed_blobs += u64::from(summary.indexed);
+        let block_number = total_data_blobs;
+        state.append(summary.state);
+
+        let stats = match summary.kind {
+            BlockKind::Nodes => &mut accum.node_type,
+            BlockKind::Ways => &mut accum.way_type,
+            BlockKind::Relations => &mut accum.relation_type,
+            BlockKind::Mixed => &mut accum.mixed_type,
+        };
+        stats.block_count += 1;
+        stats.frame_bytes += summary.frame_size as u64;
+        stats.element_count += summary.elements;
+        accum.ordering.observe(summary.kind, block_number);
+        if let Some(ref mut infos) = accum.block_infos {
+            infos.push(BlockInfo {
+                number: block_number,
+                kind: summary.kind,
+                elements: summary.elements,
+                compressed: summary.compressed_size,
+                raw: Some(summary.raw_size),
+            });
         }
-        match frame.blob_type {
-            BlobKind::OsmHeader => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())
-                    .map_err(|e| frames.locate(frame.id, e))?;
-                header_meta = extract_header_metadata(&header);
-                saw_header = true;
-            }
-            BlobKind::OsmData => {
-                total_data_blobs += 1;
-                if frame.index.is_some() {
-                    indexed_blobs += 1;
-                }
-                block_number += 1;
-                scan_data_blob(
-                    &frame,
-                    &mut decompress_buf,
-                    &mut st_scratch,
-                    &mut gr_scratch,
-                    &mut state,
-                    block_number,
-                    &mut accum,
-                )
-                .map_err(|e| frames.locate(frame.id, e))?;
-            }
-            BlobKind::Unknown(_) => {}
-        }
-    }
-    // A zero-byte file yields no frame.
-    if !saw_header {
-        return Err(crate::error::new_missing_header(path));
-    }
+        Ok(())
+    })?;
 
     let is_indexed = total_data_blobs > 0 && indexed_blobs == total_data_blobs;
 
@@ -456,32 +450,61 @@ fn full_decode_scan(
     })
 }
 
-/// Decompress, parse, and scan one OsmData blob. Updates all accumulators.
-fn scan_data_blob(
-    frame: &crate::read::frame::RawBlobFrame,
-    decompress_buf: &mut Vec<u8>,
-    st_scratch: &mut Vec<(u32, u32)>,
-    gr_scratch: &mut Vec<(u32, u32)>,
-    state: &mut ScanState,
-    block_number: u64,
-    accum: &mut BlockAccum,
-) -> Result<()> {
-    let frame_size = frame.frame_bytes.len();
-    let compressed_size = frame.blob_bytes().len();
+/// One data blob, scanned on its own on a decode worker: what the ordered
+/// fold in [`full_decode_scan`] needs from it.
+struct BlobSummary {
+    /// The blob's own scan state (a fresh `ScanState`), appended in order.
+    state: ScanState,
+    kind: BlockKind,
+    elements: u64,
+    frame_size: usize,
+    compressed_size: usize,
+    raw_size: usize,
+    /// The blob header carried readable indexdata.
+    indexed: bool,
+}
 
-    decompress_blob_data_into(frame.blob_bytes(), decompress_buf)?;
-    let raw_size = decompress_buf.len();
-    // Move the decompressed Vec straight into the block. The old
-    // `new_with_scratch(Bytes::copy_from_slice(..))` route copied the buffer
-    // twice - once into `Bytes`, then again inside `new_with_scratch`'s
-    // `to_vec()`. `from_vec_with_scratch` takes the Vec by value with zero
-    // copies; `decompress_buf` is left empty and reallocated on the next blob.
-    let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-        std::mem::take(decompress_buf),
-        st_scratch,
-        gr_scratch,
-    )?;
+/// The decode-worker side of the full-decode scan: summarizes each data
+/// blob, skips every other blob.
+struct SummarizeBlob {
+    show_id_ranges: bool,
+    show_locations: bool,
+    extended: bool,
+}
 
+impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
+    type Out = BlobSummary;
+    const PARSE_INDEXDATA: bool = true;
+
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<BlobSummary>>
+    where
+        D: FnOnce() -> Result<crate::block::PrimitiveBlock>,
+    {
+        if blob.get_type() != crate::blob::BlobType::OsmData {
+            // Unknown frames never get here (the reader skips them) and a
+            // later header is refused by the frame walk.
+            return None;
+        }
+        let indexed = blob.index().is_some();
+        Some(decode().map(|block| {
+            let mut state = ScanState::new(self.show_id_ranges, self.show_locations, self.extended);
+            let (kind, elements) = scan_block(&block, &mut state);
+            BlobSummary {
+                state,
+                kind,
+                elements,
+                frame_size: blob.frame_len(),
+                compressed_size: blob.body_len(),
+                raw_size: block.decompressed_size(),
+                indexed,
+            }
+        }))
+    }
+}
+
+/// Feed every element of `block` through `state`; returns the block's kind
+/// and element count.
+fn scan_block(block: &crate::block::PrimitiveBlock, state: &mut ScanState) -> (BlockKind, u64) {
     let mut has_nodes = false;
     let mut has_ways = false;
     let mut has_relations = false;
@@ -509,31 +532,8 @@ fn scan_data_blob(
         }
     }
 
-    let kind = classify_block(has_nodes, has_ways, has_relations);
-
-    // Update per-type stats
-    let stats = match kind {
-        BlockKind::Nodes => &mut accum.node_type,
-        BlockKind::Ways => &mut accum.way_type,
-        BlockKind::Relations => &mut accum.relation_type,
-        BlockKind::Mixed => &mut accum.mixed_type,
-    };
-    stats.block_count += 1;
-    stats.frame_bytes += frame_size as u64;
-    stats.element_count += block_elements;
-
-    accum.ordering.observe(kind, block_number);
-
-    // Per-block detail
-    if let Some(ref mut infos) = accum.block_infos {
-        infos.push(BlockInfo {
-            number: block_number,
-            kind,
-            elements: block_elements,
-            compressed: compressed_size,
-            raw: Some(raw_size),
-        });
-    }
-
-    Ok(())
+    (
+        classify_block(has_nodes, has_ways, has_relations),
+        block_elements,
+    )
 }

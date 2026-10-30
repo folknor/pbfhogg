@@ -192,6 +192,9 @@ pub(super) struct TypeIdRange {
     pub(super) min_id: i64,
     pub(super) max_id: i64,
     pub(super) monotonic: bool,
+    /// The first ID seen (meaningful once `count > 0`).
+    first_id: i64,
+    /// The last ID seen.
     prev_id: i64,
     pub(super) count: u64,
 }
@@ -202,6 +205,7 @@ impl TypeIdRange {
             min_id: i64::MAX,
             max_id: i64::MIN,
             monotonic: true,
+            first_id: i64::MIN,
             prev_id: i64::MIN,
             count: 0,
         }
@@ -216,6 +220,9 @@ impl TypeIdRange {
         }
         if self.count > 0 && id <= self.prev_id {
             self.monotonic = false;
+        }
+        if self.count == 0 {
+            self.first_id = id;
         }
         self.prev_id = id;
         self.count += 1;
@@ -234,12 +241,34 @@ impl TypeIdRange {
         if self.count > 0 && blob_min <= self.prev_id {
             self.monotonic = false;
         }
+        if self.count == 0 {
+            self.first_id = blob_min;
+        }
         self.prev_id = blob_max;
         self.count += blob_count;
     }
 
     pub(super) fn has_data(&self) -> bool {
         self.count > 0
+    }
+
+    /// Append `part`, the range of the IDs that follow every ID seen so far
+    /// (the next data blob's, in file order). Exactly what feeding `part`'s
+    /// IDs one by one through [`Self::update`] gives: an empty `part` leaves
+    /// the boundary where it was, and a `part` whose first ID does not
+    /// exceed the last ID so far breaks monotonicity.
+    fn append(&mut self, part: &TypeIdRange) {
+        if part.count == 0 {
+            return;
+        }
+        if self.count > 0 && part.first_id <= self.prev_id {
+            self.monotonic = false;
+        }
+        self.monotonic &= part.monotonic;
+        self.min_id = self.min_id.min(part.min_id);
+        self.max_id = self.max_id.max(part.max_id);
+        self.prev_id = part.prev_id;
+        self.count += part.count;
     }
 }
 
@@ -335,6 +364,25 @@ impl ExtendedStats {
     pub(super) fn has_timestamps(&self) -> bool {
         self.min_timestamp != i64::MAX
     }
+
+    /// Fold in a later blob's stats. `objects_ordered` is decided after the
+    /// scan, so it is not merged.
+    fn append(&mut self, part: &ExtendedStats) {
+        self.min_timestamp = self.min_timestamp.min(part.min_timestamp);
+        self.max_timestamp = self.max_timestamp.max(part.max_timestamp);
+        let (bb, pb) = (&mut self.data_bbox, &part.data_bbox);
+        bb.min_lat = bb.min_lat.min(pb.min_lat);
+        bb.max_lat = bb.max_lat.max(pb.max_lat);
+        bb.min_lon = bb.min_lon.min(pb.min_lon);
+        bb.max_lon = bb.max_lon.max(pb.max_lon);
+        let (m, pm) = (&mut self.metadata, &part.metadata);
+        m.total += pm.total;
+        m.has_version += pm.has_version;
+        m.has_timestamp += pm.has_timestamp;
+        m.has_changeset += pm.has_changeset;
+        m.has_uid += pm.has_uid;
+        m.has_user += pm.has_user;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +440,33 @@ impl ScanState {
             } else {
                 None
             },
+        }
+    }
+
+    /// Append `part`, the state of one later data blob scanned on its own
+    /// (a fresh `ScanState` with the same collectors), so the result is what
+    /// one serial scan over both would have given. Called in file order.
+    pub(super) fn append(&mut self, part: ScanState) {
+        self.node_count += part.node_count;
+        self.tagged_node_count += part.tagged_node_count;
+        self.way_count += part.way_count;
+        self.relation_count += part.relation_count;
+        for (acc, p) in [
+            (&mut self.node_ids, &part.node_ids),
+            (&mut self.way_ids, &part.way_ids),
+            (&mut self.relation_ids, &part.relation_ids),
+        ] {
+            if let (Some(acc), Some(p)) = (acc, p) {
+                acc.append(p);
+            }
+        }
+        if let (Some(acc), Some(p)) = (&mut self.loc_stats, part.loc_stats) {
+            acc.with_locations += p.with_locations;
+            acc.without_locations += p.without_locations;
+            acc.coord_counts.extend_from_slice(&p.coord_counts);
+        }
+        if let (Some(acc), Some(p)) = (&mut self.extended, &part.extended) {
+            acc.append(p);
         }
     }
 
@@ -634,7 +709,46 @@ fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64>
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, OrderingSummary};
+    use super::{BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, OrderingSummary, TypeIdRange};
+
+    fn fields(r: &TypeIdRange) -> (i64, i64, bool, i64, u64) {
+        (r.min_id, r.max_id, r.monotonic, r.prev_id, r.count)
+    }
+
+    /// Appending per-blob ranges in order equals one serial pass over the
+    /// same IDs, for every split of each sequence into three blobs (empty
+    /// blobs included): repeated IDs across a boundary, a type absent from a
+    /// middle blob, and descents inside and between blobs.
+    #[test]
+    fn appended_ranges_match_one_serial_pass() {
+        let seqs: [&[i64]; 6] = [
+            &[1, 2, 3, 4, 5],
+            &[1, 2, 2, 3],
+            &[5, 4, 3],
+            &[1, 3, 2, 4],
+            &[-3, -1, 0, 7],
+            &[7],
+        ];
+        for ids in seqs {
+            let mut serial = TypeIdRange::new();
+            for &id in ids {
+                serial.update(id);
+            }
+            for a in 0..=ids.len() {
+                for b in a..=ids.len() {
+                    let mut acc = TypeIdRange::new();
+                    for part_ids in [&ids[..a], &ids[a..b], &ids[b..]] {
+                        let mut part = TypeIdRange::new();
+                        for &id in part_ids {
+                            part.update(id);
+                        }
+                        acc.append(&part);
+                    }
+                    assert_eq!(fields(&acc), fields(&serial), "{ids:?} split {a}/{b}");
+                }
+            }
+        }
+    }
 
     const KINDS: [BlockKind; 4] = [
         BlockKind::Nodes,

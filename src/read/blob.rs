@@ -84,6 +84,9 @@ pub struct Blob {
     /// reader could count (sequential from the stream start). Provenance for
     /// workers that decode the blob away from its reader.
     blob_index: Option<u64>,
+    /// Bytes the whole frame occupied in its stream: length prefix,
+    /// `BlobHeader` and body. 0 for a blob not read from a frame.
+    frame_len: usize,
 }
 
 impl Blob {
@@ -93,12 +96,31 @@ impl Blob {
             blob,
             offset,
             blob_index: None,
+            frame_len: 0,
         }
     }
 
     fn with_blob_index(mut self, blob_index: Option<u64>) -> Blob {
         self.blob_index = blob_index;
         self
+    }
+
+    fn with_frame_len(mut self, frame_len: usize) -> Blob {
+        self.frame_len = frame_len;
+        self
+    }
+
+    /// Bytes the blob's frame occupied in its stream (length prefix,
+    /// `BlobHeader` and body), for reports that size frames.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+
+    /// Length of the body (the `Blob` message) in bytes.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) fn body_len(&self) -> usize {
+        usize::try_from(self.header.datasize).unwrap_or(0)
     }
 
     /// Attach this blob's true provenance - its index and byte offset, as
@@ -413,6 +435,9 @@ pub struct BlobReader<R: Read + Send> {
     /// syscall.
     #[cfg(target_os = "linux")]
     evict_calls: u64,
+    /// Skip frames of unknown type without parsing their body
+    /// ([`Self::skipping_unknown_frames`]).
+    skip_unknown: bool,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -463,6 +488,7 @@ impl<R: Read + Send> BlobReader<R> {
             evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
+            skip_unknown: false,
         }
     }
 
@@ -543,11 +569,28 @@ impl<R: Read + Send> BlobReader<R> {
     /// blob.
     pub fn leading_header(&mut self) -> Result<Blob> {
         let _call = self.frames.cancel_token().call()?;
-        match self.next() {
-            Some(Ok(blob)) if matches!(blob.get_type(), BlobType::OsmHeader) => Ok(blob),
+        // The frame's type is judged before its body is parsed: a file that
+        // opens with anything else is header-less, whatever that body holds.
+        match self.next_frame() {
+            Some(Ok(frame)) if matches!(frame.header.blob_type, BlobKind::OsmHeader) => {
+                frame.into_blob(self.frames.path()).inspect_err(|_| {
+                    self.frames.poison();
+                })
+            }
             Some(Ok(_)) | None => Err(crate::error::new_missing_header_in(self.source())),
             Some(Err(e)) => Err(e),
         }
+    }
+
+    /// Skip frames of unknown type without parsing their body: iteration
+    /// never yields them, and a body that is not a `Blob` message cannot
+    /// fail the walk. Framing, ordinals and offsets still count them. For a
+    /// reader whose job is the file as it is (`inspect`); plain iteration
+    /// keeps yielding unknown blobs.
+    #[must_use]
+    pub(crate) fn skipping_unknown_frames(mut self) -> Self {
+        self.skip_unknown = true;
+        self
     }
 
     /// Enable or disable tagdata parsing (BlobHeader field 4).
@@ -750,6 +793,8 @@ pub(crate) struct RawFrame {
     header: WireBlobHeader,
     body: Bytes,
     id: FrameId,
+    /// Prefix + `BlobHeader` + body bytes.
+    frame_len: usize,
 }
 
 impl RawFrame {
@@ -759,7 +804,9 @@ impl RawFrame {
     pub(crate) fn into_blob(self, source: Option<&Arc<Path>>) -> Result<Blob> {
         let offset = self.id.start.map(ByteOffset);
         match WireBlob::parse(&self.body) {
-            Ok(blob) => Ok(Blob::new(self.header, blob, offset).with_blob_index(self.id.ordinal)),
+            Ok(blob) => Ok(Blob::new(self.header, blob, offset)
+                .with_blob_index(self.id.ordinal)
+                .with_frame_len(self.frame_len)),
             Err(e) => Err(e.locate(Location::new(source, self.id.ordinal, offset))),
         }
     }
@@ -784,6 +831,7 @@ impl<R: Read + Send> BlobReader<R> {
         // no reallocation. It is not free of zero-fill: a reader that
         // implements only `read` (`FileReader` does) gets std's default
         // `read_buf`, which zero-fills the spare capacity before each read.
+        let frame_len = header.payload_offset() + header.data_size;
         let mut blob_data = Vec::with_capacity(header.data_size);
         if let Err(err) = self.frames.read_payload(&mut blob_data) {
             return Some(Err(err));
@@ -818,6 +866,7 @@ impl<R: Read + Send> BlobReader<R> {
             header: header.header,
             body: Bytes::from(blob_data),
             id: header.id,
+            frame_len,
         }))
     }
 }
@@ -848,9 +897,16 @@ impl<R: Read + Send> BlobReader<R> {
     /// thread's permit). A background walk must not hold a call across a
     /// read that can block on the caller's stream.
     pub(crate) fn next_blob(&mut self) -> Option<Result<Blob>> {
-        let frame = match self.next_frame()? {
-            Ok(frame) => frame,
-            Err(e) => return Some(Err(e)),
+        let frame = loop {
+            match self.next_frame()? {
+                // Skipped opaque: its body is never parsed, so a body that
+                // is not a `Blob` message cannot fail the walk.
+                Ok(frame)
+                    if self.skip_unknown
+                        && matches!(frame.header.blob_type, BlobKind::Unknown(_)) => {}
+                Ok(frame) => break frame,
+                Err(e) => return Some(Err(e)),
+            }
         };
         match frame.into_blob(self.frames.path()) {
             Ok(blob) => Some(Ok(blob)),

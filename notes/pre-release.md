@@ -64,22 +64,22 @@ does not affect RSS.
 | `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
 | `extract --complete` (`-25,34,45,72`) | 5.27 GB | 4.7 GB | 2m02s | 3m42s | `ce0bdcc0` |
 | `apply-changes --locations-on-ways` (4913, keep-untagged base) ² | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
-| `extract --simple` (`-25,34,45,72`) | 3.52 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
+| `extract --simple` (`-25,34,45,72`) ⁷ | 3.09 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
 | `renumber` | 3.19 GB | 3.3 GB | 2m00s | 3m11s | `ce4acd6a` |
-| `apply-changes` (4913, `zstd:1`) | 3.1 GB | 2.4 GB | 2m07s | 4m29s | `f2b8beed` |
-| `tags-filter w/highway=primary` (two-pass) | 2.84 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
+| `apply-changes` (4913, `zstd:1`) ⁷ | 2.97 GB | 2.4 GB | 2m07s | 4m29s | `f2b8beed` |
+| `tags-filter w/highway=primary` (two-pass) ⁷ | 2.57 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
 | `check --ids --full` | 2.47 GB | 2.22 GB | 34s | 1m10s | `f6ba05d4` |
 | `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
-| `cat --clean version` | 1.24 GB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
-| `time-filter` (cutoff 2024-01-01) | 1.16 GB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
+| `cat --clean version` ⁷ | 994 MB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
+| `time-filter` (cutoff 2024-01-01) ⁷ | 841 MB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
 | `merge-changes` (4914..4920, 7 OSCs) ⁶ | 286 MB | 2 MB | 9.9s | 54s | unstored |
-| `getparents` | 705 MB | 506 MB | 13s | 22s | `dd453b3f` |
+| `getparents` ⁷ | 288 MB | 506 MB | 13s | 22s | `dd453b3f` |
 | `tags-filter -R highway=primary` | 659 MB | 688 MB | 38s | 52s | `55f84dee` |
 | `diff --format osc -j 16` (base vs 20260411) | 653 MB | 634 MB | 4m11s | 4m54s | `607cd897` |
-| `check --ids` | 646 MB | 504 MB | 31s | 57s | `4edab6b2` |
+| `check --ids` ⁷ | 566 MB | 504 MB | 31s | 57s | `4edab6b2` |
 | `inspect --nodes -j 16` | 425 MB | 410 MB | 31s | 56.8s | `b1fc3106` |
 | `getid --invert` | 58 MB | 102 MB | 56s | 1m31s | `7ee6c776` |
-| `inspect --extended` ⁵ | 571 MB | 34 MB | 41s | 13m41s | unstored |
+| `inspect --extended` ⁵ ⁷ | 355 MB | 34 MB | 41s | 13m41s | unstored |
 | `getid` | ~13 MB ¹ | 27 MB | short ¹ | 6.1s | `67d66e4e` |
 | `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
 | `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
@@ -106,6 +106,12 @@ cell was `9b49e8fb`, 26 MB and 13m22s.
 RSS-pass cells were `f24c29af` (895 MB, 30 s) and `bf6db512` (1.6 MB,
 24 s). The README's merge-changes rows (2 MB) no longer hold for either
 cell and need refreshing with the rest of the table.
+⁷ Peak re-measured after the decode buffers were right-sized and recycled
+(a `--force` cell on `c97b9985` plus the change, so not stored; walls
+unchanged per work phase and left as stored). The RSS-pass peaks were
+cat 1.24 GB, time-filter 1.16 GB, getparents 705 MB, check `--ids`
+646 MB, apply-changes 3.1 GB, extract `--simple` 3.52 GB, tags-filter
+two-pass 2.84 GB, inspect `--extended` 571 MB.
 
 ### What moved
 
@@ -119,12 +125,28 @@ cell and need refreshing with the rest of the table.
   2.7 s / 53 MB against 24 s / 1.6 MB (see reference/performance.md,
   "Streaming path on lexical batches with spill"). The 2 MB README figure
   for 7 OSCs was a splice of two builds (notes/merge-changes-memory.md).
-- **Moderate RSS increases, all pool-heavy commands:** `cat --clean` +65 %,
-  `time-filter` +43 %, `getparents` +39 %, `apply-changes` +30 %,
-  `check --ids` +28 %, `extract --simple` +17 %, `extract --complete` +12 %,
-  `check --ids --full` +11 %, `multi-extract --simple` +10 %, `tags-filter`
-  two-pass +9 %. Part of each is bygg's worker count; code and host are not
-  separated.
+- **Pool-heavy RSS increases: resolved.** The decode workers allocated and
+  freed a 4x-compressed-size buffer per blob, the pool dropped every one,
+  and glibc kept the freed arena memory resident. Decode buffers are now
+  sized from the blob and recycled, and the CLI's allocator hook pins the
+  mmap threshold so the build side does not pay for it in kernel time (see
+  reference/performance.md, "Decode buffers sized from the blob and
+  recycled"). Re-measured with `--force` cells after the change, work-phase
+  wall unchanged: getparents 705 to 288 MB, check `--ids` 646 to 566 MB,
+  time-filter 1,177 to 841 MB, cat `--clean` 1,242 to 994 MB,
+  apply-changes 3,123 to 2,965 MB, extract `--simple` 3,522 to 3,094 MB,
+  tags-filter two-pass 2,845 to 2,568 MB, inspect `--extended` 571 to
+  355 MB. Measurement artefacts in the old percentages: per-worker peak
+  was the same on both hosts for getparents, check `--ids` and
+  time-filter (23.5 vs 23.0, 21.5 vs 22.9, 38.6 vs 36.9 MB per worker at
+  30 vs 22 workers), so those rows grew with bygg's worker count, not code;
+  the extract rows compare different bboxes (README `-10,35,32,72`, bygg
+  `-25,34,45,72`); multi-extract is about 4 % in consistent units, not
+  10 %. What still sits above the README: apply-changes (overlay, drain
+  reorder and pwrite queue, notes/pool-rss-growth.md) and cat `--clean`
+  (994 MB against 750 MB); not re-measured: check `--ids --full`,
+  extract `--complete`, multi-extract `--simple`, which share the changed
+  decode path.
 - **RSS down:** `build-geocode-index` (the README's ~25 GB was probably total
   RSS; bygg's total including file-backed mmaps is 18.8 GB), `multi-extract
   --smart`, `extract --smart`, external altw, `sort` and `cat`.
@@ -132,8 +154,8 @@ cell and need refreshing with the rest of the table.
   on the ordered decode pipeline, summarizing each blob on a worker: 41.4 s
   and 571 MB peak anon on bygg, against the row's 13m22s and 26 MB (see
   reference/performance.md, "inspect full-decode scan on the decode
-  pipeline"). The memory rise is the open trade: it is the pool-heavy
-  worker term notes/pool-rss-growth.md describes. Every other wall is
+  pipeline"); its peak fell to 355 MB with the decode-buffer fix above.
+  Every other wall is
   uninformative about the 2-7 % band, because bygg is the faster host.
 
 ### Handoff, 2026-10-30

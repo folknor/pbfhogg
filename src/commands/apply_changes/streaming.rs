@@ -17,7 +17,8 @@
 //!   thread-local scratch, extract node coords (checked, dense and plain
 //!   encodings, see `node_coords.rs`) if the blob is a Node and
 //!   `--locations-on-ways` is active, parse via
-//!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
+//!   `PrimitiveBlock::from_vec_pooled_with_scratch` (the decode buffer
+//!   returns to the worker's pool when the block drops), precise-check via
 //!   [`block_overlaps_diff`]. False positives emit a `DrainItem::CopyRange`
 //!   carrying the original descriptor so the drain can `copy_file_range`
 //!   the raw frame, or on the owned route a verbatim `DrainItem::OwnedBytes`
@@ -381,6 +382,10 @@ fn worker_loop(
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
+    // The decode buffer moves into each parsed block and comes back through
+    // this worker's pool when the block drops, so one buffer serves every
+    // candidate instead of a fresh allocation per blob.
+    let decode_pool = crate::blob::DecompressPool::new(cancel);
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -433,6 +438,7 @@ fn worker_loop(
                     diff,
                     &mut bb,
                     &mut read_buf,
+                    &decode_pool,
                     &mut decompress_buf,
                     &mut st_scratch,
                     &mut gr_scratch,
@@ -504,6 +510,7 @@ fn handle_candidate(
     diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     read_buf: &mut Vec<u8>,
+    decode_pool: &std::sync::Arc<crate::blob::DecompressPool>,
     decompress_buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
@@ -559,6 +566,10 @@ fn handle_candidate(
         0..desc.data_size
     };
     let t_decompress = crate::counters::Stopwatch::start();
+    if decompress_buf.capacity() == 0 {
+        // The last parsed block took the buffer; fetch it back.
+        *decompress_buf = crate::blob::pool_get(Some(decode_pool), 0);
+    }
     decompress_blob_raw(&read_buf[body.clone()], decompress_buf)?;
     t_decompress.record_ns(&counters.decompress_ns);
 
@@ -655,7 +666,12 @@ fn handle_candidate(
 
     let t_parse = crate::counters::Stopwatch::start();
     let raw = std::mem::take(decompress_buf);
-    let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)?;
+    let block = crate::PrimitiveBlock::from_vec_pooled_with_scratch(
+        raw,
+        decode_pool,
+        st_scratch,
+        gr_scratch,
+    )?;
     t_parse.record_ns(&counters.parse_ns);
     // The drain places the blob by its claimed kind, so an element of
     // another kind would be written out of type order or dropped.

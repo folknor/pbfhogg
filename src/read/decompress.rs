@@ -12,7 +12,8 @@ use std::cell::RefCell;
 
 use crate::error::{BlobError, Error, Result, new_blob_error};
 use crate::tunables::{
-    DECOMPRESS_EXPANSION_GUESS, DECOMPRESS_POOL_MAX_BUFFERS, DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
+    DECOMPRESS_EXPANSION_GUESS, DECOMPRESS_POOL_MAX_BUFFERS, DECOMPRESS_POOL_MAX_RETAINED_BYTES,
+    DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
 };
 
 use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
@@ -24,8 +25,19 @@ thread_local! {
     static ZLIB_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
 }
 
-// Buffers rejected by either pool limit (`DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`,
-// `DECOMPRESS_POOL_MAX_BUFFERS`) are dropped and counted for the read sidecar.
+// Buffers rejected by a pool limit (`DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`,
+// `DECOMPRESS_POOL_MAX_RETAINED_BYTES`, `DECOMPRESS_POOL_MAX_BUFFERS`) are
+// dropped and counted for the read sidecar.
+//
+// Sizing policy: every decode helper here sizes its destination from the
+// blob itself - the declared `raw_size` (clamped, and checked against the
+// decoded length afterwards) or the stored payload length - with
+// `reserve_exact`, so a recycled buffer grows only to the largest payload it
+// has held rather than doubling. Callers fetch pooled storage with no
+// capacity hint of their own. The compressed-size guess
+// (`DECOMPRESS_EXPANSION_GUESS`) applies only to a blob that declares no
+// `raw_size`. Exact growth is not amortized: a run of steadily larger blobs
+// regrows the buffer each time, which planet data does not do.
 
 /// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
 ///
@@ -38,7 +50,9 @@ thread_local! {
 /// Buffers are popped via [`DecompressPool::get`] and returned automatically when
 /// the `Bytes` (and the `PrimitiveBlock` holding slices of it) is dropped.
 pub(crate) struct DecompressPool {
-    buffers: Mutex<Vec<Vec<u8>>>,
+    /// The idle buffers and the sum of their capacities, kept together so
+    /// `retained_bytes` is always exactly what the pool holds idle.
+    idle: Mutex<IdleBuffers>,
     /// The pool permit of the invocation whose `pipeline_decompress_pool_*`
     /// counters this pool's drops count into, also for a buffer returned
     /// after the call ended. Every `PooledBuffer`'s `Arc` to the pool keeps it
@@ -52,7 +66,7 @@ impl DecompressPool {
     /// ownership.
     pub fn new(invocation: &crate::host::Recorder) -> Arc<Self> {
         Arc::new(Self {
-            buffers: Mutex::new(Vec::new()),
+            idle: Mutex::new(IdleBuffers::default()),
             permit: invocation.permit(),
         })
     }
@@ -61,18 +75,25 @@ impl DecompressPool {
     // wontfix(type-result-fallible): .ok() on Mutex::lock() - poisoning means another
     // thread panicked; falling back to a fresh Vec is the correct recovery here.
     pub fn get(&self) -> Vec<u8> {
-        self.buffers
+        self.idle
             .lock()
             .ok() // ok-deliberate: a poisoned pool hands out a fresh buffer
-            .and_then(|mut v| v.pop())
+            .and_then(|mut idle| {
+                let buf = idle.buffers.pop()?;
+                idle.retained_bytes -= buf.capacity();
+                Some(buf)
+            })
             .unwrap_or_default()
     }
 
     /// Return a buffer to the pool for reuse.
     ///
-    /// Drops oversized buffers (capacity > 4 MB) instead of retaining them,
-    /// preventing outlier blobs from permanently inflating pool memory.
-    /// Also enforces a count cap as defense-in-depth.
+    /// Retains it unless its capacity exceeds
+    /// `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY` (an outlier, dropped so it
+    /// cannot pin its size in the pool), or keeping it would take the pool's
+    /// idle capacity past `DECOMPRESS_POOL_MAX_RETAINED_BYTES` or its count
+    /// past `DECOMPRESS_POOL_MAX_BUFFERS`. A rejected buffer is freed after the
+    /// lock is released.
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
         let metrics = &self.permit.metrics().decompress;
@@ -81,12 +102,33 @@ impl DecompressPool {
             return;
         }
         buf.clear();
-        match self.buffers.lock() {
-            Ok(mut buffers) if buffers.len() < DECOMPRESS_POOL_MAX_BUFFERS => buffers.push(buf),
-            Ok(_) => metrics.record_full_drop(capacity),
-            Err(_) => metrics.record_poisoned_drop(capacity),
-        }
+        let rejected = match self.idle.lock() {
+            Ok(mut idle)
+                if idle.buffers.len() < DECOMPRESS_POOL_MAX_BUFFERS
+                    && idle.retained_bytes + capacity <= DECOMPRESS_POOL_MAX_RETAINED_BYTES =>
+            {
+                idle.retained_bytes += capacity;
+                idle.buffers.push(buf);
+                None
+            }
+            Ok(_) => {
+                metrics.record_full_drop(capacity);
+                Some(buf)
+            }
+            Err(_) => {
+                metrics.record_poisoned_drop(capacity);
+                Some(buf)
+            }
+        };
+        drop(rejected);
     }
+}
+
+/// A pool's idle buffers; `retained_bytes` is the sum of their capacities.
+#[derive(Default)]
+struct IdleBuffers {
+    buffers: Vec<Vec<u8>>,
+    retained_bytes: usize,
 }
 
 /// Owner type for `Bytes::from_owner` that returns its buffer to a
@@ -114,10 +156,10 @@ pub(crate) fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> V
     match pool {
         Some(p) => {
             let mut buf = p.get();
-            // Pooled buffers are cleared on return. `reserve` is relative to
-            // length, so reserve the full hint to ensure the buffer can hold it
-            // before inflation.
-            buf.reserve(capacity);
+            // Pooled buffers are cleared on return. `reserve_exact` is relative
+            // to length, so this asks for the full hint, and never doubles a
+            // recycled buffer that is slightly too small.
+            buf.reserve_exact(capacity);
             buf
         }
         None => Vec::with_capacity(capacity),
@@ -332,6 +374,7 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
             if size > MAX_BLOB_MESSAGE_SIZE {
                 Err(new_blob_error(BlobError::MessageTooBig { size }))
             } else {
+                buf.reserve_exact(bytes.len());
                 buf.extend_from_slice(bytes);
                 Ok(())
             }
@@ -341,7 +384,7 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
             if cap > 0 {
                 // `buf` was cleared above, so reserve the full hint to ensure
                 // it can hold the decoded payload before inflation.
-                buf.reserve(cap);
+                buf.reserve_exact(cap);
             }
             zlib_decompress_into(bytes, buf)
         }
@@ -350,7 +393,7 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
             if cap > 0 {
                 // `buf` was cleared above, so reserve the full hint to ensure
                 // it can hold the decoded payload before inflation.
-                buf.reserve(cap);
+                buf.reserve_exact(cap);
             }
             zstd_decompress_into(bytes, buf)
         }
@@ -376,6 +419,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
         if size > MAX_BLOB_MESSAGE_SIZE {
             return Err(new_blob_error(BlobError::MessageTooBig { size }));
         }
+        buf.reserve_exact(slice.len());
         buf.extend_from_slice(slice);
     } else {
         if let Some(rs) = raw_size
@@ -384,7 +428,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             #[allow(clippy::cast_sign_loss)]
             // `buf` was cleared at function entry; reserve the full clamped
             // hint because `reserve` counts additional bytes from its length.
-            buf.reserve(clamp_capacity_hint(rs as usize));
+            buf.reserve_exact(clamp_capacity_hint(rs as usize));
         }
         if field == blob_fields::ZLIB_DATA {
             zlib_decompress_into(slice, buf)?;
@@ -512,19 +556,20 @@ pub(crate) fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> R
             if size > MAX_BLOB_MESSAGE_SIZE {
                 return Err(new_blob_error(BlobError::MessageTooBig { size }));
             }
+            buf.reserve_exact(bytes.len());
             buf.extend_from_slice(bytes);
         }
         Some(BlobData::Zlib(bytes)) => {
             let est = blob.estimated_capacity();
             if est > 0 {
-                buf.reserve(est);
+                buf.reserve_exact(est);
             }
             zlib_decompress_into(bytes, buf)?;
         }
         Some(BlobData::Zstd(bytes)) => {
             let est = blob.estimated_capacity();
             if est > 0 {
-                buf.reserve(est);
+                buf.reserve_exact(est);
             }
             zstd_decompress_into(bytes, buf)?;
         }

@@ -375,10 +375,7 @@ where
             (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
                 local.read_buf.resize(d.size, 0);
                 shared_file.read_exact_at(&mut local.read_buf, d.offset)?;
-                let mut buf = crate::blob::pool_get(
-                    Some(&local.pool),
-                    d.size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
-                );
+                let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
                 crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
                 let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                     buf,

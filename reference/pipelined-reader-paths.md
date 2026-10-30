@@ -55,9 +55,14 @@ Alternative primitives used elsewhere in the codebase:
 **Retention is solved.** `DecompressPool` in `src/read/decompress.rs`
 (commit `8f6999b`, 2026-03-30) recycles decompression buffers via
 `PooledBuffer::drop` instead of cross-thread freeing. The pool caps
-its buffer count and per-buffer retained capacity
-(`DECOMPRESS_POOL_*` in `src/tunables.rs`). Any new pipelined caller
-inherits this for free; no action needed.
+each retained buffer's capacity, the sum of its idle capacities and its
+buffer count (`DECOMPRESS_POOL_*` in `src/tunables.rs`). Reuse depends on
+sizing: the decode helpers size a buffer from the blob's declared
+`raw_size` with exact growth, so a caller fetches storage with
+`pool_get(pool, 0)` and adds no capacity guess of its own; a guess past
+the per-buffer cap makes every buffer a drop (what happened at planet
+before the decode buffers were right-sized). The cap bounds idle
+storage per pool, not checked-out buffers or process RSS.
 
 **Thread oversubscription is a known architectural concern** but
 sequential conversion is *not* the answer. Measured evidence: a

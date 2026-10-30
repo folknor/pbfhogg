@@ -1622,6 +1622,19 @@ pub trait ProcessActions: Send + Sync {
     /// tens of GB of anonymous RSS uncapped, under 1 GB with the cap (the
     /// figures are in renumber's call site).
     ///
+    /// The event is the workload, not a prescribed response. The CLI's
+    /// response is two glibc settings: two arenas (`M_ARENA_MAX`), and a
+    /// pinned 32 MiB `M_MMAP_THRESHOLD`, which also disables glibc's sliding
+    /// threshold (the trim threshold keeps its current value). The pin keeps
+    /// multi-MB build and frame buffers in the shared arenas for reuse rather
+    /// than mapping and unmapping them per blob: once the decode buffers are
+    /// recycled (read/decompress.rs) nothing else raises the sliding
+    /// threshold early, and time-filter at planet spent 20 % more wall in the
+    /// kernel without the pin (reference/performance.md, "Decode buffers
+    /// sized from the blob and recycled"). Neither setting bounds memory:
+    /// arena reuse trades returning freed pages to the OS for not faulting
+    /// them in again.
+    ///
     /// Only some commands that run worker pools request it. The others were
     /// never checked for cross-thread alloc/free patterns, so not calling it
     /// is not a decision that the cap is unneeded or harmful there. To

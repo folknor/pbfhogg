@@ -231,8 +231,8 @@ impl ScheduledBlob {
 
 use crate::tunables::{
     DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
-    DECOMPRESS_EXPANSION_GUESS, POOL_DESCRIPTOR_CHANNEL_DEPTH, POOL_RESULT_CHANNEL_DEPTH,
-    WILLNEED_COALESCE_GAP_BYTES, WILLNEED_WINDOW_BYTES,
+    POOL_DESCRIPTOR_CHANNEL_DEPTH, POOL_RESULT_CHANNEL_DEPTH, WILLNEED_COALESCE_GAP_BYTES,
+    WILLNEED_WINDOW_BYTES,
 };
 
 /// Coalesce body ranges in a walker-derived schedule. Schedule entries retain
@@ -874,8 +874,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
             state: worker_init(),
         },
         |local: &mut DecodeLocal<S>, position, raw: &[u8]| {
-            let mut buf =
-                crate::blob::pool_get(Some(&local.pool), raw.len() * DECOMPRESS_EXPANSION_GUESS);
+            let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
             crate::blob::decompress_blob_raw(raw, &mut buf)?;
             let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                 buf,
@@ -1132,10 +1131,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
             (|| {
                 local.read_buf.resize(entry.data_size(), 0);
                 file.read_exact_at(&mut local.read_buf, entry.data_offset())?;
-                let mut buf = crate::blob::pool_get(
-                    Some(&local.pool),
-                    entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
-                );
+                let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
                 crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
                 let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                     buf,
@@ -1375,10 +1371,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         (|| -> crate::error::Result<()> {
                             read_buf.resize(entry.data_size(), 0);
                             file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                            let mut buf = crate::blob::pool_get(
-                                Some(&worker_pool),
-                                entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
-                            );
+                            let mut buf = crate::blob::pool_get(Some(&worker_pool), 0);
                             crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                             let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                                 buf,

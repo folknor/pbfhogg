@@ -219,30 +219,36 @@ pub(crate) const SAMPLE_CAP: usize = 1_000;
 /// Blob-count policy boundary measured in `reference/blob-density.md`.
 pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 
-/// Maximum capacity (bytes) of a buffer retained in the decompression pool.
-/// Buffers larger than this are dropped on return instead of recycled.
-/// This prevents outlier blobs (up to 32 MB decompressed) from permanently
-/// inflating the pool's retained memory.
+/// Maximum capacity (bytes) of a buffer retained in a decompression pool.
+/// Larger buffers are dropped on return instead of recycled, so an outlier
+/// block cannot pin its size in the pool. A cache policy, not a format
+/// bound: a decoded buffer holds the payload (up to 32 MiB) plus its inline
+/// string and group tables, which can exceed the payload on table-heavy
+/// input. Repeated blocks above it churn the allocator again.
 ///
-/// Set to 4 MB: covers >99% of real-world PBF blocks (8000 elements at
-/// typical sizes) while dropping the long tail of outlier blocks.
-pub(crate) const DECOMPRESS_POOL_MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
+/// 16 MiB retains every buffer of the planet file (payload plus tables; its
+/// blocks run a few MiB, pool drops 0 at `getparents` planet on bygg). The
+/// earlier 4 MiB cap, combined with a 4x-compressed-size reservation,
+/// dropped every planet buffer (see `reference/performance.md`, "Decode
+/// buffers sized from the blob and recycled"). One retained outlier per
+/// worker is the cost: up to this much per pread worker.
+pub(crate) const DECOMPRESS_POOL_MAX_RETAINED_CAPACITY: usize = 16 * 1024 * 1024;
 
-/// Maximum number of buffers retained in the decompression pool.
-/// Defense-in-depth: prevents unbounded pool growth if pipeline topology changes.
+/// Maximum idle capacity (bytes, the sum of buffer capacities) one
+/// decompression pool retains. Per pool, not per process: the pread engines
+/// build one pool per worker, which in their synchronous shape holds one
+/// buffer at a time; the shared `run_pipeline` pool holds up to its decode
+/// window. It bounds idle storage only, not checked-out buffers.
+pub(crate) const DECOMPRESS_POOL_MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum number of buffers retained in a decompression pool.
+/// Defense-in-depth beside the byte budget, which does not bound a pool of
+/// tiny buffers.
 pub(crate) const DECOMPRESS_POOL_MAX_BUFFERS: usize = 64;
 
-// The retained payload capacity is at most 64 * 4 MiB = 256 MiB. Buffers
-// rejected by either limit are dropped and counted for the read sidecar.
-const _: () = assert!(
-    DECOMPRESS_POOL_MAX_BUFFERS * DECOMPRESS_POOL_MAX_RETAINED_CAPACITY <= 256 * 1024 * 1024,
-    "the decompression pool's retained payload bound is documented as 256 MiB"
-);
-
 /// Decompression buffer capacity guess, as a multiple of the compressed size:
-/// the capacity requested for a blob that declares no `raw_size`, and for the
-/// pooled buffers the decode workers fetch per blob of `data_size` compressed
-/// bytes.
+/// the capacity requested for a blob that declares no `raw_size`. Blobs that
+/// declare one are sized from it exactly.
 pub(crate) const DECOMPRESS_EXPANSION_GUESS: usize = 4;
 
 /// `WILLNEED` coalescing gap: schedule bodies separated by up to this many
@@ -387,9 +393,10 @@ const _: () = assert!(
 
 /// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks
 /// built under the default 8000-element cap are normally below this (each of
-/// the three buffers is sized by the block's raw or framed bytes; the read
-/// side's `DecompressPool` uses the same 4 MiB retention limit on the same
-/// reasoning), so the cap only engages on outliers; larger buffers are handed
+/// the three buffers is sized by the block's raw or framed bytes; writer
+/// counters show few buffers capped at planet), so the cap only engages on
+/// outliers. It is independent of the read side's `DecompressPool` limit,
+/// whose buffers also carry inline tables; larger buffers are handed
 /// to the writer or dropped, then the thread-local scratch is allowed to warm
 /// up again. A run whose blocks all exceed it (repack with a raised
 /// `--elements-per-blob`) pays a fresh allocation per buffer per block, which
@@ -400,10 +407,6 @@ const _: () = assert!(
 /// three scratch Vecs therefore retain at most 12 MiB per `FrameScratch`, in
 /// addition to the reused compressor state.
 pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
-const _: () = assert!(
-    MAX_RETAINED_SCRATCH_CAPACITY == DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
-    "the write-side scratch retention limit is documented as the same as the read-side pool's"
-);
 
 /// Zlib worst-case output bound reserved up front: input + input >> this
 /// shift (~0.1%) + [`ZLIB_RESERVE_SLACK`] header/trailer bytes.

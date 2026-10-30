@@ -172,6 +172,12 @@ never left partial, and the library no longer touches process state.
   in scratch instead of memory: planet 7-OSC 30 s / 895 MB to 10 s / 286 MB,
   1-OSC 24 s to 2.7 s. It takes `--tmp-dir`, and the output has one gzip
   member and action section run per batch (same changes, same order).
+- Commands that decode on a worker pool recycle right-sized decode buffers
+  instead of allocating one per blob: planet peak RSS getparents 705 to
+  288 MB, time-filter 1.18 GB to 841 MB, cat `--clean` 1.24 GB to 994 MB,
+  extract `--simple` 3.52 to 3.09 GB, at unchanged wall. The CLI now also
+  pins glibc's `M_MMAP_THRESHOLD` at 32 MiB where it caps malloc arenas; an
+  embedding `ProcessActions` chooses its own policy.
 - `tags-count -e` skips blobs on the tag index.
 - A blob over the format's size limits is refused at write time, and an
   oversize tag index is dropped instead of failing the write.

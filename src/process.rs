@@ -226,24 +226,21 @@ pub fn malloc_trim() -> i32 {
     0
 }
 
-/// Lower glibc's `M_MMAP_THRESHOLD` so allocations >= `bytes` route
-/// through `mmap`/`munmap` instead of brk. mmap-backed chunks are
-/// released back to the OS the moment they're freed, while brk-arena
-/// chunks accumulate as fragmentation when allocations interleave
-/// across threads.
+/// Pin glibc's `M_MMAP_THRESHOLD` at `bytes`: allocations at or above it
+/// that the arenas cannot already satisfy go through `mmap`/`munmap`,
+/// smaller ones through the arenas. Setting it disables glibc's sliding
+/// threshold (default 128 KB, climbing as mmapped chunks are freed, up to
+/// 32 MB on 64-bit), and leaves the trim threshold where it is.
 ///
-/// Use against cross-thread allocate-here, free-there retention (see
-/// [`malloc_trim`] for the reader-side instance that has since been
-/// designed out) when mallinfo2 shows growth concentrated in `arena` (brk)
-/// with `hblkhd` (mmap) flat. Default glibc threshold is 128 KB and is
-/// also dynamic (climbs as the program runs, up to 32 MB). This
-/// pins it to a hard floor.
+/// Either direction is a trade. A low pin returns freed large chunks to
+/// the OS at once, against arena fragmentation when allocations interleave
+/// across threads (mallinfo2 growth in `arena` with `hblkhd` flat). A high
+/// pin keeps large buffers in the arenas for reuse, against per-blob
+/// mapping, faulting and unmapping; the CLI's `cross_thread_alloc_pool`
+/// pins 32 MiB for that reason.
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.
-///
-/// This remains public opt-in API even though the repository has no callers;
-/// downstream applications may use the process-wide operation.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn set_mmap_threshold(bytes: i32) -> i32 {
     // SAFETY: mallopt is glibc and safe to call from any thread

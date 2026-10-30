@@ -1209,6 +1209,19 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **Stale "BlockBuilder::new reserves nothing" comments (found
+  2026-10-30).** cat `--clean` and time-filter justify a fresh builder per
+  blob with "no heap reservation until elements are added", but
+  `BlockBuilder::new` preallocates its ten dense vectors at the 8000-element
+  cap (about 0.5 MB). Fix the comments, or the preallocation, with the
+  encode-side recycling item in notes/pool-rss-growth.md.
+- [ ] **A cold schedule header walk costs ~6 s at planet (found
+  2026-10-30).** Cells that run without the headers in page cache spend
+  about 6 s per schedule walk (getparents, check `--ids`, time-filter, cat,
+  extract, three walks in tags-filter two-pass); the RSS-pass baselines had
+  them cached. Read single-cell walls with that in mind; tags-filter walks
+  the same schedule three times.
+
 - [ ] **Stall-counter follow-ups (found 2026-10-26 adding the unordered
   pools' `*_wait_ns` counters).** Each is its own change; none is measured.
   - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`

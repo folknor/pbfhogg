@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) struct LegacyProcessActions;
 impl ProcessActions for LegacyProcessActions {
     fn cross_thread_alloc_pool(&self) {
+        // CLI process policy, both halves documented on the trait method.
         pbfhogg::process::cap_malloc_arenas();
+        pbfhogg::process::set_mmap_threshold(32 * 1024 * 1024);
     }
     fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         // CLI process policy: keep the raise for this command's lifetime.

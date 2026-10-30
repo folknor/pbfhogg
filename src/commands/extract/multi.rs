@@ -899,10 +899,7 @@ impl MultiLocal {
             input
                 .file()
                 .read_exact_at(&mut self.read_buf, entry.data_offset())?;
-            let mut buf = crate::blob::pool_get(
-                Some(&self.pool),
-                entry.data_size() * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
-            );
+            let mut buf = crate::blob::pool_get(Some(&self.pool), 0);
             crate::blob::decompress_blob_raw(&self.read_buf, &mut buf)?;
             PrimitiveBlock::from_vec_pooled_with_scratch(
                 buf,

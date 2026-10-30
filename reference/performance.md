@@ -1261,6 +1261,51 @@ wait is 0.5 %. The memory is the 30 workers' transient decode storage
 summaries: the permit window holds summaries, which are small (tens of KB at
 most, under `--locations`).
 
+### Decode buffers sized from the blob and recycled (bygg, 2026-10-30)
+
+The pread decode workers asked the per-worker `DecompressPool` for
+`4 x compressed size` (about 7.2 MB for a 1.8 MB planet blob), Vec
+doubling on the inline offset tables grew other buffers past the pool's
+4 MiB retention cap, and so every planet buffer was dropped on return
+(drops = scheduled blobs in every cell): one multi-MB allocate-and-free
+per blob per worker. mallinfo2 sampled mid-run in getparents at
+`c97b9985` showed 175-250 MB in use against 280-420 MB free inside the
+arenas, all resident (THP `always` on bygg). Now the decode helpers size
+the buffer from the declared `raw_size` with exact growth (tables
+included), callers pass no guess, and the pool retains buffers up to
+16 MiB under a 256 MiB idle budget per pool: zero pool drops at planet.
+The apply-changes workers recycle theirs through a per-worker pool too.
+
+Once decode buffers stop being freed, nothing raises glibc's sliding mmap
+threshold early, and time-filter's in-worker build and frame buffers went
+through mmap/munmap per blob: main phase 139.9 s to 169.1 s, kernel time
+1.8 to 5.7 cores. The CLI's `cross_thread_alloc_pool` hook now pins
+`M_MMAP_THRESHOLD` at 32 MiB beside the two-arena cap, which recovers
+it. Commands without the hook (getparents, extract, tags-filter,
+apply-changes) showed no work-phase regression.
+
+Planet (`planet-20260223-with-indexdata`), `--bench 1`, peak anon RSS.
+Variant cells are unstored `--force` cells on `c97b9985` plus the change.
+Wall compares the work phases (sidecar phase split): the variant cells ran
+with the schedule header walk out of page cache (about 6 s per walk,
+code unchanged), which the stored baselines had cached.
+
+| command | baseline | peak before | peak after | work phases |
+|---|---|---:|---:|---|
+| `getparents` | `dd453b3f` | 705 MB | 288 MB | decode 13.41 s to 13.29 s |
+| `check --ids` | `4edab6b2` | 646 MB | 566 MB | -1 % / -2 % |
+| `time-filter` | `4f093a45` (`c97b9985`, same day) | 1,177 MB | 841 MB | 139.9 s to 139.0 s |
+| `cat --clean version` | `a8a4384e` | 1,242 MB | 994 MB | nodes -4 %, ways -2 % |
+| `apply-changes` (4913, `zstd:1`) | `f2b8beed` | 3,123 MB | 2,965 MB | streaming 120.0 s to 120.4 s |
+| `extract --simple` (`-25,34,45,72`) | `6b3c88cc` | 3,522 MB | 3,094 MB | equal or faster per phase |
+| `tags-filter w/highway=primary` | `b8491cfd` | 2,845 MB | 2,568 MB | equal per phase |
+| `inspect --extended` | unstored 571 MB cell | 571 MB | 355 MB | 41.4 s to 42.2 s |
+
+What is left in the larger peaks is not decode storage: apply-changes'
+overlay (575 MB), unbounded drain reorder (415 MB high water) and pwrite
+queue; the persistent ID sets of extract, tags-filter and check
+`--ids --full`.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

@@ -50,9 +50,11 @@ from the 2026-10-29 session and is recorded nowhere else.
   read-only codex profile. One item per implementer. Confirm the roster
   with the user again, as that procedure requires.
 
-**What to build, in order:** the landing table at the end of this note,
-L6 next. L5 (the scenarios) and L7 (#36, the reserving descriptor
-provider) have landed; see the landing list.
+**What to build, in order:** the landing table at the end of this note.
+L5 (the scenarios), L6 (#35, capability ids and declarations) and L7
+(#36, the reserving descriptor provider) have landed; see the landing
+list. What remains is certification itself, blocked on the three required
+capabilities no scenario covers yet (#34 and #39).
 
 L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
 digest` prints the full form, `xxh128 v2`, in `v1`'s four-line grammar,
@@ -60,8 +62,10 @@ and `--form content` keeps `v1` (diff's equality, which brokkr#8's verify
 cache needs). brokkr accepts both since brokkr#60 (`98bddee`). What `v2`
 covers is in `docs/cli/commands.md` "digest": beyond brokkr#60's list it
 also hashes exact nanodegree coordinates and the declared prepass fields.
-Its residue is the re-certification, which waits on a harness (L2 onward):
-a certification under `v1` holds for `v1` only.
+Its residue is the re-certification (a certification under `v1` holds
+for `v1` only), which rides on the same `brokkr library --all` run as
+certification: the L6 sweep compared every counterpart under `v2` and all
+passed, but the sweep as a whole did not certify.
 - L0 (irreversible unbacked replacement) and L1 (#33, Decision B) have
   landed; see the landing list.
 - L2, the harness skeleton, has landed; see the landing list. Since L4 it
@@ -73,8 +77,10 @@ a certification under `v1` holds for `v1` only.
 **bz state:**
 - **pbfhogg#31 and #32** are closed by L4.
 - **#34** is narrowed to L5's residue (positive caller-pool framing
-  proof). **#35** is open and maps to L6. #33 (L1) and #36
-  (L7) are closed. #37 (L8) is closed; its re-certification is L8's gate below.
+  proof), required as `executor.caller-pool.v1`. **#39** owns the proofs
+  of `host.page-cache-keep.v1` and `counters.own-snapshot.v1`. #35 (L6),
+  #33 (L1) and #36 (L7) are closed. #37 (L8) is closed; its
+  re-certification is the certification row below.
 - **#30 and #38** are closed.
 - **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
   `98bddee`):
@@ -85,9 +91,10 @@ a certification under `v1` holds for `v1` only.
   lands, the cost of digest `v2` on the success path is unmeasured.
 - **brokkr#62** (filed at L2) is open: the call-stream defect "a name
   emitted twice" reads as forbidding repeated ordinary markers and
-  counter samples. It bites only a call that claims its stream (L6):
-  `repeat-cat` seals and declares no `stream`, and its streams print
-  "pass (not judged)".
+  counter samples. Since L6 every call claims `stream.sealed.v1`,
+  including `nofile-altw-external`, whose ordered pools emit their
+  running totals once per run; the installed brokkr passed that stream.
+  The text is still ambiguous, and a stricter brokkr would fail it.
 
 **Practical facts:**
 - **Read the protocol** through `brokkr man library` (the installed
@@ -928,11 +935,36 @@ Landed independently, 2026-10-29:
     ignored the executor would pass. It needs an observation point in the
     library; until then L6 must not let this scenario cover a
     caller-pool-execution capability.
+- L6, capability ids and declarations (#35): the commit that carries this
+  line. `[pbfhogg.library.require]` in `brokkr.toml` names the required
+  capabilities; `CallDecl::stream` and `AssertionDecl::covers` carry the
+  declarations, validated as capability ids, and the unit test
+  `declarations_match_the_require_table` keeps them and the table in step,
+  listing the required ids nothing covers with their tickets. Rulings:
+  - Every call claims `stream.sealed.v1`. Choosing stream claims by which
+    calls survive every reading of brokkr#62 would have shaped the
+    declarations around it, so the altw external call claims it too.
+  - Required ids no scenario proves stay required, so certification
+    classifies them unsupported instead of passing without them:
+    `executor.caller-pool.v1` (#34; `fixed-resources-executor` covers only
+    `executor.global-pool-unused.v1`), `host.page-cache-keep.v1` and
+    `counters.own-snapshot.v1` (#39). The altw below-320 refusal is not
+    required: the release gate's list of harness checks does not name it.
+  - Assertions were strengthened before covering anything: `own-counters`
+    requires each call's exact cat counter inventory once each (the claim
+    is about those counters only); the concurrent outcomes also require
+    the grant held at `CAT_SCAN_END`; `a.three-workers` also requires
+    `extjoin_num_shard_workers` 3; `nofile-cat-refused` now names 1100
+    spellings of a path that does not exist and requires that
+    `CAT_SCAN_START` never passed, so an input opened before admission
+    would have failed with not-found instead of the descriptor refusal.
+  Gate: `brokkr library --all --dataset denmark` ran all ten scenarios
+  passing, 13 capabilities passed and the three above unsupported: not
+  certified, as intended.
 
-| # | Landing | Gate |
+| Item | Remaining | Gate |
 |---|---|---|
-| L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
-| L8 | #37 full-fidelity digest `v2`. Landed: `digest` defaults to `--form full` (`v2`), `--form content` keeps `v1`; brokkr accepts both (brokkr#60). Remaining: certify again once a harness exists | `brokkr check` (passed at landing); `brokkr library --all --dataset denmark`, pending a harness |
+| Certification, which is also L8's (#37) re-certification under digest `v2` | `executor.caller-pool.v1` covered (#34); `host.page-cache-keep.v1` and `counters.own-snapshot.v1` covered (#39) | `brokkr library --all --dataset denmark` certifies |
 
 ## Out of scope
 

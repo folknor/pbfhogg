@@ -32,6 +32,15 @@ pub(crate) fn is_identifier(id: &str) -> bool {
         })
 }
 
+/// A capability id: an identifier ending `.v<N>`, `N` a positive decimal
+/// without a leading zero.
+pub(crate) fn is_capability_id(id: &str) -> bool {
+    is_identifier(id)
+        && id.rsplit_once(".v").is_some_and(|(_, n)| {
+            !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
 /// One-line text: 1 to 200 bytes, no control character.
 pub(crate) fn is_one_line(text: &str) -> bool {
     !text.is_empty() && text.len() <= ONE_LINE_MAX && !text.chars().any(char::is_control)
@@ -212,13 +221,21 @@ pub(crate) struct CallDecl {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) cli: Option<Counterpart>,
+    /// The capabilities the call's stream verdict (`<call>/brokkr.stream`)
+    /// stands for in a certification.
+    pub(crate) stream: &'static [&'static str],
 }
 
 pub(crate) struct AssertionDecl {
     pub(crate) id: &'static str,
     /// The call it is about, or `None` for the scenario as a whole.
     pub(crate) call: Option<&'static str>,
+    /// The capabilities its result stands for in a certification.
+    pub(crate) covers: &'static [&'static str],
 }
+
+/// The capability a sealed call's stream proves: every call claims it.
+pub(crate) const STREAM_SEALED: &[&str] = &["stream.sealed.v1"];
 
 /// A scenario's entry in the describe document.
 pub(crate) struct ScenarioDecl {
@@ -241,8 +258,13 @@ impl ScenarioDecl {
             .iter()
             .map(|call| {
                 let mut value = json!({ "id": call.id, "label": call.label });
-                if let (Some(cli), Some(object)) = (&call.cli, value.as_object_mut()) {
-                    object.insert("cli".to_owned(), cli.to_json());
+                if let Some(object) = value.as_object_mut() {
+                    if let Some(cli) = &call.cli {
+                        object.insert("cli".to_owned(), cli.to_json());
+                    }
+                    if !call.stream.is_empty() {
+                        object.insert("stream".to_owned(), json!(call.stream));
+                    }
                 }
                 value
             })
@@ -251,7 +273,13 @@ impl ScenarioDecl {
         let assertions: Vec<Value> = self
             .assertions
             .iter()
-            .map(|a| json!({ "id": a.id, "call": a.call }))
+            .map(|a| {
+                let mut value = json!({ "id": a.id, "call": a.call });
+                if let (false, Some(object)) = (a.covers.is_empty(), value.as_object_mut()) {
+                    object.insert("covers".to_owned(), json!(a.covers));
+                }
+                value
+            })
             .collect();
         let mut value = json!({
             "id": self.id,
@@ -304,6 +332,7 @@ impl ScenarioDecl {
             if let Some(cli) = &call.cli {
                 self.validate_counterpart(call.id, cli)?;
             }
+            self.validate_capabilities(call.id, call.stream)?;
         }
         let generated = self
             .roles
@@ -342,8 +371,33 @@ impl ScenarioDecl {
             if assertion.id.starts_with("brokkr.") || !call_ok {
                 return Err(format!("{}: assertion {} is bad", self.id, assertion.id));
             }
+            self.validate_capabilities(assertion.id, assertion.covers)?;
         }
         Ok(())
+    }
+
+    /// A `stream` or `covers` list: capability ids, each at most once.
+    fn validate_capabilities(&self, owner: &str, ids: &[&str]) -> Result<(), String> {
+        if let Some(bad) = ids.iter().find(|id| !is_capability_id(id)) {
+            return Err(format!(
+                "{}: {owner} names {bad:?}, not a capability id",
+                self.id
+            ));
+        }
+        unique(ids.iter().copied(), "capability", self.id)
+    }
+
+    /// Every capability the declaration covers, streams included.
+    #[cfg(test)]
+    pub(crate) fn capabilities(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.calls
+            .iter()
+            .flat_map(|c| c.stream.iter().copied())
+            .chain(
+                self.assertions
+                    .iter()
+                    .flat_map(|a| a.covers.iter().copied()),
+            )
     }
 
     fn validate_counterpart(&self, call: &str, cli: &Counterpart) -> Result<(), String> {
@@ -466,7 +520,17 @@ impl Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{cut, is_identifier, is_one_line, one_line};
+    use super::{cut, is_capability_id, is_identifier, is_one_line, one_line};
+
+    #[test]
+    fn capability_ids_end_in_a_version() {
+        for good in ["cancel.pre-decision.v1", "counters.v12", "a.v1"] {
+            assert!(is_capability_id(good), "{good:?}");
+        }
+        for bad in ["cancel", "a.v0", "a.v01", "a.v", "a.v1x", "A.v1", "a-v1"] {
+            assert!(!is_capability_id(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn identifiers_follow_the_protocol_alphabet() {

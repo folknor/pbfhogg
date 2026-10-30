@@ -14,7 +14,9 @@ use super::{
     Scenario, cat_into, clean_json, host_json, output_policy_json, overrides_json, process_json,
     write_json,
 };
-use crate::protocol::{Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, ScenarioDecl};
+use crate::protocol::{
+    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
+};
 use crate::runner::{CallSpec, Ctx, Exec};
 use pbfhogg::cat::CleanAttrs;
 use serde_json::{Value, json};
@@ -22,6 +24,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 pub(crate) struct FixedResourcesExecutor;
+
+/// The call completed on a caller's pool and rayon's global pool was never
+/// built: nothing about where the work ran beyond that.
+const GLOBAL_POOL_UNUSED: &[&str] = &["executor.global-pool-unused.v1"];
 
 /// The fixed parallelism and the caller pool's size.
 const THREADS: usize = 4;
@@ -62,19 +68,24 @@ impl Scenario for FixedResourcesExecutor {
                 id: "a",
                 label: "cat --clean version input -> out on the caller's pool",
                 cli: Some(Counterpart::output(ARGV, Some(false), EXECUTOR_DIFFERENCES)),
+                stream: STREAM_SEALED,
             }],
             roles: vec![
                 RoleDecl::dataset("input", "indexed"),
                 RoleDecl::output("out", "a"),
             ],
+            // Nothing here covers caller-pool execution
+            // (`executor.caller-pool.v1`): see the module doc.
             assertions: vec![
                 AssertionDecl {
                     id: "a.outcome",
                     call: Some("a"),
+                    covers: GLOBAL_POOL_UNUSED,
                 },
                 AssertionDecl {
                     id: "global-registry-unused",
                     call: None,
+                    covers: GLOBAL_POOL_UNUSED,
                 },
             ],
         }

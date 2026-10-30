@@ -381,11 +381,33 @@ lanes = ["gate-tests", "doc-twin"]
 certifies = "complete"
 
 # The library harness `brokkr library` builds and runs (`brokkr man
-# library`): the workspace member harness/. No [pbfhogg.library.require]
-# table yet, so `brokkr library --all` refuses until the scenarios declare
-# the capabilities they cover.
+# library`): the workspace member harness/.
 [pbfhogg.library.harness]
 package = "pbfhogg-harness"
+
+# What `brokkr library --all` certifies: capability id = one-line meaning.
+# A capability whose meaning changes gets a new id. The harness's describe
+# document declares which assertions and call streams cover each id; its
+# unit test `declarations_match_the_require_table` keeps the two in step and
+# lists the ids nothing covers yet, with their tickets. Those classify
+# unsupported, so certification fails until a scenario proves them.
+[pbfhogg.library.require]
+"calls.repeatable.v1" = "two calls in one process, one after another, each install their output and the outputs are byte-identical"
+"calls.concurrent.v1" = "two calls in one process with intersecting lifetimes both complete and install their outputs"
+"counters.own-call.v1" = "under concurrency each call's instrument sink receives exactly its own cat counters, once each, with its own values"
+"counters.own-snapshot.v1" = "concurrent calls' invocation counter snapshots hold only their own values"
+"stream.sealed.v1" = "a sealed call's stream carries every snapshot counter and one terminal record, with no proven defect"
+"fd.pool.v1" = "concurrent calls share a caller's descriptor pool, each holding its full grant from before its scan to the end of its scan and returning it whole"
+"nofile.cat-refused.v1" = "a cat needing more descriptors than the soft limit allows is refused with a typed descriptor error before acquiring any input, publishing nothing"
+"nofile.altw-external.v1" = "at caller parallelism 8 and soft nofile 1024, altw external sizes stage 1 to a cpu cap of 6 and a descriptor cap of 3, runs 3 workers, and completes"
+"executor.global-pool-unused.v1" = "a call on a caller-built Executor::Pool completes without ever building rayon's global pool"
+"executor.caller-pool.v1" = "writer framing runs on the caller's Executor::Pool"
+"host.page-cache-keep.v1" = "a call on PageCachePolicy::Keep evicts nothing of its inputs from the page cache"
+"cancel.pre-decision.v1" = "a cancel before the publication decision ends the call cancelled and publishes nothing"
+"cancel.post-decision.v1" = "a cancel after the publication decision leaves the call ok and its output installed"
+"errors.refused-unpublished.v1" = "a call refused for an input that is no PBF reports its typed kind and publishes nothing"
+"output.replace.v1" = "Overwrite::Replace replaces a seeded destination with the call's output"
+"output.refuse-existing.v1" = "a call that may not overwrite refuses a seeded destination and leaves the seed intact"
 
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.

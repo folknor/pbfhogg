@@ -7,7 +7,9 @@
 use super::{
     CLEAN_NONE, POLICY_DIFFERENCES, Scenario, cat_into, cat_plan, installed_ok, process_json,
 };
-use crate::protocol::{Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, ScenarioDecl};
+use crate::protocol::{
+    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
+};
 use crate::runner::{CallSpec, Ctx};
 use serde_json::{Value, json};
 
@@ -32,6 +34,7 @@ impl Scenario for IsolationCat {
                 id: "a",
                 label: "cat input -> out",
                 cli: Some(Counterpart::output(ARGV, Some(false), POLICY_DIFFERENCES)),
+                stream: STREAM_SEALED,
             }],
             roles: vec![
                 RoleDecl::dataset("input", "indexed"),
@@ -40,6 +43,7 @@ impl Scenario for IsolationCat {
             assertions: vec![AssertionDecl {
                 id: "a.outcome",
                 call: Some("a"),
+                covers: &[],
             }],
         }
     }

@@ -6,7 +6,7 @@
 use super::{CLEAN_NONE, POLICY_DIFFERENCES, Scenario, account, cat_into, cat_plan, process_json};
 use crate::protocol::{
     Arg, AssertionDecl, CallDecl, Counterpart, Expect, GeneratedKind, Outcome, Role, RoleDecl,
-    ScenarioDecl,
+    STREAM_SEALED, ScenarioDecl,
 };
 use crate::runner::{CallSpec, Ctx};
 use pbfhogg::{Decision, Effect};
@@ -39,6 +39,7 @@ impl Scenario for ErrorPath {
                     overwrite: Some(false),
                     policy_differences: POLICY_DIFFERENCES,
                 }),
+                stream: STREAM_SEALED,
             }],
             roles: vec![
                 RoleDecl {
@@ -52,6 +53,7 @@ impl Scenario for ErrorPath {
             assertions: vec![AssertionDecl {
                 id: "a.refused",
                 call: Some("a"),
+                covers: &["errors.refused-unpublished.v1"],
             }],
         }
     }

@@ -54,12 +54,18 @@ profiles and certifies a harness, to a protocol frozen at version 1
   as L5 (the seal, `#31` and `#32`, as L4; `#33` as L1). Still owed: a
   positive proof that writer framing runs on a caller's
   `Executor::Pool`, which needs a library observation point (L5 residue
-  in that note).
-- `#35`: the gate's capability ids in `[pbfhogg.library.require]`.
+  in that note). Required as `executor.caller-pool.v1`.
+- `#35` has landed as L6: `[pbfhogg.library.require]` in `brokkr.toml`
+  is this gate's applied form, and `brokkr library --all --dataset
+  denmark` is its check. Every scenario passes, but certification fails
+  on the required capabilities nothing covers yet: the caller pool
+  (`#34`), and the page-cache `Keep` policy and per-call counter
+  snapshots (`#39`).
 - `#36` (a reserving descriptor provider for concurrent calls,
   `host::FdPool`) has landed as L7, and `concurrent-cat` uses it.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
-  interval) have landed; `v2` still needs a certification under it.
+  interval) have landed; every counterpart now compares under `v2`, and
+  the certification that closes this gate is also `v2`'s.
 
 Still open with no ticket: **SIGPIPE on a FIFO whose reader left.**
 `MarkerFifo` writes to a FIFO; with no reader the write raises SIGPIPE.

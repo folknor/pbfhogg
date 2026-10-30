@@ -11,7 +11,8 @@ use super::{
     output_policy_json, overrides, process_json,
 };
 use crate::protocol::{
-    Arg, AssertionDecl, CallDecl, Counterpart, Expect, Outcome, Role, RoleDecl, ScenarioDecl, seed,
+    Arg, AssertionDecl, CallDecl, Counterpart, Expect, Outcome, Role, RoleDecl, STREAM_SEALED,
+    ScenarioDecl, seed,
 };
 use crate::runner::{CallSpec, Ctx};
 use pbfhogg::Overwrite;
@@ -59,6 +60,7 @@ impl Scenario for SeededReplace {
                         Some(true),
                         POLICY_DIFFERENCES,
                     )),
+                    stream: STREAM_SEALED,
                 },
                 CallDecl {
                     id: "refuse",
@@ -70,6 +72,7 @@ impl Scenario for SeededReplace {
                         overwrite: Some(false),
                         policy_differences: POLICY_DIFFERENCES,
                     }),
+                    stream: STREAM_SEALED,
                 },
             ],
             roles: vec![
@@ -81,14 +84,17 @@ impl Scenario for SeededReplace {
                 AssertionDecl {
                     id: "replace.outcome",
                     call: Some("replace"),
+                    covers: &["output.replace.v1"],
                 },
                 AssertionDecl {
                     id: "replace.seed-replaced",
                     call: Some("replace"),
+                    covers: &["output.replace.v1"],
                 },
                 AssertionDecl {
                     id: "refuse.refused",
                     call: Some("refuse"),
+                    covers: &["output.refuse-existing.v1"],
                 },
             ],
         }

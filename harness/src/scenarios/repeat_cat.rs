@@ -3,12 +3,17 @@
 //! equal output.
 
 use super::{CLEAN_NONE, POLICY_DIFFERENCES, Scenario, WRITE, cat_plan, installed_ok, overrides};
-use crate::protocol::{Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, ScenarioDecl};
+use crate::protocol::{
+    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
+};
 use crate::runner::{CallSpec, Ctx};
 use pbfhogg::{Output, Overwrite, Staging};
 use serde_json::{Value, json};
 
 pub(crate) struct RepeatCat;
+
+/// Both calls installed and their outputs are byte-identical.
+const REPEATABLE: &[&str] = &["calls.repeatable.v1"];
 
 /// The calls, each with the output role it owns and its assertion.
 const CALLS: [(&str, &str, &str); 2] = [("a", "out-a", "a.outcome"), ("b", "out-b", "b.outcome")];
@@ -32,6 +37,7 @@ impl Scenario for RepeatCat {
             id,
             label,
             cli: Some(Counterpart::output(argv, Some(false), POLICY_DIFFERENCES)),
+            stream: STREAM_SEALED,
         };
         ScenarioDecl {
             id: "repeat-cat",
@@ -52,14 +58,17 @@ impl Scenario for RepeatCat {
                 AssertionDecl {
                     id: "a.outcome",
                     call: Some("a"),
+                    covers: REPEATABLE,
                 },
                 AssertionDecl {
                     id: "b.outcome",
                     call: Some("b"),
+                    covers: REPEATABLE,
                 },
                 AssertionDecl {
                     id: "outputs-equal",
                     call: None,
+                    covers: REPEATABLE,
                 },
             ],
         }

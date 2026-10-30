@@ -408,7 +408,7 @@ fn cancel_post_decision_lets_the_publication_stand() {
 
 #[test]
 fn nofile_cat_is_refused_at_soft_1024() {
-    let (run, _) = scenario_passes("nofile-cat-refused", true, &["out"], &[]);
+    let (run, _) = scenario_passes("nofile-cat-refused", false, &["out"], &[]);
     let doc = run.doc("calls/a.json");
     assert_eq!(doc["context"]["rlimit_nofile_soft"], 1024);
     assert_eq!(doc["outcome"]["kind"], "invalid_argument");

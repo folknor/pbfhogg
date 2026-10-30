@@ -19,7 +19,8 @@ use super::{
     output_policy_json, overrides_json, process_json, write_json,
 };
 use crate::protocol::{
-    Arg, AssertionDecl, CallDecl, Counterpart, GeneratedKind, Outcome, Role, RoleDecl, ScenarioDecl,
+    Arg, AssertionDecl, CallDecl, Counterpart, GeneratedKind, Outcome, Role, RoleDecl,
+    STREAM_SEALED, ScenarioDecl,
 };
 use crate::runner::{CallRecord, CallSpec, Ctx, Process, Tap};
 use pbfhogg::debug::InstrumentSink;
@@ -39,6 +40,18 @@ const CAT_WANTS: u64 = 9;
 const BUDGET: u64 = 2 * CAT_WANTS;
 /// Nodes per generated block.
 const NODES_PER_BLOCK: i64 = 100;
+/// Both calls ran at once and completed, each holding its full grant from
+/// the shared pool across its scan.
+const CONCURRENT_POOL: &[&str] = &["calls.concurrent.v1", "fd.pool.v1"];
+/// Each call's sink got exactly its own cat counters.
+const OWN_COUNTERS: &[&str] = &["counters.own-call.v1"];
+/// The cat counters a passthrough call emits, each exactly once.
+const CAT_COUNTERS: [&str; 3] = [
+    "cat_blobs_passthrough",
+    "cat_blobs_decoded",
+    "cat_elements_written",
+];
+
 /// How long a request waits for the other call's.
 const GATE_WAIT: Duration = Duration::from_secs(60);
 
@@ -134,23 +147,25 @@ impl ProcessActions for Gated {
     }
 }
 
-/// One call's tap: whether its grant was still held at `CAT_SCAN_START`,
-/// and the cat counters it was delivered.
+/// One call's tap: whether its grant was still held at `CAT_SCAN_START`
+/// and at `CAT_SCAN_END` (release is sticky, so held at both is held
+/// throughout), and every cat counter sample it was delivered.
 struct Watch {
     released: Arc<AtomicBool>,
     held_at_scan: Mutex<Option<bool>>,
+    held_at_scan_end: Mutex<Option<bool>>,
     counters: Mutex<Vec<(String, i64)>>,
 }
 
 impl InstrumentSink for Watch {
     fn marker(&self, name: &str) {
-        if name == "CAT_SCAN_START" {
-            let held = !self.released.load(Ordering::Acquire);
-            *self
-                .held_at_scan
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(held);
-        }
+        let slot = match name {
+            "CAT_SCAN_START" => &self.held_at_scan,
+            "CAT_SCAN_END" => &self.held_at_scan_end,
+            _ => return,
+        };
+        let held = !self.released.load(Ordering::Acquire);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
     }
 
     fn counter(&self, name: &str, value: i64) {
@@ -168,14 +183,12 @@ impl Tap for Watch {
 }
 
 impl Watch {
-    fn counter_value(&self, name: &str) -> Option<i64> {
+    /// Every cat counter sample delivered, in order.
+    fn samples(&self) -> Vec<(String, i64)> {
         self.counters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| *v)
+            .clone()
     }
 }
 
@@ -194,6 +207,7 @@ impl Scenario for ConcurrentCat {
             id,
             label,
             cli: Some(Counterpart::output(argv, Some(false), POLICY_DIFFERENCES)),
+            stream: STREAM_SEALED,
         };
         ScenarioDecl {
             id: "concurrent-cat",
@@ -215,26 +229,32 @@ impl Scenario for ConcurrentCat {
                 AssertionDecl {
                     id: "a.outcome",
                     call: Some("a"),
+                    covers: CONCURRENT_POOL,
                 },
                 AssertionDecl {
                     id: "b.outcome",
                     call: Some("b"),
+                    covers: CONCURRENT_POOL,
                 },
                 AssertionDecl {
                     id: "a.own-counters",
                     call: Some("a"),
+                    covers: OWN_COUNTERS,
                 },
                 AssertionDecl {
                     id: "b.own-counters",
                     call: Some("b"),
+                    covers: OWN_COUNTERS,
                 },
                 AssertionDecl {
                     id: "lifetimes-intersected",
                     call: None,
+                    covers: CONCURRENT_POOL,
                 },
                 AssertionDecl {
                     id: "pool-whole-after",
                     call: None,
+                    covers: &["fd.pool.v1"],
                 },
             ],
         }
@@ -300,6 +320,7 @@ impl Scenario for ConcurrentCat {
                     Arc::new(Watch {
                         released,
                         held_at_scan: Mutex::new(None),
+                        held_at_scan_end: Mutex::new(None),
                         counters: Mutex::new(Vec::new()),
                     }),
                 )
@@ -388,32 +409,46 @@ fn judge(
         .held_at_scan
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    let held_end = *watch
+        .held_at_scan_end
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let released = gated.released.load(Ordering::Acquire);
     let ok = record.outcome.is_ok()
         && record.cancel.is_none()
         && super::published_once(record, Decision::Authorized, output, Effect::Installed)
         && granted == Some(CAT_WANTS)
         && held == Some(true)
+        && held_end == Some(true)
         && released;
     let outcome = Outcome::judge(
         outcome_id,
         ok,
         format!(
-            "{}, granted {granted:?}, held at CAT_SCAN_START {held:?}, released after {released}",
+            "{}, granted {granted:?}, held at CAT_SCAN_START {held:?} and CAT_SCAN_END \
+             {held_end:?}, released after {released}",
             account(record)
         ),
     );
-    // Exact values from the generated input, independent of what the
-    // call returned: every block of an indexed input is copied raw.
-    let passthrough = watch.counter_value("cat_blobs_passthrough");
-    let decoded = watch.counter_value("cat_blobs_decoded");
+    // The exact inventory, from the generated input and independent of
+    // what the call returned: every block of an indexed input is copied
+    // raw, so none is decoded and no element is re-encoded. Each name once,
+    // no other cat counter: a sample delivered to both taps shows twice.
     let expected = i64::try_from(blocks).unwrap_or(i64::MAX);
+    let mut samples = watch.samples();
+    samples.sort();
+    let mut inventory: Vec<(String, i64)> = CAT_COUNTERS
+        .iter()
+        .zip([expected, 0, 0])
+        .map(|(name, value)| ((*name).to_owned(), value))
+        .collect();
+    inventory.sort();
     let own = Outcome::judge(
         counters_id,
-        passthrough == Some(expected) && decoded == Some(0),
+        samples == inventory,
         format!(
-            "delivered to this call's tap: cat_blobs_passthrough {passthrough:?} \
-             (its input has {blocks} blocks), cat_blobs_decoded {decoded:?}"
+            "delivered to this call's tap: {samples:?}; expected each once: {inventory:?} \
+             (its input has {blocks} blocks)"
         ),
     );
     [outcome, own]

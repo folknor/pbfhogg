@@ -75,6 +75,7 @@ pub(crate) fn declared(scenario: &dyn Scenario) -> ScenarioDecl {
     decl.assertions.push(AssertionDecl {
         id: DIAGNOSTICS_CLOSED,
         call: None,
+        covers: &[],
     });
     decl
 }

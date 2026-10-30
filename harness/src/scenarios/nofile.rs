@@ -3,10 +3,14 @@
 //! untouched, read back, reported in each context), before any library
 //! work.
 //!
-//! `nofile-cat-refused`: cat of 1100 distinct spellings of one input asks
+//! `nofile-cat-refused`: cat of 1100 distinct spellings of one path asks
 //! for 1108 descriptors, more than the soft limit allows whatever is open,
-//! so it is refused before any input is pinned. No counterpart: the CLI
-//! raises its soft limit whenever a command asks, so it would not refuse.
+//! so it is refused before any input is pinned. The path does not exist:
+//! had the call opened or read an input before its descriptor admission,
+//! that would have failed first with a not-found I/O error, so the typed
+//! descriptor refusal (with `CAT_SCAN_START` never passed) shows admission
+//! ran before any input was acquired. No counterpart: the CLI raises its
+//! soft limit whenever a command asks, so it would not refuse.
 //!
 //! `nofile-altw-external`: the external join at fixed parallelism 8 (a CPU
 //! cap of 6 stage-1 workers) is held to 3 by the descriptor allowance,
@@ -20,7 +24,9 @@ use super::{
     overrides_json, process_json, published_once, write_json,
 };
 use crate::process::Nofile;
-use crate::protocol::{Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, ScenarioDecl};
+use crate::protocol::{
+    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
+};
 use crate::runner::{CallSpec, Ctx, Tap};
 use pbfhogg::altw::{AltwOptions, IndexType};
 use pbfhogg::debug::InstrumentSink;
@@ -43,28 +49,28 @@ impl Scenario for NofileCatRefused {
     fn decl(&self) -> ScenarioDecl {
         ScenarioDecl {
             id: "nofile-cat-refused",
-            description: "cat of 1100 distinct input spellings at soft RLIMIT_NOFILE 1024, refused up front",
+            description: "cat of 1100 spellings of a missing path at soft RLIMIT_NOFILE 1024, refused up front",
             deadline_s: 120,
             hotpath: false,
             isolation: false,
             calls: vec![CallDecl {
                 id: "a",
-                label: "cat 1100 spellings of input -> out at soft nofile 1024",
+                label: "cat 1100 spellings of a missing path -> out at soft nofile 1024",
                 cli: None,
+                stream: STREAM_SEALED,
             }],
-            roles: vec![
-                RoleDecl::dataset("input", "indexed"),
-                RoleDecl::output("out", "a"),
-            ],
+            roles: vec![RoleDecl::output("out", "a")],
             assertions: vec![AssertionDecl {
                 id: "a.refused",
                 call: Some("a"),
+                covers: &["nofile.cat-refused.v1"],
             }],
         }
     }
 
     fn plan(&self) -> Value {
-        let inputs = json!({ "role": "input", "spellings": SPELLINGS,
+        let inputs = json!({ "path": "absent.osm.pbf in the call's private directory, never created",
+                             "spellings": SPELLINGS,
                              "spelling": "k ./ segments before the file name, k from 0" });
         json!({
             "schedule": { "order": ["a"], "concurrency": "sequential",
@@ -80,35 +86,75 @@ impl Scenario for NofileCatRefused {
     }
 
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        let input = ctx.binding("input");
-        let (Some(dir), Some(name)) = (input.parent(), input.file_name()) else {
-            return Err("the input has no directory".to_owned());
-        };
-        // Raw spellings: `dir/./name`, `dir/././name`, ... Each is its own
-        // pin (cat compares spellings byte for byte), none is opened.
-        let spellings: Vec<PathBuf> = (0..SPELLINGS)
-            .map(|k| {
-                let mut path = OsString::from(dir.as_os_str());
-                path.push("/");
-                for _ in 0..k {
-                    path.push("./");
-                }
-                path.push(name);
-                PathBuf::from(path)
-            })
-            .collect();
-        let record = ctx.call(CallSpec::plain("a"), |host, env| {
+        let markers = Arc::new(Markers(Mutex::new(Vec::new())));
+        let mut spec = CallSpec::plain("a");
+        spec.tap = Some(Arc::clone(&markers) as Arc<dyn Tap>);
+        let mut missing_exists = false;
+        let record = ctx.call(spec, |host, env| {
+            // Raw spellings: `dir/./name`, `dir/././name`, ... Each is its
+            // own pin (cat compares spellings byte for byte).
+            let dir = env.private_dir();
+            missing_exists = !super::absent(&dir.join(MISSING));
+            let spellings: Vec<PathBuf> = (0..SPELLINGS)
+                .map(|k| {
+                    let mut path = OsString::from(dir.as_os_str());
+                    path.push("/");
+                    for _ in 0..k {
+                        path.push("./");
+                    }
+                    path.push(MISSING);
+                    PathBuf::from(path)
+                })
+                .collect();
             let inputs: Vec<&std::path::Path> = spellings.iter().map(PathBuf::as_path).collect();
             super::cat_into(env, &inputs, "out", None, &CLEAN_NONE, host).map(drop)
         })?;
         let out_absent = super::absent(ctx.binding("out"));
+        let scanned = markers.saw("CAT_SCAN_START");
         let ok = record.outcome.error().is_some_and(|(kind, message)| {
             kind == "invalid_argument" && message.contains("descriptors")
         }) && published_once(&record, Decision::RefusedError, "out", Effect::None)
-            && out_absent;
-        let detail = format!("{}, output absent {out_absent}", account(&record));
+            && out_absent
+            && !scanned
+            && !missing_exists;
+        let detail = format!(
+            "{}, output absent {out_absent}, CAT_SCAN_START passed {scanned}, \
+             missing input existed {missing_exists}",
+            account(&record)
+        );
         ctx.finish_call(&record, &[Outcome::judge("a.refused", ok, detail)])?;
         Ok(Vec::new())
+    }
+}
+
+/// The input the refused cat names, under its private directory, never
+/// created.
+const MISSING: &str = "absent.osm.pbf";
+
+/// Records every marker its call passes.
+struct Markers(Mutex<Vec<String>>);
+
+impl InstrumentSink for Markers {
+    fn marker(&self, name: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(name.to_owned());
+    }
+    fn counter(&self, _name: &str, _value: i64) {}
+}
+
+impl Tap for Markers {
+    fn release(&self) {}
+}
+
+impl Markers {
+    fn saw(&self, name: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|n| n == name)
     }
 }
 
@@ -117,6 +163,10 @@ pub(crate) struct NofileAltwExternal;
 /// The fixed parallelism: a CPU cap of 6 stage-1 workers, above the 3 the
 /// descriptor allowance gives.
 const ALTW_PARALLELISM: usize = 8;
+
+/// Sized from the caller's parallelism and the descriptor allowance, three
+/// stage-1 workers ran and the join completed.
+const ALTW_EXTERNAL: &[&str] = &["nofile.altw-external.v1"];
 
 const ARGV: &[Arg] = &[
     Arg::Literal("add-locations-to-ways"),
@@ -183,6 +233,7 @@ impl Scenario for NofileAltwExternal {
                     overwrite: Some(false),
                     policy_differences: ALTW_DIFFERENCES,
                 }),
+                stream: STREAM_SEALED,
             }],
             roles: vec![
                 RoleDecl::dataset("input", "indexed"),
@@ -192,10 +243,12 @@ impl Scenario for NofileAltwExternal {
                 AssertionDecl {
                     id: "a.outcome",
                     call: Some("a"),
+                    covers: ALTW_EXTERNAL,
                 },
                 AssertionDecl {
                     id: "a.three-workers",
                     call: Some("a"),
+                    covers: ALTW_EXTERNAL,
                 },
             ],
         }
@@ -253,14 +306,16 @@ impl Scenario for NofileAltwExternal {
             )
             .map(drop)
         })?;
-        let (cpu, fd, available) = (
+        let (cpu, fd, ran, available) = (
             workers.get("extjoin_cpu_cap_workers"),
             workers.get("extjoin_fd_cap_workers"),
+            workers.get("extjoin_num_shard_workers"),
             workers.get("extjoin_fd_available"),
         );
-        let three = cpu == Some(6) && fd == Some(3);
+        let three = cpu == Some(6) && fd == Some(3) && ran == Some(3);
         let detail = format!(
-            "cpu cap {cpu:?}, descriptor cap {fd:?}, descriptors available {available:?}: \
+            "cpu cap {cpu:?}, descriptor cap {fd:?}, shard workers run {ran:?}, \
+             descriptors available {available:?}: \
              workers are the smaller cap; three need 832 to 1087 available at soft {SOFT}"
         );
         let results = [

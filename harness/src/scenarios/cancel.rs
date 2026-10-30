@@ -19,7 +19,9 @@ use super::{
     CLEAN_NONE, POLICY_DIFFERENCES, Scenario, account, cat_into, cat_plan, process_json,
     published_once,
 };
-use crate::protocol::{Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, ScenarioDecl};
+use crate::protocol::{
+    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
+};
 use crate::runner::{CallSpec, Ctx, Tap};
 use pbfhogg::debug::InstrumentSink;
 use pbfhogg::host::Invocation;
@@ -32,6 +34,7 @@ pub(crate) struct CancelCat {
     description: &'static str,
     marker: &'static str,
     post: bool,
+    covers: &'static [&'static str],
 }
 
 impl CancelCat {
@@ -40,12 +43,14 @@ impl CancelCat {
         description: "cat whose tap cancels at CAT_SCAN_START, before its output is decided",
         marker: "CAT_SCAN_START",
         post: false,
+        covers: &["cancel.pre-decision.v1"],
     };
     pub(crate) const POST_DECISION: Self = Self {
         id: "cancel-post-decision",
         description: "cat whose tap cancels at PUBLISH_START, after its output was authorized",
         marker: "PUBLISH_START",
         post: true,
+        covers: &["cancel.post-decision.v1"],
     };
 }
 
@@ -110,6 +115,7 @@ impl Scenario for CancelCat {
                 cli: self
                     .post
                     .then(|| Counterpart::output(ARGV, Some(false), POLICY_DIFFERENCES)),
+                stream: STREAM_SEALED,
             }],
             roles: vec![
                 RoleDecl::dataset("input", "indexed"),
@@ -118,6 +124,7 @@ impl Scenario for CancelCat {
             assertions: vec![AssertionDecl {
                 id: "a.cancel",
                 call: Some("a"),
+                covers: self.covers,
             }],
         }
     }

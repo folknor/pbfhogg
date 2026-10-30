@@ -672,6 +672,19 @@ readable file exits 0 (`--indexed` alone answers yes or no in its exit code).
 Whether the file's contents match its claims, or meet the format's
 invariants, is [`check`](#check)'s question.
 
+The scanning report's full-decode modes (`--extended`, `--distrust-metadata`,
+`--locations`, and the fallback taken when a data blob carries no indexdata)
+require every OSMData block to pass the strict block reader's construction
+checks: element and packed-array framing, the parallel-array length checks and
+stringtable UTF-8. They require this even where the faulty field feeds no
+reported statistic, such as a malformed way `refs` array under `--extended`.
+A failure aborts the report as a read error (exit 2, with the blob's byte
+offset); inspect does not present the blocks it did read as whole-file totals.
+A successful report is not an integrity verdict either: the construction
+checks do not resolve string indices, for one. The default index-only report
+decodes no payload and reports the stored claims, so it can succeed on the same
+file.
+
 On indexed PBFs, uses an index-only fast path that reads blob headers without decompression (~36ms on 473 MB vs ~4s for full decode).
 
 ```

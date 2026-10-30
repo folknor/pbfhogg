@@ -457,13 +457,6 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-054: Full-decode inspect refuses statistically irrelevant bad structures
-
-Full-decode inspect refuses files whose bad structures (for example
-malformed way refs) affect no reported statistic, because validation runs
-in full. Possibly intended; nothing documents it as a choice. Decide and
-document.
-
 ---
 
 ## Documentation and comment corrections

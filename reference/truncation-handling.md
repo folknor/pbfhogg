@@ -252,6 +252,19 @@ fails to parse. There is deliberately **no lenient mode**. A
 reader that wants partial data from a corrupt file gets a hard
 error and the byte offset instead.
 
+This holds for consumers that report on fields the failing check
+does not touch. The full-decode modes of `inspect`'s scanning report
+refuse a block with a malformed way `refs` array even though no
+statistic reads it: after a read failure the report has not
+established complete aggregates, and the blocks read so far must
+not be presented as whole-file totals. The acceptance set is the
+chosen boundary, not an artifact of `PrimitiveBlock`
+construction, so a projection scanner that replaces construction
+in those modes keeps refusing exactly what the block reader
+refuses. Lookups and specialised scanners (`inspect --show`,
+`inspect --nodes`, `src/scan/node.rs`) are not bound by this
+paragraph; their own docs state what they check.
+
 The two dense-node arrays that array-length equality could not
 express are covered as well. `keys_vals` is a single flat array of
 zero-terminated per-node tag runs, so it is walked once per block

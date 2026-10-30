@@ -444,8 +444,9 @@ any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
   args and id-spec text files; ids harvested from a separate PBF
   via `--id-osm-file` are not validated (the source PBF's contents
   are treated as opaque data, matching the project-wide stance that
-  passthrough commands like `cat`/`sort`/`inspect` do not validate
-  PBF payloads). The blob-prefilter (`IdSet::any_in_range` at
+  commands do not police element values such as ID sign; structural
+  checks on decoded blocks are a separate matter, see
+  `reference/truncation-handling.md`). The blob-prefilter (`IdSet::any_in_range` at
   `src/idset.rs`) clamps `min_id < 0` to 0 so a *target* PBF whose
   indexdata range straddles zero correctly screens in its positive
   portion - without the clamp the unsigned cast wraps and the blob

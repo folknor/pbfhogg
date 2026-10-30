@@ -1,6 +1,7 @@
 //! One launch in `--test-harness` mode: read the request, establish the
-//! plan's process policy, run the scenario's calls one by one, and write
-//! the artefacts (`brokkr man library`, The run protocol and The
+//! plan's process policy, run setup, run the scenario's calls (one after
+//! another, or on threads of their own where the plan runs them at once),
+//! and write the artefacts (`brokkr man library`, The run protocol and The
 //! artefacts).
 //!
 //! Each call, in this order:
@@ -16,7 +17,8 @@
 //! 4. The seal attempt (`Invocation::seal`), then `seal_us`. A seal ends
 //!    the call stream (its sealing emissions and terminal record) before it
 //!    returns; the census of an outstanding attempt is kept as taken then.
-//! 5. Every value of the call dropped. The library's work does not outlive
+//! 5. The call's tap, if it has one, released (dropping the invocation it
+//!    may hold), then every value of the call dropped. The library's work does not outlive
 //!    the call that started it (its pools are joined, its writers wait for
 //!    their framing), so once the host is gone nothing of the call can
 //!    still report.
@@ -30,9 +32,10 @@
 use crate::diag::Collector;
 use crate::outcome::CallOutcome;
 use crate::protocol::{Outcome, PROTOCOL, ScenarioDecl, Status};
-use pbfhogg::debug::{CallId, MarkerFifo, StreamAccount, StreamState};
+use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo, StreamAccount, StreamState};
 use pbfhogg::host::{
-    Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy, SealOutcome,
+    Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy,
+    ProcessActions, SealOutcome,
 };
 use pbfhogg::{Decision, Effect};
 use serde_json::{Value, json};
@@ -122,7 +125,7 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     let fifo =
         MarkerFifo::open(fifo_path).map_err(|e| format!("cannot open the marker FIFO: {e}"))?;
     // The plan's process policy, before any library work.
-    crate::process::raise_nofile_to_hard()?;
+    scenario.nofile().apply()?;
     // Held to the end of this function: the profile covers every call and
     // its cleanup, and is written when the guard drops, after scenario.json.
     let _guard = launch.profile.then(|| {
@@ -140,10 +143,12 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
         fifo,
         private_dir: launch.private_dir,
         calls_dir,
-        settings: Settings::establish(),
+        settings: Settings::establish(scenario.starts_global_pool()),
         all_passed: true,
         late: Vec::new(),
     };
+    // Setup: every generated role, before any call.
+    scenario.setup(&ctx)?;
     let mut results = scenario.run(&mut ctx)?;
     let late = ctx.late_report();
     results.push(Outcome::judge(
@@ -173,10 +178,12 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     Ok(if passed { Exit::Passed } else { Exit::Failed })
 }
 
-/// Every role bound and nothing else; inputs existing files; output
-/// destinations absent, under resolvable directories, and naming neither an
-/// input nor each other once the directories are resolved.
+/// Every role bound and nothing else; inputs existing files; outputs and
+/// generated roles under resolvable directories, absent (a seeded output
+/// holding exactly its seed), and naming neither an input nor each other
+/// once the directories are resolved.
 fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> Result<(), String> {
+    use crate::protocol::Role;
     let declared: Vec<&str> = decl.roles.iter().map(|r| r.id).collect();
     let bound: Vec<&str> = bindings.keys().map(String::as_str).collect();
     let mut sorted = declared.clone();
@@ -190,7 +197,7 @@ fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> 
     for role in &decl.roles {
         let path = &bindings[role.id];
         let resolved = match role.role {
-            crate::protocol::Role::Dataset { .. } => {
+            Role::Dataset { .. } => {
                 let real = path
                     .canonicalize()
                     .map_err(|e| format!("input {}: {e}", role.id))?;
@@ -199,45 +206,54 @@ fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> 
                 }
                 real
             }
-            crate::protocol::Role::OutputPbf { .. } => {
-                if path.symlink_metadata().is_ok() {
-                    return Err(format!("output {} already exists", role.id));
+            Role::Generated { .. } | Role::OutputPbf { .. } => {
+                let seeded = matches!(role.role, Role::OutputPbf { seeded: true, .. });
+                let initial_ok = if seeded {
+                    path.symlink_metadata().is_ok_and(|m| m.is_file())
+                        && std::fs::read(path).is_ok_and(|b| b == crate::protocol::seed(role.id))
+                } else {
+                    path.symlink_metadata().is_err()
+                };
+                if !initial_ok {
+                    return Err(format!("role {} is not in its initial state", role.id));
                 }
                 let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-                    return Err(format!("output {} has no directory", role.id));
+                    return Err(format!("role {} has no directory", role.id));
                 };
                 let parent = parent
                     .canonicalize()
-                    .map_err(|e| format!("output {}: {e}", role.id))?;
+                    .map_err(|e| format!("role {}: {e}", role.id))?;
                 parent.join(name)
             }
         };
-        // Inputs may share a file; an output shares its path with nothing.
-        let is_output = matches!(role.role, crate::protocol::Role::OutputPbf { .. });
+        // Inputs may share a file; a written role shares its path with
+        // nothing.
+        let is_written = !matches!(role.role, Role::Dataset { .. });
         let clash = seen
             .iter()
-            .find(|(p, other_is_output, _)| *p == resolved && (is_output || *other_is_output));
+            .find(|(p, other_written, _)| *p == resolved && (is_written || *other_written));
         if let Some((_, _, other)) = clash {
             return Err(format!("roles {other} and {} name one path", role.id));
         }
-        seen.push((resolved, is_output, role.id));
+        seen.push((resolved, is_written, role.id));
     }
     Ok(())
 }
 
-/// The host settings every call of this launch gets, read once.
+/// The machine settings this launch read once.
 struct Settings {
     parallelism: Option<NonZeroUsize>,
-    /// The ambient rayon pool's size. Reading it starts rayon's global pool
-    /// here, during setup, so no call pays for starting it.
-    executor_threads: usize,
+    /// The ambient rayon pool's size, when the scenario starts it: reading
+    /// it starts rayon's global pool here, during setup, so no call pays
+    /// for starting it. `None` for a scenario that leaves it unstarted.
+    ambient_threads: Option<usize>,
 }
 
 impl Settings {
-    fn establish() -> Self {
+    fn establish(start_global_pool: bool) -> Self {
         Self {
             parallelism: std::thread::available_parallelism().ok(),
-            executor_threads: rayon::current_num_threads(),
+            ambient_threads: start_global_pool.then(rayon::current_num_threads),
         }
     }
 }
@@ -269,19 +285,95 @@ pub(crate) struct Published {
     pub(crate) members: Vec<(&'static str, Effect)>,
 }
 
+/// A tap on a call's stream: an [`InstrumentSink`] the runner releases
+/// once the call's seal was attempted, before the call's host is dropped
+/// and its diagnostics closed. Releasing drops whatever the tap holds of
+/// the call (its invocation, which would otherwise keep itself alive
+/// through its own tap); what it observed stays readable.
+pub(crate) trait Tap: InstrumentSink {
+    fn release(&self);
+}
+
+/// Releases a tap when dropped, so an early return cannot leave the
+/// invocation holding itself.
+struct Released(Option<Arc<dyn Tap>>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        if let Some(tap) = self.0.take() {
+            tap.release();
+        }
+    }
+}
+
+/// The rayon pool a call's work runs on.
+pub(crate) enum Exec {
+    /// The global pool, which the scenario started during setup.
+    Ambient,
+    /// A pool the harness built for the call.
+    Pool(Arc<rayon::ThreadPool>),
+}
+
+/// A call's process actions.
+pub(crate) enum Process {
+    /// `NoProcessActions`: the descriptor allowance is the soft limit less
+    /// the descriptors open at the request.
+    None,
+    /// A reserving pool of `budget` descriptors shared by concurrent calls,
+    /// as the harness wraps it.
+    Pool {
+        actions: Arc<dyn ProcessActions>,
+        budget: u64,
+    },
+}
+
+/// The host a call gets, and the tap on its stream.
+pub(crate) struct CallSpec {
+    pub(crate) id: &'static str,
+    /// `None`: the machine's parallelism.
+    pub(crate) parallelism: Option<NonZeroUsize>,
+    pub(crate) executor: Exec,
+    pub(crate) process: Process,
+    /// The output stance the call's body uses, for its context.
+    pub(crate) overwrite: &'static str,
+    pub(crate) tap: Option<Arc<dyn Tap>>,
+}
+
+impl CallSpec {
+    /// The default host: machine parallelism, the ambient pool, no process
+    /// actions, refusing an existing output, no tap.
+    pub(crate) fn plain(id: &'static str) -> Self {
+        Self {
+            id,
+            parallelism: None,
+            executor: Exec::Ambient,
+            process: Process::None,
+            overwrite: "refuse",
+            tap: None,
+        }
+    }
+}
+
 /// Everything a call document reports, before its assertions.
 pub(crate) struct CallRecord {
     pub(crate) id: &'static str,
     pub(crate) outcome: CallOutcome,
     pub(crate) publications: Vec<Published>,
     pub(crate) cancel: Option<pbfhogg::CancelOutcome>,
-    entry_us: u64,
-    return_us: u64,
+    pub(crate) entry_us: u64,
+    pub(crate) return_us: u64,
     seal_us: u64,
     seal: SealOutcome,
     stream: StreamAccount,
     context: Value,
     diagnostics: Vec<Value>,
+    collector: Arc<Collector>,
+}
+
+impl CallRecord {
+    pub(crate) fn sealed(&self) -> bool {
+        matches!(self.seal, SealOutcome::Sealed(_))
+    }
 }
 
 /// The run of one scenario: what its calls share.
@@ -307,32 +399,42 @@ impl Ctx<'_> {
             .map_or(Path::new(""), PathBuf::as_path)
     }
 
-    /// Run call `id` (steps 1 to 6 of the module's order).
+    /// Run one call (steps 1 to 6 of the module's order). Takes `&self`, so
+    /// calls the plan runs concurrently run on threads of their own.
     pub(crate) fn call(
-        &mut self,
-        id: &'static str,
+        &self,
+        spec: CallSpec,
         body: impl FnOnce(&Host, &CallEnv<'_>) -> pbfhogg::Result<()>,
     ) -> Result<CallRecord, String> {
+        let id = spec.id;
+        let context = self.context(&spec)?;
         let sink = self
             .fifo
             .call(CallId::new(id).map_err(|e| e.report())?)
             .map_err(|e| e.report())?;
-        let invocation = Invocation::with_call_sink(sink, None);
+        let tap = spec.tap.clone().map(|tap| tap as Arc<dyn InstrumentSink>);
+        let invocation = Invocation::with_call_sink(sink, tap);
+        let released = Released(spec.tap);
         let collector = Arc::new(Collector::new(self.fifo.clone()));
         let host = Host {
             diagnostics: Diagnostics::new(
                 Arc::clone(&collector) as Arc<dyn pbfhogg::host::DiagnosticSink>
             ),
-            process: Arc::new(NoProcessActions),
+            process: match &spec.process {
+                Process::None => Arc::new(NoProcessActions),
+                Process::Pool { actions, .. } => Arc::clone(actions),
+            },
             resources: Arc::new(Fixed {
-                parallelism: self.settings.parallelism,
+                parallelism: spec.parallelism.or(self.settings.parallelism),
                 memory_available: None,
             }),
             page_cache: PageCachePolicy::Keep,
-            executor: Executor::Ambient,
+            executor: match &spec.executor {
+                Exec::Ambient => Executor::Ambient,
+                Exec::Pool(pool) => Executor::Pool(Arc::clone(pool)),
+            },
             invocation: invocation.clone(),
         };
-        let context = self.context()?;
         let env = CallEnv {
             bindings: self.bindings,
             private_dir: self.private_dir,
@@ -347,13 +449,13 @@ impl Ctx<'_> {
         // call's values are dropped before the document is written.
         let seal = invocation.seal();
         let seal_us = self.fifo.now_us();
+        drop(released);
         drop(host);
         let diagnostics = collector
             .close()
             .iter()
             .map(crate::diag::Captured::to_json)
             .collect();
-        self.late.push((id, collector));
         let publications = self.publications(id, &invocation)?;
         let stream = invocation
             .stream_account()
@@ -370,21 +472,40 @@ impl Ctx<'_> {
             stream,
             context,
             diagnostics,
+            collector,
         })
     }
 
-    fn context(&self) -> Result<Value, String> {
-        Ok(json!({
-            "parallelism": self.settings.parallelism.map(NonZeroUsize::get),
+    /// Every effective per-call setting, from the spec the host is built
+    /// from.
+    fn context(&self, spec: &CallSpec) -> Result<Value, String> {
+        let (executor, threads) = match &spec.executor {
+            Exec::Ambient => (
+                "ambient",
+                self.settings
+                    .ambient_threads
+                    .ok_or("an ambient call in a scenario that leaves the global pool unstarted")?,
+            ),
+            Exec::Pool(pool) => ("pool", pool.current_num_threads()),
+        };
+        let mut context = json!({
+            "parallelism": spec.parallelism.or(self.settings.parallelism).map(NonZeroUsize::get),
             "memory_available": null,
-            "executor": "ambient",
-            "executor_threads": self.settings.executor_threads,
+            "executor": executor,
+            "executor_threads": threads,
             "page_cache": "keep",
             "process_actions": "none",
             "rlimit_nofile_soft": crate::process::soft_nofile()?.to_json(),
-            "overwrite": "refuse",
+            "overwrite": spec.overwrite,
             "staging": "dir_with_backups_private",
-        }))
+        });
+        if let (Process::Pool { budget, .. }, Some(object)) =
+            (&spec.process, context.as_object_mut())
+        {
+            object.insert("process_actions".to_owned(), json!("fd_pool"));
+            object.insert("fd_pool_budget".to_owned(), json!(budget));
+        }
+        Ok(context)
     }
 
     /// The call's publications, each member's destination mapped to the
@@ -426,6 +547,7 @@ impl Ctx<'_> {
         results: &[Outcome],
     ) -> Result<(), String> {
         self.all_passed &= results.iter().all(|r| r.status == Status::Pass);
+        self.late.push((record.id, Arc::clone(&record.collector)));
         let publications: Vec<Value> = record
             .publications
             .iter()

@@ -51,8 +51,8 @@ from the 2026-10-29 session and is recorded nowhere else.
   with the user again, as that procedure requires.
 
 **What to build, in order:** the landing table at the end of this note,
-run as L5, then L6. L7 (#36, the reserving descriptor provider the
-concurrent scenarios need) has landed; see the landing list.
+L6 next. L5 (the scenarios) and L7 (#36, the reserving descriptor
+provider) have landed; see the landing list.
 
 L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
 digest` prints the full form, `xxh128 v2`, in `v1`'s four-line grammar,
@@ -72,7 +72,8 @@ a certification under `v1` holds for `v1` only.
 
 **bz state:**
 - **pbfhogg#31 and #32** are closed by L4.
-- **#34 and #35** are open and map to the landings. #33 (L1) and #36
+- **#34** is narrowed to L5's residue (positive caller-pool framing
+  proof). **#35** is open and maps to L6. #33 (L1) and #36
   (L7) are closed. #37 (L8) is closed; its re-certification is L8's gate below.
 - **#30 and #38** are closed.
 - **brokkr#58, #59 and #60 are closed** (brokkr `2f407c3`, `6074751` and
@@ -654,7 +655,9 @@ its final value is a defect.
   - `expect: "output"` for calls expected to publish.
   - `expect: "refusal"` for refused or failing calls, with a required
     `exit` (2: pbfhogg's runtime refusal; never 64, a usage error). A
-    cancelled call gets none.
+    call whose outcome is cancelled gets none; one cancelled after its
+    decision returns ok with its publication complete, and keeps an
+    `output` counterpart.
   - `overwrite` is declared per counterpart.
 - **Harness rules from brokkr#59:**
   - no call publishes content identical to its role's seed;
@@ -878,10 +881,56 @@ Landed independently, 2026-10-29:
   - `nofile-altw-external`'s three stage-1 workers need fixed resources
     giving `cpu_cap` of at least 3 (parallelism 5 or more, less the 2
     reserved), not just the lowered limit.
+- L5, the remaining scenarios (#34): the commit that carries this line.
+  Every scenario of Decision E's table besides `repeat-cat`. The runner
+  takes a per-call spec (parallelism, executor, process actions, overwrite
+  stance, tap) from which both the host and the context are built, runs
+  calls on threads of their own where the plan runs them at once, applies a
+  per-scenario soft `RLIMIT_NOFILE` policy (raise to hard, or set exactly,
+  hard untouched) before any library work, runs setup for generated roles,
+  and starts rayon's global pool only for scenarios that use it. The
+  protocol types gained generated and seeded roles, `hotpath`, `isolation`,
+  `scratch` and refusal counterparts. Rulings (sparred):
+  - `concurrent-cat` reads two generated inputs of one and three blocks.
+    Overlap is proven by parking in the caller's `ProcessActions`, not in
+    the sink (which must not block): each call's wrapper around the shared
+    `FdPool` waits at a two-party gate after its grant, and the second
+    arrival reads the pool empty while both are held (a timeout is sticky).
+    Each wrapper tracks its own grant's release, which its tap reads at
+    `CAT_SCAN_START`, so cat's retention is checked, not only the pool's
+    charge. Counter equality is checked on each call's tap; the executable
+    test checks the tagged FIFO counters.
+  - The cancel scenarios cancel from the tap, on the calling thread. The
+    `InstrumentSink` contract now names `Invocation::cancel` as the one
+    call a callback may make into its own invocation (it takes only the
+    publication log's lock, under which nothing runs but bookkeeping). The
+    tap holds the invocation in a slot; the runner releases every tap after
+    the seal attempt, before the host drops, on every path.
+  - `cancel-post-decision` returns ok with its publication installed and
+    has an `output` counterpart.
+  - `nofile-cat-refused` names 1100 raw spellings of one input (`./`
+    segments), which cat pins one each, and has no counterpart: the CLI
+    raises its soft limit when a command asks.
+  - `nofile-altw-external` runs at fixed parallelism 8 (a CPU cap of 6), so
+    the descriptor cap, 3, binds; the assertion fails, naming the
+    allowance, on a launch holding enough descriptors to leave fewer than
+    832 available.
+  - `seeded-replace`'s refused call is refused when its output is built,
+    so it records no publication; no fault is armed.
+  - `isolation-cat` is also the `hotpath` scenario (profiled once,
+    `--hotpath --force`, with a valid report).
+  Gate: bare `brokkr library` (the listing; with `--dataset` brokkr
+  requires a scenario or `--all`), then each of the nine with
+  `brokkr library SCENARIO --dataset denmark`, all passing. Residue:
+  - `fixed-resources-executor` proves only that the call never initialised
+    rayon's global registry (`build_global` succeeds afterwards). That the
+    writer framed on the caller's pool is not shown: a framing path that
+    ignored the executor would pass. It needs an observation point in the
+    library; until then L6 must not let this scenario cover a
+    caller-pool-execution capability.
 
 | # | Landing | Gate |
 |---|---|---|
-| L5 | The remaining scenarios | `brokkr library --dataset denmark`, then each scenario once |
 | L6 | #35 capability ids and `covers` / `stream` declarations | `brokkr library --all --dataset denmark` certifies |
 | L8 | #37 full-fidelity digest `v2`. Landed: `digest` defaults to `--form full` (`v2`), `--form content` keeps `v1`; brokkr accepts both (brokkr#60). Remaining: certify again once a harness exists | `brokkr check` (passed at landing); `brokkr library --all --dataset denmark`, pending a harness |
 

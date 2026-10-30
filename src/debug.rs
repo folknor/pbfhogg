@@ -17,8 +17,13 @@ use crate::tunables::PIPE_BUF;
 /// samples (so a sink sees one category's totals in increasing order). So a
 /// sink must be prompt and non-blocking, and must not run library work under
 /// the same invocation (re-entering the library from a callback can
-/// deadlock on those locks). A panic in a callback is contained: the
-/// invocation stops calling that sink and the run carries on. A sink's own
+/// deadlock on those locks). The one exception is
+/// [`Invocation::cancel`](crate::host::Invocation::cancel), which a
+/// callback may call on its own invocation: it takes only the publication
+/// log's lock, under which nothing runs but the log's own bookkeeping, and
+/// never waits for a publication in progress. A panic in a callback is
+/// contained: the invocation stops calling that sink and the run carries
+/// on. A sink's own
 /// destructor runs when the last clone of its invocation drops, and must not
 /// panic. Every callback runs inside a call or under a permit of its
 /// invocation, so a seal of that invocation cannot happen while one is

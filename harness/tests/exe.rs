@@ -1,6 +1,6 @@
 //! The harness executable against brokkr's library protocol: describe mode,
-//! a passing `repeat-cat` run over a generated input, the identity of its
-//! plan and contexts, and quiet refusals.
+//! a passing run of every scenario over a generated input, the identity of
+//! `repeat-cat`'s plan and contexts, and quiet refusals.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -298,6 +298,150 @@ fn plan_and_contexts_identify_the_workload() {
     assert_eq!(first.0, narrower.0);
     assert_eq!(narrower.1["executor_threads"], 1);
     assert_ne!(first.1, narrower.1);
+}
+
+/// One launch of `scenario`, its dataset role `input` (when `dataset`)
+/// bound to a generated input, every other role under `roles/` (the `seeded` ones
+/// starting as their seed, as brokkr lays them out). Asserts a quiet exit
+/// 0 and every result passing; returns the run directory and FIFO lines.
+#[allow(clippy::disallowed_methods)] // seeds in test scratch
+fn scenario_passes(
+    scenario: &str,
+    dataset: bool,
+    roles: &[&str],
+    seeded: &[&str],
+) -> (RunDir, String) {
+    let (_keep, input) = input();
+    let mut bindings = Vec::new();
+    if dataset {
+        bindings.push("\"input\": \"@INPUT@\"".to_owned());
+    }
+    for role in roles.iter().chain(seeded) {
+        bindings.push(format!("\"{role}\": \"@ROLES@/{role}\""));
+    }
+    let request = format!(
+        "{{\"protocol\": 1, \"scenario\": \"{scenario}\", \"iteration\": 0, \"bindings\": {{{}}}}}",
+        bindings.join(", ")
+    );
+    let run_dir = RunDir::new(&input, &request);
+    for role in seeded {
+        std::fs::write(
+            run_dir.root.join("roles").join(role),
+            format!("brokkr-library-seed-v1 {role}\n"),
+        )
+        .expect("seed");
+    }
+    let fifo = Fifo::new(&run_dir.root.join("capture"));
+    let ran = run_dir.launch(&fifo.path.clone(), &[]);
+    let lines = fifo.finish();
+    assert!(
+        ran.stdout.is_empty() && ran.stderr.is_empty(),
+        "stdout {:?} stderr {:?}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let mut results = run_dir.doc("scenario.json")["assertions"]
+        .as_array()
+        .expect("results")
+        .clone();
+    for call in run_dir.entries("artefacts/calls") {
+        let doc = run_dir.doc(&format!("calls/{call}"));
+        results.extend(
+            doc["assertions"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .cloned(),
+        );
+    }
+    assert!(
+        results.iter().all(|r| r["status"] == "pass"),
+        "{scenario}: {results:?}"
+    );
+    assert_eq!(ran.status.code(), Some(0), "{}", ran.status);
+    (run_dir, lines)
+}
+
+#[test]
+fn concurrent_cat_tags_each_calls_counters() {
+    let (run, lines) = scenario_passes(
+        "concurrent-cat",
+        false,
+        &["input-small", "input-large", "out-a", "out-b"],
+        &[],
+    );
+    // The FIFO's tags carry each call's own workload: one block and three.
+    for (call, blocks) in [("a", 1), ("b", 3)] {
+        assert!(
+            lines.contains(&format!(" %{call} @cat_blobs_passthrough={blocks}\n")),
+            "call {call}: {lines}"
+        );
+        let doc = run.doc(&format!("calls/{call}.json"));
+        assert_eq!(doc["context"]["fd_pool_budget"], 18);
+    }
+}
+
+#[test]
+fn fixed_resources_executor_leaves_the_global_pool_unbuilt() {
+    let (run, _) = scenario_passes("fixed-resources-executor", true, &["out"], &[]);
+    let doc = run.doc("calls/a.json");
+    assert_eq!(doc["context"]["executor"], "pool");
+    assert_eq!(doc["context"]["executor_threads"], 4);
+}
+
+#[test]
+fn cancel_pre_decision_refuses_the_output() {
+    let (run, _) = scenario_passes("cancel-pre-decision", true, &["out"], &[]);
+    let doc = run.doc("calls/a.json");
+    assert_eq!(doc["cancel"]["result"], "before_decision");
+    assert_eq!(doc["outcome"]["status"], "cancelled");
+    assert!(run.entries("roles").is_empty());
+}
+
+#[test]
+fn cancel_post_decision_lets_the_publication_stand() {
+    let (run, _) = scenario_passes("cancel-post-decision", true, &["out"], &[]);
+    let doc = run.doc("calls/a.json");
+    assert_eq!(doc["cancel"]["result"], "after_decision");
+    assert_eq!(doc["outcome"]["status"], "ok");
+}
+
+#[test]
+fn nofile_cat_is_refused_at_soft_1024() {
+    let (run, _) = scenario_passes("nofile-cat-refused", true, &["out"], &[]);
+    let doc = run.doc("calls/a.json");
+    assert_eq!(doc["context"]["rlimit_nofile_soft"], 1024);
+    assert_eq!(doc["outcome"]["kind"], "invalid_argument");
+}
+
+#[test]
+fn nofile_altw_external_runs_three_workers() {
+    let (run, _) = scenario_passes("nofile-altw-external", true, &["out"], &[]);
+    assert_eq!(run.doc("calls/a.json")["context"]["parallelism"], 8);
+}
+
+#[test]
+fn error_path_reports_the_missing_header() {
+    let (run, _) = scenario_passes("error-path", false, &["bad-input", "out"], &[]);
+    assert_eq!(run.doc("calls/a.json")["outcome"]["kind"], "missing_header");
+    assert_eq!(run.entries("roles"), ["bad-input"]);
+}
+
+#[test]
+fn seeded_replace_replaces_one_seed_and_keeps_the_other() {
+    let (run, _) = scenario_passes("seeded-replace", true, &[], &["out-replace", "out-refuse"]);
+    let kept = std::fs::read(run.root.join("roles/out-refuse")).expect("out-refuse");
+    assert_eq!(kept, b"brokkr-library-seed-v1 out-refuse\n");
+    assert_eq!(
+        run.doc("calls/refuse.json")["publications"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn isolation_cat_runs_one_call() {
+    let (run, _) = scenario_passes("isolation-cat", true, &["out"], &[]);
+    assert_eq!(run.entries("artefacts/calls"), ["a.json"]);
 }
 
 /// A request the harness cannot honour exits 2 without a byte of output,

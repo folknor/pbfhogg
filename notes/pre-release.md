@@ -49,17 +49,15 @@ brokkr's side has landed: `brokkr library` builds, runs, verifies, measures,
 profiles and certifies a harness, to a protocol frozen at version 1
 (`brokkr man library`). What remains is pbfhogg's, tracked in bz:
 
-- `#34`: the harness member (`pbfhogg-harness`). Its skeleton has
-  landed as L2 of `notes/library-harness.md`: describe and run modes,
-  `repeat-cat`, sweep and textlint wiring, the `hotpath` /
-  `hotpath-alloc` features. Still owed: the other scenarios above. The
-  seal (`#31`, `#32`: `Invocation::seal()`, and call sinks ending their
-  stream) has landed as L4, and `#33` (cancel's linearized outcome, and
-  the publication log) as L1.
+- `#34`: the harness member (`pbfhogg-harness`) has landed: its skeleton
+  as L2 of `notes/library-harness.md`, every scenario of the list above
+  as L5 (the seal, `#31` and `#32`, as L4; `#33` as L1). Still owed: a
+  positive proof that writer framing runs on a caller's
+  `Executor::Pool`, which needs a library observation point (L5 residue
+  in that note).
 - `#35`: the gate's capability ids in `[pbfhogg.library.require]`.
 - `#36` (a reserving descriptor provider for concurrent calls,
-  `host::FdPool`) has landed as L7; the harness adopts it with the
-  concurrent scenarios.
+  `host::FdPool`) has landed as L7, and `concurrent-cat` uses it.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command
   interval) have landed; `v2` still needs a certification under it.
 

@@ -56,6 +56,18 @@ impl CallOutcome {
         matches!(self, Self::Ok)
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    /// The error's kind and message, when the call failed.
+    pub(crate) fn error(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Error { kind, message } => Some((kind, message)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         match self {
             Self::Ok => json!({ "status": "ok" }),

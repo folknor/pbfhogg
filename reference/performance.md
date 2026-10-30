@@ -1814,6 +1814,26 @@ measured uncommitted with `--force` (not stored, no UUID).
 No cost: both arms within half a percent, the pipelined arm with mixed
 signs.
 
+### Framing placement counter (bygg, 2026-10-30)
+
+Each pipelined framing job now clones the writer's `Executor` (one `Arc`
+increment and decrement) and, on success, checks whether it runs on a
+worker of that executor (one thread-local read) and adds one to
+`writer_payload_framed_on_executor_items`. The synchronous writer is
+untouched, so its arm is the control. Same gate: `brokkr write`, denmark
+`--variant indexed --bench 1 --compressions none`, cells interleaved.
+Baseline `--commit e36fa38f` (stored); variant the counter tree on top of
+it, measured uncommitted with `--force` (not stored, no UUID).
+
+| Writer | Baseline pair 1 | Variant pair 1 | Baseline pair 2 | Variant pair 2 | Medians |
+|---|---|---|---|---|---|
+| sync | 6390 ms (`d8e3ff65`) | 6498 ms | 6403 ms (`828f53ee`) | 6486 ms | 6397 vs 6492 ms |
+| pipelined | 5687 ms (`0f8f6011`) | 5749 ms | 5694 ms (`bdea0d40`) | 5808 ms | 5691 vs 5779 ms |
+
+Below noise: the pipelined arm is 1.5 % slower in both pairs, and so is
+the unchanged sync arm, so the shift is the build or the drive between
+the worktree and the working tree, not the counter.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.

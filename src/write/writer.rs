@@ -985,6 +985,7 @@ impl<W: Write> PbfWriter<W> {
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(&self.cancel, seq);
             let invocation = pipeline.invocation.clone();
+            let executor = pipeline.executor.clone();
             #[cfg(feature = "test-hooks")]
             invocation.faults().on_framing_dispatch();
             pipeline.executor.spawn(move || {
@@ -997,8 +998,8 @@ impl<W: Write> PbfWriter<W> {
                 // before the permit on return and on unwind alike: a writer
                 // holding every permit (`wait_for_framing`) knows no job
                 // still holds its invocation, sender or block bytes.
-                let (tx, writer_gone, invocation, uncompressed, meta) =
-                    (tx, writer_gone, invocation, uncompressed, meta);
+                let (tx, writer_gone, invocation, executor, uncompressed, meta) =
+                    (tx, writer_gone, invocation, executor, uncompressed, meta);
                 framing_job_starts(&invocation, seq);
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let metrics = &invocation.metrics().writer;
@@ -1023,7 +1024,18 @@ impl<W: Write> PbfWriter<W> {
                     metrics
                         .payload_framed_bytes
                         .fetch_add(parts.total_len(), Relaxed);
+                    // Where the framing above actually ran, checked here on
+                    // the thread that ran it: a worker of the writer's own
+                    // executor or not. It must stay beside the framing call;
+                    // moved to a wrapper that hands framing elsewhere, it
+                    // would report the wrapper's thread instead.
+                    if executor.on_worker() {
+                        metrics
+                            .payload_framed_on_executor_items
+                            .fetch_add(1, Relaxed);
+                    }
                 }
+                drop(executor);
                 let t_send = crate::counters::Stopwatch::start();
                 // A failed send means the writer thread has already exited,
                 // and this closure has no `Result` to return it in. Record it

@@ -375,6 +375,12 @@ pub fn write_base_pbf(path: &Path) {
     write_multi_block_test_pbf(path, &nodes, &ways, &relations, 100);
 }
 
+/// [`write_base_pbf`]'s elements and blocks without `indexdata` on any blob.
+pub fn write_base_pbf_non_indexed(path: &Path) {
+    let (nodes, ways, relations) = base_elements();
+    write_multi_block_non_indexed_pbf(path, &nodes, &ways, &relations, 100);
+}
+
 /// [`write_base_pbf`] with node 7 and way 40 deleted and node 301 added,
 /// for diff and dedupe inputs.
 pub fn write_changed_pbf(path: &Path) {

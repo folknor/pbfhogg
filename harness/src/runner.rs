@@ -374,6 +374,18 @@ impl CallRecord {
     pub(crate) fn sealed(&self) -> bool {
         matches!(self.seal, SealOutcome::Sealed(_))
     }
+
+    /// Counter `name` in the sealed call's final snapshot; `None` when the
+    /// call did not seal or never recorded it.
+    pub(crate) fn sealed_counter(&self, name: &str) -> Option<u64> {
+        match &self.seal {
+            SealOutcome::Sealed(snapshot) => snapshot
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
 }
 
 /// The run of one scenario: what its calls share.

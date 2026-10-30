@@ -311,11 +311,32 @@ fn scenario_passes(
     roles: &[&str],
     seeded: &[&str],
 ) -> (RunDir, String) {
-    let (_keep, input) = input();
-    let mut bindings = Vec::new();
-    if dataset {
-        bindings.push("\"input\": \"@INPUT@\"".to_owned());
-    }
+    let datasets: &[&str] = if dataset { &["input"] } else { &[] };
+    scenario_passes_on(scenario, datasets, roles, seeded)
+}
+
+/// [`scenario_passes`] with every role in `datasets` bound: `raw` to the
+/// generated input's blocks without indexdata, any other to the input.
+fn scenario_passes_on(
+    scenario: &str,
+    datasets: &[&str],
+    roles: &[&str],
+    seeded: &[&str],
+) -> (RunDir, String) {
+    let (keep, input) = input();
+    let raw = keep
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("raw.osm.pbf");
+    crate::common::write_base_pbf_non_indexed(&raw);
+    let mut bindings: Vec<String> = datasets
+        .iter()
+        .map(|role| match *role {
+            "raw" => format!("\"raw\": \"{}\"", raw.display()),
+            _ => format!("\"{role}\": \"@INPUT@\""),
+        })
+        .collect();
     for role in roles.iter().chain(seeded) {
         bindings.push(format!("\"{role}\": \"@ROLES@/{role}\""));
     }
@@ -382,11 +403,25 @@ fn concurrent_cat_tags_each_calls_counters() {
 }
 
 #[test]
-fn fixed_resources_executor_leaves_the_global_pool_unbuilt() {
-    let (run, _) = scenario_passes("fixed-resources-executor", true, &["out"], &[]);
-    let doc = run.doc("calls/a.json");
-    assert_eq!(doc["context"]["executor"], "pool");
-    assert_eq!(doc["context"]["executor_threads"], 4);
+fn fixed_resources_executor_frames_on_the_callers_pool_only() {
+    let (run, _) = scenario_passes_on(
+        "fixed-resources-executor",
+        &["input", "raw"],
+        &["out", "framed"],
+        &[],
+    );
+    for call in ["a", "b"] {
+        let doc = run.doc(&format!("calls/{call}.json"));
+        assert_eq!(doc["context"]["executor"], "pool");
+        assert_eq!(doc["context"]["executor_threads"], 4);
+    }
+    // Call b framed through the writer, every payload on the caller's pool.
+    let snapshot = &run.doc("calls/b.json")["snapshot"];
+    let framed = snapshot["writer_payload_framed_items"]
+        .as_u64()
+        .expect("framed");
+    assert!(framed > 0, "{snapshot}");
+    assert_eq!(snapshot["writer_payload_framed_on_executor_items"], framed);
 }
 
 #[test]

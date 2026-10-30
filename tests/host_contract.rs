@@ -840,6 +840,67 @@ fn writer_on_a_one_thread_pool_drops_unflushed() {
     .expect("writes on a one-thread pool");
     assert_eq!(count_data_blobs(&path), POOL_BLOCKS);
 }
+/// The framed payload count and the subset framed on the writer's executor,
+/// read from the writer's invocation after it ended.
+fn framed_where(invocation: &pbfhogg::host::Invocation) -> (u64, u64) {
+    (
+        counter(invocation, "writer_payload_framed_items"),
+        counter(invocation, "writer_payload_framed_on_executor_items"),
+    )
+}
+/// A pipelined writer handed a caller's pool frames every payload on that
+/// pool, whether it is driven from off any pool or from a worker of another
+/// pool (whose workers are not the executor's).
+#[test]
+fn pipelined_framing_runs_on_the_callers_pool() {
+    let dir = crate::common::test_scratch();
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("pool"),
+    );
+    let write = |path: &std::path::Path| -> pbfhogg::Result<pbfhogg::host::Invocation> {
+        let mut writer = pbfhogg::writer::PbfWriter::to_path(
+            path,
+            Default::default(),
+            &empty_header(),
+            pbfhogg::host::Executor::Pool(Arc::clone(&pool)),
+        )?;
+        let invocation = writer.invocation().clone();
+        for _ in 0..POOL_BLOCKS {
+            writer.write_primitive_block(&EMPTY_BLOCK)?;
+        }
+        writer.flush()?;
+        Ok(invocation)
+    };
+    let off_pool = write(&dir.path().join("off.pbf")).expect("off any pool");
+    let other = one_thread_pool();
+    let from_other = other
+        .install(|| write(&dir.path().join("other.pbf")))
+        .expect("from another pool");
+    let blocks = u64::try_from(POOL_BLOCKS).expect("count");
+    assert_eq!(framed_where(&off_pool), (blocks, blocks));
+    assert_eq!(framed_where(&from_other), (blocks, blocks));
+}
+/// A synchronous writer frames on its caller, so nothing it frames counts as
+/// framed on an executor: the proof above fails for a path that ignores it.
+#[test]
+fn synchronous_framing_is_never_counted_on_an_executor() {
+    let invocation = pbfhogg::host::Invocation::new();
+    let mut writer =
+        pbfhogg::writer::PbfWriter::new_in(Vec::new(), Default::default(), invocation.clone())
+            .expect("writer");
+    // Driven from a worker of a pool, too: still the caller's thread.
+    one_thread_pool().install(|| {
+        for _ in 0..POOL_BLOCKS {
+            writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
+        }
+    });
+    writer.flush().expect("flush");
+    let blocks = u64::try_from(POOL_BLOCKS).expect("count");
+    assert_eq!(framed_where(&invocation), (blocks, 0));
+}
 #[test]
 fn ambient_writer_inside_a_foreign_pool_flushes() {
     let dir = crate::common::test_scratch();

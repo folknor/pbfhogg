@@ -80,6 +80,14 @@ crate::counters::counter_set! {
         /// they are submitted, before the handoff that may then fail.
         pub payload_framed_items => "writer_payload_framed_items",
         pub payload_framed_bytes => "writer_payload_framed_bytes",
+        /// The subset of `payload_framed_items` a pipelined writer framed on
+        /// a worker of its own executor - for `Executor::Pool`, a thread of
+        /// that very pool; for `Ambient`, a thread of any rayon pool -
+        /// checked on the thread that ran the framing. A synchronous writer
+        /// frames on its caller and never counts here, so equality with
+        /// `payload_framed_items` is the observable proof that every payload
+        /// was framed on the caller's executor.
+        pub payload_framed_on_executor_items => "writer_payload_framed_on_executor_items",
         pub payload_raw_items => "writer_payload_raw_items",
         pub payload_raw_bytes => "writer_payload_raw_bytes",
         pub payload_raw_chunk_items => "writer_payload_raw_chunk_items",

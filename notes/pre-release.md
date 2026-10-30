@@ -51,16 +51,15 @@ profiles and certifies a harness, to a protocol frozen at version 1
 
 - `#34`: the harness member (`pbfhogg-harness`) has landed: its skeleton
   as L2 of `notes/library-harness.md`, every scenario of the list above
-  as L5 (the seal, `#31` and `#32`, as L4; `#33` as L1). Still owed: a
-  positive proof that writer framing runs on a caller's
-  `Executor::Pool`, which needs a library observation point (L5 residue
-  in that note). Required as `executor.caller-pool.v1`.
+  as L5 (the seal, `#31` and `#32`, as L4; `#33` as L1), and the proof
+  that writer framing runs on a caller's `Executor::Pool`
+  (`executor.caller-pool.v1`, through the counter
+  `writer_payload_framed_on_executor_items`). Closed.
 - `#35` has landed as L6: `[pbfhogg.library.require]` in `brokkr.toml`
   is this gate's applied form, and `brokkr library --all --dataset
   denmark` is its check. Every scenario passes, but certification fails
-  on the required capabilities nothing covers yet: the caller pool
-  (`#34`), and the page-cache `Keep` policy and per-call counter
-  snapshots (`#39`).
+  on the required capabilities nothing covers yet: the page-cache `Keep`
+  policy and per-call counter snapshots (`#39`).
 - `#36` (a reserving descriptor provider for concurrent calls,
   `host::FdPool`) has landed as L7, and `concurrent-cat` uses it.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command

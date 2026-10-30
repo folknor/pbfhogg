@@ -53,8 +53,9 @@ from the 2026-10-29 session and is recorded nowhere else.
 **What to build, in order:** the landing table at the end of this note.
 L5 (the scenarios), L6 (#35, capability ids and declarations) and L7
 (#36, the reserving descriptor provider) have landed; see the landing
-list. What remains is certification itself, blocked on the three required
-capabilities no scenario covers yet (#34 and #39).
+list, as has #34's caller-pool framing proof. What remains is
+certification itself, blocked on the two required capabilities no scenario
+covers yet (#39).
 
 L8 (#37, digest `v2`) has landed on the pbfhogg side: plain `pbfhogg
 digest` prints the full form, `xxh128 v2`, in `v1`'s four-line grammar,
@@ -76,8 +77,8 @@ passed, but the sweep as a whole did not certify.
 
 **bz state:**
 - **pbfhogg#31 and #32** are closed by L4.
-- **#34** is narrowed to L5's residue (positive caller-pool framing
-  proof), required as `executor.caller-pool.v1`. **#39** owns the proofs
+- **#34** is closed by its caller-pool framing proof
+  (`executor.caller-pool.v1`). **#39** owns the proofs
   of `host.page-cache-keep.v1` and `counters.own-snapshot.v1`. #35 (L6),
   #33 (L1) and #36 (L7) are closed. #37 (L8) is closed; its
   re-certification is the certification row below.
@@ -649,7 +650,7 @@ its final value is a defect.
   |---|---|
   | `repeat-cat` | the same cat twice in a row |
   | `concurrent-cat` | two inputs of different sizes so swapped tags show, plus a lifetimes-intersected assertion |
-  | `fixed-resources-executor` | fixed `Resources` and a caller-built `Executor::Pool` |
+  | `fixed-resources-executor` | fixed `Resources` and a caller-built `Executor::Pool`; a second, raw-input cat proves the writer framed on that pool |
   | `cancel-pre-decision` | the tap trips the token on a mid-run marker |
   | `cancel-post-decision` | the tap trips the token on `PUBLISH_START`, which comes after the decision |
   | `nofile-cat-refused` | about 1000 generated inputs at soft 1024 |
@@ -961,10 +962,43 @@ Landed independently, 2026-10-29:
   Gate: `brokkr library --all --dataset denmark` ran all ten scenarios
   passing, 13 capabilities passed and the three above unsupported: not
   certified, as intended.
+- #34, the caller-pool framing proof: the commit that carries this line.
+  The premise was half wrong: the old `fixed-resources-executor` call,
+  `cat --clean version`, never puts framing on the executor at all. Its
+  clean pass frames on cat's own classify workers (`frame_blob_pipelined`)
+  and hands the writer finished frames (`write_raw_owned`), so no proof
+  built on it could pass. That is the documented Executor scope (cat's
+  worker sets are not the executor), not a library defect. Rulings:
+  - The observation is a library counter,
+    `writer_payload_framed_on_executor_items`, added in the pipelined
+    framing job beside `writer_payload_framed_items` when framing
+    succeeded and `Executor::on_worker` holds on the framing thread (for
+    `Pool`, membership of that very pool; rayon compares registries, so
+    another pool or a nested `install` cannot pass). The sync writer never
+    counts. Equality with the framed total is the proof; a path that frames
+    inline, on another pool or on a library thread gives framed above zero
+    and fails. The check must stay beside the framing call: moved into a
+    wrapper that delegates framing, it would observe the wrapper.
+  - Rejected: caller-side CPU accounting of the pool threads (statistical;
+    `writer_frame_ns` excludes compression; cannot show every payload),
+    test-hooks counters (brokkr builds the harness without them), and an
+    Executor trait for job counting (proves dispatch, not where framing ran).
+  - The scenario gains call `b`, `cat --type node,way,relation --force` on
+    the `raw` variant, driven off the pool: every blob decoded on the calling
+    thread and framed through the writer. `b.framing-on-caller-pool`
+    requires no blob passed through, some decoded, framed above zero and
+    equal to framed-on-executor; it alone covers `executor.caller-pool.v1`.
+    Call `a` stays, covering only `executor.global-pool-unused.v1`; nothing
+    asserts its pool idle, since moving cat's framing onto the executor
+    would break no contract.
+  - Same capability id: its meaning did not change.
+  Bench: `reference/performance.md` "Framing placement counter", no cost.
+  Gate: `brokkr library fixed-resources-executor --dataset denmark` passes
+  (11 results), both counterparts equal under digest `v2`.
 
 | Item | Remaining | Gate |
 |---|---|---|
-| Certification, which is also L8's (#37) re-certification under digest `v2` | `executor.caller-pool.v1` covered (#34); `host.page-cache-keep.v1` and `counters.own-snapshot.v1` covered (#39) | `brokkr library --all --dataset denmark` certifies |
+| Certification, which is also L8's (#37) re-certification under digest `v2` | `host.page-cache-keep.v1` and `counters.own-snapshot.v1` covered (#39) | `brokkr library --all --dataset denmark` certifies |
 
 ## Out of scope
 

@@ -4,6 +4,14 @@
 
 ### Added
 
+- **See where a writer's framing ran.** A new invocation counter,
+  `writer_payload_framed_on_executor_items`, counts the payloads a
+  pipelined `PbfWriter` framed on a worker of its own `Executor` (for
+  `Executor::Pool`, a thread of that very pool), checked on the thread that
+  framed each one. It equals `writer_payload_framed_items` when every
+  payload was framed there; a synchronous writer frames on its caller and
+  never adds to it. Read it with `Invocation::for_each_counter` (or from a
+  sealed `Snapshot`) to confirm framing honoured a pool you passed.
 - **Per-call sinks on one sidecar FIFO.** `debug::MarkerFifo::call(CallId)`
   returns a `debug::CallSink` that writes brokkr's call stream
   (`TS %CALL_ID NAME`, `TS %CALL_ID @NAME=VALUE`) through the FIFO's one

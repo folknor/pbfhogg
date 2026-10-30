@@ -1498,7 +1498,11 @@ pub enum PageCachePolicy {
 ///
 /// `Ambient` uses whatever pool the calling thread is in, or rayon's global
 /// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
-/// `Pool` confines the work to the caller's pool. Three things follow from
+/// `Pool` confines the work to the caller's pool. A caller can check where a
+/// writer's framing ran: the invocation counter
+/// `writer_payload_framed_on_executor_items` counts the framed payloads whose
+/// framing ran on a worker of the writer's executor, and equals
+/// `writer_payload_framed_items` when every one did. Three things follow from
 /// handing the library a pool:
 ///
 /// - Thread-local framing and decompression scratch persists on whichever
@@ -1995,6 +1999,16 @@ mod tests {
             executor.install(|| executor.on_worker()),
             "install must run on a worker of the pool"
         );
+        // Membership is of that very pool: a worker of another pool is not
+        // one, nested inside this pool's install or not, and a worker of
+        // this pool installed into another is not one while it runs there.
+        let other = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("other pool");
+        assert!(!other.install(|| executor.on_worker()));
+        assert!(!executor.install(|| other.install(|| executor.on_worker())));
+        assert!(other.install(|| executor.install(|| executor.on_worker())));
     }
     /// Grants never sum past the budget while held, a short request gets
     /// what is left, each drop returns exactly its grant, and the other

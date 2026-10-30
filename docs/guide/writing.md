@@ -271,6 +271,8 @@ Three things follow from handing the writer a pool:
 - A panic in the framing work is handled by the pool's `panic_handler`. With no handler, rayon aborts the process; with one, the lost blob surfaces as an error from `flush()`.
 - A writer driven from a worker of its executor's pool - even a one-thread pool - waits for its framing work cooperatively and cannot deadlock on it. A writer moved between pools mid-stream under `Ambient` is not covered by that wait.
 
+To check where the framing ran, read the writer's invocation counters (`Invocation::for_each_counter`) once it has ended: `writer_payload_framed_on_executor_items` counts the framed payloads whose framing ran on a worker of the writer's executor (for `Pool`, a thread of that very pool), and equals `writer_payload_framed_items` when every one did. A synchronous writer frames on its caller and never adds to it.
+
 However the writer ends - `flush()`, a write that reports the writer thread's failure, or dropping it - it first waits for all the framing work it handed to the pool, on error paths too, so none of it frames or moves the writer's counters afterwards (rayon's own bookkeeping, and a `panic_handler` after a framing panic, may still be running). That wait needs the pool to run the work: off the pool's workers it blocks, so a pool whose every worker is waiting on the thread that ends the writer never lets it return.
 
 ### to_path_direct - O_DIRECT writes

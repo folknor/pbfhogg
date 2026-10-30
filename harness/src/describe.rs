@@ -51,7 +51,6 @@ mod tests {
     /// that owns its proof: `brokkr library --all` classifies them
     /// unsupported and does not certify until a scenario covers them.
     const UNCOVERED: &[(&str, &str)] = &[
-        ("executor.caller-pool.v1", "pbfhogg#34"),
         ("host.page-cache-keep.v1", "pbfhogg#39"),
         ("counters.own-snapshot.v1", "pbfhogg#39"),
     ];

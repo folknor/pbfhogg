@@ -591,7 +591,7 @@ impl Invocation {
     /// far, with the name it is emitted under on the sidecar stream and its
     /// current value: the read pipeline's `pipeline_*`, the worker pools'
     /// `classify_unordered_*` and `ordered_pool_*`, the writers' `writer_*`
-    /// and `fadvise_failures`. Every pass of the invocation adds into the
+    /// and `fadvise_failures` and `fadvise_input_evictions`. Every pass of the invocation adds into the
     /// same counters (sums for counts and waits, maxima for the high-water
     /// and peak counters), and nothing else does.
     ///
@@ -1458,6 +1458,12 @@ impl<R: std::io::Read> std::io::Read for CancellableRead<'_, R> {
 /// input's pages is host policy, not library behaviour: a second pass, a
 /// concurrent reader or a later run then reads cold. The library's own scratch
 /// files are not governed by this policy.
+///
+/// Every eviction of an input a run issues counts into its invocation's
+/// `fadvise_input_evictions` counter ([`Invocation::for_each_counter`]), so
+/// a run under `Keep` can be checked to have asked for none. Not every
+/// command evicts under `Evict`: `cat`, which walks raw frames, leaves the
+/// page cache alone either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageCachePolicy {
     /// Advise `POSIX_FADV_DONTNEED` over the consumed prefix after every blob

@@ -4,6 +4,14 @@
 
 ### Added
 
+- **See whether a run evicted its inputs.** A new invocation counter,
+  `fadvise_input_evictions`, counts every page-cache eviction
+  (`POSIX_FADV_DONTNEED` behind the read head) a run asked for on its
+  input files, failed ones included. It stays 0 under
+  `PageCachePolicy::Keep`; under `Evict` it grows by one per blob a
+  command reads through an evicting reader. Eviction of the library's own
+  scratch files is not counted. Read it with
+  `Invocation::for_each_counter` or from a sealed `Snapshot`.
 - **See where a writer's framing ran.** A new invocation counter,
   `writer_payload_framed_on_executor_items`, counts the payloads a
   pipelined `PbfWriter` framed on a worker of its own `Executor` (for

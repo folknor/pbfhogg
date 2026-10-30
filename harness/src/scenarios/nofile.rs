@@ -178,7 +178,7 @@ const ARGV: &[Arg] = &[
 ];
 
 const ALTW_DIFFERENCES: &[&str] = &[
-    "the CLI evicts its input from the page cache as it reads; the call keeps it",
+    "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
     "the CLI raises its soft RLIMIT_NOFILE when a command asks, so it may run more stage-1 workers; the call stays at 1024",
     "the CLI caps malloc arenas when a command asks; the call leaves the allocator alone",
     "the CLI sizes work by probing the machine; the call gets fixed parallelism 8 and no memory figure",

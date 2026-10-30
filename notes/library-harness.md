@@ -8,6 +8,11 @@ Status:
   carried as it stands.
 - The independent prerequisites have landed: `0e5807c7`, `02192dc3`,
   `d100ae8f`, `ce104e1e` and `d2d8836a`.
+- Every landing is in, and the harness certifies: `brokkr library --all
+  --dataset denmark` passes every scenario and every required capability
+  on the clean tree of the #39 commit, which is also L8's (#37)
+  re-certification under digest `v2`. Nothing in the landing table
+  remains.
 
 Written against `reference/technical-implementation-spec.md`. Spawned from
 the bz tickets pbfhogg#30 to #38 (filed by brokkr 2026-10-29) and the
@@ -995,10 +1000,42 @@ Landed independently, 2026-10-29:
   Bench: `reference/performance.md` "Framing placement counter", no cost.
   Gate: `brokkr library fixed-resources-executor --dataset denmark` passes
   (11 results), both counterparts equal under digest `v2`.
-
-| Item | Remaining | Gate |
-|---|---|---|
-| Certification, which is also L8's (#37) re-certification under digest `v2` | `host.page-cache-keep.v1` and `counters.own-snapshot.v1` covered (#39) | `brokkr library --all --dataset denmark` certifies |
+- #39, the page-cache `Keep` and own-snapshot proofs: the commit that
+  carries this line. Both premises held; no library defect was found
+  (no eviction under `Keep`, no counter recorded into another call's
+  invocation). Rulings:
+  - The `Keep` observation is a library invocation counter,
+    `fadvise_input_evictions`, counted at the crate's one
+    `posix_fadvise` for the new `Advice::EvictInput` (scratch eviction
+    keeps `Advice::DontNeed`), as issued, before the syscall, so a failed
+    eviction still counts. It is attributable to the call that asked,
+    not read off residency. The variant split labels input eviction; it
+    does not enforce it by type: the claim rests on it plus the audit
+    that `FileReader::evict_consumed_prefix` is the only input eviction.
+  - Rejected: a `ProcessActions` eviction hook replacing the policy (a
+    breaking surface that observes no more than the counter, every host
+    then owning `posix_fadvise`), and a per-reader count flushed at reader
+    drop (lost when a reader outlives the seal; not at the work).
+  - New scenario `page-cache-keep`: one generated 3-block input,
+    `digest` twice, call `keep` on `Keep`, then call `evict` on `Evict`
+    (`cli` null). The one covering assertion, `keep.evicts-nothing`,
+    requires keep's sealed count `0` and evict's exactly `4` (one per
+    frame, header included), so a dead counter cannot pass the
+    capability. `cat` cannot be the contrast: its raw-frame walk never
+    evicts under either policy. `CallSpec` carries the policy; contexts
+    and plans spell it from the host, no longer as a literal.
+  - `concurrent-cat` gains `a.own-snapshot` and `b.own-snapshot`
+    (`counters.own-snapshot.v1`): each sealed snapshot's
+    `writer_payload_raw_items` equals its input's data blocks (1 and 3)
+    and its `writer_bytes_written` equals its installed output's size.
+    This shows those counters uncontaminated, not every counter family:
+    a decompression counter both cats leave at zero is not judged, and
+    timings, high waters and thread-local scratch peaks follow from no
+    input.
+  - Same capability ids: neither meaning changed.
+  Bench: `reference/performance.md` "Input eviction counter", no cost.
+  Gate: `brokkr library --all --dataset denmark` certifies, 11 of 11
+  scenarios and 16 of 16 capabilities passed.
 
 ## Out of scope
 

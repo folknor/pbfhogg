@@ -935,6 +935,19 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Read path
 
+- [ ] **The CLI's `cat` never evicts its inputs, though the CLI runs on
+  `PageCachePolicy::Evict`.** Found by #39 (2026-10-30): cat walks raw
+  frames (`FileReader` through `Frames::of_input`), which has no eviction
+  hook, so `Host::page_cache` does not reach it; `fadvise_input_evictions`
+  stays 0 for a cat on either policy. Other raw-frame and pread walkers
+  (getid's schedule walk, degrade, `check` index, cat reindex, the
+  pread-from-workers passes of tags-filter and others) are likely the same,
+  unaudited. Undecided whether a passthrough cat should evict at all (it
+  is the fastest planet path and buffered prefetch helps it); either way
+  the `Host::page_cache` wording in docs/guide/advanced.md now says cat
+  does not evict; the other walkers are not yet named there. Decide,
+  then make the code or the wording true.
+
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
   The API half is closed - eviction is opt-in on the public readers
   (`BlobReader::evict_page_cache(bool)`, `ElementReader::evict_page_cache(bool)`,

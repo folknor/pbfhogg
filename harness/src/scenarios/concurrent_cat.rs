@@ -1,6 +1,7 @@
 //! `concurrent-cat`: two cats at once on two threads, each under its own
 //! invocation and host, over generated inputs of different sizes (one
-//! block and three), so counters delivered to the wrong call show.
+//! block and three), so counters delivered to the wrong call show, both in
+//! each call's sink and in each call's sealed snapshot.
 //!
 //! Both hosts share one `FdPool` sized for both cats' full requests (one
 //! distinct input plus `CAT_EXTRA_FDS` each). Each host's process actions
@@ -39,12 +40,14 @@ const CAT_WANTS: u64 = 9;
 /// Both cats' full requests.
 const BUDGET: u64 = 2 * CAT_WANTS;
 /// Nodes per generated block.
-const NODES_PER_BLOCK: i64 = 100;
+pub(crate) const NODES_PER_BLOCK: i64 = 100;
 /// Both calls ran at once and completed, each holding its full grant from
 /// the shared pool across its scan.
 const CONCURRENT_POOL: &[&str] = &["calls.concurrent.v1", "fd.pool.v1"];
 /// Each call's sink got exactly its own cat counters.
 const OWN_COUNTERS: &[&str] = &["counters.own-call.v1"];
+/// Each call's sealed snapshot holds its own engine counters.
+const OWN_SNAPSHOT: &[&str] = &["counters.own-snapshot.v1"];
 /// The cat counters a passthrough call emits, each exactly once.
 const CAT_COUNTERS: [&str; 3] = [
     "cat_blobs_passthrough",
@@ -247,6 +250,16 @@ impl Scenario for ConcurrentCat {
                     covers: OWN_COUNTERS,
                 },
                 AssertionDecl {
+                    id: "a.own-snapshot",
+                    call: Some("a"),
+                    covers: OWN_SNAPSHOT,
+                },
+                AssertionDecl {
+                    id: "b.own-snapshot",
+                    call: Some("b"),
+                    covers: OWN_SNAPSHOT,
+                },
+                AssertionDecl {
                     id: "lifetimes-intersected",
                     call: None,
                     covers: CONCURRENT_POOL,
@@ -362,7 +375,8 @@ impl Scenario for ConcurrentCat {
         for ((&(id, _, blocks, output), (gated, watch)), record) in
             CALLS.iter().zip(&parts).zip(&done)
         {
-            let judged = judge(id, blocks, output, gated, watch, record);
+            let written = std::fs::metadata(ctx.binding(output)).map(|m| m.len()).ok();
+            let judged = judge(id, blocks, output, written, gated, watch, record);
             intervals.push((record.entry_us, record.return_us));
             ctx.finish_call(record, &judged)?;
         }
@@ -390,19 +404,21 @@ impl Scenario for ConcurrentCat {
     }
 }
 
-/// `<call>.outcome` and `<call>.own-counters` for one of the two calls.
+/// `<call>.outcome`, `<call>.own-counters` and `<call>.own-snapshot` for one
+/// of the two calls. `written` is the size of the call's installed output.
 fn judge(
     id: &str,
     blocks: u64,
     output: &str,
+    written: Option<u64>,
     gated: &Gated,
     watch: &Watch,
     record: &CallRecord,
-) -> [Outcome; 2] {
-    let (outcome_id, counters_id) = if id == "a" {
-        ("a.outcome", "a.own-counters")
+) -> [Outcome; 3] {
+    let (outcome_id, counters_id, snapshot_id) = if id == "a" {
+        ("a.outcome", "a.own-counters", "a.own-snapshot")
     } else {
-        ("b.outcome", "b.own-counters")
+        ("b.outcome", "b.own-counters", "b.own-snapshot")
     };
     let granted = *gated.granted.lock().unwrap_or_else(PoisonError::into_inner);
     let held = *watch
@@ -451,12 +467,29 @@ fn judge(
              (its input has {blocks} blocks)"
         ),
     );
-    [outcome, own]
+    // The sealed snapshot itself, which the stream verdict only checks the
+    // stream against: two engine counters whose values follow from this
+    // call's own workload, so the other call's work added in, or the two
+    // snapshots swapped, shows. Every data block of the input is copied raw
+    // as one payload (the header is not a raw payload), and the bytes the
+    // writer wrote are the installed output's size. Timings, high waters and
+    // thread-local scratch peaks follow from no input and are not judged.
+    let raw_items = record.sealed_counter("writer_payload_raw_items");
+    let bytes_written = record.sealed_counter("writer_bytes_written");
+    let snapshot = Outcome::judge(
+        snapshot_id,
+        raw_items == Some(blocks) && written.is_some() && bytes_written == written,
+        format!(
+            "sealed snapshot: writer_payload_raw_items {raw_items:?} (input blocks {blocks}), \
+             writer_bytes_written {bytes_written:?} (installed output {written:?} bytes)"
+        ),
+    );
+    [outcome, own, snapshot]
 }
 
 /// A sorted PBF of `blocks` blocks of untagged nodes, ids from 1, each
 /// block written as one blob with indexdata.
-fn write_nodes(path: &std::path::Path, blocks: u64) -> pbfhogg::Result<()> {
+pub(crate) fn write_nodes(path: &std::path::Path, blocks: u64) -> pbfhogg::Result<()> {
     use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
     use pbfhogg::writer::{Compression, PbfWriter};
     let file = std::fs::File::create(path)?;

@@ -1834,6 +1834,26 @@ Below noise: the pipelined arm is 1.5 % slower in both pairs, and so is
 the unchanged sync arm, so the shift is the build or the drive between
 the worktree and the working tree, not the counter.
 
+### Input eviction counter (bygg, 2026-10-30)
+
+Every input eviction (`POSIX_FADV_DONTNEED` behind the read head, once per
+blob under `PageCachePolicy::Evict`, which the CLI uses) now mints a nested
+call on the invocation and adds one to `fadvise_input_evictions`, beside the
+syscall it counts. Under `Keep` the branch is never armed. Gate: `brokkr
+tags-filter -R`, denmark `--variant indexed --bench 1`, whose single-pass
+path reads through the evicting `ElementReader` (the default two-pass path
+reads by pread walkers and evicts at most its header reads, so it would not
+exercise the counter). Baseline `--commit 8b91fae9` (stored); variant the
+counter tree on top of it, measured uncommitted with `--force` (not stored,
+no UUID). Cells interleaved.
+
+| Baseline pair 1 | Variant pair 1 | Baseline pair 2 | Variant pair 2 | Medians |
+|---|---|---|---|---|
+| 200.8 ms (`15fbaa3b`) | 200.8 ms | 200.9 ms (`224a6659`) | 200.9 ms | 200.8 vs 200.8 ms |
+
+No cost. The run is short, so this bounds the counter to well under the
+2-3 % noise floor of a 200 ms wall, not to its absolute per-blob cost.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.

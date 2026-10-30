@@ -190,6 +190,32 @@ fn counter(invocation: &pbfhogg::host::Invocation, name: &str) -> u64 {
     found.unwrap_or_else(|| panic!("no counter named {name}"))
 }
 
+/// A reader opened under a host evicts its input only under
+/// `PageCachePolicy::Evict`, and every eviction it asks for counts into the
+/// host's invocation as `fadvise_input_evictions`: none under `Keep`.
+#[cfg(target_os = "linux")]
+#[test]
+fn input_evictions_follow_the_page_cache_policy() {
+    use pbfhogg::host::PageCachePolicy;
+    let dir = crate::common::test_scratch();
+    let base = input(dir.path());
+    let mut counted = Vec::new();
+    for policy in [PageCachePolicy::Keep, PageCachePolicy::Evict] {
+        let mut host = crate::common::test_host();
+        host.page_cache = policy;
+        host.invocation = pbfhogg::host::Invocation::new();
+        let mut elements = 0_u64;
+        pbfhogg::ElementReader::open_with(&base, false, &host)
+            .expect("open")
+            .for_each(|_| elements += 1)
+            .expect("read");
+        assert!(elements > 0);
+        counted.push(counter(&host.invocation, "fadvise_input_evictions"));
+    }
+    assert_eq!(counted[0], 0, "Keep evicted: {counted:?}");
+    assert!(counted[1] > 0, "Evict asked for no eviction: {counted:?}");
+}
+
 /// Each run's counters are its own invocation's: two runs at once, on inputs
 /// of different sizes, each count exactly their own output, and a second run
 /// under the same token adds into the same totals. When these were

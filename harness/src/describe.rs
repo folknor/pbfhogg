@@ -50,10 +50,7 @@ mod tests {
     /// Required capabilities no scenario covers yet, each with the ticket
     /// that owns its proof: `brokkr library --all` classifies them
     /// unsupported and does not certify until a scenario covers them.
-    const UNCOVERED: &[(&str, &str)] = &[
-        ("host.page-cache-keep.v1", "pbfhogg#39"),
-        ("counters.own-snapshot.v1", "pbfhogg#39"),
-    ];
+    const UNCOVERED: &[(&str, &str)] = &[];
 
     /// The ids of brokkr.toml's `[pbfhogg.library.require]` table: one
     /// quoted key per line, up to the next table header.

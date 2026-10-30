@@ -36,10 +36,17 @@ pub(crate) enum Advice {
     Random,
     /// `POSIX_FADV_WILLNEED`: start reading the range into the page cache.
     WillNeed,
-    /// `POSIX_FADV_DONTNEED`: drop the range's clean cached pages. Dirty pages
-    /// stay until written back, so a caller that wants its own writes dropped
-    /// syncs first.
+    /// `POSIX_FADV_DONTNEED` on the library's own scratch: drop the range's
+    /// clean cached pages. Dirty pages stay until written back, so a caller
+    /// that wants its own writes dropped syncs first. Never on an input: that
+    /// is [`Advice::EvictInput`].
     DontNeed,
+    /// `POSIX_FADV_DONTNEED` on an input file, the one advice host policy
+    /// governs (`host::PageCachePolicy`). Every one issued counts into the
+    /// invocation's `fadvise_input_evictions`, which is how a caller (and the
+    /// library harness's `host.page-cache-keep.v1` proof) sees that a call
+    /// under `Keep` asked the kernel to drop nothing of its inputs.
+    EvictInput,
 }
 
 /// Advise the kernel about `len` bytes of `file` from `offset`, where `len`
@@ -81,10 +88,23 @@ pub(crate) fn advise(
         Advice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
         Advice::Random => libc::POSIX_FADV_RANDOM,
         Advice::WillNeed => libc::POSIX_FADV_WILLNEED,
-        Advice::DontNeed => libc::POSIX_FADV_DONTNEED,
+        Advice::DontNeed | Advice::EvictInput => libc::POSIX_FADV_DONTNEED,
     };
     #[cfg(test)]
     tests::record_attempt(advice);
+    if advice == Advice::EvictInput {
+        // Counted as issued, before the syscall and whatever it returns: a
+        // failed eviction under `Keep` must not read as none. Input eviction
+        // runs under the reader's admission (a call or a pipeline permit),
+        // so this nested mint is not refused; a sealed invocation records
+        // nothing, as for a failure.
+        if let Ok(call) = invocation.call() {
+            call.metrics()
+                .fadvise
+                .input_evictions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     // The crate's one `posix_fadvise`.
     #[allow(clippy::disallowed_methods)]
     // Safety: the borrow keeps the descriptor open for the call, and the
@@ -122,10 +142,13 @@ pub(crate) fn advise(
 }
 
 crate::counters::counter_set! {
-    /// Failed advice of one invocation.
+    /// Failed advice, and input evictions, of one invocation.
     pub(crate) struct FadviseMetrics {
         /// `posix_fadvise` calls that returned an error.
         failures => "fadvise_failures",
+        /// `POSIX_FADV_DONTNEED` advice issued on an input file
+        /// ([`Advice::EvictInput`]), whatever the call returned.
+        input_evictions => "fadvise_input_evictions",
     }
     extra {
         /// Serializes a failure's increment with its emission (see

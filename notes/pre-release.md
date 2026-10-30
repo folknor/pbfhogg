@@ -22,11 +22,17 @@ next.
 
 ## Release gates
 
-### Library use is verified (cross-repo, nothing recorded yet)
+### Library use is verified (cross-repo, certified)
 
-brokkr runs the `pbfhogg` binary, one command per process. Nothing has ever
-driven the library the way an embedding caller would, so every behaviour that
-only exists under library use is unverified:
+Certified: `brokkr library --all --dataset denmark` certifies on the clean
+tree of the commit that landed `#39` (every scenario passed, every required
+capability passed; the record is under `.brokkr/library-certifications/`
+on bygg). A later change that
+breaks a scenario reopens this gate; rerun the sweep before a release.
+
+brokkr runs the `pbfhogg` binary, one command per process. Before the
+harness, nothing drove the library the way an embedding caller would; the
+harness now checks every behaviour below that only exists under library use:
 
 - several calls in one process, one after another and concurrently: whether
   their outputs match the CLI's, whether any process-global state still leaks
@@ -57,9 +63,12 @@ profiles and certifies a harness, to a protocol frozen at version 1
   `writer_payload_framed_on_executor_items`). Closed.
 - `#35` has landed as L6: `[pbfhogg.library.require]` in `brokkr.toml`
   is this gate's applied form, and `brokkr library --all --dataset
-  denmark` is its check. Every scenario passes, but certification fails
-  on the required capabilities nothing covers yet: the page-cache `Keep`
-  policy and per-call counter snapshots (`#39`).
+  denmark` is its check.
+- `#39` covered the last two required capabilities: `page-cache-keep`
+  proves a call on `PageCachePolicy::Keep` asks for no input eviction
+  (the invocation counter `fadvise_input_evictions`, with an `Evict` call
+  as the contrast), and `concurrent-cat` judges each call's sealed
+  snapshot against its own workload. Closed.
 - `#36` (a reserving descriptor provider for concurrent calls,
   `host::FdPool`) has landed as L7, and `concurrent-cat` uses it.
 - `#37` (full-fidelity digest `v2`) and `#38` (the CLI's command

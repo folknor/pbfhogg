@@ -336,12 +336,13 @@ pub(crate) struct CallSpec {
     pub(crate) process: Process,
     /// The output stance the call's body uses, for its context.
     pub(crate) overwrite: &'static str,
+    pub(crate) page_cache: PageCachePolicy,
     pub(crate) tap: Option<Arc<dyn Tap>>,
 }
 
 impl CallSpec {
     /// The default host: machine parallelism, the ambient pool, no process
-    /// actions, refusing an existing output, no tap.
+    /// actions, the page cache kept, refusing an existing output, no tap.
     pub(crate) fn plain(id: &'static str) -> Self {
         Self {
             id,
@@ -349,8 +350,18 @@ impl CallSpec {
             executor: Exec::Ambient,
             process: Process::None,
             overwrite: "refuse",
+            page_cache: PageCachePolicy::Keep,
             tap: None,
         }
+    }
+}
+
+/// The protocol's spelling of a page-cache policy, as plans and contexts
+/// carry it.
+pub(crate) fn page_cache_name(policy: PageCachePolicy) -> &'static str {
+    match policy {
+        PageCachePolicy::Keep => "keep",
+        PageCachePolicy::Evict => "evict",
     }
 }
 
@@ -440,7 +451,7 @@ impl Ctx<'_> {
                 parallelism: spec.parallelism.or(self.settings.parallelism),
                 memory_available: None,
             }),
-            page_cache: PageCachePolicy::Keep,
+            page_cache: spec.page_cache,
             executor: match &spec.executor {
                 Exec::Ambient => Executor::Ambient,
                 Exec::Pool(pool) => Executor::Pool(Arc::clone(pool)),
@@ -505,7 +516,7 @@ impl Ctx<'_> {
             "memory_available": null,
             "executor": executor,
             "executor_threads": threads,
-            "page_cache": "keep",
+            "page_cache": page_cache_name(spec.page_cache),
             "process_actions": "none",
             "rlimit_nofile_soft": crate::process::soft_nofile()?.to_json(),
             "overwrite": spec.overwrite,

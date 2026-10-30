@@ -53,8 +53,10 @@ pub(crate) fn direct_reads_unsupported() -> Error {
 impl FileReader {
     /// Advise away a consumed prefix using the currently owned file.
     /// Returns whether an advisory syscall was issued; O_DIRECT has no cache.
-    /// The fd is borrowed only for this call, never cached by the caller. A
-    /// failed advice counts into `invocation`.
+    /// The fd is borrowed only for this call, never cached by the caller.
+    /// This is the library's one eviction of an input: the advice counts into
+    /// `invocation`'s `fadvise_input_evictions` (and a failure into its
+    /// `fadvise_failures`).
     #[cfg(target_os = "linux")]
     pub(crate) fn evict_consumed_prefix(
         &self,
@@ -70,7 +72,7 @@ impl FileReader {
                         reader.get_ref(),
                         0,
                         offset,
-                        crate::fadvise::Advice::DontNeed,
+                        crate::fadvise::Advice::EvictInput,
                         invocation,
                     )
             }

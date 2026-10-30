@@ -399,6 +399,18 @@ fn concurrent_cat_tags_each_calls_counters() {
         );
         let doc = run.doc(&format!("calls/{call}.json"));
         assert_eq!(doc["context"]["fd_pool_budget"], 18);
+        // The sealed snapshot holds the call's own raw payloads.
+        assert_eq!(doc["snapshot"]["writer_payload_raw_items"], blocks);
+    }
+}
+
+#[test]
+fn page_cache_keep_counts_no_input_eviction() {
+    let (run, _) = scenario_passes("page-cache-keep", false, &["input"], &[]);
+    for (call, policy, evictions) in [("keep", "keep", 0), ("evict", "evict", 4)] {
+        let doc = run.doc(&format!("calls/{call}.json"));
+        assert_eq!(doc["context"]["page_cache"], policy);
+        assert_eq!(doc["snapshot"]["fadvise_input_evictions"], evictions);
     }
 }
 

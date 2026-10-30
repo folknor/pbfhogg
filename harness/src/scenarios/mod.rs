@@ -8,6 +8,7 @@ mod error_path;
 mod executor;
 mod isolation_cat;
 mod nofile;
+mod page_cache;
 mod repeat_cat;
 mod seeded_replace;
 
@@ -60,6 +61,7 @@ pub(crate) fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(nofile::NofileAltwExternal),
         Box::new(error_path::ErrorPath),
         Box::new(seeded_replace::SeededReplace),
+        Box::new(page_cache::PageCacheKeep),
         Box::new(isolation_cat::IsolationCat),
     ]
 }
@@ -82,7 +84,7 @@ pub(crate) fn declared(scenario: &dyn Scenario) -> ScenarioDecl {
 
 /// How the CLI's process policy differs from a plain call's.
 pub(crate) const POLICY_DIFFERENCES: &[&str] = &[
-    "the CLI evicts its input from the page cache as it reads; the call keeps it",
+    "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
     "the CLI raises its soft RLIMIT_NOFILE when a command asks; the harness set it at start",
     "the CLI caps malloc arenas when a command asks; the call leaves the allocator alone",
     "the CLI sizes work by probing the machine; the call gets fixed parallelism and no memory figure",
@@ -134,8 +136,18 @@ pub(crate) fn clean_json(version: bool) -> Value {
 /// The plan's host for a call: `parallelism` is `"machine"` or a fixed
 /// count, `executor` and `process_actions` name what the call gets.
 pub(crate) fn host_json(parallelism: &Value, executor: &Value, process_actions: &Value) -> Value {
+    host_json_paging(parallelism, executor, process_actions, "keep")
+}
+
+/// [`host_json`] with the call's page-cache policy, `"keep"` or `"evict"`.
+pub(crate) fn host_json_paging(
+    parallelism: &Value,
+    executor: &Value,
+    process_actions: &Value,
+    page_cache: &str,
+) -> Value {
     json!({ "resources": "fixed", "parallelism": parallelism, "memory_available": null,
-            "process_actions": process_actions, "page_cache": "keep", "executor": executor })
+            "process_actions": process_actions, "page_cache": page_cache, "executor": executor })
 }
 
 /// The plan's output policy.

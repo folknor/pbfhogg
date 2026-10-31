@@ -330,8 +330,8 @@ fn every_consumer_refuses_an_unusable_coordinate() {
 /// overlay's writer refused to emit such a member, but two sinks
 /// accepted it at parse time and one writer mapped it to "node" - which
 /// produces a well-formed OSC pointing at a completely different object.
-/// Refused at parse now, in the one shared `parse_member_type`, so no
-/// sink can inherit half the rule.
+/// Refused at parse now, in the one shared member parser, so no sink can
+/// inherit half the rule.
 #[test]
 fn every_consumer_refuses_an_exotic_member_type() {
     let dir = crate::common::test_scratch();
@@ -392,6 +392,101 @@ fn every_consumer_refuses_a_malformed_member_role() {
          </create>\n</osmChange>",
     );
     assert_all_accept(dir.path(), &input, "missing and empty roles");
+}
+
+/// The children of an object in `<delete>` carry nothing any consumer
+/// keeps, and each sink used to decide on its own which of them to parse:
+/// the overlay skipped tags and members but parsed `nd`, tags-filter
+/// skipped only tags, merge-changes parsed everything. So a malformed
+/// child of a deleted object was refused by some commands and accepted by
+/// others. The driver now interprets them with the parsers live children
+/// get and routes none of them, so every consumer refuses each the same
+/// way, as libosmium does.
+#[test]
+fn every_consumer_refuses_a_malformed_child_of_a_deleted_object() {
+    let dir = crate::common::test_scratch();
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            "tag without k",
+            "<node id=\"1\" version=\"2\"><tag v=\"x\"/></node>",
+            "missing attribute 'k'",
+        ),
+        (
+            "nd without ref",
+            "<way id=\"1\" version=\"2\"><nd/></way>",
+            "missing attribute 'ref'",
+        ),
+        (
+            "member with an exotic type",
+            "<relation id=\"1\" version=\"2\"><member type=\"changeset\" ref=\"5\"/></relation>",
+            "member type",
+        ),
+        (
+            "member without ref",
+            "<relation id=\"1\" version=\"2\"><member type=\"node\" role=\"r\"/></relation>",
+            "missing attribute 'ref'",
+        ),
+        (
+            "member with a malformed role",
+            "<relation id=\"1\" version=\"2\">\
+             <member type=\"node\" ref=\"5\" role=\"&bogus;\"/></relation>",
+            "malformed 'role' attribute",
+        ),
+    ];
+    for (case, object, needle) in cases {
+        let input = dir.path().join("delete-child.osc.gz");
+        write_gz(
+            &input,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <delete>\n    \
+                 {object}\n  </delete>\n</osmChange>"
+            ),
+        );
+        assert_all_refuse(dir.path(), &input, needle, case);
+    }
+}
+
+/// The counterpart: well-formed children of deleted objects are accepted
+/// everywhere, and a re-emitted delete still carries only its identity and
+/// metadata.
+#[test]
+fn every_consumer_accepts_and_drops_well_formed_delete_children() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("delete-children.osc.gz");
+    write_gz(
+        &input,
+        "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <delete>\n    \
+         <node id=\"1\" version=\"2\"><tag k=\"highway\" v=\"primary\"/></node>\n    \
+         <way id=\"2\" version=\"3\"><nd ref=\"1\"/><tag k=\"highway\" v=\"primary\"/></way>\n    \
+         <relation id=\"3\" version=\"4\">\
+         <member type=\"way\" ref=\"2\" role=\"outer\"/></relation>\n  \
+         </delete>\n</osmChange>",
+    );
+    assert_all_accept(dir.path(), &input, "well-formed delete children");
+
+    for (name, simplify) in [("streaming", false), ("simplify", true)] {
+        let out = dir.path().join(format!("delete-children-{name}.osc"));
+        pbfhogg::commands::merge_changes::merge_changes(
+            &[&input],
+            crate::common::out_replace(&out),
+            simplify,
+            pbfhogg::Parallelism::from_jobs(1),
+            false,
+            crate::common::scratch_in(dir.path()),
+            &crate::common::test_host(),
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+        for id in ["node id=\"1\"", "way id=\"2\"", "relation id=\"3\""] {
+            assert!(xml.contains(id), "merge-changes {name} lost {id}:\n{xml}");
+        }
+        for child in ["<tag", "<nd", "<member"] {
+            assert!(
+                !xml.contains(child),
+                "merge-changes {name} emitted a child of a deleted object:\n{xml}"
+            );
+        }
+    }
 }
 
 /// Metadata leniency is PRESENCE, not version-gating, in every sink: an

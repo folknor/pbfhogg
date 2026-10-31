@@ -57,6 +57,11 @@ never left partial, and the library no longer touches process state.
   section inside a section, or an unknown element inside an object, is
   refused instead of silently misreading the change. See the OSC section of
   `CORRECTNESS.md`.
+- The `tag` / `nd` / `member` children of an object in `<delete>` are
+  checked by the same rules as live ones in every OSC command, so a
+  malformed one is refused by `apply-changes`, `merge-changes` and
+  `tags-filter` alike (only `merge-changes` refused all of them before).
+  They are still dropped: no command keeps or writes them.
 - `apply-changes` no longer copies the base's replication timestamp and
   sequence number, and `renumber` writes no replication state.
 - The writing program is now `pbfhogg/<version>`.

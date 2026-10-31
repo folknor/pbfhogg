@@ -6,17 +6,17 @@ use flate2::write::GzEncoder;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 
+use crate::ElementKind;
 use crate::error::Result;
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
 use crate::osc::xml_parse::{
-    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type, parse_osc_path,
-    parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
+    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
+    parse_owned_metadata, parse_tag,
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
-use crate::{ElementKind, MemberId};
 
 // This tag-first traversal borrows owned OSC tags without building a
 // temporary borrowed-tag vector.
@@ -221,6 +221,16 @@ struct FilterSink<'a> {
     current: Option<CurrentElem>,
 }
 
+impl FilterSink<'_> {
+    /// The element a child belongs to. The driver routes children only of
+    /// created and modified objects, which always set one.
+    fn current(&mut self) -> Result<&mut CurrentElem> {
+        self.current.as_mut().ok_or_else(|| {
+            crate::Error::internal("tags-filter OSC: an object child with no current object")
+        })
+    }
+}
+
 impl OscSink for FilterSink<'_> {
     fn begin_element(
         &mut self,
@@ -264,49 +274,27 @@ impl OscSink for FilterSink<'_> {
     }
 
     fn tag(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        if let Some(cur) = self.current.as_mut() {
-            let k = parse_str_attr(e, "k")?;
-            let v = parse_str_attr(e, "v")?;
-            cur.tags.push((k, v));
-        }
+        let tag = parse_tag(e)?;
+        self.current()?.tags.push(tag);
         Ok(())
     }
 
     fn nd(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        let id = parse_i64_attr(e, "ref")?;
-        if let Some(cur) = self.current.as_mut() {
-            cur.refs.push(id);
-        }
+        let id = parse_nd(e)?;
+        self.current()?.refs.push(id);
         Ok(())
     }
 
     fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        let id = parse_i64_attr(e, "ref")?;
-        // An absent role is empty; a malformed one is refused (see
-        // `parse_str_attr_optional`).
-        let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
-        // The shared `parse_member_type` refuses anything that is not
-        // node/way/relation, so there is no `MemberId::Unknown` arm to
-        // write here any more. This parser used to construct one - and
-        // `osc::write::member_type_str` refuses to emit it, so a
-        // relation with an exotic member type was accepted at parse and
-        // then failed at write.
-        let member_id = match parse_member_type(&parse_str_attr(e, "type")?)? {
-            crate::MemberType::Node => MemberId::Node(id),
-            crate::MemberType::Way => MemberId::Way(id),
-            crate::MemberType::Relation => MemberId::Relation(id),
-            crate::MemberType::Unknown(v) => {
-                return Err(crate::Error::invalid_data(format!(
-                    "unknown relation member type value '{v}'"
-                )));
-            }
-        };
-        if let Some(cur) = self.current.as_mut() {
-            cur.members.push(OwnedMember {
-                id: member_id,
-                role,
-            });
-        }
+        // The shared parser admits only node/way/relation, so no
+        // `MemberId::Unknown` is ever built here (`osc::write` refuses to
+        // emit one).
+        let member = parse_member(e)?;
+        let id = member.member_id();
+        self.current()?.members.push(OwnedMember {
+            id,
+            role: member.role,
+        });
         Ok(())
     }
 

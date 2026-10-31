@@ -256,7 +256,7 @@ pub(super) struct WritePipeline {
     /// executor; the framing closure `send()`s it back as the last thing it
     /// does, which also makes the pool the writer's barrier on its framing
     /// jobs ([`wait_for_framing`](Self::wait_for_framing)). See
-    /// [`PIPELINE_DISPATCH_PERMITS`] for the memory-bound rationale.
+    /// [`PIPELINE_DISPATCH_PERMITS`] for what it does and does not bound.
     pub(super) permit_tx: SyncSender<()>,
     pub(super) permit_rx: Receiver<()>,
     /// End-of-stream handshake shared with the writer thread. `flush`
@@ -504,9 +504,11 @@ fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
 /// [`PIPELINE_DISPATCH_PERMITS`] such panics the next
 /// `write_primitive_block` blocks forever on `permit_rx.recv()` with no
 /// timeout and no diagnostic. Binding the guard first in the closure body
-/// also puts the release after the `tx.send` of the framed result, which
-/// is where it must be so the in-flight count stays correct while the result
-/// waits in the writer channel.
+/// also puts the release after the `tx.send` of the framed result, so a
+/// permit counts its job until the result is in the channel. From then on
+/// the result waits in the channel or the writer's reorder buffer, which
+/// permits do not bound (the buffer's only limit is its `max_window`
+/// failure ceiling).
 pub(super) struct PermitGuard(SyncSender<()>);
 
 impl PermitGuard {

@@ -757,11 +757,22 @@ full file per step: passthrough saves little there.
 - `frame_blob_into()` - pipelined hand-off: moves the framed header and body out of the scratch, leaving two replacement buffers at the warmed capacity (capped by the retention limit); no copy
 - `write_framed_blob()` - sync hand-off: writes the parts straight from the scratch, no per-blob allocation after warmup
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
-- Pipelined writer thread - VecDeque reorder buffer, `WRITE_AHEAD` =
-  `PIPELINE_DISPATCH_PERMITS` (64). The channel is deliberately not the
-  memory bound - the permit pool is - and sizing it below the permit count
-  lets a rayon framer block in `send` while holding the earlier-seq task the
-  writer thread is waiting for. A compile-time assertion pins the relation.
+- Pipelined writer thread - a sequence-number reorder buffer
+  (`deliver_in_order`) fed by a channel of `WRITE_AHEAD` =
+  `PIPELINE_DISPATCH_PERMITS` slots. Nothing here applies backpressure to
+  framed output end to end. A dispatch permit is taken before a framing job
+  is spawned (or a raw item sent) and returned once its result is in the
+  channel, so permits bound dispatched work - queued, running or blocked
+  sending - not results: up to `WRITE_AHEAD` items (one framed blob, or a
+  raw run of several) can wait in the channel, and the reorder buffer keeps
+  every item that arrives behind a slow earlier sequence number. Its initial
+  capacity is an allocation; its only limit is the reorder buffer's default
+  `max_window` (65,536 sequence numbers ahead), past which a push panics -
+  a failure ceiling, not admission. The channel size is not a liveness
+  condition either:
+  the writer thread receives in any order, so a full channel only throttles
+  framers until it drains. A compile-time assertion keeps the channel at
+  least as deep as the permit count, as a buffering choice.
 
 ## Error propagation and provenance
 

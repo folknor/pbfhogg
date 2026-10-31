@@ -346,9 +346,14 @@ pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
 /// emitting blocks faster than zlib:6 could drain them, killing pbfhogg via
 /// OOM at 26 GB anon RSS.
 ///
-/// Memory bound: `PIPELINE_DISPATCH_PERMITS × max_block_size`. At ~4 MB per
-/// uncompressed block and 64 permits that's ~256 MB worst case, small
-/// compared to the 2.79 GB stage-2b peak.
+/// What it bounds: dispatched framing work (queued, running, or blocked
+/// sending) and producer-side raw sends - for the input blocks, about
+/// `PIPELINE_DISPATCH_PERMITS × block size` (~256 MB at ~4 MB per
+/// uncompressed block, an assumed size, not an enforced one). A permit
+/// returns once its result is in the writer channel, so results waiting
+/// there or in the writer's reorder buffer are not covered (see
+/// [`WRITE_AHEAD`]); behind a slow earlier task the reorder buffer grows up
+/// to its `DEFAULT_MAX_WINDOW` failure ceiling, with no backpressure.
 pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 
 /// Keep room for a full batch of dispatches when changing either capacity.

@@ -68,7 +68,11 @@ impl OscAction {
 /// The driver guarantees the call sequence: exactly one `begin_element`
 /// per element, followed by zero or more `tag` / `nd` / `member` calls
 /// (already filtered to the kinds that can carry them), followed by
-/// exactly one `end_element`. A self-closing element gets `begin_element`
+/// exactly one `end_element`. The child callbacks fire only inside
+/// `<create>` and `<modify>`: the children of an object in `<delete>` carry
+/// nothing any consumer keeps, so the driver checks them itself with the
+/// same parsers ([`parse_tag`], [`parse_nd`], [`parse_member`]) and routes
+/// none of them, which is what makes every command refuse the same delete. A self-closing element gets `begin_element`
 /// immediately followed by `end_element`. The sequence is balanced on
 /// success; when the driver fails (a misplaced element, truncation, a sink
 /// error) the last element may be left begun and never ended.
@@ -197,16 +201,60 @@ pub(crate) fn parse_str_attr_optional(
     Ok(None)
 }
 
-/// Convert an OSC XML member type string to the crate's `MemberType`.
-pub(crate) fn parse_member_type(s: &str) -> ParseResult<MemberType> {
-    match ElementKind::from_name(s) {
-        Some(ElementKind::Node) => Ok(MemberType::Node),
-        Some(ElementKind::Way) => Ok(MemberType::Way),
-        Some(ElementKind::Relation) => Ok(MemberType::Relation),
-        None => Err(Error::invalid_data(format!(
-            "unknown relation member type: '{s}'"
-        ))),
+// ---------------------------------------------------------------------------
+// Object children - ONE interpretation, shared by every sink and the driver
+// ---------------------------------------------------------------------------
+
+/// A `<tag>`: its required `k` and `v`.
+pub(crate) fn parse_tag(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<(String, String)> {
+    let k = parse_str_attr(e, "k")?;
+    let v = parse_str_attr(e, "v")?;
+    Ok((k, v))
+}
+
+/// An `<nd>`: its required `ref`.
+pub(crate) fn parse_nd(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<i64> {
+    parse_i64_attr(e, "ref")
+}
+
+/// A `<member>`, read in one fixed order (type, ref, role) so every sink
+/// reports the same error when several attributes are bad.
+pub(crate) struct ParsedMember {
+    pub(crate) kind: ElementKind,
+    pub(crate) ref_id: i64,
+    /// Empty when absent; a malformed role is refused (see
+    /// [`parse_str_attr_optional`]).
+    pub(crate) role: String,
+}
+
+impl ParsedMember {
+    pub(crate) fn member_id(&self) -> crate::MemberId {
+        match self.kind {
+            ElementKind::Node => crate::MemberId::Node(self.ref_id),
+            ElementKind::Way => crate::MemberId::Way(self.ref_id),
+            ElementKind::Relation => crate::MemberId::Relation(self.ref_id),
+        }
     }
+
+    pub(crate) fn member_type(&self) -> MemberType {
+        match self.kind {
+            ElementKind::Node => MemberType::Node,
+            ElementKind::Way => MemberType::Way,
+            ElementKind::Relation => MemberType::Relation,
+        }
+    }
+}
+
+pub(crate) fn parse_member(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<ParsedMember> {
+    let type_text = parse_str_attr(e, "type")?;
+    let Some(kind) = ElementKind::from_name(&type_text) else {
+        return Err(Error::invalid_data(format!(
+            "unknown relation member type: '{type_text}'"
+        )));
+    };
+    let ref_id = parse_i64_attr(e, "ref")?;
+    let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
+    Ok(ParsedMember { kind, ref_id, role })
 }
 
 // ---------------------------------------------------------------------------
@@ -467,16 +515,25 @@ fn misplaced(name: &str, parent: &str) -> Error {
 }
 
 /// Route an object's child (`level == Element`) to the sink, or refuse it.
+///
+/// A child of a deleted object is interpreted here, by the parser a live
+/// one gets, and then dropped: a malformed one is refused in every command
+/// alike, and no sink sees delete children.
 fn handle_element_child<S: OscSink>(
     name: &str,
     e: &quick_xml::events::BytesStart<'_>,
+    section: OscAction,
     kind: ElementKind,
     sink: &mut S,
 ) -> ParseResult<()> {
+    let live = section != OscAction::Delete;
     match (name, kind) {
-        ("tag", _) => sink.tag(e),
-        ("nd", ElementKind::Way) => sink.nd(e),
-        ("member", ElementKind::Relation) => sink.member(e),
+        ("tag", _) if live => sink.tag(e),
+        ("tag", _) => parse_tag(e).map(drop),
+        ("nd", ElementKind::Way) if live => sink.nd(e),
+        ("nd", ElementKind::Way) => parse_nd(e).map(drop),
+        ("member", ElementKind::Relation) if live => sink.member(e),
+        ("member", ElementKind::Relation) => parse_member(e).map(drop),
         ("bbox" | "bounds", ElementKind::Way | ElementKind::Relation) => Ok(()),
         _ => Err(misplaced(name, &format!("inside <{}>", kind.as_str()))),
     }
@@ -517,7 +574,8 @@ fn handle_open<S: OscSink>(
     match state.level {
         Level::Element => {
             // The hot arm: every tag / nd / member of every object.
-            handle_element_child(name, e, state.open, sink).map_err(|e| input_fault(path, e))?;
+            handle_element_child(name, e, state.section, state.open, sink)
+                .map_err(|e| input_fault(path, e))?;
             if !is_empty {
                 state.level = Level::Leaf;
             }
@@ -1027,8 +1085,8 @@ fn arena_meta(
 pub(crate) struct CompactSink<'a> {
     overlay: &'a mut CompactDiffOverlay,
     /// `None` while no create/modify element is being staged - which is
-    /// also the state during a `<delete>` element, whose children carry
-    /// nothing the overlay needs.
+    /// also the state during a `<delete>` element, whose children the
+    /// driver never routes here.
     staging: Option<Staging>,
 }
 
@@ -1050,6 +1108,14 @@ impl<'a> CompactSink<'a> {
             overlay,
             staging: None,
         }
+    }
+
+    /// The element a child belongs to. The driver routes children only of
+    /// created and modified objects, which always stage one.
+    fn staged(&mut self) -> ParseResult<&mut Staging> {
+        self.staging
+            .as_mut()
+            .ok_or_else(|| Error::internal("OSC overlay: an object child with no staged object"))
     }
 }
 
@@ -1106,41 +1172,27 @@ impl OscSink for CompactSink<'_> {
     }
 
     fn tag(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
-        if self.staging.is_none() {
-            return Ok(());
-        }
-        let k = parse_str_attr(e, "k")?;
-        let v = parse_str_attr(e, "v")?;
+        let (k, v) = parse_tag(e)?;
         let key_id = self.overlay.intern(&k)?;
-        if let Some(st) = self.staging.as_mut() {
-            st.tag_keys.push(key_id);
-            st.tag_values.push(v);
-        }
+        let st = self.staged()?;
+        st.tag_keys.push(key_id);
+        st.tag_values.push(v);
         Ok(())
     }
 
     fn nd(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
-        let ref_id = parse_i64_attr(e, "ref")?;
-        if let Some(st) = self.staging.as_mut() {
-            st.refs.push(ref_id);
-        }
+        let ref_id = parse_nd(e)?;
+        self.staged()?.refs.push(ref_id);
         Ok(())
     }
 
     fn member(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
-        if self.staging.is_none() {
-            return Ok(());
-        }
-        let member_type = parse_member_type(&parse_str_attr(e, "type")?)?;
-        let ref_id = parse_i64_attr(e, "ref")?;
-        // A missing role is empty; a malformed one is refused, as in the owned
-        // sinks (see `parse_str_attr_optional`).
-        let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
-        let type_byte = member_type_to_byte(member_type)?;
-        let role_id = self.overlay.intern(&role)?;
-        if let Some(st) = self.staging.as_mut() {
-            st.members.push((ref_id, type_byte, role_id));
-        }
+        let member = parse_member(e)?;
+        let type_byte = member_type_to_byte(member.member_type())?;
+        let role_id = self.overlay.intern(&member.role)?;
+        self.staged()?
+            .members
+            .push((member.ref_id, type_byte, role_id));
         Ok(())
     }
 
@@ -1211,7 +1263,11 @@ mod tests {
             .ok_or_else(|| Error::internal("malformed role accepted"))?;
         assert!(err.to_string().contains("member"), "{err}");
         assert!(parse_str_attr(&malformed, "role").is_err());
-        assert!(parse_member_type("unknown").is_err());
+        let unknown = quick_xml::events::BytesStart::from_content(
+            "member type=\"unknown\" ref=\"1\" role=\"r\"",
+            6,
+        );
+        assert!(parse_member(&unknown).is_err());
         Ok(())
     }
 

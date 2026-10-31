@@ -505,10 +505,13 @@ as normalized XML attribute text without native-value validation. They do not
 preserve raw entity spellings or raw attribute whitespace. The apply-changes
 overlay retains its native numeric metadata parsing and treats only literal
 `false` as hidden. Applying the overlay's native metadata validation to the
-owned sinks would reject attribute text those sinks currently preserve. Where a
-member is parsed, every sink reads a missing role as empty and refuses a
-malformed role value; the apply-changes overlay does not parse the member
-children of a deleted object.
+owned sinks would reject attribute text those sinks currently preserve. Every
+`tag`, `nd` and `member` is read by one parser per child kind, whatever the
+command: a missing role reads as empty, and a malformed role, an unknown member
+type, or a missing `k`, `v` or `ref` is refused. The children of an object in
+`<delete>` get that same parse in the driver and are then dropped, so every
+command refuses the same malformed delete and none keeps or emits a deleted
+object's children.
 A delete remains pending until a re-create is accepted; a rejected stale
 re-create must not erase it.
 

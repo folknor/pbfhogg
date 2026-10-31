@@ -441,25 +441,6 @@ Diff-snapshots shares the walk.
 
 ## Correctness
 
-### WRK-105: OSC sinks disagree on children of a deleted object
-
-Children of an object in `<delete>` (tags, nds, members) are routed by the
-driver to every sink. `CompactSink` (apply-changes) and `FilterSink`
-(tags-filter) drop them without parsing; `OwnedSink` (merge-changes) parses
-and stores them, and the writer strips them again (`write_delete_xml`). So a
-malformed attribute on a deleted object's child (a bad role, a tag without
-`k`) refuses in merge-changes and passes in the other two: one input, two
-answers, with no parity test covering it. Pick one rule (likely: the owned
-sink skips delete children too, which also saves work) and add the case to
-`tests/osc_parser_parity.rs`.
-
-Correction (checked 2026-10-31): the split is per callback, not per sink.
-`FilterSink` skips a deleted object's `tag` before parsing, but parses `nd`
-(`ref`) and `member` (`ref`, `role`) before its `current` check, so those
-refuse in tags-filter too; `CompactSink` skips `tag` and `member` but parses
-`nd` first. CORRECTNESS.md states the overlay's member exception and must
-change with whatever rule lands here.
-
 ### WRK-052: Same-way fallback for unresolved refs in apply-changes -l
 
 On a base without its untagged nodes, an OSC-modified way that keeps a ref
@@ -500,13 +481,6 @@ per-chunk accounting across `Framed` / `Raw` / `RawChunks` (allocated
 capacity, not length), `CopyRange` (no bytes) and error slots, added on push
 and subtracted on pop in `deliver_in_order`; it is per blob on every
 pipelined writer, so it needs its own matched A/B.
-
-### WRK-106: pipeline.md calls the permit pool the writer's memory bound
-
-`reference/pipeline.md` (frame scratch section) says the writer channel "is
-deliberately not the memory bound - the permit pool is". Permits are released
-when framing ends (WRK-023), so they do not bound the reorder buffer either;
-fix the sentence with WRK-023's outcome.
 
 ---
 

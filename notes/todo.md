@@ -736,10 +736,12 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   64 with no matching semaphore anywhere in the file. Round 4 added a
   `max_window` bound so the buffer can no longer grow without limit, but had to
   default it to a deliberately generous 65_536 for exactly that reason. The
-  sites whose window *is* known (the `WRITE_AHEAD` writers, `read/pipeline`'s
-  `decode_ahead`) could pin it exactly with `ReorderBuffer::with_max_window` and
-  do not, because verifying each one is concurrency reasoning and a bound set
-  too low turns a memory-growth smell into a production panic.
+  `WRITE_AHEAD` writers have no known window to pin: their dispatch permits
+  are returned at send, so they do not bound sequence distance (WRK-023 in
+  `notes/pre-release.md`). `read/pipeline`'s `decode_ahead` could be pinned
+  with `ReorderBuffer::with_max_window` and is not, because verifying it is
+  concurrency reasoning and a bound set too low turns a memory-growth smell
+  into a production panic.
 
 - [ ] **`cli/src/lib.rs` argument splatting is partially cleaned up.** Round 4
   introduced `WriteOpts` and per-command flag structs for `getid`,

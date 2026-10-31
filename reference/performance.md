@@ -2452,6 +2452,37 @@ copy of compressed fragments instead of 8.2 s deflating 29 GB. The text
 form, which shares the engine but neither change, is neutral: `c12221f5`
 (`179f1b7e`) 146.3 s against 146.4 s unstored.
 
+### Single-sided stretches cut by claimed elements (bygg, 2026-10-31)
+
+`diff-snapshots --from base --to 20260411 -j 16`, matched interleaved
+`--bench 1` cells in A B B A order, base `c7eed182` (stored, built by
+`--commit`) against the same tree plus a unit cut once its single-sided
+blobs claim `DIFF_UNIT_LONE_ELEMENTS` elements (unstored, `--force`,
+landed in the commit following `c7eed182`):
+
+| Form | Cell | Arm | Wall | Peak anon | Node tail | Way tail |
+|---|---|---|---:|---:|---:|---:|
+| text | `258cbdc4` | base | 145.6 s | 1.57 GB | 4.55 s | 2.13 s |
+| text | (unstored) | variant | 141.8 s | 1.30 GB | 0.25 s | 0.25 s |
+| text | (unstored) | variant | 142.3 s | 1.30 GB | | |
+| text | `ed12c024` | base | 146.5 s | | | |
+| osc | `6d806707` | base | 156.8 s | | | |
+| osc | (unstored) | variant | 156.0 s | | | |
+| osc | (unstored) | variant | 156.2 s | 1.26 GB | | |
+| osc | `4b6f07ee` | base | 157.0 s | 1.25 GB | | |
+
+Tails are the `--durations` overlap of a kind's END past the next
+kind's START. The text base's anon sat at a 1.1 GB plateau (unit frames
+and decoded blocks) through the node merge, then jumped by 0.43 GB at
+the moment the tail began and drained linearly over 4.5 s at about
+3 user cores: each 32 MiB tail unit held about 18 new-only planet blobs
+(318k nodes each) of text, about 80 MB, against a channel of four
+blob-sized chunks, so every unit behind the head parked full and the
+head formatted alone. One-blob tail units fit their channel whole, so
+the window formats them in parallel. Text -2.8 % wall and -0.27 GB
+peak, sign-consistent across both pairs; osc, whose spill already
+removed the shape, is neutral.
+
 ### Europe, `-j 1`, OSC 4715
 
 | UUID | Commit | Wall | DIFF_SCAN | Peak anon |

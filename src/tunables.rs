@@ -702,6 +702,17 @@ pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 /// about 4 % wall for about a third less peak memory.
 pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 
+/// Claimed elements of single-sided frames (no frame of the other input can
+/// share a key with them) past which a unit closes at its next cut, beside
+/// the byte target. Every element of such a frame becomes output, so a unit
+/// cut by bytes alone there makes tens of MB of text that its channel cannot
+/// hold: later units park on a full channel and the head formats the stretch
+/// alone. About 2 MB of compact lines, under the text channel's depth of
+/// 1 MiB chunks; a target, not a cap, since a frame is never split (planet
+/// blobs of ~318k nodes make one-blob units). Only a scheduling input:
+/// claims never change the output.
+pub(crate) const DIFF_UNIT_LONE_ELEMENTS: u64 = 1 << 17;
+
 /// Frame bytes past which a unit that still cannot close is refused as a
 /// resource limit. A unit of duplicate-free input closes within the target
 /// plus a few maximum-size frames (one crossing each cut per input, one read

@@ -68,8 +68,8 @@ use crate::osc::merge_join::{
 use crate::osm_id::OsmIdKey;
 use crate::read::input::PinnedInput;
 use crate::tunables::{
-    DIFF_OUTPUT_CHUNK_DEPTH, DIFF_UNIT_CAP_BYTES, DIFF_UNIT_QUEUE_DEPTH, DIFF_UNIT_TARGET_BYTES,
-    DIFF_UNIT_WINDOW_SLACK,
+    DIFF_OUTPUT_CHUNK_DEPTH, DIFF_UNIT_CAP_BYTES, DIFF_UNIT_LONE_ELEMENTS, DIFF_UNIT_QUEUE_DEPTH,
+    DIFF_UNIT_TARGET_BYTES, DIFF_UNIT_WINDOW_SLACK,
 };
 
 /// One kind's pass and its sidecar markers.
@@ -530,6 +530,12 @@ fn plan_kind(
         // The largest first key of a frame this unit took (carried frames
         // start before `start`, so they never bound the cut).
         let mut max_first: Option<OsmIdKey> = None;
+        // Per side, the largest claimed last key in the unit (carry
+        // included), and the claimed elements of the frames taken here that
+        // no frame of the other side can share a key with.
+        let mut max_last: [Option<OsmIdKey>; 2] =
+            [0, 1].map(|s| sides[s].iter().map(|f| f.desc.last_key()).max());
+        let mut lone: u64 = 0;
         let end = loop {
             cancel.check()?;
             let peeks = [cursors[0].peek(kind)?, cursors[1].peek(kind)?];
@@ -542,7 +548,8 @@ fn plan_kind(
                 // The kind is over on both inputs.
                 break None;
             };
-            if bytes >= target && max_first.is_some_and(|m| next_first > m) {
+            let due = bytes >= target || lone >= DIFF_UNIT_LONE_ELEMENTS;
+            if due && max_first.is_some_and(|m| next_first > m) {
                 break Some(next_first);
             }
             if bytes >= DIFF_UNIT_CAP_BYTES {
@@ -554,6 +561,18 @@ fn plan_kind(
                 ));
             };
             bytes += frame.body.len();
+            // Strictly apart from the other side, in claimed keys: its next
+            // frame starts past this one and nothing of it already in the
+            // unit reaches this one's start. A mixed-sign claim (first key 0)
+            // is rarely lone, which only delays a cut.
+            let other = 1 - side;
+            let (first, last) = (frame.desc.first_key(), frame.desc.last_key());
+            if peeks[other].is_none_or(|d| d.first_key() > last)
+                && max_last[other].is_none_or(|m| m < first)
+            {
+                lone = lone.saturating_add(frame.desc.index.count);
+            }
+            max_last[side] = Some(max_last[side].map_or(last, |m| m.max(last)));
             max_first =
                 Some(max_first.map_or(frame.desc.first_key(), |m| m.max(frame.desc.first_key())));
             sides[side].push(frame);

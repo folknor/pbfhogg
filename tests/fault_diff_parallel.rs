@@ -150,6 +150,33 @@ fn a_unit_output_larger_than_a_chunk_arrives_whole() {
     }
 }
 
+/// A long stretch only the new file holds (created nodes past the old
+/// file's last ID, as in a later planet snapshot) is cut by its claimed
+/// element count as well as by bytes: the text is the same at every worker
+/// count and every byte target.
+#[test]
+fn a_single_sided_stretch_cuts_by_elements_with_the_same_answer() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("lone-old.osm.pbf");
+    let new = dir.path().join("lone-new.osm.pbf");
+    write_multi_block_test_pbf(&old, &generate_nodes(20_000, 1), &[], &[], 8_000);
+    // 400,000 created nodes: several element targets of one-sided blobs.
+    write_multi_block_test_pbf(&new, &generate_nodes(420_000, 1), &[], &[], 8_000);
+    let reference = diff_text(&old, &new, 1, 0, false);
+    assert!(
+        reference.contains("created: 400000"),
+        "{}",
+        &reference[reference.len().saturating_sub(200)..]
+    );
+    for (jobs, unit_bytes) in [(3, 0), (3, 1), (8, 0)] {
+        assert_eq!(
+            diff_text(&old, &new, jobs, unit_bytes, false),
+            reference,
+            "jobs {jobs}, unit {unit_bytes}"
+        );
+    }
+}
+
 /// A panic in a unit worker surfaces as that unit's error, not an unwind,
 /// and leaves nothing on disk; the count-only driver runs the same workers.
 #[test]

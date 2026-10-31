@@ -133,7 +133,7 @@ are listed for reference only.
 | `merge-changes` (4913, 1 OSC) (n6) | 19 MB | 2 MB | 2.0s | 44s | `9d1e9170` |
 | `inspect` | <1 MB (n1) | 5 MB | short (n1) | 6.5s | `3ec07278` |
 | `tags-filter -i w/highway=primary` (n3) | 7.49 GB | 7.0 GB | 5m16s | 7m57s | `9bf96ab2` |
-| `diff -j 16` (text, base vs 20260411) (n10) | 1.56 GB | 586 MB | 2m28s | 3m48s | `5e782b56` |
+| `diff -j 16` (text, base vs 20260411) (n10) | 1.30 GB | 586 MB | 2m22s | 3m48s | `5e782b56` |
 
 - n1: Too short for the 100 ms sampler (three samples); approximate.
 - n2: The README row for this one was measured on a 9950X3D2 like bygg, so
@@ -164,7 +164,12 @@ are listed for reference only.
   the derive spill and worker-deflate change (1.25 GB; 156.3 s and
   156.6 s), interleaved with stored `179f1b7e` cells `3660071f` and
   `955da7f4` (240.7 s, 241.3 s, 5.00 GB); `c55bebc9` (5.00 GB, 4m03s) is
-  the stored cell before it. Numbers in reference/performance.md.
+  the stored cell before it. The text row's peak and wall likewise come
+  from two `--force` cells of the single-sided element cut (1.30 GB;
+  141.8 s and 142.3 s), interleaved with stored `c7eed182` cells
+  `258cbdc4` and `ed12c024` (145.6 s, 146.5 s, 1.57 GB); `5e782b56`
+  (1.56 GB, 2m28s) is the stored cell before it. Numbers in
+  reference/performance.md.
 
 Measurement artefacts in the RSS pass's percentages, settled: per-worker
 peak was the same on both hosts for getparents, check `--ids` and
@@ -341,20 +346,6 @@ no copied frame). Belongs with the deferred `--direct-io` reach redesign in
 No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
-
-### WRK-109: Text diff tails format on the head unit's core
-
-The text diff shares the work-unit engine's head-of-line shape that the
-derive spill removed for `--format osc`: a text unit not at the head runs
-only `DIFF_OUTPUT_CHUNK_DEPTH` chunks ahead, and it takes a chunk after a
-whole single-sided blob run (a planet new-node blob is a few MB of compact
-lines). Planet text `-j 16` (`5e782b56`, `c12221f5`) peaks at 1.56 GB
-against 605 MB before `587bfc12`. Not measured: how much of its wall sits
-in serial tails (read the phase split for tails at about one core), and
-whether the peak is blob-sized chunks across the window. The text path may
-not spill (it writes no scratch by contract), so any fix is a bounded
-in-memory run-ahead, and a chunk cap alone would shrink run-ahead and
-lengthen any serial tail.
 
 ### WRK-036: merge-changes --simplify and tags-filter OSC on the batch readers
 

@@ -2413,6 +2413,36 @@ interleaved `--bench 1`:
 
 -33 % wall. Every decoding inspect mode runs the same scan.
 
+## Pipelined writer delivery window (bygg, 2026-10-31)
+
+The pipelined writer admits each item against a delivery window
+(`PIPELINE_DELIVERY_WINDOW`, 512 items, returned at ordered handoff).
+Before it, finished items behind a slow head were limited only by the
+reorder buffer's failure ceiling. Planet, interleaved `--bench 1`, no
+fstrim beforehand. Baseline cells are `8aff105a`; variant cells are the
+same commit plus the uncommitted change, run with `--force`, so they have
+no UUID.
+
+| Command | Cell | Wall | Window wait | Reorder span / filled |
+|---|---|---:|---:|---:|
+| apply-changes 4913 zstd:1 | `b9c4df3a` base | 126.6 s | | |
+| | variant | 128.9 s | 0.06 s | 112 / 112 |
+| | `aeaf92e5` base | 141.3 s | | |
+| | variant | 128.5 s | | |
+| altw external | `115c9b21` base | 437.7 s | | |
+| | variant | 455.8 s | 0.012 s | 204 / 181 |
+| | `361e31e7` base | 460.5 s | | |
+| | variant | 458.5 s | 0.010 s | |
+
+The deltas change sign between pairs, and the producer waited on the
+window for a total of 10 to 60 ms per run, so the window costs nothing
+measurable on normal input. Raw-send-only commands (cat --clean,
+time-filter, getparents) have a reorder span of 1 and cannot reach it.
+It does not shrink these runs' peaks: their pile-ups (a reorder span in
+the low hundreds, about 25 MB of 146 KB raw items on apply-changes and
+about 270 MB of 1.3 MB frames on altw external) sit below the window. It
+replaces the unbounded worst case behind a slow head with backpressure.
+
 ## `--direct-io` impact summary
 
 | Workload | Bottleneck | `--direct-io` effect |

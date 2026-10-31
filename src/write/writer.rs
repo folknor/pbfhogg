@@ -38,8 +38,8 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, WritePipeline, record_send_wait,
-    recv_permit, write_accepted, writer_thread,
+    FileOutputSink, OutputChunk, PermitGuard, Slot, WritePipeline, record_send_wait, recv_permit,
+    write_accepted, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
 
@@ -125,25 +125,36 @@ fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
     Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
-/// Reserve the next output slot: a dispatch permit and the sequence number
-/// the writer thread will place the item at. Every pipelined write, framed
-/// or raw, starts here.
+/// Reserve the next output slot: a delivery-window token, a dispatch permit
+/// and the sequence number the writer thread will place the item at, the
+/// last as a [`Slot`] that owes the writer exactly one result for it. Every
+/// pipelined write, framed or raw, starts here.
 ///
 /// If a framing closure already found the writer thread gone, join it now
 /// and return its real cause, rather than reading, copying or framing the
 /// rest of the dataset into a channel nobody is reading (see `WriterGone`).
 ///
-/// Nothing fallible may sit between this and arranging the slot's delivery
-/// unless its failure becomes the slot's ordered result: a sequence number
-/// that never reaches the writer thread is a gap it reports at end of stream.
-fn reserve(pipeline: &mut WritePipeline) -> Result<(PermitGuard, usize)> {
+/// The window token comes first, while this thread holds no dispatch
+/// permit: a disconnected window means the writer thread has let go of its
+/// inbox, and recovering its error waits for every dispatch permit
+/// (`pipeline_send_error`), which would deadlock on one held here. The
+/// token is not returned by this side at all; the writer thread sends one
+/// back per item it hands off (see
+/// [`PIPELINE_DELIVERY_WINDOW`](crate::tunables::PIPELINE_DELIVERY_WINDOW)).
+fn reserve(pipeline: &mut WritePipeline) -> Result<(PermitGuard, Slot)> {
     if pipeline.writer_gone.observed() {
+        return Err(pipeline_send_error(pipeline));
+    }
+    let t_window = crate::counters::Stopwatch::start();
+    let window = recv_permit(&pipeline.window_rx, &pipeline.executor, pipeline.metrics());
+    t_window.record_ns(&pipeline.metrics().window_wait_ns);
+    if window.is_err() {
         return Err(pipeline_send_error(pipeline));
     }
     let permit = acquire_permit(pipeline)?;
     let seq = pipeline.seq;
     pipeline.seq += 1;
-    Ok((permit, seq))
+    Ok((permit, Slot::new(seq, pipeline.tx.clone())))
 }
 
 /// An already-framed item the producer sends itself, as the caller handed
@@ -217,13 +228,10 @@ impl RawPayload<'_> {
 /// send joins the writer thread and returns its own error, after giving the
 /// permit back: that path waits for every permit.
 fn send_raw(pipeline: &mut WritePipeline, payload: RawPayload<'_>) -> Result<()> {
-    let (permit, seq) = reserve(pipeline)?;
+    let (permit, slot) = reserve(pipeline)?;
     payload.count(pipeline.metrics());
     let t_send = crate::counters::Stopwatch::start();
-    let sent = pipeline.tx.send(PipelineItem {
-        seq,
-        data: Ok(payload.into_chunk()),
-    });
+    let sent = slot.send(Ok(payload.into_chunk()));
     if sent.is_ok() {
         record_send_wait(t_send, pipeline.metrics());
     }
@@ -286,6 +294,94 @@ impl BlobMeta {
                 )
             }
         }
+    }
+}
+
+/// One pipelined framing job: everything it owns, in the order it must be
+/// released.
+///
+/// The executor closure captures this whole value (`move || job.run()`), so
+/// a closure dropped unrun drops it intact, in field order: the slot first
+/// (sending its ordered error), the permit last. A closure that touched the
+/// fields one by one would capture them separately, and their drop order
+/// would no longer be this declaration's. [`run`](Self::run) keeps the same
+/// order on return and on unwind by binding the permit as its first local.
+/// Either way, a writer holding every permit (`wait_for_framing`) knows no
+/// job still holds its slot, invocation, sender or block bytes.
+struct FramingJob {
+    slot: Slot,
+    panic_here: bool,
+    compression: Compression,
+    uncompressed: Vec<u8>,
+    meta: BlobMeta,
+    writer_gone: super::pipeline::WriterGone,
+    invocation: crate::host::Permit,
+    executor: Executor,
+    permit: PermitGuard,
+}
+
+impl FramingJob {
+    fn run(self) {
+        // Bound first so it drops last - the permit is released after the
+        // slot's send below, and also on the unwind path if any of the
+        // framing work panics. See `PermitGuard`.
+        let _permit = self.permit;
+        // Every other field becomes a local declared after the permit,
+        // before anything that can panic, so it drops before the permit.
+        let slot = self.slot;
+        let writer_gone = self.writer_gone;
+        let invocation = self.invocation;
+        let executor = self.executor;
+        let uncompressed = self.uncompressed;
+        let meta = self.meta;
+        let compression = self.compression;
+        let seq = slot.seq;
+        framing_job_starts(&invocation, seq);
+        assert!(!self.panic_here, "test hook: framing panic at seq {seq}");
+        let metrics = &invocation.metrics().writer;
+        // A scan runs here, on the framing worker, outside the scratch
+        // borrow; its failure is this slot's ordered result.
+        let result = meta.with_fields(&uncompressed, |indexdata, tagdata, way_members| {
+            PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                frame_blob_into(
+                    "OSMData",
+                    &uncompressed,
+                    &compression,
+                    indexdata,
+                    tagdata,
+                    way_members,
+                    scratch,
+                    metrics,
+                )
+            })
+        });
+        if let Ok(ref parts) = result {
+            metrics.payload_framed_items.fetch_add(1, Relaxed);
+            metrics
+                .payload_framed_bytes
+                .fetch_add(parts.total_len(), Relaxed);
+            // Where the framing above actually ran, checked here on the
+            // thread that ran it: a worker of the writer's own executor or
+            // not. It must stay beside the framing call; moved to a wrapper
+            // that hands framing elsewhere, it would report the wrapper's
+            // thread instead.
+            if executor.on_worker() {
+                metrics
+                    .payload_framed_on_executor_items
+                    .fetch_add(1, Relaxed);
+            }
+        }
+        drop(executor);
+        let t_send = crate::counters::Stopwatch::start();
+        // A failed send means the writer thread has already exited, and this
+        // closure has no `Result` to return it in. Record it so the
+        // producer's next call can join and surface the real cause instead
+        // of grinding on to `flush()`. See `WriterGone`.
+        if slot.send(result.map(OutputChunk::Framed)).is_err() {
+            writer_gone.record();
+        }
+        record_send_wait(t_send, metrics);
+        framing_job_ends(&invocation);
     }
 }
 
@@ -978,81 +1074,21 @@ impl<W: Write> PbfWriter<W> {
     /// writing straight from the scratch with no copy of the block.
     fn write_osm_data(&mut self, block: Cow<'_, [u8]>, meta: BlobMeta) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            let (permit, seq) = reserve(pipeline)?;
-            let compression = self.compression;
-            let uncompressed = block.into_owned();
-            let tx = pipeline.tx.clone();
-            let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(&self.cancel, seq);
-            let invocation = pipeline.invocation.clone();
-            let executor = pipeline.executor.clone();
+            let (permit, slot) = reserve(pipeline)?;
+            let job = FramingJob {
+                panic_here: framing_panics_at(&self.cancel, slot.seq),
+                slot,
+                compression: self.compression,
+                uncompressed: block.into_owned(),
+                meta,
+                writer_gone: pipeline.writer_gone.clone(),
+                invocation: pipeline.invocation.clone(),
+                executor: pipeline.executor.clone(),
+                permit,
+            };
             #[cfg(feature = "test-hooks")]
-            invocation.faults().on_framing_dispatch();
-            pipeline.executor.spawn(move || {
-                // Bound first so it drops last - the permit is released
-                // after `tx.send` below, and also on the unwind path if any
-                // of the framing work panics. See `PermitGuard`.
-                let _permit = permit;
-                // Every other capture becomes a local declared after the
-                // permit, before anything that can panic, so it drops
-                // before the permit on return and on unwind alike: a writer
-                // holding every permit (`wait_for_framing`) knows no job
-                // still holds its invocation, sender or block bytes.
-                let (tx, writer_gone, invocation, executor, uncompressed, meta) =
-                    (tx, writer_gone, invocation, executor, uncompressed, meta);
-                framing_job_starts(&invocation, seq);
-                assert!(!panic_here, "test hook: framing panic at seq {seq}");
-                let metrics = &invocation.metrics().writer;
-                // A scan runs here, on the framing worker, outside the
-                // scratch borrow; its failure is this slot's ordered result.
-                let result = meta.with_fields(&uncompressed, |indexdata, tagdata, way_members| {
-                    PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                        frame_blob_into(
-                            "OSMData",
-                            &uncompressed,
-                            &compression,
-                            indexdata,
-                            tagdata,
-                            way_members,
-                            scratch,
-                            metrics,
-                        )
-                    })
-                });
-                if let Ok(ref parts) = result {
-                    metrics.payload_framed_items.fetch_add(1, Relaxed);
-                    metrics
-                        .payload_framed_bytes
-                        .fetch_add(parts.total_len(), Relaxed);
-                    // Where the framing above actually ran, checked here on
-                    // the thread that ran it: a worker of the writer's own
-                    // executor or not. It must stay beside the framing call;
-                    // moved to a wrapper that hands framing elsewhere, it
-                    // would report the wrapper's thread instead.
-                    if executor.on_worker() {
-                        metrics
-                            .payload_framed_on_executor_items
-                            .fetch_add(1, Relaxed);
-                    }
-                }
-                drop(executor);
-                let t_send = crate::counters::Stopwatch::start();
-                // A failed send means the writer thread has already exited,
-                // and this closure has no `Result` to return it in. Record it
-                // so the producer's next call can join and surface the real
-                // cause instead of grinding on to `flush()`. See `WriterGone`.
-                if tx
-                    .send(PipelineItem {
-                        seq,
-                        data: result.map(OutputChunk::Framed),
-                    })
-                    .is_err()
-                {
-                    writer_gone.record();
-                }
-                record_send_wait(t_send, metrics);
-                framing_job_ends(&invocation);
-            });
+            job.invocation.faults().on_framing_dispatch();
+            pipeline.executor.spawn(move || job.run());
             self.mark_pending();
             Ok(())
         } else {
@@ -1523,9 +1559,8 @@ mod tests {
     use super::{Compression, Executor, PbfWriter, WritePipeline};
     use crate::block_builder::OwnedBlock;
     use crate::error::{Error, ErrorKind, Result};
-    use crate::write::pipeline::{PipelineItem, SeqTotal};
+    use crate::write::pipeline::{SeqTotal, new_channels};
     use std::io;
-    use std::sync::mpsc::sync_channel;
 
     /// A disk-full failure as the writer thread would report it.
     fn storage_full(msg: &'static str) -> Error {
@@ -1569,16 +1604,17 @@ mod tests {
     /// next send fails - which is exactly the shape of a writer thread that
     /// died on ENOSPC halfway through a planet write.
     fn writer_with_dead_thread(outcome: Result<()>) -> PbfWriter<Vec<u8>> {
-        let (tx, rx) = sync_channel::<PipelineItem>(1);
+        let (tx, window_rx, inbox) = new_channels();
         // Drop the receiver before the thread even starts, so every send is
         // guaranteed to fail without a race to synchronise against.
-        drop(rx);
+        drop(inbox);
         let handle = std::thread::spawn(move || outcome);
         let invocation = crate::host::Call::detached().permit();
         PbfWriter::from_pipeline(
             Compression::None,
             WritePipeline::new(
                 tx,
+                window_rx,
                 handle,
                 SeqTotal::new(),
                 Executor::Ambient,

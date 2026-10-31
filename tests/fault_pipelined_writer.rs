@@ -244,6 +244,78 @@ fn run(backend: Backend, end: End) {
     );
 }
 
+/// A slow head stalls the producer at the delivery window instead of letting
+/// finished items pile up behind it: with block 0's framing parked, exactly
+/// the window's worth of items is admitted, the next write waits, and
+/// releasing the head lets the whole stream finish in order.
+#[test]
+fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
+    const WINDOW: usize = 512;
+    for backend in [Backend::Buffered, Backend::Parallel] {
+        let dir = crate::common::test_scratch();
+        // `open`'s writer type borrows the path, and the writer moves to
+        // another thread below.
+        let path: &'static Path = Box::leak(dir.path().join("window.osm.pbf").into_boxed_path());
+        let exited = Arc::new(AtomicUsize::new(0));
+        let on_exit = Arc::clone(&exited);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(POOL_THREADS)
+                .exit_handler(move |_| {
+                    on_exit.fetch_add(1, SeqCst);
+                })
+                .build()
+                .unwrap(),
+        );
+        let mut writer = open(backend, path, Executor::Pool(Arc::clone(&pool)));
+        let invocation = writer.invocation().clone();
+        let cleanup = Cleanup {
+            invocation: invocation.clone(),
+            pool: Some(pool),
+            exited,
+        };
+        let faults = invocation.faults();
+        faults.hold_framing_at.store(0, SeqCst);
+        writer.write_primitive_block(&EMPTY_BLOCK).unwrap();
+        assert!(wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1));
+
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::clone(&admitted);
+        let raw = std::thread::spawn(move || {
+            for _ in 0..WINDOW {
+                writer.write_raw(&[]).unwrap();
+                progress.fetch_add(1, SeqCst);
+            }
+            writer
+        });
+        // Items 1 to WINDOW - 1 fit beside the parked head; the next waits.
+        assert!(
+            wait_for(|| admitted.load(SeqCst) == WINDOW - 1),
+            "{backend:?}: the window admitted {} raw items",
+            admitted.load(SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            admitted.load(SeqCst),
+            WINDOW - 1,
+            "{backend:?}: a write past the window was admitted behind a parked head"
+        );
+        faults.release_framing.store(true, SeqCst);
+        let mut writer = raw.join().unwrap();
+        writer.flush().unwrap();
+        assert!(
+            counter(&invocation, "writer_window_wait_ns") > 0,
+            "{backend:?}: the producer never waited on the window"
+        );
+        assert!(
+            counter(&invocation, "writer_reorder_high_water") <= WINDOW as u64,
+            "{backend:?}: the reorder span exceeded the window"
+        );
+        drop(writer);
+        drop(cleanup);
+    }
+}
+
 #[test]
 fn fault_injection_framing_jobs_end_before_a_failed_writer_does() {
     for backend in [Backend::Buffered, Backend::Parallel] {

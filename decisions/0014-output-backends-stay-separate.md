@@ -61,6 +61,19 @@ keeps draining after a failure so every barrier is answered, keeps its own
 own producer sent. A second textlint keeps the PBF loop's records and
 completeness check out of it.
 
+## Amendment (2026-10-31): the delivery window rides the shared loop
+
+Write-ahead admission now has two parts. The `PermitGuard` dispatch
+permits are unchanged; beside them every reserved item takes a
+delivery-window token that `deliver_in_order` returns after the item's
+handoff, so the bound on finished-but-undelivered items is end to end
+(`PIPELINE_DELIVERY_WINDOW`). Every backend receives through one
+`pipeline::Inbox` (the item receiver plus the window's only sender) and
+gets the window by running the shared loop, with no per-backend code.
+The decision above stands: the window ends at the handoff and touches no
+backend buffer, submission or completion, so the pool's and io_uring's
+downstream queues keep their own bounds.
+
 ## Alternatives considered
 
 - **One core parameterized by submit strategy (write / pwrite-pool /

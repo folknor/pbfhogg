@@ -322,8 +322,8 @@ pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 ///
 /// The channel has room for one full batch of dispatches. Permits bound tasks
 /// dispatched but not yet sent: each sender returns its permit after sending,
-/// even while its item is still buffered. They therefore do not bound channel
-/// occupancy together with active tasks, or items held in the reorder buffer.
+/// even while its item is still buffered. Items in the channel and the
+/// reorder buffer are bounded by [`PIPELINE_DELIVERY_WINDOW`] instead.
 ///
 /// A send can block on a full channel while the writer is handing a chunk to
 /// its backend.
@@ -351,10 +351,36 @@ pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
 /// `PIPELINE_DISPATCH_PERMITS × block size` (~256 MB at ~4 MB per
 /// uncompressed block, an assumed size, not an enforced one). A permit
 /// returns once its result is in the writer channel, so results waiting
-/// there or in the writer's reorder buffer are not covered (see
-/// [`WRITE_AHEAD`]); behind a slow earlier task the reorder buffer grows up
-/// to its `DEFAULT_MAX_WINDOW` failure ceiling, with no backpressure.
+/// there or in the writer's reorder buffer are bounded by
+/// [`PIPELINE_DELIVERY_WINDOW`] instead.
 pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
+
+/// Maximum number of pipelined-writer items reserved but not yet handed to
+/// the backend: the end-to-end admission window.
+///
+/// The producer takes one window token per item before it is given a
+/// sequence number, and the writer thread returns it only after the item's
+/// ordered handoff. Sequence numbers are assigned in reservation order and
+/// delivered in sequence order, so no item can sit more than this many
+/// positions past the next one to deliver, and a slow head stalls the
+/// producer here instead of letting finished frames pile up behind it. It
+/// is a separate pool from [`PIPELINE_DISPATCH_PERMITS`] on purpose: that
+/// one bounds retained input work, this one tolerated output latency, and
+/// folding them together would either throttle framing behind a slow head
+/// or admit as many queued input blocks as the window allows.
+///
+/// It counts items, not bytes. The value is headroom above what planet runs
+/// were seen to need - a reorder span in the low hundreds behind a slow
+/// head, plus the dispatch permits and the channel - so that ordinary input
+/// does not wait on it; it is not a guarantee that no input ever does.
+pub(crate) const PIPELINE_DELIVERY_WINDOW: usize = 512;
+
+/// The window must cover a full batch of dispatches plus the channel, or it
+/// rather than the dispatch pool would cap framing parallelism.
+const _: () = assert!(
+    PIPELINE_DELIVERY_WINDOW >= PIPELINE_DISPATCH_PERMITS + WRITE_AHEAD,
+    "PIPELINE_DELIVERY_WINDOW must cover the dispatch permits and the channel"
+);
 
 /// Keep room for a full batch of dispatches when changing either capacity.
 /// This is a buffering choice; liveness comes from the writer's independent,

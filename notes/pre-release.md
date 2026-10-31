@@ -255,16 +255,6 @@ hostile blobs, cancellation and error paths that release leases, and a byte
 ledger does not bound pages glibc retains. It is also the generic shape of
 WRK-024 and WRK-025.
 
-### WRK-023: Writer permits released at framing, not at ordered delivery
-
-`PIPELINE_DISPATCH_PERMITS` are released when framing finishes, and
-`ReorderBuffer::with_capacity(64)` in `src/write/pipeline.rs`
-`deliver_in_order` is an initial allocation, not an admission limit, so
-completed frames can pile up behind a slow earlier task: "64 permits plus a
-64-slot channel" is not an end-to-end bound. The read pipeline already
-carries permits to delivery. Every pipelined writer user is affected; the
-dedupe path no longer frames through the writer.
-
 ### WRK-024: apply-changes drain admission bound
 
 The drain's `BTreeMap` reorder has no bound (415 MB high water at planet);

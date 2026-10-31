@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
 use crate::tunables::NUM_BUFS;
-use crate::write::pipeline::{OutputSink, PipelineItem, SeqTotal, deliver_in_order};
+use crate::write::pipeline::{Inbox, OutputSink, SeqTotal, deliver_in_order};
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fixed;
@@ -28,7 +28,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::SyncSender;
 
 use super::metrics::WriterMetrics;
 use crate::direct_io::{alloc_aligned_zeroed, round_up};
@@ -563,7 +563,7 @@ impl super::copy_range::ReadSink for UringState {
 /// so the constructor can propagate them immediately.
 #[allow(clippy::needless_pass_by_value)] // Thread entry point - owned values required for move closure.
 pub(crate) fn uring_writer_thread(
-    rx: Receiver<PipelineItem>,
+    rx: Inbox,
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
@@ -624,7 +624,7 @@ fn setup_step(source: io::Error, step: &'static str) -> io::Error {
 /// outside the main logic.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn uring_init_and_run(
-    rx: &Receiver<PipelineItem>,
+    rx: &Inbox,
     path: &std::path::Path,
     framed_header: &[u8],
     init_tx: &SyncSender<Result<()>>,

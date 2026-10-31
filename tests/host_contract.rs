@@ -966,21 +966,31 @@ fn swallowed_framing_panic_surfaces_at_flush() {
     )
     .expect("writer");
     writer.test_faults().framing_panic_at.store(3, Relaxed);
-    for _ in 0..10 {
-        writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
-    }
-    let err = writer
-        .flush()
+    let err = write_then_flush(&mut writer, 10)
         .expect_err("a swallowed framing panic must not flush as a complete file");
     assert!(
         err.to_string()
-            .contains("an upstream framer dropped without sending an earlier seq"),
+            .contains("output item 3 ended without a result"),
         "got: {err}"
     );
 }
+
+/// Write `count` empty blocks, then flush; the first error from either.
+/// A framing panic is an ordered error at its position, so it may surface
+/// on a later write (once the writer thread has stopped on it) or at flush.
+#[cfg(feature = "test-hooks")]
+fn write_then_flush<W: std::io::Write>(
+    writer: &mut pbfhogg::writer::PbfWriter<W>,
+    count: usize,
+) -> pbfhogg::Result<()> {
+    for _ in 0..count {
+        writer.write_primitive_block(&EMPTY_BLOCK)?;
+    }
+    writer.flush()
+}
 /// A swallowed panic must return its permit even when flush itself has to
-/// run the framing job on the pool's only worker. Cover an interior gap, a
-/// missing tail, and a stream whose only task panics.
+/// run the framing job on the pool's only worker. Cover an interior item, the
+/// final one, and a stream whose only task panics.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn swallowed_framing_panics_on_one_worker_fail_flush() {
@@ -997,9 +1007,9 @@ fn swallowed_framing_panics_on_one_worker_fail_flush() {
             .expect("pool"),
     );
     for (count, panic_at, message) in [
-        (10, 3, "earlier seq"),
-        (10, 9, "final seq"),
-        (1, 0, "final seq"),
+        (10, 3, "output item 3 ended without a result"),
+        (10, 9, "output item 9 ended without a result"),
+        (1, 0, "output item 0 ended without a result"),
     ] {
         pool.install(|| {
             let mut writer = pbfhogg::writer::PbfWriter::to_path(
@@ -1013,10 +1023,7 @@ fn swallowed_framing_panics_on_one_worker_fail_flush() {
                 .test_faults()
                 .framing_panic_at
                 .store(panic_at, Relaxed);
-            for _ in 0..count {
-                writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
-            }
-            let err = writer.flush().expect_err("the output is incomplete");
+            let err = write_then_flush(&mut writer, count).expect_err("the output is incomplete");
             assert!(err.to_string().contains(message), "got: {err}");
         });
     }

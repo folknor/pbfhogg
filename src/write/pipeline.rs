@@ -8,7 +8,9 @@
 
 use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
-use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
+use crate::tunables::{
+    EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DELIVERY_WINDOW, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD,
+};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WriterMetrics;
 use std::io::Write;
@@ -87,6 +89,100 @@ impl FramedBlobParts {
 pub(crate) struct PipelineItem {
     pub(crate) seq: usize,
     pub(crate) data: Result<OutputChunk>,
+}
+
+/// The writer thread's end of a pipeline: the item receiver and the only
+/// sender of the delivery window ([`PIPELINE_DELIVERY_WINDOW`]).
+///
+/// [`deliver_in_order`] returns one window token per item it hands to the
+/// sink. Keeping the window's sender here, and nowhere else, makes the two
+/// die together: `items` is declared first so it drops first, and once the
+/// writer thread lets go of its inbox a producer waiting for a token sees a
+/// disconnect instead of waiting on a head that will never be delivered.
+pub(crate) struct Inbox {
+    pub(crate) items: Receiver<PipelineItem>,
+    window: SyncSender<()>,
+}
+
+impl Inbox {
+    /// An inbox over `items` whose window tokens go nowhere: for tests that
+    /// drive [`deliver_in_order`] directly, with no producer to admit.
+    #[cfg(test)]
+    pub(crate) fn detached(items: Receiver<PipelineItem>) -> Self {
+        let (window, _) = sync_channel(0);
+        Self { items, window }
+    }
+}
+
+/// A fresh pipeline's channels: the item sender, the producer's window
+/// receiver pre-filled with [`PIPELINE_DELIVERY_WINDOW`] tokens, and the
+/// writer thread's [`Inbox`].
+#[expect(
+    clippy::expect_used,
+    reason = "the first N sends on a fresh channel of capacity N, whose receiver is held here, cannot fail or block"
+)]
+pub(super) fn new_channels() -> (SyncSender<PipelineItem>, Receiver<()>, Inbox) {
+    let (tx, items) = sync_channel(WRITE_AHEAD);
+    let (window, window_rx) = sync_channel::<()>(PIPELINE_DELIVERY_WINDOW);
+    for _ in 0..PIPELINE_DELIVERY_WINDOW {
+        window
+            .send(())
+            .expect("seeding delivery window on fresh channel");
+    }
+    (tx, window_rx, Inbox { items, window })
+}
+
+/// One reserved output position: the obligation to deliver exactly one
+/// result for `seq`.
+///
+/// Created by the reservation that assigns the sequence number, so no seq
+/// exists without one. [`send`](Self::send) discharges it whatever the
+/// outcome (a failed send proves the writer thread is gone). Dropped
+/// undischarged - a framing job that panicked, a closure dropped unrun, a
+/// producer unwinding between reservation and send - it sends an ordered
+/// error for its seq instead. Under the delivery window a missing seq is not
+/// a gap reported at end of stream: the head would never be delivered, the
+/// window would never refill, and the producer would wait forever. The
+/// fallback send may block on a full channel, which is safe because the
+/// writer thread receives in any order on its own thread.
+pub(super) struct Slot {
+    pub(super) seq: usize,
+    tx: Option<SyncSender<PipelineItem>>,
+}
+
+impl Slot {
+    pub(super) fn new(seq: usize, tx: SyncSender<PipelineItem>) -> Self {
+        Self { seq, tx: Some(tx) }
+    }
+
+    /// Send this slot's result. `Err` means the writer thread has exited.
+    pub(super) fn send(mut self, data: Result<OutputChunk>) -> std::result::Result<(), ()> {
+        match self.tx.take() {
+            Some(tx) => tx
+                .send(PipelineItem {
+                    seq: self.seq,
+                    data,
+                })
+                .map_err(|_| ()),
+            None => Err(()),
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            // A failed send means the writer thread is gone; nothing to tell.
+            tx.send(PipelineItem {
+                seq: self.seq,
+                data: Err(Error::internal(format!(
+                    "pipelined writer: output item {} ended without a result",
+                    self.seq
+                ))),
+            })
+            .ok();
+        }
+    }
 }
 
 /// A backend's byte path: what it does with the bytes [`deliver_in_order`]
@@ -259,6 +355,10 @@ pub(super) struct WritePipeline {
     /// [`PIPELINE_DISPATCH_PERMITS`] for what it does and does not bound.
     pub(super) permit_tx: SyncSender<()>,
     pub(super) permit_rx: Receiver<()>,
+    /// The producer's side of the delivery window: one token per item from
+    /// reservation to ordered handoff. Its only sender is the writer
+    /// thread's [`Inbox`]; see [`PIPELINE_DELIVERY_WINDOW`].
+    pub(super) window_rx: Receiver<()>,
     /// End-of-stream handshake shared with the writer thread. `flush`
     /// announces `seq` into it before dropping `tx`; see [`SeqTotal`].
     pub(super) expected: SeqTotal,
@@ -281,6 +381,7 @@ impl WritePipeline {
     /// pool and nothing sent yet.
     pub(super) fn new(
         tx: SyncSender<PipelineItem>,
+        window_rx: Receiver<()>,
         join_handle: JoinHandle<Result<()>>,
         expected: SeqTotal,
         executor: crate::host::Executor,
@@ -293,6 +394,7 @@ impl WritePipeline {
             join_handle: Some(join_handle),
             permit_tx,
             permit_rx,
+            window_rx,
             expected,
             writer_gone: WriterGone::new(),
             executor,
@@ -309,13 +411,13 @@ impl WritePipeline {
         body: F,
     ) -> Self
     where
-        F: FnOnce(Receiver<PipelineItem>, &SeqTotal) -> Result<()> + Send + 'static,
+        F: FnOnce(Inbox, &SeqTotal) -> Result<()> + Send + 'static,
     {
-        let (tx, rx) = sync_channel(WRITE_AHEAD);
+        let (tx, window_rx, inbox) = new_channels();
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
-        let handle = std::thread::spawn(move || body(rx, &thread_expected));
-        Self::new(tx, handle, expected, executor, invocation)
+        let handle = std::thread::spawn(move || body(inbox, &thread_expected));
+        Self::new(tx, window_rx, handle, expected, executor, invocation)
     }
 
     /// The writer counters of this pipeline's invocation.
@@ -338,9 +440,7 @@ impl WritePipeline {
         body: F,
     ) -> Result<Self>
     where
-        F: FnOnce(Receiver<PipelineItem>, SyncSender<Result<()>>, &SeqTotal) -> Result<()>
-            + Send
-            + 'static,
+        F: FnOnce(Inbox, SyncSender<Result<()>>, &SeqTotal) -> Result<()> + Send + 'static,
     {
         let (init_tx, init_rx) = sync_channel(1);
         let mut pipeline = Self::spawn(executor, invocation, move |rx, expected| {
@@ -507,8 +607,7 @@ fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
 /// also puts the release after the `tx.send` of the framed result, so a
 /// permit counts its job until the result is in the channel. From then on
 /// the result waits in the channel or the writer's reorder buffer, which
-/// permits do not bound (the buffer's only limit is its `max_window`
-/// failure ceiling).
+/// permits do not bound (the bound there is the delivery window, [`PIPELINE_DELIVERY_WINDOW`]).
 pub(super) struct PermitGuard(SyncSender<()>);
 
 impl PermitGuard {
@@ -680,17 +779,28 @@ pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch, metrics: 
 /// number of blobs into a successful write - for io_uring and `O_DIRECT`,
 /// padded and `set_len`'d into a well-formed-looking one. Hence
 /// [`check_stream_complete`], for an interior gap and for a missing tail.
+///
+/// Each item handed to the sink returns one delivery-window token to the
+/// producer, after the whole handoff succeeds. That is what bounds the
+/// reorder buffer: the producer reserves at most
+/// [`PIPELINE_DELIVERY_WINDOW`] items past the last one handed off, and the
+/// buffer's next seq is never behind that, so its window is pinned to the
+/// same value and a push past it is a broken admission invariant, not load.
+/// The token send cannot block (each returned token was taken by the item
+/// being returned, so the channel has room) and a failed one only means the
+/// producer is gone.
 pub(super) fn deliver_in_order<S: OutputSink>(
-    rx: &Receiver<PipelineItem>,
+    inbox: &Inbox,
     sink: &mut S,
     expected: &SeqTotal,
     metrics: &WriterMetrics,
 ) -> Result<()> {
-    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
+    let mut pending: ReorderBuffer<Result<OutputChunk>> =
+        ReorderBuffer::with_max_window(WRITE_AHEAD, PIPELINE_DELIVERY_WINDOW);
 
     loop {
         let t_recv = crate::counters::Stopwatch::start();
-        let item = match rx.recv() {
+        let item = match inbox.items.recv() {
             Ok(item) => item,
             Err(_) => break,
         };
@@ -702,6 +812,7 @@ pub(super) fn deliver_in_order<S: OutputSink>(
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
             metrics.time_handoff(|| hand_off(sink, chunk, metrics))?;
+            inbox.window.send(()).ok();
         }
 
         sink.after_drain()?;
@@ -729,19 +840,22 @@ pub(super) fn deliver_in_order<S: OutputSink>(
 /// and that is the error returned here.
 #[allow(clippy::needless_pass_by_value)] // Thread entry point owns the receiver moved into std::thread::spawn.
 pub(super) fn writer_thread(
-    rx: Receiver<PipelineItem>,
+    inbox: Inbox,
     mut sink: FileOutputSink,
     expected: &SeqTotal,
 ) -> Result<()> {
     let invocation = sink.cancel.clone();
-    deliver_in_order(&rx, &mut sink, expected, &invocation.metrics().writer)?;
+    deliver_in_order(&inbox, &mut sink, expected, &invocation.metrics().writer)?;
     sink.finish()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{OutputChunk, OutputSink, PipelineItem, SeqTotal, WRITE_AHEAD, deliver_in_order};
+    use super::{
+        Inbox, OutputChunk, OutputSink, PIPELINE_DELIVERY_WINDOW, PipelineItem, SeqTotal, Slot,
+        WRITE_AHEAD, deliver_in_order, new_channels,
+    };
     use crate::error::Result;
     use std::sync::mpsc::sync_channel;
 
@@ -807,8 +921,55 @@ mod tests {
             written: Vec::new(),
             after_drains: 0,
         };
-        let result = deliver_in_order(&rx, &mut sink, &expected, metrics);
+        let result = deliver_in_order(&Inbox::detached(rx), &mut sink, &expected, metrics);
         (result, sink.written, sink.after_drains)
+    }
+
+    /// Every item handed to the sink gives its window token back, and an
+    /// item stuck behind a missing head does not: the window refills exactly
+    /// as far as delivery got.
+    #[test]
+    fn the_window_refills_only_as_far_as_ordered_delivery() {
+        let (tx, window_rx, inbox) = new_channels();
+        // Reserve three positions the way the producer does.
+        for _ in 0..3 {
+            window_rx.try_recv().unwrap();
+        }
+        for seq in [0, 2] {
+            tx.send(PipelineItem {
+                seq,
+                data: Ok(OutputChunk::Raw(vec![0])),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        let mut sink = RecordingSink {
+            written: Vec::new(),
+            after_drains: 0,
+        };
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        let result = deliver_in_order(&inbox, &mut sink, &SeqTotal::new(), &metrics);
+        assert!(result.is_err(), "seq 1 never arrived");
+        assert_eq!(sink.written.len(), 1);
+        assert_eq!(
+            window_rx.try_iter().count(),
+            PIPELINE_DELIVERY_WINDOW - 2,
+            "only seq 0's token returns; seq 2 waits behind the missing seq 1"
+        );
+    }
+
+    /// A slot dropped without sending (a panicked or never-run framing job)
+    /// still delivers an ordered error for its seq, so the head is never
+    /// silently missing.
+    #[test]
+    fn a_dropped_slot_sends_an_ordered_error() {
+        let (tx, rx) = sync_channel::<PipelineItem>(1);
+        drop(Slot::new(7, tx));
+        let item = rx.recv().unwrap();
+        assert_eq!(item.seq, 7);
+        let err = item.data.err().unwrap();
+        assert!(err.to_string().contains("ended without a result"), "{err}");
+        assert!(rx.recv().is_err(), "exactly one result per slot");
     }
 
     /// `writer_reorder_high_water` is the seq span, gaps included;

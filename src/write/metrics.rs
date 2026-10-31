@@ -5,6 +5,10 @@ use crate::counters::Stopwatch;
 crate::counters::counter_set! {
     pub(crate) struct WriterMetrics {
         pub permit_wait_ns => "writer_permit_wait_ns",
+        /// Producer time waiting for a delivery-window token: the writer
+        /// had `PIPELINE_DELIVERY_WINDOW` items reserved past its last
+        /// handoff, usually behind one slow head.
+        pub window_wait_ns => "writer_window_wait_ns",
         /// `frame_ns` and `compress_ns` are summed across whichever threads
         /// framed - the executor's workers on a pipelined writer, the caller
         /// on a synchronous one - so they are not components of any one

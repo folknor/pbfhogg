@@ -51,7 +51,9 @@ use std::thread::{Scope, ScopedJoinHandle};
 
 use crate::error::{Error, Result};
 use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE};
-use crate::write::pipeline::{OutputSink, PipelineItem, SeqTotal, deliver_in_order};
+#[cfg(test)]
+use crate::write::pipeline::PipelineItem;
+use crate::write::pipeline::{Inbox, OutputSink, SeqTotal, deliver_in_order};
 use crate::write::pool_failure::FirstFailure;
 
 /// One unit of work dispatched from the writer-thread to the pool.
@@ -105,7 +107,7 @@ enum WriteOp {
 /// ("worker channel closed") from outranking its cause.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn parallel_writer_thread(
-    rx: Receiver<PipelineItem>,
+    rx: Inbox,
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
@@ -121,7 +123,7 @@ pub(crate) fn parallel_writer_thread(
 
 #[allow(clippy::needless_pass_by_value)]
 fn parallel_writer_thread_inner(
-    rx: Receiver<PipelineItem>,
+    rx: Inbox,
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
@@ -177,7 +179,7 @@ fn parallel_writer_thread_inner(
 /// returns early past the join loop.
 fn run_pool<'scope, 'env>(
     s: &'scope Scope<'scope, 'env>,
-    rx: &Receiver<PipelineItem>,
+    rx: &Inbox,
     file: &'scope File,
     failure: &'scope FirstFailure,
     header_len: u64,
@@ -432,7 +434,7 @@ mod tests {
     /// The pool's ordered-delivery loop over `worker_txs`, as `run_pool` runs
     /// it, with the header taking no space.
     fn dispatch_loop(
-        rx: &Receiver<PipelineItem>,
+        rx: &Inbox,
         worker_txs: &[SyncSender<WriteOp>],
         failure: &FirstFailure,
         expected: &SeqTotal,
@@ -464,7 +466,7 @@ mod tests {
         let thread_total = seq_total.clone();
         let handle = std::thread::spawn(move || {
             parallel_writer_thread(
-                rx,
+                Inbox::detached(rx),
                 path,
                 header,
                 init_tx,
@@ -534,7 +536,7 @@ mod tests {
 
         let seq_total = SeqTotal::new();
         seq_total.announce(3);
-        let result = dispatch_loop(&rx, &worker_txs, &failure, &seq_total);
+        let result = dispatch_loop(&Inbox::detached(rx), &worker_txs, &failure, &seq_total);
         let err = result.expect_err("gap at channel close must surface as Err");
         let msg = err.to_string();
         assert!(
@@ -568,7 +570,7 @@ mod tests {
         // Two blobs were dispatched upstream; only seq 0 ever arrived.
         seq_total.announce(2);
 
-        let result = dispatch_loop(&rx, &worker_txs, &failure, &seq_total);
+        let result = dispatch_loop(&Inbox::detached(rx), &worker_txs, &failure, &seq_total);
         let msg = result
             .expect_err("a missing final seq is a short file, not a success")
             .to_string();
@@ -597,7 +599,7 @@ mod tests {
         let seq_total = SeqTotal::new();
         seq_total.announce(1);
 
-        dispatch_loop(&rx, &worker_txs, &failure, &seq_total)
+        dispatch_loop(&Inbox::detached(rx), &worker_txs, &failure, &seq_total)
             .expect("a complete one-item stream is not a truncation");
         drop(worker_rx);
     }

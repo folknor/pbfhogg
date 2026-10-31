@@ -129,7 +129,7 @@ Only the pipelined iteration methods honour it; the sequential `for_each` and
 | Stage | Thread | Work |
 |-------|--------|------|
 | 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
-| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (initial capacity `WRITE_AHEAD`, not a bound; its default maximum window caps the seq span), writes to `FileWriter` |
+| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (window pinned to `PIPELINE_DELIVERY_WINDOW`, the producer's end-to-end admission bound), writes to `FileWriter` |
 
 Every pipelined constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
 
@@ -759,17 +759,24 @@ full file per step: passthrough saves little there.
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
 - Pipelined writer thread - a sequence-number reorder buffer
   (`deliver_in_order`) fed by a channel of `WRITE_AHEAD` =
-  `PIPELINE_DISPATCH_PERMITS` slots. Nothing here applies backpressure to
-  framed output end to end. A dispatch permit is taken before a framing job
-  is spawned (or a raw item sent) and returned once its result is in the
-  channel, so permits bound dispatched work - queued, running or blocked
-  sending - not results: up to `WRITE_AHEAD` items (one framed blob, or a
-  raw run of several) can wait in the channel, and the reorder buffer keeps
-  every item that arrives behind a slow earlier sequence number. Its initial
-  capacity is an allocation; its only limit is the reorder buffer's default
-  `max_window` (65,536 sequence numbers ahead), past which a push panics -
-  a failure ceiling, not admission. The channel size is not a liveness
-  condition either:
+  `PIPELINE_DISPATCH_PERMITS` slots. Two pools admit work. A dispatch
+  permit is taken before a framing job is spawned (or a raw item sent) and
+  returned once its result is in the channel, so permits bound dispatched
+  work - queued, running or blocked sending - not results. Results are
+  bounded end to end by the delivery window (`PIPELINE_DELIVERY_WINDOW`
+  items): the producer takes a window token before it assigns a sequence
+  number, and the writer thread returns it only after that item's ordered
+  handoff to the backend. A slow head therefore stalls the producer
+  (`writer_window_wait_ns`) once the window's worth of items is reserved
+  past the last handoff, and the reorder buffer's window is pinned to the
+  same value. The window counts items, not bytes, and ends at the handoff:
+  the pwrite pool and io_uring keep their own queues downstream. The
+  window's only sender lives in the writer thread's inbox beside the item
+  receiver, so a producer waiting on it is released when the writer thread
+  exits. Every reserved sequence number owes exactly one result: a framing
+  job that panics or is dropped unrun sends an ordered error for its seq,
+  since a missing head would otherwise never be delivered and the window
+  never refill. The channel size is not a liveness condition either:
   the writer thread receives in any order, so a full channel only throttles
   framers until it drains. A compile-time assertion keeps the channel at
   least as deep as the permit count, as a buffering choice.

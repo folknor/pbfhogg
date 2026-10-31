@@ -13,7 +13,7 @@
 //! retain their single group walk; a second walk is needed only when a group
 //! contains plain nodes, to preserve the element iterator's dense-first order.
 //!
-//! Skipping construction also skips `validate_groups_strict`, so the dense
+//! Skipping construction also skips `validate_block`, so the dense
 //! coordinate checks it makes (equal-length, well-formed `id`/`lat`/`lon`
 //! arrays) are made here instead, during the decode itself; see
 //! `scan_dense_coords`.
@@ -136,7 +136,7 @@ fn dense_mismatch_err() -> crate::error::Error {
 /// streams of equal length.
 ///
 /// This scanner bypasses `PrimitiveBlock` construction, so the checks
-/// `validate_groups_strict` makes on these three arrays have to happen here.
+/// `validate_block` makes on these three arrays have to happen here.
 /// They cost no extra pass: each value is read with `Cursor::read_varint`,
 /// the same decoder `PackedSint64Iter` wraps, but its error is propagated
 /// instead of being turned into an end of iteration. A successful read

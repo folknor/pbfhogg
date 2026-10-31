@@ -189,7 +189,7 @@ struct WorkerScratch {
     way_scratch: WayReframeScratch,
     reframe_output: Vec<u8>,
     output: Vec<OwnedBlock>,
-    /// String-table and group-range scratch for `parse_and_inline_with_scratch`
+    /// String-table and group-range scratch for block construction
     /// on the non-way decode path. Retained across descriptors so the per-block
     /// `Vec<(u32, u32)>` allocation is eliminated.
     st_scratch: Vec<(u32, u32)>,

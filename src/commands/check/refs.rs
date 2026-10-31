@@ -239,12 +239,15 @@ fn append_capped_missing_refs(
 /// landing with decompression and parse roughly co-equal. The actual
 /// landing put decompression overwhelmingly in front of parse at
 /// planet (Europe hotpath after step #2: `decompress_blob_raw` 162 s
-/// cumulative vs `parse_and_inline` 2.1 s), so a selective parser's
-/// measured ceiling is a fraction of a second at Europe and a few
-/// seconds at planet. The lever to pull for further gains is
-/// decompression throughput (zstd input format, io_uring, direct I/O),
-/// not selective parse. Revisit step #3 only if a future change makes
-/// parse a meaningful share of wall again.
+/// cumulative vs the offset-table step 2.1 s), so a selective parser's
+/// measured ceiling looked like a fraction of a second at Europe and a few
+/// seconds at planet. That figure timed only the offset tables: block
+/// validation and the element walk were not measured separately, and on
+/// `check --ids` at planet they are about half the decode workers' CPU
+/// (`reference/performance.md`, "check --ids and getparents read through
+/// projections"). A projection on the block validator
+/// (`read::block::BlockBuffer::project`) is the selective parser this
+/// pass would take; it has not been measured here.
 ///
 /// # Input
 ///

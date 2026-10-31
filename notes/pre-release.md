@@ -194,12 +194,6 @@ holds framed vectors, each worker builds a fresh `BlockBuilder` per blob
 (deliberate and measured, see "Facts learned the hard way"), and frames are
 copied with `FramedBlobParts::into_vec`. WRK-020 is the structural fix.
 
-### WRK-011: check --ids ways phase (566 MB against the nodes phase's 301 MB)
-
-Each of the three phases spawns fresh workers and pools; the nodes phase's
-buffers are freed before the ways phase builds new ones, yet the ways phase
-peaks near twice as high. Not investigated.
-
 ### WRK-012: Allocator hook coverage by ownership pattern
 
 The CLI's `cross_thread_alloc_pool` hook (`cli/src/host.rs`: two malloc
@@ -281,16 +275,18 @@ headroom counted, hash buckets undercounted), so count resident components
 before choosing a fix. Deleted-id membership is still needed during the
 pipeline, though its representation could merge with other state.
 
-### WRK-026: Projection scanners for scan commands
+### WRK-114: check --refs and getid on the projection pools
 
-check `--ids` needs IDs plus boundary and violation summaries; getparents
-needs refs and members matched against the requested ID set. A borrowed
-scanner skips offset tables and the general element interface, keeping
-every structural and corruption check the command performs today. Shrinks
-the envelope WRK-022 rations and cuts CPU. Inspect already scans this way
-(`4dbc2d47`: a `GroupProjection` on `block::validate_groups`, through
-`Decoder::project`); a scan command is another projection on the same
-validator.
+check `--refs` still builds a block per blob and walks
+`elements_skip_metadata` to read IDs, refs and members, the same shape
+check `--ids` left (planet nodes phase about 18 s, ways 13.5 s). Its
+module comment once refused a selective parser on a hotpath that timed
+only the offset tables; validation plus the element walk were about half
+the worker CPU on check `--ids`. `parallel_project_phase` and the
+`KindIds` / `ParentProbe` pattern (record positions, decode after
+acceptance) apply directly. getid's include walk (test each ID, re-encode
+the few matches) has getparents' shape and could take `parents_in`'s
+filter-then-build structure. Measure each against a matched base.
 
 ### WRK-027: Membership track for set-dominated peaks
 

@@ -189,7 +189,7 @@ const DUP_DI_VISIBLE: &str =
 /// `WireBlock<'static>` for self-referential ownership.
 ///
 /// The (u32, u32) entry pairs (offset, length) are appended to the buffer
-/// after the protobuf data by `WireBlock::parse_and_inline`. This eliminates
+/// after the protobuf data by `WireBlock::inline_tables`. This eliminates
 /// the cross-thread Box alloc/free retention that caused 25+ GB OOM at
 /// Europe/planet scale with the pipelined reader.
 #[derive(Clone, Debug)]
@@ -363,46 +363,31 @@ pub(crate) struct WireBlock<'a> {
 }
 
 impl<'a> WireBlock<'a> {
-    /// Parse and inline: scan protobuf, then append string table entries and group
-    /// ranges as raw LE bytes to the buffer. Zero separate heap allocations.
+    /// Append the string table entries and group ranges a
+    /// [`scan_block_fields`] of `buf` recorded (`st_entries`,
+    /// `group_entries`, and its `fields`) to `buf` as raw LE bytes, and
+    /// return the metadata a `WireBlock` reads them back through. No
+    /// allocation beyond growing the buffer by the tables.
     ///
-    /// The buffer is extended in-place. After this call, the buffer layout is:
+    /// After this call the buffer layout is:
     /// `[protobuf data] [st entries: (u32,u32) × N as LE bytes] [group ranges: (u32,u32) × M as LE bytes]`
     ///
-    /// Temp Vecs used during scanning are allocated and freed on the calling thread
-    /// (no cross-thread retention). Only the buffer itself crosses thread boundaries.
-    #[hotpath::measure]
+    /// The scratch lists are the caller's, reused across blocks; only the
+    /// buffer itself crosses thread boundaries.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn parse_and_inline(buf: &mut Vec<u8>) -> Result<WireBlockMeta> {
-        let mut st_scratch = Vec::new();
-        let mut gr_scratch = Vec::new();
-        Self::parse_and_inline_with_scratch(buf, &mut st_scratch, &mut gr_scratch)
-    }
-
-    /// Like [`parse_and_inline`] but reuses caller-provided scratch buffers
-    /// to avoid per-block allocation. The scratch Vecs are cleared at the start
-    /// and may grow to accommodate the block's string table and group entries.
-    /// Between blocks, the capacity is retained - no malloc/free after the
-    /// first few blocks.
-    #[hotpath::measure]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn parse_and_inline_with_scratch(
+    pub(crate) fn inline_tables(
         buf: &mut Vec<u8>,
-        st_entries: &mut Vec<(u32, u32)>,
-        group_entries: &mut Vec<(u32, u32)>,
-    ) -> Result<WireBlockMeta> {
+        st_entries: &[(u32, u32)],
+        group_entries: &[(u32, u32)],
+        fields: BlockFields,
+    ) -> WireBlockMeta {
         let proto_len = buf.len() as u32;
-
-        // Phase 1: scan protobuf, collect into reusable scratch Vecs.
         let BlockFields {
             granularity,
             lat_offset,
             lon_offset,
             date_granularity,
-        } = scan_block_fields(buf, st_entries, group_entries)?;
-        // Phase 1 temp Vecs are still alive but immutable borrow of buf is released.
-
-        // Phase 2: append entries as raw LE bytes to the buffer.
+        } = fields;
         // Reserve room for the inline entries before appending, so the
         // extends below never grow the buffer one at a time. Exact, like the
         // decompressors' raw-size reservation (read/decompress.rs, "Sizing
@@ -414,21 +399,19 @@ impl<'a> WireBlock<'a> {
 
         let st_inline_offset = buf.len() as u32;
         let st_inline_count = st_entries.len() as u32;
-        for &(off, len) in st_entries.iter() {
+        for &(off, len) in st_entries {
             buf.extend_from_slice(&off.to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
 
         let gr_inline_offset = buf.len() as u32;
         let gr_inline_count = group_entries.len() as u32;
-        for &(off, len) in group_entries.iter() {
+        for &(off, len) in group_entries {
             buf.extend_from_slice(&off.to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
 
-        // Scratch Vecs retain capacity for the next block (caller reuses them).
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(WireBlockMeta {
+        WireBlockMeta {
             proto_len,
             st_inline_offset,
             st_inline_count,
@@ -438,7 +421,7 @@ impl<'a> WireBlock<'a> {
             lat_offset,
             lon_offset,
             date_granularity,
-        })
+        }
     }
 
     /// Construct a WireBlock from inline metadata + the extended buffer.
@@ -481,7 +464,7 @@ impl<'a> WireBlock<'a> {
     }
 }
 
-/// Metadata from `WireBlock::parse_and_inline`. Stored on the stack - no heap.
+/// Metadata from `WireBlock::inline_tables`. Stored on the stack - no heap.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WireBlockMeta {
     pub proto_len: u32,
@@ -584,7 +567,7 @@ impl<'a> Iterator for WireMessageIter<'a> {
     /// Ends the stream on a wire error, because `Iterator::next` cannot
     /// return one. Every caller walks the same group bytes' framing to the
     /// end with `?` first, so the error arms are unreachable rather than
-    /// silent truncation: `validate_groups_strict` in `block.rs` (for every
+    /// silent truncation: `validate_block` in `block.rs` (for every
     /// block iterator) and the group walk in `scan::node::extract_node_coords`.
     /// A new caller owes the same framing walk.
     #[inline]

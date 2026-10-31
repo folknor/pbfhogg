@@ -77,7 +77,7 @@ index with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
 bad role as empty when classifying boundary members.
 
-`validate_groups_strict` (`src/read/block.rs`) does not close the gap: it is a
+`validate_block` (`src/read/block.rs`) does not close the gap: it is a
 structural pass that checks array framing and parallel-array lengths without
 resolving any string index, because resolving them would mean decoding every
 packed tag array up front. A tag array that ends mid-varint, or whose keys
@@ -103,7 +103,7 @@ paths stream `tags()` straight into `BlockBuilder::add_*`, which takes an
 infallible iterator. A builder input that consumes `tags_checked()` once and
 propagates its error would refuse a bad tag without a second lookup or a
 validation pre-pass; the alternative is to resolve every index in
-`validate_groups_strict` behind an opt-in strictness flag. Either touches the
+`validate_block` behind an opt-in strictness flag. Either touches the
 hottest per-element path of every re-encoding command, so it is a measured
 change.
 

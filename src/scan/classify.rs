@@ -51,15 +51,13 @@ use crate::read::input::{InputFile, InputSource};
 /// An entry built with [`KindClaims::Refuse`] carries the kind its blob's
 /// indexdata claims (never the kind the phase wants: an unindexed blob
 /// replicated into every per-kind schedule stays claimless), and every
-/// block-decoding pool refuses the blob, after decoding it, when it holds an
-/// element of another kind ([`PrimitiveBlock::refuse_foreign_kind`]): the
-/// phase that scheduled it on the claim would drop that element, and the
-/// phase that needed it never sees the blob. One compare per blob. An entry
-/// built with [`KindClaims::Unchecked`] carries no claim and nothing is
-/// checked; every `Unchecked` at a call site is a phase that has not yet
-/// adopted the refusal.
-///
-/// [`PrimitiveBlock::refuse_foreign_kind`]: crate::PrimitiveBlock
+/// block-decoding pool refuses the blob, after validating it, when it holds
+/// an element of another kind (`BlockBuffer::project`, for a block or a
+/// projection alike): the phase that scheduled it on the claim would drop
+/// that element, and the phase that needed it never sees the blob. One
+/// compare per blob. An entry built with [`KindClaims::Unchecked`] carries
+/// no claim and nothing is checked; every `Unchecked` at a call site is a
+/// phase that has not yet adopted the refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledBlob {
     frame_start: u64,
@@ -167,12 +165,21 @@ impl ScheduledBlob {
             .and_then(crate::ElementKind::from_ordinal)
     }
 
-    /// Refuse `block`, decoded from this entry's blob, when it contradicts
-    /// the entry's enforced claim. Every block-decoding pool calls this
-    /// before handing the block to its caller.
+    /// This entry's decompressed blob as a [`BlockBuffer`], refusing what
+    /// contradicts the entry's enforced claim once validated. Every
+    /// block-decoding pool hands its caller a block or a projection through
+    /// this, so both refuse the same blobs.
+    ///
+    /// [`BlockBuffer`]: crate::read::block::BlockBuffer
     #[inline]
-    fn refuse_foreign_kind(&self, block: &crate::PrimitiveBlock) -> Result<()> {
-        block.refuse_foreign_kind(self.claim())
+    fn buffer<'w>(
+        &self,
+        buf: Vec<u8>,
+        pool: &'w std::sync::Arc<crate::blob::DecompressPool>,
+        st: &'w mut Vec<(u32, u32)>,
+        groups: &'w mut Vec<(u32, u32)>,
+    ) -> crate::read::block::BlockBuffer<'w> {
+        crate::read::block::BlockBuffer::new(buf, Some(pool), st, groups, self.claim())
     }
 
     /// The ordinal of an entry built without one.
@@ -749,6 +756,38 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     )
 }
 
+/// [`parallel_classify_phase`] for a caller that reads each blob through a
+/// projection rather than a block: `project` receives the blob's
+/// decompressed [`BlockBuffer`](crate::read::block::BlockBuffer), validates
+/// it with its own [`GroupProjection`](crate::read::block::GroupProjection)
+/// (`BlockBuffer::project`, the validator and kind-claim refusal block
+/// construction runs, so the same blobs are refused with the same errors),
+/// and may build the block from the validated bytes where it needs one.
+/// Errors are located at the blob as in `parallel_classify_phase`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_project_phase<S: Send, R: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    project: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
+    mut merge: impl FnMut(usize, R),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    run_unordered_decoded(
+        input,
+        schedule,
+        threads,
+        worker_init,
+        project,
+        |seq, r| {
+            merge(seq, r);
+            std::ops::ControlFlow::Continue(())
+        },
+        host,
+    )
+}
+
 crate::counters::counter_set! {
     /// Blocking time in this module's two unordered pools,
     /// [`run_unordered_per_blob`] (behind [`parallel_classify_phase`],
@@ -863,6 +902,30 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
+    run_unordered_decoded(
+        input,
+        schedule,
+        threads,
+        worker_init,
+        |buffer, state| classify(&buffer.block()?, state),
+        merge,
+        host,
+    )
+}
+
+/// The unordered pool's decoding worker, shared by the block and the
+/// projection phases: each blob decompressed into the worker's pooled
+/// buffer and handed to `work` as a [`BlockBuffer`](crate::read::block::BlockBuffer)
+/// carrying the entry's claim.
+fn run_unordered_decoded<S: Send, R: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    work: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
+    merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
     run_unordered_per_blob(
         input,
         schedule,
@@ -876,14 +939,13 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         |local: &mut DecodeLocal<S>, position, raw: &[u8]| {
             let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
             crate::blob::decompress_blob_raw(raw, &mut buf)?;
-            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            let buffer = schedule[position].buffer(
                 buf,
                 &local.pool,
                 &mut local.st_scratch,
                 &mut local.gr_scratch,
-            )?;
-            schedule[position].refuse_foreign_kind(&block)?;
-            classify(&block, &mut local.state)
+            );
+            work(buffer, &mut local.state)
         },
         merge,
         host,
@@ -1105,6 +1167,35 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
     merge: impl FnMut(usize, R) -> Result<()>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
+    parallel_project_phase_ordered(
+        input,
+        schedule,
+        threads,
+        window,
+        worker_init,
+        |buffer, state| classify(&buffer.block()?, state),
+        merge,
+        host,
+    )
+}
+
+/// [`parallel_classify_phase_ordered`] for a caller that reads each blob
+/// through a projection, as [`parallel_project_phase`] is to
+/// [`parallel_classify_phase`]: `project` receives the blob's decompressed
+/// [`BlockBuffer`](crate::read::block::BlockBuffer), validates it through
+/// `BlockBuffer::project` and builds the block only where it needs one.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    window: Option<std::num::NonZeroUsize>,
+    worker_init: impl Fn() -> S + Sync,
+    project: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Sync,
+    merge: impl FnMut(usize, R) -> Result<()>,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
@@ -1133,14 +1224,13 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
                 file.read_exact_at(&mut local.read_buf, entry.data_offset())?;
                 let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
                 crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
-                let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                let buffer = entry.buffer(
                     buf,
                     &local.pool,
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
-                )?;
-                entry.refuse_foreign_kind(&block)?;
-                classify(&block, &mut local.state)
+                );
+                project(buffer, &mut local.state)
             })()
             .map_err(|e| input.locate_blob(entry, e))
         },
@@ -1373,13 +1463,9 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                             file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             let mut buf = crate::blob::pool_get(Some(&worker_pool), 0);
                             crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                                buf,
-                                &worker_pool,
-                                &mut st_scratch,
-                                &mut gr_scratch,
-                            )?;
-                            entry.refuse_foreign_kind(&block)?;
+                            let block = entry
+                                .buffer(buf, &worker_pool, &mut st_scratch, &mut gr_scratch)
+                                .block()?;
                             classify_ref(&block, &mut state)
                         })()
                         .map_err(|e| input.locate_blob(entry, e))?;
@@ -1542,6 +1628,36 @@ mod tests {
                     &host,
                 ),
                 "accumulate",
+            );
+            let project = |buffer: crate::read::block::BlockBuffer<'_>, _: &mut ()| {
+                buffer
+                    .project(|_, _| crate::read::block::NoProjection)
+                    .map(drop)
+            };
+            check(
+                super::parallel_project_phase(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    || (),
+                    project,
+                    |_, ()| {},
+                    &host,
+                ),
+                "unordered projection",
+            );
+            check(
+                super::parallel_project_phase_ordered(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    None,
+                    || (),
+                    project,
+                    |_, ()| Ok(()),
+                    &host,
+                ),
+                "ordered projection",
             );
         }
     }

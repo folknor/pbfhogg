@@ -110,7 +110,7 @@ pub struct DenseNodeIter<'a> {
 
 impl<'a> DenseNodeIter<'a> {
     /// `dense` must come from a group of `block`, which block construction
-    /// validated (`validate_groups_strict` ran `WireDenseInfo::parse` on this
+    /// validated (`validate_block` ran `WireDenseInfo::parse` on this
     /// `denseinfo`). A `DenseInfo` parse failure is therefore a broken
     /// invariant and panics through `validated` rather than reading every
     /// node's metadata as absent.
@@ -254,7 +254,7 @@ impl<'a> Iterator for DenseNodeIter<'a> {
             }
             (did, dlat, dlon, _) => {
                 // Construction rejects id, lat and lon arrays of different
-                // lengths (`validate_groups_strict` in `block.rs`), so all
+                // lengths (`validate_block` in `block.rs`), so all
                 // three end together.
                 debug_assert!(
                     did.is_none() && dlat.is_none() && dlon.is_none(),

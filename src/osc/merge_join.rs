@@ -971,8 +971,8 @@ impl<'a> BlockPairSide<'a> {
     /// Each block gets a fresh buffer, as the block-pair workers always
     /// did, and that is kept for now on the default path of a measured
     /// planet command. A fresh buffer arrives at the parse exactly full, so
-    /// appending the inline metadata typically doubles its capacity (see
-    /// `WireBlock::parse_and_inline_with_scratch`). A per-worker pool shared
+    /// appending the inline metadata reallocates it (see
+    /// `WireBlock::inline_tables`). A per-worker pool shared
     /// by both sides could reuse that grown capacity, avoiding repeated
     /// growth when later blocks fit; both sides hold a live block at once,
     /// a larger block still grows, and a buffer past the pool's retain cap

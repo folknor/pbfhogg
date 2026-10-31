@@ -2577,6 +2577,52 @@ interleaved `--bench 1`:
 
 -33 % wall. Every decoding inspect mode runs the same scan.
 
+## check --ids and getparents read through projections (bygg, 2026-11-01)
+
+Both commands validate each blob through a `GroupProjection` on the block
+validator (`BlockBuffer::project`) instead of building a `PrimitiveBlock`
+and walking its elements. Block construction runs the same call with an
+empty projection, so the refusals are the same code.
+
+What the element walk cost (hotpath, HEAD `96243688`, planet, UUIDs
+`037ca3b3` and `ea1f782f`): on check `--ids` the workers spent about
+297 core-s in `decompress_blob_raw` and 157 core-s in construction
+(validation and string-table UTF-8; the offset tables were 1.9 s of it)
+out of about 737 core-s in the scan phases. Most of the rest was the
+element walk, which for dense nodes stepped `id`, `lat`, `lon` and
+`keys_vals` per node and for ways re-parsed every message the validator
+had already parsed, all to read the ID. getparents spent 110 core-s
+decompressing and 124 constructing out of about 350, the rest
+re-parsing every way and relation to test refs and members.
+
+Planet `planet-20260223-with-indexdata`, interleaved `--bench 1`, base
+`96243688` (stored) against the working tree (`--force`, not stored).
+Spans are `--durations` START/END pairs.
+
+| Command | Base wall | Projection wall | Main spans, base to projection | Peak anon |
+|---|---:|---:|---|---|
+| check `--ids` | 34.9, 35.1, 35.1, 35.0 s (`c55ab749`, `f9b9bed4`, `bb0b6535`, `b0532d7b`) | 29.0, 29.0 s | nodes 18.0-18.3 to 13.7 s, ways 10.5-10.7 to 9.2 s | 556 to 542 MB |
+| check `--ids --full` | 36.6, 36.7, 36.8, 36.9 s (`8045d024`, `10e7598f`, `932dacbf`, `4c6515ae`) | 29.8, 29.7 s | nodes 19.7-19.9 to 14.2-14.3 s, ways 10.8-10.9 to 9.4 s | 2.35 to 2.36 GB |
+| getparents, walker arm | 18.96, 18.93, 18.94 s (`db9ddfb3`, `342927f3`, `3abd7aa8`) | 16.64, 16.70, 16.71 s | `GETPARENTS_DECODE` 13.2 to 11.0 s | 288 to 277 MB |
+| getparents, FullScan arm (europe) | 11.78, 11.77 s (`a694cb57`, `35bba63f`) | 10.92, 10.89 s | `GETPARENTS_DECODE` 11.7 to 10.8 s | |
+
+check `--ids` -17 % wall (`--full` -19 %), getparents -12 % on planet
+and -7 % on europe's FullScan arm. The 5.7-6.1 s schedule walk ahead of
+both is untouched. The check `--ids` nodes phase is now read-bound
+(about 20 cores against 25 before, 58 GB in 13.7 s).
+
+A first version copied each blob's IDs into a per-worker vector. Planet
+node blobs hold a few hundred thousand nodes, so that vector kept a few
+MB per worker for the whole phase: the nodes phase peaked at 637 MB
+against 556 MB. Recording where each dense `id` array lies, and decoding
+it once after acceptance, removed it at the same wall.
+
+Construction itself moved onto the same path (validate, then append the
+offset tables, rather than the reverse). check `--refs`, which still
+builds blocks, kept its work phases at the same length: nodes 18.0 and
+18.6 s base against 18.5 s, ways 13.5 s on both (`daa8ce1b`,
+`7cb64fb5`).
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

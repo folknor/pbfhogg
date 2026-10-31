@@ -490,16 +490,15 @@ impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
         // in the same pass, without building it (see `project`).
         Some(
             decode
-                .project(|bytes, st, groups| {
-                    let (scan, kinds) = super::project::scan_block_bytes(
-                        bytes,
-                        st,
-                        groups,
+                .buffer(|buffer| {
+                    let raw_size = buffer.len();
+                    let scan = super::project::scan_block_buffer(
+                        buffer,
                         self.show_id_ranges,
                         self.show_locations,
                         self.extended,
                     )?;
-                    Ok(((scan, bytes.len()), kinds))
+                    Ok((scan, raw_size))
                 })
                 .map(|((state, kind, elements), raw_size)| BlobSummary {
                     state,

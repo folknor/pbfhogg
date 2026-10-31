@@ -1,10 +1,14 @@
 //! Validate PBF ID integrity: monotonicity, type ordering, and optional duplicate detection.
 
+use crate::ElementKind;
 use crate::error::Result;
 use crate::idset::IdSet;
 use crate::osm_id::osm_id_cmp;
 use crate::owned::TypeFilter;
+use crate::read::block::{BlockBuffer, GroupProjection};
+use crate::read::elements::WayRefIter;
 use crate::read::input::{InputSource, PinnedInput};
+use crate::read::wire::{WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay};
 
 /// True when `id` does not strictly follow `prev` in canonical OSM ID order.
 ///
@@ -287,8 +291,10 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// Two internal paths depending on `opts.full`:
 ///
 /// - **Streaming (default):** three-phase parallel scan via
-///   `parallel_classify_phase`, no IdSet population. Monotonicity +
-///   offset-based type-order only (no duplicate detection).
+///   `parallel_project_phase`, each blob read through the `KindIds`
+///   projection on the block validator (no block built), no IdSet
+///   population. Monotonicity + offset-based type-order only (no
+///   duplicate detection).
 /// - **Full:** same shape but with a shared `IdSet` per kind populated
 ///   via `set_atomic_if_new` for cross-blob duplicate detection.
 ///
@@ -405,8 +411,6 @@ fn verify_ids_streaming_parallel(
     opts: &VerifyIdsOptions,
     host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
-    use crate::Element;
-
     host.invocation.marker("VERIFYIDS_SCAN_START");
 
     // Same arena cap as `--full`. The streaming workers do no per-element
@@ -454,13 +458,8 @@ fn verify_ids_streaming_parallel(
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &node_schedule,
-            "node",
+            ElementKind::Node,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::DenseNode(dn) => Some(dn.id()),
-                Element::Node(n) => Some(n.id()),
-                _ => None,
-            },
             host,
         )?;
         node_count = count;
@@ -474,12 +473,8 @@ fn verify_ids_streaming_parallel(
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &way_schedule,
-            "way",
+            ElementKind::Way,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::Way(w) => Some(w.id()),
-                _ => None,
-            },
             host,
         )?;
         way_count = count;
@@ -493,12 +488,8 @@ fn verify_ids_streaming_parallel(
         let (count, phase_violations, phase_total) = verify_single_kind_streaming(
             &shared_file,
             &rel_schedule,
-            "relation",
+            ElementKind::Relation,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::Relation(r) => Some(r.id()),
-                _ => None,
-            },
             host,
         )?;
         relation_count = count;
@@ -522,54 +513,213 @@ fn verify_ids_streaming_parallel(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The per-blob projection
+// ---------------------------------------------------------------------------
+
+/// Where the IDs of one element kind sit in a block, in the order the
+/// element walk yields them, recorded as the block validator passes each
+/// element (`BlockBuffer::project`): no block is built, no offset table
+/// appended. A dense group's IDs are not copied out: the projection keeps
+/// the position of its validated `id` array, decoded once after the blob is
+/// accepted, where the element walk stepped `lat`, `lon` and `keys_vals`
+/// beside it. (A copy would hold a whole blob's node IDs per worker: planet
+/// node blobs of a few hundred thousand nodes made that tens of megabytes
+/// across the pool.) Way, relation and plain node IDs, taken from the
+/// messages the validator already parsed, are copied.
+///
+/// Validation is block construction's own call, so a blob is refused here
+/// exactly when building its block would refuse it, with the same error,
+/// and a contradicted kind claim is refused after it as before. What a hook
+/// records is provisional: every judgement on the IDs (order, duplicates,
+/// the shared `IdSet`) runs after the blob has been accepted.
+///
+/// The element walk yields a group's dense nodes before its plain ones
+/// while the validator hands over the plain ones first, so a group's plain
+/// node IDs wait in `plain` until the group ends. IDs are selected by the
+/// element's own kind, never by the blob's claim: an unindexed blob sits in
+/// all three phases and each takes its own kind from it.
+struct KindIds<'s> {
+    kind: ElementKind,
+    scratch: &'s mut IdScratch,
+}
+
+/// One stretch of a blob's IDs, in element order.
+enum IdRun {
+    /// A dense group's validated `id` array: its address and length in the
+    /// blob's bytes, decoded after acceptance.
+    Dense { at: usize, len: usize },
+    /// The next `n` IDs of `IdScratch::ids`.
+    Copied(usize),
+}
+
+impl KindIds<'_> {
+    fn copy(&mut self, id: i64) {
+        self.scratch.ids.push(id);
+        if let Some(IdRun::Copied(n)) = self.scratch.runs.last_mut() {
+            *n += 1;
+        } else {
+            self.scratch.runs.push(IdRun::Copied(1));
+        }
+    }
+}
+
+impl GroupProjection for KindIds<'_> {
+    fn group_begin(&mut self) {
+        self.scratch.plain.clear();
+    }
+
+    fn node(&mut self, node: &WireNode<'_>, _info: Option<&WireInfo>) {
+        if self.kind == ElementKind::Node {
+            self.scratch.plain.push(node.id);
+        }
+    }
+
+    fn way(&mut self, way: &WireWay<'_>, _info: Option<&WireInfo>) {
+        if self.kind == ElementKind::Way {
+            self.copy(way.id);
+        }
+    }
+
+    fn relation(&mut self, relation: &WireRelation<'_>, _info: Option<&WireInfo>) {
+        if self.kind == ElementKind::Relation {
+            self.copy(relation.id);
+        }
+    }
+
+    fn dense(
+        &mut self,
+        dense: &WireDenseNodes<'_>,
+        _ids: usize,
+        _info: Option<&WireDenseInfo<'_>>,
+    ) {
+        if self.kind == ElementKind::Node {
+            self.scratch.runs.push(IdRun::Dense {
+                at: dense.id_data.as_ptr() as usize,
+                len: dense.id_data.len(),
+            });
+        }
+    }
+
+    fn group_end(&mut self) {
+        let plain = std::mem::take(&mut self.scratch.plain);
+        for &id in &plain {
+            self.copy(id);
+        }
+        self.scratch.plain = plain;
+    }
+}
+
+/// A phase worker's scratch, reused across blobs: the current blob's runs
+/// and copied IDs, and the current group's plain node IDs.
+#[derive(Default)]
+struct IdScratch {
+    runs: Vec<IdRun>,
+    ids: Vec<i64>,
+    plain: Vec<i64>,
+}
+
+impl IdScratch {
+    /// The IDs the runs describe, in element order, read from `bytes`, the
+    /// accepted blob the dense runs point into.
+    fn each(&self, bytes: &[u8], mut f: impl FnMut(i64)) -> Result<()> {
+        let base = bytes.as_ptr() as usize;
+        let mut copied = self.ids.iter();
+        for run in &self.runs {
+            match *run {
+                IdRun::Dense { at, len } => {
+                    let ids = at
+                        .checked_sub(base)
+                        .and_then(|start| bytes.get(start..start.checked_add(len)?))
+                        .ok_or_else(|| {
+                            crate::error::Error::internal(
+                                "id check: a dense id array lies outside its blob",
+                            )
+                        })?;
+                    WayRefIter::delta_decoded(ids).for_each(&mut f);
+                }
+                IdRun::Copied(n) => copied.by_ref().take(n).copied().for_each(&mut f),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate one blob through [`KindIds`] and judge its IDs of `kind`: the
+/// blob's first and last ID, count and order violations, and with
+/// `atomic_ids` (`--full`) its duplicates and the IDs outside the set's
+/// allocation.
+fn verify_blob(
+    buffer: BlockBuffer<'_>,
+    kind: ElementKind,
+    atomic_ids: Option<&IdSet>,
+    scratch: &mut IdScratch,
+) -> Result<BlobVerifyResult> {
+    let elem_type = kind.as_str();
+    scratch.runs.clear();
+    scratch.ids.clear();
+    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds {
+        kind,
+        scratch: &mut *scratch,
+    })?;
+
+    let mut r = BlobVerifyResult::empty();
+    let mut prev: Option<i64> = None;
+    scratch.each(accepted.bytes(), |id| {
+        r.count += 1;
+        if r.first_id.is_none() {
+            r.first_id = Some(id);
+        }
+        r.last_id = Some(id);
+        if let Some(p) = prev
+            && not_after(id, p)
+        {
+            r.within_violations.push(IdViolation::NonMonotonic {
+                elem_type,
+                id,
+                prev_id: p,
+            });
+        }
+        prev = Some(id);
+        // Retain IDs the bounded atomic allocation cannot cover. Positive
+        // IDs are inserted after workers join; negatives remain invalid
+        // under the command's existing policy.
+        if let Some(atomic_ids) = atomic_ids {
+            match atomic_ids.set_atomic_if_new_checked(id) {
+                Some(true) => {}
+                Some(false) => r.duplicate_ids.push(id),
+                None => r.out_of_range_ids.push(id),
+            }
+        }
+    })?;
+    // The bytes go back to their pool.
+    drop(accepted);
+    Ok(r)
+}
+
 /// Per-kind streaming-parallel scan. Same shape as
 /// `verify_single_kind_parallel` but workers do not consult an `IdSet` and
 /// the merge skips the duplicate translation step.
-#[allow(clippy::type_complexity)]
 fn verify_single_kind_streaming(
     shared_file: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
-    elem_type: &'static str,
+    kind: ElementKind,
     max_errors_remaining: Option<usize>,
-    extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
     host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
     }
+    let elem_type = kind.as_str();
 
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
-    let extract_ref = &extract_id;
 
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_project_phase(
         shared_file,
         schedule,
         None,
-        || (),
-        |block, _state| -> Result<BlobVerifyResult> {
-            let mut r = BlobVerifyResult::empty();
-            let mut prev: Option<i64> = None;
-            for el in block.elements_skip_metadata() {
-                if let Some(id) = extract_ref(&el) {
-                    r.count += 1;
-                    if r.first_id.is_none() {
-                        r.first_id = Some(id);
-                    }
-                    r.last_id = Some(id);
-                    if let Some(p) = prev
-                        && not_after(id, p)
-                    {
-                        r.within_violations.push(IdViolation::NonMonotonic {
-                            elem_type,
-                            id,
-                            prev_id: p,
-                        });
-                    }
-                    prev = Some(id);
-                }
-            }
-            Ok(r)
-        },
+        IdScratch::default,
+        |buffer, scratch| verify_blob(buffer, kind, None, scratch),
         |seq, r| {
             per_blob[seq] = Some(r);
         },
@@ -675,8 +825,6 @@ fn verify_ids_full_parallel(
     opts: &VerifyIdsOptions,
     host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
-    use crate::Element;
-
     host.invocation.marker("VERIFYIDS_SCAN_START");
 
     // Pread worker pool; same motivation as check_refs step #2.
@@ -769,13 +917,8 @@ fn verify_ids_full_parallel(
             &shared_file,
             &node_schedule,
             node_ids_ref,
-            "node",
+            ElementKind::Node,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::DenseNode(dn) => Some(dn.id()),
-                Element::Node(n) => Some(n.id()),
-                _ => None,
-            },
             host,
         )?;
         node_count = count;
@@ -792,12 +935,8 @@ fn verify_ids_full_parallel(
             &shared_file,
             &way_schedule,
             way_ids_ref,
-            "way",
+            ElementKind::Way,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::Way(w) => Some(w.id()),
-                _ => None,
-            },
             host,
         )?;
         way_count = count;
@@ -814,12 +953,8 @@ fn verify_ids_full_parallel(
             &shared_file,
             &rel_schedule,
             relation_ids_ref,
-            "relation",
+            ElementKind::Relation,
             remaining_error_limit(opts.check.max_errors, violations.len()),
-            |el| match el {
-                Element::Relation(r) => Some(r.id()),
-                _ => None,
-            },
             host,
         )?;
         relation_count = count;
@@ -847,62 +982,29 @@ fn verify_ids_full_parallel(
 /// `BlobVerifyResult`; the main thread collects them in schedule-order (via
 /// a `Vec<Option<_>>` indexed by seq) and does the sequential merge:
 /// cross-blob monotonicity, duplicate violation translation, count sum.
-#[allow(clippy::type_complexity)]
 fn verify_single_kind_parallel(
     shared_file: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
     id_set: &mut IdSet,
-    elem_type: &'static str,
+    kind: ElementKind,
     max_errors_remaining: Option<usize>,
-    extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
     host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
     if schedule.is_empty() {
         return Ok((0, Vec::new(), 0));
     }
+    let elem_type = kind.as_str();
 
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
-    let extract_ref = &extract_id;
     let atomic_ids = &*id_set;
     let mut overflow = IdSet::new();
 
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_project_phase(
         shared_file,
         schedule,
         None,
-        || (),
-        |block, _state| -> Result<BlobVerifyResult> {
-            let mut r = BlobVerifyResult::empty();
-            let mut prev: Option<i64> = None;
-            for el in block.elements_skip_metadata() {
-                if let Some(id) = extract_ref(&el) {
-                    r.count += 1;
-                    if r.first_id.is_none() {
-                        r.first_id = Some(id);
-                    }
-                    r.last_id = Some(id);
-                    if let Some(p) = prev
-                        && not_after(id, p)
-                    {
-                        r.within_violations.push(IdViolation::NonMonotonic {
-                            elem_type,
-                            id,
-                            prev_id: p,
-                        });
-                    }
-                    prev = Some(id);
-                    // Retain IDs the bounded atomic allocation cannot cover.
-                    // Positive IDs are inserted after workers join; negatives
-                    // remain invalid under the command's existing policy.
-                    match atomic_ids.set_atomic_if_new_checked(id) {
-                        Some(true) => {}
-                        Some(false) => r.duplicate_ids.push(id),
-                        None => r.out_of_range_ids.push(id),
-                    }
-                }
-            }
-            Ok(r)
-        },
+        IdScratch::default,
+        |buffer, scratch| verify_blob(buffer, kind, Some(atomic_ids), scratch),
         |seq, mut r| {
             settle_overflow(&mut overflow, &mut r, host);
             per_blob[seq] = Some(r);
@@ -1108,6 +1210,133 @@ mod tests {
         assert!(type_order(&[100], &[300], &[]).is_empty());
         assert!(type_order(&[], &[], &[400]).is_empty());
         assert!(type_order(&[100], &[], &[]).is_empty());
+    }
+
+    /// The IDs of `kind` the element walk yields, in its order: what the
+    /// per-blob loop read before the projection replaced it.
+    fn walked_ids(block: &crate::PrimitiveBlock, kind: crate::ElementKind) -> Vec<i64> {
+        use crate::{Element, ElementKind};
+        block
+            .elements_skip_metadata()
+            .filter_map(|el| match (&el, kind) {
+                (Element::DenseNode(dn), ElementKind::Node) => Some(dn.id()),
+                (Element::Node(n), ElementKind::Node) => Some(n.id()),
+                (Element::Way(w), ElementKind::Way) => Some(w.id()),
+                (Element::Relation(r), ElementKind::Relation) => Some(r.id()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// For every fixture, every truncation and every probed byte value, and
+    /// every kind: the projection refuses exactly what block construction
+    /// refuses, with the same message, and where it accepts it yields the
+    /// element walk's IDs of that kind in the walk's order (dense nodes
+    /// before plain ones within a group, groups in order).
+    #[test]
+    fn kind_ids_refuse_as_construction_and_match_the_element_walk() {
+        use crate::ElementKind;
+        use crate::read::wire_fixtures::{mutations, projection_fixtures};
+
+        for (what, bytes) in projection_fixtures() {
+            assert!(
+                crate::PrimitiveBlock::from_vec(bytes.clone()).is_ok(),
+                "{what}: fixture must be valid"
+            );
+            // One worker's scratch across every case, as a phase reuses it.
+            let mut scratch = super::IdScratch::default();
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            let cases =
+                std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes));
+            for (how, input) in cases {
+                let oracle = crate::PrimitiveBlock::from_vec(input.clone());
+                for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+                    scratch.runs.clear();
+                    scratch.ids.clear();
+                    let buffer = crate::read::block::BlockBuffer::new(
+                        input.clone(),
+                        None,
+                        &mut st,
+                        &mut gr,
+                        None,
+                    );
+                    let projected = match buffer.project(|_, _| super::KindIds {
+                        kind,
+                        scratch: &mut scratch,
+                    }) {
+                        Ok((super::KindIds { .. }, accepted)) => {
+                            let mut ids = Vec::new();
+                            scratch
+                                .each(accepted.bytes(), |id| ids.push(id))
+                                .map(|()| ids)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match (&oracle, projected) {
+                        (Err(a), Err(b)) => {
+                            assert_eq!(a.to_string(), b.to_string(), "{what}, {how}, {kind}");
+                        }
+                        (Ok(block), Ok(ids)) => {
+                            assert_eq!(ids, walked_ids(block, kind), "{what}, {how}, {kind}");
+                        }
+                        (Ok(_), Err(e)) => {
+                            panic!("{what}, {how}, {kind}: refused a valid block: {e}")
+                        }
+                        (Err(e), Ok(_)) => {
+                            panic!(
+                                "{what}, {how}, {kind}: accepted a block construction refuses: {e}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A blob whose claim its elements contradict is refused after
+    /// validation, as the block path refuses it, and a malformed one for its
+    /// malformation first.
+    #[test]
+    fn a_contradicted_claim_is_refused_like_construction() {
+        use crate::ElementKind;
+        use crate::read::wire_fixtures::projection_fixtures;
+
+        let (_, bytes) = projection_fixtures().swap_remove(0);
+        let claim = Some(ElementKind::Way);
+        let project = |input: Vec<u8>| {
+            let mut scratch = super::IdScratch::default();
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            crate::read::block::BlockBuffer::new(input, None, &mut st, &mut gr, claim)
+                .project(|_, _| super::KindIds {
+                    kind: ElementKind::Node,
+                    scratch: &mut scratch,
+                })
+                .map(drop)
+        };
+        let build = |input: Vec<u8>| {
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            crate::read::block::BlockBuffer::new(input, None, &mut st, &mut gr, claim)
+                .block()
+                .map(drop)
+        };
+        let projected = project(bytes.clone()).expect_err("a node blob claiming ways");
+        assert!(projected.kind_contradiction().is_some(), "{projected}");
+        assert_eq!(
+            projected.to_string(),
+            build(bytes.clone())
+                .expect_err("the block path refuses it")
+                .to_string()
+        );
+
+        let truncated = bytes[..bytes.len() - 1].to_vec();
+        let malformed = project(truncated.clone()).expect_err("truncated");
+        assert!(malformed.kind_contradiction().is_none(), "{malformed}");
+        assert_eq!(
+            malformed.to_string(),
+            build(truncated)
+                .expect_err("the block path refuses it")
+                .to_string()
+        );
     }
 
     #[test]

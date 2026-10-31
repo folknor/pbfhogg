@@ -317,24 +317,13 @@ fn getparents_walker(
     // bounds the decoded output in flight. A write error ends the scan at
     // once (at planet scale, finishing the decode first would cost the whole
     // run before the error surfaced).
-    crate::scan::classify::parallel_classify_phase_ordered(
+    crate::scan::classify::parallel_project_phase_ordered(
         &shared_file,
         &schedule,
         None,
         None,
-        // `BlockBuilder` contains `Rc<str>` (string table) and is not
-        // Send, so it can't live as worker state across
-        // `parallel_classify_phase`'s `S: Send` bound. Instead, each
-        // classify call materialises its own builder, flushing into a
-        // per-blob `Vec<OwnedBlock>` before returning.
         || (),
-        |block, _state| -> ClassifyResult {
-            let mut bb = BlockBuilder::new();
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let counts = process_block(block, &mut bb, &mut output, ids, opts.add_self)?;
-            flush_local(&mut bb, &mut output)?;
-            Ok((output, counts))
-        },
+        |buffer, _state| -> ClassifyResult { parents_in(buffer, ids, opts.add_self) },
         |_position, (blocks, (n, w, r))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -390,14 +379,8 @@ fn getparents_pipelined(
     };
 
     host.invocation.marker("GETPARENTS_DECODE_START");
-    reader.for_each_fused_block(
-        |block| {
-            let mut bb = BlockBuilder::new();
-            let mut output = Vec::new();
-            let counts = process_block(&block, &mut bb, &mut output, ids, opts.add_self)?;
-            flush_local(&mut bb, &mut output)?;
-            Ok((output, counts))
-        },
+    reader.for_each_fused_buffer(
+        |buffer| parents_in(buffer, ids, opts.add_self),
         |(blocks, (nodes, ways, relations))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -411,6 +394,125 @@ fn getparents_pipelined(
     writer.flush()?;
     host.invocation.marker("GETPARENTS_DECODE_END");
     Ok(stats)
+}
+
+/// One blob's matches, re-encoded, with their counts: what both arms run on
+/// a decode worker.
+///
+/// The blob is validated through [`ParentProbe`], the projection that asks
+/// only whether any element is one [`process_block`] would emit
+/// (`BlockBuffer::project`: block construction's validator and kind-claim
+/// refusal, so the blob is refused exactly as building its block would
+/// refuse it). Almost every blob holds none, and that answer costs the
+/// validation pass plus the member tests, with no block built and no
+/// element re-parsed. A blob with a hit becomes its block from the
+/// validated bytes (no second validation) and goes through the unchanged
+/// `process_block`, so what is written, in what order, and every error a
+/// selected element raises (a bad user or role index) are as before. A
+/// blob without one cannot raise any: `process_block` resolves strings only
+/// for the elements it selects.
+///
+/// `BlockBuilder` holds `Rc<str>` (string table) and is not `Send`, so it
+/// cannot be worker state; each blob with a hit builds its own, flushed
+/// into a per-blob `Vec<OwnedBlock>` before returning.
+fn parents_in(
+    buffer: crate::read::block::BlockBuffer<'_>,
+    ids: &ElementIds,
+    add_self: bool,
+) -> crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))> {
+    let (probe, accepted) = buffer.project(|_, _| ParentProbe::new(ids, add_self))?;
+    if !probe.hit {
+        return Ok((Vec::new(), (0, 0, 0)));
+    }
+    let block = accepted.into_block();
+    let mut bb = BlockBuilder::new();
+    let mut output: Vec<OwnedBlock> = Vec::new();
+    let counts = process_block(&block, &mut bb, &mut output, ids, add_self)?;
+    flush_local(&mut bb, &mut output)?;
+    Ok((output, counts))
+}
+
+/// Whether a block holds an element [`process_block`] would select: the
+/// same tests on the same values, read from the messages the validator
+/// already parsed. A way is a parent when one of its refs is a queried
+/// node; a relation when one of its members is a queried node, way or
+/// relation (an `Unknown` member type matches nothing, though its delta
+/// still advances the running ID); with `add_self`, a node, way or relation
+/// whose own ID is queried. Refs and member IDs decode as the element
+/// iterators decode them (`WayRefIter::delta_decoded`, `MemberIdIter`),
+/// dense node IDs by the same wrapping running sum, and every test goes
+/// through `IdSet::get`, so a negative ID matches nothing here as there.
+///
+/// Every element of every kind is tested whatever the blob's claim: an
+/// unindexed blob is scheduled into the walk conservatively and may hold
+/// anything. After the first hit the tests stop; validation does not.
+struct ParentProbe<'q> {
+    ids: &'q ElementIds,
+    add_self: bool,
+    /// A way can only be a parent through a queried node.
+    any_nodes: bool,
+    hit: bool,
+}
+
+impl<'q> ParentProbe<'q> {
+    fn new(ids: &'q ElementIds, add_self: bool) -> Self {
+        Self {
+            ids,
+            add_self,
+            any_nodes: ids.node_ids.has_any(),
+            hit: false,
+        }
+    }
+}
+
+impl crate::read::block::GroupProjection for ParentProbe<'_> {
+    fn node(
+        &mut self,
+        node: &crate::read::wire::WireNode<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit || (self.add_self && self.ids.node_ids.get(node.id));
+    }
+
+    fn way(
+        &mut self,
+        way: &crate::read::wire::WireWay<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit
+            || (self.any_nodes
+                && crate::read::elements::WayRefIter::delta_decoded(way.refs_data)
+                    .any(|r| self.ids.node_ids.get(r)))
+            || (self.add_self && self.ids.way_ids.get(way.id));
+    }
+
+    fn relation(
+        &mut self,
+        relation: &crate::read::wire::WireRelation<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit
+            || crate::read::elements::MemberIdIter::new(relation.memids_data, relation.types_data)
+                .any(|m| match m {
+                    MemberId::Node(id) => self.ids.node_ids.get(id),
+                    MemberId::Way(id) => self.ids.way_ids.get(id),
+                    MemberId::Relation(id) => self.ids.relation_ids.get(id),
+                    MemberId::Unknown(..) => false,
+                })
+            || (self.add_self && self.ids.relation_ids.get(relation.id));
+    }
+
+    fn dense(
+        &mut self,
+        dense: &crate::read::wire::WireDenseNodes<'_>,
+        _ids: usize,
+        _info: Option<&crate::read::wire::WireDenseInfo<'_>>,
+    ) {
+        self.hit = self.hit
+            || (self.add_self
+                && crate::read::elements::WayRefIter::delta_decoded(dense.id_data)
+                    .any(|id| self.ids.node_ids.get(id)));
+    }
 }
 
 fn process_block(
@@ -514,6 +616,81 @@ mod tests {
     use crate::write::WriteOptions;
     use crate::writer::{Compression, PbfWriter};
     use crate::{Element, ElementReader, HeaderOverrides, MemberId};
+
+    /// For every fixture, every truncation and every probed byte value, and
+    /// a spread of queries with and without `--add-self`: `parents_in`
+    /// refuses exactly what block construction refuses, with the same
+    /// message, and on what it accepts returns what the unconditional
+    /// `process_block` over the constructed block returns (the same counts,
+    /// the same encoded blocks, or the same error), so the probe never
+    /// skips a blob `process_block` would have written from or failed on.
+    #[test]
+    fn the_probe_answers_as_process_block_on_every_blob() {
+        use crate::read::wire_fixtures::{mutations, projection_fixtures};
+
+        let queries: Vec<(Vec<&str>, bool)> = vec![
+            (vec!["n8"], false),
+            (vec!["n1"], false),
+            (vec!["n99"], false),
+            (vec!["n9", "w21"], false),
+            (vec!["w21"], false),
+            (vec!["r30"], false),
+            (vec!["n3"], true),
+            (vec!["n2"], true),
+            (vec!["w20"], true),
+            (vec!["r31"], true),
+            (vec!["n12345"], true),
+        ];
+        let queries: Vec<_> = queries
+            .into_iter()
+            .map(|(specs, add_self)| {
+                let specs: Vec<String> = specs.into_iter().map(str::to_owned).collect();
+                (parse_ids(&specs).expect("ids"), add_self)
+            })
+            .collect();
+
+        // The answer as comparable text: the encoded blocks and counts, or
+        // the error message.
+        let encoded =
+            |r: crate::Result<(Vec<crate::block_builder::OwnedBlock>, (u64, u64, u64))>| match r {
+                Ok((blocks, counts)) => {
+                    let bytes: Vec<Vec<u8>> = blocks.iter().map(|b| b.bytes.clone()).collect();
+                    format!("ok {bytes:?} {counts:?}")
+                }
+                Err(e) => format!("error {e}"),
+            };
+
+        for (what, bytes) in projection_fixtures() {
+            let cases =
+                std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes));
+            for (how, input) in cases {
+                let oracle = crate::PrimitiveBlock::from_vec(input.clone());
+                for (ids, add_self) in &queries {
+                    let (mut st, mut gr) = (Vec::new(), Vec::new());
+                    let buffer = crate::read::block::BlockBuffer::new(
+                        input.clone(),
+                        None,
+                        &mut st,
+                        &mut gr,
+                        None,
+                    );
+                    let probed = encoded(super::parents_in(buffer, ids, *add_self));
+                    let expected = match &oracle {
+                        Err(e) => format!("error {e}"),
+                        Ok(block) => encoded((|| {
+                            let mut bb = BlockBuilder::new();
+                            let mut output = Vec::new();
+                            let counts =
+                                super::process_block(block, &mut bb, &mut output, ids, *add_self)?;
+                            super::flush_local(&mut bb, &mut output)?;
+                            Ok((output, counts))
+                        })()),
+                    };
+                    assert_eq!(probed, expected, "{what}, {how}, add_self {add_self}");
+                }
+            }
+        }
+    }
 
     /// `path` pinned, for driving an arm directly.
     fn pinned(path: &std::path::Path) -> crate::read::input::PinnedInput {

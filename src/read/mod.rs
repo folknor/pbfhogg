@@ -18,6 +18,9 @@ pub mod reader;
 pub(crate) mod region_grid;
 pub(crate) mod wire;
 pub(crate) mod wire_schema;
+// Hand-encoded block bytes and the mutation sweep for the projection tests.
+#[cfg(test)]
+pub(crate) mod wire_fixtures;
 
 /// Emit `invocation`'s `pipeline_decompress_pool_*` sidecar counters, at
 /// most once per invocation.

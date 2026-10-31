@@ -123,7 +123,8 @@ cancellation is checked before each frame, not during its reads).
 
 ### `getparents` FullScan arm
 
-- **Surface:** fused (`for_each_fused_block`)
+- **Surface:** fused (`for_each_fused_buffer`: a projection on the
+  block validator, the block built only for a blob holding a match)
 - **Path:** `src/commands/getparents/mod.rs`, FullScan arm
 - **Scale:** high-blob-count encodings only. ADR-0006 dispatches
   low-blob-count planet (~50 k blobs) to the `HeaderWalker` arm; the
@@ -197,8 +198,9 @@ should stay that way:
   / `_phase` (pread workers)
 - `inspect` default / `inspect --indexed` - `HeaderWalker`
   (pread-only header walk)
-- `check --refs`, `check --ids --full` - `parallel_classify_phase`
-- `check --ids` streaming default - `parallel_classify_phase`
+- `check --refs` - `parallel_classify_phase`
+- `check --ids`, streaming and `--full` - `parallel_project_phase`
+  (pread workers, a projection on the block validator)
 - `tags-filter` two-pass - pread workers
 - `cat --type` / `cat --clean` re-encoding - pread classification
   and writer-side reframe paths

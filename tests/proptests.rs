@@ -40,7 +40,7 @@ proptest! {
     /// `PrimitiveBlock::from_vec` must accept any byte buffer and return Ok
     /// or Err. Adversarial input must never trigger a panic, OOM, or
     /// stack overflow during the wire-format walk inside
-    /// `WireBlock::parse_and_inline`.
+    /// block validation.
     #[test]
     fn primitive_block_from_arbitrary_bytes_never_panics(
         bytes in proptest::collection::vec(any::<u8>(), 0..2048),

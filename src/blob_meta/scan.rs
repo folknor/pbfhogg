@@ -44,7 +44,7 @@
 //! Both scanners run the same walk, so they agree on what is an `Err`.
 //! What the walk validates is the index-relevant structure, not full decoder
 //! acceptance. Not checked here, and accepted where the decoder
-//! (`validate_groups_strict` in `read/block.rs`) rejects: `Info`/`DenseInfo`
+//! (`validate_block` in `read/block.rs`) rejects: `Info`/`DenseInfo`
 //! contents, way geometry and relation member arrays, string-table UTF-8,
 //! equal `keys`/`vals` counts on Node/Way/Relation, and the `int32` width of
 //! dense `keys_vals` value indices. None of those can make an

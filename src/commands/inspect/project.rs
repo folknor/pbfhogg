@@ -1,11 +1,11 @@
 //! The inspect scan of one data blob: its statistics gathered as the block
-//! validator ([`validate_groups`]) passes each piece, with no
+//! validator (`read::block::validate_block`) passes each piece, with no
 //! `PrimitiveBlock` built, no offset tables appended to the payload and no
 //! per-element `Element` values.
 //!
-//! Validation is block construction's own, run by the same functions in the
-//! same order, so a blob is refused here exactly when building its block
-//! would refuse it. Each statistic is a function of one validated column or
+//! Validation is block construction's own call (`BlockBuffer::project`,
+//! which construction runs with an empty projection), so a blob is refused
+//! here exactly when building its block would refuse it. Each statistic is a function of one validated column or
 //! one validated element, decoded with the readers' own decoders and
 //! arithmetic (wrapping delta sums, `offset + granularity * raw` and
 //! `timestamp * date_granularity` wrapping, the packed iterators' narrowing),
@@ -14,50 +14,48 @@
 //! its dense message, so each group keeps the two apart and joins them dense
 //! first, as the element iterator yields them.
 
-use crate::read::block::{GroupProjection, validate_groups, validate_stringtable_utf8};
+use crate::read::block::{BlockBuffer, GroupProjection};
 use crate::read::wire::{
     BlockFields, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, PackedUint32Iter,
-    WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay, scan_block_fields,
+    WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay,
 };
 use crate::{ElementKind, Result};
 
 use super::types::{BlockKind, ScanState, TypeIdRange, UserNames, classify_block, count_metadata};
 
 /// Scan one decompressed data block into a fresh [`ScanState`] with the
-/// collectors the flags name; returns it with the block's kind and element
-/// count, and the kinds the validator recorded. `st` and `groups` are the
-/// caller's scratch.
-pub(super) fn scan_block_bytes(
-    buffer: &[u8],
-    st: &mut Vec<(u32, u32)>,
-    groups: &mut Vec<(u32, u32)>,
+/// collectors the flags name, validating it through the inspect projection
+/// (`BlockBuffer::project`, which also applies the buffer's kind-claim
+/// refusal); returns the state with the block's kind and element count.
+pub(super) fn scan_block_buffer(
+    buffer: BlockBuffer<'_>,
     show_id_ranges: bool,
     show_locations: bool,
     extended: bool,
-) -> Result<((ScanState, BlockKind, u64), crate::element_kind::KindSet)> {
-    let fields = scan_block_fields(buffer, st, groups)?;
-    let slice = |&(offset, len): &(u32, u32)| &buffer[offset as usize..(offset + len) as usize];
-    let state = ScanState::new(show_id_ranges, show_locations, extended);
-    let users = state
-        .extended
-        .is_some()
-        .then(|| UserNames::from_lengths(st.iter().map(|&(_, len)| len as usize)));
-    let mut projection = InspectProjection {
-        state,
-        fields,
-        st_len: st.len(),
-        users,
-        dense_ids: TypeIdRange::new(),
-        plain_ids: TypeIdRange::new(),
-    };
-    let (kinds, count) = validate_groups(groups.len(), |i| slice(&groups[i]), &mut projection)?;
-    validate_stringtable_utf8(st.iter().map(slice))?;
+) -> Result<(ScanState, BlockKind, u64)> {
+    let (projection, accepted) = buffer.project(|fields, st| {
+        let state = ScanState::new(show_id_ranges, show_locations, extended);
+        let users = state
+            .extended
+            .is_some()
+            .then(|| UserNames::from_lengths(st.iter().map(|&(_, len)| len as usize)));
+        InspectProjection {
+            state,
+            fields: *fields,
+            st_len: st.len(),
+            users,
+            dense_ids: TypeIdRange::new(),
+            plain_ids: TypeIdRange::new(),
+        }
+    })?;
+    let scan = *accepted.scan();
+    let kinds = scan.kinds;
     let kind = classify_block(
         kinds.has(ElementKind::Node),
         kinds.has(ElementKind::Way),
         kinds.has(ElementKind::Relation),
     );
-    Ok(((projection.state, kind, count), kinds))
+    Ok((projection.state, kind, scan.element_count))
 }
 
 struct InspectProjection {
@@ -293,11 +291,24 @@ impl GroupProjection for InspectProjection {
     clippy::type_complexity
 )]
 mod tests {
-    use super::scan_block_bytes;
     use crate::block_builder::{BlockBuilder, MemberData, Metadata};
     use crate::commands::inspect::scan::scan_block;
     use crate::commands::inspect::types::{BlockKind, ScanState, TypeIdRange};
     use crate::{MemberId, PrimitiveBlock};
+
+    /// The projection scan of `bytes` as the decode workers run it, on a
+    /// claimless buffer.
+    fn scan_block_bytes(
+        bytes: &[u8],
+        st: &mut Vec<(u32, u32)>,
+        gr: &mut Vec<(u32, u32)>,
+        ids: bool,
+        locs: bool,
+        ext: bool,
+    ) -> crate::Result<((ScanState, BlockKind, u64), ())> {
+        let buffer = crate::read::block::BlockBuffer::new(bytes.to_vec(), None, st, gr, None);
+        super::scan_block_buffer(buffer, ids, locs, ext).map(|scan| (scan, ()))
+    }
 
     fn range(r: Option<&TypeIdRange>) -> String {
         r.map_or_else(String::new, |r| {
@@ -465,108 +476,20 @@ mod tests {
 
     // Hand-encoded protobuf, for the shapes `BlockBuilder` never writes:
     // plain nodes, a group holding plain and dense nodes, several groups.
-
-    fn varint(out: &mut Vec<u8>, mut v: u64) {
-        while v >= 0x80 {
-            out.push((v as u8) | 0x80);
-            v >>= 7;
-        }
-        out.push(v as u8);
-    }
-
-    fn zigzag(v: i64) -> u64 {
-        ((v << 1) ^ (v >> 63)) as u64
-    }
-
-    fn field_varint(out: &mut Vec<u8>, field: u64, v: u64) {
-        varint(out, field << 3);
-        varint(out, v);
-    }
-
-    fn field_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
-        varint(out, (field << 3) | 2);
-        varint(out, bytes.len() as u64);
-        out.extend_from_slice(bytes);
-    }
-
-    fn packed(values: impl IntoIterator<Item = u64>) -> Vec<u8> {
-        let mut out = Vec::new();
-        for v in values {
-            varint(&mut out, v);
-        }
-        out
-    }
-
-    /// A plain node; `tags` are string indices, `info` (version,
-    /// timestamp, changeset, uid, user_sid).
-    fn plain_node(
-        id: i64,
-        lat: i64,
-        lon: i64,
-        tags: &[(u64, u64)],
-        info: Option<[i64; 5]>,
-    ) -> Vec<u8> {
-        let mut n = Vec::new();
-        field_varint(&mut n, 1, zigzag(id));
-        if !tags.is_empty() {
-            field_bytes(&mut n, 2, &packed(tags.iter().map(|t| t.0)));
-            field_bytes(&mut n, 3, &packed(tags.iter().map(|t| t.1)));
-        }
-        if let Some([version, timestamp, changeset, uid, user]) = info {
-            let mut i = Vec::new();
-            field_varint(&mut i, 1, version as u64);
-            field_varint(&mut i, 2, timestamp as u64);
-            field_varint(&mut i, 3, changeset as u64);
-            field_varint(&mut i, 4, uid as u64);
-            field_varint(&mut i, 5, user as u64);
-            field_bytes(&mut n, 4, &i);
-        }
-        field_varint(&mut n, 8, zigzag(lat));
-        field_varint(&mut n, 9, zigzag(lon));
-        n
-    }
-
-    /// A dense message of `(id, lat, lon)` with `keys_vals` as given.
-    fn dense(nodes: &[(i64, i64, i64)], keys_vals: &[u64]) -> Vec<u8> {
-        let delta = |pick: fn(&(i64, i64, i64)) -> i64| {
-            let mut prev = 0_i64;
-            packed(nodes.iter().map(|n| {
-                let v = pick(n);
-                let d = v.wrapping_sub(prev);
-                prev = v;
-                zigzag(d)
-            }))
-        };
-        let mut d = Vec::new();
-        field_bytes(&mut d, 1, &delta(|n| n.0));
-        field_bytes(&mut d, 8, &delta(|n| n.1));
-        field_bytes(&mut d, 9, &delta(|n| n.2));
-        if !keys_vals.is_empty() {
-            field_bytes(&mut d, 10, &packed(keys_vals.iter().copied()));
-        }
-        d
-    }
+    use crate::read::wire_fixtures::{Group, dense, plain_node};
 
     /// A block of `strings` and `groups`, each group's plain nodes and
     /// dense message.
     fn block(strings: &[&str], groups: &[(Vec<Vec<u8>>, Option<Vec<u8>>)]) -> Vec<u8> {
-        let mut st = Vec::new();
-        for s in strings {
-            field_bytes(&mut st, 1, s.as_bytes());
-        }
-        let mut out = Vec::new();
-        field_bytes(&mut out, 1, &st);
-        for (plain, dense) in groups {
-            let mut g = Vec::new();
-            for n in plain {
-                field_bytes(&mut g, 1, n);
-            }
-            if let Some(d) = dense {
-                field_bytes(&mut g, 2, d);
-            }
-            field_bytes(&mut out, 2, &g);
-        }
-        out
+        let groups: Vec<Group> = groups
+            .iter()
+            .map(|(nodes, dense)| Group {
+                nodes: nodes.clone(),
+                dense: dense.clone(),
+                ..Group::default()
+            })
+            .collect();
+        crate::read::wire_fixtures::block(strings, &groups)
     }
 
     fn wire_fixtures() -> Vec<(&'static str, Vec<u8>)> {

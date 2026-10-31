@@ -269,45 +269,41 @@ impl Decoder<'_> {
         })
     }
 
-    fn refuse_kinds(&self, kinds: crate::element_kind::KindSet) -> Result<()> {
-        if self.refuse_kinds {
-            kinds.refuse_under(self.blob.index().map(|index| index.kind))?;
-        }
-        Ok(())
-    }
-
     /// The blob as a validated data block.
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the method path `BlockBuffer::block` is not generic over the buffer's lifetime"
+    )]
     pub(crate) fn block(self) -> Result<PrimitiveBlock> {
-        let block = self.with_scratch(|st, gr| {
-            self.blob
-                .to_primitiveblock_inline_with_scratch(self.pool, st, gr)
-        })?;
-        if self.refuse_kinds {
-            block.refuse_foreign_kind(self.blob.index().map(|index| index.kind))?;
-        }
-        Ok(block)
+        self.buffer(|buffer| buffer.block())
     }
 
-    /// Run `scan` over the blob's decompressed bytes with the worker's
-    /// string table and group scratch, for a reader that validates the block
-    /// itself (`block::validate_groups`) without building one. `scan`
-    /// returns its result and the kinds the block holds, which the run's
-    /// kind-claim refusal judges as it judges a block's.
-    pub(crate) fn project<R>(
+    /// Run `f` on the blob decompressed into a buffer from the run's pool,
+    /// with the worker's string table and group scratch and the run's
+    /// kind-claim refusal: `f` validates it as a block
+    /// ([`BlockBuffer::block`](super::block::BlockBuffer::block)) or through
+    /// a projection ([`BlockBuffer::project`](super::block::BlockBuffer::project)),
+    /// which refuse the same blobs, and may build the block from a
+    /// projection's validated bytes.
+    pub(crate) fn buffer<R>(
         self,
-        scan: impl FnOnce(
-            &[u8],
-            &mut Vec<(u32, u32)>,
-            &mut Vec<(u32, u32)>,
-        ) -> Result<(R, crate::element_kind::KindSet)>,
+        f: impl FnOnce(super::block::BlockBuffer<'_>) -> Result<R>,
     ) -> Result<R> {
         let buf = self.blob.decompress_pooled(self.pool)?;
-        let scanned = self.with_scratch(|st, gr| scan(&buf, st, gr));
-        // The buffer goes back to the run's pool.
-        drop(crate::read::decompress::pool_wrap(buf, Some(self.pool)));
-        let (out, kinds) = scanned?;
-        self.refuse_kinds(kinds)?;
-        Ok(out)
+        let claim = if self.refuse_kinds {
+            self.blob.index().map(|index| index.kind)
+        } else {
+            None
+        };
+        self.with_scratch(|st, gr| {
+            f(super::block::BlockBuffer::new(
+                buf,
+                Some(self.pool),
+                st,
+                gr,
+                claim,
+            ))
+        })
     }
 }
 
@@ -352,6 +348,29 @@ where
             return None;
         }
         Some(decode.block().and_then(&self.0))
+    }
+}
+
+/// The projecting command transform: each data blob's decompressed buffer
+/// goes to the closure, which validates it through a projection (and may
+/// build the block from the validated bytes); every other blob is skipped.
+/// What `ElementReader::for_each_fused_buffer` runs.
+pub(crate) struct BufferOnly<X>(pub(crate) X);
+
+impl<T, X> DecodeTransform for BufferOnly<X>
+where
+    T: Send,
+    X: Fn(super::block::BlockBuffer<'_>) -> Result<T> + Sync,
+{
+    type Out = T;
+    const PARSE_INDEXDATA: bool = false;
+
+    #[inline]
+    fn apply(&self, blob: &crate::blob::Blob, decode: Decoder<'_>) -> Option<Result<T>> {
+        if blob.get_type() != BlobType::OsmData {
+            return None;
+        }
+        Some(decode.buffer(&self.0))
     }
 }
 

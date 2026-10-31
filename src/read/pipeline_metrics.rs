@@ -66,7 +66,7 @@ crate::counters::counter_set! {
         /// `reorder_high_water` meaning as a completion-skew diagnostic.
         pub reorder_window_high_water => "pipeline_reorder_window_high_water",
         /// Maximum retained capacity (bytes) of the per-decode-thread
-        /// `ST_SCRATCH` Vec (string-table kv pairs in `parse_and_inline`):
+        /// `ST_SCRATCH` Vec (string-table entries in `scan_block_fields`):
         /// the largest any one decode thread has retained, not a sum across
         /// threads (see [`PipelineMetrics::record_scratch_capacity`]). The iter-5 alloc
         /// profile fingered this as the dominant residual alloc bucket

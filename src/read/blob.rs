@@ -320,7 +320,7 @@ impl Blob {
 
     /// Decompress and construct PrimitiveBlock with inline string table entries,
     /// reusing caller-provided scratch buffers
-    /// for `parse_and_inline`. Used by the pipelined reader with thread-local scratch
+    /// for the block's string table and group ranges. Used with thread-local scratch
     /// to avoid per-blob `Vec<(u32, u32)>` allocations in rayon decode tasks.
     pub(crate) fn to_primitiveblock_inline_with_scratch(
         &self,

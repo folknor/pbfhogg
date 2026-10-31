@@ -69,8 +69,8 @@ macro_rules! impl_coordinate_conversions {
 /// metadata cannot fail to parse here, and this relies on that rather than
 /// guessing: `Node`, `Way` and `Relation` are built only by the block
 /// iterators in `block.rs`, from element bytes of a block that
-/// `PrimitiveBlock::finish` constructed, and `finish` runs
-/// `validate_groups_strict` first. That pass parses every element with the
+/// was constructed, and construction runs `validate_block` first
+/// (`BlockBuffer::project`). That pass parses every element with the
 /// same `WireNode` / `WireWay` / `WireRelation::parse` the iterators use, on
 /// the same immutable bytes, and runs `validate_info` - exactly
 /// `WireInfo::parse` - on the slice that parse retains. The element parsers
@@ -261,10 +261,7 @@ impl<'a> Way<'a> {
     /// Returns an iterator over the references of this way. Each reference should correspond to a
     /// node id.
     pub fn refs(&self) -> WayRefIter<'a> {
-        WayRefIter {
-            deltas: PackedSint64Iter::new(self.way.refs_data),
-            current: 0,
-        }
+        WayRefIter::delta_decoded(self.way.refs_data)
     }
 
     /// Returns an iterator over the way's node locations (latitude, longitude).
@@ -430,6 +427,20 @@ pub struct WayRefIter<'a> {
     current: i64,
 }
 
+impl<'a> WayRefIter<'a> {
+    /// The values of a packed `sint64` delta array, running sums from zero
+    /// wrapping modulo 2^64: a way's `refs`, a relation's `memids` (through
+    /// [`MemberIdIter`]), and for the projection scanners a dense group's
+    /// `id` array, whose values `DenseNodeIter` reconstructs by the same
+    /// wrapping sum in lockstep with its coordinates.
+    pub(crate) fn delta_decoded(data: &'a [u8]) -> Self {
+        WayRefIter {
+            deltas: PackedSint64Iter::new(data),
+            current: 0,
+        }
+    }
+}
+
 impl Iterator for WayRefIter<'_> {
     type Item = i64;
 
@@ -471,7 +482,7 @@ impl WayNodeLocation {
 /// `std::iter::Zip` does: the minimum of the lower bounds and the minimum of
 /// the known upper bounds.
 ///
-/// Block construction (`validate_groups_strict` in `block.rs`) rejects
+/// Block construction (`validate_block` in `block.rs`) rejects
 /// parallel arrays of different lengths, so on a constructed block every
 /// component reports the same count and any one of them would do. Taking the
 /// minimum keeps the hint true without leaning on that invariant: if
@@ -631,9 +642,7 @@ impl<'a> RelMember<'a> {
 pub struct RelMemberIter<'a> {
     block: &'a WireBlock<'static>,
     role_sids: PackedInt32Iter<'a>,
-    member_id_deltas: PackedSint64Iter<'a>,
-    member_types: PackedInt32Iter<'a>,
-    current_member_id: i64,
+    ids: MemberIdIter<'a>,
 }
 
 impl<'a> RelMemberIter<'a> {
@@ -641,9 +650,7 @@ impl<'a> RelMemberIter<'a> {
         RelMemberIter {
             block,
             role_sids: PackedInt32Iter::new(rel.roles_sid_data),
-            member_id_deltas: PackedSint64Iter::new(rel.memids_data),
-            member_types: PackedInt32Iter::new(rel.types_data),
-            current_member_id: 0,
+            ids: MemberIdIter::new(rel.memids_data, rel.types_data),
         }
     }
 }
@@ -653,26 +660,18 @@ impl<'a> Iterator for RelMemberIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match (
-            self.role_sids.next(),
-            self.member_id_deltas.next(),
-            self.member_types.next(),
-        ) {
-            (Some(role_sid), Some(mem_id_delta), Some(member_type)) => {
-                self.current_member_id = self.current_member_id.wrapping_add(mem_id_delta);
-                let mt = MemberType::from(member_type);
-                Some(RelMember {
-                    block: self.block,
-                    role_sid,
-                    id: MemberId::from_id_and_type(self.current_member_id, mt),
-                })
-            }
-            (role_sid, mem_id_delta, member_type) => {
+        match (self.role_sids.next(), self.ids.next()) {
+            (Some(role_sid), Some(id)) => Some(RelMember {
+                block: self.block,
+                role_sid,
+                id,
+            }),
+            (role_sid, id) => {
                 // Construction (`validate_relation_member_arrays` in
                 // `block.rs`) rejects member arrays of different lengths, so
                 // all three end together.
                 debug_assert!(
-                    role_sid.is_none() && mem_id_delta.is_none() && member_type.is_none(),
+                    role_sid.is_none() && id.is_none(),
                     "relation member arrays differ in length"
                 );
                 None
@@ -681,11 +680,56 @@ impl<'a> Iterator for RelMemberIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        zip_hint(&[
-            self.role_sids.size_hint(),
-            self.member_id_deltas.size_hint(),
-            self.member_types.size_hint(),
-        ])
+        zip_hint(&[self.role_sids.size_hint(), self.ids.size_hint()])
+    }
+}
+
+/// A relation's typed member IDs, from its `memids` and `types` arrays
+/// alone: what [`RelMemberIter`] yields without the roles, and what the
+/// projection scanners read members through, so a member's ID and type are
+/// one decode however it is reached. Each `memids` value is the wrapping
+/// running sum of its deltas ([`WayRefIter::delta_decoded`]), advanced by
+/// every member, an `Unknown` one included; each type narrows to `i32` and
+/// converts through [`MemberType::from`].
+#[derive(Clone)]
+pub(crate) struct MemberIdIter<'a> {
+    ids: WayRefIter<'a>,
+    types: PackedInt32Iter<'a>,
+}
+
+impl<'a> MemberIdIter<'a> {
+    pub(crate) fn new(memids_data: &'a [u8], types_data: &'a [u8]) -> Self {
+        MemberIdIter {
+            ids: WayRefIter::delta_decoded(memids_data),
+            types: PackedInt32Iter::new(types_data),
+        }
+    }
+}
+
+impl Iterator for MemberIdIter<'_> {
+    type Item = MemberId;
+
+    #[inline]
+    fn next(&mut self) -> Option<MemberId> {
+        match (self.ids.next(), self.types.next()) {
+            (Some(id), Some(member_type)) => Some(MemberId::from_id_and_type(
+                id,
+                MemberType::from(member_type),
+            )),
+            (id, member_type) => {
+                // Construction (`validate_relation_member_arrays` in
+                // `block.rs`) rejects member arrays of different lengths.
+                debug_assert!(
+                    id.is_none() && member_type.is_none(),
+                    "relation member arrays differ in length"
+                );
+                None
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        zip_hint(&[self.ids.size_hint(), self.types.size_hint()])
     }
 }
 

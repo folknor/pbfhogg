@@ -14,6 +14,11 @@
   unchanged output bytes.
 - `tags-filter --input-kind osc` filters on several threads: a planet daily
   diff went from 5.3 s to 2.5 s, with the same output.
+- `check --ids` and `getparents` read each blob without building it as a
+  block, keeping every check block construction makes. On planet, `check
+  --ids` went from 35 s to 29 s (37 s to 30 s with `--full`) and
+  `getparents` from 19 s to 16.7 s, with the same output, the same
+  refusals and unchanged peak memory.
 
 ## 0.6.0 - 2026-10-30
 

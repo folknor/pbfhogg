@@ -45,7 +45,7 @@ impl DenseNodeColumns {
     ///
     /// This is the panic-proofing, not the correctness guard. A dense group
     /// whose arrays disagree is a hard error at block construction
-    /// (`validate_groups_strict` in `block.rs`), so a short column never
+    /// (`validate_block` in `block.rs`), so a short column never
     /// reaches here and this `min` never actually truncates anything.
     #[inline]
     pub fn len(&self) -> usize {
@@ -70,7 +70,7 @@ impl DenseNodeColumns {
     /// The three arrays are decoded independently and their lengths are only
     /// equal because the wire data said so; [`Self::len`] takes the minimum so
     /// that a disagreement cannot become an out-of-bounds index downstream,
-    /// and `validate_groups_strict` in `block.rs` rejects the disagreement
+    /// and `validate_block` in `block.rs` rejects the disagreement
     /// outright at block construction.
     #[allow(clippy::cast_possible_truncation)]
     pub fn decode_append(

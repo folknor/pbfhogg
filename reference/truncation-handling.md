@@ -166,13 +166,15 @@ The other contract sites are:
   envelope parsers. Both reject a blob carrying more than one of
   `raw` / `zlib_data` / `zstd_data`, and both cross-check a
   declared `Blob.raw_size` against the payload they produced.
-- `validate_groups_strict` (`src/read/block.rs`) for the
+- `validate_block` (`src/read/block.rs`) for the
   block-layer contract below. Every `PrimitiveBlock` constructor -
   `from_vec`, `from_vec_with_scratch`,
-  `from_vec_pooled_with_scratch` - funnels through `finish` and so
-  through this check. Note that no `PrimitiveBlock` constructor is
-  a shape-5 site: they take already-decompressed bytes and cannot
-  observe a decompression failure.
+  `from_vec_pooled_with_scratch` and the decode pools - funnels
+  through `BlockBuffer::project` and so through this check, as do
+  the projection scanners that build no block. Note that no
+  `PrimitiveBlock` constructor is a shape-5 site: they take
+  already-decompressed bytes and cannot observe a decompression
+  failure.
 
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the
@@ -206,8 +208,9 @@ produced fewer elements and exit code 0 - the exact failure this
 document exists to prevent, one layer in.
 
 Since 2026-08-20 the block layer is strict too. Every
-`PrimitiveBlock` constructor funnels through `finish`, which runs
-`validate_groups_strict` before the block is handed out. Per
+`PrimitiveBlock` constructor funnels through
+`BlockBuffer::project`, which runs `validate_block` before a block
+can be assembled. After the block's own top-level framing, per
 group, in order:
 
 1. the group's own top-level field framing,
@@ -253,15 +256,21 @@ reader that wants partial data from a corrupt file gets a hard
 error and the byte offset instead.
 
 This holds for consumers that report on fields the failing check
-does not touch. The full-decode modes of `inspect`'s scanning report
-refuse a block with a malformed way `refs` array even though no
-statistic reads it: after a read failure the report has not
-established complete aggregates, and the blocks read so far must
-not be presented as whole-file totals. The acceptance set is the
-chosen boundary, not an artifact of `PrimitiveBlock`
-construction, so a projection scanner that replaces construction
-in those modes keeps refusing exactly what the block reader
-refuses. Lookups and specialised scanners (`inspect --show`,
+does not touch. The full-decode modes of `inspect`'s scanning
+report, `check --ids` and `getparents` refuse a block with a
+malformed way `refs` array (or tag arrays, `Info`, string table
+UTF-8) even where nothing they report reads it: after a read
+failure a report has not established complete aggregates, the
+blocks read so far must not be presented as whole-file totals, and
+a check that passed a corrupt file would vouch for it. The
+acceptance set is the chosen boundary, not an artifact of
+`PrimitiveBlock` construction. These commands read through
+projections (`GroupProjection`) that build no block, and stay
+inside the boundary by construction rather than by care: a
+projection runs through `BlockBuffer::project`, the same
+`validate_block` call, in the same order, that block construction
+runs with its empty projection, followed by the same kind-claim
+refusal. Lookups and specialised scanners (`inspect --show`,
 `inspect --nodes`, `src/scan/node.rs`) are not bound by this
 paragraph; their own docs state what they check.
 

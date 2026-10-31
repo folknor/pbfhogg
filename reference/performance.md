@@ -1327,7 +1327,9 @@ code unchanged), which the stored baselines had cached.
 | `inspect --extended` | unstored 571 MB cell | 571 MB | 355 MB | 41.4 s to 42.2 s |
 
 What is left in the larger peaks is not decode storage: apply-changes'
-overlay (575 MB) and drain reorder (415 MB high water; since bounded by a
+overlay (575 MB by `merge_diff_heap_bytes`, an allocated-capacity estimate,
+not resident memory; see "Apply-changes overlay: superseded records") and
+drain reorder (415 MB high water; since bounded by a
 sequence window that does not bind on this input, see "Apply-changes
 sequence window"); the
 persistent ID sets of extract, tags-filter and check `--ids --full`. The
@@ -2639,6 +2641,27 @@ medians agree (136.4 s base, 135.4 s variant). In-flight seqs peak at
 what is in flight; a window under about 420 would start to bind at planet.
 The window caps the worst case, not these runs' peak: the reorder map
 still reaches 174 items / 415 MB on the first zstd:1 variant cell.
+
+## Apply-changes overlay: superseded records (bygg, 2026-10-31)
+
+Measured at `3f8d9f35` with temporary per-record length counters in the
+overlay's push and delete paths (unstored `--force` run stopped at
+`MERGE_LOOP_START`), planet daily diff seq 4913:
+
+| kind | records appended | bytes appended | superseded by a later upsert | orphaned by a later delete |
+|---|---:|---:|---:|---:|
+| node | 2,917,899 | 168.0 MB | 40,540 / 2.9 MB | 60,905 / 4.9 MB |
+| way | 547,987 | 119.6 MB | 21,452 / 8.2 MB | 907 / 0.24 MB |
+| relation | 17,326 | 38.0 MB | 1,812 / 8.7 MB | 49 / 0.01 MB |
+
+About 25 MB of 325.7 MB appended arena payload is unreachable. The 575 MB
+`merge_diff_heap_bytes` is `heap_size_estimate`: arena capacity (growth
+headroom included, much of it untouched pages), hash tables, deleted sets,
+floors and the interner, so it is not the resident overlay. Across a week,
+`merge-changes --simplify` over seq 4914-4920 (cell `0df5c0ad`, `44c62853`)
+reduced 26,261,540 changes to 25,417,990, 3.2 % by count. Compacting the
+overlay was declined on these numbers; the reasoning sits on
+`CompactDiffOverlay` in `src/osc/parse.rs`.
 
 ## `--direct-io` impact summary
 

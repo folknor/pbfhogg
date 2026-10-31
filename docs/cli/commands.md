@@ -1644,6 +1644,11 @@ base's). Of the base's replication state it keeps the base URL and drops the
 timestamp and sequence number, since the output is past them; set the new
 state with `--output-header` (see [Output header](#output-header)).
 
+The OSC is held in memory for the whole run, and that memory grows with the
+total parsed change payload, including earlier records for objects changed
+more than once. For accumulated diffs, `merge-changes --simplify` collapses
+each object's history before it is applied.
+
 ```
 pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 ```

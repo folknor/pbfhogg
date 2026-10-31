@@ -259,18 +259,27 @@ itself at saturation; the budget value is the memory control, and fusion
 shrinks the envelope so the same budget sustains more concurrency. Risks:
 the admission protocol's liveness around the earliest task, oversized and
 hostile blobs, cancellation and error paths that release leases, and a byte
-ledger does not bound pages glibc retains. It is also the generic shape of
-WRK-025. apply-changes now bounds outstanding seqs by count
+ledger does not bound pages glibc retains. apply-changes now bounds outstanding seqs by count
 (`apply_changes/window.rs`, 512, non-binding at planet with in-flight
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-025: apply-changes overlay reclaims superseded records
+### WRK-113: Measure and reduce apply-changes' retained lookup storage
 
-`CompactDiffOverlay` holds about 575 MB at planet and never reclaims records
-superseded by later changes for the same ID (`notes/todo.md` has the older
-entry). Compact superseded records as they are replaced, or collapse at
-load, so the overlay holds only the final state per ID.
+Superseded overlay records were measured and are small (about 25 MB of
+326 MB arena payload at planet seq 4913; reasoning on `CompactDiffOverlay`,
+numbers in reference/performance.md). What else apply-changes retains
+through the pipeline is unmeasured per component and is the target:
+`DiffRanges` duplicates every live id into sorted vectors beside the
+overlay's hash indexes (about 60 MB logical at planet, outside
+`merge_diff_heap_bytes`); version floors are only needed while parsing,
+yet the CLI keeps them for the whole run (library accumulation still needs
+them); the parser interns user names on deletes although a delete keeps
+only its version claim; the interner stores each string twice (buffer and
+lookup key). `heap_size_estimate` is wrong both ways (arena capacity
+headroom counted, hash buckets undercounted), so count resident components
+before choosing a fix. Deleted-id membership is still needed during the
+pipeline, though its representation could merge with other state.
 
 ### WRK-026: Projection scanners for scan commands
 

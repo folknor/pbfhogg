@@ -42,11 +42,20 @@ pub use super::compact::{
 /// Storage is bounded by parsed payload, not surviving object count: replacing
 /// or deleting an object leaves its old arena record and interned strings
 /// (including user names) allocated. Append-only storage avoids moving records
-/// and rebuilding offsets during parsing. Compaction would need to rewrite all
-/// live offsets and intern IDs, with a second live arena at peak or an in-place
-/// relocation algorithm. Keep that cost off the measured daily-diff path until
-/// repeated-update catch-up inputs justify it; splitting a catch-up into smaller
-/// apply operations bounds each overlay's history without changing this layout.
+/// and rebuilding offsets during parsing.
+///
+/// Reclaiming those records was measured and declined (bygg, `3f8d9f35`,
+/// planet daily diff seq 4913): 325.7 MB of arena records appended, of
+/// which 19.8 MB were superseded by a later create or modify of the same id
+/// and 5.2 MB orphaned by a later delete. Separately, simplifying seven
+/// daily planet diffs (seq 4914-4920) removed 3.2 % of changes by count.
+/// A rebuild after load would copy about 300 MB of live records to free
+/// about 25 MB on that input; it would keep intern IDs and floors as they
+/// are, so only offsets move. No correctness reason calls for it either:
+/// unreachable records cost storage, never results. Input that changes
+/// the same objects many times (an unsimplified accumulation of many
+/// diffs) grows storage with its parsed history; `merge-changes
+/// --simplify` collapses that history before it reaches this overlay.
 pub struct CompactDiffOverlay {
     node_arena: Vec<u8>,
     way_arena: Vec<u8>,
@@ -298,7 +307,10 @@ impl CompactDiffOverlay {
     /// and interner memory. Includes superseded records, unused capacity and
     /// strings no surviving object references: these still consume heap, so
     /// subtracting them would underreport retained memory. This is an allocated
-    /// storage estimate, not a live-payload estimate or allocator/RSS accounting.
+    /// storage estimate, not a live-payload estimate or allocator/RSS accounting:
+    /// arena capacity includes growth headroom whose pages may never be touched,
+    /// while hash-map `capacity()` is usable entries rather than physical
+    /// buckets, so the table terms undercount. It is approximate both ways.
     /// Does not include the stack size of the struct itself.
     pub fn heap_size_estimate(&self) -> usize {
         let mut total: usize = 0;

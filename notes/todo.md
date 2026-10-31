@@ -616,18 +616,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   reconstructible patch; then tags would go through the positioned script
   always.
 
-- [ ] **`CompactDiffOverlay` never reclaims superseded arena records.** Every
-  `push_node` / `push_way` / `push_relation` appends a fresh record and orphans
-  the previous one; the index is overwritten, the bytes are not. Accumulating
-  N OSCs that repeatedly touch the same objects grows the arena by the sum of
-  all versions, not the live set. Pressure is largely off since the
-  version-regression gate refuses the worst accumulation pattern outright, so
-  remaining growth is bounded by genuine forward version churn across a
-  catch-up range. Reclaiming means compaction or a free list threaded through
-  the arena, both touching the offset-width work in `388eb4b3`. **Trigger: a
-  planet-scale `load_all_diffs` measurement showing the arena is the ceiling.**
-  Do that measurement first.
-
 - [ ] **`merge-changes --simplify` holds the rendered XML of every input
   change** (12.0 GB peak at planet 7-OSC; owned elements were 22.5 GB). The
   output's `(kind, id)` order is what forces holding it. Bounding it further

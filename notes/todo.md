@@ -628,16 +628,12 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   planet-scale `load_all_diffs` measurement showing the arena is the ceiling.**
   Do that measurement first.
 
-- [ ] **`merge-changes --simplify` is fully in-memory.** `build_simplify_stream`
-  materialises every `Change` - owned tag strings, refs, members - for all
-  inputs before dedupe; the code's own comment cites 26.3 M changes at planet
-  7-OSC. The dedupe key is `(u8, i64)` and only the last change per object
-  survives, so a two-pass shape (scan for last-occurrence offsets, then
-  re-parse and emit) would cut peak RSS by roughly the whole stream. This is a
-  rewrite, not a tweak, so per AGENTS.md it needs an interleaved matched A/B at
-  planet scale rather than an asserted improvement. Note the two-pass shape must
-  preserve the version-precedence gate, which today runs during the single
-  dedupe pass and would move into pass one.
+- [ ] **`merge-changes --simplify` holds the rendered XML of every input
+  change** (12.0 GB peak at planet 7-OSC; owned elements were 22.5 GB). The
+  output's `(kind, id)` order is what forces holding it. Bounding it further
+  means either spilling rendered batches to scratch and reading survivors
+  back by range, or an index-only first pass plus a re-parse into key-range
+  buckets; both add a full payload write and read.
 
 - [ ] **An unversioned modify launders a version floor that a delete keeps.**
   `check_version_advance` (`src/osc/parse.rs`) compares only when both sides

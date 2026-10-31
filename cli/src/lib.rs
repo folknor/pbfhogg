@@ -660,7 +660,7 @@ fn validate_tags_filter(
         (
             given(matches, "tags-filter", "jobs"),
             "-j/--jobs",
-            "the OSC parse is single-threaded",
+            "the OSC filter takes no worker count",
         ),
         (
             header.is_set(),

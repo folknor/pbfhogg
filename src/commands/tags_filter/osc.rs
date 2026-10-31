@@ -7,22 +7,32 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 
 use crate::ElementKind;
+use crate::commands::merge_changes::emit::ElementBuf;
+use crate::commands::merge_changes::stream;
 use crate::error::Result;
+#[cfg(test)]
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
+use crate::osc::xml_parse::{LexBatch, OscAction, OscSink};
+#[cfg(test)]
 use crate::osc::xml_parse::{
-    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
+    coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
     parse_owned_metadata, parse_tag,
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
+
+// The owned path below (`matches_any` through `write_filtered_osc`) is what
+// the byte path replaced, kept as the oracle its differential test compares
+// with.
 
 // This tag-first traversal borrows owned OSC tags without building a
 // temporary borrowed-tag vector.
 // It selects an entire create/modify element; deletes bypass this predicate.
 // An empty expression list matches nothing, unlike export's optional filter.
 // Single-tag wildcard and negation semantics remain owned by tag_matches.
+#[cfg(test)]
 fn matches_any(expressions: &[Expression], tags: &[(String, String)], kind: ElementKind) -> bool {
     for (key, value) in tags {
         for expr in expressions {
@@ -48,6 +58,7 @@ fn matches_any(expressions: &[Expression], tags: &[(String, String)], kind: Elem
 /// `tags-filter --input-kind osc` unable to read a plain `.osc`.
 type Section = OscAction;
 
+#[cfg(test)]
 struct CurrentElem {
     kind: ElementKind,
     id: i64,
@@ -69,6 +80,7 @@ struct CurrentElem {
     metadata: Option<crate::osc::write::OwnedMetadata>,
 }
 
+#[cfg(test)]
 impl CurrentElem {
     fn new(kind: ElementKind, id: i64, metadata: Option<crate::osc::write::OwnedMetadata>) -> Self {
         Self {
@@ -84,17 +96,10 @@ impl CurrentElem {
     }
 }
 
-// Nine action/kind vectors retain only matching creates/modifies, but every
-// delete (with metadata). Memory is O(retained payload + largest input element),
-// not O(compressed input bytes); a match-all filter can retain the whole OSC.
-// This grouping preserves create/modify/delete then node/way/relation order,
-// including encounter order within each group, through one gzip encoder.
-// Three action spools alone cannot preserve kind order for interleaved input:
-// a bounded replacement needs nine spools (or offsets plus a reorder pass).
-// That adds a full retained-XML scratch write/read and needs scratch ownership,
-// cleanup and disk-failure handling. Keep this measured in-memory path until
-// match-all/catch-up RSS warrants that trade; simply emitting on encounter would
-// change XML ordering, and concatenating gzip spools changes member bytes.
+// Nine action/kind vectors: create/modify/delete then node/way/relation
+// order, encounter order within each group. The byte path keeps the same
+// nine groups as rendered XML.
+#[cfg(test)]
 struct FilteredOsc {
     create_nodes: Vec<OwnedNode>,
     create_ways: Vec<OwnedWay>,
@@ -107,6 +112,7 @@ struct FilteredOsc {
     delete_relation_ids: Vec<(i64, Option<OwnedMetadata>)>,
 }
 
+#[cfg(test)]
 impl FilteredOsc {
     fn new() -> Self {
         Self {
@@ -177,6 +183,23 @@ pub fn tags_filter_osc(
 }
 
 /// [`tags_filter_osc`] writing to a borrowed output it does not publish.
+///
+/// The input is read on merge-changes' lexical readers
+/// ([`stream::collect`]): one reader frames and checks the document and cuts
+/// it into batches of whole elements, and pool workers check each batch's
+/// elements with the shared parsers and render the kept ones (every delete,
+/// and each create or modify with a matching tag) into nine byte groups,
+/// one per action and kind. The document is then written once: each
+/// non-empty action's section holds its node, way and relation groups, each
+/// concatenated in input order. That is the order and the bytes the owned
+/// writers produced (a differential test holds it to that), with no owned
+/// element built for any change.
+///
+/// Memory is the rendered XML of the kept changes plus the readers' bounded
+/// in-flight batches; a match-all filter retains the whole input's rendered
+/// XML. Spooling the groups to scratch would bound that at the cost of a full
+/// write and read of the kept output and a scratch owner this command does
+/// not have.
 #[hotpath::measure]
 pub(crate) fn tags_filter_osc_to(
     input: &Path,
@@ -184,15 +207,225 @@ pub(crate) fn tags_filter_osc_to(
     expression_strs: &[String],
     host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterOscStats> {
-    crate::osc::output_is_gzip(output.destination())?;
+    let is_gz = crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
     host.invocation.marker("TAGSFILTEROSC_START");
-    let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.invocation)?;
-    write_filtered_osc(output, &filtered)?;
+    let inputs = [input];
+    let plan = stream::Plan {
+        inputs: &inputs,
+        is_gz: false,
+        readers: 1,
+        executor: host.executor.borrowed(),
+        cancel: &host.invocation,
+    };
+    let expressions = expressions.as_slice();
+    let batches = stream::collect(&plan, &|batch: &LexBatch, path: &Path| {
+        filter_batch(batch, path, expressions)
+    })?;
+    let batches: Vec<FilteredBatch> = batches.into_iter().flatten().collect();
+    host.invocation.check()?;
+    let mut stats = TagsFilterOscStats::default();
+    for b in &batches {
+        stats.creates_in += b.stats.creates_in;
+        stats.creates_out += b.stats.creates_out;
+        stats.modifies_in += b.stats.modifies_in;
+        stats.modifies_out += b.stats.modifies_out;
+        stats.deletes_in += b.stats.deletes_in;
+        stats.deletes_out += b.stats.deletes_out;
+    }
+    write_groups(output, is_gz, &batches)?;
     host.invocation.marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
 
+/// One batch's kept elements, rendered: groups in (action, kind) order,
+/// create node first, delete relation last.
+struct FilteredBatch {
+    groups: [Vec<u8>; 9],
+    stats: TagsFilterOscStats,
+}
+
+fn group_index(action: Section, kind: ElementKind) -> usize {
+    let a = match action {
+        Section::Create => 0,
+        Section::Modify => 1,
+        Section::Delete => 2,
+    };
+    let k = match kind {
+        ElementKind::Node => 0,
+        ElementKind::Way => 1,
+        ElementKind::Relation => 2,
+    };
+    a * 3 + k
+}
+
+/// A writer whose indent state is the document's inside an action section
+/// (depth 2, line break pending), with nothing written: an element rendered
+/// into it has the bytes it has at that place in the document, whatever
+/// precedes it there.
+fn group_writer() -> Result<Writer<Vec<u8>>> {
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer.write_event(Event::Start(BytesStart::new("osmChange")))?;
+    writer.write_event(Event::Start(BytesStart::new("create")))?;
+    writer.get_mut().clear();
+    Ok(writer)
+}
+
+fn filter_batch(
+    batch: &LexBatch,
+    path: &Path,
+    expressions: &[Expression],
+) -> Result<FilteredBatch> {
+    let mut sink = FilterBytes {
+        element: ElementBuf::new("tags-filter OSC"),
+        groups: Vec::with_capacity(9),
+        stats: TagsFilterOscStats::default(),
+        expressions,
+    };
+    for _ in 0..9 {
+        sink.groups.push(group_writer()?);
+    }
+    batch.replay(&mut sink, path)?;
+    let mut groups: [Vec<u8>; 9] = Default::default();
+    for (slot, writer) in groups.iter_mut().zip(sink.groups) {
+        *slot = writer.into_inner();
+    }
+    Ok(FilteredBatch {
+        groups,
+        stats: sink.stats,
+    })
+}
+
+/// The worker sink: every element checked as the owned sink checks it;
+/// deletes kept unconditionally, creates and modifies when a tag matches.
+struct FilterBytes<'a> {
+    element: ElementBuf,
+    groups: Vec<Writer<Vec<u8>>>,
+    stats: TagsFilterOscStats,
+    expressions: &'a [Expression],
+}
+
+impl OscSink for FilterBytes<'_> {
+    const END_ELEMENT_EMITS: bool = true;
+
+    fn begin_element(
+        &mut self,
+        action: Section,
+        kind: ElementKind,
+        e: &BytesStart<'_>,
+    ) -> Result<()> {
+        self.element.begin(action, kind, e)
+    }
+
+    fn tag(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        self.element.tag(e)
+    }
+
+    fn nd(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        self.element.nd(e)
+    }
+
+    fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
+        self.element.member(e)
+    }
+
+    fn end_element(&mut self) -> Result<()> {
+        let Some((action, kind)) = self.element.finish() else {
+            return Ok(());
+        };
+        let keep = match action {
+            Section::Delete => {
+                self.stats.deletes_in += 1;
+                self.stats.deletes_out += 1;
+                true
+            }
+            Section::Create => {
+                self.stats.creates_in += 1;
+                let keep = self.matches(kind);
+                self.stats.creates_out += u64::from(keep);
+                keep
+            }
+            Section::Modify => {
+                self.stats.modifies_in += 1;
+                let keep = self.matches(kind);
+                self.stats.modifies_out += u64::from(keep);
+                keep
+            }
+        };
+        if keep {
+            let writer = self
+                .groups
+                .get_mut(group_index(action, kind))
+                .ok_or_else(|| crate::Error::internal("tags-filter OSC: no group writer"))?;
+            self.element.write(writer, kind)?;
+        }
+        Ok(())
+    }
+}
+
+impl FilterBytes<'_> {
+    /// [`matches_any`] over the element's tags as read.
+    fn matches(&self, kind: ElementKind) -> bool {
+        self.element.tag_pairs().any(|(key, value)| {
+            self.expressions
+                .iter()
+                .any(|expr| expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value))
+        })
+    }
+}
+
+fn write_groups(
+    output: &crate::output::BoundOutput,
+    is_gz: bool,
+    batches: &[FilteredBatch],
+) -> Result<()> {
+    let out = output.writer()?;
+    let sink = if is_gz {
+        OscByteSink::Gz(Box::new(std::io::BufWriter::with_capacity(
+            crate::tunables::OSC_GZIP_WRITE_BUFFER,
+            GzEncoder::new(out, flate2::Compression::fast()),
+        )))
+    } else {
+        OscByteSink::Plain(out)
+    };
+    let mut writer = Writer::new_with_indent(sink, b' ', 2);
+    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+    let mut root = BytesStart::new("osmChange");
+    root.push_attribute(("version", "0.6"));
+    writer.write_event(Event::Start(root))?;
+    for (a, action) in [Section::Create, Section::Modify, Section::Delete]
+        .into_iter()
+        .enumerate()
+    {
+        let range = a * 3..a * 3 + 3;
+        let present = batches
+            .iter()
+            .any(|b| b.groups[range.clone()].iter().any(|g| !g.is_empty()));
+        if !present {
+            continue;
+        }
+        writer.write_event(Event::Start(BytesStart::new(action.tag())))?;
+        // Raw bytes: a rendered element leaves the indent state as it found
+        // it, so the closing tag indents as after event-by-event writing.
+        for g in range {
+            for b in batches {
+                std::io::Write::write_all(writer.get_mut(), &b.groups[g])?;
+            }
+        }
+        writer.write_event(Event::End(BytesEnd::new(action.tag())))?;
+    }
+    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
+    match writer.into_inner() {
+        OscByteSink::Gz(buffered) => buffered
+            .into_inner()
+            .map_err(|e| crate::Error::from(e.into_error()))?
+            .finish()?
+            .finish(),
+        OscByteSink::Plain(out) => out.finish(),
+    }
+}
+
+#[cfg(test)]
 fn parse_and_filter_osc(
     input: &Path,
     expressions: &[Expression],
@@ -213,6 +446,7 @@ fn parse_and_filter_osc(
 
 /// Sink that keeps the create/modify elements matching `expressions`
 /// and forwards every delete unconditionally.
+#[cfg(test)]
 struct FilterSink<'a> {
     filtered: FilteredOsc,
     stats: TagsFilterOscStats,
@@ -221,6 +455,7 @@ struct FilterSink<'a> {
     current: Option<CurrentElem>,
 }
 
+#[cfg(test)]
 impl FilterSink<'_> {
     /// The element a child belongs to. The driver routes children only of
     /// created and modified objects, which always set one.
@@ -231,6 +466,7 @@ impl FilterSink<'_> {
     }
 }
 
+#[cfg(test)]
 impl OscSink for FilterSink<'_> {
     fn begin_element(
         &mut self,
@@ -312,6 +548,7 @@ impl OscSink for FilterSink<'_> {
     }
 }
 
+#[cfg(test)]
 fn finalize_current(
     section: Section,
     current: &mut Option<CurrentElem>,
@@ -387,6 +624,7 @@ fn finalize_current(
     }
 }
 
+#[cfg(test)]
 fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOsc) -> Result<()> {
     // Framing follows the output name, the rule every OSC producer shares
     // (`crate::osc::output_is_gzip`); the name was vetted before any work.
@@ -505,3 +743,126 @@ impl std::io::Write for OscByteSink {
 // value containing a quote or an ampersand produced malformed XML here
 // and well-formed XML from `merge-changes`. Same input, two answers -
 // the exact defect this hunt was about, one layer above the parser.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn bound(path: &Path) -> crate::output::BoundOutput {
+        let host = crate::host::Host::entered_for_tests();
+        crate::output::bind_unissued(
+            crate::output::Output::new(
+                path,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
+            &host.invocation,
+        )
+        .unwrap()
+    }
+
+    fn owned(input: &Path, output: &Path, exprs: &[String]) -> (Vec<u8>, String) {
+        let host = crate::host::Host::entered_for_tests();
+        let out = bound(output);
+        let expressions = parse_expressions(exprs).unwrap();
+        let (filtered, stats) =
+            parse_and_filter_osc(input, &expressions, &host.invocation).unwrap();
+        write_filtered_osc(&out, &filtered).unwrap();
+        out.publish().unwrap();
+        let mut summary = Vec::new();
+        stats.write_summary(&mut summary).unwrap();
+        (
+            std::fs::read(output).unwrap(),
+            String::from_utf8(summary).unwrap(),
+        )
+    }
+
+    fn rendered(input: &Path, output: &Path, exprs: &[String]) -> (Vec<u8>, String) {
+        let stats = tags_filter_osc(
+            input,
+            crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
+            exprs,
+            &crate::host::Host::entered_for_tests(),
+        )
+        .unwrap();
+        let mut summary = Vec::new();
+        stats.write_summary(&mut summary).unwrap();
+        (
+            std::fs::read(output).unwrap(),
+            String::from_utf8(summary).unwrap(),
+        )
+    }
+
+    fn decompress(bytes: &[u8]) -> String {
+        use std::io::Read;
+        let mut xml = String::new();
+        flate2::read::MultiGzDecoder::new(bytes)
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
+    /// Kinds and actions interleaved inside sections, over many batches,
+    /// with metadata, escapes and children before and after the matching
+    /// tag: the byte path writes the owned path's document.
+    #[test]
+    fn byte_path_writes_the_owned_document() {
+        let dir = crate::path_guard::tests::scratch();
+        let count = i64::try_from(crate::tunables::MERGE_CHANGES_BATCH_BYTES / 40).unwrap();
+        let mut body = String::new();
+        for k in 0..count {
+            let action = match k % 4 {
+                0 | 3 => "create",
+                1 => "modify",
+                _ => "delete",
+            };
+            let meta = if k % 5 == 0 {
+                String::new()
+            } else {
+                format!(" version=\"{}\" user=\"a&amp;{k}\"", k % 7)
+            };
+            let tag = if k % 3 == 0 { "primary" } else { "residential" };
+            let element = match k % 3 {
+                0 => format!(
+                    "<node id=\"{k}\"{meta} lat=\"1.5\" lon=\"2\"><tag k=\"highway\" v=\"{tag}\"/></node>"
+                ),
+                1 => format!(
+                    "<way id=\"{k}\"{meta}><nd ref=\"1\"/><tag k=\"highway\" v=\"{tag}\"/><nd ref=\"{k}\"/></way>"
+                ),
+                _ => format!(
+                    "<relation id=\"{k}\"{meta}><tag k=\"type\" v=\"&lt;r\"/><member type=\"node\" ref=\"{k}\" role=\"x\"/></relation>"
+                ),
+            };
+            body.push_str(&format!("<{action}>{element}</{action}>"));
+        }
+        let input = dir.path().join("in.osc");
+        std::fs::write(
+            &input,
+            format!("<osmChange version=\"0.6\">{body}</osmChange>"),
+        )
+        .unwrap();
+        for exprs in [
+            vec!["highway=primary".to_string()],
+            vec!["w/highway".to_string(), "r/type".to_string()],
+            vec!["highway!=primary".to_string()],
+            vec!["nothing=here".to_string()],
+        ] {
+            let plain = dir.path().join("out.osc");
+            let a = owned(&input, &plain, &exprs);
+            let b = rendered(&input, &plain, &exprs);
+            assert!(a == b, "{exprs:?}");
+            let gz = dir.path().join("out.osc.gz");
+            let (a_bytes, a_stats) = owned(&input, &gz, &exprs);
+            let (b_bytes, b_stats) = rendered(&input, &gz, &exprs);
+            assert_eq!(a_stats, b_stats, "{exprs:?}");
+            assert!(decompress(&a_bytes) == decompress(&b_bytes), "{exprs:?}");
+        }
+    }
+}

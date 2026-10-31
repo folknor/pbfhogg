@@ -914,6 +914,14 @@ fn assemble_osc(
     );
     let paths = [creates_path, modifies_path, deletes_path];
     let counts = [create_count, modify_count, delete_count];
+    // Deliberately not one output stage with merge-changes. Both already
+    // deflate on workers and copy finished members in order; what they would
+    // share is that copy. The obligations that decide correctness differ:
+    // this assembler joins three already ordered action fragments and
+    // deflates only the framing, while merge-changes' coordinator orders
+    // concurrent inputs' batches against a credit ledger and promotes spill
+    // files. The raw arm keeps `ParallelGzipWriter` for the unindexed stream,
+    // whose fragments are plain XML.
     match (gzip, encoding) {
         (true, Fragments::GzipMembers) => {
             // The fragments are gzip members already; only the framing

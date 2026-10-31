@@ -2,6 +2,11 @@
 //! ordered coordinator, with output memory bounded by a byte budget rather
 //! than by the size of the output.
 //!
+//! [`collect`] runs the same readers and workers with a caller's encoding
+//! and keeps every result instead of writing it (`--simplify` and the OSC
+//! tags-filter); its readers reuse a slot as soon as their reader finishes,
+//! and credit returns when a result is accepted.
+//!
 //! # Shape
 //!
 //! - **Readers.** One standard thread per input, at most `readers` alive,
@@ -15,7 +20,7 @@
 //!   spent), then spawns its encode job on the pool tagged `(input, seq)`.
 //!   Credit is taken before the sequence number becomes outstanding, and an
 //!   input's batches are sealed in order.
-//! - **Workers.** Replay a batch into the owned sink, re-emit XML and gzip
+//! - **Workers.** Replay a batch into the byte sink, re-emit XML and gzip
 //!   it into one self-contained member with its own action sections. They
 //!   never block.
 //! - **Coordinator.** The only owner of every sink. It writes each member
@@ -71,22 +76,21 @@ use crate::osc::xml_parse::{LexBatch, LexSink, parse_osc_path};
 use crate::scratch::{RunScratch, ScratchPath};
 
 /// What one streaming merge needs.
-pub(super) struct Plan<'a> {
-    pub(super) inputs: &'a [&'a Path],
-    pub(super) is_gz: bool,
+pub(crate) struct Plan<'a> {
+    pub(crate) inputs: &'a [&'a Path],
+    pub(crate) is_gz: bool,
     /// Upper bound on concurrently alive reader threads.
-    pub(super) readers: usize,
-    pub(super) executor: crate::host::ExecutorRef<'a>,
-    pub(super) scratch: &'a RunScratch,
-    pub(super) cancel: &'a crate::host::Recorder,
+    pub(crate) readers: usize,
+    pub(crate) executor: crate::host::ExecutorRef<'a>,
+    pub(crate) cancel: &'a crate::host::Recorder,
 }
 
-enum Msg {
+enum Msg<T> {
     Member {
         input: usize,
         seq: usize,
         credit: usize,
-        result: crate::Result<(Vec<u8>, u64)>,
+        result: crate::Result<T>,
     },
     ReaderDone {
         input: usize,
@@ -187,10 +191,17 @@ impl Drop for StopOnDrop<'_> {
 
 /// Run the merge, writing every member in input and batch order to `out`.
 /// Returns the number of changes written.
-pub(super) fn run(plan: &Plan<'_>, out: &mut crate::output::OutputWriter) -> crate::Result<u64> {
+pub(crate) fn run(
+    plan: &Plan<'_>,
+    scratch: &RunScratch,
+    out: &mut crate::output::OutputWriter,
+) -> crate::Result<u64> {
+    let is_gz = plan.is_gz;
+    let encode = move |batch: &LexBatch, path: &Path| super::encode_batch(batch, path, is_gz);
     let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
-    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, u64)>>();
     let ledger_ref = &ledger;
+    let encode_ref = &encode;
     let result = plan.executor.scope(move |scope| {
         std::thread::scope(|threads| {
             let _stop = StopOnDrop(ledger_ref);
@@ -199,14 +210,14 @@ pub(super) fn run(plan: &Plan<'_>, out: &mut crate::output::OutputWriter) -> cra
                 std::thread::Builder::new()
                     .name(format!("merge-read-{input}"))
                     .spawn_scoped(threads, move || {
-                        read_input(input, plan, scope, ledger_ref, &tx);
+                        read_input(input, plan, scope, ledger_ref, &tx, encode_ref);
                     })
                     .map(drop)
                     .map_err(|e| {
                         crate::Error::from(e).context("failed to spawn a merge-changes reader")
                     })
             };
-            Coordinator::new(plan, ledger_ref, out).run(&rx, spawn_reader)
+            Coordinator::new(plan, scratch, ledger_ref, out).run(&rx, spawn_reader)
         })
     });
     plan.cancel.counter(
@@ -216,17 +227,143 @@ pub(super) fn run(plan: &Plan<'_>, out: &mut crate::output::OutputWriter) -> cra
     result
 }
 
+/// Run the readers and workers of [`run`], but collect every batch's
+/// `encode` result instead of writing it: per input, in batch order. Credit
+/// is returned the moment a result is accepted, so the ledger bounds only
+/// batches not yet encoded; what is collected is the caller's to bound.
+/// Every input's reader runs to its end before this returns, so an input
+/// failure anywhere is returned ahead of anything the caller does next.
+pub(crate) fn collect<T, E>(plan: &Plan<'_>, encode: &E) -> crate::Result<Vec<Vec<T>>>
+where
+    T: Send,
+    E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
+{
+    let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
+    let (tx, rx) = std::sync::mpsc::channel::<Msg<T>>();
+    let ledger_ref = &ledger;
+    let result = plan.executor.scope(move |scope| {
+        std::thread::scope(|threads| {
+            let _stop = StopOnDrop(ledger_ref);
+            let spawn_reader = |input: usize| -> crate::Result<()> {
+                let tx = tx.clone();
+                std::thread::Builder::new()
+                    .name(format!("merge-read-{input}"))
+                    .spawn_scoped(threads, move || {
+                        read_input(input, plan, scope, ledger_ref, &tx, encode);
+                    })
+                    .map(drop)
+                    .map_err(|e| {
+                        crate::Error::from(e).context("failed to spawn a merge-changes reader")
+                    })
+            };
+            collect_results(plan, ledger_ref, &rx, spawn_reader)
+        })
+    });
+    plan.cancel.counter(
+        "merge_changes_credit_wait_ns",
+        ledger.wait_ns.load(Ordering::Relaxed),
+    );
+    result
+}
+
+/// The collecting coordinator. A reader slot is reused as soon as its
+/// reader has finished: nothing of an input is held open after that.
+fn collect_results<T>(
+    plan: &Plan<'_>,
+    ledger: &Ledger,
+    rx: &Receiver<Msg<T>>,
+    spawn_reader: impl Fn(usize) -> crate::Result<()>,
+) -> crate::Result<Vec<Vec<T>>> {
+    let n = plan.inputs.len();
+    let readers = plan.readers.clamp(1, n.max(1));
+    let mut started = 0;
+    while started < readers.min(n) {
+        spawn_reader(started)?;
+        started += 1;
+    }
+    let mut slots: Vec<Vec<Option<T>>> = (0..n).map(|_| Vec::new()).collect();
+    let mut received = vec![0usize; n];
+    let mut batches: Vec<Option<usize>> = vec![None; n];
+    let mut complete = 0usize;
+    let mut batches_total = 0usize;
+    let protocol = |input: usize| {
+        crate::Error::internal(format!(
+            "merge-changes input {input} answered out of protocol"
+        ))
+    };
+    while complete < n {
+        // A message is handled before the cancellation check, so an error
+        // it carries is returned rather than replaced by the cancellation.
+        match recv(rx, plan.executor)? {
+            Msg::Member {
+                input,
+                seq,
+                credit,
+                result,
+            } => {
+                let value = result?;
+                ledger.release(credit);
+                let slot = &mut slots[input];
+                if slot.len() <= seq {
+                    slot.resize_with(seq + 1, || None);
+                }
+                if slot[seq].is_some() || batches[input].is_some_and(|b| seq >= b) {
+                    return Err(protocol(input));
+                }
+                slot[seq] = Some(value);
+                received[input] += 1;
+                if batches[input] == Some(received[input]) {
+                    complete += 1;
+                }
+            }
+            Msg::ReaderDone {
+                input,
+                batches: count,
+            } => {
+                if batches[input].is_some() || received[input] > count || slots[input].len() > count
+                {
+                    return Err(protocol(input));
+                }
+                batches[input] = Some(count);
+                batches_total += count;
+                if received[input] == count {
+                    complete += 1;
+                }
+                if started < n {
+                    spawn_reader(started)?;
+                    started += 1;
+                }
+            }
+            Msg::ReaderFailed(error) => return Err(error),
+        }
+        plan.cancel.check()?;
+    }
+    plan.cancel.counter("merge_changes_batches", batches_total);
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(input, slot)| {
+            slot.into_iter()
+                .collect::<Option<Vec<T>>>()
+                .ok_or_else(|| protocol(input))
+        })
+        .collect()
+}
+
 /// One reader thread's whole life. Always ends with exactly one terminal
 /// message, sent last, after which it does nothing that can block.
-fn read_input<'s>(
+fn read_input<'s, T, E>(
     input: usize,
     plan: &'s Plan<'s>,
     scope: &rayon::Scope<'s>,
     ledger: &'s Ledger,
-    tx: &Sender<Msg>,
-) {
+    tx: &Sender<Msg<T>>,
+    encode: &'s E,
+) where
+    T: Send + 's,
+    E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
+{
     let path = plan.inputs[input];
-    let is_gz = plan.is_gz;
     let cancel = plan.cancel;
     let body = || -> crate::Result<usize> {
         let seq = Cell::new(0usize);
@@ -243,7 +380,7 @@ fn read_input<'s>(
                             "merge-changes stopped after an earlier failure",
                         ));
                     }
-                    super::encode_batch(&batch, path, is_gz)
+                    encode(&batch, path)
                 }))
                 .unwrap_or_else(|payload| {
                     Err(
@@ -307,6 +444,7 @@ struct InputState {
 
 struct Coordinator<'a, 'p> {
     plan: &'a Plan<'p>,
+    scratch: &'a RunScratch,
     ledger: &'a Ledger,
     out: &'a mut crate::output::OutputWriter,
     states: Vec<InputState>,
@@ -317,6 +455,7 @@ struct Coordinator<'a, 'p> {
 impl<'a, 'p> Coordinator<'a, 'p> {
     fn new(
         plan: &'a Plan<'p>,
+        scratch: &'a RunScratch,
         ledger: &'a Ledger,
         out: &'a mut crate::output::OutputWriter,
     ) -> Self {
@@ -332,6 +471,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
             .collect();
         Self {
             plan,
+            scratch,
             ledger,
             out,
             states,
@@ -342,7 +482,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
 
     fn run(
         mut self,
-        rx: &Receiver<Msg>,
+        rx: &Receiver<Msg<(Vec<u8>, u64)>>,
         spawn_reader: impl Fn(usize) -> crate::Result<()>,
     ) -> crate::Result<u64> {
         let n = self.plan.inputs.len();
@@ -454,7 +594,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
             state.next += 1;
             state.changes += changes;
             if matches!(state.sink, Sink::Pending) {
-                let path = self.plan.scratch.file(&format!("merge-input-{input}"))?;
+                let path = self.scratch.file(&format!("merge-input-{input}"))?;
                 let file = crate::scratch::create_read_write(&path, true)
                     .map_err(|e| spill_err(&path, e))?;
                 state.sink = Sink::Spill(path, io::BufWriter::with_capacity(SPILL_CHUNK, file));
@@ -526,7 +666,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 self.out.write_all(&buf[..n])?;
             }
             drop(file);
-            self.plan.scratch.remove(&path);
+            self.scratch.remove(&path);
         }
         Ok(())
     }
@@ -541,7 +681,7 @@ fn spill_err(path: &ScratchPath, e: io::Error) -> crate::Error {
 
 /// Receive one message, running queued pool jobs while waiting when the
 /// caller is a pool worker (the writer's `recv_permit` shape).
-fn recv(rx: &Receiver<Msg>, executor: crate::host::ExecutorRef<'_>) -> crate::Result<Msg> {
+fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> crate::Result<Msg<T>> {
     let lost = || crate::Error::internal("merge-changes workers exited without a result");
     loop {
         match rx.try_recv() {

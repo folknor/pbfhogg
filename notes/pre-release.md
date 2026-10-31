@@ -104,7 +104,7 @@ are listed for reference only.
 | `inspect --tags -j 16` | 17.5 GB | 17.5 GB | 1m40s | 2m50s | `7855f2a4` |
 | `build-geocode-index` | 13.4 GB | ~25 GB | 5m20s | 5m47s | `c261bd3c` |
 | `add-locations-to-ways --index-type external` | 10.7 GB | 12.0 GB | 5m21s | 9m52s | `13668dda` |
-| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) (n9) | 9.86 GB | 9.4 GB | 10m58s | 14m44s | `831424c0` |
+| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) (n9) | 9.90 GB | 9.4 GB | 2m08s | 14m44s | `eded8718` |
 | `extract --smart` (`-25,34,45,72`) | 8.2 GB | 11.17 GB | 2m20s | 4m28s | `d015bbe4` |
 | `cat --dedupe` (n4) | 1.15 GB | 1.4 GB | 4m23s | 2h13m | `5faa7ff8` |
 | `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
@@ -157,7 +157,9 @@ are listed for reference only.
   buffer change.
 - n9: Re-measured at `179f1b7e` for WRK-002; the pre-`5bfa37ab` cells were
   check `f6ba05d4` (2.47 GB, 34 s), extract `ce0bdcc0` (5.27 GB, 2m02s) and
-  multi-extract `4babae4d` (10.3 GB, 10m53s).
+  multi-extract `4babae4d` (10.3 GB, 10m53s). The multi-extract row is
+  `eded8718` at `44c62853` (worker-side compression); at `179f1b7e` it
+  was `831424c0`, 9.86 GB and 10m58s.
 - n10: Stored at `179f1b7e` (the streaming work-unit diff, `587bfc12`).
   Before it: text `f9fa4f6f` (605 MB, 3m04s), osc `607cd897` (653 MB,
   4m11s). The osc row's peak and wall come from two `--force` cells of
@@ -293,15 +295,6 @@ dense chunks. Bolder for check `--ids --full`: on input proven strictly
 sorted, strict monotonicity already rules out duplicates, so the dense sets
 can go, with a fallback for unsorted input.
 
-### WRK-028: Parallel compression for multi-extract
-
-Landed: the ordered pool's tasks compress and frame each region's blocks
-and the sync writers only copy frames (planet 5-region simple 675 s to
-128 s, matched forced cells, reference/performance.md "Compression inside
-the pool's tasks"). Residue: no stored clean cell exists at the landing
-commit, so the planet table's `multi-extract --simple` row above still
-cites `831424c0` (10m58s). Store one `--bench 1` cell and update the row.
-
 ### WRK-029: Collapse byte-equal twin frames in dedupe
 
 For entries with equal kind, range and frame length across inputs, verify
@@ -347,14 +340,13 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-036: merge-changes --simplify and tags-filter OSC on the batch readers
+### WRK-112: tags-filter --input-kind osc and -j
 
-`--simplify` still parses whole inputs into owned `ChangeStream`s per pool
-task (22.8 GB in `3e3ef119`). The reader and batch stage of `c97b9985`
-could feed its dedupe, and `tags-filter --input-kind osc` still re-emits
-through owned elements (the streaming merge's byte sink, `179f1b7e`, is the
-borrowed form). `diff --format osc` already uses `ParallelGzipWriter` and
-could converge on the same ordered output stage.
+The OSC filter now runs its workers on the host executor (the ambient pool
+under the CLI), but `tags_filter_osc` takes no `Parallelism` and the CLI
+still refuses `-j` with OSC input. Threading a `Parallelism` through (a
+fixed pool, as merge-changes builds) would let `-j` cap it like every other
+pooled command; that is a CLI contract change (flag contract table, docs).
 
 ### WRK-037: ParallelGzipWriter window size
 

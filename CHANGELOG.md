@@ -8,6 +8,12 @@
   compresses every region's output in parallel instead of on one thread.
   A 5-region planet extract went from 675 s to 128 s on the same host,
   with unchanged output bytes and peak memory.
+- `merge-changes --simplify` reads its inputs in parallel batches and no
+  longer holds every change as a parsed object. A 7-diff planet merge went
+  from 18-21 s and 22.5 GB peak memory to 5.4 s and 12.0 GB, with
+  unchanged output bytes.
+- `tags-filter --input-kind osc` filters on several threads: a planet daily
+  diff went from 5.3 s to 2.5 s, with the same output.
 
 ## 0.6.0 - 2026-10-30
 

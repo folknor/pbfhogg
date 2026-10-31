@@ -1915,10 +1915,40 @@ auto-detect on this 24-thread host lands the same workload at
 ## Merge-changes
 
 `pbfhogg merge-changes` squashes N OSC (gzip + XML) inputs into one OSC
-output. Two production code paths: **streaming** (`write_streaming`,
-the default) and **simplify** (`--simplify`, builds an in-memory
-overlay then writes the latest change per object via a `BTreeMap`
-dedupe).
+output. Two production code paths on the same lexical readers:
+**streaming** (`write_streaming`, the default) and **simplify**
+(`--simplify`, collects every change as rendered XML, dedupes by a
+parallel sort and splices the survivors' bytes).
+
+### Simplify and OSC tags-filter on the batch readers (bygg, 2026-10-31)
+
+`--simplify` used to parse each input on one thread into owned elements,
+concatenate them, dedupe them serially through a `BTreeMap`, then re-emit
+the survivors. It now runs on the streaming path's readers: workers render
+each batch to plain XML and record per element its kind, ID, action,
+version claim and byte range; a parallel sort of `(kind, id, position)`
+replaces the map; survivors' bytes are spliced into the same per-worker
+chunks, so the output bytes are unchanged (a differential test against the
+owned path holds them, gzip members included). `tags-filter --input-kind
+osc` moved onto the same readers, its workers rendering kept elements into
+nine (action, kind) groups.
+
+Matched interleaved `--bench 1` cells on bygg. Baseline `44c62853`: the
+simplify cells were built in brokkr's `--commit` worktree, the others in
+the main tree (stash, `--bench 1`, stored); variant `44c62853` + change
+(`--force`, unstored). Spans from `--durations` START/END pairs.
+
+| Cell | Baseline | Variant |
+|---|---|---|
+| merge-changes `--simplify` 7-OSC `4914..4920` | 20.9 s, 18.3 s; peak anon 22.5 GB (`0df5c0ad`, `2b1d6966`) | 5.44, 5.49, 5.41, 5.40 s; peak anon 12.0 GB (11.8 GB before element ranges widened to 64-bit offsets) |
+| merge-changes 7-OSC (default), three pairs | 3.619, 3.657, 3.625 s (`0028f8ee`, `dc3aebc0`, `1849bf51`) | 3.636, 3.704, 3.656 s (median +0.9 %, noise) |
+| `tags-filter --input-kind osc` 4913 `w/highway=primary` | 5.31 s, peak anon 244 MB (`68a6c81f`) | 2.46, 2.46 s; peak anon 131 MB |
+
+Variant simplify spans: parse and render 3.18 s (was 6.9 s of owned parse
+plus a 0.6-1.8 s concatenation), dedupe 0.23 s (was 4.3 s), emit 1.59 s,
+drain 0.29 s. The peak is the rendered XML of all 26.3 M input changes
+plus a 24-byte sort key and a 40-byte record per change, then the deflated
+chunks during emit.
 
 ### Streaming path on lexical batches with spill (bygg, 2026-10-30)
 
@@ -2073,11 +2103,10 @@ Phase breakdown of the 73.7 s `3e3ef119` run:
 - `MERGECHANGES_DRAIN`: **0.33 s** - main thread concatenates prelude
   + per-chunk members in (group, chunk-index) order + postlude.
 
-The simplify wall is now 19 s slower than the streaming wall on the
-same input. The gap is the dedupe phase (6.9 s) plus a slightly less
-efficient parse fan-out (workers parse to a separate ChangeStream
-buffer in simplify, vs the streaming path's fused parse + emit
-through `parse_osc_streaming`).
+At `abd1d9e` the simplify wall was 19 s slower than the streaming wall
+on the same input: the dedupe phase (6.9 s) plus a less efficient parse
+fan-out (workers parsed to a separate owned buffer in simplify, vs the
+streaming path's fused parse and emit of that time).
 
 Pre-parallel observations from the matrix that still hold:
 

@@ -3,10 +3,13 @@
 //! Default mode preserves the full change stream in input order.
 //! `--simplify` keeps only the last change per object (type + id).
 
-mod emit;
-mod stream;
+pub(crate) mod emit;
+mod simplify;
+pub(crate) mod stream;
 
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::collections::btree_map::Entry;
 use std::io::Write;
 use std::path::Path;
@@ -14,23 +17,30 @@ use std::path::Path;
 use flate2::write::GzEncoder;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
+#[cfg(test)]
 use rayon::prelude::*;
 
 use super::Result;
+#[cfg(test)]
 use crate::ElementKind;
+#[cfg(test)]
 use crate::osc::version_floor::VersionFloor;
+#[cfg(test)]
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
+use crate::osc::xml_parse::OscAction;
+#[cfg(test)]
 use crate::osc::xml_parse::{
-    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
+    OscSink, coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
     parse_owned_metadata, parse_tag,
 };
 
 /// `merge-changes` speaks the same three actions as the shared parser.
 type Action = OscAction;
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum ChangeElement {
     Node(OwnedNode),
@@ -38,6 +48,7 @@ enum ChangeElement {
     Relation(OwnedRelation),
 }
 
+#[cfg(test)]
 impl ChangeElement {
     fn key(&self) -> (ElementKind, i64) {
         match self {
@@ -48,17 +59,20 @@ impl ChangeElement {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct Change {
     action: Action,
     element: ChangeElement,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct ChangeStream {
     changes: Vec<Change>,
 }
 
+#[cfg(test)]
 impl ChangeStream {
     fn push(&mut self, action: Action, element: ChangeElement) {
         self.changes.push(Change { action, element });
@@ -93,6 +107,7 @@ impl MergeChangesStats {
     }
 }
 
+#[cfg(test)]
 struct CurrentElem {
     kind: ElementKind,
     id: i64,
@@ -104,6 +119,7 @@ struct CurrentElem {
     members: Vec<OwnedMember>,
 }
 
+#[cfg(test)]
 impl CurrentElem {
     fn new(kind: ElementKind, id: i64, metadata: Option<OwnedMetadata>) -> Self {
         Self {
@@ -239,17 +255,18 @@ pub(crate) fn merge_changes_to(
     let cancel = &host.invocation;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
         if simplify {
-            let stream = build_simplify_stream(inputs, cancel)?;
-            let changes_in = stream.changes.len() as u64;
-            let changes_out = write_simplified(
+            simplify::run(
+                &stream::Plan {
+                    inputs,
+                    is_gz,
+                    readers: worker_count,
+                    executor,
+                    cancel,
+                },
                 output,
-                is_gz,
-                stream,
                 worker_count,
                 allow_version_regression,
-                cancel,
-            )? as u64;
-            Ok((changes_in, changes_out))
+            )
         } else {
             let changes_out = write_streaming(
                 inputs,
@@ -289,6 +306,7 @@ pub(crate) fn merge_changes_to(
 /// `par_iter` fan-out into per-input streams, concatenated in input order
 /// so `write_simplified`'s "later inputs win" `BTreeMap` dedupe still
 /// observes inputs in sequence order.
+#[cfg(test)]
 fn build_simplify_stream(
     inputs: &[&Path],
     cancel: &crate::host::Recorder,
@@ -337,6 +355,7 @@ fn build_simplify_stream(
 /// `brokkr sidecar --durations` can measure each input's parse wall, and
 /// emit `merge_changes_changes_per_osc` on the post-parse stream length
 /// delta so the per-input change count is observable in the sidecar.
+#[cfg(test)]
 fn parse_one_into_stream(
     path: &Path,
     stream: &mut ChangeStream,
@@ -369,6 +388,7 @@ fn parse_one_into_stream(
 // ---------------------------------------------------------------------------
 
 /// Where a finished change goes.
+#[cfg(test)]
 trait ChangeDest {
     /// Whether `accept` emits the change (serializes it toward the output),
     /// so that its failure is the output's, not a fault of the input; see
@@ -378,10 +398,12 @@ trait ChangeDest {
     fn accept(&mut self, change: Change) -> Result<()>;
 }
 
+#[cfg(test)]
 struct StreamDest<'a> {
     stream: &'a mut ChangeStream,
 }
 
+#[cfg(test)]
 impl ChangeDest for StreamDest<'_> {
     const EMITS: bool = false;
 
@@ -411,12 +433,14 @@ impl ChangeDest for WriterDest<'_> {
     }
 }
 
+#[cfg(test)]
 struct OwnedSink<D: ChangeDest> {
     dest: D,
     action: Action,
     current: Option<CurrentElem>,
 }
 
+#[cfg(test)]
 impl<D: ChangeDest> OwnedSink<D> {
     fn new(dest: D) -> Self {
         Self {
@@ -435,6 +459,7 @@ impl<D: ChangeDest> OwnedSink<D> {
     }
 }
 
+#[cfg(test)]
 impl<D: ChangeDest> OscSink for OwnedSink<D> {
     const END_ELEMENT_EMITS: bool = D::EMITS;
 
@@ -498,7 +523,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
     }
 }
 
-#[hotpath::measure]
+#[cfg(test)]
 fn parse_osc_into(
     path: &Path,
     stream: &mut ChangeStream,
@@ -523,6 +548,11 @@ impl OscWriter {
     fn write_event(&mut self, event: Event<'_>) -> Result<()> {
         self.writer.write_event(event)?;
         Ok(())
+    }
+
+    /// Bytes written so far (before any deflate).
+    fn len(&self) -> usize {
+        self.writer.get_ref().len()
     }
 
     /// The finished piece: the XML, as one self-contained gzip member when
@@ -581,9 +611,9 @@ fn write_streaming(
             is_gz,
             readers,
             executor,
-            scratch,
             cancel,
         },
+        scratch,
         &mut out,
     )?;
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
@@ -660,6 +690,7 @@ fn emit_change(
 }
 
 /// The version an element claims, or `None` when it carried none.
+#[cfg(test)]
 fn change_version(change: &Change) -> Option<i32> {
     let meta = match &change.element {
         ChangeElement::Node(n) => n.metadata.as_ref(),
@@ -685,6 +716,7 @@ fn change_version(change: &Change) -> Option<i32> {
 /// previous change let an unversioned change in between reset it, so
 /// `delete v9`, unversioned `modify`, `modify v8` was accepted here and
 /// refused by apply-changes. [`VersionFloor`] holds the rule both use.
+#[cfg(test)]
 fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<()> {
     let claim = change_version(incoming);
     if let Some(version) = claim
@@ -707,7 +739,7 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
     Ok(())
 }
 
-#[hotpath::measure]
+#[cfg(test)]
 fn write_simplified(
     output: &crate::output::BoundOutput,
     is_gz: bool,
@@ -722,14 +754,8 @@ fn write_simplified(
     // Each object's last change, beside the highest version ever claimed
     // for it. The floor is only maintained while the gate is on; with
     // `--allow-version-regression` the dedupe is purely positional.
-    // Memory is O(input changes + surviving payload), not three copies of the
-    // payload: this loop moves changes out of the stream, then moves survivors
-    // out of the map into action groups. The stream's outer allocation remains
-    // until the loop ends. A position index still retains every overwritten
-    // payload until compaction, and must preserve version-floor checks and the
-    // (kind, ID) order that defines group chunking and gzip member bytes. Keep
-    // this measured path until a replacement demonstrates lower peak RSS and
-    // equivalent bytes; disk spooling would add another full payload write/read.
+    // The owned simplify path, kept as the oracle `simplify::run` is held to
+    // byte for byte (and regression for regression) by the tests below.
     let mut last_by_object: BTreeMap<(ElementKind, i64), (Change, VersionFloor)> = BTreeMap::new();
     for change in stream.changes {
         let key = change.element.key();
@@ -833,11 +859,13 @@ fn action_tag(action: Action) -> &'static str {
     action.tag()
 }
 
+#[cfg(test)]
 fn write_change_to(writer: &mut OscWriter, change: &Change) -> Result<()> {
     let delete = change.action == Action::Delete;
     write_change_element(&mut writer.writer, &change.element, delete)
 }
 
+#[cfg(test)]
 fn write_change_element<W: Write>(
     writer: &mut Writer<W>,
     element: &ChangeElement,
@@ -971,6 +999,146 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The owned simplify path (the oracle): parse to owned changes, dedupe
+    /// in a map, write the survivors.
+    fn owned_simplify(
+        inputs: &[&Path],
+        output: &Path,
+        jobs: usize,
+        allow_version_regression: bool,
+    ) -> crate::Result<Vec<u8>> {
+        let host = crate::host::Host::entered_for_tests();
+        let out = crate::output::bind_unissued(
+            crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            &host.invocation,
+        )?;
+        let is_gz = crate::osc::output_is_gzip(output)?;
+        let stream = build_simplify_stream(inputs, &host.invocation)?;
+        write_simplified(
+            &out,
+            is_gz,
+            stream,
+            jobs,
+            allow_version_regression,
+            &host.invocation,
+        )?;
+        out.publish()?;
+        Ok(std::fs::read(output)?)
+    }
+
+    fn rendered_simplify(
+        inputs: &[&Path],
+        output: &Path,
+        jobs: usize,
+        allow_version_regression: bool,
+        scratch: &Path,
+    ) -> crate::Result<Vec<u8>> {
+        merge_changes(
+            inputs,
+            crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            true,
+            crate::host::Parallelism::from_jobs(jobs),
+            allow_version_regression,
+            run_scratch(scratch),
+            &crate::host::Host::entered_for_tests(),
+        )?;
+        Ok(std::fs::read(output)?)
+    }
+
+    /// Inputs that overlap on IDs across and within files, mix actions and
+    /// kinds inside a section, carry metadata, escapes and unversioned
+    /// changes, and are large enough to cut into several batches each.
+    fn simplify_inputs(dir: &Path, regress: bool) -> Vec<std::path::PathBuf> {
+        let per_input = i64::try_from(crate::tunables::MERGE_CHANGES_BATCH_BYTES / 60).unwrap();
+        (0..4_i64)
+            .map(|i| {
+                let mut body = String::new();
+                for k in 0..per_input {
+                    let id = (k * 7 + i * 3) % (per_input / 2);
+                    let version = if regress && i == 3 && k % 1000 == 17 {
+                        1
+                    } else {
+                        i32::try_from(i + 2).unwrap()
+                    };
+                    let action = match (k + i) % 3 {
+                        0 => "create",
+                        1 => "modify",
+                        _ => "delete",
+                    };
+                    let meta = if k % 5 == 0 {
+                        String::new()
+                    } else {
+                        format!(" version=\"{version}\" user=\"u&amp;{k}\" uid=\"{k}\"")
+                    };
+                    let element = match k % 3 {
+                        0 => format!(
+                            "<node id=\"{id}\"{meta} lat=\"1.5\" lon=\"-2.25\"><tag k=\"n\" v=\"&lt;{k}\"/></node>"
+                        ),
+                        1 => format!(
+                            "<way id=\"{id}\"{meta}><tag k=\"w\" v=\"{i}\"/><nd ref=\"{k}\"/><nd ref=\"1\"/></way>"
+                        ),
+                        _ => format!(
+                            "<relation id=\"{}\"{meta}><member type=\"way\" ref=\"{k}\" role=\"r\"/></relation>",
+                            -id
+                        ),
+                    };
+                    body.push_str(&format!("<{action}>{element}</{action}>"));
+                }
+                let path = dir.join(format!("simplify-{i}.osc"));
+                std::fs::write(&path, format!("<osmChange version=\"0.6\">{body}</osmChange>"))
+                    .unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// The rendered path writes exactly the owned path's bytes, gzip
+    /// members included, at every worker count and with the gate off.
+    #[test]
+    fn rendered_simplify_writes_the_owned_bytes() -> crate::Result<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let paths = simplify_inputs(scratch.path(), false);
+        let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        for name in ["out.osc", "out.osc.gz"] {
+            let output = scratch.path().join(name);
+            for jobs in [1, 3, 8] {
+                for allow in [false, true] {
+                    let owned = owned_simplify(&inputs, &output, jobs, allow)?;
+                    let rendered =
+                        rendered_simplify(&inputs, &output, jobs, allow, scratch.path())?;
+                    assert!(owned == rendered, "{name}, jobs={jobs}, allow={allow}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// With several objects regressing, both paths name the same one.
+    #[test]
+    fn rendered_simplify_reports_the_owned_regression() -> crate::Result<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let paths = simplify_inputs(scratch.path(), true);
+        let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let output = scratch.path().join("out.osc");
+        let owned = owned_simplify(&inputs, &output, 2, false)
+            .unwrap_err()
+            .to_string();
+        let rendered = rendered_simplify(&inputs, &output, 2, false, scratch.path())
+            .unwrap_err()
+            .to_string();
+        assert!(owned.contains("version"), "{owned}");
+        assert_eq!(owned, rendered);
         Ok(())
     }
 

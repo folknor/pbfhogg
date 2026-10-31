@@ -138,6 +138,10 @@ impl OwnedMetadata {
         }
     }
 
+    /// The owned writers' metadata attributes. Production OSC re-emission
+    /// writes [`Self::append_attrs`]; this stays as the oracle the byte
+    /// sinks' differential tests compare with.
+    #[cfg(test)]
     pub(crate) fn push_attrs(&self, elem: &mut quick_xml::events::BytesStart<'_>) {
         if let Some(version) = self.version {
             let v = version.to_string();
@@ -160,8 +164,8 @@ impl OwnedMetadata {
         }
     }
 
-    /// [`Self::push_attrs`] as start tag content text: the same attributes,
-    /// order and escaping.
+    /// The metadata as start tag content text, in the owned writers'
+    /// attribute order and escaping (`push_attrs`).
     pub(crate) fn append_attrs(&self, content: &mut String) {
         if let Some(version) = self.version {
             append_int_attr(content, "version", i64::from(version));
@@ -184,6 +188,10 @@ impl OwnedMetadata {
     }
 }
 
+// The owned elements and their writers below are the byte contract the OSC
+// re-emitting sinks (`merge_changes::emit::ElementBuf`) are held to by
+// differential tests; no production path builds them any more.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedNode {
     pub(crate) id: i64,
@@ -193,6 +201,7 @@ pub(crate) struct OwnedNode {
     pub(crate) metadata: Option<OwnedMetadata>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedWay {
     pub(crate) id: i64,
@@ -207,6 +216,7 @@ pub(crate) struct OwnedMember {
     pub(crate) role: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedRelation {
     pub(crate) id: i64,
@@ -242,6 +252,7 @@ pub(crate) fn member_type_str(id: MemberId, relation_id: i64) -> crate::Result<&
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &OwnedNode,
@@ -269,6 +280,7 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &OwnedWay,
@@ -296,6 +308,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &OwnedRelation,
@@ -327,6 +340,7 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
 }
 
 /// Write an element as a delete entry (id + metadata only, no content).
+#[cfg(test)]
 pub(crate) fn write_delete_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     kind: ElementKind,
@@ -343,6 +357,7 @@ pub(crate) fn write_delete_xml<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_tags_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: &[(String, String)],
@@ -350,6 +365,7 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
     write_borrowed_tags_xml(writer, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
+#[cfg(test)]
 fn write_borrowed_tags_xml<'a, W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: impl Iterator<Item = (&'a str, &'a str)>,

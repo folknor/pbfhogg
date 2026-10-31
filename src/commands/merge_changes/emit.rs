@@ -30,12 +30,11 @@ use crate::osc::xml_parse::{
     scan_owned_metadata_into,
 };
 
-/// Writes a batch's changes straight into `writer`, framing the action
-/// sections as `emit_change` does.
-pub(super) struct ByteSink<'w> {
-    writer: &'w mut OscWriter,
-    open_action: &'w mut Option<Action>,
-    count: &'w mut u64,
+/// One element's start tag and children, checked and rendered into reused
+/// buffers: the part every re-emitting OSC byte sink shares.
+pub(crate) struct ElementBuf {
+    owner: &'static str,
+    id: i64,
     /// The current element: its action and kind, when one is open.
     current: Option<(Action, ElementKind)>,
     head: String,
@@ -43,27 +42,29 @@ pub(super) struct ByteSink<'w> {
     structural_ranges: Vec<(usize, usize)>,
     tags: String,
     tag_ranges: Vec<(usize, usize)>,
+    /// Each tag's key and value as read (unescaped), for selection.
+    tag_text: String,
+    tag_pairs: Vec<(usize, usize, usize)>,
     meta: OwnedMetadata,
     scratch: String,
     coord: String,
 }
 
-impl<'w> ByteSink<'w> {
-    pub(super) fn new(
-        writer: &'w mut OscWriter,
-        open_action: &'w mut Option<Action>,
-        count: &'w mut u64,
-    ) -> Self {
+impl ElementBuf {
+    /// `owner` names the command in the internal error for a child with no
+    /// open object.
+    pub(crate) fn new(owner: &'static str) -> Self {
         Self {
-            writer,
-            open_action,
-            count,
+            owner,
+            id: 0,
             current: None,
             head: String::new(),
             structural: String::new(),
             structural_ranges: Vec::new(),
             tags: String::new(),
             tag_ranges: Vec::new(),
+            tag_text: String::new(),
+            tag_pairs: Vec::new(),
             meta: OwnedMetadata {
                 version: None,
                 timestamp: String::new(),
@@ -77,17 +78,66 @@ impl<'w> ByteSink<'w> {
         }
     }
 
-    fn open(&mut self) -> crate::Result<ElementKind> {
+    fn open(&self) -> crate::Result<ElementKind> {
         self.current.map(|(_, kind)| kind).ok_or_else(|| {
-            crate::Error::internal("merge-changes: an object child with no current object")
+            crate::Error::internal(format!(
+                "{}: an object child with no current object",
+                self.owner
+            ))
         })
     }
-}
 
-impl OscSink for ByteSink<'_> {
-    const END_ELEMENT_EMITS: bool = true;
+    pub(crate) fn id(&self) -> i64 {
+        self.id
+    }
 
-    fn begin_element(
+    /// The element's `version` claim, `None` when it carried none.
+    pub(crate) fn version(&self) -> Option<i32> {
+        self.meta.version
+    }
+
+    /// The element's tags as read, key then value.
+    pub(crate) fn tag_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tag_pairs
+            .iter()
+            .map(|&(k, v, e)| (&self.tag_text[k..v], &self.tag_text[v..e]))
+    }
+
+    /// End the open element, returning its action and kind; its buffers
+    /// stay readable until the next `begin`.
+    pub(crate) fn finish(&mut self) -> Option<(Action, ElementKind)> {
+        self.current.take()
+    }
+
+    /// Write the element just finished as the owned writers write it.
+    pub(crate) fn write<W: std::io::Write>(
+        &self,
+        writer: &mut quick_xml::Writer<W>,
+        kind: ElementKind,
+    ) -> crate::Result<()> {
+        let name = kind.as_str();
+        let head = BytesStart::from_content(self.head.as_str(), name.len());
+        if self.structural_ranges.is_empty() && self.tag_ranges.is_empty() {
+            writer.write_event(Event::Empty(head))?;
+            return Ok(());
+        }
+        writer.write_event(Event::Start(head))?;
+        for &(start, end) in &self.structural_ranges {
+            let content = &self.structural[start..end];
+            let child_len = if content.starts_with("nd") { 2 } else { 6 };
+            writer.write_event(Event::Empty(BytesStart::from_content(content, child_len)))?;
+        }
+        for &(start, end) in &self.tag_ranges {
+            writer.write_event(Event::Empty(BytesStart::from_content(
+                &self.tags[start..end],
+                3,
+            )))?;
+        }
+        writer.write_event(Event::End(BytesEnd::new(name)))?;
+        Ok(())
+    }
+
+    pub(crate) fn begin(
         &mut self,
         action: Action,
         kind: ElementKind,
@@ -122,26 +172,31 @@ impl OscSink for ByteSink<'_> {
         self.structural_ranges.clear();
         self.tags.clear();
         self.tag_ranges.clear();
+        self.tag_text.clear();
+        self.tag_pairs.clear();
+        self.id = id;
         self.current = Some((action, kind));
         Ok(())
     }
 
-    fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+    pub(crate) fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         self.open()?;
         let start = self.tags.len();
         self.tags.push_str("tag");
         // k then v, as `parse_tag` reads them.
-        self.scratch.clear();
-        append_str_attr(e, "k", &mut self.scratch)?;
-        append_attr_escaped(&mut self.tags, "k", &self.scratch);
-        self.scratch.clear();
-        append_str_attr(e, "v", &mut self.scratch)?;
-        append_attr_escaped(&mut self.tags, "v", &self.scratch);
+        let k = self.tag_text.len();
+        append_str_attr(e, "k", &mut self.tag_text)?;
+        let v = self.tag_text.len();
+        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]);
+        append_str_attr(e, "v", &mut self.tag_text)?;
+        let end = self.tag_text.len();
+        append_attr_escaped(&mut self.tags, "v", &self.tag_text[v..end]);
         self.tag_ranges.push((start, self.tags.len()));
+        self.tag_pairs.push((k, v, end));
         Ok(())
     }
 
-    fn nd(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+    pub(crate) fn nd(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         self.open()?;
         let ref_id = parse_nd(e)?;
         let start = self.structural.len();
@@ -151,7 +206,7 @@ impl OscSink for ByteSink<'_> {
         Ok(())
     }
 
-    fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+    pub(crate) fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         self.open()?;
         let mut type_scratch = std::mem::take(&mut self.coord);
         self.scratch.clear();
@@ -166,9 +221,75 @@ impl OscSink for ByteSink<'_> {
         self.structural_ranges.push((start, self.structural.len()));
         Ok(())
     }
+}
+
+/// Writes a batch's changes straight into `writer`, framing the action
+/// sections as `emit_change` does.
+pub(super) struct ByteSink<'w> {
+    writer: &'w mut OscWriter,
+    open_action: &'w mut Option<Action>,
+    count: &'w mut u64,
+    /// When set, every written element's identity, version claim and byte
+    /// range in the writer's buffer (see [`Element`]).
+    index: Option<&'w mut Vec<Element>>,
+    element: ElementBuf,
+}
+
+impl<'w> ByteSink<'w> {
+    pub(super) fn new(
+        writer: &'w mut OscWriter,
+        open_action: &'w mut Option<Action>,
+        count: &'w mut u64,
+    ) -> Self {
+        Self {
+            writer,
+            open_action,
+            count,
+            index: None,
+            element: ElementBuf::new("merge-changes"),
+        }
+    }
+
+    /// A sink that also records each element it writes into `index`. Only
+    /// for a plain (not gzip) writer, whose buffer the ranges point into.
+    pub(super) fn with_index(
+        writer: &'w mut OscWriter,
+        open_action: &'w mut Option<Action>,
+        count: &'w mut u64,
+        index: &'w mut Vec<Element>,
+    ) -> Self {
+        let mut sink = Self::new(writer, open_action, count);
+        sink.index = Some(index);
+        sink
+    }
+}
+
+impl OscSink for ByteSink<'_> {
+    const END_ELEMENT_EMITS: bool = true;
+
+    fn begin_element(
+        &mut self,
+        action: Action,
+        kind: ElementKind,
+        e: &BytesStart<'_>,
+    ) -> crate::Result<()> {
+        self.element.begin(action, kind, e)
+    }
+
+    fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+        self.element.tag(e)
+    }
+
+    fn nd(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+        self.element.nd(e)
+    }
+
+    fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
+        self.element.member(e)
+    }
 
     fn end_element(&mut self) -> crate::Result<()> {
-        let Some((action, kind)) = self.current.take() else {
+        let Some((action, kind)) = self.element.finish() else {
             return Ok(());
         };
         if *self.open_action != Some(action) {
@@ -180,30 +301,42 @@ impl OscSink for ByteSink<'_> {
                 .write_event(Event::Start(BytesStart::new(action_tag(action))))?;
             *self.open_action = Some(action);
         }
-        let name = kind.as_str();
-        let head = BytesStart::from_content(self.head.as_str(), name.len());
-        if self.structural_ranges.is_empty() && self.tag_ranges.is_empty() {
-            self.writer.write_event(Event::Empty(head))?;
-        } else {
-            self.writer.write_event(Event::Start(head))?;
-            for &(start, end) in &self.structural_ranges {
-                let content = &self.structural[start..end];
-                let child_len = if content.starts_with("nd") { 2 } else { 6 };
-                self.writer
-                    .write_event(Event::Empty(BytesStart::from_content(content, child_len)))?;
-            }
-            for &(start, end) in &self.tag_ranges {
-                self.writer
-                    .write_event(Event::Empty(BytesStart::from_content(
-                        &self.tags[start..end],
-                        3,
-                    )))?;
-            }
-            self.writer.write_event(Event::End(BytesEnd::new(name)))?;
+        // After the action section is open, so the range holds the element
+        // alone, its leading line break and indent included.
+        let start = self.writer.len();
+        self.element.write(&mut self.writer.writer, kind)?;
+        if let Some(index) = self.index.as_deref_mut() {
+            index.push(Element {
+                kind,
+                action,
+                id: self.element.id(),
+                version: self.element.version(),
+                start,
+                end: self.writer.len(),
+            });
         }
         *self.count += 1;
         Ok(())
     }
+}
+
+/// One written element of an indexed [`ByteSink`]: what the simplify dedupe
+/// keys and gates on, and where its bytes are. Written after its action
+/// section is open (indent depth 1, line break pending), an element's bytes
+/// do not depend on what precedes them in the section, so they can be
+/// spliced into any section of the same action.
+#[derive(Clone, Copy)]
+pub(super) struct Element {
+    pub(super) kind: ElementKind,
+    pub(super) action: Action,
+    pub(super) id: i64,
+    /// The `version` claim, `None` when the element carried none.
+    pub(super) version: Option<i32>,
+    /// Byte range in the batch buffer. Not narrowed: one element's escaped
+    /// text alone can exceed 4 GiB, and the batch target cuts only between
+    /// elements.
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 #[cfg(test)]

@@ -254,6 +254,7 @@ pub(crate) struct ParsedMember {
 }
 
 impl ParsedMember {
+    #[cfg(test)]
     pub(crate) fn member_id(&self) -> crate::MemberId {
         match self.kind {
             ElementKind::Node => crate::MemberId::Node(self.ref_id),
@@ -1029,6 +1030,7 @@ pub(crate) fn coord_to_decimicro(
 // Deliberately normalize XML text without validating timestamp, changeset, uid
 // or visible. These re-emitting sinks pass metadata through; numeric validation
 // would reject previously accepted input and add work to every changed element.
+#[cfg(test)]
 pub(crate) fn parse_owned_metadata(
     e: &quick_xml::events::BytesStart<'_>,
 ) -> ParseResult<Option<crate::osc::write::OwnedMetadata>> {

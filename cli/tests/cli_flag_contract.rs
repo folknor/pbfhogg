@@ -502,7 +502,7 @@ const JOBS: &[JobsRow] = &[
         accepts: [false, false, false],
     },
     JobsRow {
-        label: "tags-filter OSC (single-threaded parse)",
+        label: "tags-filter OSC (takes no worker count)",
         words: &[
             "tags-filter",
             "OSC",

@@ -439,6 +439,13 @@ answers, with no parity test covering it. Pick one rule (likely: the owned
 sink skips delete children too, which also saves work) and add the case to
 `tests/osc_parser_parity.rs`.
 
+Correction (checked 2026-10-31): the split is per callback, not per sink.
+`FilterSink` skips a deleted object's `tag` before parsing, but parses `nd`
+(`ref`) and `member` (`ref`, `role`) before its `current` check, so those
+refuse in tags-filter too; `CompactSink` skips `tag` and `member` but parses
+`nd` first. CORRECTNESS.md states the overlay's member exception and must
+change with whatever rule lands here.
+
 ### WRK-052: Same-way fallback for unresolved refs in apply-changes -l
 
 On a base without its untagged nodes, an OSC-modified way that keeps a ref
@@ -470,34 +477,22 @@ anything beyond the documentation is wanted.
 
 ## Documentation and comment corrections
 
-### WRK-060: parallel_gzip.rs header on concatenated gzip members
+### WRK-063: Resident bytes in the writer reorder buffer
 
-The header of `src/write/parallel_gzip.rs` claims `flate2::read::GzDecoder`
-handles concatenated members. It reads only the first; `MultiGzDecoder`
-reads all (the OSC reader correctly uses it). Matters more since
-`c97b9985` writes one member per batch.
+`writer_reorder_high_water` (seq span) and `writer_reorder_filled_high_water`
+(occupied slots) are documented and recorded, but no counter gives the bytes
+held there, so memory attribution from them stays inferred. A byte peak needs
+per-chunk accounting across `Framed` / `Raw` / `RawChunks` (allocated
+capacity, not length), `CopyRange` (no bytes) and error slots, added on push
+and subtracted on pop in `deliver_in_order`; it is per blob on every
+pipelined writer, so it needs its own matched A/B.
 
-### WRK-061: CORRECTNESS.md on malformed member roles
+### WRK-106: pipeline.md calls the permit pool the writer's memory bound
 
-CORRECTNESS.md says malformed member roles become empty in all sinks;
-`src/osc/xml_parse.rs` now errors on a malformed optional role in the owned
-sinks, while the compact sink still empties it. Not re-verified.
-
-### WRK-062: Stale apply-changes tunables comments
-
-`PER_WORKER_CAPACITY` prices each pwrite op at about 800 KB; rewritten output
-frames average 146 KB framed (the 1.8 MB p50 counts passthrough input frames
-only, since the `blob_sizes` histogram skips rewritten output).
-`DRAIN_CHANNEL_CAPACITY` claims about 16 items per worker, true only at 16
-workers.
-
-### WRK-063: writer_reorder_high_water is a sequence span
-
-`writer_reorder_high_water` records `pending_len()`, the span of sequence
-numbers outstanding, not filled slots or resident frames; docs and readings
-that take it as residency overstate. Likewise
-`writer_frame_scratch_capped_bytes` is cumulative, not resident. Fix the
-counter docs, or add filled-slot and byte counters.
+`reference/pipeline.md` (frame scratch section) says the writer channel "is
+deliberately not the memory bound - the permit pool is". Permits are released
+when framing ends (WRK-023), so they do not bound the reorder buffer either;
+fix the sentence with WRK-023's outcome.
 
 ---
 

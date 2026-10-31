@@ -5,19 +5,20 @@
 //! each chunk in a worker pool, and writing the compressed chunks back
 //! to the inner writer in submission order.
 //!
-//! Gzip supports concatenated members: a file consisting of multiple
-//! back-to-back gzip streams (each with its own header + DEFLATE body +
-//! trailer) decompresses as a single logical stream. Every standard
-//! gzip reader (`gunzip`, `zcat`, `flate2::read::GzDecoder`, Python
-//! `gzip`, Node `zlib`) handles this - `pigz` and RFC 1952 both rely
-//! on it. Independent compression per chunk costs ~1-3% on the ratio
-//! (no cross-chunk dictionary) in exchange for near-linear CPU scaling
-//! on the compress side.
+//! Each chunk becomes its own gzip member (header, DEFLATE body,
+//! trailer), so the output is one gzip file of concatenated members
+//! whose decompressed contents concatenate (RFC 1952). Not every reader
+//! reads past the first member: `gunzip`, `zcat` and
+//! `flate2::read::MultiGzDecoder` read them all, while
+//! `flate2::read::GzDecoder` stops after the first and silently returns
+//! a prefix. Consumers must use a multi-member reader; the in-crate OSC
+//! reader (`open_osc_reader`) does. Compressing chunks independently
+//! gives up the cross-chunk dictionary and adds per-member framing, a
+//! workload-dependent ratio loss, in exchange for compressing chunks in
+//! parallel.
 //!
-//! The only in-crate consumer is `diff --format osc` assembly, which
-//! was the serial-tail ceiling on `-j 16` runs (32.8 s at planet, ~10%
-//! of the full run wall).
-
+//! The only in-crate consumer is `diff --format osc` assembly, whose
+//! compression was a serial tail before this writer existed.
 //!
 //! ## Failure
 //!

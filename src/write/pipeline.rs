@@ -663,7 +663,8 @@ pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch, metrics: 
 /// arrivals from parallel rayon tasks. Framing errors produced on rayon
 /// workers are propagated in order via `Result<OutputChunk>`. For pipeline
 /// items, every backend records `writer_recv_wait_ns`,
-/// `writer_reorder_high_water`, `writer_handoff_ns` (around [`hand_off`]
+/// `writer_reorder_high_water`, `writer_reorder_filled_high_water`,
+/// `writer_handoff_ns` (around [`hand_off`]
 /// only; the sink's [`after_drain`](OutputSink::after_drain) is outside it)
 /// and `writer_bytes_written` here; the header frame and the synchronous
 /// writer account for themselves at their own sites.
@@ -693,7 +694,7 @@ pub(super) fn deliver_in_order<S: OutputSink>(
         };
         metrics.record_recv_wait(t_recv);
         pending.push(item.seq, item.data);
-        metrics.record_reorder_high_water(pending.pending_len());
+        metrics.record_reorder_high_water(pending.pending_len(), pending.filled_len());
 
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
@@ -778,6 +779,15 @@ mod tests {
     ///
     /// `announce: None` models the `Drop` path, which never announces.
     fn run(seqs: &[usize], announce: Option<usize>) -> (Result<()>, Vec<Vec<u8>>, usize) {
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        run_with(seqs, announce, &metrics)
+    }
+
+    fn run_with(
+        seqs: &[usize],
+        announce: Option<usize>,
+        metrics: &crate::write::metrics::WriterMetrics,
+    ) -> (Result<()>, Vec<Vec<u8>>, usize) {
         let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);
         for &seq in seqs {
             tx.send(PipelineItem {
@@ -795,9 +805,31 @@ mod tests {
             written: Vec::new(),
             after_drains: 0,
         };
-        let metrics = crate::write::metrics::WriterMetrics::new();
-        let result = deliver_in_order(&rx, &mut sink, &expected, &metrics);
+        let result = deliver_in_order(&rx, &mut sink, &expected, metrics);
         (result, sink.written, sink.after_drains)
+    }
+
+    /// `writer_reorder_high_water` is the seq span, gaps included;
+    /// `writer_reorder_filled_high_water` is the occupied slots. Both are
+    /// sampled after the push, so in-order delivery reads one for each.
+    #[test]
+    fn reorder_counters_separate_span_from_occupancy() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        let (result, _, _) = run_with(&[0, 1, 2], Some(3), &metrics);
+        result.unwrap();
+        assert_eq!(metrics.reorder_high_water.load(Relaxed), 1);
+        assert_eq!(metrics.reorder_filled_high_water.load(Relaxed), 1);
+
+        // Seq 3 first: span 4 (seqs 0..=3) with one slot filled. Each later
+        // push is sampled before it drains, so the filled peak is 2 (seq 3
+        // plus the arrival), while the span never exceeds 4.
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        let (result, _, _) = run_with(&[3, 0, 1, 2], Some(4), &metrics);
+        result.unwrap();
+        assert_eq!(metrics.reorder_high_water.load(Relaxed), 4);
+        assert_eq!(metrics.reorder_filled_high_water.load(Relaxed), 2);
     }
 
     /// The between-items hook runs once per received item and never before

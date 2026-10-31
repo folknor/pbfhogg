@@ -129,7 +129,7 @@ Only the pipelined iteration methods honour it; the sequential `for_each` and
 | Stage | Thread | Work |
 |-------|--------|------|
 | 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
-| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (`WRITE_AHEAD`-slot write-ahead), writes to `FileWriter` |
+| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (initial capacity `WRITE_AHEAD`, not a bound; its default maximum window caps the seq span), writes to `FileWriter` |
 
 Every pipelined constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
 

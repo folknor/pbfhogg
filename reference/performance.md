@@ -1326,9 +1326,13 @@ code unchanged), which the stored baselines had cached.
 | `inspect --extended` | unstored 571 MB cell | 571 MB | 355 MB | 41.4 s to 42.2 s |
 
 What is left in the larger peaks is not decode storage: apply-changes'
-overlay (575 MB), unbounded drain reorder (415 MB high water) and pwrite
-queue; the persistent ID sets of extract, tags-filter and check
-`--ids --full`.
+overlay (575 MB) and unbounded drain reorder (415 MB high water); the
+persistent ID sets of extract, tags-filter and check `--ids --full`. The
+`pwrite` pool's queue is unquantified: no counter samples its occupancy,
+and on the default splice route it queues rewritten output frames, which
+average about 146 KB at `f2b8beed` (`627883d77`, bygg;
+`writer_payload_raw_bytes` over `writer_payload_raw_items`), not the
+1.8 MB input blobs.
 
 ### apply-changes frames each block as it completes (bygg, 2026-10-30)
 

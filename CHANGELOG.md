@@ -48,7 +48,9 @@ never left partial, and the library no longer touches process state.
 - `time-filter` refuses input whose elements carry no timestamps.
 - Input that used to be read partly or silently misread is refused: malformed
   elements and dense arrays, a `Blob` with two payload fields or a wrong
-  `raw_size`, zero-length frames, truncated or malformed OSC.
+  `raw_size`, zero-length frames, truncated or malformed OSC. That includes
+  a relation member's `role` whose text cannot be read, which `apply-changes`
+  used to write as an empty role; an absent `role` is still an empty role.
 - OSC input must follow the change-file element hierarchy (`<osmChange>`
   root, sections holding objects, objects holding `tag` / `nd` / `member` /
   `bbox`); a misplaced element, such as an object nested in another, a

@@ -306,11 +306,14 @@ pub const DEFAULT_ELEMENT_CAP: std::num::NonZeroUsize =
 pub(crate) const POOL_SIZE: usize = 16;
 
 /// Per-worker channel capacity. Kept small so the writer thread's
-/// dispatch doesn't outrun the pool; each WriteOp holds a full owned
-/// `Vec<u8>` (~800 KB for the rewrite path), so
-/// `PER_WORKER_CAPACITY` × `POOL_SIZE` × 800 KB ≈ 100 MB buffered
-/// across the pool at the current 8 × 16 - within the pipeline's
-/// existing memory budget, but note it scales with `POOL_SIZE`.
+/// dispatch doesn't outrun the pool. A `WriteOp::Write` owns one frame's
+/// buffer (a rewritten output frame, or a whole input frame on an owned
+/// passthrough route); a `WriteOp::CopyRange` owns no buffer. The
+/// channels therefore queue at most `PER_WORKER_CAPACITY` × `POOL_SIZE`
+/// operations, and what that holds scales with `POOL_SIZE` and with the
+/// allocated capacity of the frames queued. It is not the pool's whole
+/// residency: each worker also holds the operation it is executing, and
+/// the dispatcher one blocked on a full queue.
 pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 
 /// Capacity of the ordered channel between producers and the writer thread.
@@ -420,8 +423,11 @@ pub(crate) const ZLIB_RESERVE_SLACK: usize = 64;
 // ---------------------------------------------------------------------------
 
 /// Channel capacity for the unified DrainItem stream from scanner +
-/// workers. Sized for ~16 in-flight items per worker plus headroom; the
-/// drain's reorder buffer absorbs out-of-order arrivals beyond this.
+/// workers: one item per input data blob, plus the scanner's node-boundary
+/// control message under `--locations-on-ways`. Fixed, so the share per
+/// worker shrinks as the worker count (`nproc` minus a reserve, or `-j`)
+/// grows. It does not bound the drain's separate reorder buffer, which
+/// absorbs out-of-order arrivals beyond it.
 pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
 
 /// Channel capacity for the scanner→workers candidate dispatch. Workers

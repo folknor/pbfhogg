@@ -359,6 +359,41 @@ fn every_consumer_refuses_an_exotic_member_type() {
     assert_all_accept(dir.path(), &input, "the three legal member types");
 }
 
+/// A member role whose text cannot be read. The apply-changes overlay
+/// used to write it as an empty role while the owned sinks refused it,
+/// so one file was silently altered by one command and refused by the
+/// others. Every sink refuses it in a create and in a modify, and the
+/// counterpart keeps a missing and an explicitly empty role valid, so
+/// the rule cannot pass by making roles mandatory.
+#[test]
+fn every_consumer_refuses_a_malformed_member_role() {
+    let dir = crate::common::test_scratch();
+    for section in ["create", "modify"] {
+        let input = dir.path().join("role.osc.gz");
+        write_gz(
+            &input,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <{section}>\n    \
+                 <relation id=\"1\" version=\"1\">\n      \
+                 <member type=\"node\" ref=\"5\" role=\"&bogus;\"/>\n    </relation>\n  \
+                 </{section}>\n</osmChange>"
+            ),
+        );
+        assert_all_refuse(dir.path(), &input, "malformed 'role' attribute", section);
+    }
+
+    let input = dir.path().join("role-ok.osc.gz");
+    write_gz(
+        &input,
+        "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+         <relation id=\"1\" version=\"1\">\n      \
+         <member type=\"node\" ref=\"5\"/>\n      \
+         <member type=\"way\" ref=\"6\" role=\"\"/>\n    </relation>\n  \
+         </create>\n</osmChange>",
+    );
+    assert_all_accept(dir.path(), &input, "missing and empty roles");
+}
+
 /// Metadata leniency is PRESENCE, not version-gating, in every sink: an
 /// element carrying `timestamp` but no `version` still has metadata.
 /// `merge-changes` used to return `None` for any element without a

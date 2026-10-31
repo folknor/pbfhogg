@@ -1133,9 +1133,9 @@ impl OscSink for CompactSink<'_> {
         }
         let member_type = parse_member_type(&parse_str_attr(e, "type")?)?;
         let ref_id = parse_i64_attr(e, "ref")?;
-        // Deliberately replace an unreadable role with empty text, as the owned
-        // sinks do. Propagating this error would refuse previously accepted OSC.
-        let role = parse_str_attr(e, "role").unwrap_or_default();
+        // A missing role is empty; a malformed one is refused, as in the owned
+        // sinks (see `parse_str_attr_optional`).
+        let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
         let type_byte = member_type_to_byte(member_type)?;
         let role_id = self.overlay.intern(&role)?;
         if let Some(st) = self.staging.as_mut() {

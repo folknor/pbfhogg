@@ -13,15 +13,29 @@ crate::counters::counter_set! {
         pub compress_ns => "writer_compress_ns",
         pub pipeline_send_wait_ns => "writer_pipeline_send_wait_ns",
         pub recv_wait_ns => "writer_recv_wait_ns",
+        /// Peak sequence span of a pipelined PBF writer's reorder buffer:
+        /// from the next seq to deliver to the highest seq received, gaps
+        /// included, sampled after each push (so fully ordered output reads
+        /// one). Not filled slots and not resident frames: a span of 200
+        /// can hold a single early arrival. Residency is
+        /// `writer_reorder_filled_high_water`; the name keeps its original
+        /// meaning so stored runs compare like with like.
         pub reorder_high_water => "writer_reorder_high_water",
+        /// Peak occupied result slots in that reorder buffer, sampled at the
+        /// same point. A slot is one submitted item, not one blob or one
+        /// buffer: a `CopyRange` occupies a slot holding no frame bytes, a
+        /// framing error occupies one, and a `RawChunks` slot can hold many
+        /// buffers. The two peaks can occur at different moments, so their
+        /// difference is not the peak number of holes.
+        pub reorder_filled_high_water => "writer_reorder_filled_high_water",
         /// Time blocked waiting for a sequence permit in `ParallelGzipWriter`.
         pub parallel_gzip_reorder_wait_ns => "writer_parallel_gzip_reorder_wait_ns",
         /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
         pub parallel_gzip_reorder_blocked => "writer_parallel_gzip_reorder_blocked",
         /// Peak filled slots in `ParallelGzipWriter`'s reorder buffer, in
-        /// gzip chunks and flush barriers. Kept
-        /// apart from `reorder_high_water`, which counts PBF blobs in the
-        /// writer backends' reorder buffers.
+        /// gzip chunks and flush barriers. Kept apart from the PBF writer
+        /// backends' `reorder_high_water` (a sequence span) and
+        /// `reorder_filled_high_water` (filled slots).
         pub parallel_gzip_reorder_high_water => "writer_parallel_gzip_reorder_high_water",
         /// Elapsed time of ordered output handoff, on every backend: from a
         /// ready chunk (or the header frame) being handed to the backend's
@@ -142,8 +156,12 @@ crate::counters::counter_set! {
 
         /// Scratch buffers whose capacity exceeded the 4 MiB retention limit and
         /// were handed off or dropped instead of retained by a worker thread.
+        /// Cumulative over the invocation, never decremented: a count of
+        /// events, not of buffers alive at any moment.
         pub frame_scratch_capped_buffers => "writer_frame_scratch_capped_buffers",
-        /// Sum of the full capacities of buffers capped from thread-local scratch.
+        /// Sum of the full capacities of buffers capped from thread-local
+        /// scratch. Cumulative like `frame_scratch_capped_buffers`: bytes that
+        /// passed through the cap, not bytes resident.
         pub frame_scratch_capped_capacity_bytes => "writer_frame_scratch_capped_capacity_bytes",
 
         /// Time a producer on a worker of the writer's executor pool spent in the
@@ -231,8 +249,11 @@ impl WriterMetrics {
         self.bytes_written.fetch_add(len, Relaxed);
     }
 
-    pub fn record_reorder_high_water(&self, len: usize) {
-        crate::counters::record_max(&self.reorder_high_water, len as u64);
+    /// Record both reorder levels after a push: `span` is
+    /// `ReorderBuffer::pending_len`, `filled` is `ReorderBuffer::filled_len`.
+    pub fn record_reorder_high_water(&self, span: usize, filled: usize) {
+        crate::counters::record_max(&self.reorder_high_water, span as u64);
+        crate::counters::record_max(&self.reorder_filled_high_water, filled as u64);
     }
 
     /// Emit the counters, at most once per invocation.
@@ -272,7 +293,7 @@ impl WriterMetrics {
         self.for_each(|name, value| counters.push((name, value)));
 
         // An all-zero set means no writer ever ran in this invocation. Say
-        // nothing rather than publishing thirty zeroes for every `inspect`.
+        // nothing rather than publishing a set of zeroes for every `inspect`.
         if counters.iter().all(|&(_, value)| value == 0) {
             return false;
         }

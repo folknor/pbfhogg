@@ -504,8 +504,11 @@ deliberately parse version but pass timestamp, changeset, uid and visible throug
 as normalized XML attribute text without native-value validation. They do not
 preserve raw entity spellings or raw attribute whitespace. The apply-changes
 overlay retains its native numeric metadata parsing and treats only literal
-`false` as hidden. Malformed or missing member roles become empty in all sinks.
-Unifying these policies would reject accepted input or add per-element work.
+`false` as hidden. Applying the overlay's native metadata validation to the
+owned sinks would reject attribute text those sinks currently preserve. Where a
+member is parsed, every sink reads a missing role as empty and refuses a
+malformed role value; the apply-changes overlay does not parse the member
+children of a deleted object.
 A delete remains pending until a re-create is accepted; a rejected stale
 re-create must not erase it.
 

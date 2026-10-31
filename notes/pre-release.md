@@ -285,8 +285,10 @@ check `--ids` needs IDs plus boundary and violation summaries; getparents
 needs refs and members matched against the requested ID set. A borrowed
 scanner skips offset tables and the general element interface, keeping
 every structural and corruption check the command performs today. Shrinks
-the envelope WRK-022 rations and cuts CPU. WRK-041 is the same scanner for
-inspect; build one.
+the envelope WRK-022 rations and cuts CPU. Inspect already scans this way
+(`4dbc2d47`: a `GroupProjection` on `block::validate_groups`, through
+`Decoder::project`); a scan command is another projection on the same
+validator.
 
 ### WRK-027: Membership track for set-dominated peaks
 
@@ -387,33 +389,6 @@ At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB
 of raw payload. Bounded, but not small; matters if anything reuses its
 sizing.
 
-### WRK-040: inspect fused validating projection scanner
-
-After `418739bd` planet `inspect --extended` is worker bound (the dispatcher
-waits on admission for 96 % of wall), so per-blob CPU sets wall. The worker
-still constructs a `PrimitiveBlock` (offset tables appended to the payload),
-runs `validate_groups_strict`, then iterates `Element`s with per-node info
-structs and `keys_vals` rescans. One fused pass over the decompressed bytes:
-read block parameters first (protobuf field order is free); tight
-min/max/first/last loops over the id and coordinate columns; dense metadata
-in one lockstep loop (every slot judged by value whatever its version, user
-names through a per-block table of empty string indices, per CORRECTNESS.md
-"Metadata coverage in inspect --extended"); one `keys_vals` delimiter
-walk for tagged-node counts; plain Info parsed once; refs and members
-checked for structure only; the stringtable UTF-8 check in a borrowed pass.
-Validation is fused, not dropped: inspect keeps refusing every file it
-refuses today. Traps: wrapping delta and scaling semantics (scaling raw
-extrema is not equivalent under negative scales), repeated packed segments,
-mixed-group iteration order, all-or-none dense info. Risk: a second wire
-walker beside block.rs, so share varint, packed iteration and group framing.
-
-### WRK-041: One scanner for every decoding inspect mode
-
-Plain inspect's decode fallback, `--distrust-metadata`, `--locations`,
-`--blocks` and `--extended` already share `418739bd`'s engine; with WRK-040
-they become projections over one scanner. Afterwards the same scanner
-serves WRK-026.
-
 ### WRK-042: Per-blob summaries written by the producer
 
 A versioned per-blob extension carrying measured counts, ID boundaries,
@@ -425,19 +400,6 @@ design document first.
 
 ---
 
-### WRK-107: measure the streaming block-pair engine at planet
-
-The header walk and static shards are gone: both inputs are read once as
-sequential streams, cut into work units on a planner thread, merged on
-the ordered pool, and the text streams to the output (no scratch). Not yet
-measured. Planet `brokkr diff` (base against OSC 4913) at the default
-`-j`, against the stored `e95703aa` (395.4 s, 95.1 s of it the walk,
-653 MB node-phase peak anon) and `ea3d4f41`-era Europe `-j 1` cells:
-wall, device read (expected about 184 GB, from 258), peak anon (the unit
-window holds `workers + 2` units of about 32 MiB plus the planner queue),
-and `ordered_pool_*` stalls. `diff --format osc` and `diff-snapshots`
-share the engine. Blocked on brokkr passing `--tmp-dir` to a text diff,
-which pbfhogg now refuses (a text diff writes no scratch).
 
 ## Correctness
 

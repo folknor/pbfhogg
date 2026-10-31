@@ -151,7 +151,11 @@ never left partial, and the library no longer touches process state.
   text diff writes no scratch and refuses `--tmp-dir`. `-v` runs at any `-j`,
   `-c`, `-q` and `--format osc` skip byte-equal blob pairs at every `-j`,
   `--direct-io` applies at every `-j`, and inputs holding negative IDs run in
-  parallel too.
+  parallel too. A planet daily diff takes 284 s against 384 s before, at
+  1.8 GB peak anon against 0.65 GB.
+- `inspect` modes that decode blobs scan them inside the block validator
+  instead of building and walking each block: planet `inspect --extended`
+  takes 27 s against 40 s.
 - `cat --dedupe` runs on `sort`'s engine (header walk, `copy_file_range`
   passthrough, parallel merge), and `sort` streams its overlap output instead
   of buffering it. Overlapping blobs are merged without copying elements:

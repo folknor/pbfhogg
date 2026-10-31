@@ -649,8 +649,9 @@ pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 /// Larger units cost memory (a window of them is held); smaller ones cost
 /// CPU, since a blob crossing a cut is decoded once by each unit it
 /// touches, about one blob per unit. At ~1 MB planet blobs this is a few
-/// dozen blobs a unit, so the crossing decode stays a few percent. Not
-/// measured.
+/// dozen blobs a unit, so the crossing decode stays a few percent. Measured
+/// on planet diff (bygg, 32 workers, reference/performance.md): 16 MiB cost
+/// about 4 % wall for about a third less peak memory.
 pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 
 /// Frame bytes past which a unit that still cannot close is refused as a

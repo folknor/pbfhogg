@@ -2270,11 +2270,60 @@ from the sequential engine on a Geofabrik-density file and does not carry
 to planet. `diff -q` runs the same engine with the same skip and was not
 measured separately (brokkr's `diff` never passes `-q`).
 
-The serial header walk is a quarter of the wall: about 1.28 M `pread`s
+The serial header walk was a quarter of the wall: about 1.28 M `pread`s
 and 10 GB read at 0.0 cores. Walking the two files on two threads was
 tried (uncommitted, `f3e1c9b9` plus the change) and measured 98.8 s, no
-gain, so it was not kept. The merge phases read about 258 GB from the two
-92 GB inputs.
+gain, so it was not kept. The "new" input brokkr builds with
+apply-changes is 174 GB, not 92 GB: the two inputs total 266 GB, so the
+merge phases' 258 GB read was no over-read.
+
+### Planet, streaming work units (bygg, 2026-10-31)
+
+`4dbc2d47` (the engine landed in `587bfc12`) reads both inputs once as
+sequential streams cut into work units on the ordered pool; no header
+walk, and the text goes to the output in order. Matched `--bench 1`
+cells, same OSC 4913 setup:
+
+| UUID | Commit | Wall | Peak anon |
+|---|---|---:|---:|
+| `05d47098` | `4dbc2d47` | 284.1 s | 1.81 GB |
+| `ec05b5d5` | `9afb9449` (header walk, shards) | 384.1 s | |
+| `b7e58fb6` | `4dbc2d47` | 284.6 s | |
+
+-26 %. The node phase runs at 29.6 cores with 248 GB read from the
+266 GB of input, each byte once. Peak anon rose from about 0.65 GB: it
+is the unit window, `workers + DIFF_UNIT_WINDOW_SLACK` units of
+`DIFF_UNIT_TARGET_BYTES` frames plus the planner queue and decoded
+blocks. An uncommitted 16 MiB target measured 295.4 s at 1.18 GB peak
+anon, about 4 % wall for a third of the memory; 32 MiB was kept.
+
+`diff-snapshots` (base against `20260411`, two independently cut
+planets) shares the engine:
+
+| UUID | Commit | Format | Wall |
+|---|---|---|---:|
+| `aaf851c9` | `4dbc2d47` | text | 116.5 s |
+| `ca13a5b8` | `9afb9449` | text | 129.9 s |
+| `9dc54efe` | `4dbc2d47` | osc | 210.5 s |
+| `11143d70` | `9afb9449` | osc | 215.7 s |
+
+Text -10 %; osc within noise (its wall is dominated by the gzip
+assembly after the merge).
+
+## Inspect --extended: validator-projection scan (bygg, 2026-10-31)
+
+`4dbc2d47` scans each blob inside the block validator instead of
+building a `PrimitiveBlock` and walking its elements. Planet,
+interleaved `--bench 1`:
+
+| UUID | Commit | Wall | Peak anon |
+|---|---|---:|---:|
+| `970ff659` | `4dbc2d47` | 27.1 s | |
+| `3970b8a1` | `587bfc12` | 39.5 s | |
+| `c1a2a0e6` | `4dbc2d47` | 26.4 s | 303 MB |
+| `102cf3b2` | `587bfc12` | 39.7 s | 379 MB |
+
+-33 % wall. Every decoding inspect mode runs the same scan.
 
 ### Europe, `-j 1`, OSC 4715
 

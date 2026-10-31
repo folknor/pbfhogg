@@ -536,13 +536,6 @@ eviction. Nothing enforces that: a new eviction path through `DontNeed`
 would silently void the capability. A textlint or a type split would guard
 it.
 
-### WRK-075: PipelinedBlocks drop-liveness documentation
-
-The library harness's Decision A required documenting that dropping a
-`PipelinedBlocks` blocked in a caller's `Read` still blocks, as the
-caller's obligation. Whether that text exists in the `PipelinedBlocks`
-rustdoc was not verified when the harness note was retired.
-
 ---
 
 ## The measurement campaign

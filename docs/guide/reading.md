@@ -165,6 +165,8 @@ println!("Total elements: {total}");
 
 Returns an `Iterator<Item = Result<PrimitiveBlock>>` backed by a background pipeline thread (or `ErrorKind::Sealed`, starting nothing, when the reader's invocation has been sealed). Supports early exit, zipping two files, and interleaving work. Requires `R: 'static` (`ElementReader<FileReader>` from `from_path` satisfies this).
 
+Dropping the iterator early closes its channel and joins the background thread, so the pipeline normally stops instead of reading the rest of the file. The drop waits for that thread: it cannot interrupt a read of the `Read` you supplied, so a read that never returns keeps the drop from returning. Making the stream progress is the caller's obligation. Dropping does not cancel the invocation, and `Invocation::cancel` does not interrupt an ongoing read either.
+
 ```rust
 use pbfhogg::ElementReader;
 

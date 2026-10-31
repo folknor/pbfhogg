@@ -103,8 +103,12 @@ concurrent reads can emit out of order), which is how `brokkr sidecar
 `src/read/pipeline_metrics.rs` says why.
 Dropping `PipelinedBlocks` or returning an error
 from a block closure closes the decoded receiver before the scoped
-threads join, so stage 1 stops promptly instead of reading the rest of
-the file.
+threads join, and shutdown propagates through channel disconnection:
+stage 1 stops when a send observes its receiver has closed, normally
+instead of reading the rest of the file. Cleanup joins the pipeline and
+so waits for reads of the caller-supplied `Read` to complete; it cannot
+interrupt them, and the drop does not cancel the invocation (invocation
+cancellation is checked before each frame, not during its reads).
 
 ## Callers
 

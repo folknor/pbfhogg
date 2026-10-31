@@ -400,8 +400,14 @@ impl<R: Read + Send> ElementReader<R> {
     /// The 3-stage pipeline (I/O → decode → reorder) runs in a background thread.
     /// Blocks arrive in file order via a bounded channel. The consumer controls
     /// the iteration pace; backpressure propagates naturally when the channel fills.
-    /// Dropping the iterator stops the background pipeline promptly, within
-    /// about `decode_ahead` blobs, instead of reading the rest of the file.
+    /// Dropping the iterator closes its output channel and joins the
+    /// background pipeline thread, so the pipeline normally stops instead of
+    /// reading the rest of the file, and its decode workers have finished when
+    /// the drop returns. Shutdown relies on the caller-supplied `Read` letting
+    /// the reader make progress: it does not interrupt an ongoing read, and a
+    /// read that never returns keeps the drop from returning. Dropping the
+    /// iterator does not cancel the reader's invocation, and cancelling the
+    /// invocation does not interrupt an ongoing read either.
     ///
     /// This is the iterator equivalent of [`for_each_block_pipelined`](Self::for_each_block_pipelined).
     /// Use it when you need loop control (early exit, zipping two files, interleaving work).

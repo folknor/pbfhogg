@@ -295,12 +295,12 @@ can go, with a fallback for unsorted input.
 
 ### WRK-028: Parallel compression for multi-extract
 
-multi-extract's write phases run at 2-3 cores: five synchronous region
-writers compress serially on the consumer thread, and workers spend about
-17,000 thread-seconds blocked on result send behind them (about 600 s of
-write phases at planet). Compression belongs inside the tasks, with
-per-region ordering under one shared budget; five separately async writers
-would each get their own buffering allowance, which is the wrong shape.
+Landed: the ordered pool's tasks compress and frame each region's blocks
+and the sync writers only copy frames (planet 5-region simple 675 s to
+128 s, matched forced cells, reference/performance.md "Compression inside
+the pool's tasks"). Residue: no stored clean cell exists at the landing
+commit, so the planet table's `multi-extract --simple` row above still
+cites `831424c0` (10m58s). Store one `--bench 1` cell and update the row.
 
 ### WRK-029: Collapse byte-equal twin frames in dedupe
 

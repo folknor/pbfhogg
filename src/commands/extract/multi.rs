@@ -26,7 +26,9 @@ use crate::owned::{dense_node_metadata, element_metadata, relation_members_into}
 /// back to sequential if the input isn't sorted.
 ///
 /// Simple strategy only (no per-region way/relation ID tracking beyond what
-/// fits in memory). Uses sync-mode PbfWriters (no per-writer thread).
+/// fits in memory). The pool workers compress and frame each region's blocks
+/// (`RegionFraming`); the consumer copies the frames into N sync-mode
+/// PbfWriters (no per-writer thread).
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -121,13 +123,15 @@ pub(super) fn try_extract_multi_single_pass(
     let spatial_filter = spatial_blob_filter(&union_bbox);
 
     // Open N sync-mode writers. Each owns a 256 KiB buffer; publication
-    // syncs each staged output after the final flush. All N outputs are compressed serially on
-    // the consumer thread. Switching to the parallel writer was tried and
-    // reverted on 2026-08-20: two interleaved Denmark 5-region pairs came out
-    // with opposite signs (parallel/sync 1200/1100 ms, then 501/1101 ms), which
-    // is inconclusive, not evidence of a speedup. Do not re-attempt without a
-    // stable matched measurement at a larger scale - the single-region writer's
-    // shape is not known to transfer to N concurrent outputs.
+    // syncs each staged output after the final flush. The writers only copy
+    // frames: compression runs inside the ordered pool's tasks
+    // (`RegionFraming`), so all N regions share the pool's one task window
+    // and its ordinal order is each region's block order. Compressing on
+    // the consumer thread made every write phase run at 2-3 cores with the
+    // workers parked on result send (planet 5-region: 613 s of write phases,
+    // 608 s of it compression). N pipelined writers would instead give each
+    // region its own permits, delivery window and writer thread - N
+    // buffering allowances for one stream of tasks.
     let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
     for (region, output) in regions.iter().zip(outputs.iter()) {
         let bbox = region.bbox();
@@ -144,6 +148,14 @@ pub(super) fn try_extract_multi_single_pass(
         w.write_header(&header_bytes)?;
         writers.push(w);
     }
+    let framing = RegionFraming {
+        compression,
+        destinations: outputs
+            .iter()
+            .map(crate::output::BoundOutput::destination)
+            .collect(),
+        invocation: &host.invocation,
+    };
 
     // Three persistent membership sets per region; regions may overlap, so
     // sharing one set would lose which outputs need an object. These are lazy
@@ -560,6 +572,7 @@ pub(super) fn try_extract_multi_single_pass(
             }
             Ok(counts)
         },
+        &framing,
         &mut writers,
         &mut stats,
         host,
@@ -648,6 +661,7 @@ pub(super) fn try_extract_multi_single_pass(
             }
             Ok(counts)
         },
+        &framing,
         &mut writers,
         &mut stats,
         |s| &mut s.ways_written,
@@ -711,6 +725,7 @@ pub(super) fn try_extract_multi_single_pass(
             }
             Ok(counts)
         },
+        &framing,
         &mut writers,
         &mut stats,
         |s| &mut s.relations_written,
@@ -778,7 +793,8 @@ fn merge_region_ids(bbox_node_ids: &mut [IdSet], region_ids: Vec<Vec<i64>>) {
 /// Blobs verified as fully contained in ALL N regions are written as raw
 /// frames to all N writers without decode, counted by the node count
 /// classify observed. Other blobs go through parallel decode workers.
-/// Both streams are interleaved in sequence order via ReorderBuffer.
+/// Workers compress and frame the decoded blobs' per-region blocks; both
+/// streams are interleaved in sequence order by the ordered pool.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +804,7 @@ fn multi_extract_pread_write_nodes<F>(
     blob_info: &[NodeBlobInfo],
     n: usize,
     block_fn: F,
+    framing: &RegionFraming<'_>,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
     host: &crate::host::Entered<'_>,
@@ -855,7 +872,7 @@ where
             let entry = &schedule[decode_at[ordinal]];
             let block = local.decode(input, entry)?;
             local
-                .classify(&block, n, &block_fn)
+                .classify(&block, n, &block_fn, framing)
                 .map_err(|e| input.locate_blob(entry, e))
         },
         &mut consumer,
@@ -917,7 +934,8 @@ impl MultiLocal {
         block: &PrimitiveBlock,
         n: usize,
         block_fn: &F,
-    ) -> crate::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>
+        framing: &RegionFraming<'_>,
+    ) -> crate::Result<RegionFrames>
     where
         F: Fn(
             &PrimitiveBlock,
@@ -938,22 +956,87 @@ impl MultiLocal {
         for i in 0..n {
             flush_local(&mut self.bbs[i], &mut self.output[i])?;
         }
-        Ok((self.output.iter_mut().map(std::mem::take).collect(), counts))
+        let mut frames = Vec::with_capacity(n);
+        for (i, blocks) in self.output.iter_mut().enumerate() {
+            frames.push(framing.frame_region(i, blocks.drain(..))?);
+        }
+        Ok((frames, counts))
     }
 }
 
-/// Write one decoded blob's per-region blocks to the N writers, adding each
+/// One task's output: each region's framed blobs, in region order and
+/// block order within a region, and each region's element count.
+type RegionFrames = (Vec<Vec<Vec<Vec<u8>>>>, Vec<u64>);
+
+/// Compression and framing of the regions' blocks inside the pool's tasks.
+///
+/// The bytes are the sync writer's own: both go through the one framing
+/// core with the block's given index, tagdata and way members. A frame
+/// travels as two chunks, length prefix plus BlobHeader and the Blob body,
+/// so the body is never copied into a contiguous buffer.
+///
+/// The pool's window is the regions' one shared bound: a task carries every
+/// region's frames for its input blob and returns its credit only once the
+/// consumer has handed all of them to the writers. It counts tasks, not
+/// bytes; a slot holds that blob's whole framed fanout.
+struct RegionFraming<'a> {
+    compression: Compression,
+    destinations: Vec<&'a std::path::Path>,
+    invocation: &'a crate::host::Recorder,
+}
+
+impl RegionFraming<'_> {
+    /// Frame region `region`'s blocks, consuming each as it is framed so a
+    /// task never holds the uncompressed and framed copies of all its
+    /// blocks at once. Checks cancellation before each frame; a framing
+    /// error names the region's output.
+    fn frame_region(
+        &self,
+        region: usize,
+        blocks: impl Iterator<Item = OwnedBlock>,
+    ) -> Result<Vec<Vec<Vec<u8>>>> {
+        let metrics = &self.invocation.metrics().writer;
+        let mut frames = Vec::new();
+        for block in blocks {
+            self.invocation.check()?;
+            let OwnedBlock {
+                bytes,
+                index,
+                tagdata,
+                way_members,
+            } = block;
+            let indexdata = index.serialize();
+            let parts = crate::writer::frame_blob_pipelined(
+                &bytes,
+                &self.compression,
+                Some(indexdata.as_slice()),
+                tagdata.as_deref(),
+                way_members.as_deref(),
+                metrics,
+            )
+            .map_err(|e| e.writing(self.destinations[region]))?;
+            drop(bytes);
+            let mut head = Vec::with_capacity(parts.prefix.len() + parts.header.len());
+            head.extend_from_slice(&parts.prefix);
+            head.extend_from_slice(&parts.header);
+            frames.push(vec![head, parts.blob]);
+        }
+        Ok(frames)
+    }
+}
+
+/// Write one decoded blob's per-region frames to the N writers, adding each
 /// region's count through `stat_field`.
 fn write_regions(
-    (region_blocks, counts): (Vec<Vec<OwnedBlock>>, Vec<u64>),
+    (region_frames, counts): RegionFrames,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
     stat_field: fn(&mut ExtractStats) -> &mut u64,
 ) -> Result<()> {
-    for (i, blocks) in region_blocks.into_iter().enumerate() {
+    for (i, frames) in region_frames.into_iter().enumerate() {
         *stat_field(&mut stats[i]) += counts[i];
-        for block in blocks {
-            writers[i].write_primitive_block_owned(block)?;
+        for frame in frames {
+            writers[i].write_raw_chunks(frame)?;
         }
     }
     Ok(())
@@ -1001,9 +1084,7 @@ impl MultiNodeConsumer<'_> {
     }
 }
 
-impl crate::ordered_pool::OrderedConsumer<(Vec<Vec<OwnedBlock>>, Vec<u64>)>
-    for MultiNodeConsumer<'_>
-{
+impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_> {
     fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
         for position in self.interleaved.before(ordinal) {
             self.passthrough(position)?;
@@ -1011,11 +1092,7 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<Vec<OwnedBlock>>, Vec<u64>)>
         Ok(())
     }
 
-    fn consume(
-        &mut self,
-        _ordinal: usize,
-        item: (Vec<Vec<OwnedBlock>>, Vec<u64>),
-    ) -> crate::Result<()> {
+    fn consume(&mut self, _ordinal: usize, item: RegionFrames) -> crate::Result<()> {
         write_regions(item, self.writers, self.stats, |s| &mut s.nodes_in_bbox)
     }
 }
@@ -1024,7 +1101,8 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<Vec<OwnedBlock>>, Vec<u64>)>
 ///
 /// Workers pread blob data, decompress, parse into PrimitiveBlock, then call
 /// the provided closure to classify elements against N regions and produce
-/// N × Vec<OwnedBlock>. The consumer writes each region's blocks to its
+/// N × Vec<OwnedBlock>, then compress and frame those blocks
+/// (`RegionFraming`). The consumer copies each region's frames to its
 /// writer in sequence order.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -1034,6 +1112,7 @@ fn multi_extract_pread_write<F>(
     schedule: &[ScheduledBlob],
     n: usize,
     block_fn: F,
+    framing: &RegionFraming<'_>,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
     stat_field: fn(&mut ExtractStats) -> &mut u64,
@@ -1058,7 +1137,7 @@ where
         None,
         None,
         || MultiLocal::new(n, &host.invocation),
-        |block, local: &mut MultiLocal| local.classify(block, n, &block_fn),
+        |block, local: &mut MultiLocal| local.classify(block, n, &block_fn, framing),
         |_position, item| write_regions(item, writers, stats, stat_field),
         host,
     )

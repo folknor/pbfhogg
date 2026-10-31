@@ -19,7 +19,7 @@
 //!   most `window` tasks are admitted and not yet consumed - queued, held in
 //!   the reorder buffer, or in the consumer's hands - however slow one task
 //!   is. The bound counts tasks, not bytes: a task whose result is large
-//!   (multi-extract's per-region blocks) holds that much per slot.
+//!   (multi-extract's per-region framed blocks) holds that much per slot.
 //! - **Two limits, two jobs.** Results travel to the consumer through a
 //!   channel of `min(window, POOL_RESULT_CHANNEL_DEPTH)` slots, the depth
 //!   every hand-built pool before this engine used. When the consumer is the

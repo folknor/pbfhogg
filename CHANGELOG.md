@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Multi-region `extract --config` with `--simple` on sorted input
+  compresses every region's output in parallel instead of on one thread.
+  A 5-region planet extract went from 675 s to 128 s on the same host,
+  with unchanged output bytes and peak memory.
+
 ## 0.6.0 - 2026-10-30
 
 0.6.0 makes pbfhogg safe to embed as a library and strict about its input.

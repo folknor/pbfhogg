@@ -1733,7 +1733,8 @@ PrimitiveBlock lifecycle per worker.
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each
-element against N regions, write to N sync-mode PbfWriters
+element against N regions, compress and frame each region's blocks in the
+pool's tasks, write the frames to N sync-mode PbfWriters
 (sync-mode writers over the staged files; publication syncs each output
 after the final flush, once `MULTI_REL_WRITE_END` and every other phase
 marker has ended, between `PUBLISH_START` and `PUBLISH_END`; the `writer_sync_all_ns` and
@@ -1763,6 +1764,36 @@ barrier (nodes → ways → relations) with per-region `IdSetDense` +
 
 Write phases dominate Europe: `NODE_WRITE` (52 %) + `WAY_WRITE` (40 %) =
 92 % of wall. These are the real optimization targets.
+
+### Compression inside the pool's tasks (bygg, 2026-10-31)
+
+The write phases above were serial compression: every region's blocks were
+compressed on the one consumer thread by its sync writer, so they ran at
+2-3 user cores while the decode workers parked on result send (stored cell
+`831424c0`, commit `179f1b7e`: `ordered_pool_result_send` 17,260
+thread-seconds, `writer_compress_ns` 608 s against 613.6 s of write phases).
+The workers now compress and frame each region's blocks in the task and the
+consumer only copies frames into the writers. Output bytes are unchanged.
+
+Planet, 5 strips `--bbox=-10.0,35.0,32.0,72.0`, simple, `--bench 1`,
+interleaved baseline / variant / variant / baseline, baseline `d653c2b7`
+(`--commit`), variant the same tree plus the change, measured uncommitted
+with `--force`:
+
+| Cell | Wall | NODE_WRITE | WAY_WRITE | REL_WRITE | Peak anon |
+|---|---:|---:|---:|---:|---:|
+| baseline `2185e803` | 675.2 s | 362.3 s | 257.3 s | 9.2 s | 9.86 GB |
+| variant (forced) | 128.0 s | 52.2 s | 28.9 s | 0.9 s | 9.93 GB |
+| variant (forced) | 128.7 s | | | | |
+| baseline `ab191862` | 675.4 s | | | | |
+
+The second pair's phase split was not re-read; its walls agree with the
+first pair's to under 1 %.
+
+Classify phases are unchanged (node 20.9 s, way 17.7 s). In the variant
+`ordered_pool_result_send` is 0 and the consumer waits on the workers
+instead (`ordered_pool_result_recv` 70.7 s): the write phases are now
+decode, classify and compress bound across the pool.
 
 Counters emitted (UUID `c1ff6ec9` values):
 - `multi_extract_region_count=5`

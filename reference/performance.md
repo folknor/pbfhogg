@@ -1484,6 +1484,75 @@ compare per decoded block. Interleaved `--bench 1` cells against
 Both inside the noise band (extract medians 119.9 against 120.4 s, geocode
 316.0 against 321.2 s).
 
+### altw external raw scanners read fallibly (bygg, 2026-10-31)
+
+`e61e0ad7` replaced the external join's zipped `PackedSint64Iter`s (which
+swallowed decode errors) with three `read_varint`s in lockstep. `brokkr
+add-locations-to-ways --dataset planet --index-type external --bench 1`,
+`--commit` cells, after `sudo fstrim -av`, two pairs in opposite order:
+
+| Pair | `2ba3e170` (parent) | `e61e0ad7` | Delta | UUIDs |
+|---|---:|---:|---:|---|
+| 1 (parent first) | 369.9 s | 388.7 s | +5.1 % | `b3cc51d6` `ae2ba447` |
+| 2 (change first) | 360.1 s | 352.3 s | -2.2 % | `2cda149e` `764b7ba2` |
+
+Pair 1 is confounded by cell position: stage 1 pass A took 32.4 s in the
+first cell (the first after the trim) and 96.9 s in the second, more than
+the whole wall delta, while stage 2 ran 13 % faster on the change. This
+was first read as the relation scan swinging (20 s against 87 s); that
+figure is the `--human` row labelled `EXTJOIN_RELATION_SCAN_END`, which is
+the segment that begins at that marker, the rest of pass A. The scan's own
+START/END span is 12.0 and 10.3 s. In pair 2 both cells follow another
+altw cell, pass A is 65.7 and 62.7 s, and stage 1, 2 and 4 are level or
+slightly faster on the change. The whole-command walls cannot resolve a
+cost below the position effect; the phase split shows none. Next section
+for the position effect.
+
+### altw external pass A swings with run history (bygg, 2026-10-31)
+
+`brokkr add-locations-to-ways --dataset planet --index-type external
+--bench 1`, `8ccb3a2e`, two cells back to back (about 6 s apart) right
+after a `sudo fstrim -av`:
+
+| Cell | Wall | Pass A | Relation scan | `s1a_pread_ms` | `s1a_id_shard_write_ms` | UUID |
+|---|---:|---:|---:|---:|---:|---|
+| 1 (first after trim) | 316.9 s | 32.4 s | 9.9 s | 147,288 | 558,332 | `a12a2f7d` |
+| 2 | 353.4 s | 73.5 s | 12.7 s | 598,979 | 1,318,963 | `4cd2eddf` |
+
+Pass A explains the whole 36.5 s wall delta; stage 2 and stage 4 are
+within a few seconds. Pass A's work is byte-identical in every cell: 29.2
+GB pread in 17,529 calls and 149.2 GB of id shards written in about
+573,000 calls; only the time inside those calls moves (thread-cumulative
+ms above). The same split holds across the twelve planet cells of
+2026-10-30/31: the relation scan's span is 7-13 s in every one, pass A is
+32-33 s in the cells that follow a different command, a long idle or a
+trim (`13668dda`, `cf58d02e`, `b3cc51d6`) and 51-111 s in every cell that
+follows another altw external cell or a large writer.
+
+It is not input page cache. Per-process `/proc` io for `b3cc51d6` (fast)
+and `ae2ba447` (slow, 5 s later) shows both reading about 28 GB from disk
+during pass A, the whole way section; the slow cell did not lose cached
+input and the fast one did not reuse any (the host has about 32 GB of RAM).
+What differs is the rate at which pass A dirties shard pages: about 4.6
+GB/s against 1.5 GB/s, steady across the pass. That is a dirtying rate
+under kernel throttling, not a measured device rate. Each planet cell
+writes and deletes hundreds of GB of scratch on an ext4 mount without
+`discard`, so the freed blocks stay untrimmed until the next `fstrim`.
+Trim debt, an exhausted drive write cache, controller GC and inherited
+writeback state are not separated by these cells; that would need a trim
+between consecutive cells, with device throughput and Dirty/Writeback
+recorded.
+
+Consequence for measurement: on this host, an altw external cell that
+follows a scratch-heavy cell has run 30-80 s slower in pass A than one
+that follows a trim or rest (11.5 % of wall in the pair above). A matched A/B must balance what precedes
+each arm (predecessor workload and first-after-trim position), not only
+alternate arms; when the arms write different scratch volumes, alternation
+alone does not balance it. Read pass A against the rest of the command
+before attributing a wall delta to code. Whether pass A's scratch volume
+and stream layout make it more exposed to this than it needs to be is an
+open question, not a finding.
+
 ### Packed varint count (bygg, 2026-10-31)
 
 Block construction counts every packed varint array (the dense id, lat, lon

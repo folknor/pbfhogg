@@ -448,7 +448,10 @@ full-decode path exists.
 
 `sudo fstrim -av` (AGENTS.md asks for it before a matched suite) and
 `taskset` (to run bygg at a README-like worker count) are not allowlisted,
-so implementers skipped both. The maintainer's call.
+so implementers skipped both. On 2026-10-31 `! sudo fstrim -av` ran on
+bygg without a password prompt, though cached sudo credentials may explain
+that; if not, an exact `Bash(sudo fstrim -av)` allowlist entry is all
+agents would need. The maintainer's call.
 
 ### WRK-073: Digest v2 cost
 
@@ -598,26 +601,20 @@ the shared ordered-delivery loop (`7abba0df`) and the OSC gzip writer's
 (repack or cat `--clean`) plus planet `diff --format osc` covers it. Bisect
 only if it moves.
 
-### WRK-097: altw raw scanners read fallibly
+### WRK-111: altw external pass A exposure to sustained-write state
 
-`e61e0ad7^` vs `e61e0ad7`, altw external on planet (three `read_varint`s in
-lockstep instead of zipped `PackedSint64Iter`s, whose iterator swallowed
-errors on purpose). Forced sparse at planet thrashes for hours
-(`notes/todo.md`, "altw sparse path"); use europe or north-america for
-sparse. The pair also carries `e61e0ad7`'s per-byte `packed_varint_count`
-(+15-19 % on planet sequential and blobreader read, restored to a popcount
-count at HEAD; "Packed varint count" in `reference/performance.md`), so
-attribute an altw delta through the scanner phases, not the wall.
-
-Tried 2026-10-31 on bygg after a day of planet benches, confounded:
-`cf58d02e` (`e61e0ad7^`) 339.6 s, `eebd3523` (`e61e0ad7`) 374.0 s,
-`d7de4025` (HEAD `82be10a4`) 403.3 s, `84802fca` (`e61e0ad7^` again)
-428.6 s. The walls rise with run order whatever the commit, and the
-difference sits in `EXTJOIN_RELATION_SCAN` (22 s at 8.2 cores against
-82 s at 2.7 cores, an I/O wall): drive state, not the scanners. A third
-`e61e0ad7^` cell half an hour later, `b5a20ad8`, took 371.3 s: one
-commit spans 339.6 to 428.6 s the same day, far wider than the effect
-sought. Rerun after `sudo fstrim -av` (WRK-072).
+Stage 1 pass A runs 32 s on planet as the first cell after a trim or rest
+and 51-111 s after another scratch-heavy cell, on identical bytes (29.2 GB
+pread, 149.2 GB of id shards into 30 x 256 buffered streams);
+reference/performance.md, "altw external pass A swings with run history".
+Not input page cache. Open: which of trim debt, drive write cache, GC or
+inherited writeback is the mechanism (needs a trim between consecutive
+cells plus Dirty/Writeback and device stats, see the brokkr filing), and
+whether scratch bytes per reference, total scratch traffic across stages or
+the stream topology (stage1.rs already names decoupling shard ownership
+from worker count) make pass A more exposed than it must be. Fewer streams
+might help locality without fewer bytes; compression might cut bytes for
+CPU. Neither is an established remedy.
 
 ### WRK-098: Shared versus separate input descriptors
 

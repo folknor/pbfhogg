@@ -811,6 +811,14 @@ pub(crate) fn external_join_in(
                     host,
                 )
             });
+            // The scan's span nests inside EXTJOIN_S1_PASS_A and ends well
+            // before it. A marker-segmented sidecar view labels the segment
+            // that begins at EXTJOIN_RELATION_SCAN_END with that marker, so
+            // that row measures the rest of pass A, not the scan; read the
+            // scan's own time from the START/END pair. Wall swings seen in
+            // this stage at planet scale have been in pass A, with the scan
+            // steady (reference/performance.md, "altw external pass A swings
+            // with run history").
             let rel_handle = if keep_untagged_nodes && !inject_prepass {
                 None
             } else {

@@ -120,10 +120,11 @@ usually small.
   read the same either side. `cat_blobs_decoded` and cat's "Decoded N blobs"
   count input blobs decoded, not output blobs written, from `8da26b23`; a
   `cat --clean` or `cat --type` row before it is not comparable on that
-  counter. Sequential diff and derive-changes merges (`-j 1`, `--verbose`, or
-  unindexed input) decode through a recycling pool from `126cbce2` and feed
-  the `pipeline_decompress_pool_*` drop counters, which earlier such rows
-  lack; parallel shard runs are unaffected. `publish_sync_calls` and
+  counter. The unindexed diff and derive-changes merge decodes through a
+  recycling pool from `126cbce2` and feeds the
+  `pipeline_decompress_pool_*` drop counters, which earlier such rows lack;
+  indexed runs at any `-j` decode into a fresh buffer per block and are
+  unaffected. `publish_sync_calls` and
   `publish_sync_ns` count the publication's own syncs from `0fe60da5`,
   rather than a delta of the run's `writer_sync_all_*` totals; a CLI run
   never publishes concurrently, so the two definitions give the same values
@@ -2240,6 +2241,57 @@ error. Walker phase ~15 s (pread-only via `HeaderWalker` with
 `posix_fadvise(RANDOM)`; disk read 45 GB → 2.6 GB). Shard balance on
 germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
 14.7, WAY 12.9, REL 14.5 out of 16 (86-92 %).
+
+## Diff of a base against its apply-changes output (bygg, 2026-10-31)
+
+`brokkr diff`: the base against the base with one daily OSC applied, run
+as `pbfhogg diff OLD NEW --suppress-common --output FILE` (so the
+byte-equal skip may fire), `--keep-cache`, `--bench 1` cells interleaved,
+no `fstrim` (not allowlisted). All rows exit 1 (the inputs differ).
+
+### Planet, default `-j` (one shard per core), OSC 4913
+
+| UUID | Commit | Wall | DIFF_SCAN (header walk) | Node phase peak anon |
+|---|---|---:|---:|---:|
+| `789b28b4` | `79d2e923` | 401.8 s | 82.8 s | 937 MB |
+| `07380793` | `2c12a955` | 397.2 s | 87.5 s | 692 MB |
+| `7f085114` | `79d2e923` | 412.1 s | 91.0 s | 933 MB |
+| `a43d9f58` | `2c12a955` | 403.6 s | 92.7 s | 690 MB |
+| `e95703aa` | `f3e1c9b9` | 395.4 s | 95.1 s | 653 MB |
+
+`2c12a955` gave the sharded default path the byte-equal skip it lacked.
+On this workload it is worth -1.1 % and -2.1 % in the two pairs (medians
+407.0 s against 400.4 s, below noise) and about a quarter of the peak
+anon: the skip fires on 7,145 blob pairs (2.1 G elements), while 43,669
+overlapping pairs (9.9 G elements) still decode, because one day of
+edits touches most of planet's large blobs. The Japan figure that
+motivated the skip (`diff -c` 50.0 s to 6.8 s, plantasjen, April) came
+from the sequential engine on a Geofabrik-density file and does not carry
+to planet. `diff -q` runs the same engine with the same skip and was not
+measured separately (brokkr's `diff` never passes `-q`).
+
+The serial header walk is a quarter of the wall: about 1.28 M `pread`s
+and 10 GB read at 0.0 cores. Walking the two files on two threads was
+tried (uncommitted, `f3e1c9b9` plus the change) and measured 98.8 s, no
+gain, so it was not kept. The merge phases read about 258 GB from the two
+92 GB inputs.
+
+### Europe, `-j 1`, OSC 4715
+
+| UUID | Commit | Wall | DIFF_SCAN | Peak anon |
+|---|---|---:|---:|---:|
+| `cae9f615` | `79d2e923` (streaming sequential engine) | 193.0 s | none | 14.6 MB |
+| `ea3d4f41` | `2c12a955` (header walk, then one pread shard) | 270.4 s | 79.3 s | 106 MB |
+| `9503a2ce` | `f3e1c9b9` | 255.3 s | 79.3 s | 96.9 MB |
+| (unstored) | `f3e1c9b9` plus the `-j 1` stream, two cells | 177.1 s, 175.6 s | none | 18.0 MB |
+
+`2c12a955` cost `-j 1` 40 %, all of it the up-front walk of both files:
+the merge phases matched the streaming engine to within a second. One
+shard now reads each input as one sequential stream, checking each
+header as it arrives, which removes the walk and brings back
+`--direct-io` and page-cache eviction at `-j 1`: -31 % against
+`f3e1c9b9`. The unstored cells also carry `f3e1c9b9`'s cheaper block
+construction, so they compare with `79d2e923` only approximately.
 
 ## `--direct-io` impact summary
 

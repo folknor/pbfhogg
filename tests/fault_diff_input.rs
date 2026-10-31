@@ -12,8 +12,9 @@
 //!
 //! The opens of one input, in order (see `Route::opens`): the front read of
 //! the header and the first blob's indexdata; then the block-pair merge's
-//! header walk (at any shard count, negative IDs and type filters
-//! included), or the streaming reader of a route with an unindexed side.
+//! header walk (more than one shard, negative IDs and type filters
+//! included), its one stream per input at one shard, or the streaming
+//! reader of a route with an unindexed side.
 //!
 //! `diff` writes to a caller's `Write`, so a run refused at a later open
 //! may already have written text; what it owes is the typed refusal.
@@ -61,7 +62,7 @@ impl Route {
     };
 
     /// Opens of either input through its pin: the front read, then the
-    /// header walk (both inputs indexed, at any shard count and filter) or
+    /// header walk or the one-shard stream (both inputs indexed) or
     /// the streaming reader (an unindexed side).
     fn opens(self) -> u64 {
         2
@@ -347,7 +348,7 @@ fn sequential_diff_reads_only_the_pinned_inputs() {
             },
             2,
         );
-        // The excluded tail is covered by the one header walk.
+        // The excluded tail is walked by the same stream, not reopened.
         check_route(
             Route {
                 count,
@@ -426,8 +427,8 @@ fn the_streaming_diff_reads_only_the_pinned_inputs() {
 }
 
 /// The front reads and the streaming readers open `O_DIRECT` when asked
-/// to, through the pin's own direct open (the block-pair walk stays
-/// buffered).
+/// to, through the pin's own direct open: the unindexed reader and the
+/// one-shard block-pair streams (a multi-shard walk stays buffered).
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_inputs() {

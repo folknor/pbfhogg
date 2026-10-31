@@ -364,15 +364,16 @@ fn diff_block_pair<W: Write>(
     options: &DiffOptions,
     filter: &TypeFilter,
     jobs: usize,
-    // Not honoured yet: the walk and the shard reads pread through the
-    // walker's buffered descriptor at every shard count. Kept as the place
-    // the flag reaches once those reads honour it.
-    _direct_io: bool,
+    // Honoured by the `-j 1` streams only: a multi-shard walk and its shard
+    // reads pread through the walker's buffered descriptor.
+    direct_io: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<DiffStats> {
     // DIFF_SCAN_START/END and the diff_* result counters are the caller's.
-    let walked = shard::walk_pair(old, new, host)?;
-    if walked.has_negative && jobs > 1 {
+    let mut inputs = shard::open_pair(old, new, jobs, direct_io, host)?;
+    if let shard::Inputs::Walked(walked) = &inputs
+        && walked.has_negative
+    {
         crate::host::diag!(
             host.diagnostics,
             Note,
@@ -426,7 +427,7 @@ fn diff_block_pair<W: Write>(
         scratch,
     };
     let merge_stats = sharded::run(
-        &walked,
+        &mut inputs,
         &phases,
         jobs,
         options.suppress_common,

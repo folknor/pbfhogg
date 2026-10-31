@@ -1,15 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Performance
-
-- Block decoding is faster again: 0.6.0's stricter packed-varint check made
-  single-threaded planet decoding about 15-19 % slower, and it now costs
-  nothing on well-formed input (sequential `ElementReader` on planet about
-  12 % faster than 0.6.0, parallel about 6-7 %). Malformed varints are
-  still refused.
-
 ## 0.6.0 - 2026-10-30
 
 0.6.0 makes pbfhogg safe to embed as a library and strict about its input.
@@ -148,8 +138,9 @@ never left partial, and the library no longer touches process state.
 
 ### Changed
 
-- `diff` runs one engine at every `-j`: `-v` runs at any `-j`, and the
-  default path and `-q` skip byte-equal blob pairs.
+- `diff` runs one engine at every `-j`: `-v` runs at any `-j`, and `-c`,
+  `-q` and `--format osc` skip byte-equal blob pairs at the default `-j`
+  too. `-j 1` still reads each input as one stream.
 - `cat --dedupe` runs on `sort`'s engine (header walk, `copy_file_range`
   passthrough, parallel merge), and `sort` streams its overlap output instead
   of buffering it. Overlapping blobs are merged without copying elements:

@@ -152,9 +152,10 @@ together so the surface changes once.
   is taken and discarded in altw `stage1_way_pass`,
   `build_node_index_sparse`, `collect_way_referenced_node_ids`,
   `collect_relation_member_ids` (every pread path, so the flag does nothing
-  to reads in passes 0 and 1, stage 1 or stage 2), diff's and derive's block-pair paths (`diff_block_pair`,
-  `derive_changes_block_pair`: both pread through `HeaderWalker`, so
-  `diff --direct-io` on indexed inputs reads buffered at every `-j`),
+  to reads in passes 0 and 1, stage 1 or stage 2), diff's and derive's
+  multi-shard block-pair paths (both pread through `HeaderWalker`, so
+  `diff --direct-io` on indexed inputs reads buffered at `-j` above 1;
+  `-j 1` streams and honours it),
   `getid::parse_ids_from_pbf`, tags-filter's `collect_relation_member_closure`
   and `collect_way_node_dependencies` (both scans pread through the walker's
   buffered descriptor), and `check_refs` (`let _ = direct_io;`).

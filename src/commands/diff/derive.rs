@@ -529,16 +529,17 @@ fn derive_changes_block_pair(
     old: &PinnedInput,
     new: &PinnedInput,
     jobs: usize,
-    // Not honoured yet: the walk and the shard reads pread through the
-    // walker's buffered descriptor at every shard count. Kept as the place
-    // the flag reaches once those reads honour it.
-    _direct_io: bool,
+    // Honoured by the `-j 1` streams only: a multi-shard walk and its shard
+    // reads pread through the walker's buffered descriptor.
+    direct_io: bool,
     sink: &mut ChangeSink,
     scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    let walked = super::shard::walk_pair(old, new, host)?;
-    if walked.has_negative && jobs > 1 {
+    let mut inputs = super::shard::open_pair(old, new, jobs, direct_io, host)?;
+    if let super::shard::Inputs::Walked(walked) = &inputs
+        && walked.has_negative
+    {
         crate::host::diag!(
             host.diagnostics,
             Note,
@@ -573,7 +574,7 @@ fn derive_changes_block_pair(
         },
     ];
     let mut report = OscReport { sink, scratch };
-    let merge_stats = super::sharded::run(&walked, &phases, jobs, true, &mut report, host)?;
+    let merge_stats = super::sharded::run(&mut inputs, &phases, jobs, true, &mut report, host)?;
     super::emit_merge_stats_counters(&merge_stats, &host.invocation);
     Ok(())
 }

@@ -854,13 +854,7 @@ impl<R: Read + Send> BlobReader<R> {
         // host observes, so it is not a change to make on inspection alone:
         // it wants a matched A/B of both ranges on a planet-sized input with
         // the cache state recorded before it is narrowed.
-        #[cfg(target_os = "linux")]
-        if let Some(evict) = self.evict_prefix
-            && let Some(offset) = self.frames.position()
-            && evict(&self.frames.src, offset, self.frames.cancel_token())
-        {
-            self.evict_calls += 1;
-        }
+        self.evict_behind();
 
         Some(Ok(RawFrame {
             header: header.header,
@@ -868,6 +862,42 @@ impl<R: Read + Send> BlobReader<R> {
             id: header.id,
             frame_len,
         }))
+    }
+
+    /// The page-cache eviction step after a payload was copied out (see
+    /// [`Self::next_frame`]); a no-op unless eviction is on.
+    fn evict_behind(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(evict) = self.evict_prefix
+            && let Some(offset) = self.frames.position()
+            && evict(&self.frames.src, offset, self.frames.cancel_token())
+        {
+            self.evict_calls += 1;
+        }
+    }
+}
+
+impl BlobReader<FileReader> {
+    /// The next frame's header, its payload left pending: exactly one of
+    /// [`Self::read_frame_payload`] or [`Self::skip_frame_payload`] must
+    /// follow before the next header. For a walk that selects bodies by
+    /// header without parsing any envelope (the one-shard block-pair merge's
+    /// stream). `Ok(None)` at clean EOF.
+    pub(crate) fn next_frame_header(&mut self) -> Result<Option<crate::frame::FrameHeader>> {
+        self.frames.next_header()
+    }
+
+    /// Append the pending payload (the raw `Blob` envelope bytes) to `out`,
+    /// then evict behind the read head as [`Self::next_frame`] does.
+    pub(crate) fn read_frame_payload(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        self.frames.read_payload(out)?;
+        self.evict_behind();
+        Ok(())
+    }
+
+    /// Pass over the pending payload without reading it.
+    pub(crate) fn skip_frame_payload(&mut self) -> Result<()> {
+        self.frames.skip_payload()
     }
 }
 

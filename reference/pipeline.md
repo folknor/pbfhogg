@@ -296,7 +296,7 @@ Surviving base ways and relations in a rewritten blob are written into a default
 
 Two-pointer merge-join over two sorted PBFs. Three phases per element type (nodes, ways, relations). Each element compared by content equality (coordinates, tags, refs, members).
 
-- Indexed inputs (`diff/shard.rs`, `diff/sharded.rs`, `osc/merge_join.rs`): a header walk of both files, then the block-pair merge over ID-range shards, one per job (one at `-j 1`, run on the calling thread; one for inputs holding negative IDs). Multi-shard phases run each shard on its own thread and concatenate the shards' scratch output in order. One engine and one sink per command (`DiffSink`, `ChangeSink`) at every shard count.
+- Indexed inputs (`diff/shard.rs`, `diff/sharded.rs`, `osc/merge_join.rs`): the block-pair merge over ID-range shards, one per job. A multi-shard run walks both files' headers first and preads the shards' blobs from the walker's descriptors (one unbounded shard for inputs holding negative IDs). `-j 1` skips the walk: one shard on the calling thread reads each input as one sequential `BlobReader` stream (`BlobCursor`, honouring `--direct-io` and page-cache eviction), checking each header as it arrives and walking the unread rest before success. Multi-shard phases run each shard on its own thread and concatenate the shards' scratch output in order. One engine and one sink per command (`DiffSink`, `ChangeSink`) at every shard count.
 - Unindexed inputs (`diff/mod.rs`, `derive.rs`): `StreamingBlocks` element-level merge-join on the calling thread, through the same sinks.
 - `diff` → text or summary output
 - `diff --format osc` (derive-changes) → OSC XML output

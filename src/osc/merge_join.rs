@@ -2,8 +2,9 @@
 //! `derive_changes`.
 //!
 //! [`block_pair_merge_phase`] is the blob-level merge over two indexed
-//! inputs, run once per shard of the ID space (one shard at `-j 1`) over
-//! [`BlockPairSide`]s the header walk planned. [`stream_merge_phase`] is the
+//! inputs, run once per shard of the ID space over [`BlockPairSide`]s the
+//! header walk planned, or at `-j 1` once over each input's [`BlobCursor`]
+//! stream. [`stream_merge_phase`] is the
 //! element-level merge over two [`StreamingBlocks`] cursors, for inputs
 //! without indexdata. Both hand the caller borrowed elements through the
 //! same [`BlockMergeAction`] variants to one [`MergeSink`] per command, so
@@ -680,19 +681,211 @@ impl BlockPairMergeStats {
     }
 }
 
-/// One input of a block-pair merge over one shard of one kind: the shard's
-/// slice of that kind's blobs from the header walk, read by `pread` from
-/// the walker's shared descriptor.
+/// The refusal of an OsmData blob without readable indexdata, on every
+/// block-pair route (the header walk and the one-shard stream). Unlocated.
+pub(crate) fn missing_index_error() -> crate::Error {
+    crate::error::new_missing_indexdata(
+        "block-pair merge requires readable indexdata on every data blob \
+         (this blob has none, or its indexdata has an unknown version, \
+         an unknown kind or an inverted id range)",
+    )
+}
+
+/// One input of a one-shard block-pair merge, read as one sequential
+/// stream across every kind phase instead of walked up front.
+///
+/// A multi-shard plan needs every blob header of both files before any
+/// body is read; one shard reads each side's blobs in file order, so it
+/// takes headers as it meets them and reads the bodies it selects from the
+/// same stream (a whole-file header walk first cost a serial `pread` per
+/// blob, more than a third of a Europe `-j 1` diff). The stream is a
+/// command-input [`crate::blob::BlobReader`], so it honours `--direct-io`
+/// and the host's page-cache eviction, and refuses a partially indexed
+/// file through the frame walk's own guard.
+///
+/// The checks the walk makes up front are made here as each header
+/// arrives, in file order: every data header, of a selected kind or not,
+/// is observed once by [`BlobOrderGuard`] and must carry readable
+/// indexdata; the first frame is the OsmHeader the caller's front read
+/// already judged and is skipped unread, as are frames of other types.
+/// [`Self::finish`] walks what no phase consumed, so a defect past the last
+/// selected kind is still refused before success. The refusals are the
+/// walk's; only their timing differs, so a defect late in a file is
+/// reported after the output written before it.
+pub(crate) struct BlobCursor {
+    reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    path: std::sync::Arc<std::path::Path>,
+    order: BlobOrderGuard,
+    /// The leading frame has been passed over.
+    started: bool,
+    /// Clean EOF was reached; never polled again.
+    exhausted: bool,
+    /// An observed data header whose payload is still pending in the
+    /// reader: the next blob, of the running phase's kind or a later one.
+    lookahead: Option<BlobDesc>,
+    /// Payloads read since the last [`Self::take_read_count`].
+    read_count: usize,
+}
+
+impl BlobCursor {
+    /// Open `source` as a command input, buffered or `O_DIRECT` per
+    /// `direct_io`, under `host`'s eviction policy.
+    pub(crate) fn open(
+        source: crate::read::input::InputSource<'_>,
+        direct_io: bool,
+        host: &crate::host::Entered<'_>,
+    ) -> Result<Self> {
+        let path: std::sync::Arc<std::path::Path> = std::sync::Arc::from(source.path());
+        let mut reader = crate::blob::BlobReader::open_in(source, direct_io, host)?;
+        reader.set_parse_indexdata(true);
+        Ok(Self {
+            reader,
+            path,
+            order: BlobOrderGuard::new(),
+            started: false,
+            exhausted: false,
+            lookahead: None,
+            read_count: 0,
+        })
+    }
+
+    #[cold]
+    fn locate(&self, blob_index: u64, frame_offset: u64, err: crate::Error) -> crate::Error {
+        err.locate(crate::error::Location::new(
+            Some(&self.path),
+            Some(blob_index),
+            Some(crate::ByteOffset(frame_offset)),
+        ))
+    }
+
+    /// Ensure a data header is pending in `lookahead`, unless at EOF.
+    fn advance(&mut self) -> Result<()> {
+        if self.lookahead.is_some() || self.exhausted {
+            return Ok(());
+        }
+        loop {
+            let Some(header) = self.reader.next_frame_header()? else {
+                self.exhausted = true;
+                return Ok(());
+            };
+            if !self.started {
+                self.started = true;
+                self.reader.skip_frame_payload()?;
+                continue;
+            }
+            if !matches!(header.header.blob_type, crate::blob::BlobKind::OsmData) {
+                self.reader.skip_frame_payload()?;
+                continue;
+            }
+            // A walk from offset 0 that has not seeked always knows both.
+            let frame_offset = header.id.start.unwrap_or(0);
+            let blob_index = header.id.ordinal.unwrap_or(0);
+            let index = header
+                .header
+                .indexdata
+                .as_ref()
+                .and_then(|data| crate::blob_meta::BlobIndex::deserialize(data));
+            let Some(index) = index else {
+                // The frame is completed first, as the walk does, so a
+                // truncated payload or a partially indexed file is that
+                // error rather than this one.
+                self.reader.skip_frame_payload()?;
+                return Err(self.locate(blob_index, frame_offset, missing_index_error()));
+            };
+            if let Err(e) = self.order.observe(&index) {
+                return Err(self.locate(blob_index, frame_offset, e));
+            }
+            self.lookahead = Some(BlobDesc {
+                blob_index,
+                frame_offset,
+                data_offset: frame_offset + header.payload_offset() as u64,
+                data_size: header.data_size,
+                index,
+            });
+            return Ok(());
+        }
+    }
+
+    /// Pass over blobs of kinds before `kind` (excluded by the caller's type
+    /// filter; the order guard has seen them) and say whether the next blob
+    /// is of `kind`. After it, the cursor is at EOF or holds a blob of
+    /// `kind` or a later kind.
+    pub(crate) fn reaches(&mut self, kind: ElementKind) -> Result<bool> {
+        loop {
+            self.advance()?;
+            match self.lookahead {
+                None => return Ok(false),
+                Some(desc) if desc.index.kind.ordinal() < kind.ordinal() => {
+                    self.lookahead = None;
+                    self.reader.skip_frame_payload()?;
+                }
+                Some(desc) => return Ok(desc.index.kind == kind),
+            }
+        }
+    }
+
+    /// The next blob of `kind`, its body (the raw `Blob` envelope) in
+    /// `buf`; `None` once the next blob is of a later kind or the file ends.
+    fn next_of(&mut self, kind: ElementKind, buf: &mut Vec<u8>) -> Result<Option<BlobDesc>> {
+        if !self.reaches(kind)? {
+            return Ok(None);
+        }
+        let Some(desc) = self.lookahead.take() else {
+            return Err(crate::Error::internal(
+                "block-pair stream: no pending blob after reaching its kind",
+            ));
+        };
+        buf.clear();
+        self.reader.read_frame_payload(buf)?;
+        self.read_count += 1;
+        Ok(Some(desc))
+    }
+
+    /// Bodies read since the last call: one phase's blobs on this side.
+    pub(crate) fn take_read_count(&mut self) -> usize {
+        std::mem::take(&mut self.read_count)
+    }
+
+    /// Walk the rest of the file, headers checked and bodies skipped.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        loop {
+            self.advance()?;
+            if self.lookahead.take().is_none() {
+                return Ok(());
+            }
+            self.reader.skip_frame_payload()?;
+        }
+    }
+}
+
+/// Where a [`BlockPairSide`] gets its blobs.
+enum SideSource<'a> {
+    /// A shard's slice of one kind's blobs from the header walk, read by
+    /// `pread` from the walker's shared descriptor.
+    Walked {
+        file: &'a std::fs::File,
+        descs: &'a [BlobDesc],
+        next: usize,
+    },
+    /// One kind's run of a one-shard stream.
+    Stream {
+        cursor: &'a mut BlobCursor,
+        kind: ElementKind,
+    },
+}
+
+/// One input of a block-pair merge over one shard of one kind: either the
+/// shard's slice of that kind's blobs from the header walk, read by `pread`
+/// from the walker's shared descriptor, or, for a one-shard run, that
+/// kind's run of the input's [`BlobCursor`].
 ///
 /// Holds at most one blob read but not yet decoded (`read_buf`): the merge
 /// reads a fresh blob from each side before it decides whether to decode,
 /// compare or emit it, and hands one back (`held`) when only the other is
 /// emitted, so the next round can still try the byte comparison on it.
 pub(crate) struct BlockPairSide<'a> {
-    file: &'a std::fs::File,
-    source: &'a std::sync::Arc<std::path::Path>,
-    descs: &'a [BlobDesc],
-    next: usize,
+    source: SideSource<'a>,
+    path: std::sync::Arc<std::path::Path>,
     window: Option<Window>,
     /// The body (`Blob` envelope) of the blob [`BlockPairSide::next_blob`]
     /// returned last. Reused across blobs.
@@ -713,11 +906,31 @@ impl<'a> BlockPairSide<'a> {
         descs: &'a [BlobDesc],
         window: Option<Window>,
     ) -> Self {
+        Self::over(
+            SideSource::Walked {
+                file,
+                descs,
+                next: 0,
+            },
+            std::sync::Arc::clone(source),
+            window,
+        )
+    }
+
+    /// A one-shard side over `kind`'s run of `cursor`: no window.
+    pub(crate) fn streamed(cursor: &'a mut BlobCursor, kind: ElementKind) -> Self {
+        let path = std::sync::Arc::clone(&cursor.path);
+        Self::over(SideSource::Stream { cursor, kind }, path, None)
+    }
+
+    fn over(
+        source: SideSource<'a>,
+        path: std::sync::Arc<std::path::Path>,
+        window: Option<Window>,
+    ) -> Self {
         Self {
-            file,
             source,
-            descs,
-            next: 0,
+            path,
             window,
             read_buf: Vec::new(),
             st: Vec::new(),
@@ -729,7 +942,7 @@ impl<'a> BlockPairSide<'a> {
     #[cold]
     fn locate(&self, desc: &BlobDesc, err: crate::Error) -> crate::Error {
         err.locate(crate::error::Location::new(
-            Some(self.source),
+            Some(&self.path),
             Some(desc.blob_index),
             Some(crate::ByteOffset(desc.frame_offset)),
         ))
@@ -742,15 +955,24 @@ impl<'a> BlockPairSide<'a> {
         if let Some(held) = self.held.take() {
             return Ok(Some(held));
         }
-        let Some(&desc) = self.descs.get(self.next) else {
-            return Ok(None);
+        let (desc, read) = match &mut self.source {
+            SideSource::Walked { file, descs, next } => {
+                let Some(&desc) = descs.get(*next) else {
+                    return Ok(None);
+                };
+                *next += 1;
+                self.read_buf.resize(desc.data_size, 0);
+                (
+                    desc,
+                    file.read_exact_at(&mut self.read_buf, desc.data_offset),
+                )
+            }
+            // The stream locates its own failures at the frame.
+            SideSource::Stream { cursor, kind } => {
+                return cursor.next_of(*kind, &mut self.read_buf);
+            }
         };
-        self.next += 1;
-        self.read_buf.resize(desc.data_size, 0);
-        if let Err(e) = self
-            .file
-            .read_exact_at(&mut self.read_buf, desc.data_offset)
-        {
+        if let Err(e) = read {
             return Err(self.locate(&desc, e.into()));
         }
         Ok(Some(desc))

@@ -425,6 +425,20 @@ design document first.
 
 ---
 
+### WRK-107: diff's multi-shard header walk at planet
+
+Planet `brokkr diff` at the default `-j` spends about 95 s of 395 s in the
+serial header walk of both inputs (`DIFF_SCAN`: ~1.28 M preads, 10 GB read,
+0.0 cores; "Diff of a base against its apply-changes output" in
+`reference/performance.md`). Walking the two files on two threads measured
+no gain (98.8 s, uncommitted), so the walk is not simply per-file pread
+latency; find what bounds it before reshaping (a header read is a 4 KiB
+page per blob under `FADV_RANDOM`; drive state on bygg; an overlapped walk
+that starts shards on the first kind while the rest is walked). The merge
+phases also read about 258 GB from two 92 GB inputs: account for the
+over-read (straddling blobs read by every shard they touch, readahead).
+Diff-snapshots shares the walk.
+
 ## Correctness
 
 ### WRK-105: OSC sinks disagree on children of a deleted object
@@ -629,31 +643,12 @@ unindexed blob now pays the combined ID-and-tag scan in serial pass 1, and
 its serialized key set is held to pass 2 (up to GBs at 8k-encoding blob
 counts). `plan` adds four per-frame `Vec<bool>`s and about 60 B per blob.
 
-### WRK-090: diff byte-equal skip on planet
-
-Planet `brokkr diff` (base against the apply-changes output), `2c12a955^` vs
-`2c12a955`: should show the restored byte-equal skip on the default path
-(japan `diff -c` went 50.0 s to 6.8 s with it, before the July default flip
-lost it). The same cell for `diff -q`, which takes the skip too
-(`f0fe01fc`), and for the text drivers' optional writer (`dfe45a35^` vs
-`dfe45a35`, one predictable branch per write site, at the default `-j` and
-`-j 1`).
-
 ### WRK-091: diff-snapshots across the block-pair engine
 
 Planet `diff-snapshots --from base --to 20260411`, text and osc,
 `2c12a955^` vs `2c12a955`, expected unchanged. Recorded sequential planet
 figures, which cannot be re-measured: text 2134 s (`a9d430f2`), osc
 2225.6 s, peak anon about 28-41 MB per phase; header walk about 15 s cold.
-
-### WRK-092: diff -j 1 on europe, with its decision
-
-A `-j 1` europe cell for wall and peak anon. `-j 1` now does a whole-file
-header walk of both inputs first, then preads per blob from the walker's
-descriptor re-advised `SEQUENTIAL`; it lost page-cache eviction,
-`--direct-io` and `MergeBuffers` recycling. Verbose diff now shards, so its
-output goes through scratch and a copy. If clearly worse, give one-shard
-runs a streaming read back, without restoring a second engine.
 
 ### WRK-093: Unindexed sequential diff
 

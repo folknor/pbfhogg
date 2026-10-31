@@ -1,21 +1,26 @@
 //! Blob walk and shard planner for the block-pair merge, shared by the text
 //! diff and `diff --format osc` (derive).
 //!
-//! Every comparison of two indexed inputs walks both files' blob headers
-//! here, plans the ID space into shards, and runs
+//! A multi-shard comparison of two indexed inputs walks both files' blob
+//! headers here, plans the ID space into shards, and runs
 //! [`crate::osc::merge_join::block_pair_merge_phase`] once per shard and
-//! kind. `-j 1` is the same walk with a one-shard plan, so the answer and
-//! the refusals do not depend on the shard count.
+//! kind. `-j 1` runs the same merge as one shard over a
+//! [`crate::osc::merge_join::BlobCursor`] per input, which makes the walk's
+//! checks as it meets each header, so the answer and the refusals do not
+//! depend on the shard count; only when a refusal comes does.
 //!
 //! # Correctness contract
 //!
-//! - **Whole-file structure first.** [`walk_pair`] walks every blob header
-//!   of both files before any body is read: framing, indexdata on every
-//!   data blob, and canonical blob order (`BlobOrderGuard`, run in file
-//!   order before bucketing by kind, so the per-kind lists ascend). This
-//!   holds whatever the type filter; the body of an excluded kind's blob is
-//!   never read. The guard refuses disorder the indexdata ranges prove;
-//!   within a blob, and inside a mixed-sign range, order is trusted.
+//! - **Whole-file structure.** Every blob header of both files is checked:
+//!   framing, indexdata on every data blob, and canonical blob order
+//!   (`BlobOrderGuard`, run in file order before bucketing by kind, so the
+//!   per-kind lists ascend). This holds whatever the type filter; the body
+//!   of an excluded kind's blob is never read. The guard refuses disorder
+//!   the indexdata ranges prove; within a blob, and inside a mixed-sign
+//!   range, order is trusted. A multi-shard run ([`walk_pair`]) checks
+//!   before any body is read; a one-shard run checks in file order as it
+//!   reads, and walks what it did not read before it succeeds, so a defect
+//!   late in a file can be refused after earlier output was written.
 //! - **Negative IDs get one unbounded shard.** Shard windows are raw `i64`
 //!   comparisons, while elements are ordered by `osm_id_cmp` (`0, -1, -2,
 //!   ..., 1, 2, ...`); the two agree only when no ID is negative. A file
@@ -41,7 +46,7 @@ use std::sync::Arc;
 
 use crate::ElementKind;
 use crate::error::Result;
-use crate::osc::merge_join::{BlobDesc, Window};
+use crate::osc::merge_join::{BlobCursor, BlobDesc, Window};
 use crate::read::header_walker::HeaderWalker;
 use crate::read::input::InputSource;
 
@@ -74,6 +79,34 @@ pub(super) struct WalkedPair {
     /// Either file holds a negative ID: plan one unbounded shard (see the
     /// module contract).
     pub(super) has_negative: bool,
+}
+
+/// Both inputs, ready for the block-pair merge.
+pub(super) enum Inputs {
+    /// Every blob header of both files walked: what a multi-shard plan needs.
+    Walked(WalkedPair),
+    /// One sequential stream per input, for a one-shard run (`-j 1`).
+    Streamed {
+        old: Box<BlobCursor>,
+        new: Box<BlobCursor>,
+    },
+}
+
+/// Open both inputs for a comparison of up to `jobs` shards per kind: one
+/// stream per input at `-j 1` (`direct_io` honoured), else the header walk.
+pub(super) fn open_pair<'a, 'b>(
+    old_source: impl Into<InputSource<'a>>,
+    new_source: impl Into<InputSource<'b>>,
+    jobs: usize,
+    direct_io: bool,
+    host: &crate::host::Entered<'_>,
+) -> Result<Inputs> {
+    if jobs <= 1 {
+        let old = Box::new(BlobCursor::open(old_source.into(), direct_io, host)?);
+        let new = Box::new(BlobCursor::open(new_source.into(), direct_io, host)?);
+        return Ok(Inputs::Streamed { old, new });
+    }
+    walk_pair(old_source, new_source, host).map(Inputs::Walked)
 }
 
 /// Walk both inputs' blob headers.
@@ -122,14 +155,7 @@ fn walk_file(source: InputSource<'_>, host: &crate::host::Entered<'_>) -> Result
             continue;
         }
         let Some(index) = meta.index else {
-            return Err(walker.locate_meta(
-                &meta,
-                crate::error::new_missing_indexdata(
-                    "block-pair merge requires readable indexdata on every data blob \
-                     (this blob has none, or its indexdata has an unknown version, \
-                     an unknown kind or an inverted id range)",
-                ),
-            ));
+            return Err(walker.locate_meta(&meta, crate::osc::merge_join::missing_index_error()));
         };
         has_negative |= index.min_id < 0;
         in_file_order.push(BlobDesc {

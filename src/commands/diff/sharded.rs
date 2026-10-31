@@ -1,10 +1,12 @@
 //! The one driver of the block-pair merge over two indexed inputs, for the
 //! text diff and derive (`diff --format osc`) alike.
 //!
-//! Per kind it plans shards ([`super::shard::plan_shards`]) and runs
-//! [`block_pair_merge_phase`] once per shard. A phase that plans one shard
-//! (always at `-j 1`) runs inline on the caller's thread, recording straight
-//! into the command's final sink; a phase with more runs each shard on a
+//! At `-j 1` each phase is one shard over the two input streams
+//! ([`BlobCursor`]), inline on the caller's thread. Otherwise, per kind it
+//! plans shards ([`super::shard::plan_shards`]) over the header walk and
+//! runs [`block_pair_merge_phase`] once per shard. A phase of one shard
+//! runs inline on the caller's thread, recording straight into the
+//! command's final sink; a phase with more runs each shard on a
 //! scoped thread with its own sink, whose output the command then absorbs in
 //! shard order. The command supplies both sides of that through
 //! [`ShardedReport`].
@@ -12,10 +14,10 @@
 use crate::ElementKind;
 use crate::error::Result;
 use crate::osc::merge_join::{
-    BlockPairMergeStats, BlockPairSide, MergeSink, block_pair_merge_phase,
+    BlobCursor, BlockPairMergeStats, BlockPairSide, MergeSink, block_pair_merge_phase,
 };
 
-use super::shard::{Shard, WalkedFile, WalkedPair, plan_shards};
+use super::shard::{Inputs, Shard, WalkedFile, WalkedPair, plan_shards};
 
 /// A command's side of a sharded comparison.
 pub(super) trait ShardedReport {
@@ -66,16 +68,83 @@ pub(super) struct Phase {
     pub(super) end_marker: &'static str,
 }
 
-/// Run `phases` over both walked inputs with up to `jobs` shards per kind,
-/// and return the merge's shadow counters summed over every shard.
+/// Run `phases` over both inputs with up to `jobs` shards per kind, and
+/// return the merge's shadow counters summed over every shard.
 ///
 /// A phase whose kind neither input holds is skipped, markers included.
-/// When the whole run is one shard per kind (`jobs` at most one, or an input
-/// holding a negative ID), each side's descriptor is re-advised for
-/// sequential reading: the walker opened it `RANDOM` for the header walk,
-/// and one shard reads each side's blobs in file order, which readahead
-/// serves. A multi-shard run keeps `RANDOM`, the measured shape.
 pub(super) fn run<R: ShardedReport>(
+    inputs: &mut Inputs,
+    phases: &[Phase],
+    jobs: usize,
+    skip_equal_blobs: bool,
+    report: &mut R,
+    host: &crate::host::Entered<'_>,
+) -> Result<BlockPairMergeStats> {
+    match inputs {
+        Inputs::Walked(walked) => run_walked(walked, phases, jobs, skip_equal_blobs, report, host),
+        Inputs::Streamed { old, new } => {
+            run_streamed(old, new, phases, skip_equal_blobs, report, host)
+        }
+    }
+}
+
+/// One shard per kind over the two input streams, inline into the final
+/// sink. The plan is reported after each phase, when its blob counts are
+/// known; both streams are walked to their end before success.
+fn run_streamed<R: ShardedReport>(
+    old: &mut BlobCursor,
+    new: &mut BlobCursor,
+    phases: &[Phase],
+    skip_equal_blobs: bool,
+    report: &mut R,
+    host: &crate::host::Entered<'_>,
+) -> Result<BlockPairMergeStats> {
+    let mut total = BlockPairMergeStats::default();
+    for phase in phases {
+        let kind = phase.kind;
+        // Both, not short-circuited: each cursor passes the earlier kinds.
+        let old_has = old.reaches(kind)?;
+        let new_has = new.reaches(kind)?;
+        if !old_has && !new_has {
+            continue;
+        }
+        host.invocation.marker(phase.start_marker);
+        let mut stats = BlockPairMergeStats::default();
+        {
+            let mut old_side = BlockPairSide::streamed(old, kind);
+            let mut new_side = BlockPairSide::streamed(new, kind);
+            block_pair_merge_phase(
+                &mut old_side,
+                &mut new_side,
+                kind,
+                skip_equal_blobs,
+                report.inline(),
+                &mut stats,
+                &host.invocation,
+            )?;
+        }
+        let shard = Shard {
+            window: None,
+            old_start: 0,
+            old_end: old.take_read_count(),
+            new_start: 0,
+            new_end: new.take_read_count(),
+        };
+        report.on_plan(kind, &[shard], &host.invocation);
+        total.add(&stats);
+        host.invocation.marker(phase.end_marker);
+    }
+    old.finish()?;
+    new.finish()?;
+    Ok(total)
+}
+
+/// Run `phases` over both walked inputs. When the whole run is one shard per
+/// kind (an input holding a negative ID), each side's descriptor is
+/// re-advised for sequential reading: the walker opened it `RANDOM` for the
+/// header walk, and one shard reads each side's blobs in file order, which
+/// readahead serves. A multi-shard run keeps `RANDOM`, the measured shape.
+fn run_walked<R: ShardedReport>(
     walked: &WalkedPair,
     phases: &[Phase],
     jobs: usize,

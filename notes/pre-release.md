@@ -24,7 +24,7 @@ real data and its writer fixed. Multi-region extract admits its descriptors.
 The planet regressions found by the RAM pass below are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
-(apply-changes). The release itself still needs WRK-001 to WRK-005.
+(apply-changes). The release itself still needs WRK-001 and WRK-003 to WRK-005.
 
 ---
 
@@ -37,21 +37,13 @@ when it ships. Both `Cargo.toml`s still say 0.5.0, and no tag after `v0.5.0`
 exists. The 0.6.0 section was rewritten to net change against v0.5.0, one
 line per entry; keep it that terse.
 
-### WRK-002: Re-measure the rows that share the changed decode path
-
-`5bfa37ab` changed the decode path these commands share, and their rows were
-not re-measured: `check --ids --full` (stored `f6ba05d4`, 2.47 GB),
-`extract --complete` with `-25,34,45,72` (`ce0bdcc0`, 5.27 GB) and
-`multi-extract --simple -c`, 5 regions over `-10,35,32,72` (`4babae4d`,
-10.3 GB). One stored `--bench 1` cell each at HEAD, one at a time, about 14
-minutes of bygg in total. Their peaks are set-dominated, so little movement
-is expected.
-
-### WRK-003: Stored cells for the table's unstored rows
+### WRK-003: Stored cells for the table's unstored and stale rows
 
 Four rows cite `--force` cells that were never stored: `cat --dedupe`,
 `apply-changes` (4913, `zstd:1`), both `merge-changes` rows and
 `inspect --extended`. A stored HEAD cell each gives the table a UUID to cite.
+Done for all of them and for the two `diff` rows, at `179f1b7e`
+(2026-10-31, bygg); this item stays open only until WRK-004 consumes them.
 
 ### WRK-004: The README planet table
 
@@ -95,7 +87,7 @@ actually gives, not an assumption:
 
 ## Planet RAM pass against the README table (2026-10-30)
 
-Reference material for WRK-002 to WRK-004, not an item. The blocker
+Reference material for WRK-003 and WRK-004, not an item. The blocker
 question was whether every command is still RAM-safe at planet on a 28-ish
 GB host. Answer: yes. The highest peak is `inspect --tags -j 16` at 17.5 GB,
 unchanged from the README.
@@ -112,57 +104,67 @@ are listed for reference only.
 | `inspect --tags -j 16` | 17.5 GB | 17.5 GB | 1m40s | 2m50s | `7855f2a4` |
 | `build-geocode-index` | 13.4 GB | ~25 GB | 5m20s | 5m47s | `c261bd3c` |
 | `add-locations-to-ways --index-type external` | 10.7 GB | 12.0 GB | 5m21s | 9m52s | `13668dda` |
-| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) | 10.3 GB | 9.4 GB | 10m53s | 14m44s | `4babae4d` |
+| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) (n9) | 9.86 GB | 9.4 GB | 10m58s | 14m44s | `831424c0` |
 | `extract --smart` (`-25,34,45,72`) | 8.2 GB | 11.17 GB | 2m20s | 4m28s | `d015bbe4` |
-| `cat --dedupe` (n4) | 1.46 GB | 1.4 GB | 5m10s | 2h13m | unstored |
+| `cat --dedupe` (n4) | 1.15 GB | 1.4 GB | 4m23s | 2h13m | `5faa7ff8` |
 | `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
-| `extract --complete` (`-25,34,45,72`) | 5.27 GB | 4.7 GB | 2m02s | 3m42s | `ce0bdcc0` |
+| `extract --complete` (`-25,34,45,72`) (n9) | 4.87 GB | 4.7 GB | 2m02s | 3m42s | `b9dd077a` |
 | `apply-changes --locations-on-ways` (4913, keep-untagged base) (n2) | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
 | `extract --simple` (`-25,34,45,72`) (n7) | 3.09 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
 | `renumber` | 3.19 GB | 3.3 GB | 2m00s | 3m11s | `ce4acd6a` |
-| `apply-changes` (4913, `zstd:1`) (n8) | 2.36 GB | 2.4 GB | 2m05s | 4m29s | unstored |
+| `apply-changes` (4913, `zstd:1`) (n8) | 2.34 GB | 2.4 GB | 2m08s | 4m29s | `fd30dcc9` |
 | `tags-filter w/highway=primary` (two-pass) (n7) | 2.57 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
-| `check --ids --full` | 2.47 GB | 2.22 GB | 34s | 1m10s | `f6ba05d4` |
+| `check --ids --full` (n9) | 2.37 GB | 2.22 GB | 37s | 1m10s | `8c7a09a2` |
 | `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
 | `cat --clean version` (n7) | 994 MB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
 | `time-filter` (cutoff 2024-01-01) (n7) | 841 MB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
-| `merge-changes` (4914..4920, 7 OSCs) (n6) | 286 MB | 2 MB | 9.9s | 54s | unstored |
+| `merge-changes` (4914..4920, 7 OSCs) (n6) | 137 MB | 2 MB | 3.0s | 54s | `bac3e736` |
 | `getparents` (n7) | 288 MB | 506 MB | 13s | 22s | `dd453b3f` |
 | `tags-filter -R highway=primary` | 659 MB | 688 MB | 38s | 52s | `55f84dee` |
-| `diff --format osc -j 16` (base vs 20260411) | 653 MB | 634 MB | 4m11s | 4m54s | `607cd897` |
+| `diff --format osc -j 16` (base vs 20260411) (n10) | 1.25 GB | 634 MB | 2m36s | 4m54s | `c55bebc9` |
 | `check --ids` (n7) | 566 MB | 504 MB | 31s | 57s | `4edab6b2` |
 | `inspect --nodes -j 16` | 425 MB | 410 MB | 31s | 56.8s | `b1fc3106` |
 | `getid --invert` | 58 MB | 102 MB | 56s | 1m31s | `7ee6c776` |
-| `inspect --extended` (n5, n7) | 355 MB | 34 MB | 41s | 13m41s | unstored |
+| `inspect --extended` (n5) | 300 MB | 34 MB | 26s | 13m41s | `5b8e6c29` |
 | `getid` | ~13 MB (n1) | 27 MB | short (n1) | 6.1s | `67d66e4e` |
 | `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
 | `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
 | `cat --type way` | 10 MB | 10 MB | 30s | 45s | `3d4a36a8` |
-| `merge-changes` (4913, 1 OSC) (n6) | 53 MB | 2 MB | 2.7s | 44s | unstored |
+| `merge-changes` (4913, 1 OSC) (n6) | 19 MB | 2 MB | 2.0s | 44s | `9d1e9170` |
 | `inspect` | <1 MB (n1) | 5 MB | short (n1) | 6.5s | `3ec07278` |
 | `tags-filter -i w/highway=primary` (n3) | 7.49 GB | 7.0 GB | 5m16s | 7m57s | `9bf96ab2` |
-| `diff -j 16` (text, base vs 20260411) (n3) | 605 MB | 586 MB | 3m04s | 3m48s | `f9fa4f6f` |
+| `diff -j 16` (text, base vs 20260411) (n10) | 1.56 GB | 586 MB | 2m28s | 3m48s | `5e782b56` |
 
 - n1: Too short for the 100 ms sampler (three samples); approximate.
 - n2: The README row for this one was measured on a 9950X3D2 like bygg, so
   it is the one row whose walls compare directly.
 - n3: Measured later the same day on brokkr `a8605c879`, after its fixes for
   brokkr#67 and brokkr#68; every other row ran on the morning's brokkr build.
-- n4: A `--force` cell on `42ea567f` plus the borrowed-cursor sweep; the
-  RSS-pass cell was `d271f04f`, 7.57 GB and 53m43s.
-- n5: A `--force` cell on `13ec0927` plus the pipeline scan; the RSS-pass
+- n4: Stored at `179f1b7e`; the `--force` cell before it measured 1.46 GB
+  and 5m10s. The RSS-pass cell was `d271f04f`, 7.57 GB and 53m43s.
+- n5: Stored at `179f1b7e` (the validator-projection scan); the RSS-pass
   cell was `9b49e8fb`, 26 MB and 13m22s.
-- n6: A `--force` cell on `418739bd` plus lexical batches with spill; the
-  RSS-pass cells were `f24c29af` (895 MB, 30 s) and `bf6db512` (1.6 MB,
+- n6: Stored at `179f1b7e` (batch-deflated output; the 1-OSC peak is near
+  the sampler's floor). The RSS-pass cells were `f24c29af` (895 MB, 30 s) and `bf6db512` (1.6 MB,
   24 s).
 - n7: Peak from a `--force` cell on `c97b9985` plus right-sized, recycled
   decode buffers; walls unchanged per work phase and left as stored. The
   RSS-pass peaks were cat 1.24 GB, time-filter 1.16 GB, getparents 705 MB,
   check `--ids` 646 MB, extract `--simple` 3.52 GB, tags-filter two-pass
   2.84 GB, inspect `--extended` 571 MB.
-- n8: A `--force` cell on `5bfa37ab` plus per-block framing; the RSS-pass
+- n8: Stored at `179f1b7e`; the RSS-pass
   cell was `f2b8beed`, 3.12 GB and 2m07s, and 2.97 GB after the decode
   buffer change.
+- n9: Re-measured at `179f1b7e` for WRK-002; the pre-`5bfa37ab` cells were
+  check `f6ba05d4` (2.47 GB, 34 s), extract `ce0bdcc0` (5.27 GB, 2m02s) and
+  multi-extract `4babae4d` (10.3 GB, 10m53s).
+- n10: Stored at `179f1b7e` (the streaming work-unit diff, `587bfc12`).
+  Before it: text `f9fa4f6f` (605 MB, 3m04s), osc `607cd897` (653 MB,
+  4m11s). The osc row's peak and wall come from two `--force` cells of
+  the derive spill and worker-deflate change (1.25 GB; 156.3 s and
+  156.6 s), interleaved with stored `179f1b7e` cells `3660071f` and
+  `955da7f4` (240.7 s, 241.3 s, 5.00 GB); `c55bebc9` (5.00 GB, 4m03s) is
+  the stored cell before it. Numbers in reference/performance.md.
 
 Measurement artefacts in the RSS pass's percentages, settled: per-worker
 peak was the same on both hosts for getparents, check `--ids` and
@@ -356,32 +358,28 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-034: merge-changes validate-and-forward worker mode
+### WRK-109: Text diff tails format on the head unit's core
 
-Workers could validate a batch on borrowed attributes and forward the source
-bytes instead of re-emitting. Saves numeric parse/format, string allocation
-and escaping per element; a wall win only where workers, not readers, bound
-the run. The driver now enforces the element hierarchy on the reader thread,
-so what remains is attribute validation on borrowed bytes (what the sinks
-check today) and an explicit preservation policy: source
-spelling of coordinates, delete payloads (today stripped by
-`write_delete_xml`), attribute order. Preserving source bytes is a policy
-choice, not a correctness loss.
-
-### WRK-035: merge-changes in-flight budget at planet
-
-`merge_changes_credit_wait_ns` summed 15.6 s over the planet 7-OSC run:
-readers park on the 64 MiB `MERGE_CHANGES_INFLIGHT_BYTES` budget. Whether a
-larger budget shortens wall, or the pool is simply saturated, is unmeasured;
-one cell at a larger budget, read against average cores, settles it.
+The text diff shares the work-unit engine's head-of-line shape that the
+derive spill removed for `--format osc`: a text unit not at the head runs
+only `DIFF_OUTPUT_CHUNK_DEPTH` chunks ahead, and it takes a chunk after a
+whole single-sided blob run (a planet new-node blob is a few MB of compact
+lines). Planet text `-j 16` (`5e782b56`, `c12221f5`) peaks at 1.56 GB
+against 605 MB before `587bfc12`. Not measured: how much of its wall sits
+in serial tails (read the phase split for tails at about one core), and
+whether the peak is blob-sized chunks across the window. The text path may
+not spill (it writes no scratch by contract), so any fix is a bounded
+in-memory run-ahead, and a chunk cap alone would shrink run-ahead and
+lengthen any serial tail.
 
 ### WRK-036: merge-changes --simplify and tags-filter OSC on the batch readers
 
 `--simplify` still parses whole inputs into owned `ChangeStream`s per pool
 task (22.8 GB in `3e3ef119`). The reader and batch stage of `c97b9985`
-could feed its dedupe, and `tags-filter --input-kind osc` shares the
-owned-sink re-emit. `diff --format osc` already uses `ParallelGzipWriter`
-and could converge on the same ordered output stage.
+could feed its dedupe, and `tags-filter --input-kind osc` still re-emits
+through owned elements (the streaming merge's byte sink, `179f1b7e`, is the
+borrowed form). `diff --format osc` already uses `ParallelGzipWriter` and
+could converge on the same ordered output stage.
 
 ### WRK-037: ParallelGzipWriter window size
 
@@ -632,8 +630,10 @@ Tried 2026-10-31 on bygg after a day of planet benches, confounded:
 `d7de4025` (HEAD `82be10a4`) 403.3 s, `84802fca` (`e61e0ad7^` again)
 428.6 s. The walls rise with run order whatever the commit, and the
 difference sits in `EXTJOIN_RELATION_SCAN` (22 s at 8.2 cores against
-82 s at 2.7 cores, an I/O wall): drive state, not the scanners. Rerun
-after `sudo fstrim -av` (WRK-072) or a long idle.
+82 s at 2.7 cores, an I/O wall): drive state, not the scanners. A third
+`e61e0ad7^` cell half an hour later, `b5a20ad8`, took 371.3 s: one
+commit spans 339.6 to 428.6 s the same day, far wider than the effect
+sought. Rerun after `sudo fstrim -av` (WRK-072).
 
 ### WRK-098: Shared versus separate input descriptors
 

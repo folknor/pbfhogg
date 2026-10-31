@@ -151,8 +151,14 @@ never left partial, and the library no longer touches process state.
   text diff writes no scratch and refuses `--tmp-dir`. `-v` runs at any `-j`,
   `-c`, `-q` and `--format osc` skip byte-equal blob pairs at every `-j`,
   `--direct-io` applies at every `-j`, and inputs holding negative IDs run in
-  parallel too. A planet daily diff takes 284 s against 384 s before, at
-  1.8 GB peak anon against 0.65 GB.
+  parallel too. A planet daily text diff takes 284 s against 384 s before,
+  at 1.8 GB peak anon against 0.65 GB.
+- `diff --format osc` to a `.osc.gz` from indexed inputs deflates on every
+  worker and keeps its scratch compressed (about the output's size rather
+  than several times it), and no stretch of large changes (a planet's new
+  nodes) runs on one core any more: planet against planet takes 156 s
+  against 241 s, at 1.25 GB peak anon against 5.0 GB. The decompressed
+  output is unchanged; its gzip member boundaries are not.
 - `inspect` modes that decode blobs scan them inside the block validator
   instead of building and walking each block: planet `inspect --extended`
   takes 27 s against 40 s.
@@ -198,9 +204,12 @@ never left partial, and the library no longer touches process state.
 - Warnings start with `Warning:` and notes with `Note:`.
 - `merge-changes` (without `--simplify`) cuts every input into batches
   encoded in parallel, one input or many, and keeps output for later inputs
-  in scratch instead of memory: planet 7-OSC 30 s / 895 MB to 10 s / 286 MB,
-  1-OSC 24 s to 2.7 s. It takes `--tmp-dir`, and the output has one gzip
-  member and action section run per batch (same changes, same order).
+  in scratch instead of memory, and each batch's XML is deflated in one
+  call: planet 7-OSC 30 s / 895 MB to 3.7 s / 123 MB, 1-OSC 24 s to 2.4 s,
+  `--simplify` 34 s to 18 s. It takes `--tmp-dir`, and the output has one
+  gzip member and action section run per batch (same changes, same order).
+  `tags-filter --input-kind osc` writes gzip through the same kind of
+  buffer: planet 6.3 s to 5.2 s.
 - Commands that decode on a worker pool recycle right-sized decode buffers
   instead of allocating one per blob: planet peak RSS getparents 705 to
   288 MB, time-filter 1.18 GB to 841 MB, cat `--clean` 1.24 GB to 994 MB,

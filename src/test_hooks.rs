@@ -202,6 +202,13 @@ pub struct FaultPlan {
     /// Overrides the planner's unit target bytes when nonzero, so a small
     /// fixture is cut into many units and every cut path runs.
     pub diff_unit_target_bytes: AtomicUsize,
+    /// Overrides a derive unit's output chunk bytes when nonzero, so a small
+    /// fixture hands each section over in several members.
+    pub derive_chunk_bytes: AtomicUsize,
+    /// Members a derive unit queues before it spills the rest as if its
+    /// channel were full (`usize::MAX`, the default, leaves it to the
+    /// channel), so the spill and its ordering run on a small fixture.
+    pub derive_spill_after: AtomicUsize,
 
     // --- apply-changes streaming workers ---
     /// Blob sequence number at whose dequeue a streaming worker panics.
@@ -476,6 +483,8 @@ impl FaultPlan {
             diff_unit_panic: AtomicUsize::new(usize::MAX),
             derive_unit_panic: AtomicUsize::new(usize::MAX),
             diff_unit_target_bytes: AtomicUsize::new(0),
+            derive_chunk_bytes: AtomicUsize::new(0),
+            derive_spill_after: AtomicUsize::new(usize::MAX),
             apply_changes_panic_at_blob_seq: AtomicU64::new(u64::MAX),
             apply_changes_panic_waits_for_barrier_wait: AtomicBool::new(false),
             apply_changes_park_at_blob_seq: AtomicU64::new(u64::MAX),

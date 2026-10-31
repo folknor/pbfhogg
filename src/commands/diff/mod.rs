@@ -339,7 +339,7 @@ fn diff_block_pair<W: Write>(
     .collect();
 
     let text = output.is_some();
-    let make_sink = || DiffSink::new(text.then(Vec::new), options);
+    let make_sink = |_unit: usize| DiffSink::new(text.then(Vec::new), options);
     let mut consumer = TextConsumer {
         output,
         stats: DiffStats::default(),
@@ -453,17 +453,30 @@ impl units::UnitSink for DiffSink<'_, Vec<u8>> {
     type Item = Vec<u8>;
     type Stats = DiffStats;
 
-    fn take_chunk(&mut self) -> Option<Vec<u8>> {
-        let out = self.output.as_mut()?;
-        if out.len() < crate::tunables::DIFF_OUTPUT_CHUNK_BYTES {
-            return None;
+    /// Text chunks are taken after a whole action, a single-sided blob run
+    /// included: compact lines keep such a chunk a few MB at planet density,
+    /// and the text path has no scratch to spill a unit's run-ahead to, so
+    /// a larger chunk is what lets a later unit format ahead of the head.
+    fn record_into(
+        &mut self,
+        kind: ElementKind,
+        action: &BlockMergeAction<'_>,
+        out: &mut dyn units::UnitOut<Vec<u8>>,
+    ) -> Result<()> {
+        self.record(kind, action)?;
+        if let Some(buf) = self.output.as_mut()
+            && buf.len() >= crate::tunables::DIFF_OUTPUT_CHUNK_BYTES
+        {
+            out.send(std::mem::take(buf))?;
         }
-        Some(std::mem::take(out))
+        Ok(())
     }
 
-    fn finish(self) -> (Vec<Vec<u8>>, DiffStats) {
-        let rest = self.output.filter(|out| !out.is_empty());
-        (rest.into_iter().collect(), self.stats)
+    fn finish_into(self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<DiffStats> {
+        if let Some(buf) = self.output.filter(|buf| !buf.is_empty()) {
+            out.send(buf)?;
+        }
+        Ok(self.stats)
     }
 }
 

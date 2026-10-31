@@ -99,6 +99,78 @@ fn the_osc_does_not_depend_on_the_cuts() {
     }
 }
 
+/// One `.osc.gz` derive at `jobs`, one-byte units (a unit of nearly every
+/// blob), `chunk` bytes per member and units spilling after `spill_after`
+/// queued members, decompressed. Asserts the run left no scratch behind.
+fn derive_gz(
+    dir: &Path,
+    old: &Path,
+    new: &Path,
+    jobs: usize,
+    chunk: usize,
+    spill_after: usize,
+) -> String {
+    use std::io::Read;
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let host = crate::common::test_host();
+    let faults = host.invocation.faults();
+    faults.diff_unit_target_bytes.store(1, Ordering::Relaxed);
+    faults.derive_chunk_bytes.store(chunk, Ordering::Relaxed);
+    faults
+        .derive_spill_after
+        .store(spill_after, Ordering::Relaxed);
+    let run = RUN.fetch_add(1, Ordering::Relaxed);
+    let scratch = dir.join(format!("scratch-gz-{run}"));
+    std::fs::create_dir(&scratch).unwrap();
+    let osc = dir.join(format!("out-gz-{run}.osc.gz"));
+    derive_changes(
+        old,
+        new,
+        crate::common::out(&osc),
+        false,
+        false,
+        None,
+        pbfhogg::Parallelism::from_jobs(jobs),
+        &host,
+        crate::common::scratch_in(&scratch),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "jobs {jobs}, chunk {chunk}, spill {spill_after}: {}",
+            e.report()
+        )
+    });
+    assert!(snapshot_dir(&scratch).is_empty(), "spill files left behind");
+    let mut xml = String::new();
+    flate2::read::MultiGzDecoder::new(std::fs::File::open(&osc).unwrap())
+        .read_to_string(&mut xml)
+        .unwrap();
+    xml
+}
+
+/// A gzip OSC decompresses to the plain one whether each unit's members
+/// reach the consumer through its channel or through spill files, and
+/// whatever the member size: a unit that spills after some queued members,
+/// and its last partial members after the spill began, keep each action's
+/// elements in input order.
+#[test]
+fn the_gzip_osc_does_not_depend_on_members_or_spills() {
+    let dir = crate::common::test_scratch();
+    let (old, new) = write_pair(dir.path());
+    let reference = derive_xml(dir.path(), &old, &new, 1, 0);
+    for jobs in [1, 3] {
+        for chunk in [64, 0] {
+            for spill_after in [usize::MAX, 0, 2] {
+                assert_eq!(
+                    derive_gz(dir.path(), &old, &new, jobs, chunk, spill_after),
+                    reference,
+                    "jobs {jobs}, chunk {chunk}, spill after {spill_after}"
+                );
+            }
+        }
+    }
+}
+
 /// A panic in a derive unit worker surfaces as an `Err`, publishes nothing
 /// and leaves the scratch directory clean.
 #[test]

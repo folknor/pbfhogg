@@ -72,7 +72,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 
 ¹ Measured on a different host (Ryzen 9 9950X3D2, 30.5 GiB, commit `81f3fbe4`), on a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs. The earlier figure in this row came from a base without its untagged nodes, where most of the diff's way references went unresolved; see [reference/performance.md](reference/performance.md).
 
-The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (~246 GB) and `diff --format osc` (~45 GB of XML at planet). A text `diff` writes none at any `-j`: its output goes out as it is produced.
+The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (~246 GB) and `diff --format osc` (its change XML: compressed, about the output's size, for a `.osc.gz` from indexed inputs; plain and several times larger otherwise). A text `diff` writes none at any `-j`: its output goes out as it is produced.
 
 History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
 

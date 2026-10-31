@@ -1841,9 +1841,32 @@ Same change counts as the baselines (26,261,540 and 4,305,714). The
 7-OSC output is 965.1 MB against 962 MB (one gzip member per batch).
 Spill: about 787 MB written for inputs 2-7 and copied back. The readers
 spent 15.6 s summed waiting for credit
-(`merge_changes_credit_wait_ns`), so the 64 MiB budget binds at planet;
-whether a larger budget buys wall is not measured. The 1-OSC peak rises
+(`merge_changes_credit_wait_ns`), so the 64 MiB budget bound at planet;
+since `179f1b7e` the readers never wait on it (below). The 1-OSC peak rises
 from a single-threaded stream to the batch working set, accepted.
+
+### One deflate per batch, no owned elements (bygg, 2026-10-31)
+
+At `82be10a4` the workers were the bound (30.7 cores, readers parked
+16.8 s summed on the credit ledger), but not because of the XML: every
+quick-xml event went straight into a `GzEncoder`, so deflate ran once
+per tiny write. `179f1b7e` writes each batch's XML to a plain buffer and
+deflates it in one call, and replays batches into a byte sink that
+writes the owned writers' bytes without building owned elements. The
+borrowed sink alone, measured first as an uncommitted cell, moved the
+7-OSC wall only from 9.9 to 9.35 s; the deflate change took it to 3.7 s.
+
+| Cell | `82be10a4` | `179f1b7e` |
+|---|---:|---:|
+| 7-OSC `--osc-range 4914..4920` | 9.93 s (`c8b6af17`) | 3.73, 3.70 s (`ba9e4ad7`, `444fd7fa`) |
+| 1-OSC `--osc-seq 4913` | 2.61 s (`b0175d10`) | 2.40 s (`bd19099c`) |
+| 7-OSC `--simplify` | 34.2 s (`2f49e9c1`) | 17.7 s (`3ae86540`) |
+| `tags-filter --input-kind osc`, 4913 | 6.25 s (`e6749613`) | 5.24 s (`c1e30598`) |
+
+The 7-OSC run is now reader bound: 19 cores, no credit wait, peak anon
+123 MB from 295 MB. The plain-XML output of the 7-OSC merge is
+byte-identical to `82be10a4`'s; the gzip members differ in deflate
+chunking only.
 
 ### OSC driver enforces the element hierarchy (bygg, 2026-10-30)
 
@@ -2327,23 +2350,36 @@ planets) shares the engine:
 | `9dc54efe` | `4dbc2d47` | osc | 210.5 s |
 | `11143d70` | `9afb9449` | osc | 215.7 s |
 
-Text -10 %; osc within noise (its wall is dominated by the gzip
-assembly after the merge).
+Text -10 %; osc within noise.
 
-## Inspect --extended: validator-projection scan (bygg, 2026-10-31)
+### Derive units deflate and spill their own output (bygg, 2026-10-31)
 
-`4dbc2d47` scans each blob inside the block validator instead of
-building a `PrimitiveBlock` and walking its elements. Planet,
-interleaved `--bench 1`:
+`diff-snapshots --from base --to 20260411 --format osc -j 16`, matched
+interleaved `--bench 1` cells, base `179f1b7e` (stored) against the
+same tree plus worker-side gzip members and per-unit spill (unstored,
+`--force`, landed in the commit following `179f1b7e`):
 
-| UUID | Commit | Wall | Peak anon |
+| Cell | Commit | Wall | Peak anon |
 |---|---|---:|---:|
-| `970ff659` | `4dbc2d47` | 27.1 s | |
-| `3970b8a1` | `587bfc12` | 39.5 s | |
-| `c1a2a0e6` | `4dbc2d47` | 26.4 s | 303 MB |
-| `102cf3b2` | `587bfc12` | 39.7 s | 379 MB |
+| `3660071f` | `179f1b7e` | 240.7 s | 5.00 GB |
+| (unstored) | variant | 156.3 s | 1.25 GB |
+| `955da7f4` | `179f1b7e` | 241.3 s | |
+| (unstored) | variant | 156.6 s | |
 
--33 % wall. Every decoding inspect mode runs the same scan.
+-35 %, sign-consistent across both pairs. The base's phase split
+(`c55bebc9`, same commit) had the merge at 15.6 cores for 101 s, then
+37 s, 14 s and 15 s of node, way and relation tails at 1.1-1.4 user
+cores and 0.1 kernel: not the calling thread's scratch writes but
+head-of-line formatting. A unit the consumer was not reading could run
+only `DIFF_OUTPUT_CHUNK_DEPTH` chunks ahead, and the 440 new-only node
+blobs (109 M elements, about 34 MB of XML each) made each tail unit's
+output hundreds of MB, so only the head unit's worker progressed. The
+same blobs made each chunk a whole blob's XML, which was the 5.0 GB
+spike as the tail began. In the variant those tails run at 12.2, 7.4
+and 13.0 cores in 5.9 s, 4.1 s and 1.4 s, and the assembly is a 1.6 s
+copy of compressed fragments instead of 8.2 s deflating 29 GB. The text
+form, which shares the engine but neither change, is neutral: `c12221f5`
+(`179f1b7e`) 146.3 s against 146.4 s unstored.
 
 ### Europe, `-j 1`, OSC 4715
 
@@ -2361,6 +2397,21 @@ header as it arrives, which removes the walk and brings back
 `--direct-io` and page-cache eviction at `-j 1`: -31 % against
 `f3e1c9b9`. The unstored cells also carry `f3e1c9b9`'s cheaper block
 construction, so they compare with `79d2e923` only approximately.
+
+## Inspect --extended: validator-projection scan (bygg, 2026-10-31)
+
+`4dbc2d47` scans each blob inside the block validator instead of
+building a `PrimitiveBlock` and walking its elements. Planet,
+interleaved `--bench 1`:
+
+| UUID | Commit | Wall | Peak anon |
+|---|---|---:|---:|
+| `970ff659` | `4dbc2d47` | 27.1 s | |
+| `3970b8a1` | `587bfc12` | 39.5 s | |
+| `c1a2a0e6` | `4dbc2d47` | 26.4 s | 303 MB |
+| `102cf3b2` | `587bfc12` | 39.7 s | 379 MB |
+
+-33 % wall. Every decoding inspect mode runs the same scan.
 
 ## `--direct-io` impact summary
 

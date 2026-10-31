@@ -675,8 +675,15 @@ pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
 
 /// Formatted output bytes a unit's worker gathers before handing a chunk to
 /// the consumer, so a unit with a large output streams it instead of
-/// holding it whole. Not measured.
+/// holding it whole. The text diff takes a chunk after a whole merge action,
+/// so a single-sided blob run can pass it by a blob's lines; derive polls
+/// such runs element by element, so a derive chunk (one gzip member of a
+/// `.osc.gz`) passes it by at most one element. Not measured.
 pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
+
+/// Read buffer for appending a derive unit's spill file to its fragment;
+/// the cancellation token is checked once per buffer. Not measured.
+pub(crate) const DIFF_SPILL_COPY_BUFFER: usize = 1 << 20;
 
 /// Bytes of XML gathered in front of a streaming OSC gzip encoder before
 /// deflate runs: the XML writers emit many tiny writes per element, and
@@ -685,7 +692,7 @@ pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 pub(crate) const OSC_GZIP_WRITE_BUFFER: usize = 256 << 10;
 
 /// Output chunks one unit may have queued for the consumer before its
-/// worker blocks.
+/// worker blocks (text) or spills the rest of the unit to scratch (derive).
 pub(crate) const DIFF_OUTPUT_CHUNK_DEPTH: usize = 4;
 
 // ---------------------------------------------------------------------------

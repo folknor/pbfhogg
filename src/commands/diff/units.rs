@@ -8,8 +8,9 @@
 //! both inputs that intersect it. Units run on the ordered pool
 //! ([`run_ordered_streams_from`]); each worker merges its unit
 //! ([`block_pair_merge_phase`]) and streams its output in bounded chunks,
-//! which the calling thread hands to the command in unit order. Nothing is
-//! written to scratch, and no header is walked ahead of the merge.
+//! which the calling thread hands to the command in unit order. The engine
+//! writes no scratch (a command's sink may: derive spills a unit's output
+//! once its channel is full), and no header is walked ahead of the merge.
 //!
 //! # Cuts
 //!
@@ -78,20 +79,36 @@ pub(super) struct Phase {
     pub(super) end_marker: &'static str,
 }
 
-/// A command's worker-side sink: it records one unit's merge actions,
-/// gathering output it hands over in chunks.
-pub(super) trait UnitSink: MergeSink {
+/// A unit's way out to the consumer, as its sink sees it.
+pub(super) trait UnitOut<T> {
+    /// Hand one item over, blocking while the unit's channel is full.
+    fn send(&mut self, item: T) -> Result<()>;
+    /// Hand one item over if the channel has room; `Some(item)` back when
+    /// it is full.
+    fn try_send(&mut self, item: T) -> Result<Option<T>>;
+    /// Nothing this unit produces can be delivered any more.
+    fn abandoned(&self) -> bool;
+}
+
+/// A command's worker-side sink: it records one unit's merge actions and
+/// hands its output over in chunks as it goes.
+pub(super) trait UnitSink: Send {
     /// One chunk of output.
     type Item: Send;
     /// The unit's counts.
     type Stats: Send;
 
-    /// A gathered chunk, once one is due; called after every action until it
-    /// answers `None`.
-    fn take_chunk(&mut self) -> Option<Self::Item>;
+    /// Record one merge action, handing over any chunks it made due.
+    fn record_into(
+        &mut self,
+        kind: ElementKind,
+        action: &crate::osc::merge_join::BlockMergeAction<'_>,
+        out: &mut dyn UnitOut<Self::Item>,
+    ) -> Result<()>;
 
-    /// The unit is merged: its remaining output and its counts.
-    fn finish(self) -> (Vec<Self::Item>, Self::Stats);
+    /// The unit is merged: hand over the remaining output, return the
+    /// counts.
+    fn finish_into(self, out: &mut dyn UnitOut<Self::Item>) -> Result<Self::Stats>;
 }
 
 /// A command's side of the run, on the calling thread: it receives every
@@ -161,7 +178,7 @@ pub(super) fn run<C: UnitConsumer>(
     jobs: usize,
     direct_io: bool,
     skip_equal_blobs: bool,
-    make_sink: &(dyn Fn() -> C::Sink + Sync),
+    make_sink: &(dyn Fn(usize) -> C::Sink + Sync),
     consumer: &mut C,
     host: &crate::host::Entered<'_>,
 ) -> Result<BlockPairMergeStats> {
@@ -233,7 +250,7 @@ fn drive<C: UnitConsumer>(
     phases: &[Phase],
     workers: usize,
     skip_equal_blobs: bool,
-    make_sink: &(dyn Fn() -> C::Sink + Sync),
+    make_sink: &(dyn Fn(usize) -> C::Sink + Sync),
     consumer: &mut C,
     paths: (&Arc<std::path::Path>, &Arc<std::path::Path>),
     invocation: &crate::host::Recorder,
@@ -305,13 +322,11 @@ fn drive<C: UnitConsumer>(
             {
                 panic!("{}", C::panic_message(task));
             }
-            #[cfg(not(feature = "test-hooks"))]
-            let _ = task;
             merge_unit(
                 &unit,
                 (old_path, new_path),
                 skip_equal_blobs,
-                make_sink(),
+                make_sink(task),
                 emitter,
                 invocation,
             )
@@ -334,7 +349,10 @@ fn merge_unit<S: UnitSink>(
 ) -> Result<UnitEnd<S::Stats>> {
     let mut old_side = BlockPairSide::new(&unit.old, old_path, unit.window);
     let mut new_side = BlockPairSide::new(&unit.new, new_path, unit.window);
-    let mut chunking = Chunking { sink, emitter };
+    let mut chunking = Chunking {
+        sink,
+        out: EmitterOut(emitter),
+    };
     let mut merge = BlockPairMergeStats::default();
     block_pair_merge_phase(
         &mut old_side,
@@ -345,17 +363,32 @@ fn merge_unit<S: UnitSink>(
         &mut merge,
         cancel,
     )?;
-    let (rest, stats) = chunking.sink.finish();
-    for item in rest {
-        emitter.send(item)?;
-    }
+    let Chunking { sink, mut out } = chunking;
+    let stats = sink.finish_into(&mut out)?;
     Ok(UnitEnd { stats, merge })
 }
 
-/// A unit sink whose due chunks go straight to the consumer.
+/// The pool's emitter as a sink's way out.
+struct EmitterOut<'e, 'a, T, E>(&'e Emitter<'a, T, E>);
+
+impl<T, E> UnitOut<T> for EmitterOut<'_, '_, T, E> {
+    fn send(&mut self, item: T) -> Result<()> {
+        self.0.send(item)
+    }
+
+    fn try_send(&mut self, item: T) -> Result<Option<T>> {
+        self.0.try_send(item)
+    }
+
+    fn abandoned(&self) -> bool {
+        self.0.abandoned()
+    }
+}
+
+/// A unit sink recording the merge's actions through its way out.
 struct Chunking<'e, 'a, S: UnitSink> {
     sink: S,
-    emitter: &'e Emitter<'a, S::Item, UnitEnd<S::Stats>>,
+    out: EmitterOut<'e, 'a, S::Item, UnitEnd<S::Stats>>,
 }
 
 impl<S: UnitSink> MergeSink for Chunking<'_, '_, S> {
@@ -364,11 +397,7 @@ impl<S: UnitSink> MergeSink for Chunking<'_, '_, S> {
         kind: ElementKind,
         action: &crate::osc::merge_join::BlockMergeAction<'_>,
     ) -> Result<()> {
-        self.sink.record(kind, action)?;
-        while let Some(item) = self.sink.take_chunk() {
-            self.emitter.send(item)?;
-        }
-        Ok(())
+        self.sink.record_into(kind, action, &mut self.out)
     }
 }
 

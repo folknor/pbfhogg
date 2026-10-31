@@ -499,13 +499,15 @@ root. Anything else is refused, naming the misplaced element. This follows
 libosmium's section and object-child structure; the root-level differences are
 in DEVIATIONS.md. Text and comments are ignored wherever they appear.
 
-The owned OSC sinks (`merge-changes` and `tags-filter --input-kind osc`)
-deliberately parse version but pass timestamp, changeset, uid and visible through
-as normalized XML attribute text without native-value validation. They do not
-preserve raw entity spellings or raw attribute whitespace. The apply-changes
-overlay retains its native numeric metadata parsing and treats only literal
-`false` as hidden. Applying the overlay's native metadata validation to the
-owned sinks would reject attribute text those sinks currently preserve. Every
+The re-emitting OSC paths (`merge-changes`, with or without `--simplify`, and
+`tags-filter --input-kind osc`) deliberately parse version but pass timestamp,
+changeset, uid and visible through as normalized XML attribute text without
+native-value validation. They do not preserve raw entity spellings or raw
+attribute whitespace, and all of them write the same normalized bytes for the
+same element. The apply-changes overlay retains its native numeric metadata
+parsing and treats only literal `false` as hidden. Applying the overlay's
+native metadata validation to the re-emitting paths would reject attribute text
+they currently preserve. Every
 `tag`, `nd` and `member` is read by one parser per child kind, whatever the
 command: a missing role reads as empty, and a malformed role, an unknown member
 type, or a missing `k`, `v` or `ref` is refused. The children of an object in

@@ -627,7 +627,9 @@ fn guarded<T>(failure: &FirstFailure, who: &str, f: impl FnOnce() -> io::Result<
     }
 }
 
-/// Compress one chunk as a standalone gzip member.
+/// Compress one chunk as a standalone gzip member. Also what the
+/// `diff --format osc` unit workers and its framing use, so every member of
+/// that output is deflated alike, with the same fixed header.
 ///
 /// The `io::Result` return type is nominal: the inner writer is a
 /// `Vec<u8>` whose `Write` impl is infallible, and flate2 does not
@@ -636,7 +638,7 @@ fn guarded<T>(failure: &FirstFailure, who: &str, f: impl FnOnce() -> io::Result<
 /// unreachable today. Kept fallible as defensive coding in case the
 /// sink is ever swapped for a fallible writer; callers (particularly
 /// `worker_loop` above) must continue to handle `Err` as a real error.
-fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 2), compression_level());
     enc.write_all(raw)?;
     enc.finish()
@@ -935,7 +937,7 @@ mod tests {
     fn empty_stream_produces_empty_output() {
         // No bytes in means no chunks shipped means no gzip members
         // written. That's stricter than zlib would produce, but the
-        // one real consumer (`assemble_osc_from_paths`) always emits
+        // one real consumer (`assemble_osc`) always emits
         // at least the XML prologue + root element before any
         // parallel gzip member, so a truly empty stream is
         // unreachable in practice. Document the no-op behaviour here.

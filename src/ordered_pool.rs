@@ -872,6 +872,26 @@ impl<T, E> Emitter<'_, T, E> {
         Ok(())
     }
 
+    /// Hand one item to the consumer if the task's channel has room:
+    /// `Ok(None)` when sent, `Ok(Some(item))` back when the channel is full
+    /// (nothing recorded: the caller does not block). Fails once the
+    /// consumer is gone or the run is abandoned, latching as [`Self::send`].
+    pub(crate) fn try_send(&self, item: T) -> crate::Result<Option<T>> {
+        if !self.abandoned() {
+            match self.tx.try_send(StreamMsg::Item(item)) {
+                Ok(()) => return Ok(None),
+                Err(std::sync::mpsc::TrySendError::Full(StreamMsg::Item(item))) => {
+                    return Ok(Some(item));
+                }
+                Err(_) => {}
+            }
+        }
+        self.gone.set(true);
+        Err(Error::internal(
+            "ordered pool: the consumer of a streamed task is gone",
+        ))
+    }
+
     /// The run is being abandoned (the consumer has returned or a thread
     /// unwound), or a send already failed: nothing this task produces from
     /// here can be delivered, so a long task may stop early.

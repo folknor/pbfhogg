@@ -551,23 +551,13 @@ question.
 
 `brokkr read --dataset planet`, `ce6f20d9^` vs `307982d7`, the cheapest
 broad check. Covers the `BlockBuilder` cold refusal (`ce6f20d9`), the raw
-scanners and `packed_varint_count` (`e61e0ad7`), the single `run_pipeline`
+scanners and `packed_varint_count` (`e61e0ad7`; its read cost is measured
+and fixed at HEAD, see "Packed varint count" in `reference/performance.md`,
+so a range delta near +15 % on sequential read is that and nothing new),
+the single `run_pipeline`
 engine (`dd312160`) and the one frame decoder (`307982d7`: `BlobReader`'s
 prefix through one `fill`, and `HeaderWalker` copying each header into its
 buffer, which would show on warm-cache dense inputs).
-
-### WRK-081: packed_varint_count, ruled measure first
-
-`brokkr read --dataset planet`, `e61e0ad7^` vs `e61e0ad7`, plus one
-decode-bound command (`cat --clean` on europe), required whatever WRK-080
-shows. The per-byte position counter probably stops the loop vectorizing
-(estimated 2-5 % on decode-bound planet commands); BUG-191's width check was
-rejected (`bc38ad55`) for exactly that cost. Inside noise: keep. Above: keep
-the exact refusal but restore the vectorizable terminal-byte count, with a
-masked eight-bytes-at-a-time check for a run of nine continuation bytes and
-the per-byte scan only for an array that has one. The maintainer may
-instead revert to the plain count (a malformed tenth byte slips through);
-the measurement decides. `packed_uint32_count` tracked position before.
 
 ### WRK-082: The validated-invariant trio
 
@@ -713,7 +703,10 @@ only if it moves.
 lockstep instead of zipped `PackedSint64Iter`s, whose iterator swallowed
 errors on purpose). Forced sparse at planet thrashes for hours
 (`notes/todo.md`, "altw sparse path"); use europe or north-america for
-sparse. This pair cannot separate the scanners from `packed_varint_count`.
+sparse. The pair also carries `e61e0ad7`'s per-byte `packed_varint_count`
+(+15-19 % on planet sequential and blobreader read, restored to a popcount
+count at HEAD; "Packed varint count" in `reference/performance.md`), so
+attribute an altw delta through the scanner phases, not the wall.
 
 ### WRK-098: Shared versus separate input descriptors
 

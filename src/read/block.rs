@@ -767,8 +767,61 @@ impl PrimitiveBlock {
 /// negative `int32` values. This is a byte scan, not a decode - no value is
 /// reconstructed. `packed_varint_count_matches_read_varint` pins the
 /// equivalence against the decoder itself.
+///
+/// The tenth-byte rule needs a position within the varint, and carrying one
+/// per byte makes the loop serial: it cost 15-19 % of single-threaded planet
+/// decode (see "Packed varint count" in `reference/performance.md`). So the
+/// common case runs eight bytes at a time: terminal bytes are counted with one
+/// mask and popcount per word, and the only state carried between words is
+/// the length of the continuation run at the word's end. Without a run of
+/// nine continuation bytes no varint reaches a tenth byte, so every terminal
+/// byte ends a legal varint and the array is valid iff it does not end
+/// mid-varint. An array that holds such a run - never one a PBF writer
+/// emits - is judged by the exact per-byte scan instead.
 #[inline]
 pub(crate) fn packed_varint_count(data: &[u8]) -> Result<usize> {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let (words, tail) = data.as_chunks::<8>();
+    let mut count = 0usize;
+    // Continuation bytes at the end of everything scanned so far, capped at 9.
+    let mut run = 0u32;
+    let mut long_run = false;
+    for word in words {
+        // Bit 7 of byte k set iff byte k is terminal (slice order, little-endian).
+        let terminals = !u64::from_le_bytes(*word) & HIGH;
+        count += terminals.count_ones() as usize;
+        // Continuation bytes before the word's first terminal (8 if none).
+        let lead = terminals.trailing_zeros() / 8;
+        long_run |= run + lead >= 9;
+        run = if terminals == 0 {
+            (run + 8).min(9)
+        } else {
+            terminals.leading_zeros() / 8
+        };
+    }
+    for &b in tail {
+        if b & 0x80 == 0 {
+            count += 1;
+            run = 0;
+        } else {
+            run += 1;
+            long_run |= run >= 9;
+        }
+    }
+    if long_run {
+        return packed_varint_count_exact(data);
+    }
+    if run != 0 {
+        return Err(new_wire_error("packed varint array ends mid-varint"));
+    }
+    Ok(count)
+}
+
+/// The per-byte form of [`packed_varint_count`], for arrays holding a run of
+/// nine or more continuation bytes.
+#[cold]
+#[inline(never)]
+fn packed_varint_count_exact(data: &[u8]) -> Result<usize> {
     let mut count = 0usize;
     // Index of the current byte within its varint.
     let mut pos = 0u8;
@@ -1937,12 +1990,28 @@ mod strict_validation_tests {
         // Random strings almost never reach a tenth byte, so build that case
         // directly: every continuation run up to eleven bytes, then every
         // possible next byte, with and without a valid value before it and
-        // with a terminal, a continuation, or nothing after it.
+        // with a terminal, a continuation, or nothing after it. The prefixes
+        // put the run at every offset modulo eight, so the word-at-a-time
+        // scan sees it inside a word, across a word boundary and in the
+        // trailing bytes; the last prefix ends mid-varint and joins its
+        // continuation bytes onto the run.
+        let prefixes: [&[u8]; 10] = [
+            &[],
+            &[0x02],
+            &[0x02; 2],
+            &[0x02; 3],
+            &[0x02; 4],
+            &[0x02; 5],
+            &[0x02; 6],
+            &[0x02; 7],
+            &[0x02; 8],
+            &[0x02, 0x80, 0x80, 0x80, 0x80, 0x80],
+        ];
         for fill in [0x80u8, 0x8f, 0xff] {
             for run in 0..=11 {
                 for last in 0..=255u8 {
-                    for prefix in [&[][..], &[0x02]] {
-                        for suffix in [&[][..], &[0x02], &[0x80]] {
+                    for prefix in prefixes {
+                        for suffix in [&[][..], &[0x02], &[0x80], &[0x02; 9]] {
                             buf.clear();
                             buf.extend_from_slice(prefix);
                             buf.extend(std::iter::repeat_n(fill, run));
@@ -1953,6 +2022,19 @@ mod strict_validation_tests {
                     }
                 }
             }
+        }
+
+        // Two maximal legal runs back to back, at every offset: the carried
+        // run must reset at each terminal byte.
+        for offset in 0..8 {
+            buf.clear();
+            buf.extend(std::iter::repeat_n(0x02, offset));
+            for _ in 0..2 {
+                buf.extend(std::iter::repeat_n(0x80, 8));
+                buf.push(0x00);
+            }
+            assert_eq!(super::packed_varint_count(&buf).ok(), Some(offset + 2));
+            check(&buf);
         }
 
         // Longer pseudo-random strings, biased toward continuation bytes so

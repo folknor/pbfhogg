@@ -1481,6 +1481,45 @@ compare per decoded block. Interleaved `--bench 1` cells against
 Both inside the noise band (extract medians 119.9 against 120.4 s, geocode
 316.0 against 321.2 s).
 
+### Packed varint count (bygg, 2026-10-31)
+
+Block construction counts every packed varint array (the dense id, lat, lon
+and metadata arrays, way refs and coordinates, relation members) to check
+parallel-array lengths. `e61e0ad7` made the count refuse a tenth byte above
+1 by carrying a position within the varint through a per-byte loop, which
+replaced a plain terminal-byte count. `brokkr read --dataset planet
+--bench 1`, its parent `2ba3e170` then `e61e0ad7`, one pair, untrimmed:
+
+| Mode | `2ba3e170` | `e61e0ad7` | Delta | UUIDs |
+|---|---:|---:|---:|---|
+| sequential | 524.9 s | 622.7 s | +18.6 % | `37e81b55` `9d17af61` |
+| parallel | 28.7 s | 31.5 s | +9.7 % | `c7fd866a` `9dd0794c` |
+| pipelined | 197.4 s | 196.1 s | -0.7 % | `2bac0419` `bb0de759` |
+| blobreader | 562.2 s | 646.0 s | +14.9 % | `be0344af` `05ca943b` |
+
+`brokkr sidecar --compare 37e81b55 9d17af61` shows the same single core and
+the same bytes read: pure decode CPU. `cat --clean --dataset europe` on the
+same pair is flat (158.7 s `c6513257` against 156.3 s `a822749f`): its
+encode and compression hide the count.
+
+The count now works eight bytes at a time (a mask and a popcount per word,
+only the continuation run length carried between words; arrays holding a
+run of nine continuation bytes take the exact per-byte scan), with the same
+refusal. HEAD `14909999` as a stored `--commit` cell against the change
+uncommitted on top of it (`--force`, not stored), alternating, two pairs:
+
+| Mode | `14909999` | change | Delta (pair 1, pair 2) |
+|---|---:|---:|---:|
+| sequential | 597.6, 597.2 s | 528.9, 526.4 s | -11.5 %, -11.9 % |
+| parallel | 31.1, 30.7 s | 28.8, 28.9 s | -7.4 %, -6.1 % |
+| pipelined | 193.2, 192.6 s | 190.0, 190.7 s | -1.7 %, -1.0 % |
+| blobreader | 635.2, 637.8 s | 567.2, 567.0 s | -10.7 %, -11.1 % |
+
+`14909999` UUIDs: `fe3c0729` `302e9434` `4ecbe852` `a6d47169` (pair 1),
+`f6a3283c` `acb37618` `f7c4555d` `6c041b12` (pair 2). The signs agree across
+pairs, and the change brings sequential and blobreader back to the level of
+`2ba3e170`. Pipelined read is bound elsewhere and does not move.
+
 ### External stage 1 worker cap (bygg, 2026-10-28)
 
 Question: should external stage 1 pass A cap its worker count like stages

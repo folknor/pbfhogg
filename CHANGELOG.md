@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- Block decoding is faster again: 0.6.0's stricter packed-varint check made
+  single-threaded planet decoding about 15-19 % slower, and it now costs
+  nothing on well-formed input (sequential `ElementReader` on planet about
+  12 % faster than 0.6.0, parallel about 6-7 %). Malformed varints are
+  still refused.
+
 ## 0.6.0 - 2026-10-30
 
 0.6.0 makes pbfhogg safe to embed as a library and strict about its input.

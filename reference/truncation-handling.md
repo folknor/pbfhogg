@@ -300,6 +300,19 @@ the three arrays independently, could pair an id with another
 node's coordinates. A unit test checks the count against the
 decoder itself.
 
+The refusal costs nothing on normal input. The tenth-byte rule
+needs a position within the varint, and tracking one per byte
+made the count serial: about a sixth of single-threaded planet
+decode. So the count works eight bytes at a time, counting
+terminal bytes with a mask and a popcount and carrying only the
+length of the continuation run between words. Without a run of
+nine continuation bytes no varint reaches a tenth byte, so the
+array is valid exactly when it does not end mid-varint. Only an
+array that holds such a run, which no PBF writer emits, is
+judged byte by byte. `performance.md` holds the measurements.
+`packed_uint32_count`, the variant for tag string indices, scans
+per byte, because its `u32` bound needs the position anyway.
+
 This is a decodability guarantee, not a value-range one, and on
 purpose. A 32-bit field whose varint does not fit its type is
 decoded by narrowing, as protobuf specifies (a cast for `int32`

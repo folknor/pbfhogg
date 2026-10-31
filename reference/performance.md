@@ -1521,6 +1521,26 @@ uncommitted on top of it (`--force`, not stored), alternating, two pairs:
 pairs, and the change brings sequential and blobreader back to the level of
 `2ba3e170`. Pipelined read is bound elsewhere and does not move.
 
+The whole read-path range, `ce6f20d9^` (`c0f67d9e`) against `307982d7`
+(the one frame decoder) and HEAD `82be10a4`, alternating cells later the
+same day:
+
+| Mode | `c0f67d9e` | `307982d7` | `82be10a4` |
+|---|---:|---:|---:|
+| sequential | 524.4, 522.5 s | 604.7, 602.7 s | 534.9, 535.2 s |
+| parallel | 28.6, 29.1 s | 31.4, 31.4 s | 29.1, 29.5 s |
+| pipelined | 196.0, 195.6 s | 195.3, 195.8 s | 191.8, 191.1 s |
+| blobreader | 562.4, 560.8 s | 642.7, 641.9 s | 574.9, 577.6 s |
+
+The range's +15 % is the count above and nothing else: HEAD sits within
+about 2.5 % of the range's start on every mode (sequential and blobreader
++2.2 to +2.6 %, both cells; pipelined -2 %), inside the noise floor. UUIDs
+per run in mode order: `fa1a43ed` `cf9ee896` `aa12912c` `6104a00d` and
+`c2a44d9a` `50eb615e` `4d6151f6` `dc6ccb4e` (`c0f67d9e`); `725c022a`
+`a9baa55a` `0adb24b2` `02d7558c` and `6e9f2082` `1f946c48` `b6f51bdd`
+`ddbaec65` (`307982d7`); `d52a1091` `455504be` `e0f24d30` `c432d7cc` and
+`0a3ca1d6` `cbb3177c` `4738d079` `c70c136d` (`82be10a4`).
+
 ### External stage 1 worker cap (bygg, 2026-10-28)
 
 Question: should external stage 1 pass A cap its worker count like stages

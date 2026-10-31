@@ -151,13 +151,26 @@ pub(crate) fn parse_str_attr(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
 ) -> ParseResult<String> {
+    let mut out = String::new();
+    append_str_attr(e, name, &mut out)?;
+    Ok(out)
+}
+
+/// [`parse_str_attr`], appending the normalized value to `out` instead of
+/// allocating it: the same lookup and the same refusals.
+pub(crate) fn append_str_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+    out: &mut String,
+) -> ParseResult<()> {
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
             let val = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(xml_err)?;
-            return Ok(val.into_owned());
+            out.push_str(&val);
+            return Ok(());
         }
     }
     Err(missing_attr(name))
@@ -168,11 +181,23 @@ pub(crate) fn parse_str_attr(
 // role was written; that silently altered the data. The accepted OSC contract
 // changed (maintainer ruling, review audit) to match the PBF re-encoding
 // paths, the OSC arena and libosmium, whose expat parser rejects malformed XML
-// outright. Absent stays `Ok(None)`; only a malformed attribute is refused.
+// outright. Absent stays `Ok(false)`; only a malformed attribute is refused.
+#[cfg(test)]
 pub(crate) fn parse_str_attr_optional(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
 ) -> ParseResult<Option<String>> {
+    let mut out = String::new();
+    Ok(append_str_attr_optional(e, name, &mut out)?.then_some(out))
+}
+
+/// An optional attribute's normalized value, appended to `out`;
+/// `Ok(false)` when absent, refused when malformed.
+pub(crate) fn append_str_attr_optional(
+    e: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+    out: &mut String,
+) -> ParseResult<bool> {
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(|err| {
             Error::invalid_data_with(
@@ -195,10 +220,11 @@ pub(crate) fn parse_str_attr_optional(
                         err,
                     )
                 })?;
-            return Ok(Some(val.into_owned()));
+            out.push_str(&val);
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +249,7 @@ pub(crate) struct ParsedMember {
     pub(crate) kind: ElementKind,
     pub(crate) ref_id: i64,
     /// Empty when absent; a malformed role is refused (see
-    /// [`parse_str_attr_optional`]).
+    /// [`append_str_attr_optional`]).
     pub(crate) role: String,
 }
 
@@ -246,15 +272,29 @@ impl ParsedMember {
 }
 
 pub(crate) fn parse_member(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<ParsedMember> {
-    let type_text = parse_str_attr(e, "type")?;
-    let Some(kind) = ElementKind::from_name(&type_text) else {
+    let mut role = String::new();
+    let (kind, ref_id) = parse_member_into(e, &mut String::new(), &mut role)?;
+    Ok(ParsedMember { kind, ref_id, role })
+}
+
+/// [`parse_member`] without allocating: the type text goes through
+/// `type_scratch` (cleared first), the role is appended to `role_out`
+/// (nothing when absent). The same order and the same refusals.
+pub(crate) fn parse_member_into(
+    e: &quick_xml::events::BytesStart<'_>,
+    type_scratch: &mut String,
+    role_out: &mut String,
+) -> ParseResult<(ElementKind, i64)> {
+    type_scratch.clear();
+    append_str_attr(e, "type", type_scratch)?;
+    let Some(kind) = ElementKind::from_name(type_scratch) else {
         return Err(Error::invalid_data(format!(
-            "unknown relation member type: '{type_text}'"
+            "unknown relation member type: '{type_scratch}'"
         )));
     };
     let ref_id = parse_i64_attr(e, "ref")?;
-    let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
-    Ok(ParsedMember { kind, ref_id, role })
+    append_str_attr_optional(e, "role", role_out)?;
+    Ok((kind, ref_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +1040,28 @@ pub(crate) fn parse_owned_metadata(
         user: String::new(),
         visible: String::new(),
     };
-    let present = scan_meta_attrs(e, |field, attr| {
+    let present = scan_owned_metadata_into(e, &mut meta)?;
+    Ok(if present { Some(meta) } else { None })
+}
+
+/// [`parse_owned_metadata`] into caller-owned storage, every field cleared
+/// first, so a caller that reuses it allocates nothing once its strings
+/// have grown. Returns whether the element carried any metadata.
+pub(crate) fn scan_owned_metadata_into(
+    e: &quick_xml::events::BytesStart<'_>,
+    meta: &mut crate::osc::write::OwnedMetadata,
+) -> ParseResult<bool> {
+    meta.version = None;
+    for text in [
+        &mut meta.timestamp,
+        &mut meta.changeset,
+        &mut meta.uid,
+        &mut meta.user,
+        &mut meta.visible,
+    ] {
+        text.clear();
+    }
+    scan_meta_attrs(e, |field, attr| {
         // `version` is parsed rather than copied verbatim, because the
         // version-precedence gate compares it and because a non-numeric
         // version is not a version. The rest ride through as the
@@ -1012,19 +1073,20 @@ pub(crate) fn parse_owned_metadata(
         }
         let text = attr
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map_err(xml_err)?
-            .into_owned();
-        match field {
-            MetaField::Timestamp => meta.timestamp = text,
-            MetaField::Changeset => meta.changeset = text,
-            MetaField::Uid => meta.uid = text,
-            MetaField::User => meta.user = text,
-            MetaField::Visible => meta.visible = text,
+            .map_err(xml_err)?;
+        let slot = match field {
+            MetaField::Timestamp => &mut meta.timestamp,
+            MetaField::Changeset => &mut meta.changeset,
+            MetaField::Uid => &mut meta.uid,
+            MetaField::User => &mut meta.user,
+            MetaField::Visible => &mut meta.visible,
             MetaField::Version => unreachable!("handled above"),
-        }
+        };
+        // A repeated attribute keeps its last value, as the owned scan did.
+        slot.clear();
+        slot.push_str(&text);
         Ok(())
-    })?;
-    Ok(if present { Some(meta) } else { None })
+    })
 }
 
 /// Read an element's metadata into the arena representation.

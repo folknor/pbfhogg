@@ -49,6 +49,48 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
     }
 }
 
+/// Append ` key="value"` to a start tag's content, escaped as
+/// `BytesStart::push_attribute((key, value))` escapes it.
+pub(crate) fn append_attr(content: &mut String, key: &str, value: &str) {
+    content.push(' ');
+    content.push_str(key);
+    content.push_str("=\"");
+    content.push_str(&quick_xml::escape::escape(value));
+    content.push('"');
+}
+
+/// Append ` key="n"`: an integer needs no escaping, and `to_string`'s
+/// spelling is the writers'.
+pub(crate) fn append_int_attr(content: &mut String, key: &str, n: i64) {
+    use std::fmt::Write as _;
+    content.push(' ');
+    content.push_str(key);
+    content.push_str("=\"");
+    write!(content, "{n}").ok(); // ok-deliberate: writing to a String cannot fail
+    content.push('"');
+}
+
+/// Append ` key="value"` as [`push_attribute_escaped`] writes it: escaped,
+/// with newline, carriage return and tab as character references.
+pub(crate) fn append_attr_escaped(content: &mut String, key: &str, value: &str) {
+    if !value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
+        append_attr(content, key, value);
+        return;
+    }
+    content.push(' ');
+    content.push_str(key);
+    content.push_str("=\"");
+    for ch in quick_xml::escape::escape(value).chars() {
+        match ch {
+            '\n' => content.push_str("&#10;"),
+            '\r' => content.push_str("&#13;"),
+            '\t' => content.push_str("&#9;"),
+            _ => content.push(ch),
+        }
+    }
+    content.push('"');
+}
+
 // ---------------------------------------------------------------------------
 // Owned and borrowed element writers deliberately retain separate metadata
 // adapters: owned attributes preserve lexical timestamp/number/visible strings,
@@ -115,6 +157,29 @@ impl OwnedMetadata {
         }
         if !self.visible.is_empty() {
             elem.push_attribute(("visible", self.visible.as_str()));
+        }
+    }
+
+    /// [`Self::push_attrs`] as start tag content text: the same attributes,
+    /// order and escaping.
+    pub(crate) fn append_attrs(&self, content: &mut String) {
+        if let Some(version) = self.version {
+            append_int_attr(content, "version", i64::from(version));
+        }
+        for (key, value) in [
+            ("timestamp", &self.timestamp),
+            ("changeset", &self.changeset),
+            ("uid", &self.uid),
+        ] {
+            if !value.is_empty() {
+                append_attr(content, key, value);
+            }
+        }
+        if !self.user.is_empty() {
+            append_attr_escaped(content, "user", &self.user);
+        }
+        if !self.visible.is_empty() {
+            append_attr(content, "visible", &self.visible);
         }
     }
 }

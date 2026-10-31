@@ -678,6 +678,12 @@ pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
 /// holding it whole. Not measured.
 pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 
+/// Bytes of XML gathered in front of a streaming OSC gzip encoder before
+/// deflate runs: the XML writers emit many tiny writes per element, and
+/// deflate called once per write was most of the writer's time. Not
+/// measured beyond "large".
+pub(crate) const OSC_GZIP_WRITE_BUFFER: usize = 256 << 10;
+
 /// Output chunks one unit may have queued for the consumer before its
 /// worker blocks.
 pub(crate) const DIFF_OUTPUT_CHUNK_DEPTH: usize = 4;

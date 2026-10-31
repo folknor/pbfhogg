@@ -392,7 +392,10 @@ fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOs
     // (`crate::osc::output_is_gzip`); the name was vetted before any work.
     let out = output.writer()?;
     let sink = if crate::osc::output_is_gzip(output.destination())? {
-        OscByteSink::Gz(Box::new(GzEncoder::new(out, flate2::Compression::fast())))
+        OscByteSink::Gz(Box::new(std::io::BufWriter::with_capacity(
+            crate::tunables::OSC_GZIP_WRITE_BUFFER,
+            GzEncoder::new(out, flate2::Compression::fast()),
+        )))
     } else {
         OscByteSink::Plain(out)
     };
@@ -458,14 +461,21 @@ fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOs
     // Finish the gzip stream, then the output's writer, whose checked flush
     // is what lets the output be published.
     match writer.into_inner() {
-        OscByteSink::Gz(gz) => gz.finish()?.finish(),
+        OscByteSink::Gz(buffered) => buffered
+            .into_inner()
+            .map_err(|e| crate::Error::from(e.into_error()))?
+            .finish()?
+            .finish(),
         OscByteSink::Plain(out) => out.finish(),
     }
 }
 
 /// The OSC document's byte sink: gzip-framed or plain, per the output name.
+/// The gzip side is buffered in front of the encoder: the XML writer emits
+/// many tiny writes per element, and deflate run once per write was most of
+/// such a writer's time.
 enum OscByteSink {
-    Gz(Box<GzEncoder<crate::output::OutputWriter>>),
+    Gz(Box<std::io::BufWriter<GzEncoder<crate::output::OutputWriter>>>),
     Plain(crate::output::OutputWriter),
 }
 

@@ -497,18 +497,6 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-080: Read path range
-
-`brokkr read --dataset planet`, `ce6f20d9^` vs `307982d7`, the cheapest
-broad check. Covers the `BlockBuilder` cold refusal (`ce6f20d9`), the raw
-scanners and `packed_varint_count` (`e61e0ad7`; its read cost is measured
-and fixed at HEAD, see "Packed varint count" in `reference/performance.md`,
-so a range delta near +15 % on sequential read is that and nothing new),
-the single `run_pipeline`
-engine (`dd312160`) and the one frame decoder (`307982d7`: `BlobReader`'s
-prefix through one `fill`, and `HeaderWalker` copying each header into its
-buffer, which would show on warm-cache dense inputs).
-
 ### WRK-082: The validated-invariant trio
 
 `brokkr read --dataset planet` plus one tag-heavy re-encoding command
@@ -638,6 +626,14 @@ sparse. The pair also carries `e61e0ad7`'s per-byte `packed_varint_count`
 (+15-19 % on planet sequential and blobreader read, restored to a popcount
 count at HEAD; "Packed varint count" in `reference/performance.md`), so
 attribute an altw delta through the scanner phases, not the wall.
+
+Tried 2026-10-31 on bygg after a day of planet benches, confounded:
+`cf58d02e` (`e61e0ad7^`) 339.6 s, `eebd3523` (`e61e0ad7`) 374.0 s,
+`d7de4025` (HEAD `82be10a4`) 403.3 s, `84802fca` (`e61e0ad7^` again)
+428.6 s. The walls rise with run order whatever the commit, and the
+difference sits in `EXTJOIN_RELATION_SCAN` (22 s at 8.2 cores against
+82 s at 2.7 cores, an I/O wall): drive state, not the scanners. Rerun
+after `sudo fstrim -av` (WRK-072) or a long idle.
 
 ### WRK-098: Shared versus separate input descriptors
 

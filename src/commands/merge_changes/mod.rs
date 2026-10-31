@@ -3,11 +3,12 @@
 //! Default mode preserves the full change stream in input order.
 //! `--simplify` keeps only the last change per object (type + id).
 
+mod emit;
 mod stream;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 
 use flate2::write::GzEncoder;
@@ -390,13 +391,17 @@ impl ChangeDest for StreamDest<'_> {
     }
 }
 
-struct WriterDest<'a, W: io::Write> {
-    writer: &'a mut OscWriter<W>,
+/// The owned path's writer: what [`emit::ByteSink`] replaced on the
+/// streaming path, kept as the oracle its differential tests compare with.
+#[cfg(test)]
+struct WriterDest<'a> {
+    writer: &'a mut OscWriter,
     open_action: &'a mut Option<Action>,
     count: &'a mut u64,
 }
 
-impl<W: io::Write> ChangeDest for WriterDest<'_, W> {
+#[cfg(test)]
+impl ChangeDest for WriterDest<'_> {
     const EMITS: bool = true;
 
     fn accept(&mut self, change: Change) -> Result<()> {
@@ -505,36 +510,36 @@ fn parse_osc_into(
     parse_osc_path(path, &mut sink, cancel)
 }
 
-enum OscWriter<W: io::Write> {
-    Gz(Box<Writer<GzEncoder<W>>>),
-    Plain(Writer<W>),
+/// An in-memory piece of OSC output: the XML is written to a plain buffer
+/// and, for gzip, deflated in one call when the piece is finished. Writing
+/// the events through a `GzEncoder` ran deflate once per tiny write, several
+/// per element, which was most of a planet merge's worker time.
+struct OscWriter {
+    writer: Writer<Vec<u8>>,
+    gz: bool,
 }
 
-impl<W: io::Write> OscWriter<W> {
+impl OscWriter {
     fn write_event(&mut self, event: Event<'_>) -> Result<()> {
-        match self {
-            Self::Gz(w) => w.write_event(event)?,
-            Self::Plain(w) => w.write_event(event)?,
-        }
+        self.writer.write_event(event)?;
         Ok(())
     }
 
-    /// Closes the gzip stream (if Gz) and returns the inner writer.
-    /// For the file-backed flow, prefer `finish()` which also flushes
-    /// the BufWriter. For the in-memory worker flow, this is the way
-    /// to recover the produced `Vec<u8>` of compressed (or plain) XML.
-    fn into_inner(self) -> Result<W> {
-        match self {
-            Self::Gz(w) => {
-                let gz = w.into_inner();
-                Ok(gz.finish()?)
-            }
-            Self::Plain(w) => Ok(w.into_inner()),
+    /// The finished piece: the XML, as one self-contained gzip member when
+    /// gzip was asked for.
+    fn into_inner(self) -> Result<Vec<u8>> {
+        let xml = self.writer.into_inner();
+        if !self.gz {
+            return Ok(xml);
         }
+        let mut gz = GzEncoder::new(
+            Vec::with_capacity(xml.len() / 4),
+            flate2::Compression::fast(),
+        );
+        gz.write_all(&xml)?;
+        Ok(gz.finish()?)
     }
-}
 
-impl OscWriter<Vec<u8>> {
     /// In-memory `OscWriter` for encoding workers. Each batch is emitted
     /// into its own `Vec<u8>` buffer (gz-encoded if `is_gz`); the ordered
     /// drain appends the buffers in input and batch order.
@@ -542,14 +547,9 @@ impl OscWriter<Vec<u8>> {
     /// concatenation of self-contained gzip streams, decoded as the
     /// concatenation of their decompressed contents.
     fn new_buf(is_gz: bool) -> Self {
-        if is_gz {
-            Self::Gz(Box::new(Writer::new_with_indent(
-                GzEncoder::new(Vec::new(), flate2::Compression::fast()),
-                b' ',
-                2,
-            )))
-        } else {
-            Self::Plain(Writer::new_with_indent(Vec::new(), b' ', 2))
+        Self {
+            writer: Writer::new_with_indent(Vec::new(), b' ', 2),
+            gz: is_gz,
         }
     }
 }
@@ -605,15 +605,13 @@ fn encode_batch(
     path: &Path,
     is_gz: bool,
 ) -> crate::Result<(Vec<u8>, u64)> {
-    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    let mut writer = OscWriter::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
     {
-        let mut sink = OwnedSink::new(WriterDest {
-            writer: &mut writer,
-            open_action: &mut open_action,
-            count: &mut count,
-        });
+        // Checked as the owned sink checks, written as the owned writers
+        // write, with no owned element (see `emit`).
+        let mut sink = emit::ByteSink::new(&mut writer, &mut open_action, &mut count);
         batch.replay(&mut sink, path)?;
     }
     if let Some(prev) = open_action {
@@ -628,7 +626,7 @@ fn encode_batch(
 /// Used by the N > 1 parallel-drain path so the main thread can write
 /// it directly to the output file before concatenating worker chunks.
 fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
-    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    let mut writer = OscWriter::new_buf(is_gz);
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
     root.push_attribute(("version", "0.6"));
@@ -640,13 +638,14 @@ fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
 /// gzip member (or plain bytes if `is_gz` is false). Counterpart to
 /// `build_prelude_bytes`.
 fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
-    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    let mut writer = OscWriter::new_buf(is_gz);
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
     writer.into_inner()
 }
 
-fn emit_change<W: io::Write>(
-    writer: &mut OscWriter<W>,
+#[cfg(test)]
+fn emit_change(
+    writer: &mut OscWriter,
     open_action: &mut Option<Action>,
     change: &Change,
 ) -> Result<()> {
@@ -799,7 +798,7 @@ fn write_simplified(
         let chunks: crate::Result<Vec<Vec<u8>>> = group
             .par_chunks(chunk_len)
             .map(|chunk| -> crate::Result<Vec<u8>> {
-                let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+                let mut writer = OscWriter::new_buf(is_gz);
                 writer.write_event(Event::Start(BytesStart::new(action_tag(action))))?;
                 for change in chunk {
                     write_change_to(&mut writer, change)?;
@@ -834,12 +833,9 @@ fn action_tag(action: Action) -> &'static str {
     action.tag()
 }
 
-fn write_change_to<W: io::Write>(writer: &mut OscWriter<W>, change: &Change) -> Result<()> {
+fn write_change_to(writer: &mut OscWriter, change: &Change) -> Result<()> {
     let delete = change.action == Action::Delete;
-    match writer {
-        OscWriter::Gz(w) => write_change_element(w, &change.element, delete),
-        OscWriter::Plain(w) => write_change_element(w, &change.element, delete),
-    }
+    write_change_element(&mut writer.writer, &change.element, delete)
 }
 
 fn write_change_element<W: Write>(

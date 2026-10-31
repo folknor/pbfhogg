@@ -1,6 +1,7 @@
 //! Shared types and small classification helpers used across the inspect
 //! submodules.
 
+#[cfg(test)]
 use crate::Element;
 use crate::ElementKind;
 
@@ -252,17 +253,28 @@ impl TypeIdRange {
         self.count > 0
     }
 
+    /// The first and last IDs seen, the boundaries `append` joins on.
+    #[cfg(test)]
+    pub(super) fn bounds(&self) -> (i64, i64) {
+        (self.first_id, self.prev_id)
+    }
+
     /// Append `part`, the range of the IDs that follow every ID seen so far
     /// (the next data blob's, in file order). Exactly what feeding `part`'s
     /// IDs one by one through [`Self::update`] gives: an empty `part` leaves
     /// the boundary where it was, and a `part` whose first ID does not
     /// exceed the last ID so far breaks monotonicity.
-    fn append(&mut self, part: &TypeIdRange) {
+    pub(super) fn append(&mut self, part: &TypeIdRange) {
         if part.count == 0 {
             return;
         }
         if self.count > 0 && part.first_id <= self.prev_id {
             self.monotonic = false;
+        }
+        // An empty range takes the part's first ID, so a range built by
+        // appending can itself be appended (a group's parts into a blob's).
+        if self.count == 0 {
+            self.first_id = part.first_id;
         }
         self.monotonic &= part.monotonic;
         self.min_id = self.min_id.min(part.min_id);
@@ -303,7 +315,7 @@ impl DataBbox {
         }
     }
 
-    fn update(&mut self, nano_lat: i64, nano_lon: i64) {
+    pub(super) fn update(&mut self, nano_lat: i64, nano_lon: i64) {
         self.min_lat = self.min_lat.min(nano_lat);
         self.max_lat = self.max_lat.max(nano_lat);
         self.min_lon = self.min_lon.min(nano_lon);
@@ -354,7 +366,7 @@ impl ExtendedStats {
         }
     }
 
-    fn update_timestamp(&mut self, millis: i64) {
+    pub(super) fn update_timestamp(&mut self, millis: i64) {
         if millis != 0 {
             self.min_timestamp = self.min_timestamp.min(millis);
             self.max_timestamp = self.max_timestamp.max(millis);
@@ -472,6 +484,8 @@ impl ScanState {
 
     /// Process one element: update counts, ID ranges, and location stats.
     /// Returns `true` for node, `false` for way/relation (for block type classification).
+    /// The element walk's, kept as the test oracle of the projection scan.
+    #[cfg(test)]
     pub(super) fn process_element(&mut self, element: &Element<'_>) -> (bool, bool, bool) {
         match *element {
             Element::DenseNode(ref dn) => {
@@ -550,12 +564,22 @@ pub(super) struct UserNames {
 }
 
 impl UserNames {
+    #[cfg(test)]
     pub(super) fn of(block: &crate::block::PrimitiveBlock) -> Self {
-        let len = block.string_table_len();
+        Self::from_lengths(
+            (0..block.string_table_len()).map(|i| block.string_table_entry(i).map_or(1, str::len)),
+        )
+    }
+
+    /// From the byte length of every string table entry, in order: an entry
+    /// names a user exactly when it is not empty. Lengths alone, so it is
+    /// built before the table's UTF-8 is checked.
+    pub(super) fn from_lengths(lengths: impl ExactSizeIterator<Item = usize>) -> Self {
+        let len = lengths.len();
         let mut zero_empty = false;
         let mut other_empty = Vec::new();
-        for i in 0..len {
-            if block.string_table_entry(i).is_some_and(str::is_empty) {
+        for (i, entry_len) in lengths.enumerate() {
+            if entry_len == 0 {
                 if i == 0 {
                     zero_empty = true;
                 } else {
@@ -571,7 +595,7 @@ impl UserNames {
     }
 
     /// Whether `sid` resolves to a non-empty name in this block.
-    fn names(&self, sid: i32) -> bool {
+    pub(super) fn names(&self, sid: i32) -> bool {
         let Ok(sid) = usize::try_from(sid) else {
             return false;
         };
@@ -585,6 +609,7 @@ impl UserNames {
     }
 }
 
+#[cfg(test)]
 pub(super) fn update_extended_for_element(
     ext: &mut ExtendedStats,
     element: &Element<'_>,
@@ -605,6 +630,7 @@ pub(super) fn update_extended_for_element(
     }
 }
 
+#[cfg(test)]
 fn update_extended_dense_node(
     ext: &mut ExtendedStats,
     dn: &crate::DenseNode<'_>,
@@ -623,6 +649,7 @@ fn update_extended_dense_node(
     }
 }
 
+#[cfg(test)]
 fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>, users: &UserNames) {
     let user = info.raw_user_sid().is_some_and(|sid| users.names(sid));
     count_metadata(
@@ -635,7 +662,7 @@ fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>, users: 
     );
 }
 
-fn count_metadata(
+pub(super) fn count_metadata(
     ext: &mut ExtendedStats,
     version: i32,
     milli_timestamp: i64,

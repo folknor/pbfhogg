@@ -1005,13 +1005,66 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// `PrimitiveBlock::elements` yields: one per plain node, way and relation
 /// message and the dense ID count each dense group's validation computes.
 fn validate_groups_strict(block: &WireBlock<'_>) -> Result<(crate::element_kind::KindSet, u64)> {
+    validate_groups(block.group_count(), |i| block.group(i), &mut NoProjection)
+}
+
+/// What a block scan hands each piece of a block to once that piece passed
+/// its checks: the one validator ([`validate_groups`]) with a reader's own
+/// statistics riding on it, so a reader that never builds a
+/// [`PrimitiveBlock`] refuses exactly the blocks construction refuses, in
+/// the same order.
+///
+/// A hook sees data that passed its own checks, not a validated block: a
+/// later piece of the same group may still fail, and the string table's
+/// UTF-8 is checked only after every group. So a hook never fails, keeps
+/// what it gathers provisional (discarded when the scan fails), and reads
+/// string table entries only by index bound and length, never as `str`.
+///
+/// Within a group the hooks fire in validation order (plain nodes, ways,
+/// relations, then the dense message), not element iteration order (dense
+/// nodes first): a projection whose statistics depend on element order
+/// keeps each group's parts apart and joins them at [`Self::group_end`].
+pub(crate) trait GroupProjection {
+    fn group_begin(&mut self) {}
+    /// A plain node and its parsed `Info`, if it carries one.
+    fn node(&mut self, _node: &WireNode<'_>, _info: Option<&super::wire::WireInfo>) {}
+    fn way(&mut self, _way: &WireWay<'_>, _info: Option<&super::wire::WireInfo>) {}
+    fn relation(&mut self, _relation: &WireRelation<'_>, _info: Option<&super::wire::WireInfo>) {}
+    /// A dense message that passed every check, holding `ids` nodes, and
+    /// its `denseinfo` when that carries metadata for them (all five core
+    /// arrays at full length; `None` when absent or empty).
+    fn dense(
+        &mut self,
+        _dense: &WireDenseNodes<'_>,
+        _ids: usize,
+        _info: Option<&super::wire::WireDenseInfo<'_>>,
+    ) {
+    }
+    fn group_end(&mut self) {}
+}
+
+/// The projection of block construction: nothing beyond the kinds and the
+/// count [`validate_groups`] returns.
+pub(crate) struct NoProjection;
+
+impl GroupProjection for NoProjection {}
+
+/// Validate every group of a block (`group(i)` for `i` in `0..group_count`)
+/// and hand each validated piece to `projection`. Returns the kinds the
+/// block holds and its element count, as [`validate_groups_strict`] always
+/// did.
+pub(crate) fn validate_groups<'a>(
+    group_count: usize,
+    group: impl Fn(usize) -> &'a [u8],
+    projection: &mut impl GroupProjection,
+) -> Result<(crate::element_kind::KindSet, u64)> {
     use super::wire::Cursor;
     use crate::ElementKind;
 
     let mut kinds = crate::element_kind::KindSet::default();
     let mut count: u64 = 0;
-    for index in 0..block.group_count() {
-        let data = block.group(index);
+    for index in 0..group_count {
+        let data = group(index);
 
         // 1. The group's own field framing. Everything below walks this same
         //    byte range through iterators that cannot report an error.
@@ -1021,6 +1074,7 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<(crate::element_kind:
         }
 
         let group = WireGroup::new(data);
+        projection.group_begin();
 
         // 2. Every element sub-message, its optional Info sub-message, and
         //    every packed array it carries - both well-formedness and the
@@ -1029,36 +1083,39 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<(crate::element_kind:
             kinds.add(ElementKind::Node);
             count += 1;
             let node = WireNode::parse(element)?;
-            validate_info(node.info_data)?;
+            let info = validate_info(node.info_data)?;
             validate_tag_arrays(
                 node.keys_data,
                 node.vals_data,
                 "node has mismatched keys/vals tag array lengths",
             )?;
+            projection.node(&node, info.as_ref());
         }
         for element in group.ways() {
             kinds.add(ElementKind::Way);
             count += 1;
             let way = WireWay::parse(element)?;
-            validate_info(way.info_data)?;
+            let info = validate_info(way.info_data)?;
             validate_tag_arrays(
                 way.keys_data,
                 way.vals_data,
                 "way has mismatched keys/vals tag array lengths",
             )?;
             validate_way_geometry_arrays(&way)?;
+            projection.way(&way, info.as_ref());
         }
         for element in group.relations() {
             kinds.add(ElementKind::Relation);
             count += 1;
             let relation = WireRelation::parse(element)?;
-            validate_info(relation.info_data)?;
+            let info = validate_info(relation.info_data)?;
             validate_tag_arrays(
                 relation.keys_data,
                 relation.vals_data,
                 "relation has mismatched keys/vals tag array lengths",
             )?;
             validate_relation_member_arrays(&relation)?;
+            projection.relation(&relation, info.as_ref());
         }
 
         // 3. The dense group, and the parallel-array invariant every dense
@@ -1074,17 +1131,29 @@ fn validate_groups_strict(block: &WireBlock<'_>) -> Result<(crate::element_kind:
                 ));
             }
             validate_dense_keys_vals(dense.keys_vals_data, ids)?;
-            if let Some(info_data) = dense.info_data {
-                validate_dense_info_arrays(info_data, ids)?;
-            }
+            let info = match dense.info_data {
+                Some(info_data) => validate_dense_info_arrays(info_data, ids)?,
+                None => None,
+            };
             if ids > 0 {
                 kinds.add(ElementKind::Node);
             }
             count += ids as u64;
+            projection.dense(&dense, ids, info.as_ref());
         }
+        projection.group_end();
     }
 
     Ok((kinds, count))
+}
+
+/// The string table's UTF-8 check, after every group, as block construction
+/// makes it: the first entry that is not UTF-8 is refused, by index.
+pub(crate) fn validate_stringtable_utf8<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+    for (index, raw) in entries.enumerate() {
+        std::str::from_utf8(raw).map_err(|err| new_stringtable_utf8(err, index))?;
+    }
+    Ok(())
 }
 
 /// Validate an element's packed `keys` / `vals` tag arrays.
@@ -1201,7 +1270,13 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
 /// wrote through protohoggr before 0.5.0, which files already on disk still
 /// carry. See
 /// `reference/truncation-handling.md`, "Which varints count as complete".
-fn validate_dense_info_arrays(info_data: &[u8], node_count: usize) -> Result<()> {
+///
+/// Returns the parsed `denseinfo` when it carries metadata (all five core
+/// arrays, at full length), `None` when it carries none.
+fn validate_dense_info_arrays<'a>(
+    info_data: &'a [u8],
+    node_count: usize,
+) -> Result<Option<WireDenseInfo<'a>>> {
     let info = WireDenseInfo::parse(info_data)?;
     let core = [
         info.version_data,
@@ -1244,7 +1319,7 @@ fn validate_dense_info_arrays(info_data: &[u8], node_count: usize) -> Result<()>
             "dense denseinfo has a visible array but no metadata arrays",
         ));
     }
-    Ok(())
+    Ok((present == core.len()).then_some(info))
 }
 
 /// Validate a way's packed `refs` array and its optional `LocationsOnWays`
@@ -1320,11 +1395,8 @@ fn validate_relation_member_arrays(relation: &WireRelation<'_>) -> Result<()> {
 /// parsers refuse a second data-bearing `Info` (`take_message` in `wire.rs`).
 /// It is a parse check only; the user string index is not resolved.
 #[inline]
-fn validate_info(info_data: Option<&[u8]>) -> Result<()> {
-    match info_data {
-        Some(data) => super::wire::WireInfo::parse(data).map(|_| ()),
-        None => Ok(()),
-    }
+fn validate_info(info_data: Option<&[u8]>) -> Result<Option<super::wire::WireInfo>> {
+    info_data.map(super::wire::WireInfo::parse).transpose()
 }
 
 /// Unwrap a re-parse of bytes that block construction already validated.

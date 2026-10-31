@@ -4,10 +4,9 @@
 use std::path::Path;
 
 use super::super::Result;
-use super::types::{
-    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, UserNames,
-    classify_block, update_extended_for_element,
-};
+use super::types::{BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState};
+#[cfg(test)]
+use super::types::{UserNames, classify_block, update_extended_for_element};
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::read::header_walker::HeaderWalker;
@@ -476,35 +475,53 @@ impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
     type Out = BlobSummary;
     const PARSE_INDEXDATA: bool = true;
 
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<BlobSummary>>
-    where
-        D: FnOnce() -> Result<crate::block::PrimitiveBlock>,
-    {
+    fn apply(
+        &self,
+        blob: &crate::blob::Blob,
+        decode: crate::read::pipeline::Decoder<'_>,
+    ) -> Option<Result<BlobSummary>> {
         if blob.get_type() != crate::blob::BlobType::OsmData {
             // Unknown frames never get here (the reader skips them) and a
             // later header is refused by the frame walk.
             return None;
         }
         let indexed = blob.index().is_some();
-        Some(decode().map(|block| {
-            let mut state = ScanState::new(self.show_id_ranges, self.show_locations, self.extended);
-            let (kind, elements) = scan_block(&block, &mut state);
-            BlobSummary {
-                state,
-                kind,
-                elements,
-                frame_size: blob.frame_len(),
-                compressed_size: blob.body_len(),
-                raw_size: block.decompressed_size(),
-                indexed,
-            }
-        }))
+        // The block is validated as construction validates it and scanned
+        // in the same pass, without building it (see `project`).
+        Some(
+            decode
+                .project(|bytes, st, groups| {
+                    let (scan, kinds) = super::project::scan_block_bytes(
+                        bytes,
+                        st,
+                        groups,
+                        self.show_id_ranges,
+                        self.show_locations,
+                        self.extended,
+                    )?;
+                    Ok(((scan, bytes.len()), kinds))
+                })
+                .map(|((state, kind, elements), raw_size)| BlobSummary {
+                    state,
+                    kind,
+                    elements,
+                    frame_size: blob.frame_len(),
+                    compressed_size: blob.body_len(),
+                    raw_size,
+                    indexed,
+                }),
+        )
     }
 }
 
 /// Feed every element of `block` through `state`; returns the block's kind
-/// and element count.
-fn scan_block(block: &crate::block::PrimitiveBlock, state: &mut ScanState) -> (BlockKind, u64) {
+/// and element count. The element walk the projection scan replaced, kept
+/// as the oracle its tests compare against.
+#[cfg(test)]
+pub(super) fn scan_block(
+    block: &crate::block::PrimitiveBlock,
+    state: &mut ScanState,
+) -> (BlockKind, u64) {
     let mut has_nodes = false;
     let mut has_ways = false;
     let mut has_relations = false;

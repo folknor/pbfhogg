@@ -328,9 +328,16 @@ impl Blob {
         st_scratch: &mut Vec<(u32, u32)>,
         gr_scratch: &mut Vec<(u32, u32)>,
     ) -> Result<PrimitiveBlock> {
+        let buf = self.decompress_pooled(pool)?;
+        PrimitiveBlock::from_vec_pooled_with_scratch(buf, pool, st_scratch, gr_scratch)
+    }
+
+    /// Decompress into a buffer from `pool`, which the caller hands back
+    /// (through `pool_wrap`) when done with it.
+    pub(crate) fn decompress_pooled(&self, pool: &Arc<DecompressPool>) -> Result<Vec<u8>> {
         let mut buf = pool_get(Some(pool), self.blob.estimated_capacity());
         decompress_parsed_blob_into(&self.blob, &mut buf)?;
-        PrimitiveBlock::from_vec_pooled_with_scratch(buf, pool, st_scratch, gr_scratch)
+        Ok(buf)
     }
 }
 

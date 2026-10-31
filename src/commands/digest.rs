@@ -271,10 +271,11 @@ impl DecodeTransform for DigestTransform {
     type Out = BlockSummary;
     const PARSE_INDEXDATA: bool = true;
 
-    fn apply<D>(&self, blob: &Blob, decode: D) -> Option<crate::Result<BlockSummary>>
-    where
-        D: FnOnce() -> crate::Result<PrimitiveBlock>,
-    {
+    fn apply(
+        &self,
+        blob: &Blob,
+        decode: crate::read::pipeline::Decoder<'_>,
+    ) -> Option<crate::Result<BlockSummary>> {
         match blob.get_type() {
             BlobType::OsmData => {}
             // The reader refuses a misplaced header before it gets here;
@@ -298,7 +299,7 @@ impl DecodeTransform for DigestTransform {
                 way_members: declared.then(|| blob.way_members_checked()),
             },
         };
-        Some(decode().and_then(|block| {
+        Some(decode.block().and_then(|block| {
             Ok(BlockSummary {
                 index: blob.index(),
                 blob: blob.blob_index(),

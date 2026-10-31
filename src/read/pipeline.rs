@@ -221,11 +221,94 @@ pub(crate) trait DecodeTransform: Sync {
     const PARSE_INDEXDATA: bool;
 
     /// The slot's result: `None` delivers nothing for this blob. `decode`
-    /// decodes the blob as a data block (on the worker's reused scratch) and
-    /// may be called only for an `OsmData` blob.
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<Self::Out>>
-    where
-        D: FnOnce() -> Result<PrimitiveBlock>;
+    /// decodes the blob as a data block, or runs a projection over its
+    /// decompressed bytes (both on the worker's reused scratch), and may be
+    /// used only for an `OsmData` blob.
+    fn apply(&self, blob: &crate::blob::Blob, decode: Decoder<'_>) -> Option<Result<Self::Out>>;
+}
+
+thread_local! {
+    // Thread-local scratch buffers for a block's string table and group
+    // ranges. Rayon keeps them with its worker, avoiding a fresh pair of
+    // Vec<(u32, u32)> per blob.
+    static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+    static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A data blob's decode, as the engine runs it on a decode worker: the
+/// decompression buffer from the run's pool, the worker's scratch (its
+/// retained capacity recorded for the invocation's peak) and the run's
+/// kind-claim refusal, whichever form the transform asks for.
+pub(crate) struct Decoder<'a> {
+    blob: &'a crate::blob::Blob,
+    pool: &'a Arc<DecompressPool>,
+    /// Refuse a decoded block that contradicts its blob's kind claim.
+    refuse_kinds: bool,
+    metrics: &'a PipelineMetrics,
+}
+
+impl Decoder<'_> {
+    /// Run `f` on the worker's two scratch lists, recording their retained
+    /// capacity.
+    fn with_scratch<R>(
+        &self,
+        f: impl FnOnce(&mut Vec<(u32, u32)>, &mut Vec<(u32, u32)>) -> R,
+    ) -> R {
+        ST_SCRATCH.with_borrow_mut(|st| {
+            GR_SCRATCH.with_borrow_mut(|gr| {
+                let out = f(st, gr);
+                // Per-thread scratch retention is the iter-5 residual alloc
+                // bucket. Record current capacity in (u32, u32) pairs * 8
+                // bytes for the invocation's peak.
+                self.metrics.record_scratch_capacity(
+                    st.capacity().saturating_mul(8),
+                    gr.capacity().saturating_mul(8),
+                );
+                out
+            })
+        })
+    }
+
+    fn refuse_kinds(&self, kinds: crate::element_kind::KindSet) -> Result<()> {
+        if self.refuse_kinds {
+            kinds.refuse_under(self.blob.index().map(|index| index.kind))?;
+        }
+        Ok(())
+    }
+
+    /// The blob as a validated data block.
+    pub(crate) fn block(self) -> Result<PrimitiveBlock> {
+        let block = self.with_scratch(|st, gr| {
+            self.blob
+                .to_primitiveblock_inline_with_scratch(self.pool, st, gr)
+        })?;
+        if self.refuse_kinds {
+            block.refuse_foreign_kind(self.blob.index().map(|index| index.kind))?;
+        }
+        Ok(block)
+    }
+
+    /// Run `scan` over the blob's decompressed bytes with the worker's
+    /// string table and group scratch, for a reader that validates the block
+    /// itself (`block::validate_groups`) without building one. `scan`
+    /// returns its result and the kinds the block holds, which the run's
+    /// kind-claim refusal judges as it judges a block's.
+    pub(crate) fn project<R>(
+        self,
+        scan: impl FnOnce(
+            &[u8],
+            &mut Vec<(u32, u32)>,
+            &mut Vec<(u32, u32)>,
+        ) -> Result<(R, crate::element_kind::KindSet)>,
+    ) -> Result<R> {
+        let buf = self.blob.decompress_pooled(self.pool)?;
+        let scanned = self.with_scratch(|st, gr| scan(&buf, st, gr));
+        // The buffer goes back to the run's pool.
+        drop(crate::read::decompress::pool_wrap(buf, Some(self.pool)));
+        let (out, kinds) = scanned?;
+        self.refuse_kinds(kinds)?;
+        Ok(out)
+    }
 }
 
 /// The identity transform: data blobs decode and the block itself is
@@ -238,14 +321,15 @@ impl DecodeTransform for Blocks {
     const PARSE_INDEXDATA: bool = false;
 
     #[inline]
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<PrimitiveBlock>>
-    where
-        D: FnOnce() -> Result<PrimitiveBlock>,
-    {
+    fn apply(
+        &self,
+        blob: &crate::blob::Blob,
+        decode: Decoder<'_>,
+    ) -> Option<Result<PrimitiveBlock>> {
         if blob.get_type() != BlobType::OsmData {
             return None;
         }
-        Some(decode())
+        Some(decode.block())
     }
 }
 
@@ -263,14 +347,11 @@ where
     const PARSE_INDEXDATA: bool = false;
 
     #[inline]
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<T>>
-    where
-        D: FnOnce() -> Result<PrimitiveBlock>,
-    {
+    fn apply(&self, blob: &crate::blob::Blob, decode: Decoder<'_>) -> Option<Result<T>> {
         if blob.get_type() != BlobType::OsmData {
             return None;
         }
-        Some(decode().and_then(&self.0))
+        Some(decode.block().and_then(&self.0))
     }
 }
 
@@ -331,12 +412,6 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         faults,
     } = task;
     scope.spawn(move |_| {
-        // Thread-local scratch buffers for parse_and_inline. Rayon keeps them
-        // with its worker, avoiding a fresh pair of Vec<(u32, u32)> per blob.
-        thread_local! {
-            static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-            static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-        }
         let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Inside catch_unwind so the hook's park-timeout panic becomes a
             // decode error on the pipeline instead of escaping the rayon
@@ -350,28 +425,11 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
                 metrics.blobs_skipped_by_filter.fetch_add(1, Relaxed);
                 return None;
             }
-            let decode = || {
-                ST_SCRATCH
-                    .with_borrow_mut(|st| {
-                        GR_SCRATCH.with_borrow_mut(|gr| {
-                            let block =
-                                blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
-                            // Per-thread scratch retention is the iter-5 residual
-                            // alloc bucket. Record current capacity in (u32, u32)
-                            // pairs * 8 bytes for the invocation's peak.
-                            metrics.record_scratch_capacity(
-                                st.capacity().saturating_mul(8),
-                                gr.capacity().saturating_mul(8),
-                            );
-                            block
-                        })
-                    })
-                    .and_then(|block| {
-                        if refuse_kinds {
-                            block.refuse_foreign_kind(blob.index().map(|index| index.kind))?;
-                        }
-                        Ok(block)
-                    })
+            let decode = Decoder {
+                blob: &blob,
+                pool: &buffer_pool,
+                refuse_kinds,
+                metrics,
             };
             transform.apply(&blob, decode)
         }));

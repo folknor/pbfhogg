@@ -6,6 +6,7 @@ mod format;
 mod json;
 mod keys;
 pub mod node_stats;
+mod project;
 mod report;
 mod scan;
 mod show_element;

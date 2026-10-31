@@ -263,6 +263,83 @@ impl<'a> WireStringTable<'a> {
 // WireBlock - parsed PrimitiveBlock
 // ---------------------------------------------------------------------------
 
+/// A `PrimitiveBlock`'s scalar parameters, defaults applied.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlockFields {
+    pub granularity: i32,
+    pub lat_offset: i64,
+    pub lon_offset: i64,
+    pub date_granularity: i32,
+}
+
+/// Scan a `PrimitiveBlock`'s top-level fields: every field framed, the last
+/// string table's entries into `st_entries` and every group's range into
+/// `group_entries` (both buffer-relative `(offset, length)`, cleared first),
+/// and the final value of each scalar parameter. The whole top level is
+/// framed before the string table's own entries are, so a late top-level
+/// fault is reported ahead of a malformed string table. The one scan every
+/// block reader shares: block construction appends the two lists to the
+/// buffer, a projection scanner keeps them in scratch.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn scan_block_fields(
+    buffer: &[u8],
+    st_entries: &mut Vec<(u32, u32)>,
+    group_entries: &mut Vec<(u32, u32)>,
+) -> Result<BlockFields> {
+    st_entries.clear();
+    group_entries.clear();
+    let mut granularity: i32 = 100;
+    let mut lat_offset: i64 = 0;
+    let mut lon_offset: i64 = 0;
+    let mut date_granularity: i32 = 1000;
+    let mut stringtable_offset: usize = 0;
+    let mut stringtable_len: usize = 0;
+
+    let mut cursor = Cursor::new(buffer);
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        match (field, wire_type) {
+            (super::wire_schema::primitive_block::STRING_TABLE, WIRE_LEN) => {
+                let data = cursor.read_len_delimited()?;
+                stringtable_offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
+                stringtable_len = data.len();
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited()?;
+                let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
+                group_entries.push((offset as u32, data.len() as u32));
+            }
+            (17, WIRE_VARINT) => {
+                granularity = read_int32(&mut cursor, "PrimitiveBlock.granularity exceeds int32")?;
+            }
+            (19, WIRE_VARINT) => {
+                lat_offset = cursor.read_varint_i64()?;
+            }
+            (20, WIRE_VARINT) => {
+                lon_offset = cursor.read_varint_i64()?;
+            }
+            (18, WIRE_VARINT) => {
+                date_granularity =
+                    read_int32(&mut cursor, "PrimitiveBlock.date_granularity exceeds int32")?;
+            }
+            _ => cursor.skip_field(wire_type)?,
+        }
+    }
+
+    // Scan string table entries from the stringtable submessage.
+    let st_data = if stringtable_len > 0 {
+        &buffer[stringtable_offset..stringtable_offset + stringtable_len]
+    } else {
+        &[]
+    };
+    WireStringTable::scan_entries(st_data, buffer, st_entries)?;
+    Ok(BlockFields {
+        granularity,
+        lat_offset,
+        lon_offset,
+        date_granularity,
+    })
+}
+
 /// Parsed PrimitiveBlock - the root message of each data blob.
 ///
 /// All fields borrow from `buffer` (the decompressed blob bytes). Group data
@@ -317,59 +394,12 @@ impl<'a> WireBlock<'a> {
         let proto_len = buf.len() as u32;
 
         // Phase 1: scan protobuf, collect into reusable scratch Vecs.
-        st_entries.clear();
-        group_entries.clear();
-        let mut granularity: i32 = 100;
-        let mut lat_offset: i64 = 0;
-        let mut lon_offset: i64 = 0;
-        let mut date_granularity: i32 = 1000;
-        let mut stringtable_offset: usize = 0;
-        let mut stringtable_len: usize = 0;
-
-        {
-            let buffer: &[u8] = buf;
-            let mut cursor = Cursor::new(buffer);
-
-            while let Some((field, wire_type)) = cursor.read_tag()? {
-                match (field, wire_type) {
-                    (super::wire_schema::primitive_block::STRING_TABLE, WIRE_LEN) => {
-                        let data = cursor.read_len_delimited()?;
-                        stringtable_offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                        stringtable_len = data.len();
-                    }
-                    (2, WIRE_LEN) => {
-                        let data = cursor.read_len_delimited()?;
-                        let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                        group_entries.push((offset as u32, data.len() as u32));
-                    }
-                    (17, WIRE_VARINT) => {
-                        granularity =
-                            read_int32(&mut cursor, "PrimitiveBlock.granularity exceeds int32")?;
-                    }
-                    (19, WIRE_VARINT) => {
-                        lat_offset = cursor.read_varint_i64()?;
-                    }
-                    (20, WIRE_VARINT) => {
-                        lon_offset = cursor.read_varint_i64()?;
-                    }
-                    (18, WIRE_VARINT) => {
-                        date_granularity = read_int32(
-                            &mut cursor,
-                            "PrimitiveBlock.date_granularity exceeds int32",
-                        )?;
-                    }
-                    _ => cursor.skip_field(wire_type)?,
-                }
-            }
-
-            // Scan string table entries from the stringtable submessage.
-            let st_data = if stringtable_len > 0 {
-                &buffer[stringtable_offset..stringtable_offset + stringtable_len]
-            } else {
-                &[]
-            };
-            WireStringTable::scan_entries(st_data, buffer, st_entries)?;
-        }
+        let BlockFields {
+            granularity,
+            lat_offset,
+            lon_offset,
+            date_granularity,
+        } = scan_block_fields(buf, st_entries, group_entries)?;
         // Phase 1 temp Vecs are still alive but immutable borrow of buf is released.
 
         // Phase 2: append entries as raw LE bytes to the buffer.

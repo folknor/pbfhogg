@@ -283,7 +283,9 @@ Descriptor-first streaming pipeline applying an OSC diff to a sorted PBF (`src/c
 Stages:
 1. **Scanner** (`scanner.rs`) - walks blob headers, emits a `BlobDescriptor` per blob classified as `Passthrough` or `Candidate` using indexdata + `DiffRanges`. Indexdata fast-path skips ~92% of blobs at Denmark scale.
 2. **Workers** (`rewrite.rs`, `rewrite_block.rs`) - pull candidate descriptors, perform precise overlap check, emit rewritten `OwnedBlock`s or demote to false-positive passthrough.
-3. **Drain / stream output** (`drain.rs`, `stream_output.rs`, `streaming.rs`) - results reordered to file order; consecutive passthroughs coalesced; gap creates interleaved at sorted positions.
+3. **Drain / stream output** (`drain.rs`, `stream_output.rs`, `streaming.rs`) - results reordered to file order; consecutive passthroughs coalesced (owned-route frames flushed at `OWNED_PASSTHROUGH_FLUSH_BYTES`); gap creates interleaved at sorted positions.
+
+Sequence admission (`window.rs`): the scanner takes one token from a window of `APPLY_CHANGES_SEQ_WINDOW` (512) before it dispatches a seq on either route, after any barrier wait, and the drain returns it once it has processed that seq. Seqs reserved and not yet processed, wherever they sit (candidate channel, workers, drain channel, reorder map), never exceed the window, so completed blobs cannot pile up without limit behind a slow head. It bounds a count, not bytes: a rewritten blob's output grows with the creates in its range. The drain still receives every message unconditionally; gating its receive would deadlock a missing head behind later items on the shared channel. The node boundary takes no token. The drain owns the only token sender, so any drain exit wakes a parked scanner; every reserved seq owes the drain one item or a published failure. Counters: `merge_seq_window_high_water` (exact), `merge_scanner_window_wait_ns`.
 
 Optional `--locations-on-ways` keeps inline way-node coordinates current through the merge, from two separate sources:
 

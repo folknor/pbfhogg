@@ -79,6 +79,7 @@ use super::stream_output::{
     emit_create_for_output, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
 };
 use super::streaming::CoordSlots;
+use super::window::WindowReturn;
 
 /// Drain → workers post-barrier `loc_map` handle. The drain calls
 /// `set` exactly once at the node→way barrier; way-phase workers read
@@ -152,6 +153,9 @@ pub(super) struct DrainChannels {
     /// `--locations-on-ways` its one [`DrainMessage::NodeBoundary`]) and
     /// workers (Rewritten / converted FalsePositive CopyRange / OwnedBytes).
     pub drain_rx: mpsc::Receiver<DrainMessage>,
+    /// The sequence window's only sender: one token back per processed seq.
+    /// Dropped with the drain on every exit, which wakes a parked scanner.
+    pub window: WindowReturn,
 }
 
 crate::counters::counter_set! {
@@ -172,9 +176,18 @@ crate::counters::counter_set! {
         pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
         pub reorder_buffer_high_water_bytes => "merge_drain_reorder_buffer_high_water_bytes",
         pub barrier_loc_map_size => "merge_drain_barrier_loc_map_size",
-        /// Cumulative wall-clock time the drain spent waiting for the
-        /// next-in-seq item (i.e., reorder gap stalls).
+        /// Cumulative time the drain spent in a receive that ended with the
+        /// reorder buffer empty. Waits with later seqs buffered behind a
+        /// missing head are not counted, so this is not a head-of-line stall
+        /// measure; `merge_scanner_window_wait_ns` shows when such a stall
+        /// held dispatch back.
         pub reorder_gap_wait_ns => "merge_drain_reorder_gap_wait_ns",
+        /// Most seqs reserved by the scanner and not yet processed here at
+        /// once (exact, raised at reservation). It caps the drain channel's
+        /// item occupancy, which the channel itself cannot report (the
+        /// `--locations-on-ways` node boundary adds one slot), and is capped
+        /// by `tunables::APPLY_CHANGES_SEQ_WINDOW`.
+        pub seq_window_high_water => "merge_seq_window_high_water",
     }
 }
 
@@ -198,7 +211,7 @@ pub(super) fn run_drain(
 ) -> Result<MergeStats> {
     writer.cancel_token().marker("MERGE_DRAIN_START");
 
-    let DrainChannels { drain_rx } = channels;
+    let DrainChannels { drain_rx, window } = channels;
 
     let mut state = DrainState::new();
     let mut stats = MergeStats::new();
@@ -216,15 +229,15 @@ pub(super) fn run_drain(
     // The 25 ms tradeoff is recorded on `crate::tunables::DRAIN_RECV_TIMEOUT`.
     let recv_timeout = crate::tunables::DRAIN_RECV_TIMEOUT;
 
-    // This reorder map has no admission budget: bytes_in_buffer is only
-    // high-water telemetry. Do not stop receiving at a byte threshold when
-    // next_seq is missing: that worker sends on the same bounded channel,
-    // and later items can fill it ahead of the head, deadlocking the drain.
-    // A real bound needs ordered admission before dispatch, with permits
-    // retained through delivery, covering scanner passthroughs and workers.
-    // Worker-only byte permits can also starve the head behind later work.
-    // That changes scheduling on the measured splice/rewrite path and needs
-    // memory-bound tests plus matched performance measurements before use.
+    // The reorder map is bounded upstream, by the sequence window
+    // (`window.rs`): the scanner takes a token per seq before dispatch and
+    // the advance loop below returns it once that seq is processed, so the
+    // map never holds more than `APPLY_CHANGES_SEQ_WINDOW` seqs. That is a
+    // count, not bytes; bytes_in_buffer stays high-water telemetry. Never
+    // gate this receive instead (on bytes or count) while next_seq is
+    // missing: that worker sends on the same bounded channel, later items
+    // can fill it ahead of the head, and the drain deadlocks. Worker-only
+    // byte permits would starve the head behind later work the same way.
     //
     // Main loop: pull items (or timeout), reorder, advance, fire
     // barrier when ready. Exits when `drain_rx` disconnects AND the
@@ -311,6 +324,9 @@ pub(super) fn run_drain(
             state.bytes_in_buffer = state.bytes_in_buffer.saturating_sub(item.byte_cost());
             process_item(item, &cfg, &mut state, writer, &mut stats, counters)?;
             state.next_seq += 1;
+            // After processing, so an item blocked handing output to the
+            // writer still counts against the window.
+            window.release();
         }
         #[cfg(feature = "test-hooks")]
         cancel
@@ -427,6 +443,9 @@ pub(super) fn run_drain(
     writer.flush()?;
 
     cancel.marker("MERGE_DRAIN_END");
+    counters
+        .seq_window_high_water
+        .store(window.high_water(), Ordering::Relaxed);
     counters.emit_all(&cancel);
 
     Ok(stats)
@@ -761,6 +780,18 @@ fn dispatch_variant(
             flush_copy_range(state, cfg, writer, counters)?;
             let frame_len = frame_bytes.len() as u64;
             state.passthrough_chunks.push(frame_bytes);
+            // Bound the coalescer: an unchanged same-kind run would otherwise
+            // be held whole until the next rewrite, gap create or kind change.
+            // The batch holds at most the cap plus one frame, so the sum walks
+            // a few dozen frames; output bytes do not depend on where it breaks.
+            if state.passthrough_chunks.iter().map(Vec::len).sum::<usize>()
+                >= crate::tunables::OWNED_PASSTHROUGH_FLUSH_BYTES
+            {
+                flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
+                counters
+                    .passthrough_chunks_flushed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             stats.bytes_passthrough += frame_len;
             stats.blobs_passthrough += 1;
             // The owned route's counterpart of a `CopyRange` is an index hit

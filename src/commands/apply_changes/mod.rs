@@ -29,6 +29,7 @@ mod scanner;
 mod stats;
 mod stream_output;
 mod streaming;
+mod window;
 
 pub use rewrite::{MergeOptions, merge};
 pub use stats::MergeStats;

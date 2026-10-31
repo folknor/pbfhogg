@@ -46,6 +46,7 @@ use crate::read::input::PinnedInput;
 
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
+use super::window::WindowAdmit;
 
 /// Scanner channel configuration. Which channels are populated depends
 /// on the output backend: on the `Route::Splice` route (splice-capable
@@ -91,6 +92,9 @@ pub(super) struct ScannerConfig<'a> {
     /// dropped with the scanner, so it never keeps the drain channel open
     /// past the scanner's exit.
     pub boundary_tx: Option<mpsc::SyncSender<DrainMessage>>,
+    /// One token per seq, taken before dispatch and returned by the drain
+    /// once it has processed that seq (`window.rs`).
+    pub window: WindowAdmit,
 }
 
 /// Run the scanner to completion. Returns the number of OsmData
@@ -112,6 +116,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         channels,
         barrier_rx,
         boundary_tx,
+        mut window,
     } = cfg;
     // The fast-path sender, present exactly on the splice route. Borrowed by
     // each `ScannerEmit::Drain` so an item can only be built where there is a
@@ -327,6 +332,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        // Reserve the seq after any barrier wait (which holds no token) and
+        // before it becomes visible on either route.
+        window.admit()?;
         dispatch_item(
             &channels,
             item,
@@ -376,6 +384,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
 
     host.invocation.marker("MERGE_SCANNER_END");
     host.invocation.counter("merge_scanner_blobs_emitted", seq);
+    host.invocation
+        .counter("merge_scanner_window_wait_ns", window.wait_ns());
     // Deliberately retain the historical counter names and emission semantics.
     // Renaming these estimates breaks brokkr comparisons with measured runs.
     host.invocation.counter(

@@ -253,16 +253,10 @@ shrinks the envelope so the same budget sustains more concurrency. Risks:
 the admission protocol's liveness around the earliest task, oversized and
 hostile blobs, cancellation and error paths that release leases, and a byte
 ledger does not bound pages glibc retains. It is also the generic shape of
-WRK-024 and WRK-025.
-
-### WRK-024: apply-changes drain admission bound
-
-The drain's `BTreeMap` reorder has no bound (415 MB high water at planet);
-completed blobs pile up behind a slow earlier one. A real bound needs
-ordered admission before dispatch, with permits held through delivery, per
-the comment in `drain.rs`. No counter measures the 256-slot drain channel's
-occupancy; add one with the bound. Out of release scope because the
-measured peak was per-worker storage, not the drain.
+WRK-025. apply-changes now bounds outstanding seqs by count
+(`apply_changes/window.rs`, 512, non-binding at planet with in-flight
+peaks of 300-410); a byte budget here would replace that window, not sit
+beside it.
 
 ### WRK-025: apply-changes overlay reclaims superseded records
 

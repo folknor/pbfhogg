@@ -1327,7 +1327,9 @@ code unchanged), which the stored baselines had cached.
 | `inspect --extended` | unstored 571 MB cell | 571 MB | 355 MB | 41.4 s to 42.2 s |
 
 What is left in the larger peaks is not decode storage: apply-changes'
-overlay (575 MB) and unbounded drain reorder (415 MB high water); the
+overlay (575 MB) and drain reorder (415 MB high water; since bounded by a
+sequence window that does not bind on this input, see "Apply-changes
+sequence window"); the
 persistent ID sets of extract, tags-filter and check `--ids --full`. The
 `pwrite` pool's queue is unquantified: no counter samples its occupancy,
 and on the default splice route it queues rewritten output frames, which
@@ -2442,6 +2444,41 @@ It does not shrink these runs' peaks: their pile-ups (a reorder span in
 the low hundreds, about 25 MB of 146 KB raw items on apply-changes and
 about 270 MB of 1.3 MB frames on altw external) sit below the window. It
 replaces the unbounded worst case behind a slow head with backpressure.
+
+## Apply-changes sequence window (bygg, 2026-10-31)
+
+The apply-changes scanner admits each blob seq against a window
+(`APPLY_CHANGES_SEQ_WINDOW`, 512), returned when the drain processes the
+seq, so the drain's reorder map is bounded. Planet, interleaved
+`--bench 1`, no fstrim beforehand. Baseline cells are `26fe5a5e`; variant
+cells are that commit plus the uncommitted change, run with `--force`, so
+they have no UUID.
+
+| Command | Cell | Wall | Window wait | Seq window high water |
+|---|---|---:|---:|---:|
+| apply-changes 4913 zstd:1 | `188db700` base | 126.9 s | | |
+| | variant | 144.8 s | 0 | 412 |
+| | `be9267e5` base | 139.7 s | | |
+| | variant | 131.6 s | | |
+| | `f4cf4f4c` base | 136.4 s | | |
+| | variant | 135.4 s | | |
+| apply-changes 4913 (zlib) | `f62acf33` base | 240.9 s | | |
+| | variant | 242.4 s | 0 | 321 |
+| | `f710f3ce` base | 240.5 s | | |
+| | variant | 240.9 s | | |
+| apply-changes `-l`, altw-keep-untagged | `18118dbf` base | 314.1 s | | |
+| | variant | 317.0 s | 0 | 298 |
+| | `32518511` base | 314.8 s | | |
+| | variant | 314.7 s | | |
+
+The scanner never waited on the window, so on this input it changes no
+scheduling; the zstd:1 cells swing between about 127 s and 145 s on both
+arms (the same bimodality as the delivery-window pairs above), and the
+medians agree (136.4 s base, 135.4 s variant). In-flight seqs peak at
+300-410, above the reorder map's 150-190 because the map is only part of
+what is in flight; a window under about 420 would start to bind at planet.
+The window caps the worst case, not these runs' peak: the reorder map
+still reaches 174 items / 415 MB on the first zstd:1 variant cell.
 
 ## `--direct-io` impact summary
 

@@ -439,6 +439,10 @@ pub(crate) fn merge_to<'a>(
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainMessage>(DRAIN_CHANNEL_CAPACITY);
     let (candidate_tx, candidate_rx) =
         mpsc::sync_channel::<super::descriptor::ScannedBlob>(CANDIDATE_CHANNEL_CAPACITY);
+    // Sequence admission: bounds seqs reserved and not yet processed, the
+    // reorder map included. The drain owns the only token sender.
+    let (window_admit, window_return) =
+        super::window::seq_window(crate::tunables::APPLY_CHANGES_SEQ_WINDOW);
     // One decision, three views of it: the scanner holds a passthrough drain
     // sender only on the splice route (its node-boundary sender under
     // `--locations-on-ways`, below, is separate), the workers learn which route false positives
@@ -496,6 +500,7 @@ pub(crate) fn merge_to<'a>(
         },
         barrier_rx: barrier_rx_opt,
         boundary_tx: boundary_tx_opt,
+        window: window_admit,
     };
 
     let streaming_cfg = StreamingConfig {
@@ -533,7 +538,10 @@ pub(crate) fn merge_to<'a>(
         ignore_missing_nodes,
         failure: Arc::clone(&failure),
     };
-    let drain_channels = DrainChannels { drain_rx };
+    let drain_channels = DrainChannels {
+        drain_rx,
+        window: window_return,
+    };
 
     host.invocation.marker("MERGE_LOOP_START");
     let pipeline_start = crate::counters::Stopwatch::start();

@@ -458,7 +458,8 @@ pub(crate) const ZLIB_RESERVE_SLACK: usize = 64;
 /// control message under `--locations-on-ways`. Fixed, so the share per
 /// worker shrinks as the worker count (`nproc` minus a reserve, or `-j`)
 /// grows. It does not bound the drain's separate reorder buffer, which
-/// absorbs out-of-order arrivals beyond it.
+/// absorbs out-of-order arrivals beyond it; [`APPLY_CHANGES_SEQ_WINDOW`]
+/// bounds the items in both together (the node boundary is not a seq).
 pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
 
 /// Channel capacity for the scanner→workers candidate dispatch. Workers
@@ -467,10 +468,31 @@ pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
 /// workers fed during scanner pauses.
 pub(crate) const CANDIDATE_CHANNEL_CAPACITY: usize = 64;
 
+/// Apply-changes sequence admission window: the most blob seqs the scanner
+/// may have reserved that the drain has not yet processed, wherever they
+/// sit (candidate channel, workers, drain channel, reorder map). It bounds
+/// how far completed blobs can pile up behind a slow head seq. A count, not
+/// bytes: a rewritten blob's output grows with the creates in its range.
+///
+/// 512 is chosen to sit above what planet runs keep in flight, so that on
+/// normal input it does not bind; it exists so a pathological stall cannot
+/// grow the map without limit. The measured in-flight high water and the
+/// planet A/B are in `reference/performance.md` ("Apply-changes sequence
+/// window").
+pub(crate) const APPLY_CHANGES_SEQ_WINDOW: usize = 512;
+
+/// Owned-route (`--direct-io`) passthrough frames the drain coalesces into
+/// one `write_raw_chunks` call are flushed once they reach this many bytes.
+/// Without a cap a long unchanged same-kind run is buffered whole until the
+/// next rewrite, gap create or kind change. 32 MiB keeps the batching that
+/// makes the coalescer worth having (tens of frames) and bounds what it holds
+/// to the cap plus one frame.
+pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
+
 /// Drain `recv_timeout`: how long the drain blocks on an empty item channel
-/// before checking the producer failure slot and the cancellation token, and
-/// re-polling the scanner's node boundary so the barrier can fire from idle.
-/// A failed worker never delivers its seq while the scanner can sit in its
+/// before checking the producer failure slot and the cancellation token.
+/// The node boundary arrives on the item channel itself, so no polling is
+/// needed for the barrier. A failed worker never delivers its seq while the scanner can sit in its
 /// barrier wait and the other workers idle on the candidate channel, so no
 /// channel disconnect would wake the drain; the timeout does.
 ///

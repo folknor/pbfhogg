@@ -233,9 +233,8 @@ never silently means something new:
   writes no scratch, `-j` on a path with no worker pool, a PBF-only flag on
   OSC input, and so on. The refusal names the flags involved.
 - **A fallback the host or the input selects at run time is not grounds for
-  refusal**: an unindexed input taking diff's sequential path, or one with
-  negative IDs its single-shard one, `-j 0` resolving to one worker on a
-  one-core host. The same
+  refusal**: an unindexed input taking diff's sequential path, `-j 0`
+  resolving to one worker on a one-core host. The same
   command line must not be valid on one machine or file and invalid on
   another. Such a fallback prints a `Note:`.
 - **Every flag is parsed and checked before any input is opened**: malformed
@@ -264,10 +263,9 @@ An explicit `-j` (any value, `0` included) is refused where it can have no
 effect: `tags-filter -R` and OSC-mode tags-filter, `inspect` outside
 `--nodes`. One exception to the rule:
 
-- **diff**: `N` is also the number of ID-range shards the block-pair merge
-  partitions the inputs into. Sharding needs both inputs indexed and free of
-  negative IDs; otherwise the run is one shard (negative IDs) or the
-  sequential element stream (no indexdata), with a `Note:`.
+- **diff**: with both inputs indexed, `N` workers merge the work units both
+  inputs are streamed into, at any `N`; without indexdata the run is the
+  sequential element stream, with a `Note:`.
 
 `apply-changes -j 1` runs one worker beside the scanner and drain threads;
 its automatic sizing still starts at two.
@@ -530,23 +528,20 @@ staging-directory refusal.
 
 ## Scratch files
 
-`add-locations-to-ways`, `diff` (text other than `-j 1` or `--quiet`, and `--format osc`), `merge-changes` (several inputs, without `--simplify`) and `build-geocode-index` write
+`add-locations-to-ways`, `diff --format osc`, `merge-changes` (several inputs, without `--simplify`) and `build-geocode-index` write
 scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
 whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
 says where the leftover is. The directory is made at startup, before any input is opened, by
-every run that may need scratch. A run whose command line guarantees it writes none (text
-`diff -j 1`, and a quiet text `diff`, which only counts and shards without writing any text)
-makes no directory and needs no writable location. `-v` does not suppress the directory: a
-verbose text diff shards like any other. A text diff with automatic jobs makes its directory
-even when the run turns out to need one shard and writes nothing there, since the shard count
-depends on inputs it has not opened yet.
+every run that may need scratch. A run whose command line guarantees it writes none (a text
+`diff`, at any `-j`, whose text goes straight to its output) makes no directory and needs no
+writable location.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
-  it the scratch goes in the output's directory (the current directory for `diff` text to
-  stdout, and for an output name with no directory part). `build-geocode-index` refuses a `--tmp-dir` inside the index
+  it the scratch goes in the output's directory (the current directory for an output name with
+  no directory part). `build-geocode-index` refuses a `--tmp-dir` inside the index
   directory it replaces.
 - `--tmp-dir` never moves an output's staging entry (`.pbfhogg-tmp-*`), which stays beside the
   output unless `--staging-dir` moves it, nor a replaced output's backup (`.pbfhogg-backup-*`),
@@ -1405,7 +1400,7 @@ Compare two PBF files and show differences. Uses content equality (coordinates, 
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
-With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does (same paths, sharding and refusals) but formats nothing, so it writes no scratch at any `-j`. `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
+With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does (same paths and refusals) but formats nothing. `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
 With `-v`, each modified element is followed by indented detail lines: `coordinates: (lat, lon) -> (lat, lon)` for a node, `-ref @i n<id>` and `+ref @i n<id>` for a way's node refs, `-member @i type/id "role"` and `+member @i type/id "role"` for a relation (an unknown member type prints as `unknown(raw)/id`), and `-"k"="v"`, `+"k"="v"`, `~"k": "old" -> "new"` for tags. Way refs, member and tag order are content, so detail is never empty for a modified element. Refs and members are ordered edit scripts: all removals, then all insertions, each with its zero-based position in the old list (removals) or the new list (insertions), so a moved member prints as a `-member`/`+member` pair of the same member at its old and new positions, and a dropped duplicate as one `-member`. Removing the marked old items and placing the inserted ones at their new positions, with the kept items filling the rest in order, gives the new list. When several shortest scripts exist the one printed is fixed by the algorithm, not by which item moved. A script of more than 1000 edits, or one too costly to compute, prints one line instead: `refs: N -> M, old @a..b -> new @c..d replaced (details omitted)` (`members:` and `tags:` likewise), with N and M the list lengths and half-open ranges; it says the old range was replaced by the new one, not that every item in them differs. Tags are keyed, without positions: a reorder of keys present on both sides adds `tags: order changed`, and a tag list with a duplicate key prints an ordered `-tag @i "k"="v"`/`+tag @i "k"="v"` edit script instead. Every key, value and role prints as a complete double-quoted literal that is also a valid JSON string, never truncated: `"` and `\` print as `\"` and `\\`, newline, carriage return and tab as `\n`, `\r` and `\t`, and every other control character (C0, DEL, C1), U+2028, U+2029 and the Unicode bidi controls (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) as `\u` with four lowercase hex digits; all other text prints as itself. So each detail record is exactly one line, whichever of LF, CRLF or Unicode line breaks a reader splits on, and `=` or ` -> ` inside a literal is never a separator.
 
@@ -1423,17 +1418,17 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)). Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Worker threads, and the number of ID-range shards (see [Worker threads](#worker-threads)). `0` (default) uses one shard per core; `1` runs one shard on the main thread, reading each input as one sequential stream, which for text writes no scratch. The answer is the same at any `-j`. Applies to both text and `--format osc`; sharding requires both inputs to be indexed. A multi-shard run writes its shard files to the run's scratch directory (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion; a quiet text diff, which only counts, writes none. |
+| `-j, --jobs <N>` | Worker threads for the comparison of indexed inputs (see [Worker threads](#worker-threads)). `0` (default) uses one per core. Each input is read once, as one sequential stream, and cut into work units by ID range that the workers merge; the text reaches the output in order as the run goes. The answer is the same at any `-j`. Applies to both text and `--format osc` |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1`, whose one shard writes no scratch, and with `-q` on a text diff, which only counts (`--format osc` writes scratch on every path) |
-| `--direct-io` | Use O_DIRECT to bypass page cache. With both inputs indexed it applies at `-j 1` only; a multi-shard run reads buffered |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there (planet scale: ~45 GB), removed on completion. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
+| `--direct-io` | Use O_DIRECT to bypass page cache when reading the inputs |
 
 With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
 
-Inputs holding any negative ID always run as one shard, whatever `-j` says: shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
+A comparison whose ID ranges give no point to cut a work unit within 1 GiB of blobs (one ID repeated across that many adjacent blobs) is refused as a resource limit.
 
-**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`, and every blob header of both files is checked: it refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). A multi-shard run walks every header before reading any body; `-j 1` checks each header as its stream reaches it and reads the rest of both files before it succeeds, so it refuses the same inputs, but a defect late in a file can be refused after earlier text was written. The body of a blob of a kind `-t` excludes is never read. Blob bodies of the selected kinds are decoded where the comparison needs them: a byte-identical blob pair (same claimed range and count, same compression and compressed bytes) is not decoded when the comparison may skip equal blobs (`-c`, `-q`, `--format osc`), so a corrupt body inside such a pair passes there and is refused by a diff that prints common elements. Where a block holds elements past its claimed last ID, the merge refuses the claim when it meets them (a shard boundary hides elements past it from the shard below, which a later shard reads). Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
+**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`, and every blob header of both files is checked: it refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). Each header is checked as the input's stream reaches it, and the rest of both files is read before the run succeeds, so a defect late in a file can be refused after earlier text was written. The body of a blob of a kind `-t` excludes is never read. Blob bodies of the selected kinds are decoded where the comparison needs them: a byte-identical blob pair (same claimed range and count, same compression and compressed bytes) is not decoded when the comparison may skip equal blobs (`-c`, `-q`, `--format osc`), so a corrupt body inside such a pair passes there and is refused by a diff that prints common elements. Where a block holds elements past its claimed last ID, the merge refuses the claim when it meets them, unless a work-unit boundary falls inside the block's claimed range: the block is then clipped to each unit's range, and what it holds past its claim is in no unit. Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
 
 ### digest
 
@@ -1947,7 +1942,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | time-filter | Yes | Yes | Yes (R+W) | - | |
 | add-locations-to-ways | Yes | Yes | Yes (R+W) | - | All index types |
 | apply-changes | Yes | Yes | Yes (R+W) | Yes | Production merge path |
-| diff | Yes | - | Partly | - | Read-only (text output); indexed inputs read `O_DIRECT` at `-j 1` only, a multi-shard run's preads stay buffered |
+| diff | Yes | - | Partly | - | Read-only (text output); indexed inputs read `O_DIRECT` at every `-j` |
 | diff --format osc | Yes | - | Partly | - | Read-only (OSC XML output); as for text diff |
 | derive-changes (via `diff --format osc`) | Yes | - | Partly | - | Read-only (OSC XML output); as for text diff |
 | build-geocode-index | Yes | - | Yes | - | Binary index output, not PBF |

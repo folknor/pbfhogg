@@ -193,11 +193,15 @@ pub struct FaultPlan {
     /// Output constructions refused by `refuse_output_backend`.
     pub output_backend_refusals: AtomicU64,
 
-    // --- diff and derive-changes parallel shards ---
-    /// Shard index at which the parallel diff's shard worker panics.
-    pub diff_shard_panic: AtomicUsize,
-    /// Shard index at which the parallel derive-changes shard worker panics.
-    pub derive_shard_panic: AtomicUsize,
+    // --- diff and derive-changes block-pair work units ---
+    /// Unit index (in run order, across kinds) at which a text diff's unit
+    /// worker panics.
+    pub diff_unit_panic: AtomicUsize,
+    /// Unit index at which a derive-changes unit worker panics.
+    pub derive_unit_panic: AtomicUsize,
+    /// Overrides the planner's unit target bytes when nonzero, so a small
+    /// fixture is cut into many units and every cut path runs.
+    pub diff_unit_target_bytes: AtomicUsize,
 
     // --- apply-changes streaming workers ---
     /// Blob sequence number at whose dequeue a streaming worker panics.
@@ -469,8 +473,9 @@ impl FaultPlan {
             framing_wait_needed: AtomicU64::new(u64::MAX),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),
-            diff_shard_panic: AtomicUsize::new(usize::MAX),
-            derive_shard_panic: AtomicUsize::new(usize::MAX),
+            diff_unit_panic: AtomicUsize::new(usize::MAX),
+            derive_unit_panic: AtomicUsize::new(usize::MAX),
+            diff_unit_target_bytes: AtomicUsize::new(0),
             apply_changes_panic_at_blob_seq: AtomicU64::new(u64::MAX),
             apply_changes_panic_waits_for_barrier_wait: AtomicBool::new(false),
             apply_changes_park_at_blob_seq: AtomicU64::new(u64::MAX),

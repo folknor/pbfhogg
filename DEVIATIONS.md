@@ -418,10 +418,8 @@ Production PBFs (planet, Geofabrik extracts, applied OSC streams) are
 positive-only, and several code paths rely on that invariant.
 
 `diff` and `diff --format osc` are not among the sites below: they
-accept negative IDs and order them by the canonical `id_order`. Their
-shard planner compares thresholds as raw `i64`, which agrees with
-`id_order` only for non-negative IDs, so an indexed comparison holding
-any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
+accept negative IDs and order them by the canonical `id_order`, which
+their work-unit planner also cuts by (`src/commands/diff/units.rs`).
 
 **Sites enforcing the invariant:**
 
@@ -551,9 +549,8 @@ ask.
 bug: after ordering-based merging by `operator<` (which is
 canonical), the "same id?" check uses raw `it1->id() != it2->id()`
 rather than the absolute-value comparator. Mixed-sign inputs can
-mis-trigger there. pbfhogg's diff gives an indexed input holding a negative ID a
-single shard instead of planning shards by raw ID compare; the gap is not pbfhogg-unique,
-it is ecosystem-wide.
+mis-trigger there. pbfhogg's diff orders, cuts and matches by the canonical comparator
+throughout; the gap is not pbfhogg-unique, it is ecosystem-wide.
 
 **Impact:** Users with JOSM-local staging data must resolve negative
 IDs before running pbfhogg commands that touch the invariant sites.

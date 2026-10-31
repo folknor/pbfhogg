@@ -425,19 +425,19 @@ design document first.
 
 ---
 
-### WRK-107: diff's multi-shard header walk at planet
+### WRK-107: measure the streaming block-pair engine at planet
 
-Planet `brokkr diff` at the default `-j` spends about 95 s of 395 s in the
-serial header walk of both inputs (`DIFF_SCAN`: ~1.28 M preads, 10 GB read,
-0.0 cores; "Diff of a base against its apply-changes output" in
-`reference/performance.md`). Walking the two files on two threads measured
-no gain (98.8 s, uncommitted), so the walk is not simply per-file pread
-latency; find what bounds it before reshaping (a header read is a 4 KiB
-page per blob under `FADV_RANDOM`; drive state on bygg; an overlapped walk
-that starts shards on the first kind while the rest is walked). The merge
-phases also read about 258 GB from two 92 GB inputs: account for the
-over-read (straddling blobs read by every shard they touch, readahead).
-Diff-snapshots shares the walk.
+The header walk and static shards are gone: both inputs are read once as
+sequential streams, cut into work units on a planner thread, merged on
+the ordered pool, and the text streams to the output (no scratch). Not yet
+measured. Planet `brokkr diff` (base against OSC 4913) at the default
+`-j`, against the stored `e95703aa` (395.4 s, 95.1 s of it the walk,
+653 MB node-phase peak anon) and `ea3d4f41`-era Europe `-j 1` cells:
+wall, device read (expected about 184 GB, from 258), peak anon (the unit
+window holds `workers + 2` units of about 32 MiB plus the planner queue),
+and `ordered_pool_*` stalls. `diff --format osc` and `diff-snapshots`
+share the engine. Blocked on brokkr passing `--tmp-dir` to a text diff,
+which pbfhogg now refuses (a text diff writes no scratch).
 
 ## Correctness
 

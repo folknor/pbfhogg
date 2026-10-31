@@ -62,12 +62,14 @@ invariant. Enforcement is layered by site:
   or insertion has already failed, so valid input pays nothing, except
   relation-to-relation members, which are deferred without a lookup
   and take one sign compare each.
-- **Routing, not enforcement**, for the shard planners in `diff` and
-  `derive-changes` (amended 2026-10-22). Their threshold compares are
-  raw `i64`, which order negative IDs wrongly, so the shard planner
-  (`src/commands/diff/shard.rs`) plans any indexed comparison holding
-  a negative ID as one shard with no window. This replaced a
-  `debug_assert!` that left release builds to mis-shard silently.
+- **Neither enforcement nor routing** in `diff` and `derive-changes`
+  (amended 2026-10-31). Their work-unit planner
+  (`src/commands/diff/units.rs`) cuts and clips in canonical
+  `id_order` keys, so negative IDs window like any other. It replaced
+  a shard planner whose raw `i64` thresholds forced any comparison
+  holding a negative ID onto one shard (amended 2026-10-22, itself
+  replacing a `debug_assert!` that left release builds to mis-shard
+  silently).
 - **Silent inheritance** through `IdSet::set`'s no-op-on-negative
   semantics for `tags-filter` (silently drops negative-id ways) and
   `add-locations-to-ways --index-type external` (silently omits

@@ -557,7 +557,6 @@ fn diff_blob_layout_independence() {
             &opts,
             false,
             &crate::common::test_host(),
-            Some(crate::common::scratch_in(dir.path())),
         )
         .expect("diff")
     };
@@ -641,17 +640,10 @@ fn diff_stats_matches_text_diff_on_every_path() {
                     type_filter,
                     parallelism,
                 };
-                let text = pbfhogg::diff::diff(
-                    &p(old),
-                    &p(new),
-                    &mut Vec::new(),
-                    &options,
-                    false,
-                    &host,
-                    Some(crate::common::scratch_in(dir.path())),
-                )
-                .map(counts)
-                .map_err(|e| e.to_string());
+                let text =
+                    pbfhogg::diff::diff(&p(old), &p(new), &mut Vec::new(), &options, false, &host)
+                        .map(counts)
+                        .map_err(|e| e.to_string());
                 let stats = pbfhogg::diff::diff_stats(
                     &p(old),
                     &p(new),
@@ -710,7 +702,6 @@ fn an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be() {
                 &options,
                 false,
                 &crate::common::test_host(),
-                Some(crate::common::scratch_in(dir.path())),
             )
         };
         let stats = run_diff(true)
@@ -926,7 +917,6 @@ fn diff_counts(
         &options,
         false,
         &crate::common::test_host(),
-        Some(crate::common::scratch_in(dir)),
     )
     .unwrap_or_else(|e| {
         panic!("{old} vs {new}, {type_filter:?}, -j {jobs}, verbose {verbose}: {e}")
@@ -986,7 +976,6 @@ fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
                 &options,
                 false,
                 &crate::common::test_host(),
-                Some(crate::common::scratch_in(dir.path())),
             )
             .expect_err("a node blob after a way blob must be refused");
             assert!(

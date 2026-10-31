@@ -164,7 +164,8 @@ fn diff_parallel(
     scratch: &Path,
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<()> {
-    let _ = out;
+    // A text diff writes neither a file output nor scratch.
+    let _ = (out, scratch);
     pbfhogg::diff::diff(
         &i.path("base.osm.pbf"),
         &i.path("changed.osm.pbf"),
@@ -177,7 +178,6 @@ fn diff_parallel(
         },
         false,
         host,
-        Some(pbfhogg::scratch::RunScratch::create(scratch, host)?),
     )
     .map(drop)
 }

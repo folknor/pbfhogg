@@ -1429,29 +1429,6 @@ mod capability_tests {
     }
 }
 
-/// A reader that observes a cancellation token before every `read`: for the
-/// bulk copies of the library's own scratch files into a sink that is not
-/// cancellation-aware (a caller's `Write`, stdout). One relaxed load per read
-/// call, so not for per-element paths. A tripped token is
-/// `ErrorKind::Cancelled` carried in an `io::Error` of kind `Other`, which no
-/// `Read` or `Write` layer retries.
-pub(crate) struct CancellableRead<'a, R> {
-    inner: R,
-    cancel: &'a Invocation,
-}
-
-impl<'a, R> CancellableRead<'a, R> {
-    pub(crate) fn new(inner: R, cancel: &'a Invocation) -> Self {
-        Self { inner, cancel }
-    }
-}
-
-impl<R: std::io::Read> std::io::Read for CancellableRead<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.cancel.check().map_err(std::io::Error::from)?;
-        self.inner.read(buf)
-    }
-}
 /// Page-cache policy for the input files a command reads.
 ///
 /// The page cache is shared by every process on the host, so dropping an

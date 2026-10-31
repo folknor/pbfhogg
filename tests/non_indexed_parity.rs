@@ -748,7 +748,7 @@ fn derive_text(dir: &Path, old: &Path, new: &Path, name: &str) -> String {
     std::fs::read_to_string(&osc).expect("read derived OSC")
 }
 
-fn diff_text(dir: &Path, old: &Path, new: &Path) -> String {
+fn diff_text(old: &Path, new: &Path) -> String {
     let mut out = Vec::new();
     pbfhogg::diff::diff(
         old,
@@ -762,7 +762,6 @@ fn diff_text(dir: &Path, old: &Path, new: &Path) -> String {
         },
         false,
         &crate::common::test_host(),
-        Some(crate::common::scratch_in(dir)),
     )
     .expect("diff");
     String::from_utf8(out).expect("diff text is UTF-8")
@@ -830,13 +829,13 @@ fn diff_non_indexed_parity() {
     let dir = crate::common::test_scratch();
     let [old_idx, old_non, new_idx, new_non] = write_derive_pair(dir.path());
 
-    let indexed = diff_text(dir.path(), &old_idx, &new_idx);
+    let indexed = diff_text(&old_idx, &new_idx);
     for (old, new) in [
         (&old_non, &new_non),
         (&old_idx, &new_non),
         (&old_non, &new_idx),
     ] {
-        assert_eq!(diff_text(dir.path(), old, new), indexed);
+        assert_eq!(diff_text(old, new), indexed);
     }
     for line in [
         "*n2 v1 -> v2",

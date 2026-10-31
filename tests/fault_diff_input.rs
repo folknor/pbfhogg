@@ -132,7 +132,6 @@ fn inputs(route: Route) -> Inputs {
     let new = dir.path().join("new.osm.pbf");
     write_input(&old, route, Side::Old, false);
     write_input(&new, route, Side::New, false);
-    std::fs::create_dir(dir.path().join("scratch")).expect("scratch parent");
     Inputs { dir, old, new }
 }
 
@@ -142,7 +141,6 @@ fn run(
     route: Route,
     old: InputSource<'_>,
     new: InputSource<'_>,
-    scratch_parent: &Path,
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<String> {
     let parallelism = pbfhogg::Parallelism::from_jobs(route.jobs);
@@ -163,9 +161,8 @@ fn run(
         type_filter: route.type_filter(),
         parallelism,
     };
-    let scratch = (route.jobs > 1).then(|| crate::common::scratch_in(scratch_parent));
     let mut text = Vec::new();
-    let stats = pbfhogg::diff::diff(old, new, &mut text, &options, route.direct, host, scratch)?;
+    let stats = pbfhogg::diff::diff(old, new, &mut text, &options, route.direct, host)?;
     Ok(format!("{}{stats:?}", String::from_utf8_lossy(&text)))
 }
 
@@ -174,7 +171,6 @@ fn run_paths(route: Route, inputs: &Inputs, host: &pbfhogg::host::Host) -> pbfho
         route,
         InputSource::Path(&inputs.old),
         InputSource::Path(&inputs.new),
-        &inputs.dir.path().join("scratch"),
         host,
     )
 }
@@ -231,7 +227,6 @@ fn reference(
         route,
         InputSource::Path(old),
         InputSource::Path(new),
-        &dir.join("scratch"),
         &crate::common::test_host(),
     )
     .unwrap_or_else(|e| panic!("{cell}: run on the replacement: {}", e.report()));
@@ -470,14 +465,12 @@ fn a_repeated_input_is_one_pin() {
         let inputs = inputs(route);
         let input = &inputs.old;
         let replacement = inputs.dir.path().join("replacement.osm.pbf");
-        let scratch = inputs.dir.path().join("scratch");
         let opens = 2 * route.opens();
         let same = |host: &pbfhogg::host::Host| {
             run(
                 route,
                 InputSource::Path(input),
                 InputSource::Path(input),
-                &scratch,
                 host,
             )
         };
@@ -556,7 +549,6 @@ fn a_caller_pin_is_used_as_it_is() {
             unreachable!("no failure is skippable here");
         };
         let replacement = inputs.dir.path().join("replacement.osm.pbf");
-        let scratch = inputs.dir.path().join("scratch");
         for force_path in [true, false] {
             write_input(&inputs.old, route, Side::Old, false);
             write_input(&replacement, route, Side::Old, true);
@@ -574,7 +566,6 @@ fn a_caller_pin_is_used_as_it_is() {
                 route,
                 InputSource::Pinned(&pin),
                 InputSource::Path(&inputs.new),
-                &scratch,
                 &host,
             );
             if procfs {
@@ -587,7 +578,6 @@ fn a_caller_pin_is_used_as_it_is() {
                     route,
                     InputSource::Pinned(&pin),
                     InputSource::Path(&inputs.old),
-                    &scratch,
                     &host,
                 )
                 .unwrap_or_else(|e| panic!("{cell}: pin against path: {}", e.report()));
@@ -634,15 +624,9 @@ fn a_fifo_input_is_refused_before_either_input_is_read() {
                 &dir.join("unused.osm.pbf"),
                 u64::MAX,
             );
-            let err = run(
-                route,
-                InputSource::Path(old),
-                InputSource::Path(new),
-                &dir.join("scratch"),
-                &host,
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{cell}: a FIFO must be refused"));
+            let err = run(route, InputSource::Path(old), InputSource::Path(new), &host)
+                .err()
+                .unwrap_or_else(|| panic!("{cell}: a FIFO must be refused"));
             assert!(
                 matches!(err.kind(), pbfhogg::ErrorKind::InvalidArgument { .. }),
                 "{cell}: {err:?}"
@@ -660,45 +644,5 @@ fn a_fifo_input_is_refused_before_either_input_is_read() {
             // Counts derived opens only: the pin itself is not one.
             assert_eq!(attempts, 0, "{cell}: no input may be read first");
         }
-    }
-}
-
-/// The option refusals come before the inputs are touched: ahead of a
-/// FIFO's refusal and of a missing input's.
-#[test]
-fn an_invalid_option_is_refused_before_the_inputs_are_touched() {
-    let dir = crate::common::test_scratch();
-    let mut inputs = vec![dir.path().join("missing.osm.pbf")];
-    #[cfg(unix)]
-    inputs.push(crate::common::make_fifo(dir.path(), "in.fifo"));
-    let host = crate::common::test_host();
-    for input in &inputs {
-        let unsharded = DiffOptions {
-            suppress_common: false,
-            verbose: false,
-            type_filter: None,
-            parallelism: pbfhogg::Parallelism::from_jobs(3),
-        };
-        let err = pbfhogg::diff::diff(
-            input,
-            input,
-            &mut Vec::new(),
-            &unsharded,
-            false,
-            &host,
-            None,
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{}: must be refused", input.display()));
-        assert!(
-            matches!(err.kind(), pbfhogg::ErrorKind::InvalidArgument { .. }),
-            "{}: {err:?}",
-            input.display()
-        );
-        assert!(
-            err.to_string().contains("scratch"),
-            "{}: {err}",
-            input.display()
-        );
     }
 }

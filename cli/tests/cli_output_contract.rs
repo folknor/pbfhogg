@@ -365,7 +365,8 @@ const ROWS: &[Row] = &[
         label: "diff (text)",
         build: diff_text,
         kind: Kind::File,
-        tmp_dir: true,
+        // A text diff writes no scratch at any -j and refuses --tmp-dir.
+        tmp_dir: false,
         ok_codes: &[0, 1],
         gaps: &[],
     },
@@ -1410,7 +1411,10 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
                 ));
             }
         }
-        if row.tmp_dir != help.contains("--tmp-dir") {
+        // A command offers --tmp-dir when any of its rows takes it (a text
+        // diff does not, `diff --format osc` does).
+        let command_takes_tmp = ROWS.iter().any(|r| r.command == row.command && r.tmp_dir);
+        if command_takes_tmp != help.contains("--tmp-dir") {
             problems.push(format!(
                 "[{}] tmp_dir is {} but `{} --help` says otherwise",
                 row.label, row.tmp_dir, row.command

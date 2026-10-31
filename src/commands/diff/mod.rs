@@ -1,10 +1,10 @@
 //! Compare two PBF files and output human-readable differences. Equivalent to `osmium diff`.
 //!
 //! Requires both inputs to declare `Sort.Type_then_ID`. Indexed inputs are
-//! compared by the block-pair merge over ID-range shards (`shard`,
-//! `sharded`, one shard at `-j 1`); inputs without indexdata by the
+//! compared by the block-pair merge over work units streamed from both
+//! inputs (`units`), at every `-j`; inputs without indexdata by the
 //! element-level merge over [`StreamingBlocks`] cursors. Memory is bounded
-//! by the decoded blocks in flight either way.
+//! by the units and decoded blocks in flight either way.
 //!
 //! # Design: content equality, not version ordering
 //!
@@ -16,8 +16,7 @@
 
 pub mod derive;
 mod seq;
-mod shard;
-mod sharded;
+mod units;
 
 use super::Result;
 use super::input_front::sorted_and_indexed;
@@ -49,25 +48,23 @@ pub struct DiffOptions {
     pub verbose: bool,
     /// Restrict the comparison to these element types. `None` = all.
     pub type_filter: Option<TypeFilter>,
-    /// Number of ID-range shards (and worker threads) for the block-pair
-    /// merge of indexed inputs. `Fixed(1)` runs one shard on the calling
-    /// thread, writing the output directly; `Fixed(n)` dispatches up to `n`
-    /// shards across worker threads; `Auto` uses one shard per core the host
-    /// reports (one when it reports none). The answer is the same at any
-    /// count.
+    /// Worker threads for the block-pair merge of indexed inputs, which
+    /// merge the work units both inputs are streamed into. `Fixed(n)` uses
+    /// `n`; `Auto` uses one per core the host reports (one when it reports
+    /// none). The answer is the same at any count.
     pub parallelism: crate::host::Parallelism,
 }
 
 impl DiffOptions {
-    /// The shard count this run uses: the fixed count, else one per core.
-    fn shards(&self, host: &crate::host::Entered<'_>) -> usize {
-        resolve_shards(self.parallelism, host)
+    /// The worker count this run uses: the fixed count, else one per core.
+    fn workers(&self, host: &crate::host::Entered<'_>) -> usize {
+        resolve_workers(self.parallelism, host)
     }
 }
 
-/// The shard count of a diff or derive (`--format osc`) run: the fixed
+/// The worker count of a diff or derive (`--format osc`) run: the fixed
 /// count, else one per core the host reports (one when it reports none).
-pub(crate) fn resolve_shards(
+pub(crate) fn resolve_workers(
     parallelism: crate::host::Parallelism,
     host: &crate::host::Entered<'_>,
 ) -> usize {
@@ -138,15 +135,11 @@ impl DiffStats {
 
 /// Compare two sorted PBF files and write human-readable differences.
 ///
-/// Holds a bounded number of decoded blocks at a time, whatever the input
-/// size. Requires both inputs to declare
-/// `Sort.Type_then_ID` - returns an actionable error if either is unsorted.
-///
-/// `scratch` is the run's scratch directory, used by a multi-shard run for
-/// its shard files and removed when the call returns. A caller whose options
-/// run one shard (`Fixed(1)`) writes no scratch and passes `None`; `None`
-/// with more than one shard is refused, before any input is read. A caller that wants only the counts calls
-/// [`diff_stats`], which shards without scratch.
+/// Holds a bounded number of work units and decoded blocks at a time,
+/// whatever the input size, and writes no scratch: every worker's text
+/// reaches `output` in order as the run goes. Requires both inputs to
+/// declare `Sort.Type_then_ID` - returns an actionable error if either is
+/// unsorted. A caller that wants only the counts calls [`diff_stats`].
 ///
 /// Every route opens each input more than once, so both must be regular
 /// files (`InvalidArgument` otherwise) and are pinned for
@@ -165,34 +158,12 @@ pub fn diff<'a, 'b>(
     options: &DiffOptions,
     direct_io: bool,
     host: &crate::host::Host,
-    scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
     let host = &host.enter()?;
     host.invocation.check()?;
-    let jobs = options.shards(host);
-    if jobs > 1 && scratch.is_none() {
-        return Err(crate::Error::invalid_argument(
-            "diff: a run that may use more than one shard needs a scratch directory; \
-             without one it must run a single shard",
-        ));
-    }
+    let jobs = options.workers(host);
     let [old, new] = pin_pair(old.into(), new.into(), host)?;
-    let result = compare(
-        &old,
-        &new,
-        Report::Text {
-            out: output,
-            scratch: scratch.as_ref(),
-        },
-        options,
-        jobs,
-        direct_io,
-        host,
-    );
-    // The scratch directory is removed before the completion decision, so a
-    // cancellation observed during that removal is still reported as one.
-    drop(scratch);
-    let stats = result?;
+    let stats = compare(&old, &new, Some(output), options, jobs, direct_io, host)?;
     // The completion decision: a cancellation observed by now is reported
     // as one, whatever reached the caller's writer.
     host.invocation.check()?;
@@ -204,14 +175,13 @@ pub fn diff<'a, 'b>(
 ///
 /// The comparison is the one [`diff`] runs with `suppress_common` on,
 /// `verbose` off and the same `type_filter` and `parallelism`: the same
-/// paths (parallel shards for indexed inputs, the sequential fallbacks
+/// paths (parallel work units for indexed inputs, the sequential fallback
 /// otherwise) and the same input checks. Like `diff -c`, it skips a fresh
 /// pair of byte-equal blobs without decoding it, so `common` counts such a
 /// pair by the blobs' claimed `index.count` and a corrupt blob that is
 /// byte-identical on both sides is not noticed; `created`, `modified` and
 /// `deleted` are exact either way. Only the formatting is skipped, so no
-/// output or scratch I/O happens at all, and a sharded comparison needs no
-/// scratch directory.
+/// output I/O happens at all.
 ///
 /// The inputs are pinned as in [`diff`], with the same refusals.
 #[hotpath::measure]
@@ -232,17 +202,9 @@ pub fn diff_stats<'a, 'b>(
         type_filter,
         parallelism,
     };
-    let jobs = options.shards(host);
+    let jobs = options.workers(host);
     let [old, new] = pin_pair(old.into(), new.into(), host)?;
-    let stats = compare(
-        &old,
-        &new,
-        Report::<std::io::Sink>::Count,
-        &options,
-        jobs,
-        direct_io,
-        host,
-    )?;
+    let stats = compare::<std::io::Sink>(&old, &new, None, &options, jobs, direct_io, host)?;
     host.invocation.check()?;
     Ok(stats)
 }
@@ -260,27 +222,15 @@ pub(super) fn pin_pair(
         .map_err(|_| crate::Error::internal("diff: two inputs must yield two pins"))
 }
 
-/// What a comparison produces besides its counts.
-enum Report<'a, W> {
-    /// Diff text written to `out`. `scratch` holds a multi-shard run's shard
-    /// files; `None` only when the run is single-shard, which [`diff`]
-    /// enforces.
-    Text {
-        out: &'a mut W,
-        scratch: Option<&'a crate::scratch::RunScratch>,
-    },
-    /// Counts only: nothing is formatted and no scratch is written.
-    Count,
-}
-
 /// The comparison shared by [`diff`] and [`diff_stats`]: input checks, path
-/// selection and the per-path drivers. The caller owns the entry and
-/// completion cancellation checks, and has pinned both inputs: every open
-/// below is derived from a pin.
+/// selection and the per-path drivers. `output` is `None` for a count-only
+/// run, which formats nothing. The caller owns the entry and completion
+/// cancellation checks, and has pinned both inputs: every open below is
+/// derived from a pin.
 fn compare<W: Write>(
     old: &PinnedInput,
     new: &PinnedInput,
-    report: Report<'_, W>,
+    output: Option<&mut W>,
     options: &DiffOptions,
     jobs: usize,
     direct_io: bool,
@@ -317,16 +267,10 @@ fn compare<W: Write>(
 
     host.invocation.marker("DIFF_SCAN_START");
 
-    // Path selection depends on the inputs and the shard count only, never on
-    // whether text is wanted: a count-only run shards exactly as a text run.
-    let (output, scratch) = match report {
-        Report::Text { out, scratch } => (Some(out), scratch),
-        Report::Count => (None, None),
-    };
+    // Path selection depends on the inputs only, never on whether text is
+    // wanted: a count-only run cuts units exactly as a text run.
     let stats = if both_indexed {
-        diff_block_pair(
-            old, new, output, scratch, options, &filter, jobs, direct_io, host,
-        )?
+        diff_block_pair(old, new, output, options, &filter, jobs, direct_io, host)?
     } else {
         diff_element_stream(old, new, output, options, direct_io, &filter, host)?
     };
@@ -343,57 +287,29 @@ fn finish_scan(stats: DiffStats, invocation: &crate::host::Recorder) -> DiffStat
     stats
 }
 
-/// The diff of two indexed inputs: the header walk, then the block-pair
-/// merge over up to `jobs` ID-range shards per kind (see `shard` and
-/// `sharded`). Zero String allocation for unchanged elements.
+/// The diff of two indexed inputs: the block-pair merge over work units
+/// streamed from both inputs (see `units`). Zero String allocation for
+/// unchanged elements.
 ///
 /// `output` is `None` for a count-only run: every selected block is still
 /// read, decoded and merged exactly as for text (the byte-equal fast path
 /// follows `suppress_common`, not the absence of text, and `diff_stats`
-/// sets it), only nothing is
-/// formatted and no scratch is written. A text run of more than one shard
-/// writes each shard's text to `scratch` and streams it to `output` in
-/// shard order; a phase of one shard writes `output` directly.
+/// sets it), only nothing is formatted. A text run's workers hand their text
+/// over in chunks, written to `output` in unit order as the run goes.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_block_pair<W: Write>(
     old: &PinnedInput,
     new: &PinnedInput,
     output: Option<&mut W>,
-    scratch: Option<&crate::scratch::RunScratch>,
     options: &DiffOptions,
     filter: &TypeFilter,
     jobs: usize,
-    // Honoured by the `-j 1` streams only: a multi-shard walk and its shard
-    // reads pread through the walker's buffered descriptor.
     direct_io: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<DiffStats> {
     // DIFF_SCAN_START/END and the diff_* result counters are the caller's.
-    let mut inputs = shard::open_pair(old, new, jobs, direct_io, host)?;
-    if let shard::Inputs::Walked(walked) = &inputs
-        && walked.has_negative
-    {
-        crate::host::diag!(
-            host.diagnostics,
-            Note,
-            "diff.negative_id_fallback",
-            "Using a single shard: negative IDs cannot use ID-range shards"
-        );
-        host.invocation.counter("diff_negative_id_fallback", 1);
-    }
-
-    // Scratch shard files live in the run's scratch directory, which the
-    // caller placed (the CLI's --tmp-dir, else beside the output).
-    // No input-size-based free-space refusal: compressed PBF sizes and index
-    // counts do not bound changed text bytes (identical inputs emit none).
-    // Exact sizing would repeat the measured comparison/serialization pass.
-    // Shards coexist until their kind is drained, then are removed one by
-    // one; the caller's arbitrary Write destination may share this
-    // filesystem or consume no disk at all, so twice the input size is not a
-    // space budget. Keep write errors authoritative rather than rejecting on
-    // that guess.
-    let phases: Vec<sharded::Phase> = [
+    let phases: Vec<units::Phase> = [
         (
             ElementKind::Node,
             filter.nodes,
@@ -415,27 +331,33 @@ fn diff_block_pair<W: Write>(
     ]
     .into_iter()
     .filter(|&(_, enabled, _, _)| enabled)
-    .map(|(kind, _, start_marker, end_marker)| sharded::Phase {
+    .map(|(kind, _, start_marker, end_marker)| units::Phase {
         kind,
         start_marker,
         end_marker,
     })
     .collect();
 
-    let mut report = TextReport {
-        sink: DiffSink::new(output, options),
-        scratch,
+    let text = output.is_some();
+    let make_sink = || DiffSink::new(text.then(Vec::new), options);
+    let mut consumer = TextConsumer {
+        output,
+        stats: DiffStats::default(),
+        options: std::marker::PhantomData,
     };
-    let merge_stats = sharded::run(
-        &mut inputs,
+    let merge_stats = units::run(
+        old,
+        new,
         &phases,
         jobs,
+        direct_io,
         options.suppress_common,
-        &mut report,
+        &make_sink,
+        &mut consumer,
         host,
     )?;
     emit_merge_stats_counters(&merge_stats, &host.invocation);
-    Ok(report.sink.stats)
+    Ok(consumer.stats)
 }
 
 /// Where a diff's merge actions go: the counts, and the text when there is
@@ -525,154 +447,62 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
     }
 }
 
-/// The text diff's side of a sharded comparison: the caller's writer (or
-/// nothing, counting only) as the final sink, and one scratch text file per
-/// shard of a multi-shard phase.
-struct TextReport<'a, W: Write> {
-    sink: DiffSink<'a, &'a mut W>,
-    /// `None` for a count-only run, and for a text run that may use only
-    /// one shard (which `diff` enforces).
-    scratch: Option<&'a crate::scratch::RunScratch>,
-}
+/// A text diff unit's worker side: the shared sink formatting into a buffer
+/// (`None` counting only), handed over each time it passes a chunk.
+impl units::UnitSink for DiffSink<'_, Vec<u8>> {
+    type Item = Vec<u8>;
+    type Stats = DiffStats;
 
-/// One shard of a multi-shard text phase: its sink and its scratch file
-/// (`None` for a count-only run, which formats nothing).
-struct TextShard<'a> {
-    sink: DiffSink<'a, std::io::BufWriter<std::fs::File>>,
-    path: Option<crate::scratch::ScratchPath>,
-}
+    fn take_chunk(&mut self) -> Option<Vec<u8>> {
+        let out = self.output.as_mut()?;
+        if out.len() < crate::tunables::DIFF_OUTPUT_CHUNK_BYTES {
+            return None;
+        }
+        Some(std::mem::take(out))
+    }
 
-impl MergeSink for TextShard<'_> {
-    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
-        self.sink.record(kind, action)
+    fn finish(self) -> (Vec<Vec<u8>>, DiffStats) {
+        let rest = self.output.filter(|out| !out.is_empty());
+        (rest.into_iter().collect(), self.stats)
     }
 }
 
-impl<'a, W: Write> sharded::ShardedReport for TextReport<'a, W> {
-    type Shard = TextShard<'a>;
-    type Done = (Option<crate::scratch::ScratchPath>, DiffStats);
+/// The text diff's side on the calling thread: chunks to the caller's
+/// writer (nothing, counting only), counts folded in unit order.
+struct TextConsumer<'w, 'o, W: Write> {
+    output: Option<&'w mut W>,
+    stats: DiffStats,
+    /// The options the workers' sinks borrow.
+    options: std::marker::PhantomData<&'o DiffOptions>,
+}
 
-    const WORKER: &'static str = "shard worker";
+impl<'o, W: Write> units::UnitConsumer for TextConsumer<'_, 'o, W> {
+    type Sink = DiffSink<'o, Vec<u8>>;
 
-    fn inline(&mut self) -> &mut impl MergeSink {
-        &mut self.sink
+    const WORKER: &'static str = "diff unit worker";
+
+    /// A failed write - the reader of a stdout pipe going away is the
+    /// ordinary case (`diff a b | head`) - ends the run.
+    fn item(&mut self, item: Vec<u8>) -> Result<()> {
+        if let Some(out) = self.output.as_mut() {
+            out.write_all(&item)?;
+        }
+        Ok(())
     }
 
-    fn open_shard(&mut self, kind: ElementKind, idx: usize) -> Result<Self::Shard> {
-        let options = self.sink.options;
-        if self.sink.output.is_none() {
-            return Ok(TextShard {
-                sink: DiffSink::new(None, options),
-                path: None,
-            });
-        }
-        let scratch = self.scratch.ok_or_else(|| {
-            crate::Error::invalid_argument(
-                "diff: a run that may use more than one shard needs a scratch directory",
-            )
-        })?;
-        let path = scratch.file(&format!("diff-par-{}-{idx}.txt.tmp", kind.type_char()))?;
-        let file = crate::scratch::create_file(&path)?;
-        Ok(TextShard {
-            sink: DiffSink::new(Some(std::io::BufWriter::new(file)), options),
-            path: Some(path),
-        })
-    }
-
-    fn finish_shard(shard: Self::Shard) -> Result<Self::Done> {
-        // BufWriter::into_inner propagates any deferred flush error; dropping
-        // the unwrapped File closes it and the main thread reopens the path.
-        if let Some(out) = shard.sink.output {
-            drop(
-                out.into_inner()
-                    .map_err(|e| crate::Error::from(e.into_error()))?,
-            );
-        }
-        Ok((shard.path, shard.sink.stats))
-    }
-
-    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Recorder) -> Result<()> {
-        match (self.sink.output.as_mut(), self.scratch) {
-            (Some(out), Some(scratch)) => {
-                emit_shard_outputs(&mut **out, done, &mut self.sink.stats, scratch, cancel)
-            }
-            _ => {
-                for (_, stats) in done {
-                    self.sink.stats.add(&stats);
-                }
-                Ok(())
-            }
-        }
+    fn finish_unit(&mut self, stats: DiffStats) -> Result<()> {
+        self.stats.add(&stats);
+        Ok(())
     }
 
     #[cfg(feature = "test-hooks")]
     fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize {
-        &faults.diff_shard_panic
+        &faults.diff_unit_panic
     }
 
     #[cfg(feature = "test-hooks")]
     fn panic_message(idx: usize) -> String {
-        format!("test-hooks: diff/parallel shard {idx} panicking")
-    }
-}
-
-/// Stream every shard's temp file to `output` in shard order, folding each
-/// shard's counts into `total`.
-///
-/// A failed write to `output` - the reader of a stdout pipe going away is
-/// the ordinary case (`diff a b | head`) - stops the emission, but every
-/// remaining shard's temp file is still removed before the error returns.
-/// Returning on the first error left them all in the scratch directory
-/// beside the old input, one per shard per run.
-fn emit_shard_outputs(
-    output: &mut impl Write,
-    outputs: Vec<(Option<crate::scratch::ScratchPath>, DiffStats)>,
-    total: &mut DiffStats,
-    scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Recorder,
-) -> Result<()> {
-    let mut first_err = None;
-    for (text_path, stats) in outputs {
-        let Some(text_path) = text_path else {
-            return Err(crate::Error::internal(
-                "diff: a shard of a text run wrote no text file",
-            ));
-        };
-        if first_err.is_some() {
-            scratch.remove(&text_path);
-            continue;
-        }
-        if let Err(e) = append_and_cleanup(output, &text_path, scratch, cancel) {
-            first_err = Some(e);
-            continue;
-        }
-        total.add(&stats);
-    }
-    first_err.map_or(Ok(()), Err)
-}
-
-/// Copy a shard's scratch temp file to the caller's output writer and then
-/// remove it - also when the copy fails, so a failed write does not leave
-/// the temp file behind.
-fn append_and_cleanup(
-    out: &mut impl Write,
-    src: &crate::scratch::ScratchPath,
-    scratch: &crate::scratch::RunScratch,
-    cancel: &crate::host::Recorder,
-) -> Result<()> {
-    // The copy checks the token at every read of the shard file (a shard
-    // can hold gigabytes of text, and stdout is not cancellation-aware).
-    let copied = crate::scratch::open(src)
-        .and_then(|f| std::io::copy(&mut crate::host::CancellableRead::new(f, cancel), out));
-    scratch.remove(src);
-    match copied {
-        Ok(_) => Ok(()),
-        // A cancellation is not a failure of this file: left as it is.
-        Err(e) if crate::error::io_carries_cancellation(&e) => Err(e.into()),
-        Err(e) => {
-            Err(crate::Error::from(e)
-                .context(format!("failed to copy scratch file {}", src.display())))
-        }
+        format!("test-hooks: diff unit {idx} panicking")
     }
 }
 

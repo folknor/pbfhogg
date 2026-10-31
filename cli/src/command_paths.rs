@@ -78,16 +78,12 @@ impl ScratchSite {
     }
 }
 
-/// Whether a `diff` run writes scratch. `--format osc` always does, at one
-/// shard too. A text diff does unless it runs one shard (`-j 1`) or is
-/// quiet: a quiet text diff only counts (`diff_stats`), which shards without
-/// scratch. `validate_diff` refuses `--tmp-dir` on the runs this answers
-/// `false` for, each refusal with its own reason.
-fn diff_writes_scratch(format: DiffFormat, quiet: bool, jobs: pbfhogg::Parallelism) -> bool {
-    match format {
-        DiffFormat::Osc => true,
-        DiffFormat::Text => !(quiet || jobs.fixed() == Some(1)),
-    }
+/// Whether a `diff` run writes scratch: `--format osc` always does (its
+/// per-action fragments); a text diff never does, at any `-j`, its workers'
+/// text going straight to the output. `validate_diff` refuses `--tmp-dir`
+/// on a text diff.
+fn diff_writes_scratch(format: DiffFormat) -> bool {
+    matches!(format, DiffFormat::Osc)
 }
 
 /// See the module doc.
@@ -110,12 +106,10 @@ pub(crate) struct CommandPaths {
 }
 
 impl CommandPaths {
-    /// `quiet` is the global `--quiet`, which decides whether a text diff
-    /// makes scratch.
     // A new `Command` variant must be considered here, not swallowed by `_`.
     #[deny(clippy::wildcard_enum_match_arm)]
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn of(command: &Command, quiet: bool) -> Self {
+    pub(crate) fn of(command: &Command) -> Self {
         let mut paths = Self {
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -218,7 +212,6 @@ impl CommandPaths {
                 new,
                 output,
                 overwrite,
-                jobs,
                 format,
                 tmp,
                 ..
@@ -226,15 +219,15 @@ impl CommandPaths {
                 paths.inputs.extend([old.clone(), new.clone()]);
                 paths.outputs.extend(output.as_ref().map(file));
                 paths.staging.clone_from(&overwrite.staging_dir);
-                if diff_writes_scratch(*format, quiet, *jobs) {
+                if diff_writes_scratch(*format) {
                     paths.scratch = Some(ScratchSite::new(tmp, output.as_deref()));
                 }
                 // Older versions wrote `diff-par-*` shards beside the old
                 // input.
                 paths.also_scan.push(parent_of(old));
-                // Where a stdout diff that makes scratch puts it; a run that
-                // makes none (text `-j 1`, a quiet text diff, which takes
-                // no -o) still scans it for an earlier run's leftover.
+                // Where a stdout diff that made scratch put it; a run that
+                // makes none (a text diff) still scans it for an earlier
+                // run's leftover.
                 if output.is_none() && tmp.tmp_dir.is_none() {
                     paths.also_scan.push(PathBuf::from("."));
                 }
@@ -353,17 +346,6 @@ impl CommandPaths {
             .as_ref()
             .ok_or("internal error: this command line makes no scratch directory")?
             .create(host)
-    }
-
-    /// The run's scratch directory when this command line makes one.
-    pub(crate) fn create_scratch_if_any(
-        &self,
-        host: &pbfhogg::host::Host,
-    ) -> Result<Option<pbfhogg::scratch::RunScratch>, Box<dyn std::error::Error>> {
-        self.scratch
-            .as_ref()
-            .map(|site| site.create(host))
-            .transpose()
     }
 
     /// `--staging-dir`, when given.

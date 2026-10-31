@@ -2,15 +2,17 @@
 //! `derive_changes`.
 //!
 //! [`block_pair_merge_phase`] is the blob-level merge over two indexed
-//! inputs, run once per shard of the ID space over [`BlockPairSide`]s the
-//! header walk planned, or at `-j 1` once over each input's [`BlobCursor`]
-//! stream. [`stream_merge_phase`] is the
+//! inputs, run once per work unit (an OSM-order key [`Window`] of one kind
+//! and the in-memory [`Frame`]s of both inputs that intersect it, read in
+//! file order from each input's [`BlobCursor`] stream; see
+//! `commands::diff::units`). [`stream_merge_phase`] is the
 //! element-level merge over two [`StreamingBlocks`] cursors, for inputs
 //! without indexdata. Both hand the caller borrowed elements through the
 //! same [`BlockMergeAction`] variants to one [`MergeSink`] per command, so
 //! an element prints the same way whichever path found it.
 
 use crate::ElementKind;
+use crate::osm_id::OsmIdKey;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use crate::error::Result;
@@ -480,35 +482,57 @@ pub(crate) trait MergeSink {
     fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()>;
 }
 
-/// One OsmData blob's location and index metadata, from the header walk:
-/// enough to pread, compare and decode it.
+/// One OsmData blob's provenance and index metadata, from its frame header.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlobDesc {
-    /// File-wide ordinal and frame start from the header walker; provenance
-    /// for errors, never used for scheduling.
+    /// File-wide ordinal and frame start; provenance for errors, never used
+    /// for scheduling.
     pub(crate) blob_index: u64,
     pub(crate) frame_offset: u64,
-    pub(crate) data_offset: u64,
-    pub(crate) data_size: usize,
     pub(crate) index: crate::blob_meta::BlobIndex,
 }
 
-/// The ID window `(t_low, t_high]` a shard owns. Only multi-shard plans
-/// have one, and those hold no negative ID, so the bounds compare as raw
-/// `i64`.
+impl BlobDesc {
+    /// The OSM-order key of the first element the claim allows: exact for a
+    /// single-sign range, conservatively key 0 for a mixed-sign one.
+    pub(crate) fn first_key(&self) -> OsmIdKey {
+        crate::osm_id::blob_osm_first_key(self.index.min_id, self.index.max_id)
+    }
+
+    /// The OSM-order key of the last element the claim allows.
+    pub(crate) fn last_key(&self) -> OsmIdKey {
+        crate::osm_id::blob_osm_last_key(self.index.min_id, self.index.max_id)
+    }
+}
+
+/// One data blob read from its input: its descriptor and its body (the raw
+/// `Blob` envelope), shared by every work unit whose window it intersects,
+/// so a blob crossing a cut is read and held once.
+#[derive(Clone)]
+pub(crate) struct Frame {
+    pub(crate) desc: BlobDesc,
+    pub(crate) body: std::sync::Arc<Vec<u8>>,
+}
+
+/// The OSM-order key interval `[start, end)` a work unit owns, each bound
+/// `None` when unbounded. Keys, not raw IDs, so negative IDs window in the
+/// order the merge orders them (`osm_id_cmp`), and every element falls in
+/// exactly one unit of its kind.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Window {
-    pub(crate) t_low: i64,
-    pub(crate) t_high: i64,
+    pub(crate) start: Option<OsmIdKey>,
+    pub(crate) end: Option<OsmIdKey>,
 }
 
 impl Window {
     /// Whether a blob's claimed range reaches outside the window, so its
     /// decoded block must be clipped. A claim inside stays unclipped, which
     /// keeps [`check_claimed_max`] able to see a block holding more than
-    /// its claim says.
-    fn crosses(self, index: &crate::blob_meta::BlobIndex) -> bool {
-        index.min_id <= self.t_low || index.max_id > self.t_high
+    /// its claim says. Claim-based, with the conservative key 0 for a
+    /// mixed-sign range: a crossing claim costs a clip, never an element.
+    fn crosses(self, desc: &BlobDesc) -> bool {
+        self.start.is_some_and(|s| desc.first_key() < s)
+            || self.end.is_some_and(|e| desc.last_key() >= e)
     }
 }
 
@@ -516,8 +540,11 @@ impl Window {
 struct BlockState {
     block: PrimitiveBlock,
     skip_count: usize,
-    /// Exclusive bound of the shard-window part; `None` when unclipped.
+    /// Exclusive bound of the window part; `None` when unclipped.
     end: Option<usize>,
+    /// For a clipped block, the ID of the last element inside the window:
+    /// the furthest the block can still offer this unit.
+    clip_last: Option<i64>,
     index: crate::blob_meta::BlobIndex,
 }
 
@@ -586,18 +613,15 @@ fn decode_blob(
 /// Running canonical-order check over one file's blob sequence, in FILE
 /// order.
 ///
-/// The block-pair header walk runs it over every data blob of each input,
-/// before bucketing by kind throws file order away. Without it the answer
-/// depended on `-j` back when `-j 1` ran a separate streaming engine: that
-/// engine saw only kind transitions, so blobs out of order within one kind
-/// gave it a wrong answer (50 created and 50 deleted on identical content)
-/// where the parallel walk refused the file, and before the walk had the
-/// guard, `-j 1` refused a misplaced kind while the default `-j` reported
-/// "Files are identical".
+/// Each input's [`BlobCursor`] runs it over every data blob as its header
+/// arrives, of a selected kind or not. Without it a merge sees only kind
+/// transitions, so blobs out of order within one kind gave a wrong answer
+/// (50 created and 50 deleted on identical content) where another path
+/// refused the file.
 ///
-/// Sorted blob order is also a precondition of the shard planner, which
-/// scans each per-kind list assuming it ascends, and of the merge, which
-/// decides from blob ranges which blobs overlap.
+/// Sorted blob order is also a precondition of the unit planner, which cuts
+/// each kind's stream at blob first keys assuming they ascend, and of the
+/// merge, which decides from blob ranges which blobs overlap.
 ///
 /// The ranges are compared by `osm_id` keys, not raw `i64`, so negative IDs
 /// order the way `osm_id_cmp` orders them everywhere else, and only disorder
@@ -691,27 +715,25 @@ pub(crate) fn missing_index_error() -> crate::Error {
     )
 }
 
-/// One input of a one-shard block-pair merge, read as one sequential
-/// stream across every kind phase instead of walked up front.
+/// One input of a block-pair merge, read as one sequential stream across
+/// every kind, taking each header as it arrives and reading the bodies of
+/// the selected kinds from the same stream.
 ///
-/// A multi-shard plan needs every blob header of both files before any
-/// body is read; one shard reads each side's blobs in file order, so it
-/// takes headers as it meets them and reads the bodies it selects from the
-/// same stream (a whole-file header walk first cost a serial `pread` per
-/// blob, more than a third of a Europe `-j 1` diff). The stream is a
-/// command-input [`crate::blob::BlobReader`], so it honours `--direct-io`
-/// and the host's page-cache eviction, and refuses a partially indexed
-/// file through the frame walk's own guard.
+/// There is no up-front walk: a whole-file header walk is a chain of
+/// dependent `pread`s, one per blob, which cost about a quarter of a planet
+/// diff's wall before any merge started. The stream is a command-input
+/// [`crate::blob::BlobReader`], so it honours `--direct-io` and the host's
+/// page-cache eviction, and refuses a partially indexed file through the
+/// frame walk's own guard.
 ///
-/// The checks the walk makes up front are made here as each header
-/// arrives, in file order: every data header, of a selected kind or not,
-/// is observed once by [`BlobOrderGuard`] and must carry readable
-/// indexdata; the first frame is the OsmHeader the caller's front read
-/// already judged and is skipped unread, as are frames of other types.
-/// [`Self::finish`] walks what no phase consumed, so a defect past the last
-/// selected kind is still refused before success. The refusals are the
-/// walk's; only their timing differs, so a defect late in a file is
-/// reported after the output written before it.
+/// Every check is made as each header arrives, in file order: every data
+/// header, of a selected kind or not, is observed once by
+/// [`BlobOrderGuard`] and must carry readable indexdata; the first frame is
+/// the OsmHeader the caller's front read already judged and is skipped
+/// unread, as are frames of other types. [`Self::finish`] walks what no
+/// kind consumed, so a defect past the last selected kind is still refused
+/// before success. A defect late in a file is therefore reported after the
+/// output written before it.
 pub(crate) struct BlobCursor {
     reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
     path: std::sync::Arc<std::path::Path>,
@@ -721,10 +743,8 @@ pub(crate) struct BlobCursor {
     /// Clean EOF was reached; never polled again.
     exhausted: bool,
     /// An observed data header whose payload is still pending in the
-    /// reader: the next blob, of the running phase's kind or a later one.
+    /// reader: the next blob, of the running kind or a later one.
     lookahead: Option<BlobDesc>,
-    /// Payloads read since the last [`Self::take_read_count`].
-    read_count: usize,
 }
 
 impl BlobCursor {
@@ -745,7 +765,6 @@ impl BlobCursor {
             started: false,
             exhausted: false,
             lookahead: None,
-            read_count: 0,
         })
     }
 
@@ -798,8 +817,6 @@ impl BlobCursor {
             self.lookahead = Some(BlobDesc {
                 blob_index,
                 frame_offset,
-                data_offset: frame_offset + header.payload_offset() as u64,
-                data_size: header.data_size,
                 index,
             });
             return Ok(());
@@ -824,9 +841,18 @@ impl BlobCursor {
         }
     }
 
-    /// The next blob of `kind`, its body (the raw `Blob` envelope) in
-    /// `buf`; `None` once the next blob is of a later kind or the file ends.
-    fn next_of(&mut self, kind: ElementKind, buf: &mut Vec<u8>) -> Result<Option<BlobDesc>> {
+    /// The descriptor of the next blob of `kind`, its body not yet read;
+    /// `None` once the next blob is of a later kind or the file ends.
+    pub(crate) fn peek(&mut self, kind: ElementKind) -> Result<Option<BlobDesc>> {
+        if !self.reaches(kind)? {
+            return Ok(None);
+        }
+        Ok(self.lookahead)
+    }
+
+    /// The next blob of `kind` with its body (the raw `Blob` envelope);
+    /// `None` once the next blob is of a later kind or the file ends.
+    pub(crate) fn next_of(&mut self, kind: ElementKind) -> Result<Option<Frame>> {
         if !self.reaches(kind)? {
             return Ok(None);
         }
@@ -835,15 +861,17 @@ impl BlobCursor {
                 "block-pair stream: no pending blob after reaching its kind",
             ));
         };
-        buf.clear();
-        self.reader.read_frame_payload(buf)?;
-        self.read_count += 1;
-        Ok(Some(desc))
+        let mut body = Vec::new();
+        self.reader.read_frame_payload(&mut body)?;
+        Ok(Some(Frame {
+            desc,
+            body: std::sync::Arc::new(body),
+        }))
     }
 
-    /// Bodies read since the last call: one phase's blobs on this side.
-    pub(crate) fn take_read_count(&mut self) -> usize {
-        std::mem::take(&mut self.read_count)
+    /// The path this cursor reads, for locating errors.
+    pub(crate) fn path(&self) -> &std::sync::Arc<std::path::Path> {
+        &self.path
     }
 
     /// Walk the rest of the file, headers checked and bodies skipped.
@@ -858,149 +886,103 @@ impl BlobCursor {
     }
 }
 
-/// Where a [`BlockPairSide`] gets its blobs.
-enum SideSource<'a> {
-    /// A shard's slice of one kind's blobs from the header walk, read by
-    /// `pread` from the walker's shared descriptor.
-    Walked {
-        file: &'a std::fs::File,
-        descs: &'a [BlobDesc],
-        next: usize,
-    },
-    /// One kind's run of a one-shard stream.
-    Stream {
-        cursor: &'a mut BlobCursor,
-        kind: ElementKind,
-    },
-}
-
-/// One input of a block-pair merge over one shard of one kind: either the
-/// shard's slice of that kind's blobs from the header walk, read by `pread`
-/// from the walker's shared descriptor, or, for a one-shard run, that
-/// kind's run of the input's [`BlobCursor`].
+/// One input of a block-pair merge over one work unit: the unit's frames of
+/// that input, in file order, clipped to the unit's window.
 ///
-/// Holds at most one blob read but not yet decoded (`read_buf`): the merge
-/// reads a fresh blob from each side before it decides whether to decode,
-/// compare or emit it, and hands one back (`held`) when only the other is
-/// emitted, so the next round can still try the byte comparison on it.
+/// The merge takes a fresh blob from each side before it decides whether to
+/// decode, compare or emit it, and hands one back ([`Self::hold`]) when only
+/// the other is emitted, so the next round can still try the byte
+/// comparison on it.
 pub(crate) struct BlockPairSide<'a> {
-    source: SideSource<'a>,
-    path: std::sync::Arc<std::path::Path>,
-    window: Option<Window>,
-    /// The body (`Blob` envelope) of the blob [`BlockPairSide::next_blob`]
-    /// returned last. Reused across blobs.
-    read_buf: Vec<u8>,
+    frames: &'a [Frame],
+    /// Index of the next frame [`Self::next_blob`] yields.
+    next: usize,
+    /// Index of the frame [`Self::next_blob`] yielded last.
+    current: usize,
+    /// The current frame was handed back: yield it again.
+    held: bool,
+    path: &'a std::sync::Arc<std::path::Path>,
+    window: Window,
     st: Vec<(u32, u32)>,
     gr: Vec<(u32, u32)>,
-    /// A blob handed back undecoded by the non-overlap fast path; its body
-    /// is still in `read_buf`. Taken first by `next_blob`.
-    held: Option<BlobDesc>,
 }
 
 impl<'a> BlockPairSide<'a> {
-    /// A side over `descs`, one kind's blobs of this shard in file order,
-    /// clipped to `window` when the shard has one.
+    /// A side over `frames`, one kind's blobs of one input intersecting
+    /// `window`, in file order. Errors are located in `path`.
     pub(crate) fn new(
-        file: &'a std::fs::File,
-        source: &'a std::sync::Arc<std::path::Path>,
-        descs: &'a [BlobDesc],
-        window: Option<Window>,
-    ) -> Self {
-        Self::over(
-            SideSource::Walked {
-                file,
-                descs,
-                next: 0,
-            },
-            std::sync::Arc::clone(source),
-            window,
-        )
-    }
-
-    /// A one-shard side over `kind`'s run of `cursor`: no window.
-    pub(crate) fn streamed(cursor: &'a mut BlobCursor, kind: ElementKind) -> Self {
-        let path = std::sync::Arc::clone(&cursor.path);
-        Self::over(SideSource::Stream { cursor, kind }, path, None)
-    }
-
-    fn over(
-        source: SideSource<'a>,
-        path: std::sync::Arc<std::path::Path>,
-        window: Option<Window>,
+        frames: &'a [Frame],
+        path: &'a std::sync::Arc<std::path::Path>,
+        window: Window,
     ) -> Self {
         Self {
-            source,
+            frames,
+            next: 0,
+            current: 0,
+            held: false,
             path,
             window,
-            read_buf: Vec::new(),
             st: Vec::new(),
             gr: Vec::new(),
-            held: None,
         }
     }
 
     #[cold]
     fn locate(&self, desc: &BlobDesc, err: crate::Error) -> crate::Error {
         err.locate(crate::error::Location::new(
-            Some(&self.path),
+            Some(self.path),
             Some(desc.blob_index),
             Some(crate::ByteOffset(desc.frame_offset)),
         ))
     }
 
-    /// The next blob of the shard with its body read into `read_buf`,
-    /// unparsed.
-    fn next_blob(&mut self) -> Result<Option<BlobDesc>> {
-        use std::os::unix::fs::FileExt as _;
-        if let Some(held) = self.held.take() {
-            return Ok(Some(held));
+    /// The next blob of the unit, its body not yet parsed.
+    fn next_blob(&mut self) -> Option<BlobDesc> {
+        if self.held {
+            self.held = false;
+            return self.frames.get(self.current).map(|f| f.desc);
         }
-        let (desc, read) = match &mut self.source {
-            SideSource::Walked { file, descs, next } => {
-                let Some(&desc) = descs.get(*next) else {
-                    return Ok(None);
-                };
-                *next += 1;
-                self.read_buf.resize(desc.data_size, 0);
-                (
-                    desc,
-                    file.read_exact_at(&mut self.read_buf, desc.data_offset),
-                )
-            }
-            // The stream locates its own failures at the frame.
-            SideSource::Stream { cursor, kind } => {
-                return cursor.next_of(*kind, &mut self.read_buf);
-            }
-        };
-        if let Err(e) = read {
-            return Err(self.locate(&desc, e.into()));
-        }
-        Ok(Some(desc))
+        let frame = self.frames.get(self.next)?;
+        self.current = self.next;
+        self.next += 1;
+        Some(frame.desc)
     }
 
-    /// The payload of the blob in `read_buf`, for the byte comparison.
+    /// Hand the blob [`Self::next_blob`] returned last back, undecoded.
+    fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// The body of the blob [`Self::next_blob`] returned last.
+    fn body(&self) -> &[u8] {
+        self.frames
+            .get(self.current)
+            .map_or(&[], |f| f.body.as_slice())
+    }
+
+    /// The payload of the current blob, for the byte comparison.
     fn payload(&self, desc: &BlobDesc) -> Result<Option<(u8, &[u8])>> {
-        crate::blob::raw_blob_payload(&self.read_buf).map_err(|e| self.locate(desc, e))
+        crate::blob::raw_blob_payload(self.body()).map_err(|e| self.locate(desc, e))
     }
 
-    /// Decompress and parse the blob in `read_buf`, clipped to the window
-    /// when its claimed range crosses it.
+    /// Decompress and parse the current blob, clipped to the window when its
+    /// claimed range crosses it.
     ///
-    /// Each block gets a fresh buffer, as the parallel shard workers always
+    /// Each block gets a fresh buffer, as the block-pair workers always
     /// did, and that is kept for now on the default path of a measured
     /// planet command. A fresh buffer arrives at the parse exactly full, so
     /// appending the inline metadata typically doubles its capacity (see
-    /// `WireBlock::parse_and_inline_with_scratch`). A per-shard pool shared
+    /// `WireBlock::parse_and_inline_with_scratch`). A per-worker pool shared
     /// by both sides could reuse that grown capacity, avoiding repeated
     /// growth when later blocks fit; both sides hold a live block at once,
     /// a larger block still grows, and a buffer past the pool's retain cap
-    /// is dropped. Allocation and free stay on the shard's thread either
+    /// is dropped. Allocation and free stay on the worker's thread either
     /// way. The time and memory effects of a pool here are unmeasured, so
     /// this allocation policy stays pending a measured comparison.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode(&mut self, desc: BlobDesc) -> Result<BlockState> {
         let mut decompressed: Vec<u8> = Vec::new();
-        if let Err(e) = crate::blob::decompress_blob_raw(&self.read_buf, &mut decompressed) {
+        if let Err(e) = crate::blob::decompress_blob_raw(self.body(), &mut decompressed) {
             return Err(self.locate(&desc, e));
         }
         let block =
@@ -1008,28 +990,30 @@ impl<'a> BlockPairSide<'a> {
                 Ok(block) => block,
                 Err(e) => return Err(self.locate(&desc, e)),
             };
-        // The shard planner bucketed this blob by its claimed kind, so an
-        // element of another kind would be merged against the wrong file's
-        // blobs of that kind (spurious created/deleted) or dropped.
+        // The planner placed this blob by its claimed kind, so an element of
+        // another kind would be merged against the wrong file's blobs of
+        // that kind (spurious created/deleted) or dropped.
         if let Err(e) = block.refuse_foreign_kind(Some(desc.index.kind)) {
             return Err(self.locate(&desc, e));
         }
-        let (skip_count, end) = match self.window {
-            Some(window) if window.crosses(&desc.index) => clip(&block, window),
-            _ => (0, None),
+        let (skip_count, end, clip_last) = if self.window.crosses(&desc) {
+            clip(&block, self.window)
+        } else {
+            (0, None, None)
         };
         Ok(BlockState {
             block,
             skip_count,
             end,
+            clip_last,
             index: desc.index,
         })
     }
 
-    /// The next blob of the shard, decoded, passing over any that holds
+    /// The next blob of the unit, decoded, passing over any that holds
     /// nothing inside the window.
     fn next_decoded(&mut self) -> Result<Option<BlockState>> {
-        while let Some(desc) = self.next_blob()? {
+        while let Some(desc) = self.next_blob() {
             let state = self.decode(desc)?;
             if !state.spent() {
                 return Ok(Some(state));
@@ -1040,24 +1024,29 @@ impl<'a> BlockPairSide<'a> {
 }
 
 /// The window part of a block whose claim crosses the window: the number of
-/// leading elements at or below `t_low` (the shard below owns them) and the
-/// index of the first element past `t_high` (the block's length when none
-/// is). Counted from the elements, so a clipped run's count is exact. Order
-/// within the block is trusted, as everywhere in the engine.
-fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>) {
+/// leading elements before the window's start (an earlier unit owns them),
+/// the index of the first element at or past its end (the block's length
+/// when none is), and the ID of the last element inside. Counted from the
+/// elements, so a clipped run's count is exact. Order within the block is
+/// trusted, as everywhere in the engine.
+fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>, Option<i64>) {
     let mut skip = 0usize;
     let mut len = 0usize;
+    let mut last_inside = None;
     for (i, element) in block.elements_skip_metadata().enumerate() {
         let id = element_id(&element);
-        if id > window.t_high {
-            return (skip.min(i), Some(i));
+        let key = crate::osm_id::osm_id_key(id);
+        if window.end.is_some_and(|end| key >= end) {
+            return (skip.min(i), Some(i), last_inside);
         }
-        if id <= window.t_low {
+        if window.start.is_some_and(|start| key < start) {
             skip = i + 1;
+        } else {
+            last_inside = Some(id);
         }
         len = i + 1;
     }
-    (skip.min(len), Some(len))
+    (skip.min(len), Some(len), last_inside)
 }
 
 /// Drain the rest of one side's shard as single-sided runs.
@@ -1101,13 +1090,14 @@ fn emit_block<S: MergeSink>(
 }
 
 /// The OSM-order last ID a decoded block can still offer: its claimed last,
-/// or the window's upper end for a block clipped there. A clipped block
-/// exists only under a window, whose plan holds no negative ID, so the
-/// plain `min` is the OSM-order one.
-fn state_last(bs: &BlockState, window: Option<Window>) -> i64 {
+/// or, for a block clipped to the window, the earlier of that and its last
+/// element inside the window. A claim understating the block's contents
+/// stays the answer, so [`check_claimed_max`] still sees the contradiction
+/// for a block whose claim does not cross the window's end.
+fn state_last(bs: &BlockState) -> i64 {
     let last = blob_last(&bs.index);
-    match (bs.end, window) {
-        (Some(_), Some(window)) => last.min(window.t_high),
+    match bs.clip_last {
+        Some(inside) if crate::osm_id::osm_id_cmp(inside, last).is_lt() => inside,
         _ => last,
     }
 }
@@ -1117,7 +1107,6 @@ fn state_last(bs: &BlockState, window: Option<Window>) -> i64 {
 fn merge_decoded_pair<S: MergeSink>(
     old_decoded: &mut Option<BlockState>,
     new_decoded: &mut Option<BlockState>,
-    window: Option<Window>,
     kind: ElementKind,
     sink: &mut S,
 ) -> Result<()> {
@@ -1138,8 +1127,8 @@ fn merge_decoded_pair<S: MergeSink>(
     // explicitly supports as 0, -1, -2, ..., 1, 2, ..., a raw `min` picks a
     // boundary that cuts the streams in a different place than the order
     // they are being merged in.
-    let old_last = state_last(&os, window);
-    let new_last = state_last(&ns, window);
+    let old_last = state_last(&os);
+    let new_last = state_last(&ns);
     let merge_up_to = if crate::osm_id::osm_id_cmp(old_last, new_last).is_le() {
         old_last
     } else {
@@ -1157,9 +1146,9 @@ fn merge_decoded_pair<S: MergeSink>(
     // them with it, with no error and no infinite loop to notice. Compare
     // the proxy against what the iterator actually saw, and reject the
     // mismatch instead of losing elements to it. A block clipped at the
-    // window's upper end is bounded there, so what it holds past the window
-    // is the next shard's and never counts as "more"; a block whose claim
-    // lies inside the window is not clipped, so its contents stay visible.
+    // window's end is bounded there, so what it holds past the window is the
+    // next unit's and never counts as "more"; a block whose claim lies
+    // inside the window is not clipped, so its contents stay visible.
     check_claimed_max(&os.index, outcome.old_has_more, merge_up_to, "old")?;
     check_claimed_max(&ns.index, outcome.new_has_more, merge_up_to, "new")?;
 
@@ -1222,10 +1211,10 @@ fn check_claimed_max(
     Ok(())
 }
 
-/// Run one type phase of the block-pair merge over one shard.
+/// Run the block-pair merge over one work unit of one kind.
 ///
-/// `old` and `new` hold the shard's blobs of `kind`, which the header walk
-/// checked for indexdata and canonical order. Falls through to
+/// `old` and `new` hold the unit's blobs of `kind`, whose headers the input
+/// cursors checked for indexdata and canonical order. Falls through to
 /// element-level comparison for overlapping blocks.
 ///
 /// When `skip_equal_blobs` is true, a fresh overlapping blob pair (neither
@@ -1245,7 +1234,6 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
     stats: &mut BlockPairMergeStats,
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
-    let window = old.window;
     let mut old_decoded: Option<BlockState> = None;
     let mut new_decoded: Option<BlockState> = None;
 
@@ -1253,13 +1241,13 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
         // Once per merge step, each of which decodes at most one blob per
         // side.
         cancel.check()?;
-        // Fast path: both sides need fresh blobs (no residuals). Read
+        // Fast path: both sides need fresh blobs (no residuals). Taken
         // without decompressing so the compressed bytes can be compared.
         // Only here: a residual is partly consumed, and comparing it whole
         // against a fresh blob would count its consumed elements twice.
         if old_decoded.is_none() && new_decoded.is_none() {
-            let op = old.next_blob()?;
-            let np = new.next_blob()?;
+            let op = old.next_blob();
+            let np = new.next_blob();
 
             match (op, np) {
                 (None, None) => break,
@@ -1281,13 +1269,13 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                         emit_block(&os, true, kind, sink, stats)?;
                         // Hold the new blob undecoded - the next round can
                         // try the byte comparison on it.
-                        new.held = Some(np);
+                        new.hold();
                         continue;
                     }
                     if blob_entirely_before(&np.index, &op.index) {
                         let ns = new.decode(np)?;
                         emit_block(&ns, false, kind, sink, stats)?;
-                        old.held = Some(op);
+                        old.hold();
                         continue;
                     }
                     if skip_equal_blobs && blobs_byte_equal(old, &op, new, &np)? {
@@ -1332,7 +1320,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                 }
                 old_decoded = Some(os);
                 new_decoded = Some(ns);
-                merge_decoded_pair(&mut old_decoded, &mut new_decoded, window, kind, sink)?;
+                merge_decoded_pair(&mut old_decoded, &mut new_decoded, kind, sink)?;
             }
         }
     }
@@ -1357,7 +1345,7 @@ fn blobs_byte_equal(
     {
         return Ok(false);
     }
-    if old.window.is_some_and(|w| w.crosses(&op.index)) {
+    if old.window.crosses(op) {
         return Ok(false);
     }
     let a = old.payload(op)?;

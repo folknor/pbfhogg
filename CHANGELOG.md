@@ -96,7 +96,8 @@ never left partial, and the library no longer touches process state.
   to (`evict_page_cache(true)`).
 - `PbfWriter::to_path*` take an `Executor`, `write_raw_copy` takes an
   `&InputFile`, and `into_inner` returns a `Result`.
-- Scratch-using commands take a `RunScratch`, `merge_changes` included.
+- Scratch-using commands take a `RunScratch`, `merge_changes` included;
+  `diff::diff` writes none and takes none.
 - Removed: `IndexedReader`, `IdRanges`, `IdSet::count_below` and
   `count_in_range`, `BlockBuilder::with_element_cap`,
   `HeaderBuilder::from_header`, `PrimitiveBlock::new`, `inspect::show_element`,
@@ -123,8 +124,9 @@ never left partial, and the library no longer touches process state.
 - `degrade --corrupt-tagdata`, `--corrupt-indexdata` and
   `--corrupt-indexdata-kind` write well-formed but false hints.
 - A global `-q, --quiet`.
-- `--tmp-dir` on `add-locations-to-ways`, `diff` and `build-geocode-index`,
-  and `--staging-dir` on every command that writes an output.
+- `--tmp-dir` on `add-locations-to-ways`, `diff --format osc` and
+  `build-geocode-index`, and `--staging-dir` on every command that writes an
+  output.
 - Ctrl-C and SIGTERM stop a run cleanly, removing its staging and scratch.
 - Leftovers of runs that never finished are reported (never removed).
 - `getid` and `getparents` accept `node/123`-style IDs.
@@ -143,9 +145,13 @@ never left partial, and the library no longer touches process state.
 
 ### Changed
 
-- `diff` runs one engine at every `-j`: `-v` runs at any `-j`, and `-c`,
-  `-q` and `--format osc` skip byte-equal blob pairs at the default `-j`
-  too. `-j 1` still reads each input as one stream.
+- `diff` runs one engine at every `-j`: each input is read once as one
+  sequential stream (no up-front header walk), cut into work units the
+  workers merge, and the text goes to the output as it is produced, so a
+  text diff writes no scratch and refuses `--tmp-dir`. `-v` runs at any `-j`,
+  `-c`, `-q` and `--format osc` skip byte-equal blob pairs at every `-j`,
+  `--direct-io` applies at every `-j`, and inputs holding negative IDs run in
+  parallel too.
 - `cat --dedupe` runs on `sort`'s engine (header walk, `copy_file_range`
   passthrough, parallel merge), and `sort` streams its overlap output instead
   of buffering it. Overlapping blobs are merged without copying elements:

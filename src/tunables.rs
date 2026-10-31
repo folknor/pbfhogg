@@ -644,6 +644,43 @@ pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_WORK: usize = 1 << 20;
 /// not counted.
 pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 
+/// Compressed frame bytes (both inputs together) at which the block-pair
+/// planner closes a work unit, at the next cut its closure rule allows.
+/// Larger units cost memory (a window of them is held); smaller ones cost
+/// CPU, since a blob crossing a cut is decoded once by each unit it
+/// touches, about one blob per unit. At ~1 MB planet blobs this is a few
+/// dozen blobs a unit, so the crossing decode stays a few percent. Not
+/// measured.
+pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
+
+/// Frame bytes past which a unit that still cannot close is refused as a
+/// resource limit. A unit of duplicate-free input closes within the target
+/// plus a few maximum-size frames (one crossing each cut per input, one read
+/// past the target per input: under 200 MiB at the 32 MiB frame limit), so
+/// only many adjacent blobs starting at one ID - a duplicate-ID run no
+/// window can split - reach this.
+pub(crate) const DIFF_UNIT_CAP_BYTES: usize = 1 << 30;
+
+/// Planned units waiting for a worker, beyond the ones the pool's window
+/// already holds: enough that a worker freeing up rarely waits on the
+/// planner's reads. Not measured.
+pub(crate) const DIFF_UNIT_QUEUE_DEPTH: usize = 4;
+
+/// Units issued beyond one per worker. The pool holds at most `workers +
+/// DIFF_UNIT_WINDOW_SLACK` units, which with the queue above bounds the
+/// frame memory of a run; a little slack keeps every worker busy while the
+/// consumer drains the head. Not measured.
+pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
+
+/// Formatted output bytes a unit's worker gathers before handing a chunk to
+/// the consumer, so a unit with a large output streams it instead of
+/// holding it whole. Not measured.
+pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
+
+/// Output chunks one unit may have queued for the consumer before its
+/// worker blocks.
+pub(crate) const DIFF_OUTPUT_CHUNK_DEPTH: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Cat
 // ---------------------------------------------------------------------------

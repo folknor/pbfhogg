@@ -86,6 +86,11 @@
 //! publishing per-task senders through a second shared table needs its own
 //! closure protocol. So the consumer dispatches instead:
 //!
+//! - Tasks are a count known up front ([`run_ordered_streams`]) or come from
+//!   a source called on the consumer's thread as tasks are issued, each with
+//!   its own payload ([`run_ordered_streams_from`], the diff's work units); a
+//!   source failure is an ordered failure at the position of the task it did
+//!   not produce.
 //! - It issues task `k` by making its channel, keeping the receiver (in task
 //!   order) and queueing `(k, sender)` on a FIFO job queue. It issues the
 //!   first `window` tasks up front and task `k + window` once it has
@@ -918,18 +923,15 @@ impl Drop for AbandonOnUnwind<'_> {
     }
 }
 
-/// A queued streamed task: its index and the sender of its channel.
-type StreamJob<T, E> = (usize, std::sync::mpsc::SyncSender<StreamMsg<T, E>>);
-
 /// A worker's next job, or `Err` once the queue is closed and empty. Waiting
 /// for the lock behind a peer and on an empty queue are recorded apart, each
 /// only when it blocks (and tallied, so a test can wait for it to begin).
 /// The mutex guards nothing a panic could leave half updated, so a poisoned
 /// one is used as is.
-fn next_job<T, E>(
-    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<StreamJob<T, E>>>,
+fn next_job<J>(
+    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<J>>,
     metrics: &OrderedPoolMetrics,
-) -> Result<StreamJob<T, E>, std::sync::mpsc::RecvError> {
+) -> Result<J, std::sync::mpsc::RecvError> {
     let guard = match jobs.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -1005,15 +1007,111 @@ where
     W: Fn(&mut L, usize, &Emitter<'_, T, E>) -> crate::Result<E> + Sync,
     C: StreamConsumer<T, E>,
 {
+    let mut issued = 0_usize;
+    let mut source = || {
+        if issued == n_tasks {
+            return Ok(None);
+        }
+        issued += 1;
+        Ok(Some(()))
+    };
+    run_streams_core(
+        &mut source,
+        workers,
+        config,
+        local,
+        |local: &mut L, task, (), emitter: &Emitter<'_, T, E>| work(local, task, emitter),
+        consumer,
+        metrics,
+    )
+}
+
+/// [`run_ordered_streams`] over tasks a source produces as the run goes,
+/// each carrying its own payload, instead of a count known up front.
+///
+/// `source` runs on the calling thread whenever a task can be issued: up to
+/// `window` up front, then one each time the consumer finishes a task. It
+/// answers `Ok(Some(payload))` for the next task, `Ok(None)` once there are
+/// no more, or an error, which becomes a failure at the position of the task
+/// it did not produce: every earlier task is still consumed first, so an
+/// earlier task's or the consumer's own failure outranks it, as in the
+/// module's ordered-failure contract. After `None` or an error the source is
+/// not called again. A source that blocks (on a planner's queue) delays the
+/// consumer, never a worker: a worker holds its whole payload.
+pub(crate) fn run_ordered_streams_from<P, L, T, E, I, W, C>(
+    source: &mut dyn FnMut() -> crate::Result<Option<P>>,
+    workers: usize,
+    config: StreamConfig<'_>,
+    local: I,
+    work: W,
+    consumer: &mut C,
+) -> crate::Result<()>
+where
+    P: Send,
+    T: Send,
+    E: Send,
+    I: Fn(usize) -> L + Sync,
+    W: Fn(&mut L, usize, P, &Emitter<'_, T, E>) -> crate::Result<E> + Sync,
+    C: StreamConsumer<T, E>,
+{
+    run_streams_core(
+        source,
+        workers,
+        config,
+        local,
+        work,
+        consumer,
+        &config.cancel.metrics().ordered,
+    )
+}
+
+/// A queued streamed task: its index, its payload and the sender of its
+/// channel.
+type PayloadJob<P, T, E> = (usize, P, std::sync::mpsc::SyncSender<StreamMsg<T, E>>);
+
+/// Where issuing stands.
+enum Issue {
+    /// The source may still produce tasks.
+    Open,
+    /// The source answered `None`.
+    Done,
+    /// The source failed at the task it would have issued next.
+    Failed(Error),
+}
+
+/// The one streamed-run engine behind [`run_ordered_streams`] and
+/// [`run_ordered_streams_from`].
+#[allow(clippy::too_many_lines)]
+fn run_streams_core<P, L, T, E, I, W, C>(
+    source: &mut dyn FnMut() -> crate::Result<Option<P>>,
+    workers: usize,
+    config: StreamConfig<'_>,
+    local: I,
+    work: W,
+    consumer: &mut C,
+    metrics: &OrderedPoolMetrics,
+) -> crate::Result<()>
+where
+    P: Send,
+    T: Send,
+    E: Send,
+    I: Fn(usize) -> L + Sync,
+    W: Fn(&mut L, usize, P, &Emitter<'_, T, E>) -> crate::Result<E> + Sync,
+    C: StreamConsumer<T, E>,
+{
     let StreamConfig {
         window,
         depth,
         cancel,
     } = config;
     cancel.check()?;
-    if n_tasks == 0 {
-        return Ok(());
-    }
+    // The first task is pulled before any thread starts, so an empty run
+    // (and a source failing at once) starts nothing.
+    let first = match source() {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     if workers == 0 {
         return Err(Error::internal("ordered pool started with no workers"));
     }
@@ -1025,28 +1123,33 @@ where
     std::thread::scope(|scope| -> crate::Result<()> {
         // Every channel end below is a local of this closure, so any return
         // drops it before the scope joins the workers.
-        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<StreamJob<T, E>>(window.get());
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<PayloadJob<P, T, E>>(window.get());
         let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
         let mut job_tx = Some(job_tx);
         let mut pending: std::collections::VecDeque<std::sync::mpsc::Receiver<StreamMsg<T, E>>> =
             std::collections::VecDeque::with_capacity(window.get());
         let mut next_to_issue = 0_usize;
-        let mut issue = |pending: &mut std::collections::VecDeque<_>, next_to_issue: &mut usize| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(depth);
-            pending.push_back(rx);
-            if let Some(job_tx) = &job_tx {
-                // Never full (see the module docs). Refused only once every
-                // worker is gone, which drops this task's sender with the
-                // job, so the consumer sees it disconnect.
-                job_tx.send((*next_to_issue, tx)).ok();
-            }
-            *next_to_issue += 1;
-            if *next_to_issue == n_tasks {
-                job_tx = None;
-            }
-        };
-        while next_to_issue < n_tasks.min(window.get()) {
-            issue(&mut pending, &mut next_to_issue);
+        let mut state = Issue::Open;
+        issue_job(
+            job_tx.as_ref(),
+            first,
+            depth,
+            &mut pending,
+            &mut next_to_issue,
+        );
+        refill(
+            source,
+            job_tx.as_ref(),
+            window.get(),
+            depth,
+            &mut pending,
+            &mut next_to_issue,
+            &mut state,
+        );
+        // On `None` or a source error the job queue closes, so idle workers
+        // exit once it drains.
+        if !matches!(state, Issue::Open) {
+            job_tx = None;
         }
         // Declared after every channel end, so it drops first: the flag is
         // up before the receivers and the queue's sender go.
@@ -1064,14 +1167,14 @@ where
                         break;
                     }
                     let job = next_job(&jobs, metrics);
-                    let Ok((task, tx)) = job else { break };
+                    let Ok((task, payload, tx)) = job else { break };
                     let emitter = Emitter {
                         tx,
                         abandoned,
                         metrics,
                         gone: std::cell::Cell::new(false),
                     };
-                    let end = work(&mut local, task, &emitter);
+                    let end = work(&mut local, task, payload, &emitter);
                     if emitter.gone.get() || !emitter.deliver(StreamMsg::End(end)) {
                         break;
                     }
@@ -1082,12 +1185,10 @@ where
         // task sender still queued.
         drop(job_rx);
 
-        for task in 0..n_tasks {
+        let mut task = 0_usize;
+        while let Some(rx) = pending.front() {
             cancel.check()?;
             consumer.before_task(task)?;
-            let rx = pending
-                .front()
-                .ok_or_else(|| Error::internal("ordered pool: a streamed task was never issued"))?;
             loop {
                 cancel.check()?;
                 let msg = recv_counted(rx, metrics);
@@ -1103,19 +1204,76 @@ where
                         // Only a worker that died holding the task gets
                         // here; its panic takes precedence at the join.
                         return Err(Error::internal(format!(
-                            "ordered pool: a worker ended streamed task {task} of {n_tasks} \
-                             without finishing it"
+                            "ordered pool: a worker ended streamed task {task} without \
+                             finishing it"
                         )));
                     }
                 }
             }
             pending.pop_front();
-            if next_to_issue < n_tasks {
-                issue(&mut pending, &mut next_to_issue);
+            task += 1;
+            if matches!(state, Issue::Open) {
+                refill(
+                    source,
+                    job_tx.as_ref(),
+                    window.get(),
+                    depth,
+                    &mut pending,
+                    &mut next_to_issue,
+                    &mut state,
+                );
+                if !matches!(state, Issue::Open) {
+                    job_tx = None;
+                }
             }
         }
-        Ok(())
+        cancel.check()?;
+        match state {
+            Issue::Failed(e) => Err(e),
+            Issue::Open | Issue::Done => Ok(()),
+        }
     })
+}
+
+/// Issue one task: make its channel, keep the receiver in task order and
+/// queue the job.
+fn issue_job<P, T, E>(
+    job_tx: Option<&std::sync::mpsc::SyncSender<PayloadJob<P, T, E>>>,
+    payload: P,
+    depth: usize,
+    pending: &mut std::collections::VecDeque<std::sync::mpsc::Receiver<StreamMsg<T, E>>>,
+    next_to_issue: &mut usize,
+) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(depth);
+    pending.push_back(rx);
+    if let Some(job_tx) = job_tx {
+        // Never full (see the module docs). Refused only once every worker
+        // is gone, which drops this task's sender with the job, so the
+        // consumer sees it disconnect.
+        job_tx.send((*next_to_issue, payload, tx)).ok();
+    }
+    *next_to_issue += 1;
+}
+
+/// Pull tasks from `source` while the window has room and the source is
+/// open.
+#[allow(clippy::too_many_arguments)]
+fn refill<P, T, E>(
+    source: &mut dyn FnMut() -> crate::Result<Option<P>>,
+    job_tx: Option<&std::sync::mpsc::SyncSender<PayloadJob<P, T, E>>>,
+    window: usize,
+    depth: usize,
+    pending: &mut std::collections::VecDeque<std::sync::mpsc::Receiver<StreamMsg<T, E>>>,
+    next_to_issue: &mut usize,
+    state: &mut Issue,
+) {
+    while matches!(state, Issue::Open) && pending.len() < window {
+        match source() {
+            Ok(Some(payload)) => issue_job(job_tx, payload, depth, pending, next_to_issue),
+            Ok(None) => *state = Issue::Done,
+            Err(e) => *state = Issue::Failed(e),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -696,7 +696,6 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
         osmium_summary,
         output,
         type_filter,
-        jobs,
         format,
         increment_version,
         update_timestamp,
@@ -736,19 +735,8 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                     return refuse(&format!("{flag} is only valid with --format osc"));
                 }
             }
-            // `-j 1` runs one shard, whose text goes straight to the output:
-            // no scratch. (`--format osc` keeps its scratch at one shard
-            // too, so it keeps --tmp-dir.)
-            if tmp.tmp_dir.is_some() && jobs.fixed() == Some(1) {
-                return refuse(
-                    "--tmp-dir has no effect with -j 1: a one-shard text diff writes no \
-                     scratch files",
-                );
-            }
             // A quiet text diff discards its text and summary: its answer is
-            // the exit code. The flags that only shape them are refused, and
-            // so is --tmp-dir: a quiet diff only counts, sharded or not, and
-            // counting writes no scratch.
+            // the exit code. The flags that only shape them are refused.
             if quiet {
                 for (set, flag, why) in [
                     (
@@ -759,7 +747,7 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                     (
                         tmp.tmp_dir.is_some(),
                         "--tmp-dir",
-                        "a quiet text diff only counts, which writes no scratch files",
+                        "a text diff writes no scratch files",
                     ),
                     (
                         *suppress_common,
@@ -781,6 +769,15 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                         return Err(quiet_refused(&["diff"], flag, why));
                     }
                 }
+            }
+            // A text diff's workers hand their text straight to the output
+            // at any -j, so it writes no scratch. (`--format osc` keeps its
+            // per-action fragments, so it keeps --tmp-dir.)
+            if tmp.tmp_dir.is_some() {
+                return refuse(
+                    "--tmp-dir is only valid with --format osc: a text diff writes no \
+                     scratch files",
+                );
             }
         }
     }
@@ -2549,7 +2546,7 @@ pub fn run() -> process::ExitCode {
         let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
         // The command line's inputs, outputs and scratch location, stated
         // once; the dispatch below moves the command's fields.
-        let paths = CommandPaths::of(&cli.command, quiet);
+        let paths = CommandPaths::of(&cli.command);
         paths.refuse_aliases()?;
         let mut leftovers = LeftoverScanner::default();
         paths.scan_leftovers(&mut leftovers, &host);
@@ -2857,12 +2854,8 @@ pub fn run() -> process::ExitCode {
                         osmium_summary,
                         quiet,
                     };
-                    let output_handle = overwrite.open(output.as_deref(), &host)?;
-                    // Only a text diff that may shard writes scratch
-                    // (`diff_writes_scratch`); it gets its directory now,
-                    // before any input is opened.
-                    let scratch = paths.create_scratch_if_any(&host)?;
-                    let output = output_handle;
+                    // A text diff writes no scratch.
+                    let output = overwrite.open(output.as_deref(), &host)?;
                     accept_outcome(
                         &mut outcome,
                         run_diff(
@@ -2874,7 +2867,6 @@ pub fn run() -> process::ExitCode {
                             jobs,
                             io.direct_io,
                             &host,
-                            scratch,
                         ),
                     )
                 }
@@ -4214,7 +4206,6 @@ fn run_diff(
     parallelism: pbfhogg::Parallelism,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-    scratch: Option<pbfhogg::scratch::RunScratch>,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let DiffFlags {
         suppress_common,
@@ -4231,13 +4222,12 @@ fn run_diff(
     };
     let stats = if quiet {
         // The answer is the exit code: count, formatting nothing.
-        // `validate_diff` refused every flag that shapes the text, and the
-        // dispatch made no scratch directory.
+        // `validate_diff` refused every flag that shapes the text.
         pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
     } else if let Some(output) = output {
         let output = output.bind(&host.invocation)?;
         let mut out = output.writer()?;
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
         out.finish()?;
         // A diff that found differences is a completed answer, not a
         // failure: its output is published like any other.
@@ -4248,7 +4238,7 @@ fn run_diff(
         // exists, so the run ends with success rather than with the
         // differences status `run` cannot know.
         let mut out = output::buffered();
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
         out.flush()?;
         stats
     };

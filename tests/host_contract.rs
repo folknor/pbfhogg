@@ -1265,7 +1265,7 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
-    for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
+    for (command, jobs) in [("sparse", 1), ("osc", 1), ("osc", 2)] {
         let output = dir.path().join(format!("{command}-{jobs}.osc"));
         let host = crate::common::test_host();
         run_scratch_backend(
@@ -1286,41 +1286,41 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
     }
 }
 
-/// A diff that runs one shard writes no scratch and takes `None`; one that may
-/// run several refuses `None` before reading anything. `diff_stats` takes no
-/// scratch at all, however many shards it runs.
+/// A text diff takes no scratch and writes none at any worker count, verbose
+/// or not, and gives the same text at each; `diff_stats` likewise.
 #[test]
-fn diff_without_scratch_needs_a_single_shard() {
+fn diff_writes_no_scratch_at_any_worker_count() {
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
-    let run = |verbose: bool, jobs: usize| {
-        let options = pbfhogg::diff::DiffOptions {
-            suppress_common: false,
-            verbose,
-            type_filter: None,
-            parallelism: pbfhogg::Parallelism::from_jobs(jobs),
-        };
-        pbfhogg::diff::diff(
-            &base,
-            &changed,
-            &mut Vec::new(),
-            &options,
-            false,
-            &crate::common::test_host(),
-            None,
-        )
-    };
-    assert!(run(false, 1).is_ok());
-    assert!(run(true, 1).is_ok());
-    // Verbose shards like any other diff.
-    for verbose in [false, true] {
-        let err = run(verbose, 2).expect_err("two shards need scratch");
-        assert!(err.to_string().contains("scratch directory"), "{err}");
-    }
-    // Counting takes no scratch at any shard count and writes nothing.
     let before = crate::common::snapshot_dir(dir.path());
+    for verbose in [false, true] {
+        let mut texts = Vec::new();
+        for jobs in [0, 1, 2, 4] {
+            let options = pbfhogg::diff::DiffOptions {
+                suppress_common: false,
+                verbose,
+                type_filter: None,
+                parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+            };
+            let mut text = Vec::new();
+            pbfhogg::diff::diff(
+                &base,
+                &changed,
+                &mut text,
+                &options,
+                false,
+                &crate::common::test_host(),
+            )
+            .expect("diff");
+            texts.push(text);
+        }
+        assert!(
+            texts.windows(2).all(|w| w[0] == w[1]),
+            "verbose {verbose}: the text differs by worker count"
+        );
+    }
     for jobs in [0, 2, 4] {
         let stats = pbfhogg::diff::diff_stats(
             &base,
@@ -1350,7 +1350,7 @@ fn scratch_backends_write_inside_the_run_directory() {
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
-    for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
+    for (command, jobs) in [("sparse", 1), ("osc", 1), ("osc", 2)] {
         let parent = dir.path().join(format!("parent-{command}-{jobs}"));
         std::fs::create_dir(&parent).expect("parent");
         let scratch = crate::common::scratch_in(&parent);
@@ -1386,25 +1386,6 @@ fn run_scratch_backend(
     scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), String> {
     match command {
-        "text" => {
-            let options = pbfhogg::diff::DiffOptions {
-                suppress_common: false,
-                verbose: false,
-                type_filter: None,
-                parallelism: pbfhogg::Parallelism::from_jobs(jobs),
-            };
-            pbfhogg::diff::diff(
-                base,
-                changed,
-                &mut Vec::new(),
-                &options,
-                false,
-                host,
-                Some(scratch),
-            )
-            .map(drop)
-            .map_err(|e| e.to_string())
-        }
         "osc" => pbfhogg::diff::derive::derive_changes(
             base,
             changed,

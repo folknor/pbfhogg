@@ -359,7 +359,7 @@ exception, not a tier - should not survive across many PRs.
   atomics, disarmed as a `MAX` sentinel); one lives in each
   `host::Invocation` and `Invocation::faults()` reaches it. The token is what
   an invocation already hands every worker loop it starts (the read
-  pipeline, the output writers, the diff and derive shards, altw's
+  pipeline, the output writers, the diff and derive work units, altw's
   stages, the geocode passes), so a new hook is a `FaultPlan` field
   read at the site through the token in hand, gated on
   `cfg(feature = "test-hooks")`. A test arms the plan of the token in

@@ -63,7 +63,6 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
             "--tmp-dir",
             tmp_arg,
         ],
-        vec!["diff", input, other, "--tmp-dir", tmp_arg],
         vec![
             "diff",
             input,
@@ -96,6 +95,18 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
         assert!(!tmp.exists(), "{args:?}: --tmp-dir must not be created");
         assert!(!output.exists(), "{args:?}: nothing may be published");
     }
+
+    // A text diff writes no scratch at any -j, so it refuses --tmp-dir
+    // outright, also before any input is read.
+    let out = CliInvoker::new()
+        .args(["diff", input, other, "--tmp-dir", tmp_arg])
+        .assert_failure();
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--tmp-dir is only valid with --format osc"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no-such-input"), "{stderr}");
 }
 
 #[test]
@@ -180,10 +191,10 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
     }
 }
 
-/// The altw case above can fail before a scratch file exists. A sharded diff
-/// cannot: each shard creates its scratch text file before it decodes
-/// anything, so a last blob that is valid framing around an undecodable
-/// payload fails the run with scratch files already on disk.
+/// The altw case above can fail before a scratch file exists. An OSC diff
+/// cannot: it creates its per-action fragments before it decodes anything,
+/// so a last blob that is valid framing around an undecodable payload fails
+/// the run with scratch files already on disk.
 #[test]
 fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
     let dir = crate::common::test_scratch();
@@ -201,11 +212,13 @@ fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
         *payload = vec![0xff; 16];
     });
     std::fs::write(&new, corrupt).unwrap();
-    let output = work.join("out.txt");
+    let output = work.join("out.osc");
 
     for tmp_args in [vec![], vec!["--tmp-dir", tmp.to_str().unwrap()]] {
         let mut args = vec![
             "diff",
+            "--format",
+            "osc",
             "-j",
             "2",
             old.to_str().unwrap(),
@@ -226,7 +239,8 @@ fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
 }
 
 /// A run whose command line guarantees no scratch makes no run directory, so
-/// a current directory it cannot write is not an obstacle (`diff -j 1`).
+/// a current directory it cannot write is not an obstacle (a text diff, at
+/// any `-j`).
 #[test]
 fn a_scratch_free_diff_needs_no_writable_directory() {
     use std::os::unix::fs::PermissionsExt;
@@ -242,13 +256,14 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
     let cwd = dir.path().join("cwd");
     std::fs::create_dir(&cwd).unwrap();
     std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o500)).unwrap();
-    // A quiet text diff only counts, which shards without scratch.
     for args in [
         vec!["-j", "1"],
         vec!["-j", "1", "-q"],
         vec!["-v", "-j", "1"],
         vec!["-q"],
         vec!["-q", "-j", "2"],
+        vec!["-j", "2"],
+        vec!["-v"],
     ] {
         let out = CliInvoker::new()
             .current_dir(&cwd)
@@ -265,18 +280,6 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
             out.stderr_str()
         );
     }
-    // A run that may shard still fails at startup, naming the problem.
-    let out = CliInvoker::new()
-        .current_dir(&cwd)
-        .args([
-            "diff",
-            "-j",
-            "2",
-            old.to_str().unwrap(),
-            new.to_str().unwrap(),
-        ])
-        .run();
-    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
     std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
@@ -290,25 +293,6 @@ fn successful_runs_clean_up_after_themselves() {
     crate::common::write_base_pbf(&old);
     crate::common::write_changed_pbf(&new);
     let tmp_arg = tmp.to_str().unwrap();
-
-    // Text diff has no output file: the scratch goes where --tmp-dir says.
-    let out = CliInvoker::new()
-        .args([
-            "diff",
-            "-j",
-            "2",
-            old.to_str().unwrap(),
-            new.to_str().unwrap(),
-            "--tmp-dir",
-            tmp_arg,
-        ])
-        .run();
-    assert!(
-        out.status.code().is_some_and(|c| c <= 1),
-        "{}",
-        out.stderr_str()
-    );
-    assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
 
     let osc = dir.path().join("delta.osc.gz");
     // The inputs differ, so the OSC diff completes with exit 1.
@@ -571,9 +555,16 @@ fn diff_reports_what_older_versions_left_where_they_left_it() {
         let mut args = vec!["diff", old.to_str().unwrap(), new.to_str().unwrap()];
         let output = out_dir.join(format!("delta-{osc}.osc.gz"));
         if osc {
-            args.extend(["--format", "osc", "-o", output.to_str().unwrap()]);
+            // Only the osc form writes scratch, so only it takes --tmp-dir.
+            args.extend([
+                "--format",
+                "osc",
+                "-o",
+                output.to_str().unwrap(),
+                "--tmp-dir",
+                tmp.to_str().unwrap(),
+            ]);
         }
-        args.extend(["--tmp-dir", tmp.to_str().unwrap()]);
         let stderr = CliInvoker::new().args(&args).run().stderr_str();
         assert_eq!(occurrences(&stderr, &shard), 1, "osc={osc}: {stderr}");
         // Only the osc form writes beside an output.

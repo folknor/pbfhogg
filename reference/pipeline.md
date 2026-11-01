@@ -447,8 +447,10 @@ Pinning (see "One input, one file, across passes") is decided per library entry:
 
 ### check
 
-- `--ids`: sequential scan checking ID uniqueness and ordering. Optional `--full` bitmap for duplicate detection.
-- `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`). Optional `--check-relations`.
+- `--ids`: per-kind parallel scan checking ID ordering, the blobs merged in file order. Optional `--full` bitmap for duplicate detection.
+- `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`), one parallel phase per kind. Optional `--check-relations`.
+
+Both read each blob through a projection on the block validator (`src/read/project_ids.rs`), not a built block, so they refuse exactly the blobs block construction refuses.
 
 Pinning (see "One input, one file, across passes"): `verify_ids` pins (header and indexdata probe, then schedule walk) and takes its `--full` allocation size from the pin. `check_index` reads front to back through one open and `check_refs` opens once (its schedule walk, sizing its allocation from an fstat of that descriptor), so neither pins of its own; `check_index` alone still reads a FIFO, while `check_refs` reads by position and cannot. All three take an `InputSource`. The CLI pins once itself when two or more checks run (a bare `check` is `--ids` then `--refs`), and hands the pin to every check.
 

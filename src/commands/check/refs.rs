@@ -2,12 +2,13 @@
 
 use crate::counters::Stopwatch;
 
-use crate::{Element, MemberId};
+use crate::{ElementKind, MemberId};
 
 use crate::error::Result;
 use crate::idset::IdSet;
 use crate::read::input::InputSource;
-use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
+use crate::read::project_ids::{IdScratch, KindIds, RelationSpans, WaySpans};
+use crate::scan::classify::{build_classify_schedules_split, parallel_project_phase};
 use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
 /// A single missing reference entry (populated when `show_ids` is true).
@@ -181,11 +182,20 @@ fn append_capped_missing_refs(
 ///
 /// # Architecture
 ///
-/// Three-phase parallel scan following the renumber_external pattern. Each
-/// phase builds a per-kind schedule via [`build_classify_schedule`] and
-/// dispatches through [`parallel_classify_phase`]: workers pread +
-/// decompress + decode + classify in parallel; the main thread merges
-/// per-blob results.
+/// Three-phase parallel scan following the renumber_external pattern. One
+/// header walk builds the three per-kind schedules
+/// ([`build_classify_schedules_split`]) and each phase dispatches through
+/// [`parallel_project_phase`]: workers pread and decompress each blob and
+/// validate it through a projection on the block validator instead of
+/// building a block (`read::project_ids`: the node IDs, each way's ID and
+/// `refs` position, each relation's ID and member-array positions). The
+/// validator and kind-claim refusal are block construction's own call, so a
+/// blob is refused exactly as building its block would refuse it, with the
+/// same error. Only after the blob is accepted does the worker replay what
+/// the projection recorded, in element-walk order, through the same checks
+/// the element walk ran (shared-set insertion, the refusals below, missing
+/// references), so a blob's first refusal is the one the walk found first.
+/// The main thread merges per-blob results in completion order.
 ///
 /// Phase 1 (nodes) writes to `node_ids` via `IdSet::set_atomic`. Phase 2
 /// (ways) reads `node_ids` to check refs, optionally writes to `way_ids`.
@@ -227,25 +237,15 @@ fn append_capped_missing_refs(
 /// which are deferred unlooked-up and take one sign compare. A member of an
 /// unknown type is refused too, since no set can resolve it.
 ///
-/// # Why this is NOT an ID-only consumer
+/// # What a phase reads
 ///
-/// Despite appearances, check_refs needs more than just element IDs:
-/// way node refs (`w.refs()`) and relation member IDs and types
-/// (`r.members()`). A selective wire-format parser that skips
-/// stringtable/tags/coords/metadata but keeps IDs + refs + members
-/// was on the original plan as step #3, predicated on a post-parallel
-/// landing with decompression and parse roughly co-equal. The actual
-/// landing put decompression overwhelmingly in front of parse at
-/// planet (Europe hotpath after step #2: `decompress_blob_raw` 162 s
-/// cumulative vs the offset-table step 2.1 s), so a selective parser's
-/// measured ceiling looked like a fraction of a second at Europe and a few
-/// seconds at planet. That figure timed only the offset tables: block
-/// validation and the element walk were not measured separately, and on
-/// `check --ids` at planet they are about half the decode workers' CPU
-/// (`reference/performance.md`, "check --ids and getparents read through
-/// projections"). A projection on the block validator
-/// (`read::block::BlockBuffer::project`) is the selective parser this
-/// pass would take; it has not been measured here.
+/// Node IDs; each way's ID and node refs; each relation's ID and member IDs
+/// and types. Never coordinates, tags, metadata or roles, which validation
+/// still checks (a check that passed a corrupt file would vouch for it). An
+/// earlier refusal of a selective parser here rested on a Europe hotpath
+/// that timed only the offset tables; the element walk it left out was most
+/// of the workers' CPU after decompression (`reference/performance.md`,
+/// "check --refs and getid read through projections").
 ///
 /// # Input
 ///
@@ -369,20 +369,17 @@ fn check_refs_inner(
     host.invocation.marker("CHECKREFS_NODES_START");
     {
         let node_ids_ref = &node_ids;
-        parallel_classify_phase(
+        parallel_project_phase(
             &shared_file,
             &node_schedule,
             None,
-            || (),
-            |block, &mut ()| -> crate::Result<(u64, Vec<i64>)> {
+            IdScratch::default,
+            |buffer, scratch| -> crate::Result<(u64, Vec<i64>)> {
+                let (KindIds { .. }, accepted) =
+                    buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
                 let mut count: u64 = 0;
                 let mut overflow = Vec::new();
-                for el in block.elements_skip_metadata() {
-                    let id = match el {
-                        Element::DenseNode(dn) => dn.id(),
-                        Element::Node(n) => n.id(),
-                        _ => continue,
-                    };
+                scratch.each(accepted.bytes(), |_, id| {
                     if !node_ids_ref.set_atomic_checked(id) {
                         if id < 0 {
                             return Err(negative_id_error("node", id));
@@ -390,7 +387,8 @@ fn check_refs_inner(
                         overflow.push(id);
                     }
                     count += 1;
-                }
+                    Ok(())
+                })?;
                 Ok((count, overflow))
             },
             |_seq, (count, overflow_ids)| {
@@ -415,43 +413,44 @@ fn check_refs_inner(
     {
         let node_ids_ref = &node_ids;
         let way_ids_ref = &way_ids;
-        parallel_classify_phase(
+        parallel_project_phase(
             &shared_file,
             &way_schedule,
             None,
-            || (),
-            |block, &mut ()| -> crate::Result<WayBlobResult> {
+            Vec::new,
+            |buffer, ways| -> crate::Result<WayBlobResult> {
+                let (WaySpans { .. }, accepted) =
+                    buffer.project(|_, _| WaySpans::new(None, &mut *ways))?;
+                let bytes = accepted.bytes();
                 let mut r = WayBlobResult::default();
-                for el in block.elements_skip_metadata() {
-                    if let Element::Way(w) = el {
-                        let wid = w.id();
-                        // Way IDs are tracked only for the relation phase;
-                        // without it no comparison reads them, so a negative
-                        // one is refused only here.
-                        if check_relations && !way_ids_ref.set_atomic_checked(wid) {
-                            if wid < 0 {
-                                return Err(negative_id_error("way", wid));
-                            }
-                            r.overflow_ids.push(wid);
+                for way in ways.iter() {
+                    let wid = way.id;
+                    // Way IDs are tracked only for the relation phase;
+                    // without it no comparison reads them, so a negative
+                    // one is refused only here.
+                    if check_relations && !way_ids_ref.set_atomic_checked(wid) {
+                        if wid < 0 {
+                            return Err(negative_id_error("way", wid));
                         }
-                        r.way_count += 1;
-                        for nref in w.refs() {
-                            r.way_refs_checked += 1;
-                            if !node_ids_ref.get(nref) {
-                                if nref < 0 {
-                                    return Err(negative_ref_error('w', wid, 'n', nref));
-                                }
-                                r.missing_node_refs.push(nref);
-                                if show_ids
-                                    && should_store_missing_ref(r.missing_refs.len(), max_errors)
-                                {
-                                    r.missing_refs.push(MissingRef {
-                                        missing_type: 'n',
-                                        missing_id: nref,
-                                        referencing_type: 'w',
-                                        referencing_id: wid,
-                                    });
-                                }
+                        r.overflow_ids.push(wid);
+                    }
+                    r.way_count += 1;
+                    for nref in way.refs(bytes)? {
+                        r.way_refs_checked += 1;
+                        if !node_ids_ref.get(nref) {
+                            if nref < 0 {
+                                return Err(negative_ref_error('w', wid, 'n', nref));
+                            }
+                            r.missing_node_refs.push(nref);
+                            if show_ids
+                                && should_store_missing_ref(r.missing_refs.len(), max_errors)
+                            {
+                                r.missing_refs.push(MissingRef {
+                                    missing_type: 'n',
+                                    missing_id: nref,
+                                    referencing_type: 'w',
+                                    referencing_id: wid,
+                                });
                             }
                         }
                     }
@@ -497,89 +496,90 @@ fn check_refs_inner(
             let node_ids_ref = &node_ids;
             let way_ids_ref = &way_ids;
             let relation_ids_ref = &relation_ids;
-            parallel_classify_phase(
+            parallel_project_phase(
                 &shared_file,
                 &rel_schedule,
                 None,
-                || (),
-                |block, &mut ()| -> crate::Result<RelBlobResult> {
+                Vec::new,
+                |buffer, relations| -> crate::Result<RelBlobResult> {
+                    let (RelationSpans { .. }, accepted) =
+                        buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
+                    let bytes = accepted.bytes();
                     let mut r = RelBlobResult::default();
-                    for el in block.elements_skip_metadata() {
-                        if let Element::Relation(rel) = el {
-                            let rid = rel.id();
-                            if !relation_ids_ref.set_atomic_checked(rid) {
-                                if rid < 0 {
-                                    return Err(negative_id_error("relation", rid));
-                                }
-                                r.overflow_ids.push(rid);
+                    for rel in relations.iter() {
+                        let rid = rel.id;
+                        if !relation_ids_ref.set_atomic_checked(rid) {
+                            if rid < 0 {
+                                return Err(negative_id_error("relation", rid));
                             }
-                            r.relation_count += 1;
-                            for mem in rel.members() {
-                                match mem.id {
-                                    MemberId::Node(id) => {
-                                        r.rel_node_members_checked += 1;
-                                        if !node_ids_ref.get(id) {
-                                            if id < 0 {
-                                                return Err(negative_ref_error('r', rid, 'n', id));
-                                            }
-                                            r.missing_node_members.push(id);
-                                            if show_ids
-                                                && should_store_missing_ref(
-                                                    r.missing_refs.len(),
-                                                    max_errors,
-                                                )
-                                            {
-                                                r.missing_refs.push(MissingRef {
-                                                    missing_type: 'n',
-                                                    missing_id: id,
-                                                    referencing_type: 'r',
-                                                    referencing_id: rid,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    MemberId::Way(id) => {
-                                        r.rel_way_members_checked += 1;
-                                        if !way_ids_ref.get(id) {
-                                            if id < 0 {
-                                                return Err(negative_ref_error('r', rid, 'w', id));
-                                            }
-                                            r.missing_way_refs.push(id);
-                                            if show_ids
-                                                && should_store_missing_ref(
-                                                    r.missing_refs.len(),
-                                                    max_errors,
-                                                )
-                                            {
-                                                r.missing_refs.push(MissingRef {
-                                                    missing_type: 'w',
-                                                    missing_id: id,
-                                                    referencing_type: 'r',
-                                                    referencing_id: rid,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    MemberId::Relation(id) => {
-                                        // Deferred without a lookup, so the
-                                        // sign is checked here rather than in
-                                        // a failed `get`.
+                            r.overflow_ids.push(rid);
+                        }
+                        r.relation_count += 1;
+                        for member in rel.members(bytes)? {
+                            match member {
+                                MemberId::Node(id) => {
+                                    r.rel_node_members_checked += 1;
+                                    if !node_ids_ref.get(id) {
                                         if id < 0 {
-                                            return Err(negative_ref_error('r', rid, 'r', id));
+                                            return Err(negative_ref_error('r', rid, 'n', id));
                                         }
-                                        r.rel_rel_members_deferred += 1;
-                                        r.deferred_relation_refs.push(id);
-                                        if show_ids {
-                                            r.deferred_relation_ref_sources.push(rid);
+                                        r.missing_node_members.push(id);
+                                        if show_ids
+                                            && should_store_missing_ref(
+                                                r.missing_refs.len(),
+                                                max_errors,
+                                            )
+                                        {
+                                            r.missing_refs.push(MissingRef {
+                                                missing_type: 'n',
+                                                missing_id: id,
+                                                referencing_type: 'r',
+                                                referencing_id: rid,
+                                            });
                                         }
                                     }
-                                    // A member type this check has no set to
-                                    // resolve against (a newer producer's, or
-                                    // a corrupt one). Skipping it would pass
-                                    // a reference nobody checked.
-                                    MemberId::Unknown(raw_type, id) => {
-                                        return Err(unknown_member_error(rid, raw_type, id));
+                                }
+                                MemberId::Way(id) => {
+                                    r.rel_way_members_checked += 1;
+                                    if !way_ids_ref.get(id) {
+                                        if id < 0 {
+                                            return Err(negative_ref_error('r', rid, 'w', id));
+                                        }
+                                        r.missing_way_refs.push(id);
+                                        if show_ids
+                                            && should_store_missing_ref(
+                                                r.missing_refs.len(),
+                                                max_errors,
+                                            )
+                                        {
+                                            r.missing_refs.push(MissingRef {
+                                                missing_type: 'w',
+                                                missing_id: id,
+                                                referencing_type: 'r',
+                                                referencing_id: rid,
+                                            });
+                                        }
                                     }
+                                }
+                                MemberId::Relation(id) => {
+                                    // Deferred without a lookup, so the
+                                    // sign is checked here rather than in
+                                    // a failed `get`.
+                                    if id < 0 {
+                                        return Err(negative_ref_error('r', rid, 'r', id));
+                                    }
+                                    r.rel_rel_members_deferred += 1;
+                                    r.deferred_relation_refs.push(id);
+                                    if show_ids {
+                                        r.deferred_relation_ref_sources.push(rid);
+                                    }
+                                }
+                                // A member type this check has no set to
+                                // resolve against (a newer producer's, or
+                                // a corrupt one). Skipping it would pass
+                                // a reference nobody checked.
+                                MemberId::Unknown(raw_type, id) => {
+                                    return Err(unknown_member_error(rid, raw_type, id));
                                 }
                             }
                         }

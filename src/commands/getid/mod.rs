@@ -13,8 +13,10 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::read::block::BlockBuffer;
 use crate::read::header_walker::ScanArm;
 use crate::read::input::{InputSource, PinnedInput};
+use crate::read::project_ids::WaySpans;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
@@ -67,6 +69,7 @@ impl ElementIds {
 /// and the sequential consumer merges. The list stays empty unless the
 /// caller asked for found-ID reporting, so the parallel path pays
 /// nothing when `--verbose-ids` is off.
+#[derive(Default)]
 struct BlockOutcome {
     nodes: u64,
     ways: u64,
@@ -281,25 +284,35 @@ pub fn parse_ids_from_pbf<'a>(
         relation_ids: Vec<i64>,
     }
 
-    crate::scan::classify::parallel_classify_phase(
+    // Every element's ID, read through the shared ID projection on the
+    // block validator (no block built; refused exactly as construction
+    // refuses). The three sets are independent unions, so the order between
+    // kinds does not matter.
+    let mut all_kinds = crate::element_kind::KindSet::default();
+    for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+        all_kinds.add(kind);
+    }
+    crate::scan::classify::parallel_project_phase(
         &shared_file,
         &schedule,
         None,
-        || (),
-        |block, _s| {
+        crate::read::project_ids::IdScratch::default,
+        |buffer, scratch| {
+            let (crate::read::project_ids::KindIds { .. }, accepted) = buffer
+                .project(|_, _| crate::read::project_ids::KindIds::new(all_kinds, &mut *scratch))?;
             let mut batch = IdBatch {
                 node_ids: Vec::new(),
                 way_ids: Vec::new(),
                 relation_ids: Vec::new(),
             };
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn) => batch.node_ids.push(dn.id()),
-                    Element::Node(n) => batch.node_ids.push(n.id()),
-                    Element::Way(w) => batch.way_ids.push(w.id()),
-                    Element::Relation(r) => batch.relation_ids.push(r.id()),
+            scratch.each(accepted.bytes(), |kind, id| {
+                match kind {
+                    ElementKind::Node => batch.node_ids.push(id),
+                    ElementKind::Way => batch.way_ids.push(id),
+                    ElementKind::Relation => batch.relation_ids.push(id),
                 }
-            }
+                Ok(())
+            })?;
             Ok(batch)
         },
         |_seq, batch| {
@@ -775,18 +788,28 @@ fn filter_by_id_walker(
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.
-                let block = PrimitiveBlock::from_vec_with_scratch(
-                    std::mem::take(&mut decompress_buf),
-                    &mut st_scratch,
-                    &mut gr_scratch,
-                )
-                .map_err(locate)?;
                 // The blob was routed (or passed over) on its claimed kind; a
                 // block holding another kind is a lying claim, refused before
                 // anything is written for it. An unindexed blob claims nothing.
-                block
-                    .refuse_foreign_kind(meta.index.as_ref().map(|idx| idx.kind))
-                    .map_err(locate)?;
+                let buffer = BlockBuffer::new(
+                    std::mem::take(&mut decompress_buf),
+                    None,
+                    &mut st_scratch,
+                    &mut gr_scratch,
+                    meta.index.as_ref().map(|idx| idx.kind),
+                );
+                // Include mode builds the block only when it holds a
+                // selected element (`included_block`); invert re-encodes
+                // nearly every element of a blob it decodes, so a probe
+                // could only add work there and it builds the block outright.
+                let block = if include {
+                    match included_block(buffer, ids, None).map_err(locate)? {
+                        Some(block) => block,
+                        None => continue,
+                    }
+                } else {
+                    buffer.block().map_err(locate)?
+                };
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -964,16 +987,18 @@ fn filter_by_id_streaming(
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.
-                let block = PrimitiveBlock::from_vec_with_scratch(
+                // See `filter_by_id_walker`: a lying kind claim is refused,
+                // and the block is built only when it holds a selected element.
+                let buffer = BlockBuffer::new(
                     std::mem::take(&mut decompress_buf),
+                    None,
                     &mut st_scratch,
                     &mut gr_scratch,
-                )
-                .map_err(locate)?;
-                // See `filter_by_id_walker`: a lying kind claim is refused.
-                block
-                    .refuse_foreign_kind(frame.index.as_ref().map(|idx| idx.kind))
-                    .map_err(locate)?;
+                    frame.index.as_ref().map(|idx| idx.kind),
+                );
+                let Some(block) = included_block(buffer, ids, None).map_err(locate)? else {
+                    continue;
+                };
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -1058,31 +1083,38 @@ fn getid_with_refs(
             host,
         )?;
 
-        crate::scan::classify::parallel_classify_accumulate(
+        // Each blob is validated through `WaySpans` restricted to the
+        // requested ways (no block built; refused exactly as construction
+        // refuses), and only after it is accepted are those ways' refs
+        // decoded, sorted and deduplicated into a per-blob vector, which the
+        // consumer inserts into the one dependency set. A per-worker set
+        // would hold up to one node-range bitmap per worker on a broad
+        // query (`-I` naming every way); the per-blob vector is bounded by
+        // one blob's refs and empty for almost every blob of a narrow one.
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &schedule,
             None,
-            crate::idset::IdSet::new,
-            |block, node_ids| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(w) = &element
-                        && ids.way_ids.get(w.id())
-                    {
-                        for r in w.refs() {
-                            node_ids.set(r);
-                        }
-                    }
+            Vec::new,
+            |buffer, ways| -> Result<Vec<i64>> {
+                let (WaySpans { .. }, accepted) =
+                    buffer.project(|_, _| WaySpans::new(Some(&ids.way_ids), &mut *ways))?;
+                let mut refs: Vec<i64> = Vec::new();
+                for way in ways.iter() {
+                    refs.extend(way.refs(accepted.bytes())?);
                 }
-                Ok(())
+                refs.sort_unstable();
+                refs.dedup();
+                Ok(refs)
             },
-            |worker_node_ids| {
-                if worker_node_ids.has_any() {
-                    has_dep_nodes = true;
+            |_seq, refs| {
+                for r in refs {
+                    dep_node_ids.set(r);
                 }
-                dep_node_ids.merge(worker_node_ids);
             },
             host,
         )?;
+        has_dep_nodes = dep_node_ids.has_any();
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
@@ -1123,8 +1155,14 @@ fn getid_with_refs(
         None
     };
 
-    reader.for_each_fused_block(
-        |block| {
+    // Almost every blob holds nothing selected; `included_block` answers that
+    // from the validator's pass and builds the block only for a blob that
+    // does.
+    reader.for_each_fused_buffer(
+        |buffer| {
+            let Some(block) = included_block(buffer, ids, dep_ref)? else {
+                return Ok((Vec::new(), BlockOutcome::default()));
+            };
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
             let outcome = process_block(
@@ -1159,6 +1197,103 @@ fn getid_with_refs(
     writer.flush()?;
     host.invocation.marker("GETID_PASS2_END");
     Ok(stats)
+}
+
+/// The block of a decoded blob in include mode, or `None` when it holds no
+/// element include mode would emit.
+///
+/// The blob is validated through [`SelectProbe`] (`BlockBuffer::project`:
+/// block construction's validator and kind-claim refusal, so the blob is
+/// refused exactly as building its block would refuse it, whatever the
+/// probe answers). Almost every blob a narrow query decodes holds no
+/// selected element, and that answer costs the validation pass plus one ID
+/// test per element, with no block built and no element re-parsed. A blob
+/// with a hit becomes its block from the validated bytes (no second
+/// validation) and goes through the unchanged [`process_block`], so what is
+/// written, in what order, and every error a selected element raises (a
+/// bad user or role index) are as before. A blob without one cannot raise
+/// any: `process_block` resolves strings only for the elements it emits.
+///
+/// Invert mode does not come here: it emits every element not requested,
+/// so a blob it decodes is a hit at its first unrequested element and a
+/// probe would only add a pass.
+fn included_block(
+    buffer: BlockBuffer<'_>,
+    ids: &ElementIds,
+    dep_node_ids: Option<&crate::idset::IdSet>,
+) -> Result<Option<PrimitiveBlock>> {
+    let (probe, accepted) = buffer.project(|_, _| SelectProbe::new(ids, dep_node_ids))?;
+    Ok(probe.hit.then(|| accepted.into_block()))
+}
+
+/// Whether a block holds an element [`is_dominated`] selects: the same
+/// tests on the same values, read from the messages the validator already
+/// parsed. Dense node IDs decode by the wrapping running sum
+/// `DenseNodeIter` uses (`WayRefIter::delta_decoded`), and every test is
+/// an `IdSet::get`, so a negative ID matches nothing here as there. Every
+/// element of every
+/// kind is tested whatever the blob's claim; after the first hit the tests
+/// stop, validation does not.
+struct SelectProbe<'q> {
+    ids: &'q ElementIds,
+    dep_node_ids: Option<&'q crate::idset::IdSet>,
+    /// Whether any node can be selected: a requested node, or a dependent
+    /// one.
+    any_nodes: bool,
+    hit: bool,
+}
+
+impl<'q> SelectProbe<'q> {
+    fn new(ids: &'q ElementIds, dep_node_ids: Option<&'q crate::idset::IdSet>) -> Self {
+        Self {
+            ids,
+            dep_node_ids,
+            any_nodes: ids.node_ids.has_any() || dep_node_ids.is_some_and(IdSet::has_any),
+            hit: false,
+        }
+    }
+
+    fn node_selected(&self, id: i64) -> bool {
+        self.ids.node_ids.get(id) || self.dep_node_ids.is_some_and(|deps| deps.get(id))
+    }
+}
+
+impl crate::read::block::GroupProjection for SelectProbe<'_> {
+    fn node(
+        &mut self,
+        node: &crate::read::wire::WireNode<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit || (self.any_nodes && self.node_selected(node.id));
+    }
+
+    fn way(
+        &mut self,
+        way: &crate::read::wire::WireWay<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit || self.ids.way_ids.get(way.id);
+    }
+
+    fn relation(
+        &mut self,
+        relation: &crate::read::wire::WireRelation<'_>,
+        _info: Option<&crate::read::wire::WireInfo>,
+    ) {
+        self.hit = self.hit || self.ids.relation_ids.get(relation.id);
+    }
+
+    fn dense(
+        &mut self,
+        dense: &crate::read::wire::WireDenseNodes<'_>,
+        _ids: usize,
+        _info: Option<&crate::read::wire::WireDenseInfo<'_>>,
+    ) {
+        self.hit = self.hit
+            || (self.any_nodes
+                && crate::read::elements::WayRefIter::delta_decoded(dense.id_data)
+                    .any(|id| self.node_selected(id)));
+    }
 }
 
 /// Whether the element is covered by the query: requested by ID, or -
@@ -1917,6 +2052,81 @@ mod tests {
                 read_ids(&output, &crate::host::Host::entered_for_tests()),
                 vec![1, 10]
             );
+        }
+    }
+
+    /// For every fixture, every mutation, and queries with and without a
+    /// dependent node set, tag stripping and found-ID reporting: building
+    /// the block only on a probe hit and running `process_block` on it
+    /// writes and reports exactly what `process_block` on the constructed
+    /// block does, and refuses exactly what construction refuses, with the
+    /// same message.
+    #[test]
+    fn the_include_probe_answers_as_process_block_on_every_blob() {
+        use crate::read::wire_fixtures::{mutations, projection_fixtures};
+
+        let queries: Vec<ElementIds> = [
+            vec!["n8"],
+            vec!["n1"],
+            vec!["n99"],
+            vec!["w21"],
+            vec!["w42"],
+            vec!["r30", "n12"],
+            vec!["r51"],
+            vec!["n12345"],
+        ]
+        .into_iter()
+        .map(|specs| {
+            let specs: Vec<String> = specs.into_iter().map(str::to_owned).collect();
+            parse_ids(&specs).unwrap()
+        })
+        .collect();
+        let mut deps = crate::idset::IdSet::new();
+        for id in [3, 9, 11] {
+            deps.set(id);
+        }
+
+        let run = |block: &PrimitiveBlock,
+                   ids: &ElementIds,
+                   dep: Option<&crate::idset::IdSet>,
+                   strip: bool|
+         -> crate::Result<String> {
+            let mut bb = BlockBuilder::new();
+            let mut output = Vec::new();
+            let outcome = process_block(block, &mut bb, &mut output, ids, true, dep, strip, true)?;
+            flush_local(&mut bb, &mut output)?;
+            let bytes: Vec<Vec<u8>> = output.iter().map(|b| b.bytes.clone()).collect();
+            Ok(format!(
+                "{bytes:?} {} {} {} {:?}",
+                outcome.nodes, outcome.ways, outcome.relations, outcome.found
+            ))
+        };
+        let text = |r: crate::Result<String>| r.unwrap_or_else(|e| format!("error {e}"));
+
+        for (what, bytes) in projection_fixtures() {
+            let cases =
+                std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes));
+            for (how, input) in cases {
+                let oracle = PrimitiveBlock::from_vec(input.clone());
+                for ids in &queries {
+                    for (dep, strip) in [(None, false), (Some(&deps), false), (Some(&deps), true)] {
+                        let (mut st, mut gr) = (Vec::new(), Vec::new());
+                        let buffer = BlockBuffer::new(input.clone(), None, &mut st, &mut gr, None);
+                        let probed =
+                            text(
+                                included_block(buffer, ids, dep).and_then(|block| match block {
+                                    Some(block) => run(&block, ids, dep, strip),
+                                    None => Ok(format!("{:?} 0 0 0 []", Vec::<Vec<u8>>::new())),
+                                }),
+                            );
+                        let expected = match &oracle {
+                            Err(e) => format!("error {e}"),
+                            Ok(block) => text(run(block, ids, dep, strip)),
+                        };
+                        assert_eq!(probed, expected, "{what}, {how}, dep {}", dep.is_some());
+                    }
+                }
+            }
         }
     }
 }

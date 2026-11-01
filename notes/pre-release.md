@@ -274,18 +274,40 @@ headroom counted, hash buckets undercounted), so count resident components
 before choosing a fix. Deleted-id membership is still needed during the
 pipeline, though its representation could merge with other state.
 
-### WRK-114: check --refs and getid on the projection pools
+### WRK-116: getid --add-referenced follows way refs only
 
-check `--refs` still builds a block per blob and walks
-`elements_skip_metadata` to read IDs, refs and members, the same shape
-check `--ids` left (planet nodes phase about 18 s, ways 13.5 s). Its
-module comment once refused a selective parser on a hotpath that timed
-only the offset tables; validation plus the element walk were about half
-the worker CPU on check `--ids`. `parallel_project_phase` and the
-`KindIds` / `ParentProbe` pattern (record positions, decode after
-acceptance) apply directly. getid's include walk (test each ID, re-encode
-the few matches) has getparents' shape and could take `parents_in`'s
-filter-then-build structure. Measure each against a matched base.
+`getid --add-referenced` pulls in the nodes of requested ways and nothing
+else. osmium's `--add-referenced` also follows relation members (relations
+in relations, then the nodes and ways of those relations) before the way
+pass (`research/osmium-tool/src/command_getid.cpp`,
+`find_referenced_objects`). docs/cli/commands.md describes pbfhogg's
+narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
+relation closure (a relation pass on the projection pools, then the way
+pass over the closed set) or record the deviation.
+
+### WRK-117: check --refs on unindexed input decodes every blob per phase
+
+An unindexed blob is scheduled into every phase of check `--refs` (two
+without `--check-relations`, three with), so an unindexed planet
+decompresses each blob two or three times, silently. check `--ids` warns
+for the same triple scan (`check.ids.unindexed_triple_scan`); `--refs`
+does not. Either warn the same way or read each unindexed blob once and
+route its kinds to the phases that need them (the node phase must finish
+before ways are judged, so the routing has to keep positions or results,
+not blocks).
+
+### WRK-118: Remaining element walks that read only IDs and references
+
+check `--refs`, check `--ids`, getparents and getid now validate through
+projections (`src/read/project_ids.rs`, `ParentProbe`, getid's
+`SelectProbe`). Other callers still build blocks and walk
+`elements_skip_metadata` where they may read only IDs, refs or members:
+the geocode builder passes, tags-filter's ID collection, extract's
+classify phases, apply-changes' classify and refresh, the ALTW stages,
+inspect's node stats and the OSC merge join. Not audited one by one:
+first establish what each reads per element and what its walk costs at
+planet, then move the ones that pay onto a projection on the one
+validator.
 
 ### WRK-027: Membership track for set-dominated peaks
 

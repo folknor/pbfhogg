@@ -257,7 +257,8 @@ error and the byte offset instead.
 
 This holds for consumers that report on fields the failing check
 does not touch. The full-decode modes of `inspect`'s scanning
-report, `check --ids` and `getparents` refuse a block with a
+report, `check --ids`, `check --refs`, `getparents` and `getid`
+(on every blob it decodes) refuse a block with a
 malformed way `refs` array (or tag arrays, `Info`, string table
 UTF-8) even where nothing they report reads it: after a read
 failure a report has not established complete aggregates, the
@@ -265,7 +266,9 @@ blocks read so far must not be presented as whole-file totals, and
 a check that passed a corrupt file would vouch for it. The
 acceptance set is the chosen boundary, not an artifact of
 `PrimitiveBlock` construction. These commands read through
-projections (`GroupProjection`) that build no block, and stay
+projections (`GroupProjection`) that build no block (`getid`
+builds one, from the validated bytes, only for a blob holding an
+element it writes), and stay
 inside the boundary by construction rather than by care: a
 projection runs through `BlockBuffer::project`, the same
 `validate_block` call, in the same order, that block construction

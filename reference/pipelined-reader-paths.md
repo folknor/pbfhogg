@@ -114,12 +114,15 @@ cancellation is checked before each frame, not during its reads).
 
 ### `getid --add-referenced` pass 2
 
-- **Surface:** fused (`for_each_fused_block`)
+- **Surface:** fused (`for_each_fused_buffer`: a projection on the
+  block validator, the block built only for a blob holding a selected
+  element)
 - **Path:** `src/commands/getid/mod.rs`, `--add-referenced` mode only
 - **Scale:** the plain include / invert path is the common one and uses
   `HeaderWalker` + raw-frame reads, no pipelined decode at all.
-- **Per-block work:** light - `IdSet::get` per element, most
-  skipped, a few re-encoded through `BlockBuilder`
+- **Per-block work:** light - `IdSet::get` per element during
+  validation, most blobs selecting nothing, a few re-encoded through
+  `BlockBuilder`
 
 ### `getparents` FullScan arm
 
@@ -198,9 +201,11 @@ should stay that way:
   / `_phase` (pread workers)
 - `inspect` default / `inspect --indexed` - `HeaderWalker`
   (pread-only header walk)
-- `check --refs` - `parallel_classify_phase`
-- `check --ids`, streaming and `--full` - `parallel_project_phase`
-  (pread workers, a projection on the block validator)
+- `check --ids` (streaming and `--full`) and `check --refs` -
+  `parallel_project_phase` (pread workers, a projection on the block
+  validator)
+- `getid --add-referenced` pass 1 and `getid -I` -
+  `parallel_project_phase`
 - `tags-filter` two-pass - pread workers
 - `cat --type` / `cat --clean` re-encoding - pread classification
   and writer-side reframe paths

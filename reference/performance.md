@@ -2648,6 +2648,44 @@ interleaved `--bench 1`:
 
 -33 % wall. Every decoding inspect mode runs the same scan.
 
+## check --refs and getid read through projections (bygg, 2026-11-01)
+
+check `--refs` and `getid --add-referenced` read each blob through a
+projection on the block validator (`src/read/project_ids.rs`, and getid's
+include probe) instead of building a `PrimitiveBlock` and walking its
+elements, as check `--ids` and getparents already did.
+
+What the element walk cost (base, `25172fc3`, planet): check `--refs`
+hotpath `ecfaf4c7` spent 291 core-s in `decompress_blob_raw` out of about
+830 core-s in its two phases (nodes 17.7 s at 26.1 cores, ways 13.3 s at
+27.5); the rest was validation, the offset tables, the element walk and
+the set lookups. `getid --add-referenced` (`4c08d663`) ran pass 2 for
+32.8 s at 29.0 cores over every node and way blob, walking every element
+with its metadata to test one ID against a set; pass 1's pool ran 10.5 s
+at 26.4 cores walking every way blob.
+
+Planet `planet-20260223-with-indexdata`, interleaved `--bench 1`, base
+`25172fc3` (stored, `--commit`) against the working tree (`--force`, not
+stored). Spans are `--durations` START/END pairs.
+
+| Command | Base wall | Projection wall | Main spans, base to projection | Peak anon |
+|---|---:|---:|---|---|
+| check `--refs` | 38.4, 38.5 s (`752a3925`, `913fd7fe`) | 31.6, 31.8 s | nodes 18.3-18.5 to 13.5-13.6 s, ways 13.2-13.3 to 11.6 s | 2.24 to 2.17 GB |
+| `getid --add-referenced` | 49.9, 50.4 s (`232979ea`, `0b6748dd`) | 40.9, 41.0 s | pass 2 32.8-33.0 to 25.0-25.1 s, pass 1 17.1-17.4 to 15.8 s (6.5-6.8 s of it the schedule walk) | 467 to 460 MB |
+| getid (include) | 113.7, 114.5 ms (`29f5741e`, `515b464c`) | 119.4, 119.7 ms | `GETID_SCAN` 99-100 to 101 ms; the rest is `PUBLISH` | |
+
+check `--refs` -18 % wall, `getid --add-referenced` -18 %. Both nodes
+phases are now read-bound: check `--refs` nodes ran at 20.6 cores
+against 25.2 (58 GB in 13.6 s), getid pass 2 at 18.2 cores against 29.1
+(67 GB in 25 s). The include walk decodes only the handful of blobs whose
+indexdata range holds a requested ID, so its probe changes nothing
+measurable; its few-millisecond gap sits in output publication, outside
+the changed code. The first include base cell (`31c13dc7`, 6.9 s) read
+cold headers after the add-referenced cells and is not a pair.
+`getid --invert` was not measured: it builds every block it decodes as
+before, the only change being that construction and the kind-claim
+refusal are one call instead of two.
+
 ## check --ids and getparents read through projections (bygg, 2026-11-01)
 
 Both commands validate each blob through a `GroupProjection` on the block

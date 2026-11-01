@@ -220,6 +220,53 @@ pub(crate) fn projection_fixtures() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         (
+            "ways and relations sharing a group, then plain and dense nodes",
+            block(
+                &strings,
+                &[
+                    Group {
+                        ways: vec![way(40, &[1, -2, 3], (1, 2)), way(-41, &[5], (1, 2))],
+                        relations: vec![
+                            relation(50, &[(3, 40, 1), (0, -6, 0), (3, 51, 2)]),
+                            relation(51, &[(0, 7, 9)]),
+                        ],
+                        ..Group::default()
+                    },
+                    Group {
+                        nodes: vec![plain_node(-9, 1, 1, &[], None)],
+                        dense: Some(dense(&[(11, 1, 1), (12, 2, 2)], &[])),
+                        ways: vec![way(42, &[11, 12], (1, 2))],
+                        ..Group::default()
+                    },
+                ],
+            ),
+        ),
+        (
+            "absent packed fields: an empty dense message, a way without refs, a relation without members",
+            block(
+                &strings,
+                &[
+                    Group {
+                        dense: Some(Vec::new()),
+                        ..Group::default()
+                    },
+                    Group {
+                        ways: vec![{
+                            let mut w = Vec::new();
+                            field_varint(&mut w, 1, 43);
+                            w
+                        }],
+                        relations: vec![{
+                            let mut r = Vec::new();
+                            field_varint(&mut r, 1, 53);
+                            r
+                        }],
+                        ..Group::default()
+                    },
+                ],
+            ),
+        ),
+        (
             "builder dense nodes with metadata",
             encode(&|b| {
                 for i in [5_i64, 3, 9, 9, 12, -4, 20] {

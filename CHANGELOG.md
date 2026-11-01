@@ -37,6 +37,10 @@
   --ids` went from 35 s to 29 s (37 s to 30 s with `--full`) and
   `getparents` from 19 s to 16.7 s, with the same output, the same
   refusals and unchanged peak memory.
+- `check --refs` and `getid` do the same: `getid` builds a block only for
+  a blob holding an element it writes. On planet, `check --refs` went from
+  38 s to 32 s and `getid --add-referenced` from 50 s to 41 s, with the
+  same output, the same refusals and unchanged peak memory.
 
 ## 0.6.0 - 2026-10-30
 

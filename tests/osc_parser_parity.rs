@@ -64,10 +64,8 @@ fn merge_verdict(input: &Path, out: &Path) -> Verdict {
     pbfhogg::commands::merge_changes::merge_changes(
         &[input],
         crate::common::out_replace(out),
-        false,
+        pbfhogg::merge_changes::MergeMode::Stream { scratch: None },
         pbfhogg::Parallelism::from_jobs(1),
-        false,
-        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())
@@ -78,10 +76,10 @@ fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
     pbfhogg::commands::merge_changes::merge_changes(
         &[input],
         crate::common::out_replace(out),
-        true,
+        pbfhogg::merge_changes::MergeMode::Simplify {
+            allow_version_regression: false,
+        },
         pbfhogg::Parallelism::from_jobs(1),
-        false,
-        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())
@@ -464,15 +462,24 @@ fn every_consumer_accepts_and_drops_well_formed_delete_children() {
     );
     assert_all_accept(dir.path(), &input, "well-formed delete children");
 
-    for (name, simplify) in [("streaming", false), ("simplify", true)] {
+    for (name, mode) in [
+        (
+            "streaming",
+            pbfhogg::merge_changes::MergeMode::Stream { scratch: None },
+        ),
+        (
+            "simplify",
+            pbfhogg::merge_changes::MergeMode::Simplify {
+                allow_version_regression: false,
+            },
+        ),
+    ] {
         let out = dir.path().join(format!("delete-children-{name}.osc"));
         pbfhogg::commands::merge_changes::merge_changes(
             &[&input],
             crate::common::out_replace(&out),
-            simplify,
+            mode,
             pbfhogg::Parallelism::from_jobs(1),
-            false,
-            crate::common::scratch_in(dir.path()),
             &crate::common::test_host(),
         )
         .unwrap();
@@ -523,10 +530,8 @@ fn every_consumer_agrees_on_metadata_leniency() {
     pbfhogg::commands::merge_changes::merge_changes(
         &[&input],
         crate::common::out_replace(&merge_out),
-        false,
+        pbfhogg::merge_changes::MergeMode::Stream { scratch: None },
         pbfhogg::Parallelism::from_jobs(1),
-        false,
-        crate::common::scratch_in(dir.path()),
         &crate::common::test_host(),
     )
     .unwrap();
@@ -621,10 +626,8 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
         pbfhogg::commands::merge_changes::merge_changes(
             &[&input],
             crate::common::out_replace(&merge_out),
-            false,
+            pbfhogg::merge_changes::MergeMode::Stream { scratch: None },
             pbfhogg::Parallelism::from_jobs(1),
-            false,
-            crate::common::scratch_in(dir.path()),
             &crate::common::test_host(),
         )
         .expect("a re-emit path never interprets these, so it has nothing to refuse");
@@ -680,10 +683,8 @@ fn re_emit_sinks_escape_user_data_identically() {
     pbfhogg::commands::merge_changes::merge_changes(
         &[&input],
         crate::common::out_replace(&merge_out),
-        false,
+        pbfhogg::merge_changes::MergeMode::Stream { scratch: None },
         pbfhogg::Parallelism::from_jobs(1),
-        false,
-        crate::common::scratch_in(dir.path()),
         &crate::common::test_host(),
     )
     .unwrap();
@@ -756,10 +757,10 @@ fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
     pbfhogg::commands::merge_changes::merge_changes(
         &refs,
         crate::common::out_replace(out),
-        true,
+        pbfhogg::merge_changes::MergeMode::Simplify {
+            allow_version_regression: false,
+        },
         pbfhogg::Parallelism::from_jobs(1),
-        false,
-        crate::common::scratch_in(out.parent().unwrap()),
         &crate::common::test_host(),
     )
     .map(|_| ())

@@ -4,8 +4,21 @@
 
 ### Breaking
 
+**CLI**
+
+- `merge-changes` makes a run directory only where it can write scratch:
+  several inputs, without `--simplify`, at any `-j` but `1`. A single
+  input, `--simplify` or `-j 1` makes none, needs no writable scratch
+  location, and refuses `--tmp-dir` as a usage error (exit `64`) instead
+  of accepting it unused.
+
 **Library**
 
+- `merge_changes::merge_changes` takes a `MergeMode` in place of
+  `simplify`, `allow_version_regression` and the `RunScratch`:
+  `MergeMode::Stream { scratch }` with an optional scratch, required
+  exactly when `merge_changes::stream_writes_scratch` says so, or
+  `MergeMode::Simplify { allow_version_regression }`, which takes none.
 - `ProcessActions::cross_thread_alloc_pool` is removed: the library raises
   no allocator event. An implementation drops the method; a program that
   wants glibc allocator settings sets them once at start

@@ -477,7 +477,13 @@ bytes, without building owned elements.
 
 - **Default**: each batch becomes its own gzip member; one coordinator
   writes members in input and batch order, spilling a later input's output
-  to scratch until it becomes the head.
+  to scratch until it becomes the head. A reader slot is reused only once
+  its input is written, and the coordinator advances the head before it
+  drains again, so with one input, or one reader, no member of a later
+  input is drained before that input is the head and nothing can spill.
+  The command line guarantees one reader only at `Fixed(1)` (`Auto` may
+  resolve to one on a small host), so one input and `Fixed(1)` are the
+  runs that take no run directory (`stream_writes_scratch`).
 - **`--simplify`** (`merge_changes/simplify.rs`): the batches are collected
   as plain rendered XML plus a per-element record (kind, ID, action, version
   claim, byte range). A parallel sort of `(kind, id, position)` groups each

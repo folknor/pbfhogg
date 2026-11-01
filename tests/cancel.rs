@@ -149,10 +149,10 @@ fn merge_changes(
     pbfhogg::merge_changes::merge_changes(
         &[&osc, &osc],
         crate::common::out(out.join("merged.osc.gz")),
-        false,
+        pbfhogg::merge_changes::MergeMode::Stream {
+            scratch: Some(pbfhogg::scratch::RunScratch::create(scratch, host)?),
+        },
         pbfhogg::Parallelism::from_jobs(2),
-        false,
-        pbfhogg::scratch::RunScratch::create(scratch, host)?,
         host,
     )
     .map(drop)

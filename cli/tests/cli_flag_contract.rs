@@ -39,7 +39,7 @@ fn run(args: &[OsString]) -> CliOutput {
     CliInvoker::new().args(args).run()
 }
 
-/// The words of an invocation, with `IN`, `IN2`, `OSC` and `OUT` replaced by
+/// The words of an invocation, with `IN`, `IN2`, `OSC`, `OSC2` and `OUT` replaced by
 /// paths under `dir` that do not exist (`OUT`'s directory does).
 fn argv(dir: &Path, words: &[&str]) -> Vec<OsString> {
     words
@@ -48,6 +48,7 @@ fn argv(dir: &Path, words: &[&str]) -> Vec<OsString> {
             "IN" => dir.join(format!("{MISSING}.osm.pbf")).into(),
             "IN2" => dir.join(format!("{MISSING}-2.osm.pbf")).into(),
             "OSC" => dir.join(format!("{MISSING}.osc.gz")).into(),
+            "OSC2" => dir.join(format!("{MISSING}-2.osc.gz")).into(),
             "OUT" => dir.join("out.osm.pbf").into(),
             // An OSC output name must end `.osc` or `.osc.gz`.
             "OSCOUT" => dir.join("out.osc").into(),
@@ -257,6 +258,51 @@ const REFUSALS: &[(&[&str], &str)] = &[
     (
         &["diff", "IN", "IN2", "-j", "1", "--tmp-dir", "DIR"],
         "--tmp-dir",
+    ),
+    // merge-changes spills only with several inputs, without --simplify and
+    // not at -j 1; every other command line writes no scratch.
+    (
+        &["merge-changes", "OSC", "-o", "OSCOUT", "--tmp-dir", "DIR"],
+        "a single input writes no scratch",
+    ),
+    (
+        &[
+            "merge-changes",
+            "OSC",
+            "OSC2",
+            "-o",
+            "OSCOUT",
+            "--simplify",
+            "--tmp-dir",
+            "DIR",
+        ],
+        "--simplify writes no scratch",
+    ),
+    (
+        &[
+            "merge-changes",
+            "OSC",
+            "-o",
+            "OSCOUT",
+            "--simplify",
+            "--tmp-dir",
+            "DIR",
+        ],
+        "--simplify writes no scratch",
+    ),
+    (
+        &[
+            "merge-changes",
+            "OSC",
+            "OSC2",
+            "-o",
+            "OSCOUT",
+            "-j",
+            "1",
+            "--tmp-dir",
+            "DIR",
+        ],
+        "-j 1 writes no scratch",
     ),
     (
         &["diff", "IN", "IN2", "--format", "osc"],
@@ -874,6 +920,23 @@ fn merge_changes_names_a_missing_input() {
     let dir = crate::common::test_scratch();
     let out = run(&argv(dir.path(), &["merge-changes", "OSC", "-o", "OSCOUT"]));
     reached_input(&out).unwrap_or_else(|why| panic!("{why}"));
+}
+
+/// The merge that may spill takes `--tmp-dir`: several inputs without
+/// `--simplify`, at any `-j` but 1. `-j 0` is accepted whatever it resolves
+/// to on this host; that is the host's choice, not the command line's.
+#[test]
+fn merge_changes_takes_tmp_dir_where_it_may_spill() {
+    let dir = crate::common::test_scratch();
+    for jobs in [None, Some("0"), Some("2")] {
+        let mut words = vec!["merge-changes", "OSC", "OSC2", "-o", "OSCOUT"];
+        if let Some(jobs) = jobs {
+            words.extend(["-j", jobs]);
+        }
+        words.extend(["--tmp-dir", "DIR"]);
+        let out = run(&argv(dir.path(), &words));
+        reached_input(&out).unwrap_or_else(|why| panic!("-j {jobs:?}: {why}"));
+    }
 }
 
 /// Every command with `--force` refuses unindexed input through the shared

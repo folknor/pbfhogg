@@ -184,9 +184,9 @@ impl OutputArg {
 #[derive(Args)]
 struct TmpDirArg {
     /// Directory for this run's scratch files, which can be large (add-locations-to-ways
-    /// needs up to hundreds of GB with `--index-type external`; a parallel text diff has
-    /// each shard write its full text output, unchanged lines included unless `-c`). The directory must exist and be writable; it is checked before any
-    /// work starts. Each run makes one hidden `.pbfhogg-run-*` directory in it and removes it
+    /// needs up to hundreds of GB with `--index-type external`). Refused on a command line
+    /// that writes no scratch. The directory must exist and be writable; it is checked
+    /// before any work starts. Each run makes one hidden `.pbfhogg-run-*` directory in it and removes it
     /// at the end. Default: the output's directory, or the current directory when there is
     /// no output file. Output staging is placed by --staging-dir, not by this flag.
     #[arg(long = "tmp-dir", value_name = "DIR")]
@@ -583,11 +583,46 @@ fn validate_command(
             "--json",
             "it only shapes the --indexed verdict line, which a quiet run does not print",
         )),
-        Command::MergeChanges { output, .. } => {
-            validate_osc_output(&["merge-changes"], &output.output).map(|()| None)
-        }
+        Command::MergeChanges { .. } => validate_merge_changes(command).map(|()| None),
         _ => Ok(None),
     }
+}
+
+/// The OSC output name, and `--tmp-dir` only where the run may write
+/// scratch: output produced for a later input while an earlier one is
+/// still being written. The first reason that rules that out is named.
+fn validate_merge_changes(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    let Command::MergeChanges {
+        changes,
+        output,
+        simplify,
+        jobs,
+        tmp,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    validate_osc_output(&["merge-changes"], &output.output)?;
+    if tmp.tmp_dir.is_none()
+        || command_paths::merge_changes_writes_scratch(*simplify, changes.len(), *jobs)
+    {
+        return Ok(());
+    }
+    let why = if *simplify {
+        "--simplify writes no scratch files"
+    } else if changes.len() == 1 {
+        "a single input writes no scratch files: its output goes straight to the output file"
+    } else {
+        "-j 1 writes no scratch files: it reads one input at a time, each after the one before \
+         it is written"
+    };
+    Err(usage(
+        &["merge-changes"],
+        format!(
+            "--tmp-dir is only valid with several inputs, without --simplify and not at -j 1: {why}"
+        ),
+    ))
 }
 
 /// The name rule every OSC producer shares: `.osc` is written plain,
@@ -3220,16 +3255,17 @@ pub fn run() -> process::ExitCode {
                 // The output is checked before the scratch directory is made,
                 // so a missing output directory reports the output.
                 let output = output.open(&host)?;
-                let scratch = paths.create_scratch(&host)?;
-                run_merge_changes(
-                    &changes,
-                    output,
-                    simplify,
-                    jobs,
-                    allow_version_regression,
-                    scratch,
-                    &host,
-                )
+                let mode = if simplify {
+                    pbfhogg::merge_changes::MergeMode::Simplify {
+                        allow_version_regression,
+                    }
+                } else {
+                    // Made only where the run may spill (CommandPaths::of).
+                    pbfhogg::merge_changes::MergeMode::Stream {
+                        scratch: paths.create_scratch_if_any(&host)?,
+                    }
+                };
+                run_merge_changes(&changes, output, mode, jobs, &host)
             }
             Command::Check {
                 file,
@@ -4864,22 +4900,12 @@ fn run_merge_pbf(
 fn run_merge_changes(
     changes: &[PathBuf],
     output: pbfhogg::Output,
-    simplify: bool,
+    mode: pbfhogg::merge_changes::MergeMode,
     jobs: pbfhogg::Parallelism,
-    allow_version_regression: bool,
-    scratch: pbfhogg::scratch::RunScratch,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::merge_changes::merge_changes(
-        &inputs,
-        output,
-        simplify,
-        jobs,
-        allow_version_regression,
-        scratch,
-        host,
-    )?;
+    let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, mode, jobs, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("merge_changes.summary"))?;
     Ok(())
 }

@@ -453,10 +453,21 @@ const ROWS: &[Row] = &[
     },
     Row {
         command: "merge-changes",
-        label: "merge-changes",
+        label: MERGE_CHANGES_SPILL_LABEL,
         build: merge_changes,
         kind: Kind::File,
         tmp_dir: true,
+        ok_codes: &[0],
+        gaps: &[],
+    },
+    // One input never spills, so it makes no run directory and refuses
+    // --tmp-dir (as do --simplify and -j 1; see cli_flag_contract).
+    Row {
+        command: "merge-changes",
+        label: "merge-changes (one input)",
+        build: merge_changes_one_input,
+        kind: Kind::File,
+        tmp_dir: false,
         ok_codes: &[0],
         gaps: &[],
     },
@@ -648,7 +659,21 @@ fn apply_changes(c: &Ctx, i: Input) -> Invocation {
         .out("-o", pbf_out(c))
 }
 
+/// The label of the merge-changes row that may spill.
+const MERGE_CHANGES_SPILL_LABEL: &str = "merge-changes";
+
+/// Two inputs on two workers: the shape that may spill, so it makes a run
+/// directory and takes `--tmp-dir`. The input that varies comes first, so a
+/// missing one is the first the run would open.
 fn merge_changes(c: &Ctx, i: Input) -> Invocation {
+    Invocation::new(&["merge-changes"])
+        .arg(c.fx.osc(i))
+        .arg(c.fx.osc(Input::Good))
+        .words(&["-j", "2"])
+        .out("-o", c.out.join("merged.osc"))
+}
+
+fn merge_changes_one_input(c: &Ctx, i: Input) -> Invocation {
     Invocation::new(&["merge-changes"])
         .arg(c.fx.osc(i))
         .out("-o", c.out.join("merged.osc"))
@@ -1807,16 +1832,21 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         "no pause landed before the run completed ({count} checkpoints counted)"
     );
     ensure!(
-        staging_seen,
+        // The two-input merge-changes row runs two readers, so how many
+        // checkpoints a run passes, and which of them follow the first write
+        // to staging, varies from run to run; the one-input row is the
+        // merge-changes sweep that must observe staging. Both are held to
+        // leaving nothing at every pause.
+        staging_seen || row.label == MERGE_CHANGES_SPILL_LABEL,
         "no pause observed a populated staging entry ({count} checkpoints, pauses at {ks:?})"
     );
     ensure!(
         // merge-changes spills only output produced for a later input while an
-        // earlier one is unfinished; this table runs it on one input, which
-        // makes its run directory and never writes into it.
+        // earlier one is unfinished, which on this table's small inputs depends
+        // on scheduling: its run directory is made but may never be written.
         !row.tmp_dir
             || row.label == SPARSE_ALTW_LABEL
-            || row.command == "merge-changes"
+            || row.label == MERGE_CHANGES_SPILL_LABEL
             || scratch_seen,
         "no pause observed scratch payload in the run directory ({count} checkpoints, pauses \
          at {ks:?})"

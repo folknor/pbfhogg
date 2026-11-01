@@ -1993,6 +1993,25 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Run directory only where a merge may spill (bygg, 2026-11-01)
+
+The streaming merge takes an optional scratch, given only for several
+inputs at any `-j` but 1; the coordinator's spill site unwraps it once per
+spilled input. Matched interleaved `--bench 1` cells on bygg, 7-OSC
+`4914..4920`, default mode: baseline `6a9807d9` built in brokkr's
+`--commit` worktree (stored), variant `6a9807d9` + change (`--force`,
+unstored).
+
+| Cell | Baseline | Variant |
+|---|---|---|
+| merge-changes 7-OSC (default), three pairs | 3.667, 3.726, 3.721 s (`3ea1430d`, `497ad8ea`, `16d34181`) | 3.693, 3.716, 3.695 s (median -0.7 %, noise) |
+
+The phase split of the third pair is identical (parallel emit 3467 ms
+against 3440 ms, drain 249 ms on both). One-input, `--simplify` and `-j 1`
+runs lose only the run directory's creation and were not measured: brokkr
+passes `--tmp-dir` to every merge-changes, which those command lines now
+refuse.
+
 ### Simplify and OSC tags-filter on the batch readers (bygg, 2026-10-31)
 
 `--simplify` used to parse each input on one thread into owned elements,

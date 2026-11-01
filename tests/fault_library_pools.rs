@@ -186,10 +186,10 @@ fn merge_changes_fixed_pool_is_joined_before_it_returns() {
         pbfhogg::merge_changes::merge_changes(
             &[&first, &second],
             crate::common::out(out),
-            false,
+            pbfhogg::merge_changes::MergeMode::Stream {
+                scratch: Some(crate::common::scratch_in(dir.path())),
+            },
             pbfhogg::Parallelism::from_jobs(2),
-            false,
-            crate::common::scratch_in(dir.path()),
             &host,
         )
     })
@@ -211,10 +211,10 @@ fn merge_changes_partial_build_failure_joins_the_spawned_threads() {
         pbfhogg::merge_changes::merge_changes(
             &[&first, &second],
             crate::common::out(out),
-            false,
+            pbfhogg::merge_changes::MergeMode::Stream {
+                scratch: Some(crate::common::scratch_in(dir.path())),
+            },
             pbfhogg::Parallelism::from_jobs(3),
-            false,
-            crate::common::scratch_in(dir.path()),
             &host,
         )
     })

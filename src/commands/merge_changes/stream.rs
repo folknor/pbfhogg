@@ -191,9 +191,16 @@ impl Drop for StopOnDrop<'_> {
 
 /// Run the merge, writing every member in input and batch order to `out`.
 /// Returns the number of changes written.
+///
+/// `scratch` may be `None` exactly when [`super::stream_writes_scratch`] is
+/// false for this plan: with one input every member goes to the output, and
+/// with one reader the next input becomes the head before any of its members
+/// is drained (a slot is reused only at completion, and the loop advances the
+/// head before it receives again), so no input is ever pending with a member
+/// in hand.
 pub(crate) fn run(
     plan: &Plan<'_>,
-    scratch: &RunScratch,
+    scratch: Option<&RunScratch>,
     out: &mut crate::output::OutputWriter,
 ) -> crate::Result<u64> {
     let is_gz = plan.is_gz;
@@ -444,7 +451,8 @@ struct InputState {
 
 struct Coordinator<'a, 'p> {
     plan: &'a Plan<'p>,
-    scratch: &'a RunScratch,
+    /// `None` only on a plan that provably never spills; see [`run`].
+    scratch: Option<&'a RunScratch>,
     ledger: &'a Ledger,
     out: &'a mut crate::output::OutputWriter,
     states: Vec<InputState>,
@@ -455,7 +463,7 @@ struct Coordinator<'a, 'p> {
 impl<'a, 'p> Coordinator<'a, 'p> {
     fn new(
         plan: &'a Plan<'p>,
-        scratch: &'a RunScratch,
+        scratch: Option<&'a RunScratch>,
         ledger: &'a Ledger,
         out: &'a mut crate::output::OutputWriter,
     ) -> Self {
@@ -594,7 +602,8 @@ impl<'a, 'p> Coordinator<'a, 'p> {
             state.next += 1;
             state.changes += changes;
             if matches!(state.sink, Sink::Pending) {
-                let path = self.scratch.file(&format!("merge-input-{input}"))?;
+                let path =
+                    spill_scratch(self.scratch, input)?.file(&format!("merge-input-{input}"))?;
                 let file = crate::scratch::create_read_write(&path, true)
                     .map_err(|e| spill_err(&path, e))?;
                 state.sink = Sink::Spill(path, io::BufWriter::with_capacity(SPILL_CHUNK, file));
@@ -666,10 +675,20 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 self.out.write_all(&buf[..n])?;
             }
             drop(file);
-            self.scratch.remove(&path);
+            spill_scratch(self.scratch, self.head)?.remove(&path);
         }
         Ok(())
     }
+}
+
+/// The run scratch a spill of `input` goes in. A spill without one means
+/// the caller's `stream_writes_scratch` premise was broken.
+fn spill_scratch(scratch: Option<&RunScratch>, input: usize) -> crate::Result<&RunScratch> {
+    scratch.ok_or_else(|| {
+        crate::Error::internal(format!(
+            "merge-changes input {input} spilled on a run given no scratch directory"
+        ))
+    })
 }
 
 /// Spill write and copy-back unit.

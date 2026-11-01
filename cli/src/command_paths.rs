@@ -86,6 +86,18 @@ fn diff_writes_scratch(format: DiffFormat) -> bool {
     matches!(format, DiffFormat::Osc)
 }
 
+/// Whether a `merge-changes` run may write scratch: never with
+/// `--simplify`, otherwise as the library's streaming merge says (several
+/// inputs, not at `-j 1`). `validate_merge_changes` refuses `--tmp-dir`
+/// where this is false.
+pub(crate) fn merge_changes_writes_scratch(
+    simplify: bool,
+    inputs: usize,
+    jobs: pbfhogg::Parallelism,
+) -> bool {
+    !simplify && pbfhogg::merge_changes::stream_writes_scratch(inputs, jobs)
+}
+
 /// See the module doc.
 pub(crate) struct CommandPaths {
     /// Every file the command reads that the command line names.
@@ -265,13 +277,17 @@ impl CommandPaths {
             Command::MergeChanges {
                 changes,
                 output,
+                simplify,
+                jobs,
                 tmp,
                 ..
             } => {
                 paths.inputs.clone_from(changes);
                 paths.outputs.push(file(&output.output));
                 paths.staging.clone_from(&output.staging_dir);
-                paths.scratch = Some(ScratchSite::new(tmp, Some(&output.output)));
+                if merge_changes_writes_scratch(*simplify, changes.len(), *jobs) {
+                    paths.scratch = Some(ScratchSite::new(tmp, Some(&output.output)));
+                }
             }
             Command::BuildGeocodeIndex {
                 file: input,
@@ -346,6 +362,18 @@ impl CommandPaths {
             .as_ref()
             .ok_or("internal error: this command line makes no scratch directory")?
             .create(host)
+    }
+
+    /// The run's scratch directory, made now, when this command line makes
+    /// one; `None` when its arm above gives it none.
+    pub(crate) fn create_scratch_if_any(
+        &self,
+        host: &pbfhogg::host::Host,
+    ) -> Result<Option<pbfhogg::scratch::RunScratch>, Box<dyn std::error::Error>> {
+        self.scratch
+            .as_ref()
+            .map(|site| site.create(host))
+            .transpose()
     }
 
     /// `--staging-dir`, when given.
@@ -513,8 +541,33 @@ impl LeftoverScanner {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod tests {
-    use super::{ScratchSite, TmpDirArg, dir_holds};
+    use super::{ScratchSite, TmpDirArg, dir_holds, merge_changes_writes_scratch};
     use crate::host;
+
+    /// merge-changes makes a run directory only where it may spill: several
+    /// inputs, without `--simplify`, not at `-j 1`. `-j 0` may resolve to one
+    /// worker on a small host, which is not the command line's guarantee.
+    #[test]
+    fn merge_changes_declares_scratch_only_where_it_may_spill() {
+        use pbfhogg::Parallelism;
+        for (simplify, inputs, jobs, expect) in [
+            (false, 2, 0, true),
+            (false, 2, 2, true),
+            (false, 7, 8, true),
+            (false, 1, 0, false),
+            (false, 1, 4, false),
+            (false, 2, 1, false),
+            (true, 2, 0, false),
+            (true, 2, 4, false),
+            (true, 1, 0, false),
+        ] {
+            assert_eq!(
+                merge_changes_writes_scratch(simplify, inputs, Parallelism::from_jobs(jobs)),
+                expect,
+                "simplify={simplify} inputs={inputs} -j {jobs}"
+            );
+        }
+    }
 
     #[test]
     fn scratch_goes_to_tmp_dir_else_the_output_directory_else_dot() {

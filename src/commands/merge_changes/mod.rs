@@ -159,28 +159,52 @@ impl CurrentElem {
     }
 }
 
+/// How [`merge_changes`] combines its inputs.
+pub enum MergeMode {
+    /// Every change, in input order, nothing resolved. Output produced for
+    /// a later input while an earlier one is still being written is held in
+    /// `scratch` until that input becomes the head. It is required when
+    /// [`stream_writes_scratch`] says the run may spill, and refused as
+    /// missing before any work; otherwise `None` is accepted, and a scratch
+    /// given anyway is removed unused.
+    Stream {
+        scratch: Option<crate::scratch::RunScratch>,
+    },
+    /// Keep only the last change per object (type + id), by input position.
+    /// A change whose version is lower than one already seen for the object
+    /// is refused unless `allow_version_regression`. Writes no scratch.
+    Simplify { allow_version_regression: bool },
+}
+
+/// Whether a [`MergeMode::Stream`] merge of `input_count` inputs at
+/// `parallelism` may write scratch, so needs a [`RunScratch`]. One input
+/// never does: its output goes straight to the destination. Neither does
+/// `Parallelism::Fixed(1)`: inputs are then read one at a time, each only
+/// once the one before it is written, so nothing is produced ahead of the
+/// head. `Auto` may, whatever it resolves to on this host.
+///
+/// [`RunScratch`]: crate::scratch::RunScratch
+#[must_use]
+pub const fn stream_writes_scratch(
+    input_count: usize,
+    parallelism: crate::host::Parallelism,
+) -> bool {
+    input_count > 1 && !matches!(parallelism.fixed(), Some(1))
+}
+
 pub fn merge_changes(
     inputs: &[&Path],
     output: impl crate::output::BindOutput,
-    simplify: bool,
+    mode: MergeMode,
     parallelism: crate::host::Parallelism,
-    allow_version_regression: bool,
-    scratch: crate::scratch::RunScratch,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = merge_changes_to(
-        inputs,
-        &output,
-        simplify,
-        parallelism,
-        allow_version_regression,
-        &scratch,
-        host,
-    )?;
-    drop(scratch);
+    let result = merge_changes_to(inputs, &output, &mode, parallelism, host)?;
+    // The run scratch goes before publication, as on every scratch path.
+    drop(mode);
     output.publish()?;
     Ok(result)
 }
@@ -190,10 +214,8 @@ pub fn merge_changes(
 pub(crate) fn merge_changes_to(
     inputs: &[&Path],
     output: &crate::output::BoundOutput,
-    simplify: bool,
+    mode: &MergeMode,
     parallelism: crate::host::Parallelism,
-    allow_version_regression: bool,
-    scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
 ) -> Result<MergeChangesStats> {
     // Gzip or plain XML is decided by the name the caller chose (never the
@@ -204,6 +226,15 @@ pub(crate) fn merge_changes_to(
             "at least one input OSC file is required",
         ));
     }
+    if let MergeMode::Stream { scratch: None } = mode
+        && stream_writes_scratch(inputs.len(), parallelism)
+    {
+        return Err(crate::Error::invalid_argument(
+            "a merge of several inputs without simplify needs a scratch directory, unless it \
+             runs on one worker",
+        ));
+    }
+    let simplify = matches!(mode, MergeMode::Simplify { .. });
 
     let worker_count = parallelism.resolve(|| {
         crate::host::sized_workers(
@@ -254,8 +285,10 @@ pub(crate) fn merge_changes_to(
     // Under `Executor::Ambient` (the CLI) this is a direct call.
     let cancel = &host.invocation;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
-        if simplify {
-            simplify::run(
+        match mode {
+            MergeMode::Simplify {
+                allow_version_regression,
+            } => simplify::run(
                 &stream::Plan {
                     inputs,
                     is_gz,
@@ -265,19 +298,20 @@ pub(crate) fn merge_changes_to(
                 },
                 output,
                 worker_count,
-                allow_version_regression,
-            )
-        } else {
-            let changes_out = write_streaming(
-                inputs,
-                output,
-                is_gz,
-                worker_count,
-                executor,
-                scratch,
-                cancel,
-            )?;
-            Ok((changes_out, changes_out))
+                *allow_version_regression,
+            ),
+            MergeMode::Stream { scratch } => {
+                let changes_out = write_streaming(
+                    inputs,
+                    output,
+                    is_gz,
+                    worker_count,
+                    executor,
+                    scratch.as_ref(),
+                    cancel,
+                )?;
+                Ok((changes_out, changes_out))
+            }
         }
     })?;
     // Inside the marked span, so `MERGECHANGES_END` comes after the pool's
@@ -591,7 +625,7 @@ fn write_streaming(
     is_gz: bool,
     readers: usize,
     executor: crate::host::ExecutorRef<'_>,
-    scratch: &crate::scratch::RunScratch,
+    scratch: Option<&crate::scratch::RunScratch>,
     cancel: &crate::host::Recorder,
 ) -> Result<u64> {
     for path in inputs {
@@ -967,6 +1001,12 @@ mod tests {
             for jobs in [1, 2, 8] {
                 let name = if is_gz { "out.osc.gz" } else { "out.osc" };
                 let output = scratch.path().join(name);
+                let parallelism = crate::host::Parallelism::from_jobs(jobs);
+                // One worker reads the inputs one after another, so it is
+                // given no scratch: a spill there would be an error.
+                let run_dir = stream_writes_scratch(inputs.len(), parallelism)
+                    .then(|| run_scratch(scratch.path()));
+                assert_eq!(run_dir.is_none(), jobs == 1);
                 let stats = merge_changes(
                     &inputs,
                     crate::output::Output::new(
@@ -974,10 +1014,8 @@ mod tests {
                         crate::output::Overwrite::Replace,
                         &crate::host::Diagnostics::discard(),
                     )?,
-                    false,
-                    crate::host::Parallelism::from_jobs(jobs),
-                    false,
-                    run_scratch(scratch.path()),
+                    MergeMode::Stream { scratch: run_dir },
+                    parallelism,
                     &crate::host::Host::entered_for_tests(),
                 )?;
                 assert_eq!(stats.changes_out, expected_ids.len() as u64);
@@ -1000,6 +1038,108 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Several inputs at any parallelism but one worker need a scratch
+    /// directory, `Auto` included whatever it resolves to; the refusal comes
+    /// before any input is read (the inputs here do not exist). One input,
+    /// one worker and simplify need none.
+    #[test]
+    fn scratch_is_required_exactly_where_a_stream_merge_may_spill() {
+        use crate::host::Parallelism;
+        let scratch = crate::path_guard::tests::scratch();
+        let missing = scratch.path().join("no-such-input.osc");
+        let run = |inputs: &[&Path], mode: MergeMode, parallelism: Parallelism| {
+            merge_changes(
+                inputs,
+                crate::output::Output::new(
+                    scratch.path().join("out.osc"),
+                    crate::output::Overwrite::Replace,
+                    &crate::host::Diagnostics::discard(),
+                )
+                .unwrap(),
+                mode,
+                parallelism,
+                &crate::host::Host::entered_for_tests(),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        for parallelism in [Parallelism::Auto, Parallelism::from_jobs(2)] {
+            let err = run(
+                &[&missing, &missing],
+                MergeMode::Stream { scratch: None },
+                parallelism,
+            );
+            assert!(err.contains("scratch directory"), "{err}");
+            assert!(!err.contains("no-such-input"), "{err}");
+        }
+        for (inputs, mode, parallelism) in [
+            (
+                vec![missing.as_path()],
+                MergeMode::Stream { scratch: None },
+                Parallelism::Auto,
+            ),
+            (
+                vec![missing.as_path(), missing.as_path()],
+                MergeMode::Stream { scratch: None },
+                Parallelism::from_jobs(1),
+            ),
+            (
+                vec![missing.as_path(), missing.as_path()],
+                MergeMode::Simplify {
+                    allow_version_regression: false,
+                },
+                Parallelism::Auto,
+            ),
+        ] {
+            let err = run(&inputs, mode, parallelism);
+            assert!(err.contains("no-such-input"), "reached the input: {err}");
+        }
+    }
+
+    /// A scratch given to a merge that needs none is accepted and removed.
+    #[test]
+    fn an_unneeded_scratch_is_accepted_and_removed() {
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("in.osc");
+        std::fs::write(
+            &input,
+            "<osmChange version=\"0.6\"><create><node id=\"1\" lat=\"1\" lon=\"2\"/></create></osmChange>",
+        )
+        .unwrap();
+        let output = dir.join("out.osc");
+        for mode in [
+            MergeMode::Stream {
+                scratch: Some(run_scratch(&dir)),
+            },
+            MergeMode::Simplify {
+                allow_version_regression: false,
+            },
+        ] {
+            let stats = merge_changes(
+                &[&input, &input],
+                crate::output::Output::new(
+                    &output,
+                    crate::output::Overwrite::Replace,
+                    &crate::host::Diagnostics::discard(),
+                )
+                .unwrap(),
+                mode,
+                crate::host::Parallelism::from_jobs(1),
+                &crate::host::Host::entered_for_tests(),
+            )
+            .unwrap();
+            assert_eq!(stats.files, 2);
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["in.osc", "out.osc"]);
+        }
     }
 
     /// The owned simplify path (the oracle): parse to owned changes, dedupe
@@ -1038,7 +1178,6 @@ mod tests {
         output: &Path,
         jobs: usize,
         allow_version_regression: bool,
-        scratch: &Path,
     ) -> crate::Result<Vec<u8>> {
         merge_changes(
             inputs,
@@ -1047,10 +1186,10 @@ mod tests {
                 crate::output::Overwrite::Replace,
                 &crate::host::Diagnostics::discard(),
             )?,
-            true,
+            MergeMode::Simplify {
+                allow_version_regression,
+            },
             crate::host::Parallelism::from_jobs(jobs),
-            allow_version_regression,
-            run_scratch(scratch),
             &crate::host::Host::entered_for_tests(),
         )?;
         Ok(std::fs::read(output)?)
@@ -1115,8 +1254,7 @@ mod tests {
             for jobs in [1, 3, 8] {
                 for allow in [false, true] {
                     let owned = owned_simplify(&inputs, &output, jobs, allow)?;
-                    let rendered =
-                        rendered_simplify(&inputs, &output, jobs, allow, scratch.path())?;
+                    let rendered = rendered_simplify(&inputs, &output, jobs, allow)?;
                     assert!(owned == rendered, "{name}, jobs={jobs}, allow={allow}");
                 }
             }
@@ -1134,7 +1272,7 @@ mod tests {
         let owned = owned_simplify(&inputs, &output, 2, false)
             .unwrap_err()
             .to_string();
-        let rendered = rendered_simplify(&inputs, &output, 2, false, scratch.path())
+        let rendered = rendered_simplify(&inputs, &output, 2, false)
             .unwrap_err()
             .to_string();
         assert!(owned.contains("version"), "{owned}");
@@ -1178,10 +1316,8 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap(),
-            false,
+            MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            false,
-            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
@@ -1219,10 +1355,8 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap(),
-            false,
+            MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            false,
-            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .expect_err("a truncated input must be refused");
@@ -1262,10 +1396,8 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap(),
-            false,
+            MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            false,
-            run_scratch(&dir),
             &crate::host::Host::entered_for_tests(),
         )
         .unwrap();

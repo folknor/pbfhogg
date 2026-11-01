@@ -463,6 +463,12 @@ enum Slot {
     Overflow,
 }
 
+impl Default for IdSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IdSet {
     pub fn new() -> Self {
         Self {
@@ -657,8 +663,11 @@ impl IdSet {
     /// if some other thread already set the same bit.
     ///
     /// Requires `pre_allocate()` to have covered `id`. Safe for concurrent
-    /// use from multiple threads via `&self`. Relaxed ordering; callers must
-    /// synchronize (thread join) before reading via `get()`.
+    /// use from multiple threads via `&self`. Relaxed ordering: a `get()`
+    /// racing the setters is a relaxed load of the same word, so a `true`
+    /// from it is final but a `false` may miss a bit another thread is
+    /// setting; a caller that needs every set bit synchronizes (thread join)
+    /// before reading.
     ///
     /// # Panics
     ///

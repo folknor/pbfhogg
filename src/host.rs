@@ -1000,9 +1000,8 @@ impl Recorder {
 
     /// Claim the once-per-invocation diagnostic `key`: `true` the first time
     /// any part of this invocation asks (the caller then emits it), `false`
-    /// ever after, and after [`mark_reported`](Self::mark_reported). The
-    /// lock is released before the caller emits, so a slow diagnostic sink
-    /// never holds it.
+    /// ever after. The lock is released before the caller emits, so a slow
+    /// diagnostic sink never holds it.
     pub(crate) fn first_report(&self, key: &'static str) -> bool {
         self.0
             .0
@@ -1010,14 +1009,6 @@ impl Recorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key)
-    }
-
-    /// Record that the once-per-invocation diagnostic `key` is already
-    /// covered, so a later `diag_once!` with that key under this invocation
-    /// stays silent. For a command that has just reported the same condition
-    /// in its own, more specific words.
-    pub(crate) fn mark_reported(&self, key: &'static str) {
-        self.first_report(key);
     }
 
     /// Serialize one publication of this invocation against any other: the
@@ -2170,7 +2161,7 @@ impl Diagnostics {
     }
     /// Emit the event once per `invocation`: the first `diag_once!` with
     /// `key` under that invocation (or a clone of it) reaches the sink, every
-    /// later one, and any after [`Invocation::mark_reported`], stays silent.
+    /// later one stays silent.
     pub(crate) fn emit_once(
         &self,
         invocation: &Recorder,
@@ -2254,23 +2245,6 @@ mod diagnostic_tests {
         other.emit_once(&shared, EventKind::Warning, "key", format_args!("again"));
         d.emit_once(&second, EventKind::Warning, "key", format_args!("again"));
         assert_eq!(*sink.0.lock().expect("sink"), ["first", "second"]);
-    }
-    #[test]
-    fn a_reported_key_silences_a_later_once_event() {
-        let sink = Arc::new(Sink::default());
-        let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
-        let invocation = Call::detached();
-        invocation.mark_reported("key");
-        d.emit_once(&invocation, EventKind::Note, "key", format_args!("note"));
-        d.emit_once(&invocation, EventKind::Note, "other", format_args!("other"));
-        // Another invocation is not covered by the first one's report.
-        d.emit_once(
-            &Call::detached(),
-            EventKind::Note,
-            "key",
-            format_args!("fresh"),
-        );
-        assert_eq!(*sink.0.lock().expect("sink"), ["other", "fresh"]);
     }
     #[test]
     fn summary_writer_splits_lines_and_keeps_partial_on_drop() {

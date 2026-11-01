@@ -285,17 +285,6 @@ narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
 relation closure (a relation pass on the projection pools, then the way
 pass over the closed set) or record the deviation.
 
-### WRK-117: check --refs on unindexed input decodes every blob per phase
-
-An unindexed blob is scheduled into every phase of check `--refs` (two
-without `--check-relations`, three with), so an unindexed planet
-decompresses each blob two or three times, silently. check `--ids` warns
-for the same triple scan (`check.ids.unindexed_triple_scan`); `--refs`
-does not. Either warn the same way or read each unindexed blob once and
-route its kinds to the phases that need them (the node phase must finish
-before ways are judged, so the routing has to keep positions or results,
-not blocks).
-
 ### WRK-118: Remaining element walks that read only IDs and references
 
 check `--refs`, check `--ids`, getparents and getid now validate through
@@ -308,6 +297,33 @@ inspect's node stats and the OSC merge join. Not audited one by one:
 first establish what each reads per element and what its walk costs at
 planet, then move the ones that pay onto a projection on the one
 validator.
+
+### WRK-120: check --ids could judge type order on unindexed input
+
+check `--ids` skips type order on an unindexed file because the header
+walk cannot know a blob's kind (`reference/indexdata-trust.md`, "Gaps no
+verifier covers"). Its unindexed arm (`unindexed_pass` in
+`src/commands/check/verify_ids.rs`) now decodes every blob once in one
+phase, and each accepted blob's `BlockScan::kinds` is at hand there at
+no cost, so type order could be judged from the decoded kinds in file
+order. Open: what a mixed-kind blob means for it (its `KindSet` says which
+kinds, not in what order within the blob), and whether `--ids -t`, which
+still validates every blob, should judge it too. Closing it moves the
+gap out of indexdata-trust.md and the "type-order check is skipped"
+sentence out of the check section of `docs/cli/commands.md`.
+
+### WRK-119: merge-changes spill and copy-back have no deterministic test
+
+The streaming merge spills a later input's members to scratch and copies
+them back when that input becomes the head, but no test forces that path:
+`batched_merge_keeps_input_order_and_is_jobs_independent` spills only when
+scheduling lets a later input's batch finish first, and the CLI output
+contract's two-input row can neither require scratch payload nor a
+populated staging entry for the same reason. A test hook that holds the
+head input's reader (or its first member) until a later input has
+spilled would make spill, `merge_changes_spill_bytes` and the copy-back
+removal certain, and would also let the CLI interrupted-run sweep require
+scratch payload on that row.
 
 ### WRK-027: Membership track for set-dominated peaks
 

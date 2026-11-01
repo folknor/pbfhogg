@@ -901,12 +901,14 @@ fn degrade_decode_path(
         .header()
         .clone();
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(
-            input,
-            crate::scan::classify::KindClaims::Refuse,
-            host,
-        )?;
+    // Each per-kind phase re-encodes only its own kind, so an unindexed blob
+    // (only under --force) sits in all three and is decoded once per phase.
+    let (schedules, shared_file, _max_ids) = crate::scan::classify::build_classify_schedules_split(
+        input,
+        crate::scan::classify::KindClaims::Refuse,
+        host,
+    )?;
+    let (node_schedule, way_schedule, rel_schedule) = schedules.into_replicated();
     // Use the input size as a preallocation budget for the caller-supplied
     // cap. Compressed input can expand to more elements than bytes; the
     // vectors grow as needed without changing the requested block cap.

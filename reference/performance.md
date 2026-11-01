@@ -2751,6 +2751,42 @@ builds blocks, kept its work phases at the same length: nodes 18.0 and
 18.6 s base against 18.5 s, ways 13.5 s on both (`daa8ce1b`,
 `7cb64fb5`).
 
+## check reads an unindexed file once (bygg, 2026-11-01)
+
+The header walk no longer puts an unindexed blob in every per-kind
+schedule (`KindSchedules::Unindexed`). check `--ids` reads such a file in
+one phase, judging each blob's IDs of every kind from one validation pass.
+check `--refs` reads it in one combined phase that inserts each blob's
+node IDs and judges its ways (and, under `--check-relations`, relations)
+against the sets as they stand, reading again in the way or relation phase
+only a blob whose judgement missed a reference.
+
+Planet, interleaved `--bench 1`, base `2b1c6ba1` (stored, `--commit`)
+against the working tree on it (`--force`, not stored). `pbf.raw` is
+`planet-20260223.osm.pbf`, the indexed variant
+`planet-20260223-with-indexdata.osm.pbf`.
+
+| Command | Input | Base wall | Working tree wall |
+|---|---|---:|---:|
+| check `--refs` | unindexed | 51.25, 50.18 s (`1f1ac148`, `456dd944`) | 28.89, 28.84, 28.87 s |
+| check `--ids` | unindexed | 69.58 s (`017965d8`) | 26.78 s |
+| check `--ids --full` | unindexed | 70.32 s (`25c3d60b`) | 27.11 s |
+| check `--refs` | indexed | 31.75, 31.53 s (`917d217e`, `d2648b33`) | 31.70, 30.64 s |
+| check `--ids` | indexed | 29.53 s (`02167562`) | 29.68 s |
+| check `--ids --full` | indexed | 30.42 s (`d81221ae`) | 30.26 s |
+
+Unindexed check `--refs` -44 %, check `--ids` -61 %; the indexed cells
+are unchanged within noise. The base's unindexed check `--refs` read the
+file twice (`CHECKREFS_NODES` 22.5 s then `CHECKREFS_WAYS` 24.1 s, 86.8 GB
+each at 22.5 cores); the working tree's `CHECKREFS_UNINDEXED` took 25.4 s
+and the way phase re-read no blob (`checkrefs_way_blobs` 0 of 50,816):
+on this sorted file no way's reference raced the node blob holding its
+target. That one pass costs what the indexed file's two phases cost
+together (13.5 + 11.6 s); the unindexed file's lower wall is its schedule
+walk, 3.4 s against 5.7-6.1 s with indexdata to parse. Peak anon 2.13 GB
+base, 2.00 GB working tree. `--check-relations` was not measured: brokkr's
+`check-refs` cell has no way to pass it.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

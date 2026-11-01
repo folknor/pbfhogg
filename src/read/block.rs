@@ -1226,6 +1226,79 @@ pub(crate) struct NoProjection;
 
 impl GroupProjection for NoProjection {}
 
+/// Two projections riding on one validation pass, each handed every piece in
+/// validation order, the first before the second.
+impl<A: GroupProjection, B: GroupProjection> GroupProjection for (A, B) {
+    fn group_begin(&mut self) {
+        self.0.group_begin();
+        self.1.group_begin();
+    }
+    fn node(&mut self, node: &WireNode<'_>, info: Option<&super::wire::WireInfo>) {
+        self.0.node(node, info);
+        self.1.node(node, info);
+    }
+    fn way(&mut self, way: &WireWay<'_>, info: Option<&super::wire::WireInfo>) {
+        self.0.way(way, info);
+        self.1.way(way, info);
+    }
+    fn relation(&mut self, relation: &WireRelation<'_>, info: Option<&super::wire::WireInfo>) {
+        self.0.relation(relation, info);
+        self.1.relation(relation, info);
+    }
+    fn dense(
+        &mut self,
+        dense: &WireDenseNodes<'_>,
+        ids: usize,
+        info: Option<&super::wire::WireDenseInfo<'_>>,
+    ) {
+        self.0.dense(dense, ids, info);
+        self.1.dense(dense, ids, info);
+    }
+    fn group_end(&mut self) {
+        self.0.group_end();
+        self.1.group_end();
+    }
+}
+
+/// A projection the caller may leave out: `None` records nothing.
+impl<P: GroupProjection> GroupProjection for Option<P> {
+    fn group_begin(&mut self) {
+        if let Some(p) = self {
+            p.group_begin();
+        }
+    }
+    fn node(&mut self, node: &WireNode<'_>, info: Option<&super::wire::WireInfo>) {
+        if let Some(p) = self {
+            p.node(node, info);
+        }
+    }
+    fn way(&mut self, way: &WireWay<'_>, info: Option<&super::wire::WireInfo>) {
+        if let Some(p) = self {
+            p.way(way, info);
+        }
+    }
+    fn relation(&mut self, relation: &WireRelation<'_>, info: Option<&super::wire::WireInfo>) {
+        if let Some(p) = self {
+            p.relation(relation, info);
+        }
+    }
+    fn dense(
+        &mut self,
+        dense: &WireDenseNodes<'_>,
+        ids: usize,
+        info: Option<&super::wire::WireDenseInfo<'_>>,
+    ) {
+        if let Some(p) = self {
+            p.dense(dense, ids, info);
+        }
+    }
+    fn group_end(&mut self) {
+        if let Some(p) = self {
+            p.group_end();
+        }
+    }
+}
+
 /// Validate every group of a block (`group(i)` for `i` in `0..group_count`)
 /// and hand each validated piece to `projection`. Returns the kinds the
 /// block holds and its element count. The group part of [`validate_block`],

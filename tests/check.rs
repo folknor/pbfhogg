@@ -755,3 +755,325 @@ fn check_ids_stops_on_a_way_blob_claiming_another_kind() {
         .expect("the node-claimed blob is never decoded under -t way");
     assert_eq!(unseen.way_count, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Unindexed input: one combined pass, rejudged on a miss
+// ---------------------------------------------------------------------------
+
+/// One blob of a fixture, all of one kind.
+#[derive(Clone, Copy)]
+enum Blob<'a> {
+    Nodes(&'a [TestNode]),
+    Ways(&'a [TestWay]),
+    Relations(&'a [TestRelation]),
+}
+
+/// Write `blobs` as unindexed blobs in the given order, under a header that
+/// claims no sort order.
+fn write_unindexed_blobs(path: &std::path::Path, blobs: &[Blob<'_>]) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let file = std::fs::File::create(path).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().build().expect("header"))
+        .expect("write header");
+    for blob in blobs {
+        let mut bb = BlockBuilder::new();
+        match *blob {
+            Blob::Nodes(nodes) => {
+                for n in nodes {
+                    bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+                }
+            }
+            Blob::Ways(ways) => {
+                for w in ways {
+                    bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
+                }
+            }
+            Blob::Relations(relations) => {
+                for r in relations {
+                    let members: Vec<MemberData<'_>> = r
+                        .members
+                        .iter()
+                        .map(|m| MemberData {
+                            id: m.id,
+                            role: m.role,
+                        })
+                        .collect();
+                    bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
+                }
+            }
+        }
+        writer
+            .write_primitive_block_no_indexdata(bb.take().expect("take").expect("a block"))
+            .expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// Every counter a run emits, by name (the last sample of each).
+#[derive(Default)]
+struct Counters(std::sync::Mutex<Vec<(String, i64)>>);
+
+impl pbfhogg::debug::InstrumentSink for Counters {
+    fn marker(&self, _name: &str) {}
+    fn counter(&self, name: &str, value: i64) {
+        self.0
+            .lock()
+            .expect("counters")
+            .push((name.to_owned(), value));
+    }
+}
+
+impl Counters {
+    fn get(&self, name: &str) -> i64 {
+        self.0
+            .lock()
+            .expect("counters")
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map_or_else(|| panic!("no counter {name}"), |&(_, v)| v)
+    }
+}
+
+/// A refs report as comparable values: the counts and the sorted details.
+type RefsSummary = ([u64; 8], Vec<(char, i64, char, i64)>);
+
+fn refs_summary(report: &pbfhogg::check::refs::RefCheckResult) -> RefsSummary {
+    let mut details: Vec<_> = report
+        .missing_refs
+        .iter()
+        .map(|m| {
+            (
+                m.missing_type,
+                m.missing_id,
+                m.referencing_type,
+                m.referencing_id,
+            )
+        })
+        .collect();
+    details.sort_unstable();
+    (
+        [
+            report.node_count,
+            report.way_count,
+            report.relation_count,
+            report.missing_node_refs,
+            report.missing_way_refs,
+            report.missing_node_members,
+            report.missing_relation_members,
+            report.missing_relation_member_occurrences,
+        ],
+        details,
+    )
+}
+
+/// The elements of the unindexed fixtures below, and the indexed sorted
+/// file holding the same: nodes 1 to 4, way 10 resolving, way 11 missing
+/// n99 twice, relations whose node, way and relation members resolve and
+/// miss (n98, w97, r96) and one forward relation member (r21).
+fn refs_fixture_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let nodes = vec![node(1), node(2), node(3), node(4)];
+    let ways = vec![way(10, &[1, 2]), way(11, &[3, 99, 4, 99])];
+    let member = |id| TestMember { id, role: "" };
+    let relations = vec![
+        TestRelation {
+            id: 20,
+            members: vec![
+                member(MemberId::Node(1)),
+                member(MemberId::Way(10)),
+                member(MemberId::Relation(21)),
+            ],
+            tags: vec![],
+            meta: None,
+        },
+        TestRelation {
+            id: 21,
+            members: vec![
+                member(MemberId::Node(98)),
+                member(MemberId::Way(97)),
+                member(MemberId::Relation(96)),
+                member(MemberId::Way(11)),
+            ],
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    (nodes, ways, relations)
+}
+
+/// An unindexed file is judged exactly as its indexed twin, in any blob
+/// order: references that miss while their targets were not yet in their
+/// set are judged again after them, and a dropped provisional judgement
+/// counts nothing twice. Each blob is read once by the combined pass and at
+/// most once more per kind.
+#[test]
+fn check_refs_judges_an_unindexed_file_as_its_indexed_twin_in_any_order() {
+    let dir = crate::common::test_scratch();
+    let (nodes, ways, relations) = refs_fixture_elements();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    write_test_pbf_sorted(&indexed, &nodes, &ways, &relations);
+
+    let (n, w, r) = (
+        Blob::Nodes(&nodes),
+        [Blob::Ways(&ways[..1]), Blob::Ways(&ways[1..])],
+        [
+            Blob::Relations(&relations[..1]),
+            Blob::Relations(&relations[1..]),
+        ],
+    );
+    let orders: [(&str, Vec<Blob<'_>>); 2] = [
+        ("sorted", vec![n, w[0], w[1], r[0], r[1]]),
+        ("reversed", vec![r[1], r[0], w[1], w[0], n]),
+    ];
+
+    for check_relations in [false, true] {
+        for show_ids in [false, true] {
+            let want = refs_summary(
+                &run_check_refs(&indexed, check_relations, show_ids, 0).expect("indexed"),
+            );
+            for (name, blobs) in &orders {
+                let path = dir.path().join(format!("{name}.osm.pbf"));
+                write_unindexed_blobs(&path, blobs);
+                let counters = std::sync::Arc::new(Counters::default());
+                let mut host = crate::common::test_host();
+                host.invocation =
+                    pbfhogg::host::Invocation::with_sink(std::sync::Arc::clone(&counters)
+                        as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>);
+                let opts = pbfhogg::check::refs::CheckRefsOptions {
+                    check: pbfhogg::check::CheckOptions {
+                        max_errors: 0,
+                        direct_io: false,
+                    },
+                    check_relations,
+                    show_ids,
+                };
+                let report = pbfhogg::check::refs::check_refs(&path, &opts, &host)
+                    .expect("check_refs")
+                    .complete()
+                    .expect("completes");
+                let what = format!("{name}, relations {check_relations}, show_ids {show_ids}");
+                assert_eq!(refs_summary(&report), want, "{what}");
+                assert_eq!(counters.get("checkrefs_unindexed_blobs"), 5, "{what}");
+                assert_eq!(counters.get("checkrefs_node_blobs"), 0, "{what}");
+                // Way 11 misses n99 in fact, so its blob is always judged
+                // again; way 10's only if it raced the node blob.
+                let ways_again = counters.get("checkrefs_way_blobs");
+                assert!((1..=2).contains(&ways_again), "{what}: {ways_again}");
+                let relations_again = counters.get("checkrefs_relation_blobs");
+                if check_relations {
+                    assert!(
+                        (1..=2).contains(&relations_again),
+                        "{what}: {relations_again}"
+                    );
+                } else {
+                    assert_eq!(relations_again, 0, "{what}");
+                }
+                assert_eq!(
+                    counters.get("checkrefs_missing_node_refs_occurrences"),
+                    2,
+                    "{what}: n99 twice, counted once per occurrence"
+                );
+            }
+        }
+    }
+}
+
+/// The refusals stand wherever the combined pass meets them: a negative ID
+/// it would compare, in any blob order, is refused as on an indexed file.
+#[test]
+fn check_refs_refuses_negative_ids_in_an_unindexed_file_in_any_order() {
+    let dir = crate::common::test_scratch();
+    let nodes = [node(1)];
+    let neg_ref = [way(10, &[99, -5])];
+    let neg_way = [way(-10, &[1])];
+    let neg_member = [relation(3, MemberId::Way(-6))];
+    let cases: [(&str, Vec<Blob<'_>>, bool, &str); 3] = [
+        (
+            "neg-ref",
+            vec![Blob::Ways(&neg_ref), Blob::Nodes(&nodes)],
+            false,
+            "w10 references negative ID n-5",
+        ),
+        (
+            "neg-way",
+            vec![Blob::Ways(&neg_way), Blob::Nodes(&nodes)],
+            true,
+            "way -10",
+        ),
+        (
+            "neg-way-member",
+            vec![Blob::Relations(&neg_member), Blob::Nodes(&nodes)],
+            true,
+            "r3 references negative ID w-6",
+        ),
+    ];
+    for (name, blobs, check_relations, needle) in cases {
+        let path = dir.path().join(format!("{name}.osm.pbf"));
+        write_unindexed_blobs(&path, &blobs);
+        assert_refs_refused(&path, check_relations, needle);
+    }
+}
+
+/// `check --ids` reads an unindexed file once and reports exactly what it
+/// reports for the indexed twin, in both modes and under a type filter:
+/// order violations and duplicates of each kind, in kind order.
+#[test]
+fn check_ids_reports_an_unindexed_file_as_its_indexed_twin() {
+    let dir = crate::common::test_scratch();
+    let nodes = [node(1), node(3), node(2), node(5), node(5)];
+    let ways = [way(10, &[1]), way(12, &[1]), way(11, &[1]), way(12, &[1])];
+    let relations = [
+        relation(30, MemberId::Node(1)),
+        relation(30, MemberId::Node(1)),
+    ];
+    let indexed = dir.path().join("indexed.osm.pbf");
+    crate::common::write_multi_block_test_pbf(&indexed, &nodes, &ways, &relations, 2);
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    crate::common::write_multi_block_non_indexed_pbf(&unindexed, &nodes, &ways, &relations, 2);
+    crate::common::assert_non_indexed(&unindexed);
+
+    let filters = [
+        None,
+        Some(pbfhogg::TypeFilter {
+            nodes: false,
+            ways: true,
+            relations: true,
+        }),
+    ];
+    for full in [false, true] {
+        for filter in filters {
+            let report = |path: &std::path::Path| {
+                let r = verify_ids_outcome(path, full, filter)
+                    .complete()
+                    .expect("verify_ids completes");
+                // Which copy of a duplicate is reported, and so where it sits
+                // among its kind's violations, follows completion order on
+                // either file; the violations themselves do not.
+                let json = r.to_json_value("f");
+                let mut violations: Vec<String> = json["violations"]
+                    .as_array()
+                    .expect("violations")
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                violations.sort_unstable();
+                (
+                    [
+                        r.node_count,
+                        r.way_count,
+                        r.relation_count,
+                        r.total_violations,
+                    ],
+                    violations,
+                )
+            };
+            let want = report(&indexed);
+            assert!(want.0[3] > 0, "the fixture has violations");
+            assert_eq!(report(&unindexed), want, "full {full}, filter {filter:?}");
+        }
+    }
+}

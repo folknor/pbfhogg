@@ -112,8 +112,9 @@ mechanism detail belongs here: `repack` and `degrade` schedule an indexed
 blob into the one per-kind phase its indexdata names, and that phase
 re-encodes only elements of its kind. Checking the kind per blob is not
 possible in the worker, because the pool's classify closure receives only the
-decoded block and cannot tell an indexed blob from an unindexed one that the
-schedule builder replicated into all three kinds (a legitimate no-match);
+decoded block and cannot tell an indexed blob from an unindexed one that
+these two place in all three kinds' phases (`KindSchedules::into_replicated`,
+a legitimate no-match);
 checking it per element is a cost on a measured path. `cat --clean` has no
 per-kind phases: it skips a blob whose indexdata names an unselected kind and
 keeps every decoded element of a selected kind, whatever its blob claims.

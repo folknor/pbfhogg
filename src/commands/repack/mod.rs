@@ -200,14 +200,16 @@ pub(crate) fn repack_to(
         host,
     )?;
 
-    // The fifth result sizes IdSets in check callers; repack only needs the
-    // schedules.
-    let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
-        crate::scan::classify::build_classify_schedules_split(
-            input,
-            crate::scan::classify::KindClaims::Refuse,
-            host,
-        )?;
+    // The third result sizes IdSets in check callers; repack only needs the
+    // schedules. Each per-kind phase re-encodes only its own kind, so an
+    // unindexed blob (only under --force) sits in all three and is decoded
+    // once per phase.
+    let (schedules, shared_file, _) = crate::scan::classify::build_classify_schedules_split(
+        input,
+        crate::scan::classify::KindClaims::Refuse,
+        host,
+    )?;
+    let (node_schedule, way_schedule, rel_schedule) = schedules.into_replicated();
 
     host.invocation
         .counter("repack_input_blobs_nodes", node_schedule.len());

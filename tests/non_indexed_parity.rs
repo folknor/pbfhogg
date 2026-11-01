@@ -443,13 +443,11 @@ fn apply_changes_non_indexed_parity() {
 // check --refs
 // ---------------------------------------------------------------------------
 //
-// `check_refs` uses `build_classify_schedules_split`, which for
-// non-indexed blobs replicates the blob into all three per-kind
-// schedules (nodes, ways, relations). A decoded non-indexed blob is
-// thus processed three times, once per kind - only the matching-kind
-// pass contributes to the per-kind counters, but the triple-scan is
-// what extract --simple got wrong. Pin that check_refs counts survive
-// the triple-scan shape.
+// `check_refs` reads a non-indexed file in one combined pass that judges
+// each blob's ways and relations against the sets as they stand, and
+// reads again only the blobs whose judgement missed a reference. Pin that
+// its counts match the indexed twin's, so no dropped provisional
+// judgement is counted and no re-read one counted twice.
 
 #[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]
@@ -566,14 +564,11 @@ fn show_element_non_indexed_parity() {
 // ---------------------------------------------------------------------------
 //
 // Pins parity between indexed and non-indexed `check --ids --full`
-// reports. The earlier regression fired spurious `TypeOrder`
-// violations on non-indexed input because the parallel path's
-// `check_type_order` compared max/min offsets across the per-kind
-// schedules, and `build_classify_schedules_split` replicates every
-// non-indexed blob into all three schedules. Fixed 2026-04-23 by
-// gating the offset-based check on `indexed`; non-indexed `--full`
-// runs skip it and rely on the sequential element-level check for
-// the non-`--full` path.
+// reports. An earlier regression fired spurious `TypeOrder` violations on
+// non-indexed input, from offsets compared across per-kind schedules that
+// each held every non-indexed blob. Type order is now judged only from an
+// indexed file's per-kind schedules; a non-indexed file is read in one
+// pass and its type order not judged.
 
 #[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]

@@ -8,6 +8,7 @@ use crate::owned::TypeFilter;
 use crate::read::block::BlockBuffer;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::read::project_ids::{IdScratch, KindIds};
+use crate::scan::classify::KindSchedules;
 
 /// True when `id` does not strictly follow `prev` in canonical OSM ID order.
 ///
@@ -289,13 +290,18 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///
 /// Two internal paths depending on `opts.full`:
 ///
-/// - **Streaming (default):** three-phase parallel scan via
+/// - **Streaming (default):** one parallel phase per kind via
 ///   `parallel_project_phase`, each blob read through the `KindIds`
 ///   projection on the block validator (no block built), no IdSet
 ///   population. Monotonicity + offset-based type-order only (no
 ///   duplicate detection).
 /// - **Full:** same shape but with a shared `IdSet` per kind populated
 ///   via `set_atomic_if_new` for cross-blob duplicate detection.
+///
+/// No kind's judgement depends on another's, so an unindexed file, whose
+/// blobs' kinds the header walk cannot know, is read in one phase instead:
+/// each blob decoded once and its IDs judged per kind (`scan_kinds`). Type
+/// order is not checked there.
 ///
 /// Both modes use the same per-blob worker shape to keep the planet-scale
 /// memory floor bounded. Streaming mode previously walked
@@ -368,41 +374,118 @@ fn verify_ids_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Parallel streaming-mode implementation
+// The scan both modes share
 // ---------------------------------------------------------------------------
 //
-// Mirrors `verify_ids_full_parallel` minus the IdSet allocation and
-// duplicate-detection pass. Workers report `BlobVerifyResult` with
-// `duplicate_ids` always empty; the serial merge skips the duplicate
-// translation step.
+// Streaming mode is `--full` minus the IdSet allocation and duplicate
+// detection: its workers report `BlobVerifyResult` with `duplicate_ids` and
+// `out_of_range_ids` always empty, so the shared merge adds nothing for them.
 
-/// Warn that an unindexed input costs three decompression passes.
-///
-/// `build_classify_schedules_split` cannot tell which kind an unindexed blob
-/// holds, so it replicates that blob into all three per-kind schedules and each
-/// one gets read and decompressed three times. The answer is correct - which is
-/// why this went unnoticed - but it is three times the work, silently.
-///
-/// This is a warning rather than a refusal (the `require_indexdata` treatment
-/// the transform commands get) because `check` is a validation command with no
-/// `--force`: refusing would make it impossible to validate exactly the
-/// third-party files most in need of validating.
-fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Entered<'_>) {
-    if !indexed {
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "check.ids.unindexed_triple_scan",
-            "input has no blob-level indexdata, so every blob is \
-             decompressed three times - once per element kind, because an \
-             unindexed blob has to be scheduled as all three. An indexed copy \
-             is checked in a single pass."
-        );
-        // The schedule walker would add its unindexed-filter note for the
-        // same condition; this warning already says it.
-        host.invocation
-            .mark_reported("reader.filter_without_indexdata");
+const KINDS: [ElementKind; 3] = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
+
+/// The phase start and end markers of each kind, indexed by ordinal.
+const KIND_MARKERS: [(&str, &str); 3] = [
+    ("VERIFYIDS_NODES_START", "VERIFYIDS_NODES_END"),
+    ("VERIFYIDS_WAYS_START", "VERIFYIDS_WAYS_END"),
+    ("VERIFYIDS_RELATIONS_START", "VERIFYIDS_RELATIONS_END"),
+];
+
+/// Whether `filter` selects `kind`.
+fn selects(filter: &TypeFilter, kind: ElementKind) -> bool {
+    match kind {
+        ElementKind::Node => filter.nodes,
+        ElementKind::Way => filter.ways,
+        ElementKind::Relation => filter.relations,
     }
+}
+
+/// What both modes scan: the selected kinds' element counts, and the
+/// violations in report order (type order, then nodes, ways and relations),
+/// stored up to `max_errors` and all counted.
+struct Scanned {
+    counts: [u64; 3],
+    violations: Vec<IdViolation>,
+    total_violations: u64,
+}
+
+/// Scan the selected kinds of a file sorted by kind. `sets` holds a
+/// pre-allocated `IdSet` per kind under `--full` (duplicate detection) and
+/// none in streaming mode.
+///
+/// An indexed file is read one phase per selected kind, each over the blobs
+/// claiming that kind, and its type order judged from the claims. An
+/// unindexed one is read once: each blob's IDs of every selected kind are
+/// judged from one validation pass, since no kind's judgement depends on
+/// another's, and its type order is not judged (an unindexed blob's kind is
+/// unknown from headers alone; reference/indexdata-trust.md records the
+/// gap). Either way each kind's results are merged in file order, the kinds
+/// in turn, so the report is the same.
+fn scan_kinds(
+    file: &crate::read::input::InputFile,
+    schedules: KindSchedules,
+    type_filter: &TypeFilter,
+    mut sets: [Option<&mut IdSet>; 3],
+    max_errors: usize,
+    host: &crate::host::Entered<'_>,
+) -> Result<Scanned> {
+    let mut scanned = Scanned {
+        counts: [0; 3],
+        violations: Vec::new(),
+        total_violations: 0,
+    };
+    let merge = |scanned: &mut Scanned,
+                 kind: ElementKind,
+                 per_blob: Vec<Option<BlobVerifyResult>>|
+     -> Result<()> {
+        let (count, violations, total) = merge_kind(
+            per_blob,
+            kind,
+            remaining_error_limit(max_errors, scanned.violations.len()),
+        )?;
+        scanned.counts[usize::from(kind.ordinal())] = count;
+        scanned.total_violations += total;
+        scanned.violations.extend(violations);
+        Ok(())
+    };
+    match schedules {
+        KindSchedules::Indexed {
+            nodes,
+            ways,
+            relations,
+        } => {
+            check_type_order(
+                &nodes,
+                &ways,
+                &relations,
+                &mut scanned.violations,
+                &mut scanned.total_violations,
+                effective_error_limit(max_errors),
+            );
+            for (kind, schedule) in KINDS.into_iter().zip([nodes, ways, relations]) {
+                if !selects(type_filter, kind) {
+                    continue;
+                }
+                let index = usize::from(kind.ordinal());
+                let (start, end) = KIND_MARKERS[index];
+                host.invocation.marker(start);
+                let per_blob = kind_phase(file, &schedule, kind, sets[index].take(), host)?;
+                merge(&mut scanned, kind, per_blob)?;
+                host.invocation.marker(end);
+            }
+        }
+        KindSchedules::Unindexed(blobs) => {
+            host.invocation.marker("VERIFYIDS_UNINDEXED_START");
+            let sets = sets.each_ref().map(|set| set.as_deref());
+            let per_kind = unindexed_pass(file, &blobs, type_filter, sets, host)?;
+            for (kind, per_blob) in KINDS.into_iter().zip(per_kind) {
+                if selects(type_filter, kind) {
+                    merge(&mut scanned, kind, per_blob)?;
+                }
+            }
+            host.invocation.marker("VERIFYIDS_UNINDEXED_END");
+        }
+    }
+    Ok(scanned)
 }
 
 fn verify_ids_streaming_parallel(
@@ -414,84 +497,27 @@ fn verify_ids_streaming_parallel(
 
     let (header_sorted, indexed) =
         crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
-    warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(
-            pin,
-            crate::scan::classify::KindClaims::Refuse,
-            host,
-        )?;
+    let (schedules, shared_file, _max_ids) = crate::scan::classify::build_classify_schedules_split(
+        pin,
+        crate::scan::classify::KindClaims::Refuse,
+        host,
+    )?;
 
-    let mut node_count: u64 = 0;
-    let mut way_count: u64 = 0;
-    let mut relation_count: u64 = 0;
-    let mut violations: Vec<IdViolation> = Vec::new();
-    let mut total_violations: u64 = 0;
-
-    // Same offset-based type-order check as --full; non-indexed inputs
-    // skip it (build_classify_schedules_split replicates blobs into all
-    // three schedules when indexdata is missing).
-    if indexed {
-        check_type_order(
-            &node_schedule,
-            &way_schedule,
-            &rel_schedule,
-            &mut violations,
-            &mut total_violations,
-            effective_error_limit(opts.check.max_errors),
-        );
-    }
-
-    if type_filter.nodes {
-        host.invocation.marker("VERIFYIDS_NODES_START");
-        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
-            &shared_file,
-            &node_schedule,
-            ElementKind::Node,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        node_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_NODES_END");
-    }
-
-    if type_filter.ways {
-        host.invocation.marker("VERIFYIDS_WAYS_START");
-        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
-            &shared_file,
-            &way_schedule,
-            ElementKind::Way,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        way_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_WAYS_END");
-    }
-
-    if type_filter.relations {
-        host.invocation.marker("VERIFYIDS_RELATIONS_START");
-        let (count, phase_violations, phase_total) = verify_single_kind_streaming(
-            &shared_file,
-            &rel_schedule,
-            ElementKind::Relation,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        relation_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_RELATIONS_END");
-    }
+    let scanned = scan_kinds(
+        &shared_file,
+        schedules,
+        &type_filter,
+        [None, None, None],
+        opts.check.max_errors,
+        host,
+    )?;
 
     host.invocation.marker("VERIFYIDS_SCAN_END");
 
+    let [node_count, way_count, relation_count] = scanned.counts;
     Ok(VerifyIdsReport {
         header_sorted,
         indexed,
@@ -499,9 +525,9 @@ fn verify_ids_streaming_parallel(
         node_count,
         way_count,
         relation_count,
-        passed: total_violations == 0,
-        total_violations,
-        violations,
+        passed: scanned.total_violations == 0,
+        total_violations: scanned.total_violations,
+        violations: scanned.violations,
     })
 }
 
@@ -509,40 +535,43 @@ fn verify_ids_streaming_parallel(
 // The per-blob projection
 // ---------------------------------------------------------------------------
 
-/// Validate one blob through [`KindIds`] (the shared ID projection: block
-/// construction's validator and kind-claim refusal, no block built) and
-/// judge its IDs of `kind` once it is accepted: the blob's first and last
-/// ID, count and order violations, and with `atomic_ids` (`--full`) its
-/// duplicates and the IDs outside the set's allocation. The projection
-/// takes IDs by the element's own kind, never the blob's claim: an
-/// unindexed blob sits in all three phases and each takes its own kind.
-fn verify_blob(
-    buffer: BlockBuffer<'_>,
-    kind: ElementKind,
-    atomic_ids: Option<&IdSet>,
-    scratch: &mut IdScratch,
-) -> Result<BlobVerifyResult> {
-    let elem_type = kind.as_str();
-    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
+/// One blob's judgement of the IDs of one kind, fed in element-walk order:
+/// the blob's first and last ID, count and order violations, and with the
+/// kind's `IdSet` (`--full`) its duplicates and the IDs outside the set's
+/// allocation.
+struct KindJudge {
+    elem_type: &'static str,
+    prev: Option<i64>,
+    r: BlobVerifyResult,
+}
 
-    let mut r = BlobVerifyResult::empty();
-    let mut prev: Option<i64> = None;
-    scratch.each(accepted.bytes(), |_, id| {
+impl KindJudge {
+    fn new(kind: ElementKind) -> Self {
+        Self {
+            elem_type: kind.as_str(),
+            prev: None,
+            r: BlobVerifyResult::empty(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, id: i64, atomic_ids: Option<&IdSet>) {
+        let r = &mut self.r;
         r.count += 1;
         if r.first_id.is_none() {
             r.first_id = Some(id);
         }
         r.last_id = Some(id);
-        if let Some(p) = prev
+        if let Some(p) = self.prev
             && not_after(id, p)
         {
             r.within_violations.push(IdViolation::NonMonotonic {
-                elem_type,
+                elem_type: self.elem_type,
                 id,
                 prev_id: p,
             });
         }
-        prev = Some(id);
+        self.prev = Some(id);
         // Retain IDs the bounded atomic allocation cannot cover. Positive
         // IDs are inserted after workers join; negatives remain invalid
         // under the command's existing policy.
@@ -553,45 +582,122 @@ fn verify_blob(
                 None => r.out_of_range_ids.push(id),
             }
         }
+    }
+}
+
+/// Validate one blob through [`KindIds`] (the shared ID projection: block
+/// construction's validator and kind-claim refusal, no block built) and
+/// judge its IDs of `kind` once it is accepted ([`KindJudge`]). The
+/// projection takes IDs by the element's own kind, never the blob's claim.
+fn verify_blob(
+    buffer: BlockBuffer<'_>,
+    kind: ElementKind,
+    atomic_ids: Option<&IdSet>,
+    scratch: &mut IdScratch,
+) -> Result<BlobVerifyResult> {
+    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
+    let mut judge = KindJudge::new(kind);
+    scratch.each(accepted.bytes(), |_, id| {
+        judge.push(id, atomic_ids);
         Ok(())
     })?;
     // The bytes go back to their pool.
     drop(accepted);
-    Ok(r)
+    Ok(judge.r)
 }
 
-/// Per-kind streaming-parallel scan. Same shape as
-/// `verify_single_kind_parallel` but workers do not consult an `IdSet` and
-/// the merge skips the duplicate translation step.
-fn verify_single_kind_streaming(
-    shared_file: &crate::read::input::InputFile,
+/// One phase of an indexed file: the blobs claiming `kind`, judged per blob
+/// and returned by schedule position. Under `--full` each result's IDs
+/// above the set's allocation are settled as it arrives and moved into the
+/// set after the phase.
+fn kind_phase(
+    file: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
-    max_errors_remaining: Option<usize>,
+    id_set: Option<&mut IdSet>,
     host: &crate::host::Entered<'_>,
-) -> Result<(u64, Vec<IdViolation>, u64)> {
-    if schedule.is_empty() {
-        return Ok((0, Vec::new(), 0));
-    }
-    let elem_type = kind.as_str();
-
+) -> Result<Vec<Option<BlobVerifyResult>>> {
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
-
+    let mut overflow = IdSet::new();
+    let atomic_ids = id_set.as_deref();
     crate::scan::classify::parallel_project_phase(
-        shared_file,
+        file,
         schedule,
         None,
         IdScratch::default,
-        |buffer, scratch| verify_blob(buffer, kind, None, scratch),
-        |seq, r| {
+        |buffer, scratch| verify_blob(buffer, kind, atomic_ids, scratch),
+        |seq, mut r| {
+            settle_overflow(&mut overflow, &mut r, host);
             per_blob[seq] = Some(r);
         },
         host,
     )?;
+    if let Some(id_set) = id_set {
+        id_set.merge(overflow);
+    }
+    Ok(per_blob)
+}
 
-    // Serial merge in schedule (= file) order. duplicate_ids is always
-    // empty in streaming results, so the `for id in r.duplicate_ids` loop
-    // from the --full merge is dropped.
+/// The one pass over an unindexed file: each blob validated once through
+/// [`KindIds`] of the selected kinds, its IDs judged per kind as
+/// [`verify_blob`] judges one kind's (the projection yields each kind's IDs
+/// in element-walk order), the results returned per kind by blob position,
+/// a kind not selected holding empty ones. Under `--full` each kind's
+/// overflow is settled in its own side set.
+fn unindexed_pass(
+    file: &crate::read::input::InputFile,
+    blobs: &[crate::scan::classify::ScheduledBlob],
+    type_filter: &TypeFilter,
+    sets: [Option<&IdSet>; 3],
+    host: &crate::host::Entered<'_>,
+) -> Result<[Vec<Option<BlobVerifyResult>>; 3]> {
+    let mut kinds = crate::element_kind::KindSet::default();
+    for kind in KINDS {
+        if selects(type_filter, kind) {
+            kinds.add(kind);
+        }
+    }
+    let mut per_kind: [Vec<Option<BlobVerifyResult>>; 3] =
+        std::array::from_fn(|_| (0..blobs.len()).map(|_| None).collect());
+    let mut overflow: [IdSet; 3] = std::array::from_fn(|_| IdSet::new());
+    crate::scan::classify::parallel_project_phase(
+        file,
+        blobs,
+        None,
+        IdScratch::default,
+        |buffer, scratch| -> Result<[BlobVerifyResult; 3]> {
+            let (KindIds { .. }, accepted) =
+                buffer.project(|_, _| KindIds::new(kinds, &mut *scratch))?;
+            let mut judges = KINDS.map(KindJudge::new);
+            scratch.each(accepted.bytes(), |kind, id| {
+                let index = usize::from(kind.ordinal());
+                judges[index].push(id, sets[index]);
+                Ok(())
+            })?;
+            drop(accepted);
+            Ok(judges.map(|judge| judge.r))
+        },
+        |seq, results| {
+            for ((slots, overflow), mut r) in per_kind.iter_mut().zip(&mut overflow).zip(results) {
+                settle_overflow(overflow, &mut r, host);
+                slots[seq] = Some(r);
+            }
+        },
+        host,
+    )?;
+    Ok(per_kind)
+}
+
+/// Merge one kind's per-blob results in file order: counts summed, each
+/// blob's own violations, then a step down from the previous blob's last ID,
+/// its duplicates and its IDs outside the duplicate-detection range, stored
+/// up to `max_errors_remaining` and all counted.
+fn merge_kind(
+    per_blob: Vec<Option<BlobVerifyResult>>,
+    kind: ElementKind,
+    max_errors_remaining: Option<usize>,
+) -> Result<(u64, Vec<IdViolation>, u64)> {
+    let elem_type = kind.as_str();
     let mut count: u64 = 0;
     let mut violations: Vec<IdViolation> = Vec::new();
     let mut total_violations: u64 = 0;
@@ -621,11 +727,22 @@ fn verify_single_kind_streaming(
                 });
             }
         }
+        for id in r.duplicate_ids {
+            total_violations += 1;
+            if should_store_violation(violations.len(), max_errors_remaining) {
+                violations.push(IdViolation::Duplicate { elem_type, id });
+            }
+        }
+        for id in r.out_of_range_ids {
+            total_violations += 1;
+            if should_store_violation(violations.len(), max_errors_remaining) {
+                violations.push(IdViolation::IdOutOfRange { elem_type, id });
+            }
+        }
         if r.last_id.is_some() {
             prev_last = r.last_id;
         }
     }
-
     Ok((count, violations, total_violations))
 }
 
@@ -676,13 +793,10 @@ impl BlobVerifyResult {
     }
 }
 
-/// Full-mode entry. Three-phase parallel scan mirroring the check_refs step #2
-/// shape. Each phase is independent of the others' results (no cross-kind
-/// dependency - verify_ids only cares about per-kind monotonicity and
-/// per-kind duplicates), so phase ordering is purely for phase-wall
-/// attribution in the sidecar.
-// This pass owns all three ID sets and their ordered phase merges.
-#[allow(clippy::too_many_lines)]
+/// Full-mode entry: `scan_kinds` with an ID set per selected kind. No
+/// kind's judgement depends on another's (verify_ids only cares about
+/// per-kind monotonicity and per-kind duplicates), so on an indexed file
+/// phase ordering is purely for phase-wall attribution in the sidecar.
 fn verify_ids_full_parallel(
     pin: &PinnedInput,
     opts: &VerifyIdsOptions,
@@ -695,16 +809,14 @@ fn verify_ids_full_parallel(
     // shared_file from build_classify_schedules_split.
     let (header_sorted, indexed) =
         crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
-    warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
-    let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        crate::scan::classify::build_classify_schedules_split(
-            pin,
-            crate::scan::classify::KindClaims::Refuse,
-            host,
-        )?;
+    let (schedules, shared_file, max_ids) = crate::scan::classify::build_classify_schedules_split(
+        pin,
+        crate::scan::classify::KindClaims::Refuse,
+        host,
+    )?;
 
     // Indexdata only sizes the bounded parallel allocation. Decoded IDs
     // outside it are inserted serially from each phase's merge, so
@@ -736,95 +848,25 @@ fn verify_ids_full_parallel(
         ));
     }
 
-    // Accumulators for the report.
-    let mut node_count: u64 = 0;
-    let mut way_count: u64 = 0;
-    let mut relation_count: u64 = 0;
-    let mut violations: Vec<IdViolation> = Vec::new();
-    let mut total_violations: u64 = 0;
-
-    // Type-ordering check: track max data_offset per kind. After all phases
-    // are dispatched, validate that max(node_offsets) < min(way_offsets) and
-    // max(way_offsets) < min(relation_offsets). Uses the schedule directly
-    // (no extra I/O); relies on build_classify_schedules_split delivering
-    // offsets in file order, which it does.
-    //
-    // Non-indexed inputs: skip. `build_classify_schedules_split`
-    // replicates every blob into all three per-kind schedules when
-    // indexdata is missing (there's no cheap way to know a blob's
-    // element kind from headers alone), so the offset comparisons
-    // above span the same offset set three times and produce spurious
-    // violations on correctly-ordered files. The streaming arm skips it
-    // the same way, so neither arm checks type order on unindexed input:
-    // that is a coverage gap of `check --ids`, recorded in
-    // reference/indexdata-trust.md.
-    if indexed {
-        check_type_order(
-            &node_schedule,
-            &way_schedule,
-            &rel_schedule,
-            &mut violations,
-            &mut total_violations,
-            effective_error_limit(opts.check.max_errors),
-        );
-    }
-
-    // Phase 1 - nodes
-    if type_filter.nodes {
-        host.invocation.marker("VERIFYIDS_NODES_START");
-        let node_ids_ref = &mut node_ids;
-        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
-            &shared_file,
-            &node_schedule,
-            node_ids_ref,
-            ElementKind::Node,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        node_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_NODES_END");
-    }
-
-    // Phase 2 - ways
-    if type_filter.ways {
-        host.invocation.marker("VERIFYIDS_WAYS_START");
-        let way_ids_ref = &mut way_ids;
-        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
-            &shared_file,
-            &way_schedule,
-            way_ids_ref,
-            ElementKind::Way,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        way_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_WAYS_END");
-    }
-
-    // Phase 3 - relations
-    if type_filter.relations {
-        host.invocation.marker("VERIFYIDS_RELATIONS_START");
-        let relation_ids_ref = &mut relation_ids;
-        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
-            &shared_file,
-            &rel_schedule,
-            relation_ids_ref,
-            ElementKind::Relation,
-            remaining_error_limit(opts.check.max_errors, violations.len()),
-            host,
-        )?;
-        relation_count = count;
-        total_violations += phase_total;
-        violations.extend(phase_violations);
-        host.invocation.marker("VERIFYIDS_RELATIONS_END");
-    }
+    // Type order is judged from the schedules' offsets on an indexed file
+    // (`check_type_order`, no extra I/O) and not at all on an unindexed one
+    // (see `scan_kinds`).
+    let scanned = scan_kinds(
+        &shared_file,
+        schedules,
+        &type_filter,
+        [
+            type_filter.nodes.then_some(&mut node_ids),
+            type_filter.ways.then_some(&mut way_ids),
+            type_filter.relations.then_some(&mut relation_ids),
+        ],
+        opts.check.max_errors,
+        host,
+    )?;
 
     host.invocation.marker("VERIFYIDS_SCAN_END");
 
+    let [node_count, way_count, relation_count] = scanned.counts;
     Ok(VerifyIdsReport {
         header_sorted,
         indexed,
@@ -832,95 +874,10 @@ fn verify_ids_full_parallel(
         node_count,
         way_count,
         relation_count,
-        passed: total_violations == 0,
-        total_violations,
-        violations,
+        passed: scanned.total_violations == 0,
+        total_violations: scanned.total_violations,
+        violations: scanned.violations,
     })
-}
-
-/// Run a single parallel phase for one element kind. Each blob returns a
-/// `BlobVerifyResult`; the main thread collects them in schedule-order (via
-/// a `Vec<Option<_>>` indexed by seq) and does the sequential merge:
-/// cross-blob monotonicity, duplicate violation translation, count sum.
-fn verify_single_kind_parallel(
-    shared_file: &crate::read::input::InputFile,
-    schedule: &[crate::scan::classify::ScheduledBlob],
-    id_set: &mut IdSet,
-    kind: ElementKind,
-    max_errors_remaining: Option<usize>,
-    host: &crate::host::Entered<'_>,
-) -> Result<(u64, Vec<IdViolation>, u64)> {
-    if schedule.is_empty() {
-        return Ok((0, Vec::new(), 0));
-    }
-    let elem_type = kind.as_str();
-
-    let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
-    let atomic_ids = &*id_set;
-    let mut overflow = IdSet::new();
-
-    crate::scan::classify::parallel_project_phase(
-        shared_file,
-        schedule,
-        None,
-        IdScratch::default,
-        |buffer, scratch| verify_blob(buffer, kind, Some(atomic_ids), scratch),
-        |seq, mut r| {
-            settle_overflow(&mut overflow, &mut r, host);
-            per_blob[seq] = Some(r);
-        },
-        host,
-    )?;
-    id_set.merge(overflow);
-
-    // Serial merge in schedule (= file) order.
-    let mut count: u64 = 0;
-    let mut violations: Vec<IdViolation> = Vec::new();
-    let mut total_violations: u64 = 0;
-    let mut prev_last: Option<i64> = None;
-    for slot in per_blob {
-        let Some(r) = slot else {
-            return Err(crate::error::Error::internal(
-                "id check: classify phase left a blob slot unfilled",
-            ));
-        };
-        count += r.count;
-        for v in r.within_violations {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(v);
-            }
-        }
-        if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
-            && not_after(fi, pl)
-        {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::NonMonotonic {
-                    elem_type,
-                    id: fi,
-                    prev_id: pl,
-                });
-            }
-        }
-        for id in r.duplicate_ids {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::Duplicate { elem_type, id });
-            }
-        }
-        for id in r.out_of_range_ids {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::IdOutOfRange { elem_type, id });
-            }
-        }
-        if r.last_id.is_some() {
-            prev_last = r.last_id;
-        }
-    }
-
-    Ok((count, violations, total_violations))
 }
 
 /// Settle the IDs one blob found outside the phase's pre-allocation, from the

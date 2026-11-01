@@ -1290,16 +1290,8 @@ const POLICY: &[PolicyRow] = &[
         exit: &[0, 1],
         policy: Policy::FallsBack(Says::Text("Using sequential comparison: missing indexdata")),
     },
-    falls_back(
-        "check",
-        check,
-        Says::Text("Warning: input has no blob-level indexdata"),
-    ),
-    falls_back(
-        "check --ids",
-        check_ids,
-        Says::Text("Warning: input has no blob-level indexdata"),
-    ),
+    falls_back("check", check, Says::Text(BLOBS_NOTE)),
+    falls_back("check --ids", check_ids, Says::Text(BLOBS_NOTE)),
     falls_back("check --refs", check_refs, Says::Text(BLOBS_NOTE)),
     // Verify rather than trust.
     PolicyRow {

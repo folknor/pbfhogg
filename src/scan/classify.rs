@@ -616,19 +616,59 @@ fn schedule_walk<'a>(
     Ok((schedule, shared_file, blobs_skipped_by_tag))
 }
 
-/// Like [`build_classify_schedule`] but returns three per-kind schedules
-/// from a single header pass. At planet / Europe scale the header walk is
-/// itself ~15 s; callers that need all three kinds (currently `check_refs`)
-/// would otherwise pay that cost three times.
+/// What one header walk knows about a file's data blobs, by kind: the blobs
+/// of each kind its indexdata claims, or, for a file without indexdata, only
+/// the blobs in file order. A partially indexed file is refused by the walk
+/// (`Frames::refuse_partial_index`), so no file is both; a file with no data
+/// blob is `Indexed` with three empty schedules.
 ///
-/// Blobs lacking indexdata are included in all three schedules (matching
-/// the per-kind behaviour of `build_classify_schedule(.., Some(kind))`,
-/// which only skips blobs whose indexdata reports a mismatched kind). A
-/// partially indexed file is refused, as there.
-/// Positions are local to each schedule (each is a contiguous 0..n range
-/// for `parallel_classify_phase`).
+/// No kind is assumed for an unindexed blob: each caller says what it does
+/// with blobs whose kind is unknown until they are decoded. A caller that
+/// cannot route them takes [`Self::into_replicated`], which puts every such
+/// blob in all three schedules, so each per-kind phase decodes it again.
+#[derive(Debug)]
+pub(crate) enum KindSchedules {
+    /// Every data blob carries indexdata; each schedule holds the blobs
+    /// claiming its kind, in file order.
+    Indexed {
+        nodes: Vec<ScheduledBlob>,
+        ways: Vec<ScheduledBlob>,
+        relations: Vec<ScheduledBlob>,
+    },
+    /// No data blob carries indexdata: every one, in file order, claimless.
+    Unindexed(Vec<ScheduledBlob>),
+}
+
+impl KindSchedules {
+    /// The node, way and relation schedules, with an unindexed file's every
+    /// blob in all three: for a per-kind phase that reads only its own
+    /// kind's elements and has no use for knowing which blobs hold them, at
+    /// the price of decoding an unindexed blob once per phase.
+    pub(crate) fn into_replicated(
+        self,
+    ) -> (Vec<ScheduledBlob>, Vec<ScheduledBlob>, Vec<ScheduledBlob>) {
+        match self {
+            Self::Indexed {
+                nodes,
+                ways,
+                relations,
+            } => (nodes, ways, relations),
+            Self::Unindexed(blobs) => (blobs.clone(), blobs.clone(), blobs),
+        }
+    }
+}
+
+/// Like [`build_classify_schedule`] but sorts every data blob by kind from a
+/// single header pass. At planet / Europe scale the header walk is itself
+/// ~15 s; callers that need all three kinds would otherwise pay that cost
+/// three times.
 ///
-/// The fifth return value is the highest `max_id` indexdata reports per kind,
+/// An indexed file yields one schedule per claimed kind and an unindexed one
+/// a single schedule of every blob ([`KindSchedules`]); a partially indexed
+/// file is refused, as by every walk. Positions are local to each schedule
+/// (each is a contiguous 0..n range for the pools).
+///
+/// The third return value is the highest `max_id` indexdata reports per kind,
 /// indexed `[node, way, relation]`, or 0 for a kind whose blobs carry no
 /// indexdata. It is a *sizing hint only* - indexdata is not verified anywhere,
 /// so a consumer that allocates from it must still cope with an ID that
@@ -636,18 +676,11 @@ fn schedule_walk<'a>(
 /// panicking). It exists so allocations track the file instead of a hard-coded
 /// ceiling that the passage of time invalidates.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split<'a>(
     input: impl Into<InputSource<'a>>,
     claims: KindClaims,
     host: &crate::host::Entered<'_>,
-) -> Result<(
-    Vec<ScheduledBlob>,
-    Vec<ScheduledBlob>,
-    Vec<ScheduledBlob>,
-    InputFile,
-    [i64; 3],
-)> {
+) -> Result<(KindSchedules, InputFile, [i64; 3])> {
     let source = input.into();
     let input = source.path();
     host.invocation.marker("SCHEDULE_SCANNER_OPEN_START");
@@ -659,6 +692,7 @@ pub(crate) fn build_classify_schedules_split<'a>(
     let mut nodes: Vec<ScheduledBlob> = Vec::new();
     let mut ways: Vec<ScheduledBlob> = Vec::new();
     let mut rels: Vec<ScheduledBlob> = Vec::new();
+    let mut unindexed: Vec<ScheduledBlob> = Vec::new();
     let mut max_ids: [i64; 3] = [0; 3];
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
@@ -681,11 +715,7 @@ pub(crate) fn build_classify_schedules_split<'a>(
             }
             None => {
                 walker.observe_filter_index(None);
-                // Unindexed: visible to every kind filter in the legacy path,
-                // so replicate to all three schedules here.
-                nodes.push(entry);
-                ways.push(entry);
-                rels.push(entry);
+                unindexed.push(entry);
             }
         }
     }
@@ -700,7 +730,22 @@ pub(crate) fn build_classify_schedules_split<'a>(
     host.invocation.counter("schedule_way_blobs", ways.len());
     host.invocation
         .counter("schedule_relation_blobs", rels.len());
-    Ok((nodes, ways, rels, shared_file, max_ids))
+    host.invocation
+        .counter("schedule_unindexed_blobs", unindexed.len());
+    let schedules = if unindexed.is_empty() {
+        KindSchedules::Indexed {
+            nodes,
+            ways,
+            relations: rels,
+        }
+    } else if nodes.is_empty() && ways.is_empty() && rels.is_empty() {
+        KindSchedules::Unindexed(unindexed)
+    } else {
+        return Err(Error::internal(
+            "schedule walk: a partially indexed file passed the walk's refusal",
+        ));
+    };
+    Ok((schedules, shared_file, max_ids))
 }
 
 /// Run a parallel classification phase: pread workers decompress and classify
@@ -1572,8 +1617,11 @@ mod tests {
         });
 
         for claims in [super::KindClaims::Refuse, UNCHECKED] {
-            let (nodes, ways, _rels, input, _) =
+            let (schedules, input, _) =
                 super::build_classify_schedules_split(&path, claims, &host).unwrap();
+            let super::KindSchedules::Indexed { nodes, ways, .. } = schedules else {
+                panic!("an indexed file yields per-kind schedules");
+            };
             assert_eq!((nodes.len(), ways.len()), (2, 0), "{claims:?}");
             let refuse = claims == super::KindClaims::Refuse;
             assert_eq!(
@@ -1662,8 +1710,9 @@ mod tests {
         }
     }
 
-    /// An unindexed blob carries no claim even under `Refuse`: it stands in
-    /// every per-kind schedule, and holds every kind it likes.
+    /// An unindexed blob carries no claim even under `Refuse`: it comes back
+    /// in the one unindexed schedule, in every replicated per-kind schedule
+    /// for a caller that asks for them, and holds every kind it likes.
     #[test]
     fn an_unindexed_entry_carries_no_claim() {
         use crate::block_builder::{BlockBuilder, HeaderBuilder};
@@ -1684,8 +1733,14 @@ mod tests {
         writer.flush().unwrap();
 
         let host = crate::host::Host::entered_for_tests();
-        let (nodes, ways, rels, input, _) =
+        let (schedules, input, _) =
             super::build_classify_schedules_split(&path, super::KindClaims::Refuse, &host).unwrap();
+        let super::KindSchedules::Unindexed(blobs) = &schedules else {
+            panic!("an unindexed file yields one unindexed schedule");
+        };
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].claim(), None);
+        let (nodes, ways, rels) = schedules.into_replicated();
         for schedule in [&nodes, &ways, &rels] {
             assert_eq!(schedule.len(), 1);
             assert_eq!(schedule[0].claim(), None);

@@ -852,6 +852,18 @@ claiming relations, and `--ids -t` reads only the selected kinds' blobs;
 `--index` verifies every claim. When a file has two lying blobs, which one
 is named can vary from run to run.
 
+**A wholly unindexed input is checked, not refused** (a partially indexed
+one is refused, as by every command). With no claims to read blobs by,
+`--ids` and `--refs` read each blob once and judge every kind it holds in
+that one read; `--refs` reads a blob again, once per kind at most, only
+where a way's reference or a relation's node or way member missed in that
+read: its target not yet read, an ID above the range the check sized from
+the file, or a reference missing in fact. A sorted, referentially complete
+file costs about one read of each blob; no file costs more than one read
+per kind. The type-order check
+of `--ids` needs the claims and is skipped. A `Note:` says the input has
+blobs without indexdata.
+
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
 The ID check judges monotonicity by canonical OSM order - `0`, then the

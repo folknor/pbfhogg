@@ -98,9 +98,13 @@ The escape, and whether a command refuses at all, is decided per command:
 - `renumber` has no escape. It reads each blob's element count from indexdata
   to assign new IDs without a decode pass, so its header scan refuses the
   input if any data blob lacks indexdata.
-- `getparents` and `check --ids` do not refuse a wholly unindexed input:
-  `getparents` uses indexdata to choose a scan strategy, and `check --ids`
-  warns that unindexed input is scanned more slowly.
+- `getparents` and `check` do not refuse a wholly unindexed input:
+  `getparents` uses indexdata to choose a scan strategy, and `check`
+  (`--ids` and `--refs`) reads each unindexed blob once and judges every
+  element kind it holds in that one read. `check --refs` reads a blob again
+  only where a reference missed in that read: its target not yet read (an
+  unsorted file), an ID above the range the check sized from the file, or
+  a reference that is missing in fact.
 - `tags-filter` asks for indexdata only when it would use it: not with
   `--invert-match` or `--distrust-metadata`, nor on OSC input.
 - `cat --clean` without `--type` does not refuse: it decodes every blob

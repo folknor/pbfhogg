@@ -6,9 +6,13 @@ use crate::{ElementKind, MemberId};
 
 use crate::error::Result;
 use crate::idset::IdSet;
-use crate::read::input::InputSource;
-use crate::read::project_ids::{IdScratch, KindIds, RelationSpans, WaySpans};
-use crate::scan::classify::{build_classify_schedules_split, parallel_project_phase};
+use crate::read::input::{InputFile, InputSource};
+use crate::read::project_ids::{
+    IdScratch, KindIds, RelationSpan, RelationSpans, WaySpan, WaySpans,
+};
+use crate::scan::classify::{
+    KindSchedules, ScheduledBlob, build_classify_schedules_split, parallel_project_phase,
+};
 use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
 /// A single missing reference entry (populated when `show_ids` is true).
@@ -168,11 +172,11 @@ fn append_capped_missing_refs(
 /// If `check_relations` is true, also verifies that relation members
 /// (node, way, relation) point to existing elements.
 ///
-/// Relies on PBF sort order: nodes before ways before relations. Reports
-/// unique missing IDs for nodes and ways (since they precede relations and
-/// are fully indexed before relation processing). Reports unique missing
-/// relation IDs for relation-to-relation members (deferred to post-pass to
-/// handle forward references, then deduplicated).
+/// Reports unique missing IDs for nodes and ways (every node and way is in
+/// its set before a reference to it is finally judged, whatever the file's
+/// order). Reports unique missing relation IDs for relation-to-relation
+/// members (deferred to a post-pass to handle forward references, then
+/// deduplicated).
 ///
 /// # Errors
 ///
@@ -182,26 +186,47 @@ fn append_capped_missing_refs(
 ///
 /// # Architecture
 ///
-/// Three-phase parallel scan following the renumber_external pattern. One
-/// header walk builds the three per-kind schedules
-/// ([`build_classify_schedules_split`]) and each phase dispatches through
-/// [`parallel_project_phase`]: workers pread and decompress each blob and
-/// validate it through a projection on the block validator instead of
-/// building a block (`read::project_ids`: the node IDs, each way's ID and
-/// `refs` position, each relation's ID and member-array positions). The
-/// validator and kind-claim refusal are block construction's own call, so a
-/// blob is refused exactly as building its block would refuse it, with the
-/// same error. Only after the blob is accepted does the worker replay what
-/// the projection recorded, in element-walk order, through the same checks
-/// the element walk ran (shared-set insertion, the refusals below, missing
-/// references), so a blob's first refusal is the one the walk found first.
-/// The main thread merges per-blob results in completion order.
+/// One header walk sorts the blobs by kind ([`build_classify_schedules_split`])
+/// and each phase dispatches through [`parallel_project_phase`]: workers pread
+/// and decompress each blob and validate it through a projection on the block
+/// validator instead of building a block (`read::project_ids`: the node IDs,
+/// each way's ID and `refs` position, each relation's ID and member-array
+/// positions). The validator and kind-claim refusal are block construction's
+/// own call, so a blob is refused exactly as building its block would refuse
+/// it, with the same error. Only after the blob is accepted does the worker
+/// replay what the projection recorded, in element-walk order, through the
+/// same checks the element walk ran (shared-set insertion, the refusals
+/// below, missing references), so a blob's first refusal is the one the walk
+/// found first. The main thread merges per-blob results in completion order.
 ///
-/// Phase 1 (nodes) writes to `node_ids` via `IdSet::set_atomic`. Phase 2
-/// (ways) reads `node_ids` to check refs, optionally writes to `way_ids`.
-/// Phase 3 (relations, only when `check_relations`) reads both and populates
-/// `relation_ids`. Forward relation-relation references are deferred to a
-/// post-pass when `relation_ids` is complete.
+/// On an indexed file, phase 1 reads the node blobs and writes `node_ids` via
+/// `IdSet::set_atomic`. Phase 2 reads the way blobs, checks their refs
+/// against `node_ids` and, under `check_relations`, writes `way_ids`. Phase 3
+/// (only under `check_relations`) reads the relation blobs, checks their
+/// members against both and populates `relation_ids`. Forward
+/// relation-relation references are deferred to a post-pass when
+/// `relation_ids` is complete.
+///
+/// # Unindexed input
+///
+/// A blob without indexdata could hold any kind, and a way cannot be judged
+/// before every node is in `node_ids`. Rather than read such a blob in every
+/// phase, an unindexed file is read once by a combined phase that records
+/// node IDs, ways and (under `check_relations`) relations in one validation
+/// pass, and replays each accepted blob's nodes, then its ways, then its
+/// relations, each way's and relation's ID inserted as it is judged. A
+/// reference found in its set is final, since the sets only grow and only
+/// accepted elements enter them. A miss is not, as the node blob holding the
+/// target may not have been replayed yet (or holds an ID above the
+/// pre-allocation, which joins the set only after the phase), so a blob whose
+/// way judgement found any missing reference has that judgement dropped
+/// whole and is read again by phase 2, after `node_ids` is complete; one
+/// whose relation judgement missed a node or way member likewise by phase 3.
+/// The refusals do not depend on order, so they stand wherever they are met.
+/// A sorted file re-reads only the blobs whose references raced the blobs
+/// still being replayed and the blobs with references that are missing in
+/// fact; no blob is read more than once per phase, so no order costs more
+/// than reading every blob in every phase would.
 ///
 /// # Planet-scale memory usage
 ///
@@ -262,7 +287,8 @@ fn append_capped_missing_refs(
 /// ([`CheckOutcome::Stopped`](super::CheckOutcome)): the phase that needed
 /// that element never reads the blob. A blob claiming relations is decoded
 /// only under `check_relations`, so without it a lie there goes unseen;
-/// `check --index` is the verifier of every claim.
+/// `check --index` is the verifier of every claim. An unindexed blob claims
+/// nothing, and the combined phase takes each element by its own kind.
 #[hotpath::measure]
 pub fn check_refs<'a>(
     input: impl Into<InputSource<'a>>,
@@ -275,58 +301,455 @@ pub fn check_refs<'a>(
         .decided(|| super::CheckOutcome::stop_on_contradiction(check_refs_inner(input, opts, host)))
 }
 
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn check_refs_inner(
-    input: InputSource<'_>,
-    opts: &CheckRefsOptions,
-    host: &crate::host::Entered<'_>,
-) -> Result<RefCheckResult> {
-    let check_relations = opts.check_relations;
-    let show_ids = opts.show_ids;
-    let max_errors = opts.check.max_errors;
-    // `opts.check.direct_io` is accepted and has no effect: every read here
-    // is the schedule walk or a `parallel_classify_phase` pread of an
-    // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
-    // when the flag is given.
+/// What judging a blob's ways and relations needs besides the sets.
+#[derive(Clone, Copy)]
+struct Judge {
+    check_relations: bool,
+    show_ids: bool,
+    max_errors: usize,
+}
 
-    host.invocation.marker("CHECKREFS_SCAN_START");
+/// The ID sets every judgement reads, and the phases write.
+struct Sets {
+    nodes: IdSet,
+    ways: IdSet,
+    relations: IdSet,
+}
 
-    let mut result = RefCheckResult {
-        node_count: 0,
-        way_count: 0,
-        relation_count: 0,
-        missing_node_refs: 0,
-        missing_way_refs: 0,
-        missing_node_members: 0,
-        missing_relation_members: 0,
-        missing_relation_member_occurrences: 0,
-        missing_refs: Vec::new(),
-    };
+/// Insert one accepted blob's node IDs into `node_ids`, returning how many
+/// there were and those above the pre-allocation, for the serial merge.
+fn replay_nodes(scratch: &IdScratch, bytes: &[u8], node_ids: &IdSet) -> Result<(u64, Vec<i64>)> {
+    let mut count: u64 = 0;
+    let mut overflow = Vec::new();
+    scratch.each(bytes, |_, id| {
+        if !node_ids.set_atomic_checked(id) {
+            if id < 0 {
+                return Err(negative_id_error("node", id));
+            }
+            overflow.push(id);
+        }
+        count += 1;
+        Ok(())
+    })?;
+    Ok((count, overflow))
+}
 
+/// Judge one accepted blob's ways, in element-walk order: each way's ID into
+/// `way_ids` (under `check_relations`), then its refs against `node_ids`.
+fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Result<WayBlobResult> {
+    let mut r = WayBlobResult::default();
+    for way in ways {
+        let wid = way.id;
+        // Way IDs are tracked only for the relation phase; without it no
+        // comparison reads them, so a negative one is refused only here.
+        if judge.check_relations && !sets.ways.set_atomic_checked(wid) {
+            if wid < 0 {
+                return Err(negative_id_error("way", wid));
+            }
+            r.overflow_ids.push(wid);
+        }
+        r.way_count += 1;
+        for nref in way.refs(bytes)? {
+            r.way_refs_checked += 1;
+            if !sets.nodes.get(nref) {
+                if nref < 0 {
+                    return Err(negative_ref_error('w', wid, 'n', nref));
+                }
+                r.missing_node_refs.push(nref);
+                if judge.show_ids
+                    && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
+                {
+                    r.missing_refs.push(MissingRef {
+                        missing_type: 'n',
+                        missing_id: nref,
+                        referencing_type: 'w',
+                        referencing_id: wid,
+                    });
+                }
+            }
+        }
+    }
+    r.missing_node_ref_occurrences = r.missing_node_refs.len() as u64;
+    sort_dedup(&mut r.missing_node_refs);
+    Ok(r)
+}
+
+/// Judge one accepted blob's relations, in element-walk order: each
+/// relation's ID into `relation_ids`, then its node and way members against
+/// their sets, its relation members deferred.
+fn judge_relations(
+    relations: &[RelationSpan],
+    bytes: &[u8],
+    sets: &Sets,
+    judge: Judge,
+) -> Result<RelBlobResult> {
+    let mut r = RelBlobResult::default();
+    for rel in relations {
+        let rid = rel.id;
+        if !sets.relations.set_atomic_checked(rid) {
+            if rid < 0 {
+                return Err(negative_id_error("relation", rid));
+            }
+            r.overflow_ids.push(rid);
+        }
+        r.relation_count += 1;
+        for member in rel.members(bytes)? {
+            match member {
+                MemberId::Node(id) => {
+                    r.rel_node_members_checked += 1;
+                    if !sets.nodes.get(id) {
+                        if id < 0 {
+                            return Err(negative_ref_error('r', rid, 'n', id));
+                        }
+                        r.missing_node_members.push(id);
+                        if judge.show_ids
+                            && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
+                        {
+                            r.missing_refs.push(MissingRef {
+                                missing_type: 'n',
+                                missing_id: id,
+                                referencing_type: 'r',
+                                referencing_id: rid,
+                            });
+                        }
+                    }
+                }
+                MemberId::Way(id) => {
+                    r.rel_way_members_checked += 1;
+                    if !sets.ways.get(id) {
+                        if id < 0 {
+                            return Err(negative_ref_error('r', rid, 'w', id));
+                        }
+                        r.missing_way_refs.push(id);
+                        if judge.show_ids
+                            && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
+                        {
+                            r.missing_refs.push(MissingRef {
+                                missing_type: 'w',
+                                missing_id: id,
+                                referencing_type: 'r',
+                                referencing_id: rid,
+                            });
+                        }
+                    }
+                }
+                MemberId::Relation(id) => {
+                    // Deferred without a lookup, so the sign is checked
+                    // here rather than in a failed `get`.
+                    if id < 0 {
+                        return Err(negative_ref_error('r', rid, 'r', id));
+                    }
+                    r.rel_rel_members_deferred += 1;
+                    r.deferred_relation_refs.push(id);
+                    if judge.show_ids {
+                        r.deferred_relation_ref_sources.push(rid);
+                    }
+                }
+                // A member type this check has no set to resolve against (a
+                // newer producer's, or a corrupt one). Skipping it would pass
+                // a reference nobody checked.
+                MemberId::Unknown(raw_type, id) => {
+                    return Err(unknown_member_error(rid, raw_type, id));
+                }
+            }
+        }
+    }
+    r.missing_node_member_occurrences = r.missing_node_members.len() as u64;
+    r.missing_way_ref_occurrences = r.missing_way_refs.len() as u64;
+    sort_dedup(&mut r.missing_node_members);
+    sort_dedup(&mut r.missing_way_refs);
+    Ok(r)
+}
+
+/// Everything the serial merges accumulate, and the side sets holding each
+/// kind's IDs above its pre-allocation until its phase ends.
+#[derive(Default)]
+struct Tally {
+    node_count: u64,
+    way_count: u64,
+    relation_count: u64,
     // One set per reported category - `total_missing` sums the categories,
     // so a node missing from a way and from a relation counts in both. The
     // merge inserts each blob's distinct missing IDs, so memory follows the
     // missing ID range rather than the reference count: a ways-only file,
     // where every ref is missing, used to retain 8 bytes per reference.
-    let mut missing_nodes_in_ways = IdSet::new();
-    let mut missing_ways_in_relations = IdSet::new();
-    let mut missing_nodes_in_relations = IdSet::new();
-    let mut missing_node_refs_occurrences: u64 = 0;
-    let mut missing_way_refs_occurrences: u64 = 0;
-    let mut missing_node_members_occurrences: u64 = 0;
-    let mut deferred_relation_refs: Vec<i64> = Vec::new();
-    let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
-    let mut missing_refs: Vec<MissingRef> = Vec::new();
+    missing_nodes_in_ways: IdSet,
+    missing_ways_in_relations: IdSet,
+    missing_nodes_in_relations: IdSet,
+    missing_node_refs_occurrences: u64,
+    missing_way_refs_occurrences: u64,
+    missing_node_members_occurrences: u64,
+    deferred_relation_refs: Vec<i64>,
+    deferred_relation_ref_sources: Vec<i64>,
+    missing_refs: Vec<MissingRef>,
+    way_refs_checked: u64,
+    rel_node_members_checked: u64,
+    rel_way_members_checked: u64,
+    rel_rel_members_deferred: u64,
+    node_overflow: IdSet,
+    way_overflow: IdSet,
+    relation_overflow: IdSet,
+}
 
-    let mut way_refs_checked: u64 = 0;
-    let mut rel_node_members_checked: u64 = 0;
-    let mut rel_way_members_checked: u64 = 0;
-    let mut rel_rel_members_deferred: u64 = 0;
+impl Tally {
+    // Each phase inserts IDs above its pre-allocation into a side set from
+    // its serial merge and moves it into the kind's own set after the join
+    // (see `check::insert_overflow_ids`).
+    fn merge_nodes(&mut self, count: u64, overflow_ids: Vec<i64>, host: &crate::host::Entered<'_>) {
+        super::insert_overflow_ids(&mut self.node_overflow, overflow_ids, host);
+        self.node_count += count;
+    }
 
-    // Single header-chain walk building all three per-kind schedules at
-    // once. At Europe scale the header walk is ~15 s; three separate
-    // `build_classify_schedule` calls would triple that cost.
-    let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
+    fn merge_ways(&mut self, r: WayBlobResult, judge: Judge, host: &crate::host::Entered<'_>) {
+        super::insert_overflow_ids(&mut self.way_overflow, r.overflow_ids, host);
+        self.way_count += r.way_count;
+        self.way_refs_checked += r.way_refs_checked;
+        self.missing_node_refs_occurrences += r.missing_node_ref_occurrences;
+        for id in r.missing_node_refs {
+            self.missing_nodes_in_ways.set(id);
+        }
+        if judge.show_ids {
+            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, judge.max_errors);
+        }
+    }
+
+    fn merge_relations(&mut self, r: RelBlobResult, judge: Judge, host: &crate::host::Entered<'_>) {
+        super::insert_overflow_ids(&mut self.relation_overflow, r.overflow_ids, host);
+        self.relation_count += r.relation_count;
+        self.rel_node_members_checked += r.rel_node_members_checked;
+        self.rel_way_members_checked += r.rel_way_members_checked;
+        self.rel_rel_members_deferred += r.rel_rel_members_deferred;
+        self.missing_node_members_occurrences += r.missing_node_member_occurrences;
+        self.missing_way_refs_occurrences += r.missing_way_ref_occurrences;
+        for id in r.missing_node_members {
+            self.missing_nodes_in_relations.set(id);
+        }
+        for id in r.missing_way_refs {
+            self.missing_ways_in_relations.set(id);
+        }
+        self.deferred_relation_refs.extend(r.deferred_relation_refs);
+        if judge.show_ids {
+            self.deferred_relation_ref_sources
+                .extend(r.deferred_relation_ref_sources);
+            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, judge.max_errors);
+        }
+    }
+}
+
+/// Phase 1 of an indexed file: the node blobs into `node_ids`.
+fn node_phase(
+    file: &InputFile,
+    schedule: &[ScheduledBlob],
+    sets: &Sets,
+    tally: &mut Tally,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    parallel_project_phase(
+        file,
+        schedule,
+        None,
+        IdScratch::default,
+        |buffer, scratch| -> Result<(u64, Vec<i64>)> {
+            let (KindIds { .. }, accepted) =
+                buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
+            replay_nodes(scratch, accepted.bytes(), &sets.nodes)
+        },
+        |_seq, (count, overflow_ids)| tally.merge_nodes(count, overflow_ids, host),
+        host,
+    )
+}
+
+/// Phase 2: the way blobs (an indexed file's, or the unindexed blobs the
+/// combined phase could not judge), after `node_ids` is complete.
+fn way_phase(
+    file: &InputFile,
+    schedule: &[ScheduledBlob],
+    sets: &Sets,
+    judge: Judge,
+    tally: &mut Tally,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    parallel_project_phase(
+        file,
+        schedule,
+        None,
+        Vec::new,
+        |buffer, ways| -> Result<WayBlobResult> {
+            let (WaySpans { .. }, accepted) =
+                buffer.project(|_, _| WaySpans::new(None, &mut *ways))?;
+            judge_ways(ways, accepted.bytes(), sets, judge)
+        },
+        |_seq, r| tally.merge_ways(r, judge, host),
+        host,
+    )
+}
+
+/// Phase 3: the relation blobs (an indexed file's, or the unindexed blobs
+/// the combined phase could not judge), after `node_ids` and `way_ids` are
+/// complete.
+fn relation_phase(
+    file: &InputFile,
+    schedule: &[ScheduledBlob],
+    sets: &Sets,
+    judge: Judge,
+    tally: &mut Tally,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    parallel_project_phase(
+        file,
+        schedule,
+        None,
+        Vec::new,
+        |buffer, relations| -> Result<RelBlobResult> {
+            let (RelationSpans { .. }, accepted) =
+                buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
+            judge_relations(relations, accepted.bytes(), sets, judge)
+        },
+        |_seq, r| tally.merge_relations(r, judge, host),
+        host,
+    )
+}
+
+/// A worker's scratch for the combined phase: one projection's worth each.
+#[derive(Default)]
+struct UnindexedScratch {
+    ids: IdScratch,
+    ways: Vec<WaySpan>,
+    relations: Vec<RelationSpan>,
+}
+
+/// One kind's judgement of an unindexed blob in the combined phase.
+enum Judged<R> {
+    /// The blob holds none of the kind (or the run does not judge it).
+    Absent,
+    /// Every reference resolved, so the judgement is final.
+    Final(R),
+    /// A reference missed while its target may not yet have been in its
+    /// set: the judgement is dropped and the blob read again by the kind's
+    /// phase.
+    Again,
+}
+
+/// What the combined phase found in one unindexed blob.
+struct UnindexedBlobResult {
+    node_count: u64,
+    node_overflow: Vec<i64>,
+    ways: Judged<WayBlobResult>,
+    relations: Judged<RelBlobResult>,
+}
+
+/// The combined phase of an unindexed file (see `check_refs`, "Unindexed
+/// input"): every blob read once, its nodes inserted and its ways and
+/// relations judged against the sets as they stand. Returns the blobs whose
+/// way and whose relation judgements have to be made again, in file order.
+fn unindexed_phase(
+    file: &InputFile,
+    blobs: &[ScheduledBlob],
+    sets: &Sets,
+    judge: Judge,
+    tally: &mut Tally,
+    host: &crate::host::Entered<'_>,
+) -> Result<(Vec<ScheduledBlob>, Vec<ScheduledBlob>)> {
+    let mut ways_again: Vec<usize> = Vec::new();
+    let mut relations_again: Vec<usize> = Vec::new();
+    parallel_project_phase(
+        file,
+        blobs,
+        None,
+        UnindexedScratch::default,
+        |buffer, scratch| -> Result<UnindexedBlobResult> {
+            let UnindexedScratch {
+                ids,
+                ways,
+                relations,
+            } = scratch;
+            relations.clear();
+            let (_, accepted) = buffer.project(|_, _| {
+                (
+                    (
+                        KindIds::of(ElementKind::Node, &mut *ids),
+                        WaySpans::new(None, &mut *ways),
+                    ),
+                    judge
+                        .check_relations
+                        .then(|| RelationSpans::new(&mut *relations)),
+                )
+            })?;
+            let bytes = accepted.bytes();
+            let (node_count, node_overflow) = replay_nodes(ids, bytes, &sets.nodes)?;
+            let ways = if ways.is_empty() {
+                Judged::Absent
+            } else {
+                let r = judge_ways(ways, bytes, sets, judge)?;
+                if r.missing_node_ref_occurrences > 0 {
+                    Judged::Again
+                } else {
+                    Judged::Final(r)
+                }
+            };
+            let relations = if relations.is_empty() {
+                Judged::Absent
+            } else {
+                let r = judge_relations(relations, bytes, sets, judge)?;
+                if r.missing_node_member_occurrences + r.missing_way_ref_occurrences > 0 {
+                    Judged::Again
+                } else {
+                    Judged::Final(r)
+                }
+            };
+            Ok(UnindexedBlobResult {
+                node_count,
+                node_overflow,
+                ways,
+                relations,
+            })
+        },
+        |seq, r| {
+            tally.merge_nodes(r.node_count, r.node_overflow, host);
+            match r.ways {
+                Judged::Absent => {}
+                Judged::Final(w) => tally.merge_ways(w, judge, host),
+                Judged::Again => ways_again.push(seq),
+            }
+            match r.relations {
+                Judged::Absent => {}
+                Judged::Final(rel) => tally.merge_relations(rel, judge, host),
+                Judged::Again => relations_again.push(seq),
+            }
+        },
+        host,
+    )?;
+    // Completion order back to file order, which the next phases' read-ahead
+    // advice coalesces.
+    let again = |mut positions: Vec<usize>| -> Vec<ScheduledBlob> {
+        positions.sort_unstable();
+        positions.into_iter().map(|p| blobs[p]).collect()
+    };
+    Ok((again(ways_again), again(relations_again)))
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_refs_inner(
+    input: InputSource<'_>,
+    opts: &CheckRefsOptions,
+    host: &crate::host::Entered<'_>,
+) -> Result<RefCheckResult> {
+    let judge = Judge {
+        check_relations: opts.check_relations,
+        show_ids: opts.show_ids,
+        max_errors: opts.check.max_errors,
+    };
+    // `opts.check.direct_io` is accepted and has no effect: every read here
+    // is the schedule walk or a `parallel_project_phase` pread of an
+    // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
+    // when the flag is given.
+
+    host.invocation.marker("CHECKREFS_SCAN_START");
+
+    // Single header-chain walk sorting every blob by kind at once. At
+    // Europe scale the header walk is ~15 s; one walk per kind would triple
+    // that cost.
+    let (schedules, shared_file, max_ids) =
         build_classify_schedules_split(input, crate::scan::classify::KindClaims::Refuse, host)?;
 
     // Bound indexdata-driven allocation, then insert observed positive IDs
@@ -342,139 +765,63 @@ fn check_refs_inner(
             crate::Error::from(e).context(format!("failed to stat {}", input.path().display()))
         })?
         .len();
-    let mut node_ids = IdSet::new();
-    node_ids.pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
-    let mut way_ids = IdSet::new();
-    let mut relation_ids = IdSet::new();
-    if check_relations {
-        way_ids.pre_allocate(super::id_alloc_bound(max_ids[1], WAY_ID_FLOOR, file_len));
-        relation_ids.pre_allocate(super::id_alloc_bound(
+    let mut sets = Sets {
+        nodes: IdSet::new(),
+        ways: IdSet::new(),
+        relations: IdSet::new(),
+    };
+    sets.nodes
+        .pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
+    if judge.check_relations {
+        sets.ways
+            .pre_allocate(super::id_alloc_bound(max_ids[1], WAY_ID_FLOOR, file_len));
+        sets.relations.pre_allocate(super::id_alloc_bound(
             max_ids[2],
             RELATION_ID_FLOOR,
             file_len,
         ));
     }
 
-    let node_blobs = node_schedule.len() as u64;
-    let way_blobs = way_schedule.len() as u64;
-    let relation_blobs_total = rel_schedule.len() as u64;
+    let mut tally = Tally::default();
 
     // ------------------------------------------------------------------
-    // Phase 1 - node scan. Workers populate `node_ids` via `set_atomic`.
+    // Phase 1 - the node blobs of an indexed file, or every blob of an
+    // unindexed one, judging what it can. Afterwards `node_ids` is complete.
     // ------------------------------------------------------------------
-    // Each phase inserts IDs above its pre-allocation into a side set from
-    // its serial merge and moves it into the phase's own set after the join
-    // (see `check::insert_overflow_ids`).
-    let mut overflow = IdSet::new();
-    host.invocation.marker("CHECKREFS_NODES_START");
-    {
-        let node_ids_ref = &node_ids;
-        parallel_project_phase(
-            &shared_file,
-            &node_schedule,
-            None,
-            IdScratch::default,
-            |buffer, scratch| -> crate::Result<(u64, Vec<i64>)> {
-                let (KindIds { .. }, accepted) =
-                    buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
-                let mut count: u64 = 0;
-                let mut overflow = Vec::new();
-                scratch.each(accepted.bytes(), |_, id| {
-                    if !node_ids_ref.set_atomic_checked(id) {
-                        if id < 0 {
-                            return Err(negative_id_error("node", id));
-                        }
-                        overflow.push(id);
-                    }
-                    count += 1;
-                    Ok(())
-                })?;
-                Ok((count, overflow))
-            },
-            |_seq, (count, overflow_ids)| {
-                super::insert_overflow_ids(&mut overflow, overflow_ids, host);
-                result.node_count += count;
-            },
-            host,
-        )?;
-    }
-    node_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
-    host.invocation.marker("CHECKREFS_NODES_END");
+    let mut unindexed_blobs: u64 = 0;
+    let (node_blobs, way_schedule, rel_schedule) = match schedules {
+        KindSchedules::Indexed {
+            nodes,
+            ways,
+            relations,
+        } => {
+            host.invocation.marker("CHECKREFS_NODES_START");
+            node_phase(&shared_file, &nodes, &sets, &mut tally, host)?;
+            sets.nodes.merge(std::mem::take(&mut tally.node_overflow));
+            host.invocation.marker("CHECKREFS_NODES_END");
+            (nodes.len() as u64, ways, relations)
+        }
+        KindSchedules::Unindexed(blobs) => {
+            unindexed_blobs = blobs.len() as u64;
+            host.invocation.marker("CHECKREFS_UNINDEXED_START");
+            let (ways, relations) =
+                unindexed_phase(&shared_file, &blobs, &sets, judge, &mut tally, host)?;
+            sets.nodes.merge(std::mem::take(&mut tally.node_overflow));
+            host.invocation.marker("CHECKREFS_UNINDEXED_END");
+            (0, ways, relations)
+        }
+    };
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the invocation has a sink.
     crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_nodes");
 
     // ------------------------------------------------------------------
-    // Phase 2 - way scan. Workers read `node_ids` (via `get`, no atomic
-    // needed now that phase 1 joined), optionally write `way_ids`, and
-    // collect per-blob missing-ref vecs.
+    // Phase 2 - way scan. Workers read the complete `node_ids`, optionally
+    // write `way_ids`, and collect per-blob missing-ref vecs.
     // ------------------------------------------------------------------
     host.invocation.marker("CHECKREFS_WAYS_START");
-    {
-        let node_ids_ref = &node_ids;
-        let way_ids_ref = &way_ids;
-        parallel_project_phase(
-            &shared_file,
-            &way_schedule,
-            None,
-            Vec::new,
-            |buffer, ways| -> crate::Result<WayBlobResult> {
-                let (WaySpans { .. }, accepted) =
-                    buffer.project(|_, _| WaySpans::new(None, &mut *ways))?;
-                let bytes = accepted.bytes();
-                let mut r = WayBlobResult::default();
-                for way in ways.iter() {
-                    let wid = way.id;
-                    // Way IDs are tracked only for the relation phase;
-                    // without it no comparison reads them, so a negative
-                    // one is refused only here.
-                    if check_relations && !way_ids_ref.set_atomic_checked(wid) {
-                        if wid < 0 {
-                            return Err(negative_id_error("way", wid));
-                        }
-                        r.overflow_ids.push(wid);
-                    }
-                    r.way_count += 1;
-                    for nref in way.refs(bytes)? {
-                        r.way_refs_checked += 1;
-                        if !node_ids_ref.get(nref) {
-                            if nref < 0 {
-                                return Err(negative_ref_error('w', wid, 'n', nref));
-                            }
-                            r.missing_node_refs.push(nref);
-                            if show_ids
-                                && should_store_missing_ref(r.missing_refs.len(), max_errors)
-                            {
-                                r.missing_refs.push(MissingRef {
-                                    missing_type: 'n',
-                                    missing_id: nref,
-                                    referencing_type: 'w',
-                                    referencing_id: wid,
-                                });
-                            }
-                        }
-                    }
-                }
-                r.missing_node_ref_occurrences = r.missing_node_refs.len() as u64;
-                sort_dedup(&mut r.missing_node_refs);
-                Ok(r)
-            },
-            |_seq, r| {
-                super::insert_overflow_ids(&mut overflow, r.overflow_ids, host);
-                result.way_count += r.way_count;
-                way_refs_checked += r.way_refs_checked;
-                missing_node_refs_occurrences += r.missing_node_ref_occurrences;
-                for id in r.missing_node_refs {
-                    missing_nodes_in_ways.set(id);
-                }
-                if show_ids {
-                    append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
-                }
-            },
-            host,
-        )?;
-    }
-    way_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
+    way_phase(&shared_file, &way_schedule, &sets, judge, &mut tally, host)?;
+    sets.ways.merge(std::mem::take(&mut tally.way_overflow));
     host.invocation.marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the invocation has a sink.
@@ -482,170 +829,65 @@ fn check_refs_inner(
 
     // ------------------------------------------------------------------
     // Phase 3 - relation scan (only when `check_relations`). Workers read
-    // both `node_ids` and `way_ids`, write `relation_ids`, and collect
-    // per-blob missing/deferred vecs.
+    // both complete sets, write `relation_ids`, and collect per-blob
+    // missing/deferred vecs.
     // ------------------------------------------------------------------
-    let relation_blobs: u64 = if check_relations {
-        relation_blobs_total
+    let relation_blobs: u64 = if judge.check_relations {
+        rel_schedule.len() as u64
     } else {
         0
     };
-    if check_relations {
+    if judge.check_relations {
         host.invocation.marker("CHECKREFS_RELATIONS_START");
-        {
-            let node_ids_ref = &node_ids;
-            let way_ids_ref = &way_ids;
-            let relation_ids_ref = &relation_ids;
-            parallel_project_phase(
-                &shared_file,
-                &rel_schedule,
-                None,
-                Vec::new,
-                |buffer, relations| -> crate::Result<RelBlobResult> {
-                    let (RelationSpans { .. }, accepted) =
-                        buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
-                    let bytes = accepted.bytes();
-                    let mut r = RelBlobResult::default();
-                    for rel in relations.iter() {
-                        let rid = rel.id;
-                        if !relation_ids_ref.set_atomic_checked(rid) {
-                            if rid < 0 {
-                                return Err(negative_id_error("relation", rid));
-                            }
-                            r.overflow_ids.push(rid);
-                        }
-                        r.relation_count += 1;
-                        for member in rel.members(bytes)? {
-                            match member {
-                                MemberId::Node(id) => {
-                                    r.rel_node_members_checked += 1;
-                                    if !node_ids_ref.get(id) {
-                                        if id < 0 {
-                                            return Err(negative_ref_error('r', rid, 'n', id));
-                                        }
-                                        r.missing_node_members.push(id);
-                                        if show_ids
-                                            && should_store_missing_ref(
-                                                r.missing_refs.len(),
-                                                max_errors,
-                                            )
-                                        {
-                                            r.missing_refs.push(MissingRef {
-                                                missing_type: 'n',
-                                                missing_id: id,
-                                                referencing_type: 'r',
-                                                referencing_id: rid,
-                                            });
-                                        }
-                                    }
-                                }
-                                MemberId::Way(id) => {
-                                    r.rel_way_members_checked += 1;
-                                    if !way_ids_ref.get(id) {
-                                        if id < 0 {
-                                            return Err(negative_ref_error('r', rid, 'w', id));
-                                        }
-                                        r.missing_way_refs.push(id);
-                                        if show_ids
-                                            && should_store_missing_ref(
-                                                r.missing_refs.len(),
-                                                max_errors,
-                                            )
-                                        {
-                                            r.missing_refs.push(MissingRef {
-                                                missing_type: 'w',
-                                                missing_id: id,
-                                                referencing_type: 'r',
-                                                referencing_id: rid,
-                                            });
-                                        }
-                                    }
-                                }
-                                MemberId::Relation(id) => {
-                                    // Deferred without a lookup, so the
-                                    // sign is checked here rather than in
-                                    // a failed `get`.
-                                    if id < 0 {
-                                        return Err(negative_ref_error('r', rid, 'r', id));
-                                    }
-                                    r.rel_rel_members_deferred += 1;
-                                    r.deferred_relation_refs.push(id);
-                                    if show_ids {
-                                        r.deferred_relation_ref_sources.push(rid);
-                                    }
-                                }
-                                // A member type this check has no set to
-                                // resolve against (a newer producer's, or
-                                // a corrupt one). Skipping it would pass
-                                // a reference nobody checked.
-                                MemberId::Unknown(raw_type, id) => {
-                                    return Err(unknown_member_error(rid, raw_type, id));
-                                }
-                            }
-                        }
-                    }
-                    r.missing_node_member_occurrences = r.missing_node_members.len() as u64;
-                    r.missing_way_ref_occurrences = r.missing_way_refs.len() as u64;
-                    sort_dedup(&mut r.missing_node_members);
-                    sort_dedup(&mut r.missing_way_refs);
-                    Ok(r)
-                },
-                |_seq, r| {
-                    super::insert_overflow_ids(&mut overflow, r.overflow_ids, host);
-                    result.relation_count += r.relation_count;
-                    rel_node_members_checked += r.rel_node_members_checked;
-                    rel_way_members_checked += r.rel_way_members_checked;
-                    rel_rel_members_deferred += r.rel_rel_members_deferred;
-                    missing_node_members_occurrences += r.missing_node_member_occurrences;
-                    missing_way_refs_occurrences += r.missing_way_ref_occurrences;
-                    for id in r.missing_node_members {
-                        missing_nodes_in_relations.set(id);
-                    }
-                    for id in r.missing_way_refs {
-                        missing_ways_in_relations.set(id);
-                    }
-                    deferred_relation_refs.extend(r.deferred_relation_refs);
-                    if show_ids {
-                        deferred_relation_ref_sources.extend(r.deferred_relation_ref_sources);
-                        append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
-                    }
-                },
-                host,
-            )?;
-        }
-        relation_ids.merge(std::mem::replace(&mut overflow, IdSet::new()));
+        relation_phase(&shared_file, &rel_schedule, &sets, judge, &mut tally, host)?;
+        sets.relations
+            .merge(std::mem::take(&mut tally.relation_overflow));
         host.invocation.marker("CHECKREFS_RELATIONS_END");
         // Brokkr stores named counters generically and reports changes in sidecar
         // comparisons; this sample is inert unless the invocation has a sink.
         crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_relations");
     }
 
+    let mut result = RefCheckResult {
+        node_count: tally.node_count,
+        way_count: tally.way_count,
+        relation_count: tally.relation_count,
+        missing_node_refs: 0,
+        missing_way_refs: 0,
+        missing_node_members: 0,
+        missing_relation_members: 0,
+        missing_relation_member_occurrences: 0,
+        missing_refs: Vec::new(),
+    };
+
     // Unique-missing counts are the sets' cardinalities. The timer keeps its
     // `missing_dedup` name from the sort-and-dedup it replaced.
     let t_dedup = Stopwatch::start();
-    result.missing_node_refs = missing_nodes_in_ways.len();
-    result.missing_way_refs = missing_ways_in_relations.len();
-    result.missing_node_members = missing_nodes_in_relations.len();
+    result.missing_node_refs = tally.missing_nodes_in_ways.len();
+    result.missing_way_refs = tally.missing_ways_in_relations.len();
+    result.missing_node_members = tally.missing_nodes_in_relations.len();
     let missing_dedup_ms = t_dedup.elapsed_ms();
 
     // Resolve deferred relation refs against the complete relation_ids set.
     host.invocation.marker("CHECKREFS_DEFERRED_RESOLVE_START");
     let t_deferred = Stopwatch::start();
-    if check_relations {
+    let mut missing_refs = std::mem::take(&mut tally.missing_refs);
+    if judge.check_relations {
         let mut missing_relation_members = IdSet::new();
         let mut occurrences: u64 = 0;
         // `deferred_relation_ref_sources` is parallel to
         // `deferred_relation_refs` when `show_ids` is set, and empty otherwise.
-        for (i, &id) in deferred_relation_refs.iter().enumerate() {
-            if !relation_ids.get(id) {
+        for (i, &id) in tally.deferred_relation_refs.iter().enumerate() {
+            if !sets.relations.get(id) {
                 missing_relation_members.set(id);
                 occurrences += 1;
-                if show_ids && should_store_missing_ref(missing_refs.len(), max_errors) {
+                if judge.show_ids && should_store_missing_ref(missing_refs.len(), judge.max_errors)
+                {
                     missing_refs.push(MissingRef {
                         missing_type: 'r',
                         missing_id: id,
                         referencing_type: 'r',
-                        referencing_id: deferred_relation_ref_sources[i],
+                        referencing_id: tally.deferred_relation_ref_sources[i],
                     });
                 }
             }
@@ -687,34 +929,41 @@ fn check_refs_inner(
     host.invocation
         .counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms);
 
-    // Structural counters.
+    // Structural counters: the blobs each phase read. On an unindexed file
+    // the combined phase read every blob once and the way and relation
+    // phases only the blobs it could not judge.
     host.invocation.counter("checkrefs_node_blobs", node_blobs);
-    host.invocation.counter("checkrefs_way_blobs", way_blobs);
+    host.invocation
+        .counter("checkrefs_unindexed_blobs", unindexed_blobs);
+    host.invocation
+        .counter("checkrefs_way_blobs", way_schedule.len() as u64);
     host.invocation
         .counter("checkrefs_relation_blobs", relation_blobs);
     host.invocation
-        .counter("checkrefs_way_refs_checked", way_refs_checked);
+        .counter("checkrefs_way_refs_checked", tally.way_refs_checked);
     host.invocation.counter(
         "checkrefs_rel_node_members_checked",
-        rel_node_members_checked,
+        tally.rel_node_members_checked,
     );
-    host.invocation
-        .counter("checkrefs_rel_way_members_checked", rel_way_members_checked);
+    host.invocation.counter(
+        "checkrefs_rel_way_members_checked",
+        tally.rel_way_members_checked,
+    );
     host.invocation.counter(
         "checkrefs_rel_rel_members_deferred",
-        rel_rel_members_deferred,
+        tally.rel_rel_members_deferred,
     );
     host.invocation.counter(
         "checkrefs_missing_node_refs_occurrences",
-        missing_node_refs_occurrences,
+        tally.missing_node_refs_occurrences,
     );
     host.invocation.counter(
         "checkrefs_missing_way_refs_occurrences",
-        missing_way_refs_occurrences,
+        tally.missing_way_refs_occurrences,
     );
     host.invocation.counter(
         "checkrefs_missing_node_members_occurrences",
-        missing_node_members_occurrences,
+        tally.missing_node_members_occurrences,
     );
 
     Ok(result)

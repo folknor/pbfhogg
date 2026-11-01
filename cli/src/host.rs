@@ -161,9 +161,6 @@ fn diagnostic_hint(key: &str) -> &'static str {
             " Pass --index-type external to use it, or --index-type auto to choose."
         }
         "extract.passthrough_demoted" => " `pbfhogg check --index` checks it.",
-        "check.ids.unindexed_triple_scan" => {
-            " `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` writes an indexed copy."
-        }
         _ => "",
     }
 }

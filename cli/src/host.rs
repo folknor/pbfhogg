@@ -6,11 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) struct LegacyProcessActions;
 impl ProcessActions for LegacyProcessActions {
-    fn cross_thread_alloc_pool(&self) {
-        // CLI process policy, both halves documented on the trait method.
-        pbfhogg::process::cap_malloc_arenas();
-        pbfhogg::process::set_mmap_threshold(32 * 1024 * 1024);
-    }
     fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         // CLI process policy: keep the raise for this command's lifetime.
         // Embedded callers choose their own ProcessActions; the library must
@@ -86,8 +81,8 @@ pub(crate) const COMMAND_END: &str = "CLI_COMMAND_END";
 /// harness call's `return_us`. So the interval holds the subcommand's own
 /// option resolution, its output and scratch construction, every library
 /// call it makes, any publication the CLI does itself, and the summary or
-/// report it renders; process policy (the descriptor raise, the arena cap,
-/// page-cache eviction) is applied inside it, by the library's hooks.
+/// report it renders; process policy (the descriptor raise, page-cache
+/// eviction) is applied inside it, by the library's hooks.
 ///
 /// A process refused before dispatch, or that prints help or the version,
 /// emits neither marker. One that unwinds out of the dispatch emits no

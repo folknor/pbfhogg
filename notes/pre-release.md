@@ -193,25 +193,22 @@ After `5bfa37ab` the peak sits in the relations phase. The 64-task window
 holds framed vectors, each worker builds a fresh `BlockBuilder` per blob
 (deliberate and measured, see "Facts learned the hard way"), and frames are
 copied with `FramedBlobParts::into_vec`. WRK-020 is the structural fix.
+Without the two-arena cap (gone since 2026-11-01) a planet cell peaked at
+918 MB, still in the relations phase.
 
-### WRK-012: Allocator hook coverage by ownership pattern
+### WRK-115: repack and degrade relation phase at 1.93 GB
 
-The CLI's `cross_thread_alloc_pool` hook (`cli/src/host.rs`: two malloc
-arenas, `M_MMAP_THRESHOLD` pinned at 32 MiB since `5bfa37ab`) is requested
-per command. Per the hook's stated condition the call should follow whether
-a command frees buffers on another thread than it allocates them (for
-example writer-pool framing), not which commands showed a regression.
-getparents, extract, tags-filter and inspect do not call it. apply-changes
-is settled as not requested (WRK-013). Settle the rest per command.
-
-### WRK-013: Why the allocator hook costs 20x on apply-changes
-
-With the hook, planet apply-changes took 2606 s instead of 125 s, almost all
-kernel time (23.3 cores kernel, 3.3 user), for 112 MB less peak. Recorded as
-a measured exclusion in the hook's doc in `src/host.rs`. Which of the two
-settings causes it, and the mechanism, are unknown. The same settings serve
-cat, time-filter and the dedupe path, so the answer matters beyond
-apply-changes.
+With glibc's default arenas (the CLI's two-arena cap is gone; see
+reference/performance.md, "The CLI no longer caps malloc arenas") planet
+repack and degrade `--strip-locations` both peak at 1.93 GB in the
+relations phase, against 1.37 and 1.38 GB under the cap. In repack's
+uncapped cell that phase ran about 4 s at 8 cores with 65 threads, after
+a ways phase peaking at 1.19 GB; pinning `M_MMAP_THRESHOLD` alone gave
+repack 1.70 GB. Repack's ordered pool admits its default window (8 tasks
+per worker, at least 32) and its consumer batches `FRAME_BATCH` blocks;
+which holds the extra half GB, and whether it is retention across the
+threads' arenas or live data, is unmeasured. Nothing in the phase sizes
+against `Resources::memory_available`.
 
 ---
 
@@ -224,10 +221,12 @@ frame into output storage with a bounded return path from the writer.
 `BlockBuilder::take_owned` takes `encode_buf`,
 `FrameScratch::take_with_capacity` allocates a replacement per handoff and
 `into_vec` copies the frame, so keeping a builder per worker alone recycles
-nothing. Makes library throughput independent of the host's allocator
-policy: embedded callers with `NoProcessActions` currently pay the mmap
-churn the CLI hook avoids. `notes/todo.md` "Stale BlockBuilder::new
-reserves nothing comments" rides with it.
+nothing. Reduces throughput's dependence on the host's allocator policy:
+per-blob buffers above the tcache limit are what made a two-arena cap add
+10 to 82 % wall at planet (reference/performance.md, "The CLI no longer
+caps malloc arenas"), and an embedder that caps arenas still pays it.
+`notes/todo.md` "Stale BlockBuilder::new reserves nothing comments" rides
+with it.
 
 ### WRK-021: Separate offset-table workspace
 
@@ -807,8 +806,15 @@ What a session picking this up needs that is not written elsewhere:
   mmapped chunk raises the process-wide `mmap_threshold` to its size (32 MiB
   cap) and `trim_threshold` to twice that, which is why buffers that stop
   being freed can push later allocations onto mmap (time-filter paid 29 s of
-  kernel time for it before `5bfa37ab` pinned the threshold). Read the source
-  rather than reasoning from memory.
+  kernel time for it before `5bfa37ab` pinned the threshold, but only under
+  the two-arena cap). Read the source rather than reasoning from memory.
+- **Two malloc arenas are two locks** (2026-11-01): `M_ARENA_MAX=2` makes
+  every allocation above the tcache limit from every pool thread take one
+  of two arena mutexes, and an arena-backed `realloc` that moves copies
+  under it. Every measured re-encoding command paid 10 to 82 % more planet
+  wall for it, apply-changes 20x; the memory it was added for had already
+  gone with the decode-side string tables.
+  The CLI sets no allocator policy; measure before adding any.
 - **Per-blob decode buffers at planet** (`5bfa37ab`): the old 4x-compressed
   reservation plus the table append put every buffer over the pool's cap,
   and glibc kept the freed memory resident. Raising the cap alone made it

@@ -25,7 +25,7 @@ use crate::protocol::{
 };
 use crate::runner::{CallRecord, CallSpec, Ctx, Process, Tap};
 use pbfhogg::debug::InstrumentSink;
-use pbfhogg::host::{FdPool, NoProcessActions, ProcessActions};
+use pbfhogg::host::{FdPool, ProcessActions};
 use pbfhogg::process::FdReservation;
 use pbfhogg::{Decision, Effect};
 use serde_json::{Value, json};
@@ -133,10 +133,6 @@ struct Gated {
 }
 
 impl ProcessActions for Gated {
-    fn cross_thread_alloc_pool(&self) {
-        self.gate.pool.cross_thread_alloc_pool();
-    }
-
     fn fd_allowance(&self, wanted: u64) -> FdReservation {
         let inner = self.gate.pool.fd_allowance(wanted);
         let allowance = inner.allowance();
@@ -314,7 +310,7 @@ impl Scenario for ConcurrentCat {
     }
 
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        let pool = Arc::new(FdPool::new(BUDGET, Arc::new(NoProcessActions)));
+        let pool = Arc::new(FdPool::new(BUDGET));
         let gate = Arc::new(Gate {
             pool: Arc::clone(&pool),
             state: Mutex::new(GateState::default()),

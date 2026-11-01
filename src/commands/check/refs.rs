@@ -181,9 +181,7 @@ fn append_capped_missing_refs(
 ///
 /// # Architecture
 ///
-/// Three-phase parallel scan following the renumber_external pattern.
-/// [`crate::host::ProcessActions::cross_thread_alloc_pool`] caps glibc arenas to prevent
-/// cross-thread alloc/free fragmentation from the pread worker pool. Each
+/// Three-phase parallel scan following the renumber_external pattern. Each
 /// phase builds a per-kind schedule via [`build_classify_schedule`] and
 /// dispatches through [`parallel_classify_phase`]: workers pread +
 /// decompress + decode + classify in parallel; the main thread merges
@@ -292,10 +290,6 @@ fn check_refs_inner(
     // when the flag is given.
 
     host.invocation.marker("CHECKREFS_SCAN_START");
-
-    // Pread worker pool allocates decoded blocks; the main thread frees
-    // them after the merge.
-    host.process.cross_thread_alloc_pool();
 
     let mut result = RefCheckResult {
         node_count: 0,

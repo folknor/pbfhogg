@@ -897,9 +897,6 @@ fn degrade_decode_path(
         host,
     )?;
 
-    // Per-blob worker pool; same precedent as `cat --clean` and `repack`.
-    host.process.cross_thread_alloc_pool();
-
     let header = ElementReader::open_in(input, direct_io, host)?
         .header()
         .clone();

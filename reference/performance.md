@@ -1304,10 +1304,13 @@ The apply-changes workers recycle theirs through a per-worker pool too.
 Once decode buffers stop being freed, nothing raises glibc's sliding mmap
 threshold early, and time-filter's in-worker build and frame buffers went
 through mmap/munmap per blob: main phase 139.9 s to 169.1 s, kernel time
-1.8 to 5.7 cores. The CLI's `cross_thread_alloc_pool` hook now pins
-`M_MMAP_THRESHOLD` at 32 MiB beside the two-arena cap, which recovers
+1.8 to 5.7 cores. The CLI's allocator hook then pinned
+`M_MMAP_THRESHOLD` at 32 MiB beside its two-arena cap, which recovered
 it. Commands without the hook (getparents, extract, tags-filter,
-apply-changes) showed no work-phase regression.
+apply-changes) showed no work-phase regression. The churn was costly only
+under the arena cap: with glibc's default arenas time-filter runs the same
+wall with or without the pin, and the CLI now sets neither (see "The CLI
+no longer caps malloc arenas").
 
 Planet (`planet-20260223-with-indexdata`), `--bench 1`, peak anon RSS.
 Variant cells are unstored `--force` cells on `c97b9985` plus the change.
@@ -1361,10 +1364,79 @@ cell on `5bfa37ab` plus the change.
 | `5bfa37ab` + per-block framing | 125.1 s | 2,364 MB | user 28.1, kernel 1.2 |
 | the same + `cross_thread_alloc_pool` | 2606 s | 2,252 MB | user 3.3, kernel 23.3 |
 
-The last row is why apply-changes does not request the CLI's allocator
+The last row is why apply-changes never requested the CLI's allocator
 hook (two arenas plus the pinned 32 MiB mmap threshold): twenty times the
-wall, nearly all of it kernel time, for 112 MB less peak. The cell does
-not isolate either setting and the mechanism is unverified.
+wall, nearly all of it kernel time, for 112 MB less peak. The arena cap
+alone causes it, and the hook is gone; see "The CLI no longer caps malloc
+arenas".
+
+### The CLI no longer caps malloc arenas (bygg, 2026-11-01)
+
+The CLI answered the library's cross-thread allocation hook with
+`mallopt(M_ARENA_MAX, 2)` and a 32 MiB `M_MMAP_THRESHOLD` pin. Both are
+gone, with the hook. Cells are unstored `--force` cells of one binary,
+`7a99298f` plus a switch choosing which settings the hook applied (cap,
+pin, both, none); apply-changes, which never requested the hook, took
+the same settings from `GLIBC_TUNABLES` on the same binary. `--bench 1`,
+32 threads, glibc 2.43.
+
+Which setting. germany apply-changes (OSC 4705, `zstd:1`), streaming
+phase: none 1.36 s, pin only 1.33 s, cap only 4.94 s, both 5.07 s;
+kernel 3.0 cores without the cap, 18.4 with it. germany cat `--clean`
+walls: none 7.4 s, pin only 7.4 s, cap only 17.1 s, both 17.2 and 17.5 s.
+The cap is the whole cost; the pin is neutral. At planet (OSC 4913,
+`zstd:1`) apply-changes with both settings still takes 2608.9 s
+(`MERGE_STREAMING` 2603.0 s, user 3.4 and kernel 22.9 cores, peak anon
+2,335 MB), against 126.9 s (`MERGE_STREAMING` 120.3 s, user 26.6 and
+kernel 1.3 cores, 2,389 MB) in the stored cell `188db700` at
+`26fe5a5e`: the 2606 s of the previous section reproduces after the
+sequence and delivery windows.
+
+Mechanism. `strace -f -c` of the germany apply-changes run: 1,125,285
+`futex` calls with the cap against 186,934 without, while `madvise`
+(138 against 164), `mmap`, `munmap` and `mprotect` did not grow, nor did
+minor faults in the sidecar (about 96k either way), so the time is not
+trimming, mapping or faulting. With two arenas, every allocation above
+the tcache limit (about 1 KiB) from 30 workers and the writer threads
+takes one of two arena mutexes (glibc's `lll_lock`: futex-backed, no
+user-space spin), and for an arena-backed chunk `__libc_realloc` holds
+the mutex across `_int_realloc`, including the allocate, copy and free of
+a block it has to move (`malloc/malloc.c`). apply-changes allocates 12.3 GB on
+germany (`--alloc`, 4.7 GB input), mostly framing (447 KB average per
+call), block take-out (379 KB) and rewrite (230 KB) buffers, so its pool
+runs as two lock convoys. Where in the kernel the extra 15 cores go was
+not traced (no perf on the host); the futex count says it is contention
+handling.
+
+Planet (`planet-20260223-with-indexdata`), wall and peak anon, hook
+(both settings) against none:
+
+| command | with the hook | without |
+|---|---:|---:|
+| `cat --clean version` | 237.2 s, 971 MB | 150.6 s, 918 MB |
+| `build-geocode-index` | 320.1 s, 13,296 MB | 175.5 s, 13,319 MB |
+| `repack` | 268.9 s, 1,371 MB | 170.9 s, 1,934 MB |
+| `degrade --strip-locations` | 268.0 s, 1,384 MB | 170.4 s, 1,932 MB |
+| `cat --dedupe` | 258.6 s, 1,096 MB | 217.0 s, 1,101 MB |
+| `time-filter` | 147.5 s, 802 MB | 134.1 s, 761 MB |
+| `renumber` | 125.3 s, 3,159 MB | 124.3 s, 3,324 MB |
+| `check --refs` | 36.4 s, 2,216 MB | 36.4 s, 2,226 MB |
+| `check --ids --full` | 28.3 s, 2,318 MB | 28.3 s, 2,295 MB |
+
+Pin only: time-filter 134.0 s, 811 MB; repack 169.5 s, 1,697 MB. Removing
+the cap cut the wall of every measured command that encodes or builds per
+blob by 9 to 45 % (the cap added 10 to 82 %), and in each the hooked
+cell's work phases carried more kernel time (up to 1.7 cores in
+time-filter, up to 12 to 17 in cat `--clean`, repack, degrade and the
+geocode builder, against at most 1 without); the read-only checks and renumber's splice rewriters were
+unaffected. The memory the cap was added for no longer
+appears: renumber's call site recorded about 26 GB uncapped and the
+geocode builder's 25 GB, against 3.3 GB and 13.3 GB measured here. The
+one peak the cap still lowers is repack's and degrade's relation phase
+(about 4 s of the run), 1.38 GB against 1.93 GB, which is left to the
+phase itself rather than bought with 98 s of wall. Not measured at
+planet: `check --locations`, the sort sweep on an input with runs, and
+`check --ids` without `--full`.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
@@ -1663,9 +1735,7 @@ R2d: parallel with inline rank() dispatch (relation_map replaced by
 files. Zero scratch disk usage. Single shared input fd across all
 data phases (the header read and the schedule walk have their own).
 Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
-defaults to zlib:1. The arena cap requested at the start of `renumber_external()` through
-the caller's process actions (the CLI applies it) prevents glibc cross-thread arena
-fragmentation.
+defaults to zlib:1.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
@@ -1677,8 +1747,9 @@ Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /
 Peak anon 3.3 GB (commit `cb99106`). Single shared `IdSetDense` with
 `AtomicU8::fetch_or` for concurrent pass 1 writes (~1.5 GB node bitset
 + rank index, ~200 MB way bitset + rank, ~20 MB relation bitset).
-Zero temp disk. The arena cap requested at the start of `renumber_external()` through the
-caller's process actions (the CLI applies it) caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
+Zero temp disk. Renumber ran with glibc capped at two arenas until
+2026-11; without the cap the planet peak is 3.32 GB against 3.16 GB with
+it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Phase breakdown (commit `cb99106`, planet, `--bench 1`, UUID `f9098cab`)
 

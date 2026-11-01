@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use pbfhogg::cat::CleanAttrs;
 use pbfhogg::debug::InstrumentSink;
-use pbfhogg::host::{FdPool, Host, Invocation, NoProcessActions, ProcessActions};
+use pbfhogg::host::{FdPool, Host, Invocation, ProcessActions};
 use pbfhogg::write::WriteOptions;
 
 /// Records the pool's free count at each named marker, and every counter
@@ -53,7 +53,7 @@ fn watched(pool: &Arc<FdPool>, at: &'static [&'static str]) -> (Host, Arc<Watch>
 }
 
 fn pool(budget: u64) -> Arc<FdPool> {
-    Arc::new(FdPool::new(budget, Arc::new(NoProcessActions)))
+    Arc::new(FdPool::new(budget))
 }
 
 fn inputs(dir: &Path) -> [PathBuf; 2] {

@@ -413,13 +413,6 @@ fn verify_ids_streaming_parallel(
 ) -> Result<VerifyIdsReport> {
     host.invocation.marker("VERIFYIDS_SCAN_START");
 
-    // Same arena cap as `--full`. The streaming workers do no per-element
-    // allocation (just reads + push to a small per-blob within_violations
-    // Vec), so the contention cost measured on the pre-migration
-    // time-filter snapshot path (allocation-heavy BlockBuilder scratch
-    // reused across blobs) doesn't apply here.
-    host.process.cross_thread_alloc_pool();
-
     let (header_sorted, indexed) =
         crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
     warn_unindexed_triple_scan(indexed, host);
@@ -826,9 +819,6 @@ fn verify_ids_full_parallel(
     host: &crate::host::Entered<'_>,
 ) -> Result<VerifyIdsReport> {
     host.invocation.marker("VERIFYIDS_SCAN_START");
-
-    // Pread worker pool; same motivation as check_refs step #2.
-    host.process.cross_thread_alloc_pool();
 
     // Cheap: one front read of the header and the first data blob's header.
     // parallel_classify_phase reads through its own descriptor, the

@@ -360,12 +360,6 @@ fn build_generation(
     host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
-    // Pass 2a pread worker pool: PrimitiveBlock Vec<u8>s allocated on
-    // decode workers and freed on the main-thread merge path. Uncapped,
-    // arenas grow to 25+ GB anon RSS at planet scale (documented
-    // rationale for the previous sequential-Pass-2 choice).
-    host.process.cross_thread_alloc_pool();
-
     let start_time = std::time::Instant::now();
 
     // `output_dir` is the output's staging directory, which `OutputDir`

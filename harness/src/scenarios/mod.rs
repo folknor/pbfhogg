@@ -87,7 +87,6 @@ pub(crate) fn declared(scenario: &dyn Scenario) -> ScenarioDecl {
 pub(crate) const POLICY_DIFFERENCES: &[&str] = &[
     "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
     "the CLI raises its soft RLIMIT_NOFILE when a command asks; the harness set it at start",
-    "the CLI caps malloc arenas when a command asks; the call leaves the allocator alone",
     "the CLI sizes work by probing the machine; the call gets fixed parallelism and no memory figure",
 ];
 

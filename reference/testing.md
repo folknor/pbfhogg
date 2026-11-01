@@ -513,7 +513,7 @@ exception, not a tier - should not survive across many PRs.
   a CI gate.
 
 `pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
-use `NoProcessActions`; the CLI applies its arena cap in a child. The
+use `NoProcessActions`; the CLI raises its descriptor limit in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
 
 Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.

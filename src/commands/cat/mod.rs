@@ -951,12 +951,6 @@ fn cat_filtered(
     host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let (compression, direct_io) = (write.compression, write.direct_reads);
-    // Per-blob worker pool; same precedent as check --refs / verify_ids.
-    // The workers do BlockBuilder re-encode (allocation-heavy) but each
-    // blob's alloc/free cycle is confined to a single worker thread, so
-    // the cross-blob scratch reuse that arena capping penalises (measured
-    // on the pre-migration time-filter snapshot path) doesn't apply.
-    host.process.cross_thread_alloc_pool();
 
     // -----------------------------------------------------------------------
     // Output header: reconciled across every input; every way re-encoded.

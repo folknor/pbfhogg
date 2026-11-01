@@ -2,8 +2,26 @@
 
 ## Unreleased
 
+### Breaking
+
+**Library**
+
+- `ProcessActions::cross_thread_alloc_pool` is removed: the library raises
+  no allocator event. An implementation drops the method; a program that
+  wants glibc allocator settings sets them once at start
+  (`process::cap_malloc_arenas`, `process::set_mmap_threshold`).
+- `host::FdPool::new` takes only the budget; the pool forwarded nothing
+  else.
+
 ### Changed
 
+- The CLI no longer caps glibc at two malloc arenas or pins
+  `M_MMAP_THRESHOLD`. The cap made every worker's larger allocations
+  queue on two locks. On planet, `build-geocode-index` went from 320 s to
+  176 s, `cat --clean` from 237 s to 151 s, `repack` and `degrade` from
+  268 s to 171 s, `cat --dedupe` from 259 s to 217 s and `time-filter`
+  from 148 s to 134 s, with peak memory within a few percent except
+  `repack` and `degrade`, whose peak rises from 1.4 GB to 1.9 GB.
 - Multi-region `extract --config` with `--simple` on sorted input
   compresses every region's output in parallel instead of on one thread.
   A 5-region planet extract went from 675 s to 128 s on the same host,

@@ -997,9 +997,6 @@ pub(crate) fn write_plan(
         cursor: 0,
     };
     if !plan.runs.is_empty() {
-        // Frames are allocated on the sweep workers and freed on the writer
-        // thread: cap the allocator arenas, as the other cross-thread pools do.
-        host.process.cross_thread_alloc_pool();
         let metrics = &writer_invocation.metrics().writer;
         let workers = crate::host::sized_workers(
             &*host.resources,

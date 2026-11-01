@@ -140,9 +140,6 @@ pub(crate) fn time_filter_to(
     // is learned from the header, so whether the input is reopened is not
     // known until it has been read once, and a FIFO is refused up front.
     let pin = input.pin(host)?;
-    // History path: no arena-cap hook. Snapshot path: invokes the
-    // host's `cross_thread_alloc_pool` hook - see the in-function
-    // comment in time_filter_snapshot.
     let reader = ElementReader::open_in(&pin, direct_io, host)?;
     require_sorted(
         reader.header().is_sorted(),
@@ -366,17 +363,6 @@ fn time_filter_snapshot(
     compression: Compression,
     host: &crate::host::Entered<'_>,
 ) -> Result<TimeFilterStats> {
-    // Per-blob worker pool; same precedent as cat --clean and
-    // check --refs / verify_ids. Post-migration, each blob's BlockBuilder
-    // alloc/free cycle is confined to a single worker thread, so the
-    // pattern that regressed iter-3 (cross-blob scratch reuse defeated
-    // by arena capping) doesn't apply: K=2 measured -69 % wall and
-    // -24 % anon on the pre-migration code, but that pre-migration code
-    // had thread-local BlockBuilder state surviving across blobs on the
-    // same rayon worker. The classify pool's workers hold no builder across
-    // blobs here.
-    host.process.cross_thread_alloc_pool();
-
     let mut stats = TimeFilterStats {
         versions_seen: 0,
         versions_before_cutoff: 0,

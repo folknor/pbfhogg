@@ -176,9 +176,6 @@ pub(crate) fn repack_to(
         host,
     )?;
 
-    // Per-blob worker pool; same precedent as `cat --clean`.
-    host.process.cross_thread_alloc_pool();
-
     // Unlike tags-filter / extract, repack round-trips way payloads with
     // their inline coordinates, so an input declaring LocationsOnWays keeps
     // it: the way phase threads the coordinates through both the worker

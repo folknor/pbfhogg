@@ -90,7 +90,6 @@ const ARGV_B: &[Arg] = &[
 const EXECUTOR_DIFFERENCES: &[&str] = &[
     "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
     "the CLI raises its soft RLIMIT_NOFILE when a command asks; the harness set it at start",
-    "the CLI caps malloc arenas when a command asks; the call leaves the allocator alone",
     "the CLI sizes work by probing the machine and runs on rayon's global pool; the call gets fixed parallelism and a pool of its own",
 ];
 

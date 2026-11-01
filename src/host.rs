@@ -1591,46 +1591,19 @@ impl ExecutorRef<'_> {
     }
 }
 /// Invocation count and position are part of the contract, never deduplicated or hoisted.
+///
+/// There is no allocator event. glibc's allocator settings are
+/// process-global (the arena limit also latches: it only stops new arenas
+/// being created), so a caller that wants one sets it at process start,
+/// where it is no worse than at any point the library could name. The
+/// library once announced its cross-thread allocate-and-free pools so the
+/// CLI could cap glibc at two arenas there; measured, the cap serialised
+/// each pool on two arena locks and cost every allocation-heavy command
+/// measured wall time without bounding memory, so the event went with it
+/// ([`crate::process::cap_malloc_arenas`] has the mechanism;
+/// reference/performance.md, "The CLI no longer caps malloc arenas", the
+/// numbers).
 pub trait ProcessActions: Send + Sync {
-    /// A pool will allocate and free buffers on different threads.
-    ///
-    /// The motivating measurement is renumber on planet: blocks allocated on
-    /// worker threads and freed on compression threads grew glibc arenas to
-    /// tens of GB of anonymous RSS uncapped, under 1 GB with the cap (the
-    /// figures are in renumber's call site).
-    ///
-    /// The event is the workload, not a prescribed response. The CLI's
-    /// response is two glibc settings: two arenas (`M_ARENA_MAX`), and a
-    /// pinned 32 MiB `M_MMAP_THRESHOLD`, which also disables glibc's sliding
-    /// threshold (the trim threshold keeps its current value). The pin keeps
-    /// multi-MB build and frame buffers in the shared arenas for reuse rather
-    /// than mapping and unmapping them per blob: once the decode buffers are
-    /// recycled (read/decompress.rs) nothing else raises the sliding
-    /// threshold early, and time-filter at planet spent 20 % more wall in the
-    /// kernel without the pin (reference/performance.md, "Decode buffers
-    /// sized from the blob and recycled"). Neither setting bounds memory:
-    /// arena reuse trades returning freed pages to the OS for not faulting
-    /// them in again.
-    ///
-    /// Only some commands that run worker pools request it. The others were
-    /// never checked for cross-thread alloc/free patterns, so not calling it
-    /// is not a decision that the cap is unneeded or harmful there. To
-    /// settle it, measure those commands on a large input, then either call
-    /// this once from the CLI's `main` as process policy and drop the
-    /// per-command calls, or document here, per command, why it must not be
-    /// capped.
-    ///
-    /// Not requested, on measurement:
-    /// - apply-changes. Its framed output is allocated on the workers and
-    ///   freed on the drain and pwrite threads, but on planet (OSC 4913,
-    ///   `zstd:1`, 30 workers, bygg, uncommitted on `5bfa37ab` with blocks
-    ///   framed as the rewrite completes them) requesting it took the run
-    ///   from 125.1 s to 2606 s, nearly all of it kernel time, for a peak
-    ///   anon of 2,252 MB against 2,364 MB without. The measurement does not
-    ///   isolate either glibc setting, and the mechanism is unverified
-    ///   (reference/performance.md, "apply-changes frames each block as it
-    ///   completes").
-    fn cross_thread_alloc_pool(&self);
     /// Request permission to hold `wanted` descriptors at once. The answer's
     /// [`allowance`](FdReservation::allowance) is how many the work may open
     /// on top of those already open in the process; the library holds the
@@ -1650,7 +1623,6 @@ pub trait ProcessActions: Send + Sync {
 /// Leave process policy unchanged.
 pub struct NoProcessActions;
 impl ProcessActions for NoProcessActions {
-    fn cross_thread_alloc_pool(&self) {}
     fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         FdReservation::unreserved(crate::process::current_nofile())
     }
@@ -1679,10 +1651,8 @@ impl ProcessActions for NoProcessActions {
 /// Grants are first come, first served and never wait: a request finding
 /// the budget short is granted what is left, and a command needing all of
 /// its request (`cat`) refuses and drops the grant at once.
-/// `cross_thread_alloc_pool` is forwarded to `inner`.
 pub struct FdPool {
     state: Arc<FdPoolState>,
-    inner: Arc<dyn ProcessActions>,
 }
 
 struct FdPoolState {
@@ -1691,15 +1661,13 @@ struct FdPoolState {
 }
 
 impl FdPool {
-    /// A pool of `budget` descriptors, forwarding the other process
-    /// actions to `inner`.
-    pub fn new(budget: u64, inner: Arc<dyn ProcessActions>) -> Self {
+    /// A pool of `budget` descriptors.
+    pub fn new(budget: u64) -> Self {
         Self {
             state: Arc::new(FdPoolState {
                 budget,
                 free: std::sync::atomic::AtomicU64::new(budget),
             }),
-            inner,
         }
     }
 
@@ -1716,9 +1684,6 @@ impl FdPool {
 }
 
 impl ProcessActions for FdPool {
-    fn cross_thread_alloc_pool(&self) {
-        self.inner.cross_thread_alloc_pool();
-    }
     fn fd_allowance(&self, wanted: u64) -> FdReservation {
         use std::sync::atomic::Ordering;
         let before = self
@@ -2018,24 +1983,10 @@ mod tests {
         assert!(other.install(|| executor.install(|| executor.on_worker())));
     }
     /// Grants never sum past the budget while held, a short request gets
-    /// what is left, each drop returns exactly its grant, and the other
-    /// process action goes to the inner provider.
+    /// what is left, and each drop returns exactly its grant.
     #[test]
     fn fd_pool_grants_conserve_the_budget() {
-        struct Count(std::sync::atomic::AtomicUsize);
-        impl ProcessActions for Count {
-            fn cross_thread_alloc_pool(&self) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            fn fd_allowance(&self, _wanted: u64) -> FdReservation {
-                panic!("the pool never forwards a descriptor request")
-            }
-        }
-        let inner = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
-        let pool = FdPool::new(100, Arc::clone(&inner) as Arc<dyn ProcessActions>);
-        pool.cross_thread_alloc_pool();
-        assert_eq!(inner.0.load(std::sync::atomic::Ordering::Relaxed), 1);
-
+        let pool = FdPool::new(100);
         let a = pool.fd_allowance(60);
         let b = pool.fd_allowance(60);
         let c = pool.fd_allowance(1);

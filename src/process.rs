@@ -230,14 +230,17 @@ pub fn malloc_trim() -> i32 {
 /// that the arenas cannot already satisfy go through `mmap`/`munmap`,
 /// smaller ones through the arenas. Setting it disables glibc's sliding
 /// threshold (default 128 KB, climbing as mmapped chunks are freed, up to
-/// 32 MB on 64-bit), and leaves the trim threshold where it is.
+/// 32 MB on 64-bit), and freezes the trim threshold where it is (128 KB
+/// unless something already raised it).
 ///
 /// Either direction is a trade. A low pin returns freed large chunks to
 /// the OS at once, against arena fragmentation when allocations interleave
 /// across threads (mallinfo2 growth in `arena` with `hblkhd` flat). A high
 /// pin keeps large buffers in the arenas for reuse, against per-blob
-/// mapping, faulting and unmapping; the CLI's `cross_thread_alloc_pool`
-/// pins 32 MiB for that reason.
+/// mapping, faulting and unmapping. The per-blob mapping a high pin avoids
+/// was costly only under a two-arena cap ([`cap_malloc_arenas`]): with
+/// glibc's default arenas, time-filter and repack at planet ran the same
+/// wall with or without a 32 MiB pin, so the CLI sets none.
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.
@@ -256,19 +259,27 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
 /// Cap glibc's malloc arena count at 2 (`mallopt(M_ARENA_MAX, 2)`).
 ///
 /// glibc gives each thread its own arena on contention, up to 8 x cores.
-/// When buffers are allocated on one thread and freed on another (decode
-/// or pread workers allocate, the merge / compression / consumer thread
-/// frees), the freed chunks land back on the allocating thread's arena
-/// and accumulate there as fragmentation instead of being reused or
-/// returned to the OS, which shows as anon RSS climbing with file size.
-/// The decode pipeline's per-block string-table allocations were the
-/// worst instance (tens of GB at planet) and are gone (see
-/// [`malloc_trim`]); other buffers still cross threads. Two arenas force
-/// the worker pool to share free lists, which keeps the peak bounded.
+/// An arena-backed chunk too large for the freeing thread's tcache goes
+/// back to the arena that allocated it, so each arena keeps its own free
+/// memory, and fewer arenas share more of it. The cap bounds the arena
+/// count, not bytes: it once held anon RSS down when the decode pipeline
+/// allocated per-block string tables on workers and freed them on the
+/// consumer (tens of GB at planet; gone, see [`malloc_trim`]). Of the
+/// commands measured without it at planet, only repack and degrade peaked
+/// much higher (1.4 to 1.9 GB).
 ///
-/// The cost is lock contention on the shared arenas, which hurts
-/// workers that keep allocation-heavy scratch alive across blobs on the
-/// same thread. Call sites document why their worker shape is safe.
+/// The cost is that every thread's allocations above the tcache limit
+/// (about 1 KiB by default) take one of two arena mutexes, a futex lock
+/// with no user-space spinning; for an arena-backed chunk `__libc_realloc`
+/// holds the mutex across `_int_realloc`, including the allocate, copy and
+/// free of a block it has to move (glibc's `malloc/malloc.c`). A worker
+/// pool that builds or frames hundreds of KB per blob then runs as two
+/// lock convoys. On a 32-thread host at planet, removing the cap cut the
+/// wall of every re-encoding command the CLI used to cap by 9 to 45 % (cat
+/// `--clean`, repack, degrade, time-filter, cat `--dedupe`, the geocode
+/// builder), and apply-changes, which never took it, ran twenty times
+/// longer with it (reference/performance.md, "The CLI no longer caps
+/// malloc arenas"). No command in this repository calls it.
 ///
 /// The setting is process-global and overrides an arena_max glibc tunable.
 /// Once glibc has latched the limit at 2 it cannot be raised again. If glibc

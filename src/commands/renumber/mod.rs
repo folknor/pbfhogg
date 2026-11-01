@@ -429,11 +429,6 @@ pub(crate) fn renumber_external_to<'a>(
     let pin: PinnedInput = input.into().pin(host)?;
     let input = pin.path();
 
-    // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
-    // and freed on rayon compression threads. Uncapped, the arenas grow
-    // to ~26 GB anon RSS on planet; with 2 the peak stays under 1 GB.
-    host.process.cross_thread_alloc_pool();
-
     // ---- Header validation + output writer setup ----
     // The reader reports a file without a leading OsmHeader through the one
     // missing-header error, ahead of the sortedness check.

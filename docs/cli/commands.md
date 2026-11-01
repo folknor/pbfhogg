@@ -141,8 +141,8 @@ The CLI adds one pair of its own, its **command interval**:
 Between them lie the subcommand's own option handling, the opening of its
 outputs and scratch, every library pass it makes with all of its markers,
 its publication and the summary or report it prints. Process policy (the
-raised descriptor limit, the capped malloc arenas, input page-cache
-eviction) is applied inside the interval, where the command needs it.
+raised descriptor limit, input page-cache eviction) is applied inside the
+interval, where the command needs it.
 
 A process writes at most one pair. A command line refused before dispatch
 (by the argument parser, a flag rule or the alias refusal), `--help` and

@@ -9,13 +9,9 @@ use std::sync::{
 
 #[derive(Default)]
 struct Actions {
-    alloc: AtomicUsize,
     fd: AtomicUsize,
 }
 impl ProcessActions for Actions {
-    fn cross_thread_alloc_pool(&self) {
-        self.alloc.fetch_add(1, Relaxed);
-    }
     fn fd_allowance(&self, _wanted: u64) -> FdReservation {
         self.fd.fetch_add(1, Relaxed);
         FdReservation::unreserved(pbfhogg::process::current_nofile())
@@ -49,11 +45,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     )
     .expect("cat clean");
     // cat asks for one descriptor per pinned input before pinning them.
-    assert_eq!(
-        (actions.alloc.load(Relaxed), actions.fd.load(Relaxed)),
-        (1, 1)
-    );
-    actions.alloc.store(0, Relaxed);
+    assert_eq!(actions.fd.load(Relaxed), 1);
     actions.fd.store(0, Relaxed);
     pbfhogg::altw::external::external_join(
         &base,
@@ -66,10 +58,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         crate::common::scratch_in(dir.path()),
     )
     .expect("external");
-    assert_eq!(
-        (actions.alloc.load(Relaxed), actions.fd.load(Relaxed)),
-        (0, 1)
-    );
+    assert_eq!(actions.fd.load(Relaxed), 1);
     actions.fd.store(0, Relaxed);
     pbfhogg::cat::cat(
         &[&base],
@@ -81,10 +70,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         &host,
     )
     .expect("cat");
-    assert_eq!(
-        (actions.alloc.load(Relaxed), actions.fd.load(Relaxed)),
-        (0, 1)
-    );
+    assert_eq!(actions.fd.load(Relaxed), 1);
 }
 struct CountingResources(AtomicUsize);
 impl Resources for CountingResources {
@@ -1172,7 +1158,6 @@ fn concurrent_external_joins_use_distinct_scratch() {
     let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
     struct Overlap(std::sync::Barrier);
     impl ProcessActions for Overlap {
-        fn cross_thread_alloc_pool(&self) {}
         fn fd_allowance(&self, _wanted: u64) -> FdReservation {
             self.0.wait();
             FdReservation::unreserved(pbfhogg::process::current_nofile())

@@ -782,7 +782,6 @@ fn check_locations_inner(
     // that charges page cache to the process (a cgroup v2 limit) reports far
     // less available than the run can use.
     let available = host.resources.memory_available();
-    host.process.cross_thread_alloc_pool();
     let mut walk = walk(&pin, host)?;
     let cap = opts.check.max_errors;
     let mut details = Details::new(cap);

@@ -228,14 +228,6 @@ caps malloc arenas"), and an embedder that caps arenas still pays it.
 `notes/todo.md` "Stale BlockBuilder::new reserves nothing comments" rides
 with it.
 
-### WRK-021: Separate offset-table workspace
-
-`parse_and_inline_with_scratch` appends the inline string and group offset
-tables to the payload buffer, which can grow it geometrically and relocate
-the payload. Keeping the tables in a separate workspace the parsed view
-borrows means the payload never relocates and a buffer's size is the
-payload's.
-
 ### WRK-022: Byte-budgeted fused task engine
 
 One execution model for decode, transform, encode and frame under one byte
@@ -297,6 +289,27 @@ inspect's node stats and the OSC merge join. Not audited one by one:
 first establish what each reads per element and what its walk costs at
 planet, then move the ones that pay onto a projection on the one
 validator.
+
+### WRK-121: Payload copies made only to build or validate a block
+
+Block construction takes an owned `Vec<u8>` (it appends the offset
+tables), so callers holding a borrowed payload copy it whole first. check
+`--locations` does this for every blob: `validate_block` in
+`src/commands/check/locations/scan.rs` copies the worker's decompressed
+buffer with `to_vec`, builds a `PrimitiveBlock` and drops it, paying a
+full payload memcpy, a fresh allocation that then grows (it arrives
+exactly full) and a free per blob, all to get the validator's verdict.
+extract `--simple`'s `verify_candidate` (`src/commands/extract/simple.rs`)
+does the same for each passthrough candidate. multi-extract's candidate
+pass (`src/commands/extract/multi.rs`) copies and then classifies the
+block. cat's `reencode_unclassifiable` and blob_merge's `kind_indexes`
+copy too but are cold. The validation-only sites need a borrowing entry
+over `validate_block` with no projection (same refusals, no copy); the
+multi-extract site needs either a block view borrowed for the callback or
+the worker's buffer handed into a pooled block. Measuring the check
+`--locations` change waits on a brokkr cell for it (brokkr#100; brokkr has
+`check-refs`, `check-ids` and `check-index` only); extract `--simple` and
+multi-extract can be measured today.
 
 ### WRK-120: check --ids could judge type order on unindexed input
 

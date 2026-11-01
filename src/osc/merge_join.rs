@@ -977,8 +977,12 @@ impl<'a> BlockPairSide<'a> {
     /// growth when later blocks fit; both sides hold a live block at once,
     /// a larger block still grows, and a buffer past the pool's retain cap
     /// is dropped. Allocation and free stay on the worker's thread either
-    /// way. The time and memory effects of a pool here are unmeasured, so
-    /// this allocation policy stays pending a measured comparison.
+    /// way. What the append costs here today is measured: on planet
+    /// diff-snapshots (bygg, `d7d4f967`) `inline_tables` took 3.79 core-s
+    /// over 107,701 blocks against 1,113 core-s in this function, its
+    /// P95 168 us tail consistent with the payload moving. What a pool
+    /// would save of that, and its memory effect, are unmeasured, so this
+    /// allocation policy stays pending a measured comparison.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode(&mut self, desc: BlobDesc) -> Result<BlockState> {
         let mut decompressed: Vec<u8> = Vec::new();

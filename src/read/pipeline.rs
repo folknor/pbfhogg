@@ -554,11 +554,11 @@ where
 ///
 /// # Memory: decoded-block working set
 ///
-/// Each decoded `PrimitiveBlock` is built by the inline-entries constructors
-/// (`to_primitiveblock_inline_with_scratch` / `from_vec_pooled_with_scratch`):
-/// the string-table entries and group ranges live as `(u32, u32)` slices
-/// carved from the decompressed `Bytes` using reused thread-local scratch,
-/// and the decompression buffer returns to `DecompressPool` on drop. There is
+/// Each decoded `PrimitiveBlock` is built through `BlockBuffer`: validation
+/// records the string-table entries and group ranges as `(u32, u32)` pairs in
+/// reused thread-local scratch, construction appends them as bytes to the end
+/// of the decompressed buffer (`WireBlock::inline_tables`), and the buffer
+/// returns to `DecompressPool` on drop. There is
 /// no per-block ~10 KB `WireStringTable::entries` heap Vec allocated on a
 /// decode thread and freed on the consumer thread, so the earlier cross-thread
 /// "free but mapped" retention pathology (once measured at 25+ GB at

@@ -374,6 +374,29 @@ impl<'a> WireBlock<'a> {
     ///
     /// The scratch lists are the caller's, reused across blocks; only the
     /// buffer itself crosses thread boundaries.
+    ///
+    /// # Why the tables live in the payload buffer
+    ///
+    /// The tables travel with the block, so they need storage the block
+    /// owns: the scratch is the worker's and a block outlives the worker's
+    /// next decode, often on another thread. A second per-block allocation
+    /// is the cross-thread `Box` shape this layout replaced, and pooling it
+    /// beside the payload would add a second recycled resource whose
+    /// capacity tracks its own maximum, for a cost that does not pay:
+    /// measured on planet (bygg, `d7d4f967`) this function took 0.55 core-s
+    /// over 50,816 blocks on cat `--clean`'s pooled path (P99 45 us) and
+    /// 3.79 core-s over 107,701 blocks on diff-snapshots' unpooled
+    /// block-pair path (P50 10 us, P95 168 us, the tail consistent with the
+    /// payload moving), against 339 core-s of decompression on the first
+    /// and 1,113 core-s of decompression and construction on the second.
+    /// The table bytes exist under either layout; what the append adds is
+    /// a moving realloc's transient old payload on a buffer that arrives
+    /// full, plus whatever the allocator retains of it, which is
+    /// unmeasured. A caller
+    /// that holds borrowed bytes and copies them into a `Vec` only to build
+    /// a block pays a full payload copy before this point; that copy is the
+    /// caller's to remove (validate in place, or hand over an owned buffer),
+    /// not a reason to move the tables.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn inline_tables(
         buf: &mut Vec<u8>,

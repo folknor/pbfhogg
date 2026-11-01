@@ -748,17 +748,18 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **PrimitiveBlock ownership** - `src/read/block.rs`:
 - Owns `Bytes` buffer (decompressed ~1.4 MB) + `WireBlock<'static>` (self-referential, unsafe transmute)
-- `WireBlock::parse()` - builds `WireStringTable` and `group_ranges` as inline (offset, count) into the decompressed buffer - zero separate allocation
-- `to_primitiveblock_inline()` with pool recycling: reuses `PrimitiveBlock` across blobs (string table Vec, group Vecs) via `clear_and_reuse()`
+- Every block is built through `BlockBuffer` (`block.rs`): `validate_block` scans the block (`wire::scan_block_fields`) into the worker's reused `(u32, u32)` scratch for the string-table entries and group ranges, then `ValidatedBlock::into_block` appends both lists as LE bytes after the protobuf payload (`WireBlock::inline_tables`), so the block's tables live in its own buffer - no separate allocation. A projection reader (`BlockBuffer::project` without `into_block`) reads the tables from scratch and never appends
+- The append reserves exactly the tables' size. A buffer that arrives full (a fresh one) grows once and may move; a recycled pooled buffer grows only when payload plus tables exceed the most it has held. The pool's retained-capacity limits charge the tables too. `decompressed_size()` reports the payload alone
+- Why the tables are not kept in separate storage: `WireBlock::inline_tables`, with the measured cost of the append
 
 **Element iteration** - zero-copy, zero-alloc:
 - `WireGroup` lazy scanner - scans protobuf on-the-fly
 - Tag/ref iterators use `PackedSint64Iter`/`PackedUint32Iter` from protohoggr - decode varints from raw bytes, no Vec
 
 **Key allocation sites per blob (read path):**
-- Decompression buffer: ~1.4 MB (pooled, reused)
-- `WireStringTable`: inline (offset, count) into decompressed buffer - zero separate allocation
-- `WireBlock` group_ranges: inline (offset, count) into decompressed buffer - zero separate allocation
+- Decompression buffer: ~1.4 MB (pooled and reused on the pool-backed paths; a fresh `Vec` per block on the unpooled paths, such as the sequential reader and the block-pair diff path)
+- `WireStringTable`: (offset, length) pairs appended to the decompressed buffer - zero separate allocation
+- `WireBlock` group ranges: (offset, length) pairs appended to the decompressed buffer - zero separate allocation
 - Element wrappers: stack-allocated (~24 bytes each)
 
 ## Merge passthrough ratios (measured)

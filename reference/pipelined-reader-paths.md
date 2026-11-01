@@ -53,7 +53,7 @@ Alternative primitives used elsewhere in the codebase:
 ## Invariants
 
 **Retention is solved.** `DecompressPool` in `src/read/decompress.rs`
-(commit `8f6999b`, 2026-03-30) recycles decompression buffers via
+recycles decompression buffers via
 `PooledBuffer::drop` instead of cross-thread freeing. The pool caps
 each retained buffer's capacity, the sum of its idle capacities and its
 buffer count (`DECOMPRESS_POOL_*` in `src/tunables.rs`). Reuse depends on

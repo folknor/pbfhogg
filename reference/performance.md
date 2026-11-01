@@ -2787,6 +2787,31 @@ walk, 3.4 s against 5.7-6.1 s with indexdata to parse. Peak anon 2.13 GB
 base, 2.00 GB working tree. `--check-relations` was not measured: brokkr's
 `check-refs` cell has no way to pass it.
 
+## Cost of appending the offset tables to the payload (bygg, 2026-11-01)
+
+What block construction pays to append the string-table and group
+offset tables to the decompressed payload (`WireBlock::inline_tables`),
+the question being whether keeping the tables in separate per-block
+storage would pay. Planet `planet-20260223-with-indexdata`, `--hotpath`
+cells on `d7d4f967` plus a `hotpath::measure` attribute on
+`inline_tables` (unstored `--force` cells):
+
+| Command, buffer source | Calls | Avg | P50 | P95 | P99 | Total | Decode it rides on |
+|---|---:|---:|---:|---:|---:|---:|---|
+| cat `--clean`, pooled | 50,816 | 10.7 us | 7.7 us | 26.2 us | 44.5 us | 0.55 core-s | `decompress_blob_raw` 339 core-s, wall 154.6 s |
+| diff-snapshots base to `20260411`, fresh buffer per block | 107,701 | 35.2 us | 9.6 us | 167.8 us | 272.4 us | 3.79 core-s | block-pair `decode` 1,113 core-s, wall 111.2 s |
+
+The unpooled path's tail is consistent with the payload moving on the
+growth (a buffer arrives exactly full), though the timer covers the
+reservation and the serialization together. Even there the append is
+0.3 % of decode work; spread over the run's cores it is about 0.1 s of
+wall, a throughput share rather than a bound. Separate storage would not
+remove the table bytes, only move them; what it would remove is a moving
+realloc's transient old payload per active decoder and any allocator
+retention of it, neither measured. It was not built. time-filter at the
+same commit builds no block (its decode phase projects), so it never
+appends.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

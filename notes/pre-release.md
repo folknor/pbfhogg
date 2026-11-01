@@ -325,19 +325,6 @@ still validates every blob, should judge it too. Closing it moves the
 gap out of indexdata-trust.md and the "type-order check is skipped"
 sentence out of the check section of `docs/cli/commands.md`.
 
-### WRK-119: merge-changes spill and copy-back have no deterministic test
-
-The streaming merge spills a later input's members to scratch and copies
-them back when that input becomes the head, but no test forces that path:
-`batched_merge_keeps_input_order_and_is_jobs_independent` spills only when
-scheduling lets a later input's batch finish first, and the CLI output
-contract's two-input row can neither require scratch payload nor a
-populated staging entry for the same reason. A test hook that holds the
-head input's reader (or its first member) until a later input has
-spilled would make spill, `merge_changes_spill_bytes` and the copy-back
-removal certain, and would also let the CLI interrupted-run sweep require
-scratch payload on that row.
-
 ### WRK-027: Membership track for set-dominated peaks
 
 The rows dominated by ID sets (extract, multi-extract, tags-filter two-pass,

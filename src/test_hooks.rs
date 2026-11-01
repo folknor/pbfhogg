@@ -210,6 +210,38 @@ pub struct FaultPlan {
     /// channel), so the spill and its ordering run on a small fixture.
     pub derive_spill_after: AtomicUsize,
 
+    // --- merge-changes ordered merge (`commands::merge_changes::stream`) ---
+    /// Members of input 1 the ordered merge (not `--simplify`) spills before
+    /// input 0 is read (`usize::MAX`, the default, leaves it to
+    /// scheduling). Input 0's reader waits (bounded) until input 1 is
+    /// complete, or its reader is held and that many of its members are in
+    /// its spill file; input 1's reader holds before it seals batch `N`
+    /// until input 1 is the head. So input 1 has every member spilled and
+    /// its file closed when it is promoted if it has at most `N` batches,
+    /// and is promoted mid-read with its file open if it has more. Needs
+    /// two inputs and two readers; anything else waits out the bound, which
+    /// fails the run (`merge_changes_hook_timed_out`).
+    pub merge_changes_spill_first: AtomicUsize,
+    /// Members of input 1 written to its spill file.
+    pub merge_changes_members_spilled: AtomicU64,
+    /// Set when input 1 is complete while not the head, after its spill
+    /// file (if any) was flushed and closed.
+    pub merge_changes_spilled_input_complete: AtomicBool,
+    /// Set when input 1's reader holds before sealing batch `N`.
+    pub merge_changes_reader_held: AtomicBool,
+    /// The head input, published once each promotion (its copy-back and
+    /// spill file removal included) has finished.
+    pub merge_changes_head: AtomicUsize,
+    /// Promotions that copied back a spill file still open (the input was
+    /// still being read).
+    pub merge_changes_copied_open: AtomicU64,
+    /// Promotions that copied back a spill file closed when its input
+    /// completed.
+    pub merge_changes_copied_closed: AtomicU64,
+    /// A bounded merge-changes hook wait expired; the waiting reader fails
+    /// the run.
+    pub merge_changes_hook_timed_out: AtomicBool,
+
     // --- apply-changes streaming workers ---
     /// Blob sequence number at whose dequeue a streaming worker panics.
     pub apply_changes_panic_at_blob_seq: AtomicU64,
@@ -437,6 +469,10 @@ impl Default for FaultPlan {
 impl FaultPlan {
     /// A plan with every fault disarmed and every counter at zero.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one initializer per field, a flat list that grows with the plan"
+    )]
     pub const fn new() -> Self {
         Self {
             decode_gate: Mutex::new(DecodeGate {
@@ -485,6 +521,14 @@ impl FaultPlan {
             diff_unit_target_bytes: AtomicUsize::new(0),
             derive_chunk_bytes: AtomicUsize::new(0),
             derive_spill_after: AtomicUsize::new(usize::MAX),
+            merge_changes_spill_first: AtomicUsize::new(usize::MAX),
+            merge_changes_members_spilled: AtomicU64::new(0),
+            merge_changes_spilled_input_complete: AtomicBool::new(false),
+            merge_changes_reader_held: AtomicBool::new(false),
+            merge_changes_head: AtomicUsize::new(0),
+            merge_changes_copied_open: AtomicU64::new(0),
+            merge_changes_copied_closed: AtomicU64::new(0),
+            merge_changes_hook_timed_out: AtomicBool::new(false),
             apply_changes_panic_at_blob_seq: AtomicU64::new(u64::MAX),
             apply_changes_panic_waits_for_barrier_wait: AtomicBool::new(false),
             apply_changes_park_at_blob_seq: AtomicU64::new(u64::MAX),
@@ -921,6 +965,99 @@ impl FaultPlan {
             "direct-io",
             std::io::Error::new(std::io::ErrorKind::Unsupported, INJECTED_BACKEND_REFUSAL),
         ))
+    }
+
+    // ---- merge-changes ordered merge -------------------------------------
+
+    /// A bounded wait for the `merge_changes_spill_first` handshake that
+    /// fails the run when the bound expires, so a run that did not get the
+    /// ordering it was armed for (a subprocess included) cannot pass.
+    fn merge_changes_wait(
+        &self,
+        stopped: impl Fn() -> bool,
+        cond: impl Fn() -> bool,
+    ) -> crate::Result<()> {
+        let timed_out = &self.merge_changes_hook_timed_out;
+        self.wait_until(timed_out, || stopped() || cond());
+        if timed_out.load(Ordering::SeqCst) {
+            return Err(crate::Error::internal(format!(
+                "test-hooks: the merge-changes spill-first handshake did not happen within \
+                 {HOOK_WAIT:?} (it needs two inputs and two readers)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Called by an ordered merge's reader of `input` before it reads;
+    /// `stopped` is true once the run is failing or cancelled.
+    pub(crate) fn before_merge_changes_read(
+        &self,
+        input: usize,
+        stopped: impl Fn() -> bool,
+    ) -> crate::Result<()> {
+        let first = self.merge_changes_spill_first.load(Ordering::SeqCst);
+        if input != 0 || first == usize::MAX {
+            return Ok(());
+        }
+        self.merge_changes_wait(stopped, || {
+            self.merge_changes_spilled_input_complete
+                .load(Ordering::SeqCst)
+                || (self.merge_changes_reader_held.load(Ordering::SeqCst)
+                    && self.merge_changes_members_spilled.load(Ordering::SeqCst) >= first as u64)
+        })
+    }
+
+    /// Called by an ordered merge's reader of `input` before it seals batch
+    /// `seq`.
+    pub(crate) fn before_merge_changes_seal(
+        &self,
+        input: usize,
+        seq: usize,
+        stopped: impl Fn() -> bool,
+    ) -> crate::Result<()> {
+        if input != 1 || seq != self.merge_changes_spill_first.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.merge_changes_reader_held.store(true, Ordering::SeqCst);
+        self.merge_changes_wait(stopped, || {
+            self.merge_changes_head.load(Ordering::SeqCst) >= 1
+        })
+    }
+
+    /// Called by the coordinator after it wrote a member of `input` to
+    /// that input's spill file.
+    pub(crate) fn on_merge_changes_spilled(&self, input: usize) {
+        if input == 1 {
+            self.merge_changes_members_spilled
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Called by the coordinator once `input`, not the head, is complete
+    /// and its spill file (if any) flushed and closed.
+    pub(crate) fn on_merge_changes_complete(&self, input: usize) {
+        if input == 1 {
+            self.merge_changes_spilled_input_complete
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Called by the coordinator once `head` has been promoted, after
+    /// copying back a spill file that was still `open` or already closed
+    /// (`None`: there was none).
+    pub(crate) fn on_merge_changes_promoted(&self, head: usize, copied: Option<bool>) {
+        match copied {
+            Some(true) => {
+                self.merge_changes_copied_open
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Some(false) => {
+                self.merge_changes_copied_closed
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            None => {}
+        }
+        self.merge_changes_head.store(head, Ordering::SeqCst);
     }
 
     // ---- apply-changes ---------------------------------------------------

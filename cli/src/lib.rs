@@ -2540,6 +2540,8 @@ pub fn run() -> process::ExitCode {
     signals::test_hooks::arm_input_replacement(&cancel);
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::arm_publication(&cancel);
+    #[cfg(feature = "test-hooks")]
+    signals::test_hooks::arm_merge_changes(&cancel);
     let host = host::cli_host(cancel);
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])

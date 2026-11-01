@@ -392,8 +392,27 @@ exception, not a tier - should not survive across many PRs.
   assert the exit code and an empty directory, with no sleeps. Ordinals are
   positions, not sites, and the fixture's counts are not real data's, so
   neither sweep proves every checkpoint site of a planet run unwinds.
+  A row whose checkpoint layout would depend on scheduling is pinned to
+  one schedule rather than waived: the counting run and every paused run
+  go through the same per-row setup (`with_visible_scratch`), and each
+  row must observe both a populated staging entry and, where it takes
+  `--tmp-dir`, scratch payload (only the sparse add-locations-to-ways row
+  is excused, its store being unlinked once mapped).
   `CliInvoker::spawn` returns a `RunningCli` that can be signalled and is
   killed on drop.
+- **Merge-changes spill.** The ordered merge spills a later input's
+  output only when scheduling lets it run ahead of the head, so
+  `FaultPlan::merge_changes_spill_first = N` forces it: input 1 spills its
+  first `N` members before input 0 is read, and its reader holds before
+  batch `N` until input 1 is the head, so a promotion copies back a spill
+  file that is still open (more than `N` batches) or one already closed
+  (at most `N`). It needs two inputs and two readers; a handshake that
+  does not happen within the hook bound fails the run, so a subprocess
+  cannot pass unarmed. `--simplify` is not affected. The CLI, built with
+  `test-hooks`, arms it from `PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST=<n>`
+  (a value that does not parse exits 101); the two-input merge-changes
+  row of the interruption sweeps runs under `1`, and `tests/cancel.rs`
+  arms it for its merge-changes entry.
 - **Capability accounting.** `Invocation::capabilities` (`test-hooks`,
   doc-hidden) reads the invocation's transition word (live call guards and
   permits, and whether a count saturated) and its census (issued block

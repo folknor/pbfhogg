@@ -1594,29 +1594,37 @@ mod interrupted {
             })
     }
 
-    /// Extra arguments that put a row on the path whose scratch is visible:
+    /// `invoker` with what puts a row on the path whose scratch is visible.
     /// add-locations-to-ways picks the sparse store for a small input, and
     /// that store is unlinked as soon as it is mapped, so only the external
-    /// join leaves scratch files a pause can observe.
-    pub(super) fn visible_scratch_args(row: &Row) -> Vec<OsString> {
+    /// join leaves scratch files a pause can observe. The two-input
+    /// merge-changes row spills only output produced ahead of the head, so
+    /// its second input is made to spill (and close its spill file) before
+    /// the first is read: the run then passes the same checkpoints in the
+    /// same phases every time, and a pause between the spill and its
+    /// copy-back sees the payload. Every run of a row that is counted and
+    /// then paused goes through here, so both see the same schedule.
+    pub(super) fn with_visible_scratch(row: &Row, invoker: CliInvoker) -> CliInvoker {
         if row.command == "add-locations-to-ways" && row.label != SPARSE_ALTW_LABEL {
-            vec!["--index-type".into(), "external".into()]
+            invoker.args(["--index-type", "external"])
+        } else if row.label == MERGE_CHANGES_SPILL_LABEL {
+            invoker.env("PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST", "1")
         } else {
-            Vec::new()
+            invoker
         }
     }
 
     /// The row's invocation in a fresh output directory, with `--tmp-dir`
     /// for rows that take it (so scratch and staging are told apart).
-    struct Run {
+    struct Run<'r> {
+        row: &'r Row,
         out: TempDir,
         tmp: Option<TempDir>,
         inv: Invocation,
-        extra: Vec<OsString>,
     }
 
-    impl Run {
-        fn new(fx: &Fx, row: &Row) -> Self {
+    impl<'r> Run<'r> {
+        fn new(fx: &Fx, row: &'r Row) -> Self {
             let out = crate::common::test_scratch();
             let tmp = row.tmp_dir.then(crate::common::test_scratch);
             let inv = (row.build)(
@@ -1626,18 +1634,11 @@ mod interrupted {
                 },
                 Input::Good,
             );
-            Self {
-                out,
-                tmp,
-                inv,
-                extra: visible_scratch_args(row),
-            }
+            Self { row, out, tmp, inv }
         }
 
         fn invoker(&self, extra: &[OsString]) -> CliInvoker {
-            CliInvoker::new()
-                .args(&self.inv.args)
-                .args(&self.extra)
+            with_visible_scratch(self.row, CliInvoker::new().args(&self.inv.args))
                 .args(extra)
                 .args(tmp_args(self.tmp.as_ref().map(TempDir::path)))
         }
@@ -1832,22 +1833,11 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         "no pause landed before the run completed ({count} checkpoints counted)"
     );
     ensure!(
-        // The two-input merge-changes row runs two readers, so how many
-        // checkpoints a run passes, and which of them follow the first write
-        // to staging, varies from run to run; the one-input row is the
-        // merge-changes sweep that must observe staging. Both are held to
-        // leaving nothing at every pause.
-        staging_seen || row.label == MERGE_CHANGES_SPILL_LABEL,
+        staging_seen,
         "no pause observed a populated staging entry ({count} checkpoints, pauses at {ks:?})"
     );
     ensure!(
-        // merge-changes spills only output produced for a later input while an
-        // earlier one is unfinished, which on this table's small inputs depends
-        // on scheduling: its run directory is made but may never be written.
-        !row.tmp_dir
-            || row.label == SPARSE_ALTW_LABEL
-            || row.label == MERGE_CHANGES_SPILL_LABEL
-            || scratch_seen,
+        !row.tmp_dir || row.label == SPARSE_ALTW_LABEL || scratch_seen,
         "no pause observed scratch payload in the run directory ({count} checkpoints, pauses \
          at {ks:?})"
     );
@@ -1963,14 +1953,12 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
         Input::Good,
     );
     let mut extra: Vec<OsString> = vec!["--staging-dir".into(), staging.path().into()];
-    extra.extend(interrupted::visible_scratch_args(row));
     extra.extend(tmp_args(row.tmp_dir.then_some(tmp)));
     let ready = control.path().join("ready");
     let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
     pause.push(ready.as_os_str());
     pause.push(":stuck");
-    let mut child = CliInvoker::new()
-        .args(&inv.args)
+    let mut child = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
         .args(&extra)
         .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
         .spawn();
@@ -2020,7 +2008,9 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     }
 
     let before = tree_snapshot(staging.path());
-    let next = CliInvoker::new().args(&inv.args).args(&extra).run();
+    let next = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
+        .args(&extra)
+        .run();
     let stderr = next.stderr_str();
     ensure!(exited_ok(row, &next), "the next run failed: {stderr}");
     for entry in staged.iter().take(1).chain(&run_dirs) {
@@ -2072,8 +2062,7 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     // A fresh private directory for the next run, which replaces the
     // outputs and leaves the directory empty.
     std::fs::create_dir(staging.path()).unwrap();
-    let again = CliInvoker::new()
-        .args(&inv.args)
+    let again = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
         .args(&extra)
         .arg("--overwrite")
         .run();
@@ -2886,9 +2875,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
         pause.push(ready.as_os_str());
         pause.push(":stuck");
-        let mut child = CliInvoker::new()
-            .args(&inv.args)
-            .args(interrupted::visible_scratch_args(row))
+        let mut child = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
             .args(tmp_args(Some(tmp.path())))
             .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
             .spawn();
@@ -2935,9 +2922,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             left.iter().any(|n| n.starts_with(".pbfhogg-tmp-")),
             "expected the abandoned staging entry, found {left:?}"
         );
-        let next = CliInvoker::new()
-            .args(&inv.args)
-            .args(interrupted::visible_scratch_args(row))
+        let next = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
             .args(tmp_args(Some(tmp.path())))
             .run();
         assert!(

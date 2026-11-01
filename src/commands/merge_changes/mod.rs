@@ -959,7 +959,9 @@ mod tests {
     }
 
     // Inputs large enough to cut into several batches each, so later inputs
-    // spill and are copied back, plus an empty input and action transitions
+    // may spill and be copied back (whether they do is scheduling;
+    // `a_forced_spill_is_copied_back_and_removed` forces it), plus an empty
+    // input and action transitions
     // inside one input. The output must hold every change in input order,
     // and its bytes must not depend on the worker count: batch boundaries
     // come from the batch byte target alone. The one-thread pool exercises
@@ -1036,6 +1038,134 @@ mod tests {
                     Some(f) => assert_eq!(&bytes, f, "jobs={jobs}, gzip={is_gz}"),
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Counter samples a run emits, by name.
+    #[cfg(feature = "test-hooks")]
+    #[derive(Default)]
+    struct Counters(std::sync::Mutex<Vec<(String, i64)>>);
+
+    #[cfg(feature = "test-hooks")]
+    impl crate::debug::InstrumentSink for Counters {
+        fn marker(&self, _: &str) {}
+        fn counter(&self, name: &str, value: i64) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((name.to_owned(), value));
+        }
+    }
+
+    /// Input 1 forced to spill ahead of input 0 (the `test-hooks`
+    /// spill-first handshake), once promoted with its spill file still open
+    /// (it has more batches than are spilled first) and once with it closed
+    /// (every batch spilled first). Each run writes the bytes the one-worker
+    /// merge writes, reports the spilled bytes, takes the copy-back branch it
+    /// was forced into, and has removed the spill file itself: the run
+    /// directory, still alive after the merge, holds only its bookkeeping.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn a_forced_spill_is_copied_back_and_removed() -> crate::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scratch = crate::path_guard::tests::scratch();
+        // Several batches per input.
+        let per_input = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 20;
+        let mut paths = Vec::new();
+        for i in 0..2_usize {
+            let path = scratch.path().join(format!("input-{i}.osc"));
+            let mut body = String::from("<osmChange version=\"0.6\"><modify>");
+            for k in 0..per_input {
+                let id = i * 10_000_000 + k;
+                body.push_str(&format!(
+                    "<node id=\"{id}\" lat=\"1\" lon=\"2\"><tag k=\"n\" v=\"{k}\"/></node>"
+                ));
+            }
+            body.push_str("</modify></osmChange>");
+            std::fs::write(&path, body)?;
+            paths.push(path);
+        }
+        let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let reference = scratch.path().join("reference.osc");
+        merge_changes(
+            &inputs,
+            crate::output::Output::new(
+                &reference,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            MergeMode::Stream { scratch: None },
+            crate::host::Parallelism::from_jobs(1),
+            &crate::host::Host::entered_for_tests(),
+        )?;
+        let reference = std::fs::read(reference)?;
+
+        // (members spilled first, promoted with the file open)
+        for (first, open) in [(1, true), (1_000, false)] {
+            let sink = std::sync::Arc::new(Counters::default());
+            let host = crate::host::Host {
+                invocation: crate::host::Invocation::with_sink(std::sync::Arc::clone(&sink) as _),
+                ..crate::host::Host::for_tests()
+            }
+            .entered_leaked();
+            let faults = host.invocation.faults();
+            faults.merge_changes_spill_first.store(first, SeqCst);
+            let dest = scratch.path().join(format!("out-{first}.osc"));
+            let output = crate::output::bind_unissued(
+                crate::output::Output::new(
+                    &dest,
+                    crate::output::Overwrite::Replace,
+                    &crate::host::Diagnostics::discard(),
+                )?,
+                &host.invocation,
+            )?;
+            let mode = MergeMode::Stream {
+                scratch: Some(run_scratch(scratch.path())),
+            };
+            merge_changes_to(
+                &inputs,
+                &output,
+                &mode,
+                crate::host::Parallelism::from_jobs(2),
+                &host,
+            )?;
+            let case = format!("spill first {first}");
+            assert!(!faults.merge_changes_hook_timed_out.load(SeqCst), "{case}");
+            assert_eq!(
+                faults.merge_changes_copied_open.load(SeqCst),
+                u64::from(open),
+                "{case}"
+            );
+            assert_eq!(
+                faults.merge_changes_copied_closed.load(SeqCst),
+                u64::from(!open),
+                "{case}"
+            );
+            let MergeMode::Stream {
+                scratch: Some(run_dir),
+            } = &mode
+            else {
+                unreachable!()
+            };
+            let mut left = std::fs::read_dir(run_dir.path())?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            left.sort();
+            assert_eq!(left, ["LOCK", "READY"], "{case}");
+            drop(mode);
+            output.publish()?;
+            assert_eq!(std::fs::read(&dest)?, reference, "{case}");
+            let spilled: Vec<i64> = sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(name, _)| name == "merge_changes_spill_bytes")
+                .map(|(_, value)| *value)
+                .collect();
+            assert_eq!(spilled.len(), 1, "{case}: {spilled:?}");
+            assert!(spilled[0] > 0, "{case}: {spilled:?}");
         }
         Ok(())
     }

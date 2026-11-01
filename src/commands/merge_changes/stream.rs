@@ -217,7 +217,7 @@ pub(crate) fn run(
                 std::thread::Builder::new()
                     .name(format!("merge-read-{input}"))
                     .spawn_scoped(threads, move || {
-                        read_input(input, plan, scope, ledger_ref, &tx, encode_ref);
+                        read_input(input, plan, scope, ledger_ref, &tx, encode_ref, true);
                     })
                     .map(drop)
                     .map_err(|e| {
@@ -256,7 +256,7 @@ where
                 std::thread::Builder::new()
                     .name(format!("merge-read-{input}"))
                     .spawn_scoped(threads, move || {
-                        read_input(input, plan, scope, ledger_ref, &tx, encode);
+                        read_input(input, plan, scope, ledger_ref, &tx, encode, false);
                     })
                     .map(drop)
                     .map_err(|e| {
@@ -359,6 +359,8 @@ fn collect_results<T>(
 
 /// One reader thread's whole life. Always ends with exactly one terminal
 /// message, sent last, after which it does nothing that can block.
+/// `ordered` is true under [`run`]'s coordinator, the only one the
+/// `test-hooks` spill-first handshake applies to.
 fn read_input<'s, T, E>(
     input: usize,
     plan: &'s Plan<'s>,
@@ -366,15 +368,30 @@ fn read_input<'s, T, E>(
     ledger: &'s Ledger,
     tx: &Sender<Msg<T>>,
     encode: &'s E,
+    ordered: bool,
 ) where
     T: Send + 's,
     E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
 {
     let path = plan.inputs[input];
     let cancel = plan.cancel;
+    #[cfg(feature = "test-hooks")]
+    let stopped = || ledger.halted() || cancel.is_cancelled();
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = ordered;
     let body = || -> crate::Result<usize> {
+        #[cfg(feature = "test-hooks")]
+        if ordered {
+            cancel.faults().before_merge_changes_read(input, stopped)?;
+        }
         let seq = Cell::new(0usize);
         let seal = |batch: LexBatch| -> crate::Result<()> {
+            #[cfg(feature = "test-hooks")]
+            if ordered {
+                cancel
+                    .faults()
+                    .before_merge_changes_seal(input, seq.get(), stopped)?;
+            }
             let credit = batch.bytes().max(1);
             ledger.acquire(credit, cancel)?;
             let s = seq.get();
@@ -589,6 +606,8 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 .map_err(|e| spill_err(&path, e.into_error()))?;
             state.sink = Sink::Closed(path);
         }
+        #[cfg(feature = "test-hooks")]
+        self.plan.cancel.faults().on_merge_changes_complete(input);
         Ok(true)
     }
 
@@ -615,6 +634,8 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 }
                 Sink::Spill(path, file) => {
                     file.write_all(&bytes).map_err(|e| spill_err(path, e))?;
+                    #[cfg(feature = "test-hooks")]
+                    self.plan.cancel.faults().on_merge_changes_spilled(input);
                 }
                 Sink::Pending | Sink::Closed(_) => {
                     return Err(crate::Error::internal(
@@ -641,6 +662,12 @@ impl<'a, 'p> Coordinator<'a, 'p> {
         let sink = std::mem::replace(&mut state.sink, Sink::Output);
         // Members already counted while spilling reach the output now.
         self.total += state.changes;
+        #[cfg(feature = "test-hooks")]
+        let copied = match &sink {
+            Sink::Spill(..) => Some(true),
+            Sink::Closed(_) => Some(false),
+            Sink::Pending | Sink::Output => None,
+        };
         let spill = match sink {
             Sink::Spill(path, file) => {
                 let file = file
@@ -677,6 +704,11 @@ impl<'a, 'p> Coordinator<'a, 'p> {
             drop(file);
             spill_scratch(self.scratch, self.head)?.remove(&path);
         }
+        #[cfg(feature = "test-hooks")]
+        self.plan
+            .cancel
+            .faults()
+            .on_merge_changes_promoted(self.head, copied);
         Ok(())
     }
 }

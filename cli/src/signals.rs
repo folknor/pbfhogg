@@ -335,6 +335,29 @@ pub(crate) mod test_hooks {
         );
     }
 
+    /// `PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST=<n>` arms the library's
+    /// merge-changes spill-first handshake on the run's token
+    /// (`pbfhogg::test_hooks::FaultPlan::merge_changes_spill_first`): the
+    /// second input spills its first `n` members before the first input is
+    /// read. A value that does not parse ends the run with a message, so a
+    /// test cannot silently run unarmed.
+    pub(crate) fn arm_merge_changes(cancel: &Invocation) {
+        let Some(spec) = std::env::var_os("PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST") else {
+            return;
+        };
+        let Some(n) = spec.to_str().and_then(|n| n.parse::<usize>().ok()) else {
+            crate::host::cli_note(
+                "cli.test_hooks",
+                format_args!("PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST={spec:?} is not a count"),
+            );
+            std::process::exit(101);
+        };
+        cancel
+            .faults()
+            .merge_changes_spill_first
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// `PBFHOGG_TEST_REPLACE_REPORT=<file>`: write the armed replacement's
     /// observations as one line, `fired attempts verified refused
     /// attempts_after_fired` (`fired` as 0 or 1).

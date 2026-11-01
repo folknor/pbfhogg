@@ -146,6 +146,15 @@ fn merge_changes(
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<()> {
     let osc = i.path("change.osc");
+    // The second input spills its one member, and its file is closed,
+    // before the first is read: every checkpoint of the run then falls at a
+    // fixed point of the spill, so the sweep trips inside it and inside the
+    // copy-back.
+    #[cfg(feature = "test-hooks")]
+    host.invocation
+        .faults()
+        .merge_changes_spill_first
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     pbfhogg::merge_changes::merge_changes(
         &[&osc, &osc],
         crate::common::out(out.join("merged.osc.gz")),

@@ -44,9 +44,8 @@ carries indexdata is passed through as it is). For a file from elsewhere,
 `pbfhogg check --index --ids` is the admission test: `--index` decompresses
 every blob and diffs what it finds against what the header claims, and
 `--ids` checks ID and type order; either exits `1` on a disagreement. It has
-gaps: element-kind order is not checked on a file without indexdata, and the
-header's feature flags (`LocationsOnWays` and the like) are not checked at
-all. See [check](../cli/commands.md#check), and the
+a gap: the header's feature flags (`LocationsOnWays` and the like) are not
+checked at all. See [check](../cli/commands.md#check), and the
 [indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md)
 for which command believes which claim, what a false one costs, and what no
 check covers.

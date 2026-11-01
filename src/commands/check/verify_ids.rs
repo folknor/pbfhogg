@@ -300,8 +300,8 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///
 /// No kind's judgement depends on another's, so an unindexed file, whose
 /// blobs' kinds the header walk cannot know, is read in one phase instead:
-/// each blob decoded once and its IDs judged per kind (`scan_kinds`). Type
-/// order is not checked there.
+/// each blob decoded once, its IDs judged per kind and its type order from
+/// the kinds the decode found (`scan_kinds`).
 ///
 /// Both modes use the same per-blob worker shape to keep the planet-scale
 /// memory floor bounded. Streaming mode previously walked
@@ -331,8 +331,9 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///
 /// # Kind claims
 ///
-/// Each kind's phase reads the blobs whose indexdata claims that kind, and
-/// type order is judged from those claims, so a decoded element of another
+/// On an indexed file each kind's phase reads the blobs whose indexdata
+/// claims that kind, and type order is judged from those claims (an empty
+/// blob claiming a kind counts as that kind), so a decoded element of another
 /// kind in a scheduled blob stops the check
 /// ([`CheckOutcome::Stopped`](super::CheckOutcome)), discarding the type
 /// order and every other finding. Under a `type_filter` only the selected
@@ -413,13 +414,15 @@ struct Scanned {
 /// none in streaming mode.
 ///
 /// An indexed file is read one phase per selected kind, each over the blobs
-/// claiming that kind, and its type order judged from the claims. An
-/// unindexed one is read once: each blob's IDs of every selected kind are
-/// judged from one validation pass, since no kind's judgement depends on
-/// another's, and its type order is not judged (an unindexed blob's kind is
-/// unknown from headers alone; reference/indexdata-trust.md records the
-/// gap). Either way each kind's results are merged in file order, the kinds
-/// in turn, so the report is the same.
+/// claiming that kind, and its type order judged from the claims (the
+/// schedules' frame offsets). An unindexed one is read once: each blob's IDs
+/// of every selected kind are judged from one validation pass, since no
+/// kind's judgement depends on another's, and its type order from the kinds
+/// the same pass decodes, by blob and group position ([`GroupKinds`]). Type
+/// order covers every kind whatever `type_filter` selects, in both arms.
+/// Either way it is judged first and each kind's results are then merged in
+/// file order, the kinds in turn, so on a file whose indexdata is true the
+/// report is the same.
 fn scan_kinds(
     file: &crate::read::input::InputFile,
     schedules: KindSchedules,
@@ -454,9 +457,11 @@ fn scan_kinds(
             relations,
         } => {
             check_type_order(
-                &nodes,
-                &ways,
-                &relations,
+                &[
+                    schedule_span(&nodes),
+                    schedule_span(&ways),
+                    schedule_span(&relations),
+                ],
                 &mut scanned.violations,
                 &mut scanned.total_violations,
                 effective_error_limit(max_errors),
@@ -476,7 +481,13 @@ fn scan_kinds(
         KindSchedules::Unindexed(blobs) => {
             host.invocation.marker("VERIFYIDS_UNINDEXED_START");
             let sets = sets.each_ref().map(|set| set.as_deref());
-            let per_kind = unindexed_pass(file, &blobs, type_filter, sets, host)?;
+            let (per_kind, spans) = unindexed_pass(file, &blobs, type_filter, sets, host)?;
+            check_type_order(
+                &spans,
+                &mut scanned.violations,
+                &mut scanned.total_violations,
+                effective_error_limit(max_errors),
+            );
             for (kind, per_blob) in KINDS.into_iter().zip(per_kind) {
                 if selects(type_filter, kind) {
                     merge(&mut scanned, kind, per_blob)?;
@@ -643,31 +654,34 @@ fn kind_phase(
 /// [`verify_blob`] judges one kind's (the projection yields each kind's IDs
 /// in element-walk order), the results returned per kind by blob position,
 /// a kind not selected holding empty ones. Under `--full` each kind's
-/// overflow is settled in its own side set.
+/// overflow is settled in its own side set. Beside them, where each kind's
+/// elements first and last appear in the file, at `(blob position, group
+/// index)`, for every kind whatever `type_filter` selects
+/// ([`GroupKinds`]).
 fn unindexed_pass(
     file: &crate::read::input::InputFile,
     blobs: &[crate::scan::classify::ScheduledBlob],
     type_filter: &TypeFilter,
     sets: [Option<&IdSet>; 3],
     host: &crate::host::Entered<'_>,
-) -> Result<[Vec<Option<BlobVerifyResult>>; 3]> {
+) -> Result<(PerKind, KindSpans<(usize, usize)>)> {
     let mut kinds = crate::element_kind::KindSet::default();
     for kind in KINDS {
         if selects(type_filter, kind) {
             kinds.add(kind);
         }
     }
-    let mut per_kind: [Vec<Option<BlobVerifyResult>>; 3] =
-        std::array::from_fn(|_| (0..blobs.len()).map(|_| None).collect());
+    let mut per_kind: PerKind = std::array::from_fn(|_| (0..blobs.len()).map(|_| None).collect());
     let mut overflow: [IdSet; 3] = std::array::from_fn(|_| IdSet::new());
+    let mut spans: KindSpans<(usize, usize)> = [None; 3];
     crate::scan::classify::parallel_project_phase(
         file,
         blobs,
         None,
         IdScratch::default,
-        |buffer, scratch| -> Result<[BlobVerifyResult; 3]> {
-            let (KindIds { .. }, accepted) =
-                buffer.project(|_, _| KindIds::new(kinds, &mut *scratch))?;
+        |buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
+            let ((KindIds { .. }, groups), accepted) = buffer
+                .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
             let mut judges = KINDS.map(KindJudge::new);
             scratch.each(accepted.bytes(), |kind, id| {
                 let index = usize::from(kind.ordinal());
@@ -675,17 +689,75 @@ fn unindexed_pass(
                 Ok(())
             })?;
             drop(accepted);
-            Ok(judges.map(|judge| judge.r))
+            Ok((judges.map(|judge| judge.r), groups.spans))
         },
-        |seq, results| {
+        |seq, (results, groups)| {
             for ((slots, overflow), mut r) in per_kind.iter_mut().zip(&mut overflow).zip(results) {
                 settle_overflow(overflow, &mut r, host);
                 slots[seq] = Some(r);
             }
+            for (span, group) in spans.iter_mut().zip(groups) {
+                if let Some((first, last)) = group {
+                    widen(span, (seq, first), (seq, last));
+                }
+            }
         },
         host,
     )?;
-    Ok(per_kind)
+    Ok((per_kind, spans))
+}
+
+/// Each kind's per-blob results by blob position, indexed by ordinal.
+type PerKind = [Vec<Option<BlobVerifyResult>>; 3];
+
+/// Where each kind's elements first and last appear, as positions under some
+/// order of the file (`None`: the kind is absent), indexed by ordinal.
+type KindSpans<K> = [Option<(K, K)>; 3];
+
+/// Widen `span` to cover `first..=last`. Results arrive in completion order,
+/// so the bounds are a minimum and a maximum, never the latest arrival.
+fn widen<K: Ord + Copy>(span: &mut Option<(K, K)>, first: K, last: K) {
+    *span = Some(match *span {
+        None => (first, last),
+        Some((lo, hi)) => (lo.min(first), hi.max(last)),
+    });
+}
+
+/// The frame offsets of a claimed schedule's first and last blob.
+fn schedule_span(schedule: &[crate::scan::classify::ScheduledBlob]) -> Option<(u64, u64)> {
+    let mut span = None;
+    for blob in schedule {
+        let offset = blob.frame_start();
+        widen(&mut span, offset, offset);
+    }
+    span
+}
+
+/// The type-order evidence one unindexed blob's validation yields: for each
+/// kind, the index of the first and the last group holding it, from the kinds
+/// the validator hands each group's end. The element walk reads a group's
+/// nodes, then its ways, then its relations, whatever its field order (a
+/// group holding several kinds already breaks the PBF format, which allows
+/// one), so inside a group the kinds are in order and two kinds sharing a
+/// group share a position: an inversion inside a blob is a later group
+/// holding a kind below one an earlier group held, which these positions,
+/// read under the blob's place in the file, expose to [`check_type_order`].
+/// What a hook records is provisional, read only once the blob is accepted.
+#[derive(Default)]
+struct GroupKinds {
+    group: usize,
+    spans: KindSpans<usize>,
+}
+
+impl crate::read::block::GroupProjection for GroupKinds {
+    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
+        for (kind, span) in KINDS.into_iter().zip(&mut self.spans) {
+            if kinds.has(kind) {
+                widen(span, self.group, self.group);
+            }
+        }
+        self.group += 1;
+    }
 }
 
 /// Merge one kind's per-blob results in file order: counts summed, each
@@ -849,8 +921,8 @@ fn verify_ids_full_parallel(
     }
 
     // Type order is judged from the schedules' offsets on an indexed file
-    // (`check_type_order`, no extra I/O) and not at all on an unindexed one
-    // (see `scan_kinds`).
+    // (no extra I/O) and from the decoded kinds on an unindexed one (see
+    // `scan_kinds`).
     let scanned = scan_kinds(
         &shared_file,
         schedules,
@@ -915,16 +987,19 @@ fn settle_overflow(
     let _ = (host, inserted);
 }
 
-/// Verify that schedules appear in canonical file order: all node blobs
-/// before all way blobs before all relation blobs. Uses data offsets from
-/// the schedules directly (cheap; no extra I/O).
+/// Verify canonical kind order: every node before every way before every
+/// relation. `spans` holds, per kind, its first and last position in the
+/// file under one order: the claimed schedules' frame offsets on an indexed
+/// file ([`schedule_span`]; no extra I/O), the decoded `(blob, group)`
+/// positions on an unindexed one ([`GroupKinds`]). A pair is inverted when
+/// the lower kind's last position lies past the higher kind's first; equal
+/// positions (two kinds in one group) are in order.
 ///
 /// Emits one `TypeOrder` violation per inversion found (bounded at three:
-/// node→way, node→relation, way→relation).
-fn check_type_order(
-    node_sched: &[crate::scan::classify::ScheduledBlob],
-    way_sched: &[crate::scan::classify::ScheduledBlob],
-    rel_sched: &[crate::scan::classify::ScheduledBlob],
+/// node-way, node-relation, way-relation), each counted whether or not it
+/// is stored.
+fn check_type_order<K: Ord + Copy>(
+    spans: &KindSpans<K>,
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,
     max_errors: Option<usize>,
@@ -941,18 +1016,17 @@ fn check_type_order(
         }
     };
 
-    // Canonical order is nodes < ways < relations (by file offset). The
-    // node-relation pair is checked directly: node<way and way<rel imply it
-    // only when ways exist, and a file with no ways (a relation blob, then a
-    // node blob) would otherwise pass. On a correctly ordered file
-    // max_node < min_rel, so the direct check never fires there; on a
-    // disordered one it may fire beside the other two, which is the bound
-    // the doc above states.
-    let offset = crate::scan::classify::ScheduledBlob::frame_start;
-    let max_node = node_sched.iter().map(offset).max();
-    let min_way = way_sched.iter().map(offset).min();
-    let max_way = way_sched.iter().map(offset).max();
-    let min_rel = rel_sched.iter().map(offset).min();
+    // Canonical order is nodes < ways < relations. The node-relation pair is
+    // checked directly: node<way and way<rel imply it only when ways exist,
+    // and a file with no ways (a relation, then a node) would otherwise
+    // pass. On a correctly ordered file max_node <= min_rel, so the direct
+    // check never fires there; on a disordered one it may fire beside the
+    // other two, which is the bound the doc above states.
+    let [nodes, ways, relations] = *spans;
+    let max_node = nodes.map(|(_, last)| last);
+    let min_way = ways.map(|(first, _)| first);
+    let max_way = ways.map(|(_, last)| last);
+    let min_rel = relations.map(|(first, _)| first);
 
     if let (Some(mn), Some(mw)) = (max_node, min_way)
         && mn > mw
@@ -973,7 +1047,7 @@ fn check_type_order(
 
 #[cfg(test)]
 mod tests {
-    use super::{IdViolation, check_type_order};
+    use super::{IdViolation, check_type_order, schedule_span};
     use crate::scan::classify::ScheduledBlob;
 
     /// One schedule entry per frame start, each a small frame.
@@ -997,9 +1071,11 @@ mod tests {
         let mut violations = Vec::new();
         let mut total = 0u64;
         check_type_order(
-            &blobs(nodes),
-            &blobs(ways),
-            &blobs(rels),
+            &[
+                schedule_span(&blobs(nodes)),
+                schedule_span(&blobs(ways)),
+                schedule_span(&blobs(rels)),
+            ],
             &mut violations,
             &mut total,
             None,

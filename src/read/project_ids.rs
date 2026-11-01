@@ -245,7 +245,7 @@ impl GroupProjection for KindIds<'_> {
         }
     }
 
-    fn group_end(&mut self) {
+    fn group_end(&mut self, _kinds: KindSet) {
         let plain = std::mem::take(&mut self.scratch.plain);
         for &id in &plain {
             self.copy(ElementKind::Node, id);

@@ -58,12 +58,20 @@
   not once per element kind, with the same reports. `check --refs` reads
   a blob again only where a reference missed in that read (its target not
   yet read, above the range the check sized, or missing in fact). On an
-  unindexed planet, `check --refs` went from 51 s to
-  29 s and `check --ids` from 70 s to 27 s (`--full` likewise). The
+  unindexed planet, `check --refs` went from 51 s to 29 s (72 s to 29 s
+  with `--check-relations`) and `check --ids` from 70 s to 27 s (`--full`
+  likewise). The
   `Warning:` `check --ids` printed for such input, that every blob is
   decompressed three times, is gone with the cost it described; both
   checks print the `Note:` that the input has blobs without indexdata,
   which `--quiet` silences.
+- `check --ids` judges type order on a file without indexdata too, from
+  the elements it decodes, in the order pbfhogg reads them: a file whose
+  ways, relations and nodes are out of kind order, across blobs or across
+  the groups of one blob, now fails with `type order: ... after ...`
+  violations (exit `1`) where it used to pass. A blob holding several
+  kinds in order passes. With `-t`, type order is still judged over every
+  kind, as it already was on an indexed file. No cost on planet.
 
 ## 0.6.0 - 2026-10-30
 

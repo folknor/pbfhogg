@@ -1217,7 +1217,13 @@ pub(crate) trait GroupProjection {
         _info: Option<&super::wire::WireDenseInfo<'_>>,
     ) {
     }
-    fn group_end(&mut self) {}
+    /// The group passed every check. `kinds` are the kinds of the elements
+    /// it holds as the validator counts them (a plain node, a dense message
+    /// with at least one ID, a way, a relation), whatever the projection
+    /// selects: an empty group, an empty dense message and a changeset group
+    /// add none. Fires for every group the validator completes, empty ones
+    /// included, in group order.
+    fn group_end(&mut self, _kinds: crate::element_kind::KindSet) {}
 }
 
 /// The projection of block construction: nothing beyond the kinds and the
@@ -1254,9 +1260,9 @@ impl<A: GroupProjection, B: GroupProjection> GroupProjection for (A, B) {
         self.0.dense(dense, ids, info);
         self.1.dense(dense, ids, info);
     }
-    fn group_end(&mut self) {
-        self.0.group_end();
-        self.1.group_end();
+    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
+        self.0.group_end(kinds);
+        self.1.group_end(kinds);
     }
 }
 
@@ -1292,9 +1298,9 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
             p.dense(dense, ids, info);
         }
     }
-    fn group_end(&mut self) {
+    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
         if let Some(p) = self {
-            p.group_end();
+            p.group_end(kinds);
         }
     }
 }
@@ -1315,6 +1321,9 @@ fn validate_groups<'a>(
     let mut count: u64 = 0;
     for index in 0..group_count {
         let data = group(index);
+        // This group's kinds, handed to the projection when it ends and
+        // joined into the block's.
+        let mut group_kinds = crate::element_kind::KindSet::default();
 
         // 1. The group's own field framing. Everything below walks this same
         //    byte range through iterators that cannot report an error.
@@ -1330,7 +1339,7 @@ fn validate_groups<'a>(
         //    every packed array it carries - both well-formedness and the
         //    parallel-array invariants the zipping iterators depend on.
         for element in group.nodes() {
-            kinds.add(ElementKind::Node);
+            group_kinds.add(ElementKind::Node);
             count += 1;
             let node = WireNode::parse(element)?;
             let info = validate_info(node.info_data)?;
@@ -1342,7 +1351,7 @@ fn validate_groups<'a>(
             projection.node(&node, info.as_ref());
         }
         for element in group.ways() {
-            kinds.add(ElementKind::Way);
+            group_kinds.add(ElementKind::Way);
             count += 1;
             let way = WireWay::parse(element)?;
             let info = validate_info(way.info_data)?;
@@ -1355,7 +1364,7 @@ fn validate_groups<'a>(
             projection.way(&way, info.as_ref());
         }
         for element in group.relations() {
-            kinds.add(ElementKind::Relation);
+            group_kinds.add(ElementKind::Relation);
             count += 1;
             let relation = WireRelation::parse(element)?;
             let info = validate_info(relation.info_data)?;
@@ -1386,12 +1395,13 @@ fn validate_groups<'a>(
                 None => None,
             };
             if ids > 0 {
-                kinds.add(ElementKind::Node);
+                group_kinds.add(ElementKind::Node);
             }
             count += ids as u64;
             projection.dense(&dense, ids, info.as_ref());
         }
-        projection.group_end();
+        projection.group_end(group_kinds);
+        kinds = kinds.union(group_kinds);
     }
 
     Ok((kinds, count))

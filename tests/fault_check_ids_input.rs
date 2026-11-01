@@ -254,8 +254,8 @@ fn streaming_and_full_read_only_the_pinned_input() {
     }
 }
 
-/// On an input without indexdata every blob is scheduled for all three
-/// kinds; the probe and the walk still open once each.
+/// On an input without indexdata every blob is read in one pass for every
+/// kind; the probe and the walk still open once each.
 #[test]
 fn an_unindexed_input_reads_only_the_pinned_input() {
     for full in [false, true] {

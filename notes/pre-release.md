@@ -311,20 +311,6 @@ the worker's buffer handed into a pooled block. Measuring the check
 `check-refs`, `check-ids` and `check-index` only); extract `--simple` and
 multi-extract can be measured today.
 
-### WRK-120: check --ids could judge type order on unindexed input
-
-check `--ids` skips type order on an unindexed file because the header
-walk cannot know a blob's kind (`reference/indexdata-trust.md`, "Gaps no
-verifier covers"). Its unindexed arm (`unindexed_pass` in
-`src/commands/check/verify_ids.rs`) now decodes every blob once in one
-phase, and each accepted blob's `BlockScan::kinds` is at hand there at
-no cost, so type order could be judged from the decoded kinds in file
-order. Open: what a mixed-kind blob means for it (its `KindSet` says which
-kinds, not in what order within the blob), and whether `--ids -t`, which
-still validates every blob, should judge it too. Closing it moves the
-gap out of indexdata-trust.md and the "type-order check is skipped"
-sentence out of the check section of `docs/cli/commands.md`.
-
 ### WRK-027: Membership track for set-dominated peaks
 
 The rows dominated by ID sets (extract, multi-extract, tags-filter two-pass,

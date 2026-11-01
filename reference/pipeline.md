@@ -448,7 +448,7 @@ Pinning (see "One input, one file, across passes") is decided per library entry:
 
 ### check
 
-- `--ids`: per-kind parallel scan checking ID ordering, the blobs merged in file order. Optional `--full` bitmap for duplicate detection.
+- `--ids`: per-kind parallel scan checking ID ordering, the blobs merged in file order; an unindexed file is read in one parallel pass judging every kind, its type order taken from the decoded group kinds. Optional `--full` bitmap for duplicate detection.
 - `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`), one parallel phase per kind. Optional `--check-relations`.
 
 Both read each blob through a projection on the block validator (`src/read/project_ids.rs`), not a built block, so they refuse exactly the blobs block construction refuses.

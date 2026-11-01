@@ -32,6 +32,7 @@
 //! `CliInvoker`.
 
 pub mod adversarial;
+pub mod groups;
 
 use std::collections::BTreeMap;
 use std::path::Path;

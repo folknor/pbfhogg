@@ -2784,8 +2784,41 @@ on this sorted file no way's reference raced the node blob holding its
 target. That one pass costs what the indexed file's two phases cost
 together (13.5 + 11.6 s); the unindexed file's lower wall is its schedule
 walk, 3.4 s against 5.7-6.1 s with indexdata to parse. Peak anon 2.13 GB
-base, 2.00 GB working tree. `--check-relations` was not measured: brokkr's
-`check-refs` cell has no way to pass it.
+base, 2.00 GB working tree.
+
+`--check-relations`, measured once brokkr's `check-refs` cell could pass
+it: unindexed planet, interleaved `--bench 1`, base `2b1c6ba1` against
+`ece03638` (both stored; `ece03638` carries the single-pass path above):
+
+| Command | Input | `2b1c6ba1` wall | `ece03638` wall |
+|---|---|---:|---:|
+| check `--refs --check-relations` | unindexed | 72.62, 71.51 s (`09fe2081`, `75913388`) | 28.85, 29.15 s (`22a6c583`, `44119112`) |
+
+-60 %. The base read the file three times (`CHECKREFS_NODES` 22.4 s,
+`CHECKREFS_WAYS` 24.0 s, `CHECKREFS_RELATIONS` 21.5 s, about 86 GB each at
+21.5-22.6 cores); `ece03638` read it once (`CHECKREFS_UNINDEXED` 25.3 s,
+87.8 GB, 23.5 cores), and the relation phase re-read 2 of 50,816 blobs in
+16 ms (`checkrefs_relation_blobs` 2, `checkrefs_way_blobs` 0): relations
+then cost nothing over the plain check, 28.9 s. Peak anon 2.33 GB base,
+2.24 GB `ece03638`.
+
+## check --ids judges type order on unindexed input (bygg, 2026-11-01)
+
+The unindexed pass of check `--ids` takes each blob's per-group kinds from
+the validator (`GroupProjection::group_end` now carries the group's
+`KindSet`, accumulated group-locally in place of the block-wide set it
+joins) and reduces them to each kind's first and last `(blob, group)`
+position. That touches every decode through the validator, by one set
+union and one call per group. Planet, interleaved `--bench 1`, base
+`ece03638` (stored, `--commit`) against the working tree on it
+(`--force`, not stored):
+
+| Command | Input | Base wall | Working tree wall |
+|---|---|---:|---:|
+| check `--ids` | unindexed | 26.86, 26.23 s (`e51fade9`, `7125af76`) | 26.42, 26.48 s |
+| check `--ids` | indexed | 30.03, 29.71 s (`39471fc0`, `56b3604b`) | 29.58, 29.61 s |
+
+Both within noise: no cost.
 
 ## Cost of appending the offset tables to the payload (bygg, 2026-11-01)
 

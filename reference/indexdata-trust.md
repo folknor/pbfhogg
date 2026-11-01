@@ -310,13 +310,19 @@ take the bound from `IdSet::file_bounded_max_id`.
   sortedness its scanner computes is discarded. The field-by-field contract
   is in the [CLI reference](../docs/cli/commands.md#index-verification).
 - **`check --ids`** checks ID order within each blob and across blobs, per
-  kind, and type order across blobs on indexed input. It tests the order
-  requirement, not the header's claim: an honestly unsorted file fails it
-  too. Its per-kind schedules come from the indexdata kind; a scheduled blob
-  holding another kind stops it and fails the file, but a lie in a blob no
-  selected phase reads (under `-t`) is not seen, which `check --index`
-  covers. Combine the two selectors to run both; flag order implies no
-  sequencing.
+  kind, and type order over every kind whatever `-t` selects. It tests the
+  order requirement, not the header's claim: an honestly unsorted file fails
+  it too. On indexed input type order is judged across blobs from the
+  claimed kinds (an empty blob counts as the kind it claims); on unindexed
+  input from the decoded elements, in the order the element walk reads them:
+  blobs and their groups in turn, each group's nodes, then its ways, then its
+  relations, whatever the group's field order (a group holding several kinds
+  breaks the format and is read anyway; libosmium reads such a group in field
+  order). On a file whose indexdata is true the two agree. Its per-kind
+  schedules come from the indexdata kind; a scheduled blob holding another
+  kind stops it and fails the file, but a lie in a blob no selected phase
+  reads (under `-t`) is not seen, which `check --index` covers. Combine the
+  two selectors to run both; flag order implies no sequencing.
 
 How `check --index` is built, so its verdict means what it says:
 
@@ -349,8 +355,6 @@ How `check --index` is built, so its verdict means what it says:
 
 Gaps no verifier covers:
 
-- Type order on unindexed input: both `check --ids` arms skip it, since an
-  unindexed blob's kind is unknown from headers alone.
 - The header feature declarations (out of scope above).
 - Decode-time arithmetic on metadata (timestamp deltas and the like) in a
   blob copied raw.

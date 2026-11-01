@@ -448,6 +448,38 @@ fn cli_check_json_preserves_non_utf8_filename_lossily() {
     assert!(!json.to_string().contains("input.osm.pbf"));
 }
 
+/// `check --ids` judges type order on a file without indexdata: a blob
+/// whose way group precedes its node group fails it (exit 1, the inversion
+/// named), and the same groups in order pass (exit 0).
+#[test]
+fn cli_check_ids_fails_an_unindexed_file_out_of_type_order() {
+    use crate::common::groups::{Field, block, write_unindexed_blocks};
+
+    let dir = crate::common::test_scratch();
+    let ways: &[Field<'_>] = &[Field::Ways(&[10])];
+    let nodes: &[Field<'_>] = &[Field::Dense(&[1])];
+    for (name, groups, code, needle) in [
+        ("disordered", [ways, nodes], 1, "type order: node after way"),
+        ("ordered", [nodes, ways], 0, "ID integrity: OK"),
+    ] {
+        let input = dir.path().join(format!("{name}.osm.pbf"));
+        write_unindexed_blocks(&input, &[block(&groups)]);
+        let output = CliInvoker::new()
+            .arg("check")
+            .arg(&input)
+            .arg("--ids")
+            .run();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{name}: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(needle), "{name}: {stdout}");
+    }
+}
+
 #[test]
 fn cli_osc_outputs_are_plain_under_osc_and_keep_metadata() {
     let dir = crate::common::test_scratch();

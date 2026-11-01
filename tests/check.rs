@@ -667,9 +667,18 @@ fn verify_ids_outcome(
     full: bool,
     type_filter: Option<pbfhogg::TypeFilter>,
 ) -> pbfhogg::check::CheckOutcome<pbfhogg::check::verify_ids::VerifyIdsReport> {
+    verify_ids_limited(path, full, type_filter, 0)
+}
+
+fn verify_ids_limited(
+    path: &std::path::Path,
+    full: bool,
+    type_filter: Option<pbfhogg::TypeFilter>,
+    max_errors: usize,
+) -> pbfhogg::check::CheckOutcome<pbfhogg::check::verify_ids::VerifyIdsReport> {
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
         check: pbfhogg::check::CheckOptions {
-            max_errors: 0,
+            max_errors,
             direct_io: false,
         },
         full,
@@ -771,6 +780,12 @@ enum Blob<'a> {
 /// Write `blobs` as unindexed blobs in the given order, under a header that
 /// claims no sort order.
 fn write_unindexed_blobs(path: &std::path::Path, blobs: &[Blob<'_>]) {
+    write_blobs(path, blobs, false);
+}
+
+/// Write `blobs` in the given order, each with its indexdata when `indexed`,
+/// under a header that claims no sort order.
+fn write_blobs(path: &std::path::Path, blobs: &[Blob<'_>], indexed: bool) {
     use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
     use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -806,9 +821,13 @@ fn write_unindexed_blobs(path: &std::path::Path, blobs: &[Blob<'_>]) {
                 }
             }
         }
-        writer
-            .write_primitive_block_no_indexdata(bb.take().expect("take").expect("a block"))
-            .expect("write block");
+        let bytes = bb.take().expect("take").expect("a block");
+        if indexed {
+            writer.write_primitive_block(bytes)
+        } else {
+            writer.write_primitive_block_no_indexdata(bytes)
+        }
+        .expect("write block");
     }
     writer.flush().expect("flush");
 }
@@ -1074,6 +1093,209 @@ fn check_ids_reports_an_unindexed_file_as_its_indexed_twin() {
             let want = report(&indexed);
             assert!(want.0[3] > 0, "the fixture has violations");
             assert_eq!(report(&unindexed), want, "full {full}, filter {filter:?}");
+        }
+    }
+}
+
+/// The stored violations of a complete `check --ids` report as JSON
+/// strings, and its type-order inversions as `(found, after)`, in report
+/// order.
+fn ids_violations(r: &pbfhogg::check::verify_ids::VerifyIdsReport) -> (Vec<String>, Vec<String>) {
+    let json = r.to_json_value("f");
+    let violations = json["violations"].as_array().expect("violations");
+    let pairs = violations
+        .iter()
+        .filter(|v| v["type"] == "type_order")
+        .map(|v| format!("{} after {}", v["found"], v["after"]).replace('"', ""))
+        .collect();
+    (violations.iter().map(ToString::to_string).collect(), pairs)
+}
+
+const NOT_NODES: pbfhogg::TypeFilter = pbfhogg::TypeFilter {
+    nodes: false,
+    ways: true,
+    relations: true,
+};
+
+const NODES_ONLY: pbfhogg::TypeFilter = pbfhogg::TypeFilter {
+    nodes: true,
+    ways: false,
+    relations: false,
+};
+
+/// Type order on single-kind blobs: the unindexed file, judged from its
+/// decoded kinds, reports what its indexed twin reports from the claims,
+/// in both modes and whatever `-t` selects, since type order covers every
+/// kind in both arms.
+#[test]
+fn check_ids_judges_type_order_on_an_unindexed_file_as_on_its_indexed_twin() {
+    let dir = crate::common::test_scratch();
+    let nodes = [node(1), node(2)];
+    let ways = [way(10, &[1])];
+    let relations = [relation(30, MemberId::Node(1))];
+    let (n, w, r) = (
+        Blob::Nodes(&nodes),
+        Blob::Ways(&ways),
+        Blob::Relations(&relations),
+    );
+    let cases: [(&str, Vec<Blob<'_>>, &[&str]); 4] = [
+        ("in-order", vec![n, w, r], &[]),
+        (
+            "reversed",
+            vec![r, w, n],
+            &[
+                "node after way",
+                "node after relation",
+                "way after relation",
+            ],
+        ),
+        ("way-after-relation", vec![n, r, w], &["way after relation"]),
+        (
+            "node-after-relation-no-ways",
+            vec![r, n],
+            &["node after relation"],
+        ),
+    ];
+    for (name, blobs, want) in cases {
+        let indexed = dir.path().join(format!("{name}-indexed.osm.pbf"));
+        write_blobs(&indexed, &blobs, true);
+        crate::common::assert_every_data_blob_indexed(&indexed);
+        let unindexed = dir.path().join(format!("{name}-unindexed.osm.pbf"));
+        write_blobs(&unindexed, &blobs, false);
+        crate::common::assert_non_indexed(&unindexed);
+        for full in [false, true] {
+            for filter in [None, Some(NOT_NODES), Some(NODES_ONLY)] {
+                let judge = |path: &std::path::Path| {
+                    let r = verify_ids_outcome(path, full, filter)
+                        .complete()
+                        .expect("verify_ids completes");
+                    let counts = [r.node_count, r.way_count, r.relation_count];
+                    (ids_violations(&r), r.total_violations, r.passed, counts)
+                };
+                let got = judge(&unindexed);
+                let what = format!("{name}, full {full}, filter {filter:?}");
+                assert_eq!(got, judge(&indexed), "{what}");
+                assert_eq!(got.0.1, want, "{what}");
+                assert_eq!(got.2, want.is_empty(), "{what}");
+            }
+        }
+    }
+}
+
+/// An unindexed blob is judged by the order the element walk reads it in:
+/// its groups in turn, each group's nodes, then ways, then relations,
+/// whatever its field order (a group holding two kinds breaks the format,
+/// but is read). So a later group holding a kind below an earlier group's
+/// is an inversion, two kinds in one group are not, and an empty group or
+/// an empty dense message holds no kind.
+#[test]
+fn check_ids_judges_an_unindexed_blob_by_its_group_order() {
+    use crate::common::groups::{Field, block, write_unindexed_blocks};
+    use Field::{Dense, Nodes, Relations, Ways};
+
+    /// A fixture's name, its blocks, and the inversions it must report.
+    type Case = (&'static str, Vec<Vec<u8>>, &'static [&'static str]);
+
+    let dir = crate::common::test_scratch();
+    let cases: [Case; 7] = [
+        (
+            "ways-group-then-dense-group",
+            vec![block(&[&[Ways(&[10])], &[Dense(&[1])]])],
+            &["node after way"],
+        ),
+        (
+            "dense-group-then-ways-group",
+            vec![block(&[&[Dense(&[1])], &[Ways(&[10])]])],
+            &[],
+        ),
+        (
+            "ways-field-before-dense-field-in-one-group",
+            vec![block(&[&[Ways(&[10]), Dense(&[1])]])],
+            &[],
+        ),
+        (
+            "plain-nodes-ways-plain-nodes",
+            vec![block(&[&[Nodes(&[1])], &[Ways(&[10])], &[Nodes(&[2])]])],
+            &["node after way"],
+        ),
+        (
+            "sorted-mixed-blob-then-node-blob",
+            vec![
+                block(&[&[Dense(&[1])], &[Ways(&[10])]]),
+                block(&[&[Dense(&[2])]]),
+            ],
+            &["node after way"],
+        ),
+        (
+            "empty-groups-hold-no-kind",
+            vec![block(&[
+                &[Ways(&[10])],
+                &[Dense(&[])],
+                &[],
+                &[Relations(&[30])],
+            ])],
+            &[],
+        ),
+        (
+            "relations-group-then-ways-group",
+            vec![block(&[
+                &[Dense(&[1])],
+                &[Relations(&[30])],
+                &[Ways(&[10])],
+            ])],
+            &["way after relation"],
+        ),
+    ];
+    for (name, blocks, want) in cases {
+        let path = dir.path().join(format!("{name}.osm.pbf"));
+        write_unindexed_blocks(&path, &blocks);
+        crate::common::assert_non_indexed(&path);
+        for full in [false, true] {
+            for filter in [None, Some(NODES_ONLY)] {
+                let r = verify_ids_outcome(&path, full, filter)
+                    .complete()
+                    .expect("verify_ids completes");
+                let what = format!("{name}, full {full}, filter {filter:?}");
+                assert_eq!(ids_violations(&r).1, want, "{what}");
+                assert_eq!(r.total_violations, want.len() as u64, "{what}");
+                assert_eq!(r.passed, want.is_empty(), "{what}");
+            }
+        }
+    }
+}
+
+/// Type-order inversions come first in the report and count against
+/// `--max-errors` like any violation, every one counted in the total, on an
+/// unindexed file as on its indexed twin.
+#[test]
+fn check_ids_type_order_is_reported_first_and_counted_past_the_limit() {
+    let dir = crate::common::test_scratch();
+    let nodes_hi = [node(2)];
+    let nodes_lo = [node(1)];
+    let ways = [way(10, &[1])];
+    let relations = [relation(30, MemberId::Node(1))];
+    let blobs = [
+        Blob::Relations(&relations),
+        Blob::Ways(&ways),
+        Blob::Nodes(&nodes_hi),
+        Blob::Nodes(&nodes_lo),
+    ];
+    let all = [
+        r#"{"after":"way","found":"node","type":"type_order"}"#,
+        r#"{"after":"relation","found":"node","type":"type_order"}"#,
+        r#"{"after":"relation","found":"way","type":"type_order"}"#,
+        r#"{"elem_type":"node","id":1,"prev_id":2,"type":"non_monotonic"}"#,
+    ];
+    for indexed in [false, true] {
+        let path = dir.path().join(format!("limits-{indexed}.osm.pbf"));
+        write_blobs(&path, &blobs, indexed);
+        for (max_errors, stored) in [(1, 1), (3, 3), (0, 4)] {
+            let r = verify_ids_limited(&path, false, None, max_errors)
+                .complete()
+                .expect("verify_ids completes");
+            let what = format!("indexed {indexed}, max_errors {max_errors}");
+            assert_eq!(ids_violations(&r).0, all[..stored], "{what}");
+            assert_eq!(r.total_violations, 4, "{what}");
         }
     }
 }

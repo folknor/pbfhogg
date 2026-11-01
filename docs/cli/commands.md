@@ -160,8 +160,8 @@ Commands that act on blob-level indexdata or tagdata, or on the header's
 `Sort.Type_then_ID` flag, believe them; a few checks happen in passing where
 a command decodes anyway, but none is a guarantee. A file whose claims are
 false can get a wrong answer that reports success. `check --index --ids`
-verifies a file of unknown provenance, except for element-kind order on a
-file without indexdata and the header's feature flags. Which command
+verifies a file of unknown provenance, except for the header's feature
+flags. Which command
 believes which claim, and what a false one costs, is in the
 [indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
@@ -814,7 +814,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--locations` | Verify a LocationsOnWays file's inline way-node coordinates against its node records |
 | `--agreement` | Also require every inline coordinate of a node the file does not contain to agree across the ways referencing it. Requires `--locations` |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
-| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
+| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check). Limits the kinds whose IDs are judged; type order is judged over every kind |
 | `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue [default: 100] |
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
@@ -860,9 +860,13 @@ where a way's reference or a relation's node or way member missed in that
 read: its target not yet read, an ID above the range the check sized from
 the file, or a reference missing in fact. A sorted, referentially complete
 file costs about one read of each blob; no file costs more than one read
-per kind. The type-order check
-of `--ids` needs the claims and is skipped. A `Note:` says the input has
-blobs without indexdata.
+per kind. The type-order check of `--ids` judges the decoded elements in
+the order pbfhogg reads them: blobs and their groups in turn, and within a
+group its nodes, then its ways, then its relations, whatever its field
+order (a group holding several kinds breaks the PBF format; it is read, not
+refused). A blob holding several kinds in order passes it; one whose way
+group comes before a node group fails it (`type order: node after way`).
+A `Note:` says the input has blobs without indexdata.
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 

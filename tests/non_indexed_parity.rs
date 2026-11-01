@@ -566,9 +566,9 @@ fn show_element_non_indexed_parity() {
 // Pins parity between indexed and non-indexed `check --ids --full`
 // reports. An earlier regression fired spurious `TypeOrder` violations on
 // non-indexed input, from offsets compared across per-kind schedules that
-// each held every non-indexed blob. Type order is now judged only from an
-// indexed file's per-kind schedules; a non-indexed file is read in one
-// pass and its type order not judged.
+// each held every non-indexed blob. Type order is now judged from an
+// indexed file's per-kind schedules and from a non-indexed file's decoded
+// kinds, read in one pass.
 
 #[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]

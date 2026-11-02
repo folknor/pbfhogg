@@ -107,8 +107,17 @@ crate::counters::counter_set! {
         pread_calls => "s2_pread_calls",
         open_calls => "s2_open_calls",
         stat_calls => "s2_stat_calls",
+        /// Id shards advised out of the page cache once read back; zero off
+        /// Linux.
         fadvise_calls => "s2_fadvise_calls",
+        /// Bytes of those shards; zero off Linux.
         fadvise_bytes => "s2_fadvise_bytes",
+        /// Slot buckets advised out of the page cache once written back
+        /// ([`SharedSlotBuckets::finish`]), empty ones included; zero off
+        /// Linux.
+        slot_fadvise_calls => "s2_slot_fadvise_calls",
+        /// Bytes written to those buckets; zero off Linux.
+        slot_fadvise_bytes => "s2_slot_fadvise_bytes",
     }
 }
 
@@ -257,7 +266,12 @@ impl SharedSlotBuckets {
         Error::from(err).context(format!("failed to write slot bucket {path}"))
     }
 
-    pub(super) fn finish(&self, invocation: &crate::host::Recorder) -> Result<()> {
+    /// Flush every bucket and, on Linux, write it back and advise it out of
+    /// the page cache, counting each advice into `counters`. Runs once, at
+    /// the end of [`stage2_node_join`], after its workers have joined.
+    fn finish(&self, counters: &Stage2Counters, invocation: &crate::host::Recorder) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (counters, invocation);
         for (bucket, writer_mutex) in self.writers.iter().enumerate() {
             let mut w = writer_mutex
                 .lock()
@@ -284,7 +298,14 @@ impl SharedSlotBuckets {
                 w.get_ref()
                     .sync_data()
                     .map_err(|e| self.sync_error(bucket, e))?;
-                crate::fadvise::evict_scratch(w.get_ref(), invocation);
+                if crate::fadvise::evict_scratch(w.get_ref(), invocation) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    counters.slot_fadvise_calls.fetch_add(1, Relaxed);
+                    let entries = self.entry_counts.get(bucket).map_or(0, |n| n.load(Relaxed));
+                    counters
+                        .slot_fadvise_bytes
+                        .fetch_add(entries * RESOLVED_ENTRY_SIZE as u64, Relaxed);
+                }
             }
         }
         Ok(())
@@ -784,6 +805,11 @@ pub(super) fn stage2_node_join(
     if let Some(e) = s2_error.into_inner().unwrap_or(None) {
         return Err(e);
     }
+
+    // Stage 2's tail: every worker has joined, so the slot buckets are
+    // complete and are written back and evicted here, counted with the rest
+    // of the stage.
+    slot_buckets.finish(&counters, &host.invocation)?;
 
     counters.emit_all(&host.invocation);
     host.invocation.counter("s2_num_workers", num_workers);

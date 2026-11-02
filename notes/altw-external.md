@@ -466,7 +466,7 @@ second device).
 The two 149 GB scratch streams are written once and read once; the
 working set can never fit 26 GB of RAM, so their page-cache residency is
 mostly pure churn against input-blob cache. Read-side DONTNEED already
-exists (shards, slot buckets, under the linux-direct-io feature). The
+exists (shards, slot buckets, in every Linux build). The
 open question is the write side.
 
 Cautions (why this is a probe, not a plan): dirty pages cannot be

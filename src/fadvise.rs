@@ -17,7 +17,7 @@
 //! changes nothing another descriptor or process sees beyond what the read
 //! itself would.
 //!
-//! # Three entries, one of them counted
+//! # Three entries, each eviction counted by its kind
 //!
 //! The `host.page-cache-keep.v1` library capability is proven by the
 //! invocation counter `fadvise_input_evictions` staying 0 under
@@ -30,9 +30,14 @@
 //!   and it always counts. It fails closed: it holds a call on the invocation
 //!   across the syscall, and issues nothing when the invocation refuses one
 //!   (sealed), so no eviction can land after the count was snapshotted.
-//! - [`evict_scratch`] drops pages uncounted, and takes only a
+//! - [`evict_scratch`] takes only a
 //!   [`ScratchFile`](crate::scratch::ScratchFile), which `crate::scratch`
-//!   alone mints, from a path inside the run's own scratch directory.
+//!   alone mints, from a path inside the run's own scratch directory. It
+//!   never counts as an input eviction; it counts apart, as
+//!   `fadvise_scratch_evictions`, so a run that stopped evicting its scratch
+//!   can be told from one that evicts it. That count proves no absence, so it
+//!   needs no fail-closed hold: the caller's capability already keeps the
+//!   invocation from sealing across the call.
 //!
 //! Whether an input is evicted at all is the caller's policy, decided before
 //! it gets here; `brokkr.toml` text rules confine the entry points that arm
@@ -69,7 +74,7 @@ enum Advice {
     Hint(Hint),
     /// `POSIX_FADV_DONTNEED` on an input, counted ([`evict_input`]).
     EvictInput,
-    /// `POSIX_FADV_DONTNEED` on library scratch, uncounted
+    /// `POSIX_FADV_DONTNEED` on library scratch, counted apart from input
     /// ([`evict_scratch`]).
     EvictScratch,
 }
@@ -150,13 +155,20 @@ pub(crate) fn evict_input(
 /// library scratch management, not the caller's page-cache policy
 /// (ADR-0016), and it is not counted as an input eviction; the
 /// [`ScratchFile`](crate::scratch::ScratchFile) argument is what keeps an
-/// input out of it. Returns whether the advice was given (`false` off
-/// Linux); a failure counts into `recorder`.
+/// input out of it. Counted into `recorder`'s `fadvise_scratch_evictions` as
+/// issued, before the syscall and whatever it returns, like an input
+/// eviction; a failure also counts into its `fadvise_failures`. Returns
+/// whether the advice was given (`false` off Linux, where nothing counts).
 #[cfg(target_os = "linux")]
 pub(crate) fn evict_scratch(
     file: &crate::scratch::ScratchFile,
     recorder: &crate::host::Recorder,
 ) -> bool {
+    recorder
+        .metrics()
+        .fadvise
+        .scratch_evictions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The whole file: offset 0, length 0, always expressible.
     if issue(file.as_file(), (0, 0), Advice::EvictScratch) != 0 {
         recorder.metrics().fadvise.record_failure(recorder);
@@ -246,13 +258,18 @@ pub(crate) fn evict_scratch(
 }
 
 crate::counters::counter_set! {
-    /// Failed advice, and input evictions, of one invocation.
+    /// Failed advice, and evictions by kind, of one invocation.
     pub(crate) struct FadviseMetrics {
         /// `posix_fadvise` calls that returned an error.
         failures => "fadvise_failures",
         /// `POSIX_FADV_DONTNEED` advice issued on an input file
         /// ([`evict_input`]), whatever the call returned.
         input_evictions => "fadvise_input_evictions",
+        /// `POSIX_FADV_DONTNEED` advice issued on a library scratch file
+        /// ([`evict_scratch`]), whatever the call returned. Every advice
+        /// issued, on a failed or cancelled run too: it is what the run
+        /// asked for, not what a command expected to ask for.
+        scratch_evictions => "fadvise_scratch_evictions",
     }
     extra {
         /// Serializes a failure's increment with its emission (see
@@ -287,7 +304,7 @@ impl FadviseMetrics {
 #[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
-    use super::{Advice, Hint, advise, evict_input, off_t_max};
+    use super::{Advice, Hint, advise, evict_input, evict_scratch, off_t_max};
     use std::cell::RefCell;
 
     thread_local! {
@@ -309,14 +326,18 @@ pub(crate) mod tests {
         attempts(Advice::Hint(hint))
     }
 
-    fn input_evictions(inv: &crate::host::Invocation) -> u64 {
+    fn counter(inv: &crate::host::Invocation, wanted: &str) -> u64 {
         let mut n = None;
         inv.for_each_counter(|name, value| {
-            if name == "fadvise_input_evictions" {
+            if name == wanted {
                 n = Some(value);
             }
         });
         n.unwrap()
+    }
+
+    fn input_evictions(inv: &crate::host::Invocation) -> u64 {
+        counter(inv, "fadvise_input_evictions")
     }
 
     #[test]
@@ -361,5 +382,30 @@ pub(crate) mod tests {
         assert!(matches!(inv.seal(), crate::host::SealOutcome::Sealed(_)));
         assert!(!evict_input(&file, 0, 1, &inv), "sealed: refused");
         assert_eq!(attempts(Advice::EvictInput), before + 1, "nothing issued");
+    }
+
+    /// A scratch eviction issues exactly one `DONTNEED` of the scratch kind
+    /// and counts exactly one `fadvise_scratch_evictions`, never an input
+    /// eviction. The count and the syscall are pinned to each other here, on
+    /// the calling thread; the altw external integration test pins which
+    /// scratch a run evicts.
+    #[test]
+    fn scratch_evictions_are_issued_and_counted_apart_from_input() {
+        let parent = crate::path_guard::tests::scratch();
+        let run =
+            crate::scratch::RunScratch::create(parent.path(), &crate::host::Host::for_tests())
+                .unwrap();
+        let file = crate::scratch::create(&run.file("bucket").unwrap()).unwrap();
+        std::io::Write::write_all(&mut file.as_file(), b"x").unwrap();
+        let inv = crate::host::Invocation::new();
+        let scratch_before = attempts(Advice::EvictScratch);
+        let input_before = attempts(Advice::EvictInput);
+        let call = inv.call().unwrap();
+        assert!(evict_scratch(&file, &call));
+        drop(call);
+        assert_eq!(attempts(Advice::EvictScratch), scratch_before + 1);
+        assert_eq!(attempts(Advice::EvictInput), input_before);
+        assert_eq!(counter(&inv, "fadvise_scratch_evictions"), 1);
+        assert_eq!(input_evictions(&inv), 0);
     }
 }

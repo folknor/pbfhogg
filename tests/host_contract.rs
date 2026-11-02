@@ -202,6 +202,72 @@ fn input_evictions_follow_the_page_cache_policy() {
     assert!(counted[1] > 0, "Evict asked for no eviction: {counted:?}");
 }
 
+/// Scratch eviction is library scratch management (ADR-0016), so it runs
+/// whatever the page-cache policy and never counts as an input eviction.
+/// Under `Keep`, an external join drops every scratch byte it reads back:
+/// each id shard after stage 2 loads it, each slot bucket once stage 2 has
+/// written it back and again after stage 3 loads it. Every advice the
+/// invocation counts in `fadvise_scratch_evictions` is one of those three
+/// stage counters' (a completed run; a failed stage emits no stage counters
+/// though the advice it issued still counts), so a site that stops evicting,
+/// or a new uncounted one, fails here.
+#[cfg(target_os = "linux")]
+#[test]
+fn external_join_evicts_its_scratch_and_no_input() {
+    let dir = crate::common::test_scratch();
+    let base = input(dir.path());
+    let sink = Arc::new(RecordingSink::default());
+    let mut host = crate::common::test_host();
+    host.page_cache = pbfhogg::host::PageCachePolicy::Keep;
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    run_external_join(
+        &base,
+        &dir.path().join("external.pbf"),
+        &host,
+        crate::common::scratch_in(dir.path()),
+    )
+    .expect("external join");
+
+    let samples = sink.counters.lock().expect("sink").clone();
+    // Stage-end counters are emitted once each; a second sample would hide
+    // behind any last-value reading.
+    let emitted = |name: &str| -> u64 {
+        let values: Vec<i64> = samples
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|&(_, v)| v)
+            .collect();
+        assert_eq!(values.len(), 1, "{name} emitted {values:?}");
+        u64::try_from(values[0]).expect("non-negative")
+    };
+    let id_shards = emitted("s2_fadvise_calls");
+    let slot_written = emitted("s2_slot_fadvise_calls");
+    let slot_read = emitted("s3_fadvise_calls");
+    let slot_bytes = emitted("s2_slot_bytes_written");
+
+    assert!(id_shards > 0, "no id shard evicted");
+    assert_eq!(
+        emitted("s2_fadvise_bytes"),
+        emitted("s1a_id_shard_bytes_written"),
+        "every id-shard byte written is evicted after it is read back"
+    );
+    assert!(emitted("s2_fadvise_bytes") > 0);
+    assert_eq!(slot_written, emitted("extjoin_slot_bucket_count"));
+    assert!(slot_bytes > 0, "the fixture resolves no location");
+    assert_eq!(emitted("s2_slot_fadvise_bytes"), slot_bytes);
+    assert_eq!(slot_read, emitted("extjoin_slot_buckets_nonempty"));
+    assert!(slot_read > 0);
+    assert_eq!(emitted("s3_fadvise_bytes"), slot_bytes);
+    assert_eq!(
+        counter(&host.invocation, "fadvise_scratch_evictions"),
+        id_shards + slot_written + slot_read,
+        "an eviction no stage counter accounts for"
+    );
+    assert_eq!(counter(&host.invocation, "fadvise_input_evictions"), 0);
+}
+
 /// Each run's counters are its own invocation's: two runs at once, on inputs
 /// of different sizes, each count exactly their own output, and a second run
 /// under the same token adds into the same totals. When these were

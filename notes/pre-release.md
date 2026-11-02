@@ -25,7 +25,7 @@ The planet regressions found by the RAM pass below are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
 (apply-changes). The release itself still needs WRK-001, WRK-003 to WRK-005 and the
-maintainer's ruling in WRK-137.
+maintainer's rulings in WRK-137 and WRK-146.
 
 ---
 
@@ -104,6 +104,20 @@ empty value), a CHANGELOG entry, and those three doc passages rewritten.
 The counting engine (the sharded table landed in `befcab8e`) counts per
 key=value text; key-only rows would need a per-key tally beside it or a
 fold of each key's rows at output.
+
+### WRK-146: Maintainer ruling on ADR-0005 and release-mode invariant panics
+
+A decision for the maintainer before 0.6.0.
+`decisions/0005-latent-invariant-debug-asserts.md` (Accepted) makes
+`debug_assert!` plus a comment the default disposition for a latent
+internal invariant and rejects runtime enforcement for its per-blob cost.
+The maintainer's standing line in this file ("What the maintainer has made
+clear") is the opposite: for a broken internal invariant, a release-mode
+panic over a `debug_assert!`. The ADR is the durable record a reader will
+trust, and nothing amends or supersedes it. Rule on how the two reconcile
+(for example: release-mode checks wherever the check is off the
+per-element path, `debug_assert!` only where it would cost per element);
+an amended or superseding ADR follows.
 
 ---
 
@@ -482,19 +496,6 @@ or advise only when the run's decode path can produce a block, and say
 "the block cap" in the table). On the header-only passthrough no block is
 encoded, so the advice can only be wrong there.
 
-### WRK-146: ADR-0005 still defaults broken internal invariants to debug_assert
-
-`decisions/0005-latent-invariant-debug-asserts.md` (Accepted) makes
-`debug_assert!` plus a comment the default disposition for a latent
-internal invariant and rejects runtime enforcement for its per-blob cost.
-The maintainer's standing line in this file ("What the maintainer has made
-clear") is the opposite: for a broken internal invariant, a release-mode
-panic over a `debug_assert!`. The ADR is the durable record a reader will
-trust, and nothing amends or supersedes it. Needs the maintainer's ruling
-on how the two reconcile (for example: release-mode checks wherever the
-check is off the per-element path, `debug_assert!` only where it would
-cost per element), then an amended or superseding ADR.
-
 ### WRK-037: ParallelGzipWriter window size
 
 At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB
@@ -583,20 +584,6 @@ denmark indexed cells put digest at 503 ms on `d2d8836a` against 701 ms on
 `4157567d`, about 39 % slower, after the digest `v2` change (`16154b0d`).
 The ticket suggests a `--form content` run to separate drift from code.
 The recorded "no cost" claim for v2 needs re-checking against that.
-
-### WRK-143: Scratch eviction has no test that it happens
-
-altw external evicts its id shards (stage 2) and slot buckets (stage 3)
-through `fadvise::evict_scratch` and counts it in `s2_fadvise_calls`,
-`s2_fadvise_bytes`, `s3_fadvise_calls` and `s3_fadvise_bytes`. Nothing in
-`tests/`, `cli/tests/` or `harness/` reads those counters, and no test calls
-`evict_scratch`, so a change that silently stopped scratch eviction (a
-reader that lost its `ScratchFile`, a gate that never opens) would pass
-every check. Input eviction has its own pins (`fadvise_input_evictions` in
-`tests/host_contract.rs` and the harness `page-cache-keep` scenario);
-scratch eviction wants the matching one: an altw external run under the
-test host reporting nonzero `s2_fadvise_calls` and `s3_fadvise_calls` on
-Linux.
 
 ---
 

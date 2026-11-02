@@ -366,16 +366,6 @@ does not fit, the shape is to sort and print from the shards without
 owning the strings, which the public `Vec<TagCount>` return type rules
 out: a streaming or borrowed-row API.
 
-### WRK-138: inspect tags' unindexed Note says the type filter is a no-op
-
-Without indexdata, `tags_count_inner` (`src/commands/tags_count/mod.rs`)
-passes `require_indexdata` the message "Without indexdata, the type filter
-is a no-op - all blobs are decompressed". Only the blob pruning is lost:
-`tally::TagRuns` still admits elements by kind, so `--type node --force`
-counts node tags only. Reword it to say every blob is decompressed, not
-that the filter does nothing; check the other `require_indexdata` callers'
-messages for the same claim.
-
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 
 The unsorted single-pass extract paths (`src/commands/extract/simple.rs`,

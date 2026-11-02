@@ -238,6 +238,31 @@ pub struct TagsFilterOptions<'a> {
     pub distrust_metadata: bool,
 }
 
+impl TagsFilterOptions<'_> {
+    /// Whether [`tags_filter`] with these options refuses a PBF input without
+    /// blob-level indexdata unless `write.force` is set: whether the run
+    /// would skip blobs on their indexdata. The two-pass mode always would
+    /// (its way-dependency scan reads way blobs only); the single pass
+    /// (`add_referenced` `None`) only when its expressions restrict the
+    /// element kinds; `invert` and `distrust_metadata` never. Tag-key
+    /// skipping reads tagdata, not indexdata, so it does not count. A
+    /// malformed expression is the same error [`tags_filter`] returns.
+    pub fn requires_indexdata(&self) -> Result<bool> {
+        let expressions = parse_expressions(self.expression_strs)?;
+        Ok(self.requires_indexdata_for(&expressions))
+    }
+
+    /// [`Self::requires_indexdata`] over expressions already parsed.
+    fn requires_indexdata_for(&self, expressions: &[Expression]) -> bool {
+        if self.invert || self.distrust_metadata {
+            return false;
+        }
+        self.add_referenced.is_some()
+            || trusted_blob_filter(expressions, self.invert, self.distrust_metadata)
+                .is_some_and(|filter| filter.uses_index())
+    }
+}
+
 /// Filter a PBF file by tag expressions.
 ///
 /// With `add_referenced` set, the objects the direct matches reference are
@@ -290,9 +315,12 @@ pub(crate) fn tags_filter_to<'a>(
     let pin = input.into().pin(host)?;
     let input = &pin;
 
-    // Blob-level filtering can't help in invert mode (we want non-matching
-    // blobs), and `--distrust-metadata` declines to use it at all - demanding
-    // indexdata the run will not consult would be a pointless refusal.
+    // Indexdata is demanded only where the run would skip blobs on it
+    // (`TagsFilterOptions::requires_indexdata`): never in invert mode (we
+    // want non-matching blobs) or under `--distrust-metadata` (which declines
+    // to use it), and in `-R`'s single pass only when the expressions
+    // restrict the element kinds. Demanding indexdata the run will not
+    // consult would be a refusal with no slower path behind it.
     //
     // A partially indexed file (some data blobs with indexdata, some without,
     // in either order) is refused on every path, `--invert-match` and
@@ -304,13 +332,16 @@ pub(crate) fn tags_filter_to<'a>(
     // question of whether a path could cope; distrusting the claims is not
     // waiving it. reference/indexdata-trust.md, "Missing and partial
     // indexdata".
-    if !opts.invert && !opts.distrust_metadata {
+    // The reason names only kind skipping: tag-key skipping reads tagdata,
+    // which an unindexed file may still carry, and every element is still
+    // matched against the expressions on a forced run.
+    if opts.requires_indexdata_for(&expressions) {
         require_indexdata(
             input,
             opts.write.direct_reads,
             opts.write.force,
-            "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
-             filters are no-ops - all blobs are decompressed (significantly slower).",
+            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+             element type, so blobs of types a pass does not need are decompressed too.",
             host,
         )?;
     }

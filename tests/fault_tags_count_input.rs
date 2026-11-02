@@ -8,10 +8,11 @@
 //! each of its opens in turn, the last included. Both opens are taken on the
 //! calling thread, one at a time, so the counts are exact.
 //!
-//! The opens, in order, on every route: the indexdata probe, then the
-//! schedule walk, whose descriptor the classify pool preads. A type filter,
-//! expressions (a tag index that skips some or every blob), a forced
-//! unindexed input and direct reads change neither.
+//! The opens, in order: the indexdata probe, on a route that skips blobs on
+//! indexdata (a single-kind type filter here), then on every route the
+//! schedule walk, whose descriptor the classify pool preads. Expressions (a
+//! tag index that skips some or every blob), a forced unindexed input and
+//! direct reads change neither.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -23,8 +24,14 @@ use crate::common::{
     TestWay, generate_nodes, write_multi_block_non_indexed_pbf, write_multi_block_test_pbf,
 };
 
-/// Every route opens the input twice after the pin.
-const OPENS: u64 = 2;
+impl Route {
+    /// Opens of the input after the pin: the schedule walk, and before it
+    /// the indexdata probe on a route that skips blobs on indexdata (the
+    /// ways-only filter; `amenity=*` and `craft=*` name every kind).
+    fn opens(self) -> u64 {
+        1 + u64::from(matches!(self.filter, Filter::Ways))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Filter {
@@ -161,10 +168,11 @@ fn reference(
     dir: &Path,
     skippable: impl Fn(&pbfhogg::Error) -> bool,
 ) -> Reference {
+    let opens = route.opens();
     let host = crate::common::test_host();
     host.invocation
         .faults()
-        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), OPENS + 1);
+        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
     let counts = match run(route, input, &host) {
         Ok(counts) => counts,
         Err(e) if skippable(&e) => {
@@ -179,8 +187,8 @@ fn reference(
         .input_replacement()
         .expect("armed replacement");
     assert!(!counted.fired, "{route:?}: {counted:?}");
-    assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
-    assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
+    assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
+    assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
     assert_eq!(counts, expected(route), "{route:?}: the unreplaced counts");
     Reference::Counts(counts)
@@ -190,7 +198,8 @@ fn reference(
 /// in both reopen modes, against the unreplaced `expected`.
 fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &Counts) {
     let replacement = dir.join("replacement.osm.pbf");
-    for after in 1..=OPENS {
+    let opens = route.opens();
+    for after in 1..=opens {
         for force_path in [true, false] {
             write_input(input, route);
             write_replacement(&replacement);
@@ -221,16 +230,16 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &Counts)
 
             // After the last open nothing opens again, so the run reads only
             // what it already holds, in either mode.
-            if procfs || after == OPENS {
+            if procfs || after == opens {
                 let counts = result.unwrap_or_else(|e| {
                     panic!("{cell}: the run is unaffected by the replacement: {e}")
                 });
-                assert_eq!(report.attempts, OPENS, "{cell}: {report:?}");
-                assert_eq!(report.verified, OPENS, "{cell}: {report:?}");
+                assert_eq!(report.attempts, opens, "{cell}: {report:?}");
+                assert_eq!(report.verified, opens, "{cell}: {report:?}");
                 assert_eq!(report.refused, 0, "{cell}: {report:?}");
                 assert_eq!(
                     report.attempts_after_fired,
-                    OPENS - after,
+                    opens - after,
                     "{cell}: {report:?}"
                 );
                 assert_eq!(
@@ -281,14 +290,57 @@ fn every_filter_reads_only_the_pinned_input() {
     }
 }
 
-/// Forced on an input without indexdata: the probe and the walk still open
-/// once each.
+/// On an input without indexdata: forced where the route probes, the probe
+/// and the walk still open once each; where it does not, the walk alone.
 #[test]
 fn a_forced_unindexed_input_reads_only_the_pinned_input() {
-    check_route(Route {
-        unindexed: true,
+    for filter in [Filter::None, Filter::Ways] {
+        check_route(Route {
+            filter,
+            unindexed: true,
+            ..Route::PLAIN
+        });
+    }
+}
+
+/// An unindexed input on a route that skips nothing on indexdata is counted
+/// without `force`, and only the selected kind is counted when a forced
+/// route has lost its kind skipping.
+#[test]
+fn an_unindexed_input_is_refused_only_where_indexdata_would_skip_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input, true, ("cafe", "bakery", "primary"));
+    let host = crate::common::test_host();
+    for filter in [Filter::None, Filter::Amenity, Filter::Absent] {
+        let route = Route {
+            filter,
+            ..Route::PLAIN
+        };
+        let counts = run(route, &input, &host)
+            .unwrap_or_else(|e| panic!("{filter:?}: an unforced run must count: {e}"));
+        assert_eq!(counts, expected(route), "{filter:?}");
+    }
+    let ways = Route {
+        filter: Filter::Ways,
         ..Route::PLAIN
-    });
+    };
+    let err = run(ways, &input, &host)
+        .err()
+        .unwrap_or_else(|| panic!("a ways-only run must refuse without force"));
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::MissingIndexdata { .. }),
+        "{err:?}"
+    );
+    let forced = Route {
+        unindexed: true,
+        ..ways
+    };
+    assert_eq!(
+        run(forced, &input, &host).expect("forced"),
+        expected(ways),
+        "a forced ways-only run counts way tags only"
+    );
 }
 
 /// The probe opens `O_DIRECT` when asked to, through the pin's own direct
@@ -298,6 +350,7 @@ fn a_forced_unindexed_input_reads_only_the_pinned_input() {
 fn direct_reads_follow_the_pinned_input() {
     let route = Route {
         direct: true,
+        filter: Filter::Ways,
         ..Route::PLAIN
     };
     let dir = crate::common::test_scratch();

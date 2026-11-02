@@ -32,7 +32,9 @@ use pbfhogg::MemberId;
 /// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [--invert-match]
 /// [--remove-tags] [-j N] <expressions...> [--force]` and assert success.
 /// `--force` is left out with `--invert-match`, which never refuses an
-/// unindexed input and so refuses the flag. Returns the captured stderr
+/// unindexed input and so refuses the flag, and with `-R`, whose one pass
+/// refuses it unless the expressions leave some element type out (the
+/// fixtures are indexed, so it is never needed). Returns the captured stderr
 /// (which carries the `TagsFilterStats::write_summary` line).
 fn run_filter_full(
     input: &Path,
@@ -53,7 +55,7 @@ fn run_filter_full(
     }
     if invert {
         cli = cli.arg("--invert-match");
-    } else {
+    } else if !omit_referenced {
         cli = cli.arg("--force");
     }
     if remove_tags {
@@ -463,7 +465,6 @@ fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
         .arg("-o")
         .arg(&output)
         .arg("-R")
-        .arg("--force")
         .arg("-e")
         .arg(&exprs)
         .assert_success();

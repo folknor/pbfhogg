@@ -1196,7 +1196,13 @@ const POLICY: &[PolicyRow] = &[
     ),
     refuses("repack", repack, FORCE_NOTED),
     refuses("tags-filter", tags_filter, FORCE_NOTED),
-    refuses("tags-filter -R", tags_filter_omit, FORCE_NOTED),
+    // `-R`'s one pass skips blobs on indexdata only for expressions that
+    // leave a kind out; `highway` alone names every kind.
+    refuses(
+        "tags-filter -R w/highway",
+        tags_filter_omit_typed,
+        FORCE_NOTED,
+    ),
     refuses("getid", getid, FORCE_NOTED),
     refuses("getid --invert", getid_invert, FORCE_NOTED),
     refuses("getid --add-referenced", getid_add_referenced, FORCE_NOTED),
@@ -1211,7 +1217,12 @@ const POLICY: &[PolicyRow] = &[
     // degrade's decode path (a transformation that re-encodes elements).
     refuses("degrade --strip-locations", degrade, FORCE_NOTED),
     refuses("inspect --nodes", inspect_nodes, FORCE_NOTED),
-    refuses("inspect tags", inspect_tags, FORCE_NOTED),
+    refuses("inspect tags --type", inspect_tags_typed, FORCE_NOTED),
+    refuses(
+        "inspect tags w/highway",
+        inspect_tags_kind_expr,
+        FORCE_NOTED,
+    ),
     // Refuse with no escape.
     PolicyRow {
         label: "renumber",
@@ -1259,6 +1270,21 @@ const POLICY: &[PolicyRow] = &[
     falls_back(
         "tags-filter --distrust-metadata",
         tags_filter_distrust,
+        Says::Nothing,
+    ),
+    // Nothing to skip on indexdata: the schedule holds every blob either
+    // way, and tag-key skipping reads tagdata.
+    falls_back("tags-filter -R", tags_filter_omit, Says::Nothing),
+    falls_back("inspect tags", inspect_tags, Says::Nothing),
+    falls_back(
+        "inspect tags highway",
+        inspect_tags_untyped_expr,
+        Says::Nothing,
+    ),
+    // Typed expressions whose union names every kind skip no kind.
+    falls_back(
+        "inspect tags w/highway highway",
+        inspect_tags_union_expr,
         Says::Nothing,
     ),
     falls_back("extract --simple", extract_simple, Says::Text(BLOBS_NOTE)),
@@ -1319,6 +1345,32 @@ const POLICY: &[PolicyRow] = &[
         policy: Policy::Verifies("Indexed:  no"),
     },
 ];
+
+fn tags_filter_omit_typed(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["tags-filter"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .words(&["w/highway", "-R"])
+}
+
+fn inspect_tags_kind_expr(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect", "tags"])
+        .arg(input)
+        .words(&["w/highway"])
+}
+
+fn inspect_tags_untyped_expr(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect", "tags"])
+        .arg(input)
+        .words(&["highway"])
+}
+
+fn inspect_tags_union_expr(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect", "tags"])
+        .arg(input)
+        .words(&["w/highway", "highway"])
+}
 
 fn tags_filter_invert(c: &Ctx, input: &Path) -> Invocation {
     tags_filter(c, input).words(&["--invert-match"])
@@ -1659,9 +1711,24 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
         &["--force"],
         Mixed::RefusesPartial,
     ),
+    // No first-blob gate on an untyped `-R` (its `--force` is refused as
+    // ineffective), so the partial refusal is its first word.
     (
-        "tags-filter -R --force",
+        "tags-filter -R",
         tags_filter_omit,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter -R w/highway --force",
+        tags_filter_omit_typed,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    ("inspect tags", inspect_tags, &[], Mixed::RefusesPartial),
+    (
+        "inspect tags --type --force",
+        inspect_tags_typed,
         &["--force"],
         Mixed::RefusesPartial,
     ),

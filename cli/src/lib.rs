@@ -636,6 +636,56 @@ fn validate_osc_output(
         .map_err(|e| usage(path, e))
 }
 
+/// The refusal of `--force` on a command line whose run would not refuse
+/// unindexed input (it skips no blob on indexdata), which the expressions,
+/// not clap, decide.
+fn force_refused(path: &[&str]) -> Box<dyn std::error::Error> {
+    usage(
+        path,
+        "the argument '--force' has no effect here: this configuration accepts unindexed \
+         input without it",
+    )
+}
+
+/// tags-filter's switches that shape its library options.
+#[derive(Clone, Copy)]
+struct TagsFilterFlags {
+    omit_referenced: bool,
+    remove_tags: bool,
+    invert_match: bool,
+    distrust_metadata: bool,
+    direct_io: bool,
+    force: bool,
+}
+
+/// The library options a PBF tags-filter run executes, built in one place so
+/// the `--force` check in `validate_tags_filter` asks about exactly the run
+/// the dispatch makes.
+fn tags_filter_options<'a>(
+    expressions: &'a [String],
+    flags: TagsFilterFlags,
+    compression: Compression,
+    jobs: pbfhogg::Parallelism,
+) -> pbfhogg::tags_filter::TagsFilterOptions<'a> {
+    // Clap has refused `-R` beside `--remove-tags` or an explicit `-j`, so
+    // `-R` drops nothing here.
+    pbfhogg::tags_filter::TagsFilterOptions {
+        expression_strs: expressions,
+        add_referenced: (!flags.omit_referenced).then_some(pbfhogg::tags_filter::AddReferenced {
+            remove_tags: flags.remove_tags,
+            parallelism: jobs,
+        }),
+        invert: flags.invert_match,
+        write: WriteOptions {
+            compression,
+            backend: OutputBackend::from_flags(flags.direct_io, false),
+            direct_reads: flags.direct_io,
+            force: flags.force,
+        },
+        distrust_metadata: flags.distrust_metadata,
+    }
+}
+
 fn validate_tags_filter(
     command: &Command,
     matches: &clap::ArgMatches,
@@ -653,6 +703,8 @@ fn validate_tags_filter(
         force,
         header,
         output,
+        compression,
+        jobs,
         ..
     } = command
     else {
@@ -660,6 +712,27 @@ fn validate_tags_filter(
     };
     // The expressions first: they need no input, and the sniff below opens it.
     let expressions = filter_expressions(expressions_file.as_deref(), expressions)?;
+    // `--force` where the PBF run would not refuse unindexed input is
+    // ineffective, and the options alone settle that, so it is refused
+    // before the sniff. (On OSC input `--force` is refused below either way.)
+    if *force {
+        let opts = tags_filter_options(
+            &expressions,
+            TagsFilterFlags {
+                omit_referenced: *omit_referenced,
+                remove_tags: *remove_tags,
+                invert_match: *invert_match,
+                distrust_metadata: distrust.distrust_metadata,
+                direct_io: io.direct_io,
+                force: *force,
+            },
+            compression.compression,
+            *jobs,
+        );
+        if !opts.requires_indexdata()? {
+            return Err(force_refused(&["tags-filter"]));
+        }
+    }
     let kind = input_kind.unwrap_or_else(|| detect_input_kind(file));
     if matches!(kind, InputKind::Pbf) {
         return Ok((kind, expressions));
@@ -1588,7 +1661,9 @@ enum Command {
         io: DirectIoArg,
         /// Proceed on input without blob-level indexdata, which this command
         /// would otherwise refuse, through its slower fallback path. Not
-        /// with --invert-match or --distrust-metadata, which never refuse
+        /// with --invert-match or --distrust-metadata, which never refuse,
+        /// nor with -R unless the expressions together leave some element
+        /// type out (the one-pass filter then skips no blob on indexdata)
         #[arg(long, conflicts_with_all = ["invert_match", "distrust_metadata"])]
         force: bool,
         #[command(flatten)]
@@ -2783,26 +2858,19 @@ pub fn run() -> process::ExitCode {
                         run_tags_filter_osc(&file, output.open(&host)?, &expressions, jobs, &host)
                     }
                     InputKind::Pbf => {
-                        let write = WriteOptions {
-                            compression: compression.compression,
-                            backend: OutputBackend::from_flags(io.direct_io, false),
-                            direct_reads: io.direct_io,
-                            force,
-                        };
-                        // Clap has refused `-R` beside `--remove-tags` or an
-                        // explicit `-j`, so `-R` drops nothing here.
-                        let opts = pbfhogg::tags_filter::TagsFilterOptions {
-                            expression_strs: &expressions,
-                            add_referenced: (!omit_referenced).then_some(
-                                pbfhogg::tags_filter::AddReferenced {
-                                    remove_tags,
-                                    parallelism: jobs,
-                                },
-                            ),
-                            invert: invert_match,
-                            write,
-                            distrust_metadata: distrust.distrust_metadata,
-                        };
+                        let opts = tags_filter_options(
+                            &expressions,
+                            TagsFilterFlags {
+                                omit_referenced,
+                                remove_tags,
+                                invert_match,
+                                distrust_metadata: distrust.distrust_metadata,
+                                direct_io: io.direct_io,
+                                force,
+                            },
+                            compression.compression,
+                            jobs,
+                        );
                         run_tags_filter(
                             &file,
                             output.open(&host)?,
@@ -3892,6 +3960,12 @@ fn run_tags_count(
         force,
         parallelism,
     };
+    // `--force` on a run that skips no blob on indexdata, which accepts
+    // unindexed input anyway, is ineffective; the expressions decide that,
+    // so it is refused here rather than by clap, still before the input.
+    if force && !opts.requires_indexdata()? {
+        return Err(force_refused(&["inspect", "tags"]));
+    }
     let results = pbfhogg::tags_count::tags_count(path, &opts, host)?;
 
     use pbfhogg::text_quote::Quoted;

@@ -11,8 +11,21 @@
   input, `--simplify` or `-j 1` makes none, needs no writable scratch
   location, and refuses `--tmp-dir` as a usage error (exit `64`) instead
   of accepting it unused.
+- `inspect tags` asks for indexdata only when it would skip blobs on it:
+  with `--type`, or with expressions that together leave some element type
+  out (`w/highway`). Any other run, including a plain `inspect tags`, reads
+  an unindexed input as it is instead of refusing it, and refuses `--force`
+  as ineffective (exit `64`). `tags-filter -R` does the same when its
+  expressions name every element type (`highway`): it no longer refuses
+  unindexed input there, and refuses `--force`. A script passing `--force`
+  to such a command line drops it.
 
 **Library**
+
+- `tags_count::tags_count` refuses unindexed input only where
+  `TagCountOptions::requires_indexdata` says so, and
+  `tags_filter::tags_filter` only where
+  `TagsFilterOptions::requires_indexdata` does; both methods are new.
 
 - `merge_changes::merge_changes` takes a `MergeMode` in place of
   `simplify`, `allow_version_regression` and the `RunScratch`:
@@ -57,6 +70,15 @@
 
 ### Changed
 
+- A refusal of unindexed input says what indexdata would have bought the
+  run (skipping blobs by element type, ID range or node bounding box, or
+  copying them whole) instead of calling the type, tag-key, ID or bbox
+  filter "a no-op": on a `--force` run every filter still applies to every
+  decoded element, and tag-key skipping, which reads tagdata, still skips
+  blobs. The forced run's `Note:` now reads `Input contains blobs without
+  indexdata; proceeding without its optimizations`.
+- `getid --add-referenced` skips way blobs when no way ID is requested; it
+  decoded every way blob before.
 - `inspect tags` ends with `D distinct key/value pairs counted, K passed
   the count thresholds` on stderr in place of `N distinct tag values`,
   whose number was the rows printed, not distinct values: with

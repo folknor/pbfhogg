@@ -946,8 +946,9 @@ pub(crate) fn extract_to(
         // the header again on their own descriptions.
         super::input_front::InputFront::open(input, write.direct_reads, host)?.require_indexdata(
             write.force,
-            "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
-             filter is a no-op - all blobs are decompressed (significantly slower).",
+            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+             element type or node bounding box, and may be decompressed repeatedly across \
+             processing phases.",
             host,
         )?;
     }

@@ -407,6 +407,21 @@ const REFUSALS: &[(&[&str], &str)] = &[
         ],
         "OSC mode",
     ),
+    // `--force` on a run that skips no blob on indexdata, which therefore
+    // never refuses unindexed input; the expressions decide it.
+    (&["inspect", "tags", "IN", "--force"], "no effect"),
+    (
+        &["inspect", "tags", "IN", "highway", "--force"],
+        "no effect",
+    ),
+    (
+        &["inspect", "tags", "IN", "w/highway", "highway", "--force"],
+        "no effect",
+    ),
+    (
+        &["tags-filter", "IN", "-o", "OUT", "-R", "highway", "--force"],
+        "no effect",
+    ),
     // A malformed value.
     (
         &["renumber", "IN", "-o", "OUT", "--start-id", "1,2"],
@@ -778,7 +793,7 @@ const FORCE: &[ForceRow] = &[
     },
     ForceRow {
         command: "inspect tags",
-        words: &["inspect", "tags", "U"],
+        words: &["inspect", "tags", "U", "--type", "way"],
     },
     ForceRow {
         command: "build-geocode-index",

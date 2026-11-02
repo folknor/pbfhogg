@@ -304,9 +304,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             // determine the blob's kind or bbox up front, so replicate into
             // every per-kind schedule; classify closures below already
             // kind-filter via `match element`, so blobs of the wrong kind
-            // no-op at the element level. Mirrors the same replication
-            // pattern in `scan::classify::build_classify_schedules_split`
-            // and `multi::try_extract_multi_single_pass`.
+            // no-op at the element level. The same replication repack and
+            // degrade ask for through `scan::classify::KindSchedules::
+            // into_replicated`, and `multi::try_extract_multi_single_pass`
+            // does.
             node_schedule.push(entry);
             way_schedule.push(entry);
             relation_schedule.push(entry);

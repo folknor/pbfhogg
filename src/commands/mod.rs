@@ -559,9 +559,13 @@ pub(crate) fn clean_metadata<'a>(
 ///
 /// Returns `true` if indexdata is present, `false` if absent but `force` is set;
 /// the forced case emits the one keyed Note every forced run shares.
-/// The `reason` should be a complete sentence explaining why indexdata matters,
-/// e.g. "input PBF has no blob-level indexdata. Without indexdata, the type
-/// filter is a no-op - all blobs are decompressed (significantly slower)."
+/// The `reason` is a complete sentence naming what indexdata buys this run
+/// and so what a forced run loses, e.g. "input PBF has no blob-level
+/// indexdata. Without it, blobs cannot be skipped by element type, so blobs
+/// of unselected types are decompressed too." A filter the command applies
+/// still applies to every decoded element on a forced run, so a reason never
+/// calls it ineffective; and a run that would skip nothing on indexdata does
+/// not call this at all, since it has no slower path to refuse.
 // Call sites own acceptance policy and the reason: getparents can choose a
 // scan arm without refusing input, extract gates only complete/smart, and
 // renumber requires metadata in every scheduled blob with no force fallback.
@@ -599,13 +603,16 @@ pub(crate) fn indexdata_policy(
     if !present {
         // The one statement every forced run on unindexed input makes. It
         // shares the reader's key, so the filter notes that would follow
-        // from the same run are folded into it.
+        // from the same run are folded into it. It names no speed: what a
+        // forced run loses is the reason's subject, and whether that costs
+        // this file anything (a tag index may skip the same blobs, a file
+        // may hold only the selected kind) is not known here.
         crate::host::diag_once!(
             host.diagnostics,
             &host.invocation,
             Note,
             "reader.filter_without_indexdata",
-            "Input contains blobs without indexdata; proceeding without it, this run is slower"
+            "Input contains blobs without indexdata; proceeding without its optimizations"
         );
     }
     Ok(present)

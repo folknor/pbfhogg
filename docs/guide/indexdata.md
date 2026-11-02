@@ -79,12 +79,12 @@ These commands will error if the input PBF lacks indexdata:
 - `sort` - blob-level permutation for sorted inputs
 - `add-locations-to-ways` - parallel node index building, blob passthrough
 - `extract` (complete-ways and smart strategies) - spatial blob filtering
-- `tags-filter` - skips blobs lacking required tag keys
+- `tags-filter` - skips blobs of element types a pass does not need (skipping blobs that lack the required tag keys reads tagdata, which works without indexdata)
 - `getid` - skips blobs whose ID range has no intersection with requested IDs
 - `cat --type` (with or without `--clean`) - skips non-matching blob types entirely (except `--type node,way,relation --clean`, which skips nothing and does not refuse)
 - `cat --dedupe` - blob-level overlap planning and merging
 - `repack`, and `degrade` on its decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`; its header-only flags never refuse) - per-kind blob schedules
-- `inspect tags` (with or without `--type`) - its blob schedule
+- `inspect tags` with `--type`, or with expressions that together leave some element type out - skips blobs of the other types
 - `inspect --nodes` - node coordinate analysis
 - `build-geocode-index` - multi-pass pipeline with type filtering (escape differs, see below)
 - `renumber` - per-blob element counts for ID assignment (no escape, see below)
@@ -105,7 +105,11 @@ The escape, and whether a command refuses at all, is decided per command:
   unsorted file), an ID above the range the check sized from the file, or
   a reference that is missing in fact.
 - `tags-filter` asks for indexdata only when it would use it: not with
-  `--invert-match` or `--distrust-metadata`, nor on OSC input.
+  `--invert-match` or `--distrust-metadata`, not with `-R` when its
+  expressions together name every element type (that single pass then skips
+  blobs on tagdata alone), nor on OSC input.
+- `inspect tags` without `--type` and without a kind-restricting expression
+  does not refuse: it schedules every blob whether or not it is indexed.
 - `cat --clean` without `--type` does not refuse: it decodes every blob
   exactly once whether or not it is indexed, so indexdata would save it
   nothing.
@@ -146,7 +150,7 @@ check and proceed with a raw (non-indexed) PBF:
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
 ```
 
-Commands will work but use slower fallback paths - they must decompress every blob to determine its contents instead of reading the blob header metadata. `--force` is not a universal escape: see the exceptions above.
+Commands will work but use slower fallback paths: they decompress the blobs indexdata would have let them skip (by element type, ID range or node bounding box) or copy whole, and find out what each holds by decoding it. Every filter still applies to every decoded element; only the blob-level shortcuts are lost. `--force` is not a universal escape: see the exceptions above.
 
 The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
 

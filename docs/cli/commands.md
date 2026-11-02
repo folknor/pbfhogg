@@ -291,12 +291,26 @@ to proceed anyway.` only where
 `--force` is accepted: modes that need indexdata whatever `--force` says get
 no such line, and `build-geocode-index` names `--allow-unindexed` instead.
 
+A command refuses only on paths where indexdata buys the run something, and
+the refusal says what: skipping blobs by element type, ID range or node
+bounding box, or copying a blob whole. A forced run loses only that. Every
+filter the command applies still applies to every element it decodes, so
+`inspect tags --type node --force` counts node tags only, and tag-key
+skipping, which reads tagdata rather than indexdata, still skips blobs. The
+forced run prints one `Note:`, `Input contains blobs without indexdata;
+proceeding without its optimizations`. Where a path skips nothing on
+indexdata it takes an unindexed input as it is, and `--force` there is
+refused as ineffective (see [Flag rules](#flag-rules)); for `inspect tags` and
+`tags-filter -R` the expressions decide which, so that refusal follows the
+expressions check rather than clap's.
+
 | Command | Refuses unindexed input on | `--force` refused with |
 |---------|----------------------------|------------------------|
 | cat | `--type` (with or without `--clean`), `--dedupe` | plain `cat`, which adds the indexdata, `--reindex`, which rescans every blob whatever it carries, and `--clean` without `--type`, which decodes every blob exactly once either way. `--type node,way,relation --clean` is the clean pass and does not refuse; `--force` alongside it is accepted and does nothing |
-| sort, repack, getid (with or without `--invert`), inspect tags | every path | - |
+| sort, repack, getid (with or without `--invert`) | every path | - |
+| inspect tags | `--type`, or expressions that together leave some element type out (`w/highway`, not `highway` or `w/highway highway`) | any other run, which schedules every blob either way |
 | degrade | the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`) | only header-only flags |
-| tags-filter | PBF input | `--invert-match`, `--distrust-metadata` (neither refuses), OSC input |
+| tags-filter | PBF input, except `-R` with expressions that name every element type | `--invert-match`, `--distrust-metadata` (neither refuses), `-R` whose expressions name every element type, OSC input |
 | extract | complete-ways and `--smart` | `--simple` |
 | inspect | `--nodes` | anything but `--nodes` |
 | add-locations-to-ways | sparse, and `--index-type auto` routing to it | `--index-type external` and `--inject-prepass`, which need indexdata whatever `--force` says |
@@ -756,7 +770,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-t, --type <TYPE>` | Count one element type: exactly one of node, way, or relation (a list is refused) |
 | `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
+| `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)). Only with `--type` or expressions that together leave some element type out: any other run schedules every blob whether or not it is indexed, does not refuse unindexed input, and refuses `--force` as ineffective |
 
 Each output row on stdout is three tab-separated fields: the count, then the
 key and the value, each a double-quoted literal escaped as in
@@ -1391,7 +1405,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `--distrust-metadata` | Do not skip blobs on their `indexdata` or tag index; decode every blob. Blob-level tag-index skipping is a trust boundary with nothing on the other side of it - nothing validates a blob's tag index against its payload - so a file whose index omits a key its elements carry silently loses those elements from the output. This flag trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition (`--force` is not needed alongside it). Not valid in OSC mode, which has no blobs. `degrade --corrupt-tagdata` produces the file this flag exists for. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed on unindexed input with the slower fallback. Not with `--invert-match` or `--distrust-metadata`, which never refuse |
+| `--force` | Proceed on unindexed input with the slower fallback. Not with `--invert-match` or `--distrust-metadata`, which never refuse, nor with `-R` when the expressions together name every element type (`highway`, not `w/highway`): that single pass skips no blob on indexdata and takes unindexed input as it is |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 

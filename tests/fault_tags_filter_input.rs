@@ -20,7 +20,9 @@
 //!   convergence round), the way-dependency schedule walk, pass 2's header
 //!   read and pass 2's schedule walk (its descriptor serves the decode
 //!   workers).
-//! - `-R`: the probe (under the same condition) and the pipelined reader.
+//! - `-R`: the probe (under the same condition, and only for expressions
+//!   that leave some kind out, as every route's here do: no `n/`) and the
+//!   pipelined reader.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;

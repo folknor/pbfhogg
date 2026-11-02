@@ -499,15 +499,19 @@ fn getid_dispatched<'a>(
     // any other open of the input; a caller's pin is used as it is.
     let pin = input.into().pin(host)?;
     let input = &pin;
-    let has_indexdata = require_indexdata(
-        input,
-        write.direct_reads,
-        write.force,
-        "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-         based on requested ID types is a no-op - all blobs are decompressed \
-         (significantly slower).",
-        host,
-    )?;
+    // Every element is still matched against the requested IDs on a forced
+    // run; what is lost is the blob skipping. The include paths skip on kind
+    // and ID range, `add_referenced`'s two passes on kind alone (pass 1 reads
+    // way blobs only; pass 2 skips the kinds nothing was requested of).
+    let reason = if opts.add_referenced.is_some() {
+        "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+         element type, so blobs of types a pass does not need are decompressed too."
+    } else {
+        "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+         element type or ID range, so blobs holding none of the requested IDs are \
+         decompressed too."
+    };
+    let has_indexdata = require_indexdata(input, write.direct_reads, write.force, reason, host)?;
 
     // The indexdata result selects an arm only for the no-references path.
     // add_referenced still shares the refusal above: --force explicitly opts
@@ -1148,10 +1152,13 @@ fn getid_with_refs(
     host.invocation.marker("GETID_PASS2_START");
     let reader = ElementReader::open_in(input, write.direct_reads, host)?.refusing_kind_claims();
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
-    // ways always needed (add-referenced mode), relations if no relation IDs.
+    // ways and relations if none of theirs were requested. The references
+    // added are only the requested ways' nodes (pass 1), never relation
+    // members, so a way is written only when its own ID was requested, as
+    // `included_block` and `process_block` select.
     let reader = reader.with_blob_filter(BlobFilter::new(
         ids.node_ids.has_any() || has_dep_nodes,
-        true,
+        ids.way_ids.has_any(),
         ids.relation_ids.has_any(),
     ));
     let mut writer = writer_from_header(

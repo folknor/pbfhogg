@@ -431,8 +431,8 @@ fn node_stats_inner(
         &pin,
         direct_io,
         force,
-        "input PBF has no blob-level indexdata. Without indexdata, the node-only \
-         filter is a no-op - all blobs are decompressed (significantly slower).",
+        "input PBF has no blob-level indexdata. Without it, way and relation blobs cannot \
+         be skipped, so they are decompressed too.",
         host,
     )?;
 

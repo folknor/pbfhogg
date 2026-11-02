@@ -788,11 +788,11 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   nor GitHub makes clickable. Turn each into a GitHub URL link, the form
   `scripts/check_doc_links.py` resolves for site pages.
 - [ ] **AGENTS.md "Commands requiring indexdata" is out of step with the
-  CLI.** It lists `inspect --tags --type` (brokkr's spelling); the CLI's
-  `inspect tags` refuses unindexed input on every path, `--type` or not
-  (`src/commands/tags_count/mod.rs` calls `require_indexdata` before
-  looking at the filter), and `degrade` refuses on its decode path, which
-  the list omits. The per-command truth is the "Proceeding without
+  CLI.** It lists `inspect --tags --type` (brokkr's spelling), which
+  misses that a kind-restricting expression (`w/highway`) also makes
+  `inspect tags` refuse; plain `tags-filter`, though `-R` with expressions
+  naming every kind does not refuse; and `degrade`, which refuses on its
+  decode path. The per-command truth is the "Proceeding without
   indexdata" table in `docs/cli/commands.md`; the AGENTS.md list should
   point there or match it.
 - [ ] **Old site fragments into the correctness and deviations pages land on

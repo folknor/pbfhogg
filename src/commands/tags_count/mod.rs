@@ -51,6 +51,68 @@ impl TagCountStats {
     }
 }
 
+/// What a run skips blobs on, derived once from the options: the library
+/// gate and [`TagCountOptions::requires_indexdata`] read the same values the
+/// schedule walk uses.
+struct Plan {
+    tf: TypeFilter,
+    /// The schedule's kind filter: set only when exactly one kind is
+    /// selected, since a two-kind filter still has to visit both kinds'
+    /// blobs.
+    kind_filter: Option<ElementKind>,
+    /// The same blob-level filter `tags-filter` uses. `inspect tags -e
+    /// highway=*` counts only tags matching an expression, so a blob whose
+    /// tag index carries none of the required keys cannot contribute a
+    /// count, and skipping it means never decompressing it. It has to come
+    /// from `blob_filter_from_expressions`, not be rebuilt here: that helper
+    /// clears the entire key set when any expression carries a key matcher
+    /// it cannot express as key-set membership, because the filter's
+    /// semantics are a union and a partial clear would silently skip blobs
+    /// the unconstrained expression could still match.
+    blob_filter: Option<crate::blob_meta::BlobFilter>,
+}
+
+impl Plan {
+    fn new(type_filter: Option<TypeFilter>, expressions: Option<&[Expression]>) -> Self {
+        let tf = TypeFilter::or_all(type_filter);
+        Self {
+            tf,
+            kind_filter: tf.single_kind(),
+            blob_filter: expressions
+                .and_then(crate::commands::tags_filter::blob_filter_from_expressions),
+        }
+    }
+
+    /// Whether the run skips blobs on their indexdata: a single-kind filter,
+    /// or expressions that leave some kind out (their union). Tag-key
+    /// skipping reads tagdata, not indexdata, so it does not count.
+    fn requires_indexdata(&self) -> bool {
+        self.kind_filter.is_some()
+            || self
+                .blob_filter
+                .as_ref()
+                .is_some_and(crate::blob_meta::BlobFilter::uses_index)
+    }
+}
+
+impl TagCountOptions<'_> {
+    /// Whether [`tags_count`] with these options refuses an input without
+    /// blob-level indexdata unless `force` is set: whether the run would
+    /// skip blobs on their indexdata (a single-kind `type_filter`, or
+    /// expressions that together leave some element kind out). Any other
+    /// run schedules every blob whatever the file carries and accepts an
+    /// unindexed input as it is. A malformed expression is the same error
+    /// [`tags_count`] returns.
+    pub fn requires_indexdata(&self) -> Result<bool> {
+        let expressions = if self.expressions.is_empty() {
+            None
+        } else {
+            Some(parse_expressions(self.expressions)?)
+        };
+        Ok(Plan::new(self.type_filter, expressions.as_deref()).requires_indexdata())
+    }
+}
+
 /// Sort order for tag count results.
 #[derive(Clone, Copy, Default)]
 pub enum TagCountSort {
@@ -153,46 +215,34 @@ fn tags_count_inner(
     // of the input.
     let pin = input.pin(host)?;
 
-    // Need indexdata either for the type-filter schedule or (when there
-    // is no type filter) simply for the all-kinds schedule the parallel
-    // path uses. `require_indexdata` gracefully accepts `force`.
-    require_indexdata(
-        &pin,
-        opts.direct_io,
-        opts.force,
-        "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-         is a no-op - all blobs are decompressed (significantly slower).",
-        host,
-    )?;
+    let plan = Plan::new(opts.type_filter, expressions.as_deref());
 
-    let tf = TypeFilter::or_all(opts.type_filter);
-    // Narrow the blob schedule only when the filter names exactly one
-    // kind; a two-kind filter still has to visit both kinds' blobs.
-    let kind_filter = tf.single_kind();
+    // Indexdata is demanded only where the run skips blobs on it. With no
+    // single-kind filter and no kind-restricting expression the schedule
+    // holds every data blob whatever the file carries, so an unindexed input
+    // costs nothing and there is no slower path for `force` to grant. A
+    // forced run still selects every element by its decoded kind; only the
+    // blob skipping is lost. A partially indexed file is refused by the
+    // schedule walk either way.
+    if plan.requires_indexdata() {
+        require_indexdata(
+            &pin,
+            opts.direct_io,
+            opts.force,
+            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+             element type, so blobs of unselected types are decompressed too.",
+            host,
+        )?;
+    }
 
     host.invocation.marker("TAGSCOUNT_START");
 
-    // Apply the same blob-level tag index `tags-filter` uses.
-    //
-    // `tags-count -e highway=*` counts only tags matching an expression, so a
-    // blob whose tag index carries none of the required keys cannot contribute
-    // a single count - and skipping it means never decompressing it. Without
-    // this the command parsed the identical expressions and then decoded every
-    // blob in the file anyway.
-    //
-    // The filter has to come from `blob_filter_from_expressions`, not be
-    // rebuilt here: that helper clears the entire key set when any expression
-    // carries a key matcher it cannot express as key-set membership, because
-    // the filter's semantics are a union and a partial clear would silently
-    // skip blobs the unconstrained expression could still match.
-    let blob_filter = expressions
-        .as_deref()
-        .and_then(crate::commands::tags_filter::blob_filter_from_expressions);
+    // The schedule skips on the plan's kind and blob filters (see `Plan`).
     let (schedule, shared_file, blobs_skipped_by_tag) =
         crate::scan::classify::build_classify_schedule_blob_filtered(
             &pin,
-            kind_filter,
-            blob_filter.as_ref(),
+            plan.kind_filter,
+            plan.blob_filter.as_ref(),
             crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
@@ -218,7 +268,13 @@ fn tags_count_inner(
         thread_override,
         || tally::BlobTally::new(seeds.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
         |buffer, tally| {
-            tally.add_blob(buffer, tf, expressions.as_deref(), &table, &host.invocation)
+            tally.add_blob(
+                buffer,
+                plan.tf,
+                expressions.as_deref(),
+                &table,
+                &host.invocation,
+            )
         },
         drop,
         host,

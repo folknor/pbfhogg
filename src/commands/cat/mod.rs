@@ -165,15 +165,18 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     // every kind selected decodes every blob exactly once whatever its
     // indexdata, so it has no slower fallback for `--force` to make explicit.
     if type_filter.is_some() {
+        // Every element is still selected by its decoded kind on a forced
+        // run; what is lost is skipping, and without `--clean` the raw copy.
+        let reason = if clean.any() {
+            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+             element type, so blobs of unselected types are decompressed too."
+        } else {
+            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped or \
+             copied whole by element type, so every blob is decompressed and its selected \
+             elements re-encoded."
+        };
         for file in files {
-            require_indexdata(
-                file,
-                direct_io,
-                force,
-                "input PBF has no blob-level indexdata. Without indexdata, the type \
-                 filter is a no-op - all blobs are decompressed (significantly slower).",
-                host,
-            )?;
+            require_indexdata(file, direct_io, force, reason, host)?;
         }
     }
 

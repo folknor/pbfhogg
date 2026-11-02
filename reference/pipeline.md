@@ -40,8 +40,10 @@ Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling
 Used by:
 - `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) - two files read in lockstep
 
-`inspect tags` uses pread workers through `parallel_classify_phase`, with
-per-blob tag counts merged by the caller.
+`inspect tags` uses pread workers through `parallel_project_accumulate`,
+reading each blob through a projection on the block validator; every worker
+merges its blob's counts into one count table sharded by pair hash, a mutex
+per shard, so no single thread merges.
 
 ### Ordered pread pool
 

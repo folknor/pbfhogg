@@ -199,8 +199,9 @@ should stay that way:
 
 - `inspect --nodes` - `parallel_project_accumulate` (pread workers, a
   projection on the block validator)
-- `inspect --tags` - `parallel_classify_accumulate` / `_phase` (pread
-  workers)
+- `inspect --tags` - `parallel_project_accumulate` (pread workers, a
+  projection on the block validator; each worker merges its blobs into a
+  sharded count table)
 - `inspect` default / `inspect --indexed` - `HeaderWalker`
   (pread-only header walk)
 - `check --ids` (streaming and `--full`) and `check --refs` -

@@ -745,7 +745,7 @@ suite; the rest still carry their older commit in the Notes column.
 | getparents | `--bench 3` | **22.8 s** | `39570d10` | commit `fb743f6`, 2026-07-14. Matched same-day pair vs `--commit 2306fd9` 24.4 s (`da60663d`): **HEAD is 6.6 % faster**. The 19.0 s `a7c064eb` figure is retired - it was a warm-header-walk artifact, see flag below |
 | inspect default (index-only) | `--bench 1` | **6.5 s** | `c146f2bb` | |
 | inspect --nodes `-j 16` | `--bench 1` | **49.4 s** | post-`01c67da` | |
-| inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `9d741341` / post-`01c67da` | |
+| inspect --tags `-j 16` | `--bench 1` | **168.3 s** | `00e00846` (`de8daf1`) | serial-merge era; superseded on bygg by "inspect tags counts into a sharded table" below |
 | inspect --tags --type node | `--bench 1` | 71.3 s | `047ac2f9` | |
 | inspect --tags --type way | `--bench 1` | 82.9 s | `959bda7c` | |
 | inspect --tags --type relation | `--bench 1` | 8.8 s | `8daf5f04` | |
@@ -3076,6 +3076,49 @@ way-message re-parse a projection removes (2.3 % of tags-filter, under
 1 % of smart). A pass that scans every way's refs against a node set
 (smart and complete pass 1, multi-extract's way classify by the same
 shape) gains nothing measurable: the ref lookups are its cost.
+
+## inspect tags counts into a sharded table (bygg, 2026-11-02, against `a77eb163`)
+
+Before the change, `inspect tags` built a `PrimitiveBlock` per blob, walked
+every element resolving each tag's strings, and sent a per-blob
+`HashMap<String, HashMap<String, u64>>` to the calling thread, which merged
+it into the global map. At planet that single merging thread was the whole
+wall: in the stored HEAD cell `4e2830c4` (default `-j`, 30 workers)
+`classify_unordered_result_send_wait_ns` summed 1,856 s over an 88 s scan,
+the workers parked about 70 % of the time, while the consumer's
+`result_recv_wait_ns` was 0.3 s; an 18 s single-core tail followed
+(reserving the result, walking and freeing about 10^8 strings). The element
+walk itself was off the critical path.
+
+The change reads each blob through a projection on the block validator,
+counts (kind, key index, value index) per blob, resolves and hashes each
+distinct pair once, and has every worker merge its blob into one table of
+256 shards, a mutex each, shard by pair hash. A shard stores strings in
+fixed 256 KiB chunks with keys interned per shard. Planet
+`planet-20260223-with-indexdata`, default `-j`, interleaved `--bench 1`,
+both arms built in the main tree (both unstored `--force`; the HEAD arm
+by checking out the changed paths), arm order alternated:
+
+| Pair | HEAD | Change |
+|---|---:|---:|
+| 1 (change first) | 98.91 s, peak anon 17.59 GB | 36.13 s, 10.82 GB |
+| 2 (HEAD first) | 98.70 s, 17.59 GB | 36.25 s, 10.83 GB |
+
+-63 % wall, -6.8 GB peak anon. After the 6.1 s schedule walk both arms
+share, HEAD's scan and tail (no marker between them) took 92.67 and
+92.46 s at 8.8 cores; the change's scan took 29.41 and 29.56 s at 23.4
+cores, now CPU-bound, and its drain (`TAGSCOUNT_DRAIN`, which keeps no
+rows under brokkr's `--min-count 999999999`) 0.67 and 0.59 s. The stored HEAD cell `4e2830c4`
+earlier the same day ran 113.6 s because the host swapped (up to 4 GB,
+1.3 M major faults) at its 16-17 GB peak; the change does not reach that
+peak.
+
+Table counters at the end of the scan: 187.4 M distinct pairs, 1.64 M
+interned keys (107,879 distinct keys over 256 shards), 3.69 GB of strings
+in 3.73 GB of chunks, 6.75 GB of hash tables. The first version stored the
+key's bytes with every pair in one doubling vector per shard: 14.0 GB peak,
+of which 1.86 GB was repeated key bytes and 2.7 GB the vectors' unfilled
+reserve, at the same wall.
 
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 

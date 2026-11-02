@@ -77,6 +77,13 @@ index with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
 bad role as empty when classifying boundary members.
 
+`inspect tags` does not go through these iterators: it reads the raw index
+arrays through a projection on the block validator
+(`src/commands/tags_count/tally.rs`) and counts each element's tags by the
+same rule, up to the first pair whose key or value index lies past the
+table. Its unit tests hold its counts to the element walk's on every
+fixture and mutation, so the two cannot drift apart silently.
+
 `validate_block` (`src/read/block.rs`) does not close the gap: it is a
 structural pass that checks array framing and parallel-array lengths without
 resolving any string index, because resolving them would mean decoding every

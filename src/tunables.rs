@@ -903,6 +903,30 @@ pub(crate) const ANOMALY_LARGE_DENOMINATOR: u64 = 2;
 /// room to see the shape of a non-standard file.
 pub(crate) const INSPECT_ORDERING_HEAD_SEGMENTS: usize = 64;
 
+/// `inspect tags`: the count table has `1 << TAGS_COUNT_SHARD_BITS` shards,
+/// each behind its own mutex. Every decode worker merges its blob's distinct
+/// pairs into the shards itself, one shard locked at a time, so the merge is
+/// not serialised on one thread (a single consumer merging per-blob maps was
+/// the whole wall at planet, workers parked behind it). With many more
+/// shards than workers, two workers rarely want one shard at once; each blob
+/// takes each shard it touches once.
+pub(crate) const TAGS_COUNT_SHARD_BITS: u32 = 8;
+
+/// `inspect tags`: bytes per chunk of a count shard's string arena. A shard
+/// appends strings to fixed chunks instead of a doubling vector, which at
+/// planet reserved about half again what it stored and copied on every
+/// growth. A string longer than this gets a chunk of its own. The unfilled
+/// rest of each shard's current chunk is the floor of the waste, so the
+/// shard count times this stays small beside a planet table.
+pub(crate) const TAGS_COUNT_ARENA_CHUNK_BYTES: usize = 256 * 1024;
+
+/// `inspect tags`: how far a worker moves the shard its next blob starts
+/// merging at, and the multiple of the worker's seed its first blob starts
+/// at, so the workers' walks over the shards start apart rather than all at
+/// shard 0. Odd, so a worker's starts cycle through every shard of the
+/// power-of-two table.
+pub(crate) const TAGS_COUNT_ROTATION_STEP: usize = 97;
+
 // ---------------------------------------------------------------------------
 // Debug sidecar
 // ---------------------------------------------------------------------------

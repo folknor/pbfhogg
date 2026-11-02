@@ -57,6 +57,12 @@
 - `inspect --nodes` reads each node blob without building it as a block,
   keeping every check block construction makes. On planet it went from
   26 s to 22.4 s, with the same refusals and slightly lower peak memory.
+- `inspect tags` counts on every worker thread instead of merging every
+  blob's counts on one, and keeps its strings in compact shared storage
+  instead of one allocation per value. On planet it went from 99 s and
+  17.6 GB peak memory to 36 s and 10.8 GB, with the same output and the
+  same refusals. The count thresholds still apply only after the whole
+  file is counted, so they do not bound memory.
 - `check --ids` and `check --refs` read a wholly unindexed input once,
   not once per element kind, with the same reports. `check --refs` reads
   a blob again only where a reference missed in that read (its target not

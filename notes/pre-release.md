@@ -90,7 +90,10 @@ actually gives, not an assumption:
 Reference material for WRK-003 and WRK-004, not an item. The blocker
 question was whether every command is still RAM-safe at planet on a 28-ish
 GB host. Answer: yes. The highest peak is `inspect --tags -j 16` at 17.5 GB,
-unchanged from the README.
+unchanged from the README. (Since superseded for `inspect --tags`: 36 s and
+10.8 GB peak anon at default `-j` on bygg, reference/performance.md
+"inspect tags counts into a sharded table"; `build-geocode-index` is now the
+highest row below.)
 
 Setup: host bygg (Ryzen 9 9950X3D2, 16c/32t, 30.5 GiB, 29.1 GiB available),
 pbfhogg `627883d7`, one `--bench 1` cell per command after `fstrim`, input
@@ -333,20 +336,50 @@ narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
 relation closure (a relation pass on the projection pools, then the way
 pass over the closed set) or record the deviation.
 
-### WRK-129: inspect --tags counts tags through a built block per blob
+### WRK-131: inspect tags with its default thresholds at planet is unmeasured
 
-`inspect --tags` (`src/commands/tags_count/mod.rs`) builds every block and
-walks every element with `elements_skip_metadata`, resolving each tag's
-key and value strings, to count them. A planet run took 100.6 s at `-j 16`
-(`7855f2a4`, 627883d7, bygg), the slowest whole-file read among the
-inspect modes. The dense element walk is the cost the projection moves of
-check --ids, getparents and inspect --nodes removed (inspect --nodes -14 %
-at planet). A projection could count string-table index pairs per block
-(dense `keys_vals` runs and plain `keys`/`vals` arrays, read back after
-acceptance) and resolve each distinct index once per block, but the
-strings must still be resolved and validated as the block path does
-(CORRECTNESS.md on out-of-range indices). Unmeasured at the current tree:
-take a default `-j` planet cell and a hotpath split first.
+Every brokkr `inspect --tags` cell passes `--min-count 999999999`, so no
+measured run builds output rows. With the default `--min-count 1` every
+distinct pair becomes a row: at planet 187.4 M `TagCount`s (counter
+`tags_count_distinct_pairs`), each owning a key and a value `String`
+(`table::CountTable::into_counts` in `src/commands/tags_count/`), then one
+single-threaded `sort_by` over them and the formatter. The rows plus the
+table still held for the shards not yet drained may exceed a 30 GB host;
+the sort alone is a long serial tail. Measure a default-threshold planet
+run first (it needs a brokkr cell that does not pass `--min-count`). If it
+does not fit, the shape is to sort and print from the shards without
+owning the strings, which the public `Vec<TagCount>` return type rules
+out: a streaming or borrowed-row API.
+
+### WRK-132: inspect tags' summary line counts rows kept, not distinct values
+
+`run_tags_count` (`cli/src/lib.rs`) prints `N distinct tag values` from the
+length of the result, which is the rows `--min-count` / `--max-count` kept:
+the denmark run with `-M 50 --type node` prints 3,009,986 where the file
+holds more distinct node pairs, and brokkr's cells print 0. Either word the
+line as rows printed or report the distinct-pair count, which the library
+does not return today (`tags_count_distinct_pairs` is a sidecar counter
+only). `cli/tests/cli_quiet.rs` asserts the line's wording.
+
+### WRK-133: osmium-parity docs miss inspect tags' counting difference
+
+With no expression osmium `tags-count` counts keys alone
+(`research/osmium-tool/src/command_tags_count.cpp`, `m_keys_filter =
+osmium::TagsFilter{true}`), and a key-only expression counts its key, not
+its key=value pairs; pbfhogg always counts key=value pairs and prints three
+fields per row. `docs/cli/osmium-parity.md` and
+`reference/osmium-parity.md` ("tags-count is now `inspect tags`") list
+only flag renames; DEVIATIONS.md records only the type-prefix difference.
+Record the counting difference (and the row escaping) or adopt osmium's
+key-only rows.
+
+### WRK-134: reference/performance.md planet table keeps a dead inspect --extended row
+
+The plantasjen planet table prints `inspect --extended` at 820.7 s
+(`19db1512`). Since the extended scan moved onto a validator projection it
+runs in about 27 s (reference/performance.md "Inspect --extended:
+validator-projection scan"; CHANGELOG says 27 s). Retire the row or point it
+at that section, as the `inspect --tags` row now points at its successor.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 

@@ -772,17 +772,18 @@ filter as unrestricted.
 
 Counts are exact. Memory grows with the number of distinct selected key/value
 pairs and their string bytes, with no fixed byte cap or spill to disk. One
-global map stores one key string per distinct key and one value string and
-counter per distinct pair, plus hash-table capacity overhead. The blob
-schedule, decoded blobs and in-flight per-blob count maps add transient
+table, split into shards that the workers fill concurrently, stores each
+distinct pair's value bytes and counter, and each distinct key's bytes once
+per shard holding a pair of it, plus hash-table capacity overhead. The blob
+schedule, decoded blobs and each worker's per-blob scratch add transient
 storage; input blobs are not limited to the writer's default element count.
-The sorted result reserves one entry per distinct pair before applying
-`--min-count` or `--max-count`, and retained entries each own a copy of the key.
-During conversion that allocation overlaps the remaining map storage.
-Consequently count thresholds do not bound memory, even when few rows are
-printed. Restrict element types and tag expressions to reduce the selected
-cardinality; neither a higher minimum count nor fewer workers bounds the
-global map. No approximate counts or silent truncation are used.
+Every distinct pair stays in the table until the scan ends, whatever
+`--min-count` or `--max-count` say; only the rows those thresholds keep are
+then copied out, shard by shard, to be sorted and printed. Consequently count
+thresholds do not bound memory, even when few rows are printed. Restrict
+element types and tag expressions to reduce the selected cardinality; neither
+a higher minimum count nor fewer workers bounds the table. No approximate
+counts or silent truncation are used.
 
 ### check
 

@@ -1191,6 +1191,25 @@ impl ValidatedBlock<'_> {
         &self.buffer
     }
 
+    /// How many entries the accepted block's string table holds.
+    pub(crate) fn string_count(&self) -> usize {
+        self.st.len()
+    }
+
+    /// String table entry `index` of the accepted block, exactly what
+    /// [`str_from_stringtable`] gives for it in the built block (the entry
+    /// as stored, index 0 included: nothing here assumes it is empty), or
+    /// `None` past the table.
+    pub(crate) fn string(&self, index: usize) -> Option<&str> {
+        let &(offset, len) = self.st.get(index)?;
+        let bytes = &self.buffer[offset as usize..offset as usize + len as usize];
+        // SAFETY: `validate_block` checked every entry of `st` as UTF-8
+        // (`validate_stringtable_utf8`) before `BlockBuffer::project` returned
+        // this value, and neither `buffer` nor `st` can change while it
+        // lives: both are private and nothing here hands out mutable access.
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+    }
+
     /// The block: its offset tables appended to the bytes, from the scan
     /// that validated them.
     pub(crate) fn into_block(mut self) -> PrimitiveBlock {

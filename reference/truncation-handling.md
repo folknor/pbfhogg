@@ -259,7 +259,7 @@ error and the byte offset instead.
 
 This holds for consumers that report on fields the failing check
 does not touch. The full-decode modes of `inspect`'s scanning
-report, `inspect --nodes`, `check --ids`, `check --refs`,
+report, `inspect --nodes`, `inspect tags`, `check --ids`, `check --refs`,
 `getparents` and `getid`
 (on every blob it decodes) refuse a block with a
 malformed way `refs` array (or tag arrays, `Info`, string table

@@ -1,15 +1,15 @@
 //! Count tag frequencies in a PBF file. Equivalent to `osmium tags-count`.
 
-use rustc_hash::FxHashMap;
+mod table;
+mod tally;
 
 use super::require_indexdata;
+use crate::ElementKind;
 use crate::owned::TypeFilter;
 use crate::read::input::InputSource;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
-use crate::{Element, ElementKind, PrimitiveBlock};
 
 use super::Result;
-type CountMap = FxHashMap<String, FxHashMap<String, u64>>;
 
 /// A single tag count entry: key, value, count.
 pub struct TagCount {
@@ -55,25 +55,26 @@ pub struct TagCountOptions<'a> {
 /// If `expressions` is non-empty, only tags matching at least one
 /// expression are counted (same syntax as `tags-filter`).
 ///
-/// Parallel workers via `parallel_classify_phase`: each worker emits a
-/// per-blob `CountMap` (sized to that blob's distinct tags); the
-/// consumer thread merges per-blob maps into a single global. The
-/// accumulate-style alternative (per-worker map held across every
-/// blob a worker sees) hit 26.8 GB peak anon at planet because every
-/// worker held roughly the global cardinality by the end. Per-blob
-/// emission avoids retaining a whole-file map per worker. Transient map
-/// storage depends on blob contents and the number of in-flight maps;
-/// 8 000 elements is a writer default, not a bound on arbitrary input.
+/// Parallel workers via `parallel_project_accumulate`: each worker reads a
+/// blob through a validator projection (`tally`), counts its tags by string
+/// table index, and merges the blob's distinct pairs into one table shared by
+/// every worker, sharded by pair hash with a mutex per shard (`table`). No
+/// per-blob map crosses a channel and no single thread does the merging: a
+/// lone consumer merging per-blob maps was the whole wall at planet, with the
+/// workers parked behind it. Per-worker whole-file maps are not kept either
+/// (that shape held roughly the global cardinality once per worker).
+/// Transient per-worker storage is one blob's distinct index pairs.
 ///
-/// The global map is not bounded independently of input: for D distinct
-/// selected key/value pairs, K distinct keys, and S bytes of stored key/value
-/// strings, it needs O(D + K + S) space plus hash-table capacity overhead.
-/// The blob schedule and in-flight decode/per-blob maps add separate storage.
-/// `min_count` and `max_count` filter only after the exact totals are known;
-/// neither limits this map. Early eviction can lose a later threshold crossing,
-/// and a sketch would change the exact-count contract. Use type/expression
-/// restrictions to reduce cardinality, rather than treating thresholds as a
-/// memory budget. See docs/cli/commands.md, "inspect tags".
+/// The table is not bounded independently of input: for D distinct selected
+/// key/value pairs whose value bytes total S, and K distinct keys of total
+/// length L, it needs O(D + S) for the pairs plus at most O(K + L) per shard
+/// for the keys (a key is interned once in each shard holding a pair of
+/// it), plus hash-table capacity overhead. `min_count` and `max_count` filter only after the
+/// exact totals are known; neither limits the table. Early eviction can lose
+/// a later threshold crossing, and a sketch would change the exact-count
+/// contract. Use type/expression restrictions to reduce cardinality, rather
+/// than treating thresholds as a memory budget. See docs/cli/commands.md,
+/// "inspect tags".
 ///
 /// The input must be a regular file (`InvalidArgument` otherwise), and is pinned for the run once the expressions are accepted
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is
@@ -169,42 +170,30 @@ fn tags_count_inner(
         );
     }
     let thread_override = opts.parallelism.fixed();
-    let mut counts: CountMap = FxHashMap::default();
+    let table = table::CountTable::new();
+    // Distinct per worker, so the workers start their shard walks apart.
+    let seeds = std::sync::atomic::AtomicUsize::new(0);
 
-    crate::scan::classify::parallel_classify_phase(
+    // Each worker merges its own blobs into the shared table (see `table`),
+    // so the accumulate pool's per-worker state is only scratch and nothing
+    // is handed back at the end.
+    crate::scan::classify::parallel_project_accumulate(
         &shared_file,
         &schedule,
         thread_override,
-        || (),
-        |block, _s| {
-            let mut local: CountMap = FxHashMap::default();
-            count_block_tags(&mut local, block, tf, &expressions);
-            Ok(local)
+        || tally::BlobTally::new(seeds.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        |buffer, tally| {
+            tally.add_blob(buffer, tf, expressions.as_deref(), &table, &host.invocation)
         },
-        |_seq, per_blob| {
-            merge_counts(&mut counts, per_blob);
-        },
+        drop,
         host,
     )?;
 
-    // Reserve for all D pairs, even if thresholds retain fewer. While the map
-    // drains, this vector coexists with its remaining allocations; each retained
-    // pair also gets its own key String to satisfy the public TagCount shape.
-    // Values move into the result. Thresholds therefore do not bound even the
-    // result's reserved capacity, and key bytes may be repeated D times.
-    let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
-    let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
-    for (key, inner) in counts {
-        for (value, count) in inner {
-            if count >= opts.min_count && opts.max_count.is_none_or(|max| count <= max) {
-                results.push(TagCount {
-                    key: key.clone(),
-                    value,
-                    count,
-                });
-            }
-        }
-    }
+    host.invocation.marker("TAGSCOUNT_DRAIN_START");
+    let mut results = table.into_counts(
+        |count| count >= opts.min_count && opts.max_count.is_none_or(|max| count <= max),
+        &host.invocation,
+    )?;
 
     results.sort_by(|a, b| match opts.sort {
         TagCountSort::CountDesc => b
@@ -229,6 +218,7 @@ fn tags_count_inner(
             .then_with(|| b.count.cmp(&a.count)),
     });
 
+    host.invocation.marker("TAGSCOUNT_DRAIN_END");
     host.invocation.marker("TAGSCOUNT_END");
     Ok(results)
 }
@@ -237,7 +227,7 @@ fn tags_count_inner(
 ///
 /// This predicate is per tag, not per element: counting every tag on an
 /// element with one matching tag would inflate unrelated counts. Callers pass
-/// one kind from the exhaustive Element match below. Keep this quantifier
+/// the kind of the element carrying the tag. Keep this quantifier
 /// separate from element filtering and use tag_matches for shared semantics.
 fn matches_expression(
     expressions: &[Expression],
@@ -251,100 +241,4 @@ fn matches_expression(
         }
     }
     false
-}
-
-/// Count tags from a single block into a local map.
-fn count_block_tags(
-    counts: &mut CountMap,
-    block: &PrimitiveBlock,
-    type_filter: TypeFilter,
-    expressions: &Option<Vec<Expression>>,
-) {
-    for element in block.elements_skip_metadata() {
-        let kind = match &element {
-            Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
-            Element::Way(_) => ElementKind::Way,
-            Element::Relation(_) => ElementKind::Relation,
-        };
-        if !type_filter.admits(kind) {
-            continue;
-        }
-
-        match &element {
-            Element::DenseNode(dn) => {
-                for (k, v) in dn.tags() {
-                    if expressions
-                        .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, kind))
-                    {
-                        increment_tag(counts, k, v);
-                    }
-                }
-            }
-            Element::Node(n) => {
-                for (k, v) in n.tags() {
-                    if expressions
-                        .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, kind))
-                    {
-                        increment_tag(counts, k, v);
-                    }
-                }
-            }
-            Element::Way(w) => {
-                for (k, v) in w.tags() {
-                    if expressions
-                        .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, kind))
-                    {
-                        increment_tag(counts, k, v);
-                    }
-                }
-            }
-            Element::Relation(r) => {
-                for (k, v) in r.tags() {
-                    if expressions
-                        .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, kind))
-                    {
-                        increment_tag(counts, k, v);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Increment the count for a (key, value) pair, allocating only on first insert.
-#[inline]
-fn increment_tag(counts: &mut CountMap, k: &str, v: &str) {
-    if let Some(inner) = counts.get_mut(k) {
-        if let Some(count) = inner.get_mut(v) {
-            *count += 1;
-        } else {
-            inner.insert(v.to_string(), 1);
-        }
-    } else {
-        let mut inner = FxHashMap::default();
-        inner.insert(v.to_string(), 1);
-        counts.insert(k.to_string(), inner);
-    }
-}
-
-/// Merge a per-worker CountMap into the global totals. Sums counts for
-/// keys present in both; moves unique entries across. Move-based for
-/// the inner maps to avoid re-hashing value strings.
-fn merge_counts(global: &mut CountMap, worker: CountMap) {
-    for (key, worker_inner) in worker {
-        match global.get_mut(&key) {
-            Some(global_inner) => {
-                for (value, count) in worker_inner {
-                    *global_inner.entry(value).or_insert(0) += count;
-                }
-            }
-            None => {
-                global.insert(key, worker_inner);
-            }
-        }
-    }
 }

@@ -1199,6 +1199,12 @@ impl OscSink for CompactSink<'_> {
             // it as a versioned tombstone so a later stale change cannot
             // resurrect an earlier version through the gap a bare
             // index removal used to leave.
+            //
+            // Only the version claim is kept, yet the user name is
+            // interned here like a create's: one metadata reader for every
+            // action. It costs nothing measurable - at planet (daily diff
+            // seq 4913, bygg) the strings only deletes interned were 48 of
+            // 13,692, 537 bytes.
             let meta = arena_meta(e, self.overlay)?;
             match kind {
                 ElementKind::Node => self.overlay.delete_node(id, &meta)?,

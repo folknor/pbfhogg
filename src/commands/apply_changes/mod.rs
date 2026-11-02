@@ -15,7 +15,6 @@
 
 mod classify;
 mod descriptor;
-mod diff_ranges;
 mod drain;
 mod element_writes;
 mod failure;
@@ -29,6 +28,7 @@ mod scanner;
 mod stats;
 mod stream_output;
 mod streaming;
+mod upsert_cursors;
 mod window;
 
 pub use rewrite::{MergeOptions, merge};

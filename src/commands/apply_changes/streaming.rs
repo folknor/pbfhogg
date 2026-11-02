@@ -72,7 +72,6 @@ use crate::writer::{Compression, reframe_raw_with_index};
 
 use super::classify::{blob_walk, block_overlaps_diff};
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
-use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
 use super::element_writes::RefreshScratch;
 use super::failure::FailureSlot;
@@ -81,7 +80,7 @@ use super::node_coords::extract_node_coords;
 use super::refresh::{StaleProbe, detect_stale_block, detect_stale_wire};
 use super::rewrite_block::rewrite_block_parallel;
 
-use crate::osc::CompactDiffOverlay;
+use crate::osc::sorted::SortedDiff;
 
 /// One worker's shared coord accumulator. Workers hold their own; the
 /// drain holds clones of every slot.
@@ -98,8 +97,7 @@ pub(super) type CoordSlots = Vec<CoordSlot>;
 pub(super) struct StreamingConfig {
     /// The run's pinned base; the pool opens one description of it.
     pub base: crate::read::input::PinnedInput,
-    pub ranges: Arc<DiffRanges>,
-    pub diff: Arc<CompactDiffOverlay>,
+    pub diff: Arc<SortedDiff>,
     /// Number of worker threads. Should be `nproc - 2` (one each for the
     /// scanner and drain).
     pub worker_count: usize,
@@ -240,7 +238,6 @@ pub(super) fn run_workers(
 ) {
     let StreamingConfig {
         base,
-        ranges,
         diff,
         worker_count,
         locations_on_ways,
@@ -306,7 +303,6 @@ pub(super) fn run_workers(
             let source = &source;
             let candidate_rx = &candidate_rx;
             let failure = &*failure;
-            let ranges = &*ranges;
             let diff = &*diff;
             let probe = &*probe;
             let cancel = &cancel;
@@ -320,7 +316,6 @@ pub(super) fn run_workers(
                         candidate_rx,
                         &drain_tx,
                         counters,
-                        ranges,
                         diff,
                         locations_on_ways,
                         coord_slot.as_ref(),
@@ -372,8 +367,7 @@ fn worker_loop(
     candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
+    diff: &SortedDiff,
     locations_on_ways: bool,
     coord_slot: Option<&CoordSlot>,
     loc_map_handle: Option<&LocMapHandle>,
@@ -436,7 +430,6 @@ fn worker_loop(
                     &mut desc,
                     drain_tx,
                     counters,
-                    ranges,
                     diff,
                     &mut builder,
                     &mut read_buf,
@@ -508,8 +501,7 @@ fn handle_candidate(
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
+    diff: &SortedDiff,
     builder: &mut WorkerBuilder,
     read_buf: &mut Vec<u8>,
     decode_pool: &std::sync::Arc<crate::blob::DecompressPool>,
@@ -543,7 +535,7 @@ fn handle_candidate(
         && desc.index.is_some()
         && desc
             .id_range
-            .is_some_and(|(min, max)| !ranges.range_overlaps(ElementKind::Way, min, max));
+            .is_some_and(|(min, max)| !diff.range_overlaps(ElementKind::Way, min, max));
     // Set when the only reason to rewrite this blob is a stale way.
     let mut refresh_only = false;
 
@@ -701,7 +693,7 @@ fn handle_candidate(
 
     let t_precise = crate::counters::Stopwatch::start();
     let mut walk = blob_walk(claim.as_ref());
-    let overlaps = block_overlaps_diff(&block, ranges, &mut walk)?;
+    let overlaps = block_overlaps_diff(&block, diff, &mut walk)?;
     if !overlaps {
         // A miss visited every element: the walk is complete.
         walk.finish()?;
@@ -754,7 +746,7 @@ fn handle_candidate(
         }
     };
     let inline_upserts = upsert_slice(
-        ranges,
+        diff,
         effective_kind,
         first,
         effective_min_id,
@@ -1064,19 +1056,20 @@ fn pread_into(
 /// stands). Upserts between the previous blob and `first` are the drain's
 /// gap creates, bounded by the same first element
 /// (`descriptor::Placement::gap_bound`).
+///
+/// Returned as an index range into `diff.upserts(kind)`.
 fn upsert_slice(
-    ranges: &DiffRanges,
+    diff: &SortedDiff,
     kind: ElementKind,
     first: i64,
     min_id: i64,
     max_id: i64,
-) -> &[i64] {
-    let upserts = ranges.upserts(kind);
-    let first = crate::osm_id::osm_id_key(first);
-    let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
-    let start = upserts.partition_point(|&id| crate::osm_id::osm_id_key(id) < first);
-    let end = upserts[start..].partition_point(|&id| crate::osm_id::osm_id_key(id) <= last) + start;
-    &upserts[start..end]
+) -> std::ops::Range<usize> {
+    diff.upsert_range(
+        kind,
+        first,
+        crate::osm_id::blob_osm_last_key(min_id, max_id),
+    )
 }
 
 /// Drain `local` into the worker's shared coord slot. Acquires the mutex

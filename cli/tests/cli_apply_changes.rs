@@ -3490,6 +3490,40 @@ fn merge_writes_an_upsert_once_beside_a_mixed_sign_blob() {
     assert_eq!(node_ids(&read_all_elements(&output)), vec![-1, -2, 1]);
 }
 
+/// A base holding an ID more than once, within a blob and across a blob
+/// boundary: `[3, 5, 5]`, `[5, 7, 7]`, `[9]`. Every copy of the modified 5
+/// is replaced where it stands and every copy of the deleted 7 dropped,
+/// while the creates 4, 6 and 10 land once at their sorted positions. The
+/// rewrite finds each base element's change by forward cursors over the
+/// diff's sorted lists, which must not step past an ID on its first match.
+/// Indexed, and unindexed under `--force`.
+#[test]
+fn merge_replaces_and_deletes_every_copy_of_a_repeated_id() {
+    for indexed in [true, false] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs_indexed(&base, &[&[3, 5, 5], &[5, 7, 7], &[9]], indexed);
+        node_osc(
+            &osc,
+            r#"<create><node id="4" lat="4.0" lon="4.0" version="1"/><node id="6" lat="6.0" lon="6.0" version="1"/><node id="10" lat="7.0" lon="7.0" version="1"/></create>
+<modify><node id="5" lat="1.0" lon="1.0" version="2"/></modify>
+<delete><node id="7" version="2"/></delete>"#,
+        );
+        run_apply_ok(&base, &osc, &output);
+        let c = read_all_elements(&output);
+        assert_eq!(
+            node_ids(&c),
+            vec![3, 4, 5, 5, 5, 6, 9, 10],
+            "indexed: {indexed}"
+        );
+        for n in c.nodes.iter().filter(|n| n.0 == 5) {
+            assert_eq!((n.1, n.2), (10_000_000, 10_000_000), "indexed: {indexed}");
+        }
+    }
+}
+
 /// A create between a blob and a mixed-sign blob's first element: `[-1]`
 /// then `[-3, 1]` (canonical -1, -3, 1), the diff creating -2. The second
 /// blob's slice starts at its first element, -3, so -2 is the drain's gap

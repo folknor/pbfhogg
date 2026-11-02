@@ -91,6 +91,14 @@
   resident as allocator free memory to the end. Planet peak memory is
   2.2-2.9 GB, against 2.6-3.1 GB with the encoder change above alone
   (2.3-2.4 GB before both), with the same wall time and output bytes.
+- `apply-changes` keeps the parsed diff in ID order for the run and drops
+  the hash tables it needed only while parsing, about 120 MB less held on a
+  planet daily diff. Rewriting a blob walks the sorted diff instead of
+  looking up every base element in two hash tables: planet went from 98 s
+  to 89 s (270 s to 261 s with `--locations-on-ways`), with the same output.
+  The summary's diff memory line now reads `OSC diff heap` and, like
+  `MergeStats::diff_heap_bytes`, counts what is held for the run (about
+  530 MB there, against an estimate of 575 MB before).
 
 ## 0.6.0 - 2026-10-30
 

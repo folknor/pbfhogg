@@ -307,22 +307,20 @@ ledger does not bound pages glibc retains. apply-changes now bounds outstanding 
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-113: Measure and reduce apply-changes' retained lookup storage
+### WRK-130: apply-changes -l refresh probe re-stores the diff's nodes in a hash map
 
-Superseded overlay records were measured and are small (about 25 MB of
-326 MB arena payload at planet seq 4913; reasoning on `CompactDiffOverlay`,
-numbers in reference/performance.md). What else apply-changes retains
-through the pipeline is unmeasured per component and is the target:
-`DiffRanges` duplicates every live id into sorted vectors beside the
-overlay's hash indexes (about 60 MB logical at planet, outside
-`merge_diff_heap_bytes`); version floors are only needed while parsing,
-yet the CLI keeps them for the whole run (library accumulation still needs
-them); the parser interns user names on deletes although a delete keeps
-only its version claim; the interner stores each string twice (buffer and
-lookup key). `heap_size_estimate` is wrong both ways (arena capacity
-headroom counted, hash buckets undercounted), so count resident components
-before choosing a fix. Deleted-id membership is still needed during the
-pipeline, though its representation could merge with other state.
+Under `--locations-on-ways`, `StaleProbe` (`apply_changes/refresh.rs`)
+holds every node the OSC upserts or deletes in an `FxHashMap<i64,
+ProbeEntry>` behind a Bloom filter: 100.1 MB at planet seq 4913
+(`merge_loc_refresh_probe_bytes`, bygg, 2026-11-02), for the whole run.
+`SortedDiff` already holds the same IDs sorted, with each upsert's record
+(and so its coordinates) one offset away. The Bloom filter turns away about
+all of the probes (about one way ref in ten thousand names a diff node), so
+a binary search over the sorted node lists behind the same filter may cost
+nothing measurable and would leave only the filter words, a few MB. The
+probe is random access from base way refs, so it is a lookup, not a merge;
+measure the hit path at planet before choosing. `NodeLocationIndex`'s
+`needed_set` and `locations` are separate and needed past setup.
 
 ### WRK-116: getid --add-referenced follows way refs only
 

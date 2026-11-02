@@ -54,7 +54,7 @@ use protohoggr::{encode_varint, zigzag_decode_64, zigzag_encode_64};
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, new_wire_error};
-use crate::osc::CompactDiffOverlay;
+use crate::osc::sorted::SortedDiff;
 use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT, WireWay};
 
 /// What the OSC says about one node a base way references.
@@ -94,19 +94,17 @@ impl StaleProbe {
     /// Build from the parsed OSC. The overlay holds one final state per node
     /// (an upsert removes a delete and the reverse), so an ID is either
     /// upserted or deleted, never both.
-    pub(super) fn from_diff(diff: &CompactDiffOverlay) -> Self {
-        let deleted = diff.deleted_ids(crate::ElementKind::Node);
-        let mut map: FxHashMap<i64, ProbeEntry> = FxHashMap::with_capacity_and_hasher(
-            diff.node_count() + deleted.len(),
-            Default::default(),
-        );
-        for &id in diff.node_ids() {
-            if let Some(node) = diff.get_node(id) {
-                map.insert(
-                    id,
-                    ProbeEntry::Upserted(node.decimicro_lat(), node.decimicro_lon()),
-                );
-            }
+    pub(super) fn from_diff(diff: &SortedDiff) -> Self {
+        let upserts = diff.upserts(crate::ElementKind::Node);
+        let deleted = diff.deleted(crate::ElementKind::Node);
+        let mut map: FxHashMap<i64, ProbeEntry> =
+            FxHashMap::with_capacity_and_hasher(upserts.len() + deleted.len(), Default::default());
+        for (i, &id) in upserts.iter().enumerate() {
+            let node = diff.node(i);
+            map.insert(
+                id,
+                ProbeEntry::Upserted(node.decimicro_lat(), node.decimicro_lon()),
+            );
         }
         for &id in deleted {
             map.insert(id, ProbeEntry::Deleted);

@@ -66,11 +66,10 @@ use crate::ElementKind;
 use crate::commands::flush_passthrough_buf;
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
-use crate::osc::CompactDiffOverlay;
+use crate::osc::sorted::SortedDiff;
 use crate::writer::PbfWriter;
 
 use super::descriptor::{DrainItem, DrainMessage, Route};
-use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::stats::MergeStats;
@@ -78,6 +77,7 @@ use super::stream_output::{
     CreateEncoder, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
 };
 use super::streaming::CoordSlots;
+use super::upsert_cursors::UpsertCursors;
 use super::window::WindowReturn;
 
 /// Drain → workers post-barrier `loc_map` handle. The drain calls
@@ -94,8 +94,7 @@ pub(super) type SeededLocations = std::sync::Mutex<Option<FxHashMap<i64, (i32, i
 /// (it needs `&mut`, which doesn't compose with the immutable borrows
 /// of the rest of the config in the inner item-processing functions).
 pub(super) struct DrainConfig<'a> {
-    pub ranges: &'a DiffRanges,
-    pub diff: &'a CompactDiffOverlay,
+    pub diff: &'a SortedDiff,
     /// Where create runs longer than one block are encoded and framed (the
     /// invocation's executor; `None` encodes them on the drain thread), and
     /// the output compression they are framed with.
@@ -421,7 +420,7 @@ pub(super) fn run_drain(
     let loc_map_owned = state.loc_map.clone();
     let loc = LocMode::new(cfg.locations_on_ways, loc_map_owned.as_deref());
     for &kind in types_to_flush {
-        let (cursor, upserts) = state.cursors.get(kind, cfg.ranges);
+        let (cursor, upserts) = state.cursors.get(kind, cfg.diff);
         let run = &upserts[cursor..];
         // Trailing creates are a second emission channel: they do not
         // pass through `dispatch_item`, so without these calls the
@@ -437,10 +436,15 @@ pub(super) fn run_drain(
             let key = crate::osm_id::osm_id_key(id);
             check_output_order(&mut state, kind, key, key)?;
         }
-        state
-            .creates
-            .emit(kind, run, cfg.diff, loc, writer, &mut stats)?;
-        let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
+        state.creates.emit(
+            kind,
+            cursor..upserts.len(),
+            cfg.diff,
+            loc,
+            writer,
+            &mut stats,
+        )?;
+        let (cursor, _) = state.cursors.get_mut(kind, cfg.diff);
         *cursor = upserts.len();
         counters
             .trailing_creates_emitted
@@ -592,7 +596,6 @@ fn handle_type_transition(
     let emitted = flush_remaining_upserts(
         prev,
         item_kind,
-        cfg.ranges,
         cfg.diff,
         &mut state.cursors,
         &mut state.creates,
@@ -617,7 +620,7 @@ fn handle_gap_creates(
     stats: &mut MergeStats,
     counters: &DrainCounters,
 ) -> Result<()> {
-    if !has_gap_creates(item_kind, osm_first, cfg.ranges, &state.cursors) {
+    if !has_gap_creates(item_kind, osm_first, cfg.diff, &state.cursors) {
         return Ok(());
     }
     flush_copy_range(state, cfg, writer, counters)?;
@@ -626,7 +629,6 @@ fn handle_gap_creates(
     emit_gap_creates(
         item_kind,
         osm_first,
-        cfg.ranges,
         cfg.diff,
         &mut state.cursors,
         &mut state.creates,
@@ -868,7 +870,7 @@ fn dispatch_variant(
             // become gap creates on the next same-type blob.
             let (min_id, max_id) = id_range;
             let last = crate::osm_id::blob_osm_last_key(min_id, max_id);
-            let (cursor, upserts) = state.cursors.get_mut(kind, cfg.ranges);
+            let (cursor, upserts) = state.cursors.get_mut(kind, cfg.diff);
             while *cursor < upserts.len() && crate::osm_id::osm_id_key(upserts[*cursor]) <= last {
                 *cursor += 1;
             }

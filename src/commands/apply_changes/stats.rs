@@ -21,7 +21,12 @@ pub struct MergeStats {
     pub bytes_passthrough: u64,
     /// Bytes of rewritten blobs as written (framed, compressed).
     pub bytes_rewritten: u64,
-    /// Heap bytes used by the CompactDiffOverlay after OSC parsing.
+    /// Backing bytes the parsed OSC holds for the whole rewrite, by
+    /// allocation capacity: the record arenas (growth headroom included,
+    /// whose untouched pages are not resident), the sorted ID and offset
+    /// vectors, and the interned strings. Not RSS and not allocator
+    /// overhead. The parse-time hash indexes, deleted sets and version
+    /// floors are gone by then and are not in it.
     pub diff_heap_bytes: u64,
     /// Per-blob frame sizes in bytes for exact percentile computation.
     /// Retains 4 bytes per observed blob (plus Vec spare capacity); summary
@@ -164,7 +169,7 @@ impl MergeStats {
         if self.diff_heap_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]
             let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
-            writeln!(w, "  CompactDiffOverlay heap: {mb:.1} MB")?;
+            writeln!(w, "  OSC diff heap: {mb:.1} MB")?;
         }
         if self.loc_nodes_needed > 0 {
             writeln!(

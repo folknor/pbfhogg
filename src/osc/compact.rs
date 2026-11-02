@@ -1,13 +1,14 @@
 //! Arena-packed binary layout for OSC elements, plus the zero-copy iterator
 //! and accessor types that read them back out. Tag keys and relation member
-//! roles are stored as u32 intern IDs into the `StringInterner` owned by the
-//! enclosing [`super::parse::CompactDiffOverlay`].
+//! roles are stored as u32 intern IDs into the `StringTable` of the
+//! enclosing [`super::parse::CompactDiffOverlay`]'s interner, or of the
+//! [`super::sorted::SortedDiff`] a finished parse becomes.
 
 use crate::ElementKind;
 use crate::read::elements::MemberType;
 
 use super::ParseResult;
-use super::interner::{StringInterner, arena_invariant_broken};
+use super::interner::{StringTable, arena_invariant_broken};
 
 // ---------------------------------------------------------------------------
 // LE byte-reading helpers
@@ -97,7 +98,7 @@ fn byte_to_member_type(b: u8) -> MemberType {
 /// `timestamp` is Unix epoch seconds (OSC carries second resolution).
 /// User names go through the overlay's `StringInterner` like tag keys and
 /// member roles. A zeroed block (flags = 0) means "no metadata on this
-/// element" - `CompactDiffOverlay` accessors return `None` in that case,
+/// element" - the record accessors' `metadata()` returns `None` in that case,
 /// and apply-changes writes the element without metadata, matching the
 /// pre-metadata behavior for producers that omit the attributes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -188,7 +189,7 @@ fn arena_append_meta(arena: &mut Vec<u8>, meta: &ArenaMeta) {
 fn read_meta<'a>(
     data: &'a [u8],
     offset: usize,
-    interner: &'a StringInterner,
+    strings: &'a StringTable,
 ) -> Option<crate::write::block_builder::Metadata<'a>> {
     let flags = data[offset];
     if flags & META_FLAG_PRESENT == 0 {
@@ -200,7 +201,7 @@ fn read_meta<'a>(
         changeset: read_i64_le(data, offset + M_CHANGESET),
         uid: read_i32_le(data, offset + M_UID),
         user: if flags & META_FLAG_HAS_USER != 0 {
-            interner.resolve(read_u32_le(data, offset + M_USER_ID))
+            strings.resolve(read_u32_le(data, offset + M_USER_ID))
         } else {
             ""
         },
@@ -332,7 +333,7 @@ pub struct CompactTagIter<'a> {
     data: &'a [u8],
     offset: usize,
     remaining: usize,
-    interner: &'a StringInterner,
+    strings: &'a StringTable,
 }
 
 impl<'a> Iterator for CompactTagIter<'a> {
@@ -349,7 +350,7 @@ impl<'a> Iterator for CompactTagIter<'a> {
         self.offset += 4;
         let value_bytes = &self.data[self.offset..self.offset + value_len];
         self.offset += value_len;
-        let key = self.interner.resolve(key_id);
+        let key = self.strings.resolve(key_id);
         // The value bytes were copied from a `&str` by `append_tags`, so
         // they decode unless this walk misread the record. Still checked,
         // not `from_utf8_unchecked`: a misread is then a panic, not UB.
@@ -403,7 +404,7 @@ pub struct CompactMemberIter<'a> {
     data: &'a [u8],
     offset: usize,
     remaining: usize,
-    interner: &'a StringInterner,
+    strings: &'a StringTable,
 }
 
 impl<'a> Iterator for CompactMemberIter<'a> {
@@ -421,7 +422,7 @@ impl<'a> Iterator for CompactMemberIter<'a> {
         let role_id = read_u32_le(self.data, self.offset);
         self.offset += 4;
         let member_type = byte_to_member_type(type_byte);
-        let role = self.interner.resolve(role_id);
+        let role = self.strings.resolve(role_id);
         Some((member_type, ref_id, role))
     }
 
@@ -441,7 +442,7 @@ impl ExactSizeIterator for CompactMemberIter<'_> {}
 /// Layout: `[id:i64][lat:i32][lon:i32][tag_count:u32][meta:29B]` then tags.
 pub struct CompactNodeRef<'a> {
     pub(super) data: &'a [u8],
-    pub(super) interner: &'a StringInterner,
+    pub(super) strings: &'a StringTable,
 }
 
 impl<'a> CompactNodeRef<'a> {
@@ -473,7 +474,7 @@ impl<'a> CompactNodeRef<'a> {
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
     pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
-        read_meta(self.data, Self::META_OFF, self.interner)
+        read_meta(self.data, Self::META_OFF, self.strings)
     }
 
     /// Returns an iterator over the tags as `(&str, &str)` pairs.
@@ -482,7 +483,7 @@ impl<'a> CompactNodeRef<'a> {
             data: self.data,
             offset: Self::HEADER_LEN,
             remaining: self.tag_count(),
-            interner: self.interner,
+            strings: self.strings,
         }
     }
 }
@@ -492,7 +493,7 @@ impl<'a> CompactNodeRef<'a> {
 /// Layout: `[id:i64][ref_count:u32][tag_count:u32][meta:29B]` then refs, then tags.
 pub struct CompactWayRef<'a> {
     pub(super) data: &'a [u8],
-    pub(super) interner: &'a StringInterner,
+    pub(super) strings: &'a StringTable,
 }
 
 impl<'a> CompactWayRef<'a> {
@@ -519,7 +520,7 @@ impl<'a> CompactWayRef<'a> {
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
     pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
-        read_meta(self.data, Self::META_OFF, self.interner)
+        read_meta(self.data, Self::META_OFF, self.strings)
     }
 
     /// Returns an iterator over the node references.
@@ -538,7 +539,7 @@ impl<'a> CompactWayRef<'a> {
             data: self.data,
             offset: tag_offset,
             remaining: self.tag_count(),
-            interner: self.interner,
+            strings: self.strings,
         }
     }
 }
@@ -548,7 +549,7 @@ impl<'a> CompactWayRef<'a> {
 /// Layout: `[id:i64][member_count:u32][tag_count:u32][meta:29B]` then members, then tags.
 pub struct CompactRelationRef<'a> {
     pub(super) data: &'a [u8],
-    pub(super) interner: &'a StringInterner,
+    pub(super) strings: &'a StringTable,
 }
 
 impl<'a> CompactRelationRef<'a> {
@@ -578,7 +579,7 @@ impl<'a> CompactRelationRef<'a> {
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
     pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
-        read_meta(self.data, Self::META_OFF, self.interner)
+        read_meta(self.data, Self::META_OFF, self.strings)
     }
 
     /// Returns an iterator over the members as `(MemberType, i64, &str)` tuples.
@@ -587,7 +588,7 @@ impl<'a> CompactRelationRef<'a> {
             data: self.data,
             offset: Self::HEADER_LEN,
             remaining: self.member_count(),
-            interner: self.interner,
+            strings: self.strings,
         }
     }
 
@@ -598,7 +599,7 @@ impl<'a> CompactRelationRef<'a> {
             data: self.data,
             offset: tag_offset,
             remaining: self.tag_count(),
-            interner: self.interner,
+            strings: self.strings,
         }
     }
 }

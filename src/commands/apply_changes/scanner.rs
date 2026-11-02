@@ -45,8 +45,8 @@ use crate::read::header_walker::HeaderWalker;
 use crate::read::input::PinnedInput;
 
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
-use super::diff_ranges::DiffRanges;
 use super::window::WindowAdmit;
+use crate::osc::sorted::SortedDiff;
 
 /// Scanner channel configuration. Which channels are populated depends
 /// on the output backend: on the `Route::Splice` route (splice-capable
@@ -68,7 +68,7 @@ pub(super) struct ScannerChannels {
 pub(super) struct ScannerConfig<'a> {
     /// The run's pinned base; the walker opens its own description of it.
     pub base: &'a PinnedInput,
-    pub ranges: &'a DiffRanges,
+    pub diff: &'a SortedDiff,
     /// True when `--locations-on-ways` is active. Enables the node→way
     /// barrier: at the first way or relation descriptor the scanner waits
     /// on `barrier_rx` for the drain's signal that `Arc<loc_map>` is
@@ -110,7 +110,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     // signals end-of-input to the worker pool and drain.
     let ScannerConfig {
         base,
-        ranges,
+        diff,
         locations_on_ways,
         refresh_ways,
         channels,
@@ -249,7 +249,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         let item = if let Some(drain_tx) = splice_tx
             && has_indexdata
             && !low_must_decompress
-            && !ranges.range_overlaps(
+            && !diff.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
                 id_range.map_or(0, |r| r.1),
@@ -268,7 +268,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
             )
         } else if !low_must_decompress
             && has_indexdata
-            && !ranges.range_overlaps(
+            && !diff.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
                 id_range.map_or(0, |r| r.1),

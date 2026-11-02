@@ -5,12 +5,10 @@
 //! gone - the scanner owns the fast-path now and the worker pool slow-path
 //! always decompresses + parses + precise-checks.
 
-use crate::Element;
-use crate::PrimitiveBlock;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
-
-use super::diff_ranges::DiffRanges;
+use crate::osc::sorted::{Seek, SortedDiff};
+use crate::{Element, ElementKind, PrimitiveBlock};
 
 /// The walk every decoded candidate's element loops feed: the shared
 /// [`ClaimWalk`](crate::blob_meta::ClaimWalk) under apply-changes' order
@@ -53,14 +51,10 @@ pub(super) fn blob_walk(claim: Option<&BlobIndex>) -> BlobWalk<'_> {
 /// element has been visited and the caller ends the walk. On `true` the walk
 /// stops at the hit, and the rewrite that follows walks the block whole.
 ///
-/// Sorted-merge has a per-kind cursor that only advances forward. Since
-/// block elements within a kind are sorted (`walk` refuses a block that is
-/// not) and `DiffRanges` IDs are sorted by `osm_id_cmp`, each cursor starts
-/// by binary search at the first diff ID not before the kind's first
-/// element, and then visits at most the sub-slice of diff IDs spanning the
-/// block's ID range.
+/// A sorted merge against the diff's upserts and deletes through
+/// [`KindSeeks`]: per-kind cursors that only advance forward.
 ///
-/// **Key distinction from `range_overlaps`**: a diff with only pure
+/// **Key distinction from `SortedDiff::range_overlaps`**: a diff with only pure
 /// creates (new IDs not present in the base PBF) can cause
 /// `range_overlaps` to return true (the create IDs fall within the
 /// blob's range), but this function returns false (no element in the
@@ -77,36 +71,68 @@ pub(super) fn blob_walk(claim: Option<&BlobIndex>) -> BlobWalk<'_> {
 /// even if a projection removed all of it.
 pub(super) fn block_overlaps_diff(
     block: &PrimitiveBlock,
-    ranges: &DiffRanges,
+    diff: &SortedDiff,
     walk: &mut BlobWalk<'_>,
 ) -> Result<bool> {
-    use std::cmp::Ordering;
-
-    // `None` until the kind's first element seeds it by binary search;
-    // starting at 0 walked the whole diff prefix below every blob.
-    let mut node_cursor: Option<usize> = None;
-    let mut way_cursor: Option<usize> = None;
-    let mut rel_cursor: Option<usize> = None;
-
+    let mut cursors = KindSeeks::default();
     for element in block.elements_skip_metadata() {
-        let (cursor, sorted, id) = match &element {
-            Element::DenseNode(dn) => (&mut node_cursor, &ranges.node_ids[..], dn.id()),
-            Element::Node(n) => (&mut node_cursor, &ranges.node_ids[..], n.id()),
-            Element::Way(w) => (&mut way_cursor, &ranges.way_ids[..], w.id()),
-            Element::Relation(r) => (&mut rel_cursor, &ranges.rel_ids[..], r.id()),
-        };
+        let (kind, id) = element_kind_id(&element);
         walk.observe(id)?;
-        let cursor = cursor.get_or_insert_with(|| {
-            sorted.partition_point(|&x| crate::osm_id::osm_id_cmp(x, id) == Ordering::Less)
-        });
-        while *cursor < sorted.len()
-            && crate::osm_id::osm_id_cmp(sorted[*cursor], id) == Ordering::Less
-        {
-            *cursor += 1;
-        }
-        if *cursor < sorted.len() && sorted[*cursor] == id {
+        if cursors.find(diff, kind, id) != DiffHit::None {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// The kind and ID of a decoded element.
+#[inline]
+pub(super) fn element_kind_id(element: &Element<'_>) -> (ElementKind, i64) {
+    match element {
+        Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
+        Element::Node(n) => (ElementKind::Node, n.id()),
+        Element::Way(w) => (ElementKind::Way, w.id()),
+        Element::Relation(r) => (ElementKind::Relation, r.id()),
+    }
+}
+
+/// What the diff says about one base element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DiffHit {
+    /// Untouched by the diff.
+    None,
+    /// Deleted by the diff.
+    Deleted,
+    /// Replaced by the diff's record at this index into the kind's upserts.
+    Upserted(usize),
+}
+
+/// Per-kind forward cursors over the diff's sorted upserts and deletes,
+/// for one block's elements: each kind's elements arrive in `osm_id_cmp`
+/// order (the block's walk refuses a block that breaks it, before any
+/// output leaves the worker), so each cursor starts by binary search at
+/// the kind's first element and then only moves forward, over at most the
+/// diff IDs spanning the block. An ID the block holds twice is found both
+/// times ([`Seek`]). Kept per kind, not only for the blob's claimed kind, so
+/// an element of another kind in the block is matched against its own
+/// kind's changes.
+#[derive(Default)]
+pub(super) struct KindSeeks {
+    upserts: [Seek; 3],
+    deleted: [Seek; 3],
+}
+
+impl KindSeeks {
+    #[inline]
+    pub(super) fn find(&mut self, diff: &SortedDiff, kind: ElementKind, id: i64) -> DiffHit {
+        let k = usize::from(kind.ordinal());
+        let table = diff.kind(kind);
+        if self.deleted[k].find(table.deleted(), id).is_some() {
+            DiffHit::Deleted
+        } else if let Some(i) = self.upserts[k].find(table.upserts(), id) {
+            DiffHit::Upserted(i)
+        } else {
+            DiffHit::None
+        }
+    }
 }

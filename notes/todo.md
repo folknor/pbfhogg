@@ -623,22 +623,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   back by range, or an index-only first pass plus a re-parse into key-range
   buckets; both add a full payload write and read.
 
-- [ ] **An unversioned modify launders a version floor that a delete keeps.**
-  `check_version_advance` (`src/osc/parse.rs`) compares only when both sides
-  claim a version, and an unversioned delete carries the live record's version
-  into its tombstone, so `create v9 -> delete (no version) -> modify v9` is
-  refused. An unversioned modify instead replaces the live record with one that
-  claims nothing, and `KindStore::stored_version` reads only the current record,
-  so `modify v9 -> modify (no version) -> modify v8` is accepted. Inside the
-  documented contract (DEVIATIONS.md) and pinned deliberately by
-  `test_version_advance_and_unversioned_still_accepted`; real replication diffs
-  always carry `version`, so reaching the laundering sequence needs a producer
-  that emits versions inconsistently, at which point positional order is the
-  only signal left. Closing it means a per-id version-floor map updated on every
-  claimless overwrite (the tombstone maps generalise into that), plus the
-  matching change in `merge_changes::check_version_advance`, which has the same
-  shape. Do both together or neither.
-
 - [ ] **Absent-versus-zero survives in the PBF metadata representation.**
   `osc::compact::ArenaMeta` and `write::block_builder::Metadata` carry no
   per-field presence bit, so an OSC element with `version="4"` and nothing else

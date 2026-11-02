@@ -14,7 +14,6 @@ use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 use crate::read::input::InputSource;
 
 use super::descriptor::{DrainMessage, Route};
-use super::diff_ranges::DiffRanges;
 use super::drain::{
     self, DrainChannels, DrainConfig, DrainCounters, LocMapHandle, SeededLocations,
 };
@@ -281,7 +280,7 @@ pub(crate) fn merge_to<'a>(
         "Parsing OSC diff: {}",
         osc_file.display()
     );
-    let diff = Arc::new({
+    let overlay = {
         let mut overlay = crate::osc::CompactDiffOverlay::new();
         overlay.allow_version_regression(allow_version_regression);
         // The shared parser also emits merge_changes_decompress_ns once per
@@ -290,34 +289,35 @@ pub(crate) fn merge_to<'a>(
         // TimedRead in osc/xml_parse.rs, documents the attribution.
         crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.invocation)?;
         overlay
-    });
-    crate::host::diag!(
-        host.diagnostics,
-        Progress,
-        "apply_changes.diff_counts",
-        "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
-        diff.node_count(),
-        diff.way_count(),
-        diff.relation_count(),
-        diff.deleted_ids(crate::ElementKind::Node).len(),
-        diff.deleted_ids(crate::ElementKind::Way).len(),
-        diff.deleted_ids(crate::ElementKind::Relation).len(),
-    );
-    let diff_heap_bytes = diff.heap_size_estimate() as u64;
+    };
     let osc_parse_ms = osc_start.elapsed_ms();
 
+    // The pipeline reads the diff only in ID order and parses nothing more,
+    // so the parse-time hash indexes, deleted sets, version floors and
+    // interner lookup go here; `SortedDiff` (osc/sorted.rs) is the sorted
+    // view every stage reads. `merge_diffranges_ms` keeps its name for the
+    // sort.
     let diffranges_start = crate::counters::Stopwatch::start();
-    let ranges = Arc::new(DiffRanges::from_diff(&diff));
+    let diff = Arc::new(overlay.into_sorted());
     let diffranges_ms = diffranges_start.elapsed_ms();
-    crate::host::diag!(
-        host.diagnostics,
-        Progress,
-        "apply_changes.diff_ranges",
-        "Diff ID ranges: {} node IDs, {} way IDs, {} rel IDs",
-        ranges.node_ids.len(),
-        ranges.way_ids.len(),
-        ranges.rel_ids.len(),
-    );
+    let diff_heap_bytes = diff.heap_bytes() as u64;
+    {
+        use crate::ElementKind::{Node, Relation, Way};
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.diff_counts",
+            "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
+            diff.upserts(Node).len(),
+            diff.upserts(Way).len(),
+            diff.upserts(Relation).len(),
+            diff.deleted(Node).len(),
+            diff.deleted(Way).len(),
+            diff.deleted(Relation).len(),
+        );
+    }
+    host.invocation
+        .counter("merge_diff_arena_len_bytes", diff.arena_len_bytes());
 
     // --locations-on-ways setup. The descriptor-first pipeline fuses
     // prefill into the worker pool, so we no longer call
@@ -487,7 +487,7 @@ pub(crate) fn merge_to<'a>(
 
     let scanner_cfg = ScannerConfig {
         base: &base,
-        ranges: &ranges,
+        diff: &diff,
         locations_on_ways,
         refresh_ways: locations_on_ways && probe.has_upserts(),
         channels: ScannerChannels {
@@ -501,7 +501,6 @@ pub(crate) fn merge_to<'a>(
 
     let streaming_cfg = StreamingConfig {
         base: base.clone(),
-        ranges: Arc::clone(&ranges),
         diff: Arc::clone(&diff),
         worker_count,
         locations_on_ways,
@@ -522,7 +521,6 @@ pub(crate) fn merge_to<'a>(
     };
 
     let drain_cfg = DrainConfig {
-        ranges: &ranges,
         diff: &diff,
         // A single worker comes only from an explicit `-j 1` (the automatic
         // sizing starts at two), which runs sequentially: its create runs

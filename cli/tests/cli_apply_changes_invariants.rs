@@ -6,7 +6,9 @@
 //! byte-for-byte, and any later rewrite must still preserve. Each
 //! test pins one invariant:
 //!
-//! - `cursor_rule_*`: Rewrite slots advance UpsertCursors past their blob's ID range; Passthrough/FalsePositive slots do NOT.
+//! - `interior_create_in_*_false_positive_blob_*`: a create inside a blob the diff otherwise leaves alone forces its rewrite, so it lands at its sorted position rather than as the next blob's gap create.
+//! - `unsorted_base_*`, `sorted_multi_blob_base_*`: the sorted stamp is only written over input in order.
+//! - `forced_run_*`: an unindexed base under `--force` comes out wholly indexed, and a blob mixing kinds is refused.
 //! - `empty_base_pbf_*`: `last_type == None` forever; trailing creates must flush all three kinds.
 //! - `trailing_creates_after_*`: Type-transition flush correctness.
 //! - `modify_on_missing_id_*`, `delete_on_missing_id_*`, `create_on_existing_id_*`: Permissive missing-element semantics (reference/osmium-parity.md).

@@ -3,10 +3,12 @@
 //! their sorted positions, and frames each output block on the worker as it
 //! completes.
 
+use std::ops::Range;
+
 use crate::ElementKind;
 use crate::blob_meta::BlobIndex;
 use crate::block_builder::BlockBuilder;
-use crate::osc::CompactDiffOverlay;
+use crate::osc::sorted::SortedDiff;
 use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
@@ -15,7 +17,7 @@ use crate::commands::{
 };
 
 use super::Result;
-use super::classify::blob_walk;
+use super::classify::{DiffHit, KindSeeks, blob_walk, element_kind_id};
 use super::element_writes::{
     BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation,
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
@@ -41,12 +43,12 @@ pub(super) struct RewriteOutput {
 // The create dispatch mirrors stream_output, but capacity checks below must
 // flush into this worker's local blocks before stats advance. The shared
 // add_osc_* helpers own only encoding, not ordering or output submission.
-/// Emit a single create element into the local BlockBuilder.
-#[allow(clippy::too_many_arguments)]
-fn emit_create_local(
-    id: i64,
+/// Write the diff's record `upserts(kind)[i]` into the local BlockBuilder:
+/// a create, or the replacement of a base element.
+fn write_osc_local(
+    i: usize,
     kind: ElementKind,
-    diff: &CompactDiffOverlay,
+    diff: &SortedDiff,
     bb: &mut BlockBuilder,
     output: &mut FramedBlocks<'_>,
     stats: &mut MergeStats,
@@ -54,24 +56,18 @@ fn emit_create_local(
 ) -> Result<()> {
     match kind {
         ElementKind::Node => {
-            if let Some(osc) = diff.get_node(id) {
-                ensure_node_capacity_local(bb, output)?;
-                add_osc_node(bb, &osc);
-                stats.diff_nodes += 1;
-            }
+            ensure_node_capacity_local(bb, output)?;
+            add_osc_node(bb, &diff.node(i));
+            stats.diff_nodes += 1;
         }
         ElementKind::Way => {
-            if let Some(osc) = diff.get_way(id) {
-                write_osc_way_local(bb, output, &osc, loc)?;
-                stats.diff_ways += 1;
-            }
+            write_osc_way_local(bb, output, &diff.way(i), loc)?;
+            stats.diff_ways += 1;
         }
         ElementKind::Relation => {
-            if let Some(osc) = diff.get_relation(id) {
-                ensure_relation_capacity_local(bb, output)?;
-                add_osc_relation(bb, &osc);
-                stats.diff_relations += 1;
-            }
+            ensure_relation_capacity_local(bb, output)?;
+            add_osc_relation(bb, &diff.relation(i));
+            stats.diff_relations += 1;
         }
     }
     Ok(())
@@ -110,9 +106,9 @@ fn emit_create_local(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
     block: &PrimitiveBlock,
-    diff: &CompactDiffOverlay,
+    diff: &SortedDiff,
     bb: &mut BlockBuilder,
-    inline_upserts: &[i64],
+    inline_upserts: Range<usize>,
     kind: ElementKind,
     loc: LocMode<'_>,
     probe: &StaleProbe,
@@ -124,18 +120,20 @@ pub(super) fn rewrite_block_parallel(
     let mut walk = blob_walk(claim);
     let mut output = FramedBlocks::new(*compression, metrics);
     let mut stats = MergeStats::new();
-    let mut upsert_cursor: usize = 0;
     let mut base_writes = BaseWrites::new(block, probe, scratch);
+    // Creates come from `inline_upserts` alone; what the diff does to each
+    // base element is found by its own per-kind cursors, so a base element
+    // the upsert cursor has already passed (an ID the block holds twice) is
+    // still replaced.
+    let mut seeks = KindSeeks::default();
+    let inline_ids = &diff.upserts(kind)[inline_upserts.clone()];
+    let inline_base = inline_upserts.start;
+    let mut upsert_cursor: usize = 0;
 
     bb.pre_seed_string_table(block);
 
     for element in block.elements() {
-        let elem_id = match &element {
-            Element::DenseNode(dn) => dn.id(),
-            Element::Node(n) => n.id(),
-            Element::Way(w) => w.id(),
-            Element::Relation(r) => r.id(),
-        };
+        let (elem_kind, elem_id) = element_kind_id(&element);
         walk.observe(elem_id)?;
 
         // Emit creates (upsert IDs not in base block) before this element.
@@ -146,55 +144,42 @@ pub(super) fn rewrite_block_parallel(
         // claims it and `walk` refuses the block where it is false; any
         // future caller that bypasses both must re-establish the invariant
         // or the cursor may skip past upserts and drop creates.
-        while upsert_cursor < inline_upserts.len()
-            && crate::osm_id::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt()
+        while upsert_cursor < inline_ids.len()
+            && crate::osm_id::osm_id_cmp(inline_ids[upsert_cursor], elem_id).is_lt()
         {
-            let cid = inline_upserts[upsert_cursor];
+            let i = inline_base + upsert_cursor;
             upsert_cursor += 1;
-            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
+            write_osc_local(i, kind, diff, bb, &mut output, &mut stats, loc)?;
         }
         // Skip modification IDs (handled below by normal element processing)
-        if upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] == elem_id {
+        if upsert_cursor < inline_ids.len() && inline_ids[upsert_cursor] == elem_id {
             upsert_cursor += 1;
+        }
+
+        match seeks.find(diff, elem_kind, elem_id) {
+            DiffHit::Deleted => {
+                stats.deleted += 1;
+                continue;
+            }
+            DiffHit::Upserted(i) => {
+                write_osc_local(i, elem_kind, diff, bb, &mut output, &mut stats, loc)?;
+                continue;
+            }
+            DiffHit::None => {}
         }
 
         match &element {
             Element::DenseNode(dn) => {
-                let id = dn.id();
-                if diff.deleted_ids(crate::ElementKind::Node).contains(&id) {
-                    stats.deleted += 1;
-                } else if let Some(osc) = diff.get_node(id) {
-                    ensure_node_capacity_local(bb, &mut output)?;
-                    add_osc_node(bb, &osc);
-
-                    stats.diff_nodes += 1;
-                } else {
-                    write_base_dense_node_local(bb, &mut output, dn, block)?;
-                    stats.base_nodes += 1;
-                }
+                write_base_dense_node_local(bb, &mut output, dn, block)?;
+                stats.base_nodes += 1;
             }
             Element::Node(n) => {
-                let id = n.id();
-                if diff.deleted_ids(crate::ElementKind::Node).contains(&id) {
-                    stats.deleted += 1;
-                } else if let Some(osc) = diff.get_node(id) {
-                    ensure_node_capacity_local(bb, &mut output)?;
-                    add_osc_node(bb, &osc);
-
-                    stats.diff_nodes += 1;
-                } else {
-                    write_base_node_local(bb, &mut output, n, block)?;
-                    stats.base_nodes += 1;
-                }
+                write_base_node_local(bb, &mut output, n, block)?;
+                stats.base_nodes += 1;
             }
             Element::Way(w) => {
                 let id = w.id();
-                if diff.deleted_ids(crate::ElementKind::Way).contains(&id) {
-                    stats.deleted += 1;
-                } else if let Some(osc) = diff.get_way(id) {
-                    write_osc_way_local(bb, &mut output, &osc, loc)?;
-                    stats.diff_ways += 1;
-                } else if loc.for_way(id)?.is_some() {
+                if loc.for_way(id)?.is_some() {
                     write_base_way_local_with_locations(
                         bb,
                         &mut output,
@@ -209,27 +194,15 @@ pub(super) fn rewrite_block_parallel(
                 }
             }
             Element::Relation(r) => {
-                let id = r.id();
-                if diff.deleted_ids(crate::ElementKind::Relation).contains(&id) {
-                    stats.deleted += 1;
-                } else if let Some(osc) = diff.get_relation(id) {
-                    ensure_relation_capacity_local(bb, &mut output)?;
-                    add_osc_relation(bb, &osc);
-
-                    stats.diff_relations += 1;
-                } else {
-                    write_base_relation_local(bb, &mut output, r, block, &mut base_writes)?;
-                    stats.base_relations += 1;
-                }
+                write_base_relation_local(bb, &mut output, r, block, &mut base_writes)?;
+                stats.base_relations += 1;
             }
         }
     }
 
     // Emit remaining upserts after the last element (trailing creates)
-    while upsert_cursor < inline_upserts.len() {
-        let cid = inline_upserts[upsert_cursor];
-        upsert_cursor += 1;
-        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
+    for i in inline_base + upsert_cursor..inline_upserts.end {
+        write_osc_local(i, kind, diff, bb, &mut output, &mut stats, loc)?;
     }
 
     // Flush remaining elements in the BlockBuilder, then end the walk.

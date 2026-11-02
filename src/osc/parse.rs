@@ -234,7 +234,7 @@ impl CompactDiffOverlay {
         let &offset = self.node_index.get(&id)?;
         Some(CompactNodeRef {
             data: &self.node_arena[offset..],
-            interner: &self.interner,
+            strings: self.interner.strings(),
         })
     }
 
@@ -243,7 +243,7 @@ impl CompactDiffOverlay {
         let &offset = self.way_index.get(&id)?;
         Some(CompactWayRef {
             data: &self.way_arena[offset..],
-            interner: &self.interner,
+            strings: self.interner.strings(),
         })
     }
 
@@ -252,7 +252,7 @@ impl CompactDiffOverlay {
         let &offset = self.relation_index.get(&id)?;
         Some(CompactRelationRef {
             data: &self.relation_arena[offset..],
-            interner: &self.interner,
+            strings: self.interner.strings(),
         })
     }
 
@@ -342,6 +342,24 @@ impl CompactDiffOverlay {
         total += self.interner.heap_size_estimate();
 
         total
+    }
+
+    /// The finished parse in ID order, for a reader that walks it sorted
+    /// and parses nothing more (apply-changes). Keeps the arenas and the
+    /// interned strings; drops the hash indexes, deleted sets, version
+    /// floors and the interner's lookup map, which only parsing reads.
+    pub(crate) fn into_sorted(self) -> super::sorted::SortedDiff {
+        use super::sorted::{KindTable, SortedDiff};
+        SortedDiff::new(
+            KindTable::build(self.node_arena, self.node_index, self.deleted_nodes),
+            KindTable::build(self.way_arena, self.way_index, self.deleted_ways),
+            KindTable::build(
+                self.relation_arena,
+                self.relation_index,
+                self.deleted_relations,
+            ),
+            self.interner.into_strings(),
+        )
     }
 
     /// Deleted IDs by OSM object kind, without mutable access to overlay state.
@@ -1628,9 +1646,9 @@ mod tests {
         let id_world = interner.intern("world")?;
         let id_empty = interner.intern("")?;
 
-        assert_eq!(interner.resolve(id_hello), "hello");
-        assert_eq!(interner.resolve(id_world), "world");
-        assert_eq!(interner.resolve(id_empty), "");
+        assert_eq!(interner.strings().resolve(id_hello), "hello");
+        assert_eq!(interner.strings().resolve(id_world), "world");
+        assert_eq!(interner.strings().resolve(id_empty), "");
         assert_eq!(id_empty, 0); // empty string is always intern_id 0
         Ok(())
     }
@@ -1642,8 +1660,8 @@ mod tests {
     fn test_interner_resolve_unknown_id_panics() {
         let mut interner = StringInterner::new();
         let known = interner.intern("highway").expect("intern");
-        assert_eq!(interner.resolve(known), "highway");
-        let _ = interner.resolve(known + 1);
+        assert_eq!(interner.strings().resolve(known), "highway");
+        let _ = interner.strings().resolve(known + 1);
     }
 
     /// A tag value whose arena bytes do not decode is a broken arena
@@ -1660,7 +1678,7 @@ mod tests {
         arena[offset + NODE_META_OFF + META_LEN + 8] = 0xFF;
         let node = CompactNodeRef {
             data: &arena[offset..],
-            interner: &interner,
+            strings: interner.strings(),
         };
         let _ = node.tags().count();
     }
@@ -1685,7 +1703,7 @@ mod tests {
         arena[offset + RELATION_META_OFF + META_LEN + 8] = 7;
         let rel = CompactRelationRef {
             data: &arena[offset..],
-            interner: &interner,
+            strings: interner.strings(),
         };
         let _ = rel.members().count();
     }
@@ -1725,7 +1743,7 @@ mod tests {
 
         let node = CompactNodeRef {
             data: &arena[offset..],
-            interner: &interner,
+            strings: interner.strings(),
         };
 
         assert_eq!(node.id(), 42);
@@ -1751,7 +1769,7 @@ mod tests {
 
         let way = CompactWayRef {
             data: &arena[offset..],
-            interner: &interner,
+            strings: interner.strings(),
         };
 
         assert_eq!(way.id(), 99);
@@ -1786,7 +1804,7 @@ mod tests {
 
         let rel = CompactRelationRef {
             data: &arena[offset..],
-            interner: &interner,
+            strings: interner.strings(),
         };
 
         assert_eq!(rel.id(), 500);

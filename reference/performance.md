@@ -1331,8 +1331,9 @@ code unchanged), which the stored baselines had cached.
 | `inspect --extended` | unstored 571 MB cell | 571 MB | 355 MB | 41.4 s to 42.2 s |
 
 What is left in the larger peaks is not decode storage: apply-changes'
-overlay (575 MB by `merge_diff_heap_bytes`, an allocated-capacity estimate,
-not resident memory; see "Apply-changes overlay: superseded records") and
+overlay (575 MB by `merge_diff_heap_bytes` as it was then, an
+allocated-capacity estimate, not resident memory; its parts are counted
+in "Apply-changes retained lookup storage") and
 drain reorder (415 MB high water; since bounded by a
 sequence window that does not bind on this input, see "Apply-changes
 sequence window"); the
@@ -3154,13 +3155,68 @@ overlay's push and delete paths (unstored `--force` run stopped at
 | relation | 17,326 | 38.0 MB | 1,812 / 8.7 MB | 49 / 0.01 MB |
 
 About 25 MB of 325.7 MB appended arena payload is unreachable. The 575 MB
-`merge_diff_heap_bytes` is `heap_size_estimate`: arena capacity (growth
-headroom included, much of it untouched pages), hash tables, deleted sets,
-floors and the interner, so it is not the resident overlay. Across a week,
+`merge_diff_heap_bytes` of that commit was `heap_size_estimate`: arena
+capacity (growth headroom included, much of it untouched pages), hash
+tables, deleted sets, floors and the interner, so it was not the resident
+overlay (the next section counts each part). Across a week,
 `merge-changes --simplify` over seq 4914-4920 (cell `0df5c0ad`, `44c62853`)
 reduced 26,261,540 changes to 25,417,990, 3.2 % by count. Compacting the
 overlay was declined on these numbers; the reasoning sits on
 `CompactDiffOverlay` in `src/osc/parse.rs`.
+
+## Apply-changes retained lookup storage (bygg, 2026-11-02)
+
+What apply-changes held beside the arena records for the whole run, counted
+at `b5680edb` with temporary counters (exact allocation sizes from `Vec`
+capacities and hashbrown bucket counts, unstored `--force` run stopped at
+`MERGE_LOOP_START`), planet daily diff seq 4913:
+
+| part | entries | bytes |
+|---|---:|---:|
+| arenas, appended (capacity) | | 325.7 MB (469.8 MB) |
+| live hash indexes | 2,816,454 / 525,628 / 15,465 | 89.7 MB |
+| deleted sets | 771,375 / 50,447 / 540 | 10.0 MB |
+| version floors | 822,482 | 19.0 MB |
+| interner lookup map and its keys | 13,692 strings | 1.0 MB |
+| interner strings and table | 168 KB of strings | 0.4 MB |
+| `DiffRanges` (six sorted ID vectors) | | 60.3 MB |
+
+The strings only deletes interned (user names) were 48, 537 bytes. glibc
+agreed (`mallinfo2` after the ID ranges: 610 MB in mapped chunks plus 40 MB
+in the heap). After the parse nothing reads the hash indexes, deleted
+sets, floors or lookup map except through lookups the sorted vectors could
+answer, so apply-changes now turns the overlay into `SortedDiff`
+(`src/osc/sorted.rs`): per kind sorted upsert IDs, parallel record
+offsets and sorted deletes, 60 MB, the same as `DiffRanges` alone. Retained
+allocation 650 MB to 530 MB (`merge_diff_heap_bytes` 574,583,740 estimated
+to 530,454,912 exact); anon at the end of setup about 570 MB to about
+450 MB. The workers' per-element hash probes (deleted set, then index)
+became forward cursors over the sorted lists.
+
+Planet, `--osc-seq 4913`, interleaved `--bench 1`, `sudo fstrim -av` first.
+Both arms are unstored `--force` main-tree builds, base `b5680edb` and
+variant that commit plus the change, swapped by checkout, order
+alternated. Core-seconds are `merge_streaming_rewrite_ns` and
+`merge_streaming_precise_ns`.
+
+| cell | wall | peak anon | rewrite | precise |
+|---|---:|---:|---:|---:|
+| zstd:1 variant | 88.6 s | 2,470 MB | | |
+| zstd:1 base | 95.8 s | 2,408 MB | 1,295 | 85.8 |
+| zstd:1 base | 100.8 s | 2,584 MB | 1,265 | 82.8 |
+| zstd:1 variant | 89.1 s | 2,288 MB | 1,046 | 100.7 |
+| zstd:1 variant | 95.7 s | 2,974 MB | 990 | 95.1 |
+| zstd:1 base | 97.6 s | 2,687 MB | 1,290 | 85.1 |
+| `-l` altw-keep-untagged base | 269.9 s | 3,521 MB | 1,552 | 137.7 |
+| `-l` altw-keep-untagged variant | 261.4 s | 3,317 MB | 1,260 | 162.9 |
+
+zstd:1 medians 97.6 s base, 89.1 s variant, faster in every pair; the
+rewrite loses about 250 core-seconds of hash probes, the precise check
+gains about 12 (two cursors per element, upserts and deletes, where one
+merged vector served). Peak anon is the run-to-run variable burst after
+way blobs start (pbfhogg#42), wider than the 120 MB this removes. Under
+`-l` the setup phase went 6.1 s to 5.5 s (the referenced-node lookup is a
+merge join over sorted refs), one pair.
 
 ## `--direct-io` impact summary
 

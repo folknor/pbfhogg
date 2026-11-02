@@ -164,8 +164,9 @@ pub(super) struct StreamingChannels {
     /// Drain inputs. Workers send `DrainItem`s directly so the drain has
     /// one unified input stream (the
     /// scanner's fast-path `DrainItem::CopyRange` and worker outputs
-    /// merge into the same unbounded reorder buffer keyed by global
-    /// seq).
+    /// merge into the same reorder buffer keyed by global seq). Bounded
+    /// by `DRAIN_CHANNEL_CAPACITY`: a worker blocks sending while the
+    /// drain is behind the writer.
     pub drain_tx: mpsc::SyncSender<DrainMessage>,
 }
 

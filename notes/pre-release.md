@@ -259,37 +259,27 @@ against `Resources::memory_available`.
 
 ## Memory and throughput: structural work
 
-### WRK-122: bz pbfhogg#42, apply-changes' residual step after the node-to-way transition
+### WRK-147: apply-changes' unattributed persistent live growth
 
-Every unstored `--force` cell keeps its own sidecar under its own id
-(`brokkr sidecar <prefix>`; brokkr prints the id since `07f32a6`), so
-interleaved cells can be read after the fact. The 2026-11-02 cells at
-`2cd85f7e` are all still there: arm `45939525` is `e5698c1a`,
-`a814c474`, `f5ef47d0`, `9f84e4d7`; arm `9f1c8a11` is `78df81c4`,
-`b968047d`, `008f6838`, `0436e917`. The malloc dumps and diagnostic
-scripts from that attribution are in `.plans/wrk122/` (git-ignored).
-
-Attributed and partly removed (reference/performance.md, "apply-changes'
-memory step at the node-to-way transition"): the 32 threads are rayon's
-global pool and hold nothing; the step is glibc free memory left in the
-worker arenas by a transient live burst, bounded and flat afterwards. The
-deterministic burst (the drain encoding the trailing node creates
-serially) is gone; median planet peak about 3.06 to 2.5 GB. What remains
-is a run-to-run variable burst once ways start, when the drain flips from
-writer-bound to worker-bound: in one cell live rose 1.0 to 2.1 GB over
-1.6 s with the drain's reorder map near empty, leaving 0.8 GB free; in
-another nothing. Its owners are unmeasured: queued and running seqs (the
-drain channel's items are invisible to the reorder counter), frames past
-the writer's handoff (which no longer hold a sequence token), worker
-scratch (read and decode buffers; the rewrite's encode buffer no longer
-changes hands per block, reference/performance.md "apply-changes'
-rewrite workers frame from their builder"). Attribute them before choosing a fix; a byte budget on in-flight
-seqs (WRK-022) would not cover frames downstream of the handoff. The
-start-up ramp produced one such burst too (a cell peaked at t=15 s). The
-attribution used an uncommitted diagnostic: `crate::debug::emit_mallinfo2`
-every 100 ms from the drain loop beside the reorder bytes, `next_seq` and
-the writer send-wait and reorder-gap-wait counters, and glibc
-`malloc_info` per arena around the transition.
+At planet (zstd:1, OSC 4913, 30 workers, `eeb7ab6c`) a diagnostic that
+counted the bytes of every pipeline stage (candidates, decode buffers in
+use, worker `read_buf`, idle decode-pool buffers, rewrite frames, the
+drain channel, the reorder map, the drain's current item, frames past the
+writer handoff) left live heap (`mallinfo2` `uordblks`) beyond their sum
+rising from about 0.53 to 0.80 GB over the late node phase and at the
+node-to-way transition, and staying there to the end. The starting figure
+holds whatever of the parsed diff (about 530 MB) does not sit in mmapped
+chunks, which `uordblks` excludes; that split was not read. The growth is
+what matters. Candidates, none measured: the 30 workers' `BlockBuilder`
+buffers (each released only past `MAX_RETAINED_SCRATCH_CAPACITY`, several
+per builder), the thread-local
+framing scratch of the workers and of the 32 executor threads built at the
+first create batch, `RefreshScratch` and the group scratch vectors.
+Count them the same way before choosing anything; with the drain-channel
+backlog gone this is the largest unexplained live share of the peak. The
+diagnostic's patch is reproducible from the description in
+reference/performance.md, "apply-changes' drain channel held the node
+phase's backlog".
 
 ### WRK-123: Dense-node block body copied twice in the encoder
 
@@ -327,7 +317,13 @@ block it ever met in each. The ordered-pool workers release past
 `MAX_RETAINED_SCRATCH_CAPACITY` per task. At planet blob sizes (p99 about
 2.7 MB) the bound is small; an input with outlier blobs would hold 30
 outliers per buffer for the rest of the run. Apply the rule per
-candidate, or record why these differ.
+candidate, or record why these differ. Measured on bygg at `eeb7ab6c`
+(30 workers): the `read_buf`s hold 150-170 MB together on planet, and
+under `-l` (altw base) 157 MB in the node phase and 351 MB once way blobs
+start, about 11.7 MB per worker; `pread_into`'s `resize` grows capacity
+geometrically, so a buffer can hold up to twice the largest frame it
+read. A plain 4 MiB release rule would drop and regrow most of them on
+every planet blob, so the rule needs measuring, not just applying.
 
 ### WRK-022: Byte-budgeted fused task engine
 

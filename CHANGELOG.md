@@ -182,6 +182,11 @@
   The summary's diff memory line now reads `OSC diff heap` and, like
   `MergeStats::diff_heap_bytes`, counts what is held for the run (about
   530 MB there, against an estimate of 575 MB before).
+- `apply-changes` queues fewer finished blobs while the output is the
+  bottleneck: up to 32 instead of 256, which at planet blob sizes was up to
+  1 GB of rewritten output, kept as allocator free memory once the queue
+  emptied. Planet peak memory is 2.0-2.2 GB, against 2.3-3.0 GB before,
+  with the same wall time and output bytes.
 
 ## 0.6.0 - 2026-10-30
 

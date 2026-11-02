@@ -460,12 +460,28 @@ pub(crate) const ZLIB_RESERVE_SLACK: usize = 64;
 
 /// Channel capacity for the unified DrainItem stream from scanner +
 /// workers: one item per input data blob, plus the scanner's node-boundary
-/// control message under `--locations-on-ways`. Fixed, so the share per
-/// worker shrinks as the worker count (`nproc` minus a reserve, or `-j`)
-/// grows. It does not bound the drain's separate reorder buffer, which
-/// absorbs out-of-order arrivals beyond it; [`APPLY_CHANGES_SEQ_WINDOW`]
-/// bounds the items in both together (the node boundary is not a seq).
-pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
+/// control message under `--locations-on-ways`.
+///
+/// A rewritten blob's item carries every frame its rewrite produced (about
+/// 4 MB at planet, more with the creates in its range), so this depth is
+/// what bounds the results queued into a drain that is busy writing. While
+/// the drain is writer-bound (the node phase at planet) the workers
+/// out-produce it in bursts; the channel holds that backlog, and once it is
+/// full each worker blocks sending its one finished result, which costs
+/// nothing because the writer is the bottleneck. The backlog is about this
+/// capacity plus the worker count times a rewrite result; at 256 it reached
+/// about 1 GB at planet and stayed as allocator free memory, and 32 holds the
+/// channel near 0.15 GB with the same wall time (`reference/performance.md`,
+/// "apply-changes' drain channel held the node phase's backlog"). Fixed
+/// rather than scaled with the worker count, which already adds one held
+/// result per worker.
+///
+/// Not a ceiling on the run's memory: it does not bound the drain's
+/// separate reorder buffer, which absorbs out-of-order arrivals beyond it
+/// ([`APPLY_CHANGES_SEQ_WINDOW`] bounds the items in both together, as a
+/// count; the node boundary is not a seq), the item the drain is writing,
+/// or anything already handed to the writer.
+pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 32;
 
 /// Channel capacity for the scanner→workers candidate dispatch. Workers
 /// pull at decompress + parse pace (ms per blob); the producer (scanner)

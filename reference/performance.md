@@ -378,7 +378,7 @@ Walls agree within 0.5 %, and the way phase (the segment ending at
 `MERGE_SCANNER_BARRIER_WAIT_END`) is 113.0 s and 113.6 s against 112.9 s and
 112.8 s; rewrite core-seconds are about 1 % higher, the searches the map's
 lookups became. Setup anon falls by about 85 MB, the map less the run-to-run
-spread; peak anon stays inside the pbfhogg#42 burst's variance. Refresh
+spread; peak anon stays inside its run-to-run spread. Refresh
 counters are identical in all four cells (244,817 refs in 58,701 ways, 505
 way blobs searched, 163 rewritten only for the refresh).
 
@@ -1579,8 +1579,9 @@ HEAD, change:
 Three diagnostic cells of the change (instrumented as above) ran 99.2,
 99.2 and 99.4 s and peaked at 2,301, 2,942 and 2,169 MB. Walls do not
 move; the median peak falls from about 3.06 to about 2.5 GB. One change
-cell (2,702 MB) peaked at t=15 s in the start-up ramp, not at the
-transition.
+cell (2,702 MB) reached its plateau (2.58 GB) at t=15 s in the start-up
+ramp; its recorded peak came at the end of the run, 0.12 GB above that
+plateau, not at the transition.
 
 **Residual, not removed**: the step does not always vanish. A 100 ms
 diagnostic of the change shows the drain writer-bound through the node
@@ -1589,10 +1590,11 @@ worker-bound once ways start (send wait near zero, reorder-gap wait
 instead). In one cell live heap then rose 1.01 to 2.13 GB over 1.6 s with
 the drain's reorder map near empty and the drain advancing about 400 seqs
 per second, fell back to 1.1 GB, and left 0.8 GB free; in another nothing
-of the kind happened (live 1.04-1.13 GB, anon +0.1 GB). Which owners held
-that burst (queued and running seqs, frames past the writer's handoff,
-worker scratch) is not measured; the drain's reorder bytes, the one
-counter that sees part of it, stayed near zero.
+of the kind happened (live 1.04-1.13 GB, anon +0.1 GB). Its owner was
+measured later and removed: rewritten blobs queued in the drain channel
+while the drain was writer-bound, in the node phase and at the transition,
+not after way blobs start ("apply-changes' drain channel held the node
+phase's backlog" below).
 
 ### apply-changes' rewrite workers frame from their builder (bygg, 2026-11-02, against `cbf48cc8`)
 
@@ -1626,6 +1628,76 @@ encode, on both arms) is unchanged at about 660 core-seconds. The change
 landed as a simplification, not for its numbers; the arenas' free heap
 was not instrumented, so how much of apply-changes' residual step these
 buffers fed is not attributed.
+
+### apply-changes' drain channel held the node phase's backlog (bygg, 2026-11-02, against `eeb7ab6c`)
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, 30 workers.
+
+**Attribution** (uncommitted diagnostic: one thread sampling `mallinfo2`
+and the bytes each stage holds every 100-120 ms: candidates queued,
+decode buffers in use, worker `read_buf` capacity, idle decode-pool
+buffers, frames of a rewrite in progress, results in workers blocked
+sending, results in the drain channel, the reorder map, the item the drain
+is writing, frames past `write_raw_owned` not yet written by the pool;
+beside the cumulative writer send wait and drain gap wait). Two cells,
+sidecar sessions `dbf409a4` and `dce4df1c`:
+
+- The variable burst was the drain channel. It reached 244 and 246 items
+  holding 0.94 and 0.80 GB of rewrite results (about 4 MB each: every
+  frame one input blob's rewrite produced), against an empty channel at
+  other times. Live heap followed it (0.9 GB with the channel empty, 1.7 to
+  1.9 GB at its peaks) and the heap kept what it grew (arena 1.58 to 2.04
+  and 2.46 GB). The reorder map stayed under 0.1 GB, workers never blocked
+  sending, and frames past the writer's handoff held 5 to 25 MB (up to
+  120 MB for a moment at the node-to-way transition).
+- It happens in the node phase, the start-up ramp included, and at the
+  transition, never after it. Through the node phase the drain is
+  writer-bound (writer send wait accrues 0.7 to 1.0 s per second, gap wait
+  none), so whenever the workers briefly out-produce the writer their
+  results queue in the channel, whose 256 slots were the only limit
+  (candidates 65, workers 30 and the channel stay under the 512-seq
+  window). After the transition the drain is worker-bound and the channel
+  stays empty to the end; when in the node phase the backlog builds, and
+  how far, is what varied between runs.
+- Worker scratch is steady, not the burst: decode buffers in use 100 to
+  160 MB, `read_buf` capacity 150 to 170 MB, idle pool buffers 0 to
+  150 MB.
+- Not attributed: live heap beyond every counted stage rises from about
+  0.53 to 0.80 GB over the late node phase and the transition, and stays.
+
+Under `-l` (`planet-20260223-altw-keep-untagged`, session `5fd7df66`, 300 ms
+sampling) the drain is worker-bound for the whole run and the channel
+never showed more than 10 items. The step there at the node-to-way barrier
+is the way phase's larger working set and stays: `read_buf` capacity 157 to
+351 MB and decode buffers in use 175 to 300 MB (way blobs with locations
+are larger), plus about 250 MB of other live growth, the published
+coordinate map among it.
+
+**The change**: `DRAIN_CHANNEL_CAPACITY` 256 to 32. Workers block sending
+while the drain is behind the writer, which costs nothing there because
+the writer is the bottleneck; the drain still receives every message
+whatever the reorder state, so no seq can be held back. A diagnostic cell
+at 32 (`03547df0`) held at most about 140 MB in the channel, live heap
+peaked at 1.08 to 1.28 GB, and no head starvation was observed.
+
+Interleaved cells after `fstrim`, run order change, HEAD, HEAD, change,
+change, HEAD, HEAD, change:
+
+| arm | walls (s) | peak anon (MB) |
+|---|---|---|
+| `eeb7ab6c` (`a722a405`, `d268c8e3`, `5fe46b45`, `38e4e0a6`) | 89.6, 99.0, 89.1, 95.7 | 2,275, 2,995, 2,376, 2,868 |
+| change | 89.8, 89.4, 96.0, 89.1 | 2,038, 2,090, 2,017, 2,151 |
+
+Walls overlap (medians 92.7 and 89.6 s, not a speedup); the median peak
+falls from about 2.62 to about 2.06 GB and its spread from 0.72 to
+0.13 GB.
+
+Where the scanner's splices share the smaller channel with rewrite
+results, germany (OSC 4705, 82 % of blobs spliced, `--bench 3`, order
+change, HEAD, HEAD, change) ran 3.01 and 3.00 s against 3.05 and 3.06 s
+(`b0a5b51a`, `cffb4f7c`). Under `-l`, one pair: 261.8 s against 258.5 s
+(`44becd1a`), within noise, as the channel there never fills.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
@@ -3303,8 +3375,9 @@ alternated. Core-seconds are `merge_streaming_rewrite_ns` and
 zstd:1 medians 97.6 s base, 89.1 s variant, faster in every pair; the
 rewrite loses about 250 core-seconds of hash probes, the precise check
 gains about 12 (two cursors per element, upserts and deletes, where one
-merged vector served). Peak anon is the run-to-run variable burst after
-way blobs start (pbfhogg#42), wider than the 120 MB this removes. Under
+merged vector served). Peak anon is set by the run-to-run variable
+backlog in the drain channel (later removed, "apply-changes' drain channel
+held the node phase's backlog"), wider than the 120 MB this removes. Under
 `-l` the setup phase went 6.1 s to 5.5 s (the referenced-node lookup is a
 merge join over sorted refs), one pair.
 

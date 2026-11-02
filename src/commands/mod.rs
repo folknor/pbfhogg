@@ -61,55 +61,6 @@ pub(crate) fn flush_passthrough_buf(
     Ok(())
 }
 
-/// Flush the current block from a [`BlockBuilder`] into a [`PbfWriter`].
-///
-/// If the builder has accumulated elements, `take_owned()` serializes them
-/// into a protobuf `PrimitiveBlock` and the owned bytes are moved into the
-/// writer (no `to_vec()` copy in pipelined mode). If the builder is empty,
-/// this is a no-op.
-pub(crate) fn flush_block(bb: &mut BlockBuilder, writer: &mut PbfWriter<FileWriter>) -> Result<()> {
-    if let Some(block) = bb.take_owned()? {
-        writer.write_primitive_block_owned(block)?;
-    }
-    Ok(())
-}
-
-/// Ensure the [`BlockBuilder`] has capacity for a node, flushing to the writer
-/// if full. Used by sequential output paths (merge, sort).
-pub(crate) fn ensure_node_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-/// Ensure the [`BlockBuilder`] has capacity for a way, flushing to the writer
-/// if full.
-pub(crate) fn ensure_way_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_way() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-/// Ensure the [`BlockBuilder`] has capacity for a relation, flushing to the
-/// writer if full.
-pub(crate) fn ensure_relation_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_relation() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
 /// Drain parallel batch results: write blocks to the writer, merge stats via closure.
 ///
 /// Each result is `(Vec<OwnedBlock>, S)` where `S` is a per-block stats type.
@@ -262,8 +213,7 @@ pub(crate) fn release_scratch<T>(v: &mut Vec<T>) {
 /// Flush the current block from a [`BlockBuilder`] into a worker's
 /// [`BlockSink`].
 ///
-/// Like `flush_block` but never touches a `PbfWriter`, so it can be called
-/// from worker threads.
+/// Never touches a `PbfWriter`, so it can be called from worker threads.
 pub(crate) fn flush_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
     output: &mut O,

@@ -1,17 +1,16 @@
 //! Element-write helpers shared between OSC-diff emission and base-PBF
-//! passthrough. Two shapes: `*_local` helpers flush to a local `Vec<OwnedBlock>`
-//! for parallel rewrite tasks; the other pair writes through a `PbfWriter`
-//! directly for the sequential output path.
+//! passthrough. The `*_local` helpers flush to a local `Vec<OwnedBlock>` for
+//! the workers' rewrite tasks; the `add_osc_*` encoders add one element and
+//! leave capacity to the caller, as the drain's create runs
+//! (`stream_output.rs`) size every block themselves.
 
 use crate::PrimitiveBlock;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_raw_metadata, element_raw_metadata};
-use crate::writer::PbfWriter;
 
 use crate::commands::{
-    ensure_node_capacity_local, ensure_relation_capacity, ensure_relation_capacity_local,
-    ensure_way_capacity, ensure_way_capacity_local, flush_local,
+    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    flush_local,
 };
 
 use super::Result;
@@ -23,10 +22,10 @@ use super::refresh::{CoordFraming, StaleProbe, evaluate_way, refreshed_locations
 // ---------------------------------------------------------------------------
 
 // Callers own merge-stat accounting and select the capacity/flush operation.
-// Keep direct writer and worker-local output separate: a local flush returns
-// OwnedBlocks to the ordered drain, whereas a direct flush submits immediately
-// to PbfWriter. A common sink must not move flush boundaries, pre-seeding or
-// stats across those owners. Share only the post-capacity element encoding.
+// Keep worker-local output and the drain's create runs separate: a local
+// flush returns OwnedBlocks to the ordered drain, whereas a create run cuts
+// its own blocks. A common sink must not move flush boundaries, pre-seeding
+// or stats across those owners. Share only the post-capacity element encoding.
 
 pub(super) fn add_osc_node(bb: &mut BlockBuilder, node: &crate::osc::CompactNodeRef<'_>) {
     bb.add_node(
@@ -38,25 +37,17 @@ pub(super) fn add_osc_node(bb: &mut BlockBuilder, node: &crate::osc::CompactNode
     );
 }
 
-pub(super) fn write_osc_way(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    way: &crate::osc::CompactWayRef<'_>,
-    loc: LocMode<'_>,
-) -> Result<()> {
-    let locs = loc.for_way(way.id())?;
-    ensure_way_capacity(bb, writer)?;
-    add_osc_way(bb, way, locs);
-    Ok(())
-}
-
 /// Add an OSC way to `bb`, with inline locations when `locs` is present.
 ///
 /// An id absent from `locs` gets `(0, 0)`. That is only reachable when the
 /// run allows it: `rewrite::merge` counts unresolved references against the
 /// merged map and fails the command unless `--ignore-missing-nodes` asked
 /// for this fallback.
-fn add_osc_way(bb: &mut BlockBuilder, way: &crate::osc::CompactWayRef<'_>, locs: Option<&LocMap>) {
+pub(super) fn add_osc_way(
+    bb: &mut BlockBuilder,
+    way: &crate::osc::CompactWayRef<'_>,
+    locs: Option<&LocMap>,
+) {
     let refs: Vec<i64> = way.refs().collect();
     let meta = way.metadata();
     if let Some(locs) = locs {
@@ -68,16 +59,6 @@ fn add_osc_way(bb: &mut BlockBuilder, way: &crate::osc::CompactWayRef<'_>, locs:
     } else {
         bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
     }
-}
-
-pub(super) fn write_osc_relation(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    rel: &crate::osc::CompactRelationRef<'_>,
-) -> Result<()> {
-    ensure_relation_capacity(bb, writer)?;
-    add_osc_relation(bb, rel);
-    Ok(())
 }
 
 pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactRelationRef<'_>) {

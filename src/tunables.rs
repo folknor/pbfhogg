@@ -494,6 +494,16 @@ pub(crate) const APPLY_CHANGES_SEQ_WINDOW: usize = 512;
 /// to the cap plus one frame.
 pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 
+/// Blocks of one create run the drain encodes and frames in parallel per
+/// executor call, before it writes them in order and starts the next batch.
+/// A run longer than one block (the OSC's creates past the last base blob
+/// of a kind, about 300 node blocks at planet) is encoded on the executor
+/// so the drain is not busy for the whole run while the workers keep
+/// producing behind it. The batch bounds what one call holds (its frames,
+/// and a builder per running task), whatever the run's length; 64 keeps a
+/// 32-thread executor busy through a batch.
+pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: usize = 64;
+
 /// Drain `recv_timeout`: how long the drain blocks on an empty item channel
 /// before checking the producer failure slot and the cancellation token.
 /// The node boundary arrives on the item channel itself, so no polling is

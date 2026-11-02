@@ -14,8 +14,8 @@
 //!    `copy_file_range` coalescer + the `OwnedBytes` passthrough buffer,
 //!    then call [`flush_remaining_upserts`] for the previous type.
 //! 2. Gap creates: when upserts of `item.kind` exist with `id <
-//!    item.min_id`, flush coalescers + emit gap-create elements into a
-//!    fresh `BlockBuilder` and flush.
+//!    item.min_id`, flush coalescers + write them as one create run
+//!    (`stream_output::CreateEncoder`).
 //! 3. Item dispatch:
 //!    - [`DrainItem::CopyRange`]: extend the contiguous-range
 //!      `copy_file_range` coalescer; flush as a single
@@ -24,8 +24,8 @@
 //!    - [`DrainItem::OwnedBytes`]: flush copy-range coalescer; push
 //!      the frame into the passthrough chunk buffer for
 //!      `write_raw_chunks`.
-//!    - [`DrainItem::Rewritten`]: flush both coalescers; call
-//!      `write_primitive_block_owned` per output block; advance the
+//!    - [`DrainItem::Rewritten`]: flush both coalescers; write each
+//!      worker-framed chunk with `write_raw_owned`; advance the
 //!      cursor past `blob_osm_last_key(min_id, max_id)` (the
 //!      cursor-rule invariant - Rewrite advances, CopyRange/OwnedBytes
 //!      do NOT).
@@ -63,8 +63,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 use rustc_hash::FxHashMap;
 
 use crate::ElementKind;
-use crate::block_builder::BlockBuilder;
-use crate::commands::{flush_block, flush_passthrough_buf};
+use crate::commands::flush_passthrough_buf;
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
@@ -76,7 +75,7 @@ use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 use super::stream_output::{
-    emit_create_for_output, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
+    CreateEncoder, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
 };
 use super::streaming::CoordSlots;
 use super::window::WindowReturn;
@@ -97,6 +96,11 @@ pub(super) type SeededLocations = std::sync::Mutex<Option<FxHashMap<i64, (i32, i
 pub(super) struct DrainConfig<'a> {
     pub ranges: &'a DiffRanges,
     pub diff: &'a CompactDiffOverlay,
+    /// Where create runs longer than one block are encoded and framed (the
+    /// invocation's executor; `None` encodes them on the drain thread), and
+    /// the output compression they are framed with.
+    pub create_executor: Option<&'a crate::host::Executor>,
+    pub compression: crate::writer::Compression,
     /// `Splice` when the output backend supports kernel-space
     /// `copy_file_range`, carrying the open input PBF that `write_raw_copy`
     /// splices from. `Owned` under `--direct-io`: the drain only ever sees
@@ -172,6 +176,9 @@ crate::counters::counter_set! {
         pub passthrough_chunks_flushed => "merge_drain_passthrough_chunks_flushed",
         pub rewrite_blocks_written => "merge_drain_rewrite_blocks_written",
         pub gap_creates_emitted => "merge_drain_gap_creates_emitted",
+        /// Creates written at type transitions: the upserts of a kind left
+        /// after its last blob (and of a skipped kind), counted per id.
+        pub transition_creates_emitted => "merge_drain_transition_creates_emitted",
         pub trailing_creates_emitted => "merge_drain_trailing_creates_emitted",
         pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
         pub reorder_buffer_high_water_bytes => "merge_drain_reorder_buffer_high_water_bytes",
@@ -213,7 +220,7 @@ pub(super) fn run_drain(
 
     let DrainChannels { drain_rx, window } = channels;
 
-    let mut state = DrainState::new();
+    let mut state = DrainState::new(CreateEncoder::new(cfg.create_executor, cfg.compression));
     let mut stats = MergeStats::new();
     // The scanner's node boundary under `--locations-on-ways`, once
     // received: the exclusive end of the node seqs.
@@ -414,29 +421,30 @@ pub(super) fn run_drain(
     let loc_map_owned = state.loc_map.clone();
     let loc = LocMode::new(cfg.locations_on_ways, loc_map_owned.as_deref());
     for &kind in types_to_flush {
-        loop {
-            let (cursor, upserts) = state.cursors.get(kind, cfg.ranges);
-            let Some(&id) = upserts.get(cursor) else {
-                break;
-            };
-            // Trailing creates are a second emission channel: they do not
-            // pass through `dispatch_item`, so without this call the
-            // sortedness guard would be blind to exactly the last thing
-            // written - the same shape of trailing blindness the write
-            // path's stream-completeness check had. A single ID is its own
-            // one-element span. `upserts` is sorted with `osm_id_cmp`, so a
-            // run of trailing creates never trips the guard on its own; a
-            // create ordered before base output already emitted does.
+        let (cursor, upserts) = state.cursors.get(kind, cfg.ranges);
+        let run = &upserts[cursor..];
+        // Trailing creates are a second emission channel: they do not
+        // pass through `dispatch_item`, so without these calls the
+        // sortedness guard would be blind to exactly the last thing
+        // written - the same shape of trailing blindness the write
+        // path's stream-completeness check had. A single ID is its own
+        // one-element span. `upserts` is sorted with `osm_id_cmp`, so a
+        // run of trailing creates never trips the guard on its own; a
+        // create ordered before base output already emitted does. The
+        // whole run is checked before any of it is encoded; a refusal fails
+        // the run unpublished either way.
+        for &id in run {
             let key = crate::osm_id::osm_id_key(id);
             check_output_order(&mut state, kind, key, key)?;
-            emit_create_for_output(id, kind, cfg.diff, &mut state.bb, writer, &mut stats, loc)?;
-            let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
-            *cursor += 1;
-            counters
-                .trailing_creates_emitted
-                .fetch_add(1, Ordering::Relaxed);
         }
-        flush_block(&mut state.bb, writer)?;
+        state
+            .creates
+            .emit(kind, run, cfg.diff, loc, writer, &mut stats)?;
+        let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
+        *cursor = upserts.len();
+        counters
+            .trailing_creates_emitted
+            .fetch_add(run.len() as u64, Ordering::Relaxed);
     }
     cancel.marker("MERGE_TRAILING_CREATES_END");
 
@@ -453,7 +461,7 @@ pub(super) fn run_drain(
 
 /// Drain working state. Carved out of `run_drain` so `process_item` can
 /// take a single `&mut DrainState` instead of half a dozen mut refs.
-struct DrainState {
+struct DrainState<'a> {
     /// Reorder buffer keyed by global seq.
     buffer: BTreeMap<u64, DrainItem>,
     /// Sum of `byte_cost()` across all items currently buffered.
@@ -463,10 +471,10 @@ struct DrainState {
     /// Last item kind processed. Drives type transitions.
     last_type: Option<ElementKind>,
     cursors: UpsertCursors,
-    /// Builder used for gap-create + trailing-create elements only.
-    /// Rewrite blocks bypass this path entirely (drain forwards them
-    /// straight to `writer.write_primitive_block_owned`).
-    bb: BlockBuilder,
+    /// Writes every create run: gap creates, the creates left at a type
+    /// transition and the trailing creates. Rewritten blobs arrive framed
+    /// and bypass it.
+    creates: CreateEncoder<'a>,
     /// Coalesced contiguous `copy_file_range` runs. `Some((start, end))`
     /// means a run is in progress; flushed when broken.
     copy_range_run: Option<(u64, u64)>,
@@ -486,15 +494,15 @@ struct DrainState {
     order_watermark: crate::osm_id::OrderWatermark,
 }
 
-impl DrainState {
-    fn new() -> Self {
+impl<'a> DrainState<'a> {
+    fn new(creates: CreateEncoder<'a>) -> Self {
         Self {
             buffer: BTreeMap::new(),
             bytes_in_buffer: 0,
             next_seq: 0,
             last_type: None,
             cursors: UpsertCursors::new(),
-            bb: BlockBuilder::new(),
+            creates,
             copy_range_run: None,
             passthrough_chunks: Vec::new(),
             loc_map: None,
@@ -533,7 +541,7 @@ impl DrainState {
 /// shared boundary ID between two blobs is a duplicate-ID problem, not an
 /// ordering one, and is not this guard's business.
 fn check_output_order(
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     kind: ElementKind,
     first: crate::osm_id::OsmIdKey,
     last: crate::osm_id::OsmIdKey,
@@ -566,7 +574,7 @@ fn handle_type_transition(
     prev: ElementKind,
     item_kind: ElementKind,
     cfg: &DrainConfig<'_>,
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
     counters: &DrainCounters,
@@ -581,17 +589,21 @@ fn handle_type_transition(
     }
 
     let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
-    flush_remaining_upserts(
+    let emitted = flush_remaining_upserts(
         prev,
         item_kind,
         cfg.ranges,
         cfg.diff,
         &mut state.cursors,
-        &mut state.bb,
+        &mut state.creates,
         writer,
         stats,
         loc,
-    )
+    )?;
+    counters
+        .transition_creates_emitted
+        .fetch_add(emitted, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Emit gap creates for the current blob's kind: upserts whose ID
@@ -600,7 +612,7 @@ fn handle_gap_creates(
     item_kind: ElementKind,
     osm_first: i64,
     cfg: &DrainConfig<'_>,
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
     counters: &DrainCounters,
@@ -617,12 +629,11 @@ fn handle_gap_creates(
         cfg.ranges,
         cfg.diff,
         &mut state.cursors,
-        &mut state.bb,
+        &mut state.creates,
         writer,
         stats,
         loc,
     )?;
-    flush_block(&mut state.bb, writer)?;
     counters.gap_creates_emitted.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -633,7 +644,7 @@ fn handle_gap_creates(
 fn process_item(
     item: DrainItem,
     cfg: &DrainConfig<'_>,
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
     counters: &DrainCounters,
@@ -707,7 +718,7 @@ fn process_item(
 fn dispatch_variant(
     item: DrainItem,
     cfg: &DrainConfig<'_>,
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
     counters: &DrainCounters,
@@ -872,7 +883,7 @@ fn dispatch_variant(
 /// `Route::Splice` route, which `merge()` selects when the output backend can
 /// splice.
 fn flush_copy_range(
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     cfg: &DrainConfig<'_>,
     writer: &mut PbfWriter<FileWriter>,
     counters: &DrainCounters,
@@ -898,7 +909,7 @@ fn flush_copy_range(
 /// seq below the scanner's node boundary is processed.
 fn barrier_publish_loc_map(
     cfg: &DrainConfig<'_>,
-    state: &mut DrainState,
+    state: &mut DrainState<'_>,
     counters: &DrainCounters,
     invocation: &crate::host::Recorder,
 ) -> Result<()> {

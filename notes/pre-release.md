@@ -220,25 +220,27 @@ against `Resources::memory_available`.
 
 ## Memory and throughput: structural work
 
-### WRK-122: apply-changes holds about 1 GB more after its thread step
+### WRK-122: apply-changes' residual step after the node-to-way transition
 
-The encode-storage change made planet apply-changes (4913, `zstd:1`) 17 %
-faster (128 s to 106 s on bygg) and raised its peak anon from 2.30-2.43 GB
-to 2.66-3.27 GB; a cell of the change with the old `Rc<str>` string table
-ran 124.6 s at 2.51 GB, so both come from the arena string table. Until
-about 72 % of the run the change's timeline is flatter than HEAD's (median
-1.76 against 1.94 GB). Then the process goes from 51 to 83 threads in both
-builds, HEAD steps up about 0.3 GB and the change about 1.1 GB, which stays
-resident to the end. The step persists under MALLOC_ARENA_MAX=2, so it
-reads as live data rather than arena retention. Ruled out: the builder's
-encode reservation (removed, same peak) and the 4 MiB retention limit on
-builder buffers (raised sixteenfold, same peak). Open: what the 32 threads
-started at that point are and what each holds - plausibly one string
-table and builder per new worker, whose arena keeps its high-water
-capacity up to the retention limit where the `Rc<str>` table freed per
-block. Its drain reorder buffer peaked lower (316 against 406 MB) and its
-writer reorder higher (326 against 169 items). Numbers in
-reference/performance.md, "Encode storage kept across blocks".
+Attributed and partly removed (reference/performance.md, "apply-changes'
+memory step at the node-to-way transition"): the 32 threads are rayon's
+global pool and hold nothing; the step is glibc free memory left in the
+worker arenas by a transient live burst, bounded and flat afterwards. The
+deterministic burst (the drain encoding the trailing node creates
+serially) is gone; median planet peak about 3.06 to 2.5 GB. What remains
+is a run-to-run variable burst once ways start, when the drain flips from
+writer-bound to worker-bound: in one cell live rose 1.0 to 2.1 GB over
+1.6 s with the drain's reorder map near empty, leaving 0.8 GB free; in
+another nothing. Its owners are unmeasured: queued and running seqs (the
+drain channel's items are invisible to the reorder counter), frames past
+the writer's handoff (which no longer hold a sequence token), worker
+scratch. Attribute them before choosing a fix; a byte budget on in-flight
+seqs (WRK-022) would not cover frames downstream of the handoff. The
+start-up ramp produced one such burst too (a cell peaked at t=15 s). The
+attribution used an uncommitted diagnostic: `crate::debug::emit_mallinfo2`
+every 100 ms from the drain loop beside the reorder bytes, `next_seq` and
+the writer send-wait and reorder-gap-wait counters, and glibc
+`malloc_info` per arena around the transition.
 
 ### WRK-123: Dense-node block body copied twice in the encoder
 
@@ -259,8 +261,11 @@ apply-changes' streaming path (`src/commands/apply_changes/streaming.rs`)
 passes an owned block buffer to its framing closure instead of lending the
 encoded block (`BlockBuilder::take_encoded`), as cat `--clean`, repack,
 degrade and the time-filter snapshot path now do through their per-worker
-builders. Likely one allocation and free per rewritten blob. Measure
-against WRK-122's step, since both sit on the same workers.
+builders. Likely one allocation and free per output block (the encode
+buffer `take_owned` moves out, a block's raw size each). The worker arenas
+are where WRK-122's residual free memory sits, so measure the arenas' free
+heap with it, not only the wall; WRK-122's attribution did not reach
+these buffers.
 
 ### WRK-022: Byte-budgeted fused task engine
 
@@ -482,10 +487,14 @@ pipelined writer, so it needs its own matched A/B.
 
 ### WRK-070: bz pbfhogg#18, sidecar --compare and repeated phase names
 
-Waiting on brokkr's source: whether `brokkr sidecar --compare` matches a
-repeated phase name to its first occurrence only. No stored run repeats a
-marker name, so existing data cannot settle it. Matters for multi-input
-cat `--clean` per-kind rows.
+Settled 2026-11-02 on two planet check-locations cells (six
+`CHECKLOC_PARTITION_START` segments each): `brokkr sidecar --compare`
+aligns run A by position but shows run B's first occurrence on every
+repeated row, fabricating +39 to +78 % deltas. Filed as brokkr#107
+(ordinal pairing wanted), which blocks pbfhogg#18. Until it lands, read
+repeated spans (check-locations partitions, multi-input cat `--clean`
+per-kind rows) from each cell's own `--human` or `--durations` view, not
+from `--compare`. Close pbfhogg#18 and this entry when brokkr#107 ships.
 
 ### WRK-071: inspect rows stored under other command names
 

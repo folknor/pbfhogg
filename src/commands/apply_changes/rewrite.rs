@@ -524,6 +524,11 @@ pub(crate) fn merge_to<'a>(
     let drain_cfg = DrainConfig {
         ranges: &ranges,
         diff: &diff,
+        // A single worker comes only from an explicit `-j 1` (the automatic
+        // sizing starts at two), which runs sequentially: its create runs
+        // are encoded on the drain thread too.
+        create_executor: (worker_count > 1).then_some(&host.executor),
+        compression,
         route: drain_route,
         locations_on_ways,
         coord_slots,

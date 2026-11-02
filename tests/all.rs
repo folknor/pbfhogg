@@ -52,6 +52,7 @@ mod geocode_index;
 #[cfg(feature = "commands")]
 mod inspect;
 
+mod apply_changes_create_runs;
 #[cfg(feature = "test-hooks")]
 mod capabilities;
 mod corrupt_input;

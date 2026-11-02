@@ -78,9 +78,16 @@
   the whole run. Under a two-arena glibc cap, as an embedder may set, the
   slowdown is gone: on planet, `cat --clean` went from 235 s to 153 s and
   `repack` from 267 s to 173 s, the same as uncapped. With default
-  arenas, `apply-changes` went from 128 s to 106 s, and its peak memory
-  rose from 2.3-2.4 GB to 2.7-3.3 GB; `cat --clean`, `repack`, `degrade`
-  and `time-filter` peak 5 to 8 % lower. Output bytes are unchanged.
+  arenas, `apply-changes` went from 128 s to 106 s; `cat --clean`,
+  `repack`, `degrade` and `time-filter` peak 5 to 8 % lower. Output bytes
+  are unchanged.
+- `apply-changes` encodes the diff's creates that follow the last base
+  blob of a kind (most of a diff's new nodes) on every thread instead of
+  one. Writing them one block at a time kept the whole run waiting a third
+  of a second on planet, and the output that piled up meanwhile stayed
+  resident as allocator free memory to the end. Planet peak memory is
+  2.2-2.9 GB, against 2.6-3.1 GB with the encoder change above alone
+  (2.3-2.4 GB before both), with the same wall time and output bytes.
 
 ## 0.6.0 - 2026-10-30
 

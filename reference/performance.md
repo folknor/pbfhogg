@@ -186,8 +186,9 @@ Best results per dataset.
 Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
 North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
 rewritten blobs. All variants under 600 MB RSS.
-Planet (87 GB, daily diff): 86% rewrite. Current peak memory is in
-"apply-changes frames each block as it completes" below.
+Planet (87 GB, daily diff): 86% rewrite. Peak memory is traced through
+the dated sections below, most recent last ("apply-changes' memory step at
+the node-to-way transition").
 
 io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
@@ -1482,17 +1483,81 @@ change's capped walls equal its uncapped ones.
 
 Walls are flat within noise except apply-changes, 17 % faster: an
 apply-changes cell of the change with the old `Rc<str>` table ran 124.6 s
-and peaked at 2,508 MB, so both the wall and the peak below come from the
-arena table. Peaks fall 5 to 8 % on the four commands whose workers now
-keep a builder; cat `--dedupe` is about 3.5 % higher. apply-changes' peak
-rises 0.3 to 0.9 GB. Its timeline is flatter than `5789830e`'s (median
-1.76 GB against 1.94) until about 72 % of the run, when the process goes
-from 51 to 83 threads in both builds; there `5789830e` steps up about
-0.3 GB and the change about 1.1 GB, which stays resident to the end. Neither
-the encode reservation (removed: same peak) nor the string table's release
-limit (raised sixteenfold: same peak) explains the step; what the 32 new
-threads hold is not yet attributed. Its drain reorder buffer peaked lower
-(316 MB against 406) and its writer reorder higher (326 items against 169).
+and peaked at 2,508 MB, so the wall comes from the arena table. Peaks fall
+5 to 8 % on the four commands whose workers now keep a builder; cat
+`--dedupe` is about 3.5 % higher. apply-changes' peak rises 0.3 to 0.9 GB,
+in a step at the node-to-way transition (51 to 83 threads in both builds)
+that stays resident to the end. The table does not hold it: the step is
+allocator free memory left by a transient burst there, and the arena table
+changes only how much of the burst the arenas' existing free memory
+absorbs. The next section attributes it.
+
+### apply-changes' memory step at the node-to-way transition (bygg, 2026-11-02, against `2cd85f7e`)
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, 30 workers. All cells are unstored `--force` cells
+built in the main tree (the clean arm by checking out the changed paths).
+
+**Attribution** (diagnostic build of `2cd85f7e`: `mallinfo2` and per-arena
+`malloc_info` from the drain loop every 5 s and around each type
+transition, markers around the transition; 99.4 s, peak 3,142 MB):
+
+- The 32 threads are rayon's global pool, built lazily by the drain's
+  first block framed on the writer's executor: the OSC's node creates past
+  the last base node blob, written at the node-to-way transition (309
+  blocks, about 2.47 M creates; nothing in apply-changes used rayon before
+  it). Their 32 arenas hold under 2 MB each.
+- The transition took 335 ms on the drain thread, encoding those creates
+  one by one. Meanwhile the workers kept producing framed way output
+  behind it: live heap (`uordblks`) went 1.058 to 1.772 GB during it, and
+  back to 1.05-1.10 GB within three seconds, where it stayed to the end.
+  The heap (`arena`) grew 1.772 to 2.498 GB and free heap (`fordblks`)
+  0.715 to 1.41-1.45 GB, both flat to the end; anon peaked at 3.14 GB 1.6 s
+  after the transition and settled at 2.75 GB.
+- Per arena, the 725 MB of heap growth is spread over the 30 worker arenas
+  and main (5 to 54 MB each), and in each the growth is free memory, mostly
+  in 0.5-2 MB chunks. So the step is allocator retention of a transient
+  backlog, not live data and not the new threads; it is a one-time high
+  water and does not grow with the input after it.
+- With the old `Rc<str>` table swapped into the same build (122.2 s, peak
+  2,547 MB) the burst is the same (+0.62 GB live over a 431 ms
+  transition), but the heap grows only 0.30 GB: more of it is served from
+  free memory the arenas already held.
+
+**The change**: every create run of the drain (gap creates, the creates
+left at a type transition, the trailing creates) is cut into blocks of the
+element cap, as one builder filling to the cap would cut it, encoded and
+framed in parallel on the invocation's executor when it spans more than one
+block (`stream_output::CreateEncoder`), and written raw in order. The
+node-to-way transition went from 335 ms to 66 ms, and the live growth over
+it from +0.71 GB to +0.13 GB. Output blocks are unchanged
+(`tests/apply_changes_create_runs.rs` pins the cuts).
+
+Interleaved cells, in run order change, HEAD, HEAD, change, change, HEAD,
+HEAD, change:
+
+| arm | walls (s) | peak anon (MB) | step at the transition |
+|---|---|---|---|
+| `2cd85f7e` | 98.9, 104.8, 99.7, 104.6 | 2,655, 3,063, 3,075, 2,546 | +0.48 to +0.80 GB where read |
+| change | 98.9, 100.0, 105.8, 100.6 | 2,737, 2,251, 2,702, 2,524 | +0.06 to +0.60 GB |
+
+Three diagnostic cells of the change (instrumented as above) ran 99.2,
+99.2 and 99.4 s and peaked at 2,301, 2,942 and 2,169 MB. Walls do not
+move; the median peak falls from about 3.06 to about 2.5 GB. One change
+cell (2,702 MB) peaked at t=15 s in the start-up ramp, not at the
+transition.
+
+**Residual, not removed**: the step does not always vanish. A 100 ms
+diagnostic of the change shows the drain writer-bound through the node
+phase (blocked sending to the writer for 50 to 100 ms of every 100) and
+worker-bound once ways start (send wait near zero, reorder-gap wait
+instead). In one cell live heap then rose 1.01 to 2.13 GB over 1.6 s with
+the drain's reorder map near empty and the drain advancing about 400 seqs
+per second, fell back to 1.1 GB, and left 0.8 GB free; in another nothing
+of the kind happened (live 1.04-1.13 GB, anon +0.1 GB). Which owners held
+that burst (queued and running seqs, frames past the writer's handoff,
+worker scratch) is not measured; the drain's reorder bytes, the one
+counter that sees part of it, stayed near zero.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 

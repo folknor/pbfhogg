@@ -193,6 +193,19 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["degrade", "IN", "-o", "OUT", "--strip-indexdata", "--force"],
         "--unsort",
     ),
+    // Only the decode path re-encodes, so only it has a block cap.
+    (
+        &[
+            "degrade",
+            "IN",
+            "-o",
+            "OUT",
+            "--strip-indexdata",
+            "--block-cap",
+            "5",
+        ],
+        "--unsort",
+    ),
     (
         &[
             "degrade",

@@ -467,16 +467,20 @@ explicitly (the `given` provenance check), only `--refs` is selected and
 change; CHANGELOG, `docs/cli/commands.md` check section, and a
 `cli_flag_contract` row.
 
-### WRK-140: degrade takes block_cap on every route, read only when it decodes
+### WRK-145: degrade advises and documents its hidden --block-cap
 
-`degrade::degrade` takes `block_cap` beside `DegradeFlags`, but only
-`degrade_decode_path` reads it; `degrade_passthrough` (selected when
-`flags.needs_decode()` is false, before the input is opened) ignores it.
-Several composable transformations select decoding, so the fix needs a
-domain type for "these transformations, decoded at this cap" rather than
-one Option wrapped round a bool. Check what the shared compression setting
-means on the passthrough route (data blobs keep their compression; the
-header is framed anew) while there. Library API break; CHANGELOG.
+`docs/cli/commands.md` calls `degrade --block-cap` a hidden test
+instrument outside the supported surface, yet the CLI names it to users:
+`advice()` in `cli/src/lib.rs` sets `element_cap` to `--block-cap` for any
+degrade run (the arg has a default, so `try_contains_id` is always true),
+and `cli/src/exit_code.rs` answers `BlobTooLarge` with "; lower
+--block-cap". The `--unsort` row of the degrade flag table also says a
+kind needs "more than `block-cap + 1` elements". Decide whether the cap is
+a supported knob (unhide it and document it, as repack's
+`--elements-per-blob` is) or a test instrument (advise nothing on degrade,
+or advise only when the run's decode path can produce a block, and say
+"the block cap" in the table). On the header-only passthrough no block is
+encoded, so the advice can only be wrong there.
 
 ### WRK-141: apply-changes stage configs carry LocationsOnWays resources as loose Options
 

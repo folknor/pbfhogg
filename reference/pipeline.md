@@ -717,8 +717,9 @@ rule, after its output-name refusal; it owns its `Output` and writes it
 only after every input open, so a refused run publishes nothing.
 
 A command whose route is known before it opens anything pins only the
-routes that reopen. `degrade` chooses its route from the flags alone: the
-decode path pins the input and derives its three opens (the indexdata
+routes that reopen. `degrade` chooses its route from its options alone
+(`DegradeFlags::reencode`; on the command line, whether a decode-path flag
+is given): the decode path pins the input and derives its three opens (the indexdata
 probe, the header reader, the schedule walk) from the pin, while the
 header-only passthrough reads the header and every data frame through one
 open and takes no pin of its own, so it reads a FIFO. A caller's pin is

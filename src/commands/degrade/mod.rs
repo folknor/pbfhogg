@@ -3,14 +3,15 @@
 //! code paths that require less-optimised inputs (unsorted, missing
 //! indexdata, scattered coords).
 //!
-//! The transformation flags are defined by [`DegradeFlags`].
-//! Flags compose (except the two unsort modes, which are mutually
-//! exclusive).
+//! The transformations are defined by [`DegradeFlags`]: header edits, which
+//! compose with either route, and an optional [`Reencode`], which holds the
+//! transformations that need elements decoded and the block cap they are
+//! re-encoded at.
 //!
-//! Implementation paths:
+//! Implementation paths, chosen by [`DegradeFlags::reencode`] alone:
 //!
-//! - Pure passthrough (`--strip-indexdata`, `--strip-tagdata`, and/or
-//!   `--strip-bbox` with no unsort/strip-locations/drop-ids): the input
+//! - Pure passthrough (`reencode: None`; header edits only: `--strip-indexdata`,
+//!   `--strip-tagdata`, `--strip-bbox` and the `--corrupt-*` rewrites): the input
 //!   `HeaderBlock` payload is preserved verbatim (the outer Blob envelope is
 //!   re-compressed, so the decompressed `HeaderBlock` protobuf is
 //!   field-identical, not blob-byte-identical) - it is forwarded
@@ -20,8 +21,9 @@
 //!   (`pbfhogg.WayMembers-v1`, `SharedNodePins-v1`), a non-default
 //!   `writingprogram`, replication metadata, and unknown fields all survive
 //!   byte-for-byte. Raw OsmData blob frames are then reframed by copying
-//!   the original `BlobHeader` through byte-for-byte and clearing only the
-//!   targeted field(s) - `indexdata` (field 2) and/or `tagdata` (field 4).
+//!   the original `BlobHeader` through byte-for-byte and clearing (or, under
+//!   `--corrupt-*`, replacing) only the targeted field(s) - `indexdata`
+//!   (field 2) and/or `tagdata` (field 4).
 //!   `--strip-bbox` is entirely an OSMHeader change; it never touches an
 //!   OsmData `BlobHeader` or payload.
 //!   Every other header field is preserved verbatim: the untouched hint's
@@ -29,7 +31,8 @@
 //!   any unknown/extension fields. Blob bytes are bit-identical; only the
 //!   targeted header field changes. Mirrors `cat`'s passthrough but drops
 //!   header hints instead of adding them.
-//! - Decode path (either unsort mode, `--strip-locations`, or `--drop-ids`): three
+//! - Decode path (`reencode: Some`; on the command line, either unsort mode,
+//!   `--strip-locations`, or `--drop-ids`): three
 //!   sequential per-kind phases driven by `parallel_classify_phase`.
 //!   Workers decode one input blob, filter to the current kind, and
 //!   re-encode. Without an unsort mode, workers pre-frame full cap-sized
@@ -221,14 +224,78 @@ fn keep_smallest(heap: &mut BinaryHeap<DropKey>, n: u64, key: DropKey) {
     }
 }
 
-/// Set of degradations to apply. At least one flag must be set.
+/// Which unsort shape a [`Reencode`] produces. Both clear `Sort.Type_then_ID`
+/// and swap one adjacent same-kind element pair per kind; see the module
+/// documentation for where each pair lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsort {
+    /// Cross-blob unsort (`--unsort`): adjacent same-kind blobs get
+    /// overlapping ID ranges. Valid at any block cap.
+    CrossBlob,
+    /// Intra-blob unsort (`--unsort-intra`): one same-kind blob gets an
+    /// internal ID inversion. Needs a block cap of at least 2.
+    IntraBlob,
+}
+
+/// Decode every element and re-encode it at `block_cap` elements per block
+/// at most, applying the transformations that need decoded elements.
+///
+/// Every re-encode writes ways without inline coordinates, rebuilds each
+/// blob's `indexdata` and `tagdata` from the elements it wrote (stripped
+/// again where [`DegradeFlags`] asks), and builds the output header anew,
+/// so a `LocationsOnWays` input loses that feature with a warning unless
+/// `strip_locations` declares the loss intended. Output blocks follow the
+/// input's blob boundaries, except under [`Unsort::CrossBlob`], which packs
+/// each kind continuously to the cap. A `Reencode` with none of its
+/// transformations set is that re-encode alone.
+#[derive(Clone, Copy, Debug)]
+pub struct Reencode {
+    /// The per-block element cap. [`Reencode::default`] uses
+    /// [`DEFAULT_BLOCK_CAP`]; tests pass a smaller value so the unsort swaps
+    /// can be exercised on fixtures of modest size.
+    pub block_cap: std::num::NonZeroUsize,
+    pub unsort: Option<Unsort>,
+    /// The way coordinates every re-encode drops are the request
+    /// (`--strip-locations`), so their loss is not warned about.
+    pub strip_locations: bool,
+    /// Deterministically remove exactly this many unique element IDs.
+    pub drop_ids: Option<DropSpec>,
+}
+
+impl Default for Reencode {
+    fn default() -> Self {
+        Self {
+            block_cap: DEFAULT_BLOCK_CAP,
+            unsort: None,
+            strip_locations: false,
+            drop_ids: None,
+        }
+    }
+}
+
+impl Reencode {
+    /// Cross-blob unsort suppresses the per-input-blob boundary flush so
+    /// the central `BlockBuilder` packs to `block_cap` and the swap straddles
+    /// a genuine output-blob boundary (adjacent blobs overlap). Every other
+    /// re-encode - including [`Unsort::IntraBlob`] - keeps the flush so output
+    /// blobs mirror input blobs. (The intra-blob swap is confined to a single
+    /// blob by its hold-at-position-1 placement, not by the flush, so it
+    /// stays intra-blob regardless of input blob sizes.)
+    fn suppress_boundary_flush(self) -> bool {
+        self.unsort == Some(Unsort::CrossBlob)
+    }
+}
+
+/// Set of degradations to apply: header edits and an optional [`Reencode`].
+/// At least one must be requested.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DegradeFlags {
-    /// Cross-blob unsort: adjacent same-kind blobs get overlapping ID ranges.
-    pub unsort: bool,
-    /// Intra-blob unsort: one same-kind blob gets an internal ID inversion.
-    pub unsort_intra: bool,
-    pub strip_locations: bool,
+    /// Decode and re-encode every element (`None`: the header-only
+    /// passthrough). Every transformation that needs decoded elements lives
+    /// inside it, and it may also be asked for with none of them set. The
+    /// command line sets it exactly when `--unsort`, `--unsort-intra`,
+    /// `--strip-locations` or `--drop-ids` is given.
+    pub reencode: Option<Reencode>,
     pub strip_indexdata: bool,
     /// Clear the per-blob `BlobHeader.tagdata` (field 4) tag key index so
     /// `tags-filter`'s no-hint fallback path is exercised. Like
@@ -249,8 +316,9 @@ pub struct DegradeFlags {
     /// is the failure mode blob-level tag-index skipping risks, and until this
     /// flag existed there was no way to write a test that produced it.
     ///
-    /// Header-only, so it composes with the passthrough path. Mutually
-    /// exclusive with `--strip-tagdata`: both target field 4.
+    /// Header-only, so it runs on the passthrough path only: a re-encode
+    /// would rebuild the hint correctly. Mutually exclusive with
+    /// `--strip-tagdata`: both target field 4.
     pub corrupt_tagdata: bool,
     /// Replace every blob's `BlobHeader.indexdata` (field 2) with a *valid but
     /// wrong* index: same element kind, inflated `count`, widened `max_id`.
@@ -286,64 +354,43 @@ pub struct DegradeFlags {
     /// other header-only strips it composes with the passthrough path and
     /// carries no indexdata precondition.
     pub strip_bbox: bool,
-    /// Deterministically remove exactly this many unique element IDs.
-    pub drop_ids: Option<DropSpec>,
 }
 
 impl DegradeFlags {
-    fn flag_states(self) -> [(bool, &'static str, bool); 10] {
+    /// What the run is asked to do, each operation by name - the library's
+    /// own vocabulary, not a front end's flag spelling. The first element of
+    /// each pair says whether it is requested; the second whether it is one
+    /// of the top-level requests (`reencode` and the header edits), as
+    /// opposed to a transformation inside the re-encode.
+    fn operations(self) -> [(bool, bool, &'static str); 11] {
+        let reencode = self.reencode;
+        let inside = |f: fn(Reencode) -> bool| reencode.is_some_and(f);
         [
-            // Named as the `DegradeFlags` fields are: the library's own
-            // vocabulary, not a front end's flag spelling.
-            (self.unsort, "unsort", true),
-            (self.unsort_intra, "unsort_intra", true),
-            (self.strip_locations, "strip_locations", true),
-            (self.strip_indexdata, "strip_indexdata", false),
-            (self.strip_tagdata, "strip_tagdata", false),
-            (self.corrupt_tagdata, "corrupt_tagdata", false),
-            (self.corrupt_indexdata, "corrupt_indexdata", false),
-            (self.corrupt_indexdata_kind, "corrupt_indexdata_kind", false),
-            (self.strip_bbox, "strip_bbox", false),
-            (self.drop_ids.is_some(), "drop_ids", true),
+            (reencode.is_some(), true, "reencode"),
+            (
+                inside(|r| r.unsort == Some(Unsort::CrossBlob)),
+                false,
+                "unsort",
+            ),
+            (
+                inside(|r| r.unsort == Some(Unsort::IntraBlob)),
+                false,
+                "unsort_intra",
+            ),
+            (inside(|r| r.strip_locations), false, "strip_locations"),
+            (self.strip_indexdata, true, "strip_indexdata"),
+            (self.strip_tagdata, true, "strip_tagdata"),
+            (self.corrupt_tagdata, true, "corrupt_tagdata"),
+            (self.corrupt_indexdata, true, "corrupt_indexdata"),
+            (self.corrupt_indexdata_kind, true, "corrupt_indexdata_kind"),
+            (self.strip_bbox, true, "strip_bbox"),
+            (inside(|r| r.drop_ids.is_some()), false, "drop_ids"),
         ]
     }
 
-    fn flag_names(self) -> [&'static str; 10] {
-        self.flag_states().map(|(_, name, _)| name)
-    }
-
+    /// Whether anything at all is requested: a re-encode or a header edit.
     pub fn any(self) -> bool {
-        self.flag_states()
-            .into_iter()
-            .any(|(enabled, _, _)| enabled)
-    }
-
-    /// Returns `true` if elements must be decoded and re-encoded. Only the
-    /// header-only strips (`--strip-indexdata` / `--strip-tagdata` /
-    /// `--strip-bbox`, alone or together) can run as a pure blob-level
-    /// passthrough.
-    fn needs_decode(self) -> bool {
-        self.flag_states()
-            .into_iter()
-            .any(|(enabled, _, needs_decode)| enabled && needs_decode)
-    }
-
-    /// Either unsort mode: workers ship every matching element as `Owned*`,
-    /// the merge thread runs the cap-1 swap state machine, and the output
-    /// header's `Sort.Type_then_ID` flag is cleared.
-    fn unsort_any(self) -> bool {
-        self.unsort || self.unsort_intra
-    }
-
-    /// Cross-blob `--unsort` suppresses the per-input-blob boundary flush so
-    /// the central `BlockBuilder` packs to `block_cap` and the swap straddles
-    /// a genuine output-blob boundary (adjacent blobs overlap). Every other
-    /// mode - including `--unsort-intra` - keeps the flush so output blobs
-    /// mirror input blobs. (`--unsort-intra`'s swap is confined to a single
-    /// blob by its hold-at-position-1 placement, not by the flush, so it
-    /// stays intra-blob regardless of input blob sizes.)
-    fn suppress_boundary_flush(self) -> bool {
-        self.unsort
+        self.operations().into_iter().any(|(enabled, _, _)| enabled)
     }
 }
 
@@ -359,9 +406,9 @@ impl DegradeStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let applied: Vec<&str> = self
             .flags
-            .flag_states()
+            .operations()
             .into_iter()
-            .filter_map(|(enabled, name, _)| if enabled { Some(name) } else { None })
+            .filter_map(|(enabled, _, name)| if enabled { Some(name) } else { None })
             .collect();
         let dropped = if self.dropped > 0 {
             format!(" (dropped {} elements)", self.dropped)
@@ -383,15 +430,14 @@ impl DegradeStats {
 
 /// Apply the requested degradations to `input` and emit `output`.
 ///
-/// `block_cap` is the per-block element cap used by the decode path's
-/// `BlockBuilder`. Production callers pass [`DEFAULT_BLOCK_CAP`]; tests pass
-/// a smaller value so the `--unsort` swap can be exercised on fixtures of
-/// modest size.
+/// `write.force` skips the indexdata precondition required by the decode
+/// path's per-kind classify pipeline. Has no effect on the passthrough path.
+/// `write.compression` applies to every blob the run frames: on the
+/// passthrough that is the OSMHeader alone, since data blobs are copied with
+/// their own compression.
 ///
-/// `force` skips the indexdata precondition required by the decode path's
-/// per-kind classify pipeline. Has no effect on the passthrough path.
-///
-/// The route is chosen from `flags` alone, before the input is opened. The
+/// The route is chosen from [`DegradeFlags::reencode`] alone, before the
+/// input is opened. The
 /// passthrough reads the input once, sequentially, so any readable input
 /// serves it, a FIFO included (with buffered reads). The decode path reads
 /// it in several passes, so there it must be a regular file or a block
@@ -404,7 +450,6 @@ pub fn degrade<'a>(
     input: impl Into<InputSource<'a>>,
     output: impl crate::output::BindOutput,
     flags: DegradeFlags,
-    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -412,15 +457,7 @@ pub fn degrade<'a>(
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = degrade_to(
-        input.into(),
-        &output,
-        flags,
-        block_cap,
-        write,
-        overrides,
-        host,
-    )?;
+    let result = degrade_to(input.into(), &output, flags, write, overrides, host)?;
     output.publish()?;
     Ok(result)
 }
@@ -432,28 +469,30 @@ pub(crate) fn degrade_to(
     input: InputSource<'_>,
     output: &crate::output::BoundOutput,
     flags: DegradeFlags,
-    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<DegradeStats> {
     if !flags.any() {
-        let flag_names = flags.flag_names().join(", ");
+        let names: Vec<&str> = flags
+            .operations()
+            .into_iter()
+            .filter_map(|(_, top_level, name)| top_level.then_some(name))
+            .collect();
         return Err(Error::invalid_argument(format!(
-            "degrade requires at least one transformation flag ({flag_names})"
+            "degrade requires at least one transformation ({})",
+            names.join(", ")
         )));
     }
     // The decode path rebuilds each blob's hints from the elements it just
     // re-encoded, so a corrupt hint written there would be overwritten by a
     // correct one. Refuse rather than accept a flag that would do nothing.
     if (flags.corrupt_tagdata || flags.corrupt_indexdata || flags.corrupt_indexdata_kind)
-        && flags.needs_decode()
+        && flags.reencode.is_some()
     {
         return Err(Error::invalid_argument(
             "corrupt_tagdata, corrupt_indexdata and corrupt_indexdata_kind are \
-             header-only rewrites and cannot be combined with a transformation \
-             that re-encodes blobs \
-             (unsort, unsort_intra, strip_locations, drop_ids), which \
+             header-only rewrites and cannot be combined with reencode, which \
              would rebuild the hint correctly",
         ));
     }
@@ -471,13 +510,6 @@ pub(crate) fn degrade_to(
              one to nothing and the others to a deliberately wrong index",
         ));
     }
-    if flags.unsort && flags.unsort_intra {
-        return Err(Error::invalid_argument(
-            "unsort and unsort_intra are mutually exclusive: unsort \
-             produces cross-blob ID-range overlap, unsort_intra produces \
-             an intra-blob inversion",
-        ));
-    }
     // An intra-blob inversion needs two same-kind elements sitting inside
     // one output block. A cap of 1 puts every element in its own block, so
     // the requested shape is impossible - reject it rather than silently
@@ -485,19 +517,29 @@ pub(crate) fn degrade_to(
     // stream. Cross-blob `unsort` IS achievable at cap 1: two adjacent
     // single-element blobs with a descending step overlap, so it stays
     // supported.
-    if flags.unsort_intra && block_cap.get() < 2 {
+    if let Some(reencode) = flags.reencode
+        && reencode.unsort == Some(Unsort::IntraBlob)
+        && reencode.block_cap.get() < 2
+    {
         return Err(Error::invalid_argument(
-            "unsort_intra needs a block cap of at least 2: an intra-blob \
-             inversion requires at least two same-kind elements inside \
-             one output block, which a cap of 1 cannot hold",
+            "an intra-blob unsort needs a block cap of at least 2: an \
+             intra-blob inversion requires at least two same-kind elements \
+             inside one output block, which a cap of 1 cannot hold",
         ));
     }
 
-    host.invocation.counter("degrade_unsort", flags.unsort);
+    let reencode = flags.reencode;
+    let unsort = reencode.and_then(|r| r.unsort);
     host.invocation
-        .counter("degrade_unsort_intra", flags.unsort_intra);
+        .counter("degrade_reencode", reencode.is_some());
     host.invocation
-        .counter("degrade_strip_locations", flags.strip_locations);
+        .counter("degrade_unsort", unsort == Some(Unsort::CrossBlob));
+    host.invocation
+        .counter("degrade_unsort_intra", unsort == Some(Unsort::IntraBlob));
+    host.invocation.counter(
+        "degrade_strip_locations",
+        reencode.is_some_and(|r| r.strip_locations),
+    );
     host.invocation
         .counter("degrade_strip_indexdata", flags.strip_indexdata);
     host.invocation
@@ -512,9 +554,10 @@ pub(crate) fn degrade_to(
     );
     host.invocation
         .counter("degrade_strip_bbox", flags.strip_bbox);
+    let drop_ids = reencode.and_then(|r| r.drop_ids);
     host.invocation
-        .counter("degrade_drop_ids", flags.drop_ids.is_some());
-    if let Some(spec) = flags.drop_ids {
+        .counter("degrade_drop_ids", drop_ids.is_some());
+    if let Some(spec) = drop_ids {
         // Both are user-supplied u64s and have always been emitted as their
         // bit pattern reinterpreted as i64 (a value from 2^63 up arrives
         // negative), so they keep that rather than the saturation
@@ -524,11 +567,12 @@ pub(crate) fn degrade_to(
         host.invocation
             .counter("degrade_drop_seed", spec.seed.cast_signed());
     }
-    host.invocation
-        .counter("degrade_block_cap", block_cap.get());
 
-    let stats = if flags.needs_decode() {
-        degrade_decode_path(input, output, flags, block_cap, write, overrides, host)?
+    let stats = if let Some(reencode) = reencode {
+        // The cap is a re-encode setting: a passthrough run has none to report.
+        host.invocation
+            .counter("degrade_block_cap", reencode.block_cap.get());
+        degrade_decode_path(input, output, flags, reencode, write, overrides, host)?
     } else {
         degrade_passthrough(input, output, flags, write, overrides, host)?
     };
@@ -544,25 +588,9 @@ pub(crate) fn degrade_to(
 }
 
 // ---------------------------------------------------------------------------
-// Passthrough: --strip-indexdata and/or --strip-tagdata only
+// Passthrough: header edits only (no reencode)
 // ---------------------------------------------------------------------------
 
-/// Raw blob frame iteration that clears the requested header-only fields
-/// (`BlobHeader.indexdata` and/or `tagdata`) while preserving every other
-/// header field and the entire blob payload byte-for-byte.
-///
-/// Each output `BlobHeader` is the input header with only the targeted
-/// field(s) removed - so the untargeted hint keeps its exact original bytes
-/// (a v1 index is never upgraded to v2, an undeserializable index is never
-/// dropped), and `WayMembers-v1` (field 5) plus any unknown/extension fields
-/// carry through unchanged. Blob payload bytes are forwarded verbatim -
-/// inline `LocationsOnWays` coordinates, sortedness, and every element-level
-/// property pass through unchanged. The output's `LocationsOnWays` and
-/// `Sort.Type_then_ID` header features are preserved when the input declared
-/// them, since the blob bytes still encode that data. `indexdata` survives
-/// unless `--strip-indexdata` is set; `tagdata` survives unless
-/// `--strip-tagdata` is set - so `--strip-tagdata` alone yields a still-indexed
-/// file.
 /// Build the OSMHeader payload (raw `HeaderBlock` protobuf bytes) for the
 /// passthrough path.
 ///
@@ -599,6 +627,25 @@ fn passthrough_header_bytes(
     super::output_header::verbatim(&header_block, flags.strip_bbox, overrides).map_err(locate)
 }
 
+/// Raw blob frame iteration that applies the requested header edits to each
+/// `BlobHeader` (clearing or rewriting `indexdata` and/or `tagdata`) while
+/// preserving every other header field and the entire blob payload
+/// byte-for-byte.
+///
+/// Each output `BlobHeader` is the input header with only the targeted
+/// field(s) changed - so the untargeted hint keeps its exact original bytes
+/// (a v1 index is never upgraded to v2, an undeserializable index is never
+/// dropped), and `WayMembers-v1` (field 5) plus any unknown/extension fields
+/// carry through unchanged. Blob payload bytes are forwarded verbatim -
+/// inline `LocationsOnWays` coordinates, sortedness, compression and every
+/// element-level property pass through unchanged; `write.compression`
+/// frames only the OSMHeader. The output's `LocationsOnWays` and
+/// `Sort.Type_then_ID` header features are preserved when the input declared
+/// them, since the blob bytes still encode that data. `indexdata` survives
+/// unless `--strip-indexdata` clears it or `--corrupt-indexdata` /
+/// `--corrupt-indexdata-kind` replaces it; `tagdata` survives unless
+/// `--strip-tagdata` clears it or `--corrupt-tagdata` replaces it - so
+/// `--strip-tagdata` alone yields a still-indexed file.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough(
     source: InputSource<'_>,
@@ -774,7 +821,7 @@ fn reframe_raw(
 }
 
 // ---------------------------------------------------------------------------
-// Decode path: --unsort / --unsort-intra and/or --strip-locations (with optional --strip-indexdata / --strip-tagdata)
+// Decode path: a Reencode, with optional --strip-indexdata / --strip-tagdata / --strip-bbox
 // ---------------------------------------------------------------------------
 
 /// Trailing-partial payload: 0 to `cap-1` elements that didn't fill a
@@ -830,10 +877,13 @@ struct UnsortKindState {
 }
 
 impl UnsortKindState {
-    fn new(flags: DegradeFlags, cap: usize) -> Self {
+    fn new(mode: Unsort, cap: usize) -> Self {
         // block_cap validation upstream guarantees hold_at is reachable:
-        // >= 1 for --unsort, >= 2 for --unsort-intra.
-        let hold_at = if flags.unsort_intra { 1 } else { cap as u64 };
+        // >= 1 for cross-blob, >= 2 for intra-blob.
+        let hold_at = match mode {
+            Unsort::CrossBlob => cap as u64,
+            Unsort::IntraBlob => 1,
+        };
         Self {
             held: None,
             seen: 0,
@@ -863,7 +913,7 @@ fn degrade_decode_path(
     input: InputSource<'_>,
     output: &crate::output::BoundOutput,
     flags: DegradeFlags,
-    block_cap: std::num::NonZeroUsize,
+    reencode: Reencode,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
@@ -917,7 +967,7 @@ fn degrade_decode_path(
 
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
-    let drop_sets = if let Some(spec) = flags.drop_ids {
+    let drop_sets = if let Some(spec) = reencode.drop_ids {
         host.invocation.marker("DEGRADE_DROP_SELECT_START");
         let sets = select_drop_sets(
             &shared_file,
@@ -936,7 +986,7 @@ fn degrade_decode_path(
     // Every way is re-encoded without inline coordinates or prepass fields;
     // under --strip-locations that is the request, not a loss to warn about.
     let facts = OutputFacts {
-        order: if flags.unsort_any() {
+        order: if reencode.unsort.is_some() {
             Order::Unsorted
         } else {
             Order::AsInput
@@ -946,7 +996,7 @@ fn degrade_decode_path(
         } else {
             Bbox::Carry
         },
-        ..OutputFacts::carry(if flags.strip_locations {
+        ..OutputFacts::carry(if reencode.strip_locations {
             Ways::Stripped
         } else {
             Ways::Reencoded
@@ -964,7 +1014,7 @@ fn degrade_decode_path(
         &shared_file,
         &node_schedule,
         ElementKind::Node,
-        block_cap,
+        reencode,
         prealloc_bound,
         flags,
         compression,
@@ -984,7 +1034,7 @@ fn degrade_decode_path(
         &shared_file,
         &way_schedule,
         ElementKind::Way,
-        block_cap,
+        reencode,
         prealloc_bound,
         flags,
         compression,
@@ -1004,7 +1054,7 @@ fn degrade_decode_path(
         &shared_file,
         &rel_schedule,
         ElementKind::Relation,
-        block_cap,
+        reencode,
         prealloc_bound,
         flags,
         compression,
@@ -1036,7 +1086,7 @@ fn degrade_decode_path(
     Ok(DegradeStats {
         blobs_written,
         elements_written,
-        dropped: flags.drop_ids.map_or(0, |spec| spec.n),
+        dropped: reencode.drop_ids.map_or(0, |spec| spec.n),
         flags,
     })
 }
@@ -1141,7 +1191,7 @@ fn run_kind_phase(
     shared_file: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
-    cap: std::num::NonZeroUsize,
+    reencode: Reencode,
     prealloc_bound: usize,
     flags: DegradeFlags,
     compression: Compression,
@@ -1149,6 +1199,7 @@ fn run_kind_phase(
     writer: &mut PbfWriter<FileWriter>,
     host: &crate::host::Entered<'_>,
 ) -> Result<PhaseStats> {
+    let cap = reencode.block_cap;
     let block_cap = cap.get();
 
     if schedule.is_empty() {
@@ -1164,7 +1215,11 @@ fn run_kind_phase(
     let mut bb = BlockBuilder::with_element_cap_prealloc(cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
-    let mut unsort = UnsortKindState::new(flags, block_cap);
+    // Present only under an unsort mode; without one every tail goes
+    // straight into the central builder.
+    let mut unsort = reencode
+        .unsort
+        .map(|mode| UnsortKindState::new(mode, block_cap));
 
     let mut blobs: u64 = 0;
     let mut elements: u64 = 0;
@@ -1193,8 +1248,7 @@ fn run_kind_phase(
             worker_decode_kind(
                 block,
                 kind,
-                cap,
-                flags,
+                reencode,
                 drop,
                 worker.task()?,
                 refs_buf,
@@ -1231,7 +1285,7 @@ fn run_kind_phase(
             // later batch would land after higher IDs. Both are
             // checked (as in repack) so correctness does not rest on
             // `pending` being empty whenever `bb` is.
-            if !flags.suppress_boundary_flush() && (!bb.is_empty() || !pending.is_empty()) {
+            if !reencode.suppress_boundary_flush() && (!bb.is_empty() || !pending.is_empty()) {
                 flush_local(&mut bb, &mut output)?;
                 pending.append(&mut output);
                 if !pending.is_empty() {
@@ -1256,8 +1310,8 @@ fn run_kind_phase(
                 blobs += 1;
             }
 
-            if flags.unsort_any() {
-                feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)?;
+            if let Some(state) = unsort.as_mut() {
+                feed_tail_unsort(tail, state, &mut bb, &mut output)?;
             } else {
                 feed_tail_plain(tail, &mut bb, &mut output)?;
             }
@@ -1283,7 +1337,7 @@ fn run_kind_phase(
 
     // End-of-phase: re-inject any held element (partial swap fire), then
     // flush the central builder one last time.
-    if let Some(elem) = unsort.held.take() {
+    if let Some(elem) = unsort.as_mut().and_then(|state| state.held.take()) {
         write_owned_to_central(&elem, &mut bb, &mut output)?;
         // This element was already counted in its input tail.
     }
@@ -1306,7 +1360,7 @@ fn run_kind_phase(
     Ok(PhaseStats {
         blobs,
         elements,
-        unsort_fired: unsort.fired,
+        unsort_fired: unsort.is_some_and(|state| state.fired),
     })
 }
 
@@ -1320,14 +1374,13 @@ fn run_kind_phase(
 fn worker_decode_kind(
     block: &crate::PrimitiveBlock,
     kind: ElementKind,
-    cap_nz: std::num::NonZeroUsize,
-    flags: DegradeFlags,
+    reencode: Reencode,
     drop: Option<&FxHashSet<i64>>,
     bb: &mut BlockBuilder,
     refs_buf: &mut Vec<i64>,
     mut framed: crate::commands::FramedBlocks<'_>,
 ) -> crate::Result<WorkerOutput> {
-    let cap = cap_nz.get();
+    let cap = reencode.block_cap.get();
     // Trust: the schedules (drop selection included) are built with
     // `KindClaims::Refuse`, so the pool that decoded this block has already
     // refused it if it holds an element of a kind other than the one its
@@ -1343,7 +1396,7 @@ fn worker_decode_kind(
 
     // Under either unsort mode the merge thread must see every element in
     // order to apply the cap-1 swap, so workers ship everything as tail.
-    let (full_count, tail_size) = if flags.unsort_any() {
+    let (full_count, tail_size) = if reencode.unsort.is_some() {
         (0usize, total)
     } else {
         let tail = total % cap;
@@ -1609,11 +1662,7 @@ mod tests {
 
     #[test]
     fn unsort_accepts_the_largest_block_cap_without_overflow() {
-        let flags = super::DegradeFlags {
-            unsort: true,
-            ..super::DegradeFlags::default()
-        };
-        let mut state = super::UnsortKindState::new(flags, usize::MAX);
+        let mut state = super::UnsortKindState::new(super::Unsort::CrossBlob, usize::MAX);
         assert!(!state.should_hold());
         assert!(state.take_due().is_none());
         state.seen = 1;

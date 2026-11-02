@@ -56,6 +56,7 @@ mod apply_changes_create_runs;
 #[cfg(feature = "test-hooks")]
 mod capabilities;
 mod corrupt_input;
+mod degrade;
 mod digest_input;
 mod edge_cases;
 #[cfg(feature = "test-hooks")]

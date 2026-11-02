@@ -91,7 +91,8 @@ impl OutputBackend {
 /// Output options taken by library entry points that write a PBF.
 #[derive(Clone, Copy, Debug)]
 pub struct WriteOptions {
-    /// Blob compression for the output.
+    /// Compression of the blobs the command encodes. A blob a command copies
+    /// whole keeps the compression it has.
     pub compression: Compression,
     /// Which writer to build.
     pub backend: OutputBackend,

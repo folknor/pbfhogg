@@ -1568,11 +1568,14 @@ enum Command {
         drop_ids: Option<pbfhogg::degrade::DropSpec>,
         /// Per-block element cap on the decode path. Hidden; used by
         /// the test suite so `--unsort` can fire on small fixtures
-        /// without large fixtures per element kind.
+        /// without large fixtures per element kind. Only the decode path
+        /// re-encodes, so given explicitly it needs a decode-path flag (a
+        /// default is not an explicit value and does not trip `requires`).
         #[arg(
             long = "block-cap",
             default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
             value_parser = parse_element_cap,
+            requires = "degrade_decode",
             hide = true
         )]
         block_cap: std::num::NonZeroUsize,
@@ -2785,30 +2788,34 @@ pub fn run() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force,
                 };
-                // Six adjacent `bool`s used to be six positional arguments
-                // here; the library's own `DegradeFlags` already names them,
-                // so build it where the flags are read.
+                // The decode-path flags (the `degrade_decode` group) are
+                // exactly the transformations a `Reencode` holds, so one of
+                // them given is what asks for the re-encode. Clap has already
+                // refused `--unsort` with `--unsort-intra`.
+                let unsort = if unsort {
+                    Some(pbfhogg::degrade::Unsort::CrossBlob)
+                } else if unsort_intra {
+                    Some(pbfhogg::degrade::Unsort::IntraBlob)
+                } else {
+                    None
+                };
+                let reencode = (unsort.is_some() || strip_locations || drop_ids.is_some())
+                    .then_some(pbfhogg::degrade::Reencode {
+                        block_cap,
+                        unsort,
+                        strip_locations,
+                        drop_ids,
+                    });
                 let flags = pbfhogg::degrade::DegradeFlags {
-                    unsort,
-                    unsort_intra,
-                    strip_locations,
+                    reencode,
                     strip_indexdata,
                     strip_tagdata,
                     corrupt_tagdata,
                     corrupt_indexdata,
                     corrupt_indexdata_kind,
                     strip_bbox,
-                    drop_ids,
                 };
-                run_degrade(
-                    &file,
-                    output.open(&host)?,
-                    flags,
-                    block_cap,
-                    &write,
-                    &overrides,
-                    &host,
-                )
+                run_degrade(&file, output.open(&host)?, flags, &write, &overrides, &host)
             }
             Command::Renumber {
                 file,
@@ -4041,12 +4048,11 @@ fn run_degrade(
     file: &std::path::Path,
     output: pbfhogg::Output,
     flags: pbfhogg::degrade::DegradeFlags,
-    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::degrade::degrade(file, output, flags, block_cap, write, overrides, host)?;
+    let stats = pbfhogg::degrade::degrade(file, output, flags, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("degrade.summary"))?;
     Ok(())
 }

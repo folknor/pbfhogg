@@ -1262,19 +1262,22 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--strip-bbox` | Clear `HeaderBlock.bbox` (field 1). Header-only change; no OsmData blob is touched. Exercises `inspect`'s bbox handling (`extract_header_metadata`, the `inspect --get header.bbox` fast path) and downstream/external-consumer tolerance of a file with no declared extent. Does not affect `extract --bbox`, which derives its region from the CLI argument and prunes via per-blob `indexdata` bboxes rather than reading the header. |
 | `--drop-ids <N:SEED>` | Deterministically remove exactly N elements selected globally by kind, ID, and seed. Surviving references to removed elements intentionally dangle. |
 | `--force` | Proceed on unindexed input on the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`), which falls back to scanning every blob for every kind; slower. The header-only flags never refuse, so `--force` without a decode-path flag is an error. |
-| `--compression` | Blob compression [default: zlib] |
+| `--compression` | Compression of the blobs the run encodes [default: zlib]. The header-only flags encode only the OSMHeader blob; every data blob is copied with the compression it has |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-**Implementation paths:** `--strip-indexdata`, `--strip-tagdata`, and/or `--strip-bbox` (with no `--unsort`/`--strip-locations`/`--drop-ids`) run as a header-and-blob-level passthrough: the input `HeaderBlock` payload is forwarded field-for-field via a surgical wire-level field stripper, with only the bbox (field 1) removed under `--strip-bbox` and each `--generator`/`--output-header` override replacing only the field it names, and raw OsmData frames are reframed by copying the original `BlobHeader` through byte-for-byte with only `indexdata` (field 2) and/or `tagdata` (field 4) cleared as targeted. This preserves every other header and blob-header field byte-for-byte - `source`, custom optional features, a non-default `writingprogram`, replication metadata, `WayMembers-v1`, and unknown/extension fields all survive, with or without an override. Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements, re-encodes via `BlockBuilder`, and frames with `indexdata=None` when `--strip-indexdata` composes; `--strip-bbox` on this path clears the bbox from the rebuilt output header. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
+**Implementation paths:** the header-only flags (`--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--corrupt-*`), with no `--unsort`/`--unsort-intra`/`--strip-locations`/`--drop-ids`, run as a header-and-blob-level passthrough: the input `HeaderBlock` payload is forwarded field-for-field via a surgical wire-level field stripper, with only the bbox (field 1) removed under `--strip-bbox` and each `--generator`/`--output-header` override replacing only the field it names, and raw OsmData frames are reframed by copying the original `BlobHeader` through byte-for-byte with only `indexdata` (field 2) and/or `tagdata` (field 4) cleared or replaced as targeted. This preserves every other header and blob-header field byte-for-byte - `source`, custom optional features, a non-default `writingprogram`, replication metadata, `WayMembers-v1`, and unknown/extension fields all survive, with or without an override. Any combination involving `--unsort`, `--unsort-intra`, `--strip-locations`, or `--drop-ids` decodes elements, re-encodes via `BlockBuilder`, and frames with `indexdata=None` when `--strip-indexdata` composes; `--strip-bbox` on this path clears the bbox from the rebuilt output header. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
 
 `degrade --block-cap` and `getparents --full-scan-min-blobs` are hidden
 (`hide = true`) test instruments: they override an internal threshold so
 the suite can fire a code path without building a full-scale fixture.
 They are not part of the supported surface and may change or disappear
-without a deprecation cycle. `--full-scan-min-blobs` is nevertheless
+without a deprecation cycle. `--block-cap` is the decode path's cap, so
+given explicitly it needs one of `--unsort`, `--unsort-intra`,
+`--strip-locations` or `--drop-ids` (a usage error otherwise, exit 64).
+`--full-scan-min-blobs` is nevertheless
 range-checked at the CLI boundary (1 to 1,000,000,000): the library entry
 point behind it takes the value raw, and 0 is not a threshold - it pins the
 FullScan arm unconditionally.

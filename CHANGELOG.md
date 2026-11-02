@@ -71,6 +71,17 @@
     Option<check::refs::ShowIds { max_errors }>`, which replaces the
     `show_ids` bool; `max_errors` without `show_ids` used to be accepted
     and ignored.
+  - `degrade::degrade` no longer takes a `block_cap`, which the header-only
+    passthrough ignored. `degrade::DegradeFlags` replaces `unsort`,
+    `unsort_intra`, `strip_locations` and `drop_ids` with `reencode:
+    Option<degrade::Reencode { block_cap, unsort, strip_locations, drop_ids }>`,
+    where `unsort` is an `Option<degrade::Unsort>` (`CrossBlob` for the old
+    `unsort`, `IntraBlob` for `unsort_intra`), so the two unsort modes can
+    no longer both be asked for. `Some` selects the decode path, `None` the
+    passthrough. A `Reencode` with none of its transformations set is
+    accepted as a plain re-encode, and `Reencode::default` carries the
+    default block cap. The hidden `degrade --block-cap` test flag is now
+    refused without a decode-path flag (exit `64`).
 
 ### Added
 

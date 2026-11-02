@@ -1,11 +1,12 @@
 //! degrade against an input renamed over mid-run, through the fault plan on
 //! the run's token (`arm_input_replacement`, see `pbfhogg::test_hooks`).
 //!
-//! degrade picks its route from the flags alone, before it opens anything.
+//! degrade picks its route from `DegradeFlags::reencode` alone, before it
+//! opens anything.
 //!
-//! The decode path (`unsort`, `unsort_intra`, `strip_locations`, `drop_ids`)
-//! pins the input and opens it three times through the pin, in order, on
-//! the calling thread: the indexdata probe, the header reader, then the
+//! The decode path (a `Reencode`: with an unsort mode, `strip_locations`,
+//! `drop_ids`, or none of them) pins the input and opens it three times
+//! through the pin, in order, on the calling thread: the indexdata probe, the header reader, then the
 //! schedule walk whose descriptor the drop selection and every per-kind
 //! pool pread. On a host that reopens through `/proc/self/fd` a replaced
 //! input does not affect the run; where opens go through the path the run
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
-use pbfhogg::degrade::{DegradeFlags, DropSpec};
+use pbfhogg::degrade::{DegradeFlags, DropSpec, Reencode, Unsort};
 use pbfhogg::read::input::{InputSource, PinnedInput};
 use pbfhogg::write::WriteOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -70,10 +71,21 @@ impl Route {
         }
     }
 
-    fn strip_locations() -> Self {
+    /// A re-encode at [`CAP`] carrying `reencode`'s transformations.
+    fn reencode(reencode: Reencode) -> Self {
         Self::of(DegradeFlags {
-            strip_locations: true,
+            reencode: Some(Reencode {
+                block_cap: std::num::NonZeroUsize::new(CAP).expect("non-zero cap"),
+                ..reencode
+            }),
             ..DegradeFlags::default()
+        })
+    }
+
+    fn strip_locations() -> Self {
+        Self::reencode(Reencode {
+            strip_locations: true,
+            ..Reencode::default()
         })
     }
 
@@ -85,7 +97,7 @@ impl Route {
     }
 
     fn dropped(self) -> usize {
-        if self.flags.drop_ids.is_some() {
+        if self.flags.reencode.and_then(|r| r.drop_ids).is_some() {
             usize::try_from(DROP).expect("small")
         } else {
             0
@@ -93,29 +105,31 @@ impl Route {
     }
 }
 
-/// Every decode route: each decode flag on its own, a forced unindexed
-/// input, and `drop_ids` with a header-only strip riding along.
+/// Every decode route: a re-encode with no transformation of its own, each
+/// decode transformation on its own, a forced unindexed input, and
+/// `drop_ids` with header-only strips riding along.
 fn decode_routes() -> Vec<Route> {
     let drop = Some(DropSpec { n: DROP, seed: 42 });
+    let dropping = Route::reencode(Reencode {
+        drop_ids: drop,
+        ..Reencode::default()
+    });
     vec![
+        Route::reencode(Reencode::default()),
         Route::strip_locations(),
-        Route::of(DegradeFlags {
-            unsort: true,
-            ..DegradeFlags::default()
+        Route::reencode(Reencode {
+            unsort: Some(Unsort::CrossBlob),
+            ..Reencode::default()
         }),
-        Route::of(DegradeFlags {
-            unsort_intra: true,
-            ..DegradeFlags::default()
+        Route::reencode(Reencode {
+            unsort: Some(Unsort::IntraBlob),
+            ..Reencode::default()
         }),
+        dropping,
         Route::of(DegradeFlags {
-            drop_ids: drop,
-            ..DegradeFlags::default()
-        }),
-        Route::of(DegradeFlags {
-            drop_ids: drop,
             strip_tagdata: true,
             strip_bbox: true,
-            ..DegradeFlags::default()
+            ..dropping.flags
         }),
         Route {
             indexed: false,
@@ -341,7 +355,6 @@ fn run<'a>(
         input,
         output,
         route.flags,
-        std::num::NonZeroUsize::new(CAP).expect("non-zero cap"),
         &write_options(route),
         &pbfhogg::HeaderOverrides::default(),
         host,

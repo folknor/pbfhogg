@@ -459,16 +459,50 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-135: TagsFilterOptions keeps two-pass knobs beside omit_referenced
+### WRK-139: CheckRefsOptions carries settings check-refs never or only sometimes reads
 
-`TagsFilterOptions` carries `omit_referenced` as a bool beside
-`remove_tags` and `parallelism`, which mean something only in the two-pass
-mode; `validate()` refuses a set `remove_tags` or a fixed `parallelism` with
-`omit_referenced` at run time. The session's mode-enum ruling (knobs of one
-mode live inside that mode) says these belong in a mode enum (single pass
-versus two-pass with `remove_tags` and `parallelism`), which would make the
-refusal unrepresentable in the library and leave it to the CLI. Library API
-break; CHANGELOG.
+`check::refs::CheckRefsOptions` embeds the shared `CheckOptions`, so it
+carries `max_errors` beside `show_ids` although every read of
+`max_errors` in `refs.rs` (the `Judge`, `append_capped_missing_refs`, the
+deferred relation refs) is gated on `show_ids`: without it the limit has no
+effect. It also carries `CheckOptions::direct_io`, which the check accepts
+and ignores (its doc says so). Same rule as the tags-filter, getid and
+apply-changes mode payloads: the limit belongs inside a `show_ids` payload
+(e.g. `missing_ids: Option<MissingIds { max_errors }>`), and the check may
+stop embedding `CheckOptions` rather than reshape it for every check.
+Library API break; CHANGELOG.
+
+### WRK-140: degrade takes block_cap on every route, read only when it decodes
+
+`degrade::degrade` takes `block_cap` beside `DegradeFlags`, but only
+`degrade_decode_path` reads it; `degrade_passthrough` (selected when
+`flags.needs_decode()` is false, before the input is opened) ignores it.
+Several composable transformations select decoding, so the fix needs a
+domain type for "these transformations, decoded at this cap" rather than
+one Option wrapped round a bool. Check what the shared compression setting
+means on the passthrough route (data blobs keep their compression; the
+header is framed anew) while there. Library API break; CHANGELOG.
+
+### WRK-141: apply-changes stage configs carry LocationsOnWays resources as loose Options
+
+`MergeOptions` now takes `Option<LocationsOnWays>`, but `merge_to` turns it
+back into `locations_on_ways` and `ignore_missing_nodes` bools for the
+stages. `ScannerConfig` (`refresh_ways`, the barrier receiver, the boundary
+sender), `StreamingConfig` (`coord_slots`, `loc_map_handle`, `needed_set`,
+`probe`) and `DrainConfig` (`coord_slots`, `seeded_locations`, `barrier_tx`,
+`loc_map_out`, `loc_nodes_needed`, `ignore_missing_nodes`) each carry the
+mode's resources as separate Options beside the bool, so partly configured
+states are representable and surface as `Error::internal` ("locations_on_ways
+true but coord_slots is None"). Each stage's resources belong in one
+locations payload. Internal; on a measured path, so planet apply-changes -l
+walls before and after.
+
+### WRK-142: parse_ids_from_pbf takes a direct_io it ignores
+
+`getid::parse_ids_from_pbf(input, _direct_io, host)` accepts the flag and
+never reads it: the schedule walk it reads through has no O_DIRECT route
+here. Either honour it or drop the parameter (and the CLI's forwarding of
+`--direct-io` to the `-I` read). Library API break; CHANGELOG.
 
 ### WRK-037: ParallelGzipWriter window size
 

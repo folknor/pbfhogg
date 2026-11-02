@@ -199,23 +199,30 @@ impl TagsFilterStats {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The two-pass mode of [`tags_filter`]: the direct matches plus the objects
+/// they reference, with the settings that mean something only there.
+pub struct AddReferenced {
+    /// Strip tags from referenced objects not directly matched by the
+    /// expressions.
+    pub remove_tags: bool,
+    /// Worker-pool size for the classify passes (blob scanning, relation
+    /// closure, way-node dependencies) and the pass-2 decode-and-filter
+    /// pool. `Auto` keeps the pools' host-derived sizing.
+    pub parallelism: crate::host::Parallelism,
+}
+
 /// Options for the tags-filter command.
 pub struct TagsFilterOptions<'a> {
     pub expression_strs: &'a [String],
-    pub omit_referenced: bool,
+    /// `Some` runs the two-pass mode: every direct match, plus the nodes of
+    /// matched ways and the members of matched relations (relation closure
+    /// included). `None` emits the direct matches only, in one pass on the
+    /// pipelined reader, whose decode pool is sized from the machine; that
+    /// mode has no setting of its own, so there is nothing to refuse.
+    pub add_referenced: Option<AddReferenced>,
     pub invert: bool,
-    /// Strip tags from referenced objects not directly matched by expressions.
-    /// Only meaningful without `-R` (two-pass mode with reference expansion).
-    pub remove_tags: bool,
     /// Output compression, backend and the shared input flags.
     pub write: WriteOptions,
-    /// Worker-pool size for two-pass mode: the classify passes (blob
-    /// scanning, relation closure, way-node dependencies) and the pass-2
-    /// decode-and-filter pool. `Auto` keeps the decode pools' host-derived
-    /// sizing. Single-pass mode (`omit_referenced`) reads through the
-    /// pipelined reader and has no such pool, so a `Fixed` value there is
-    /// refused rather than ignored.
-    pub parallelism: crate::host::Parallelism,
     /// Do not trust the per-blob sidecar metadata. Every blob is decompressed
     /// and every element examined, regardless of what the blob's `indexdata`
     /// and tag index claim about its contents.
@@ -231,39 +238,11 @@ pub struct TagsFilterOptions<'a> {
     pub distrust_metadata: bool,
 }
 
-impl TagsFilterOptions<'_> {
-    /// Refuse option combinations in which one option cannot take effect.
-    ///
-    /// Single-pass mode emits only direct matches, so there are no referenced
-    /// objects for `remove_tags` to strip, and it has no worker pool for a
-    /// fixed `parallelism` to size. Called first by [`tags_filter`]; a caller
-    /// can call it earlier to refuse before reserving an output.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidArgument` naming the options that cannot be combined.
-    pub fn validate(&self) -> Result<()> {
-        if self.omit_referenced && self.remove_tags {
-            return Err(crate::Error::invalid_argument(
-                "tags-filter: remove_tags has no effect with omit_referenced, which \
-                 emits no referenced objects to strip",
-            ));
-        }
-        if self.omit_referenced && self.parallelism != crate::host::Parallelism::Auto {
-            return Err(crate::Error::invalid_argument(
-                "tags-filter: a fixed parallelism has no effect with omit_referenced, \
-                 whose single pass has no worker pool to size",
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Filter a PBF file by tag expressions.
 ///
-/// If `omit_referenced` is true (`-R` flag), only directly matching elements
-/// are output (single pass, faster). Otherwise, referenced nodes of matching
-/// ways are also included (two-pass).
+/// With `add_referenced` set, the objects the direct matches reference are
+/// also included (two passes). Without it (the CLI's `-R`), only directly
+/// matching elements are output (single pass, faster).
 ///
 /// The input must be a regular file (`InvalidArgument`
 /// otherwise), in every mode, and is pinned for the run once the options
@@ -295,9 +274,7 @@ pub(crate) fn tags_filter_to<'a>(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterStats> {
-    // Options that cannot take effect together are refused before the input
-    // is touched, and so is a malformed expression.
-    opts.validate()?;
+    // A malformed expression is refused before the input is touched.
     let expressions = parse_expressions(opts.expression_strs)?;
 
     // Every pass opens the input again, each through its own open file
@@ -338,38 +315,19 @@ pub(crate) fn tags_filter_to<'a>(
         )?;
     }
 
-    if let Some(n) = opts.parallelism.fixed() {
-        host.invocation.counter("tagsfilter_worker_count", n);
-    }
-
-    if opts.omit_referenced {
-        let result = tags_filter_single_pass(
-            input,
-            output,
-            &expressions,
-            opts.invert,
-            opts.distrust_metadata,
-            &opts.write,
-            overrides,
-            host,
-        )?;
-        host.invocation
-            .counter("tagsfilter_matched_nodes", result.nodes_matched);
-        host.invocation
-            .counter("tagsfilter_matched_ways", result.ways_matched);
-        host.invocation
-            .counter("tagsfilter_matched_relations", result.relations_matched);
-        Ok(result)
-    } else {
+    if let Some(add) = &opts.add_referenced {
+        if let Some(n) = add.parallelism.fixed() {
+            host.invocation.counter("tagsfilter_worker_count", n);
+        }
         let result = tags_filter_two_pass(
             input,
             output,
             &expressions,
             opts.invert,
             opts.distrust_metadata,
-            opts.remove_tags,
+            add.remove_tags,
             &opts.write,
-            opts.parallelism,
+            add.parallelism,
             overrides,
             host,
         )?;
@@ -391,6 +349,24 @@ pub(crate) fn tags_filter_to<'a>(
             "tagsfilter_relations_from_relations",
             result.relations_from_relations,
         );
+        Ok(result)
+    } else {
+        let result = tags_filter_single_pass(
+            input,
+            output,
+            &expressions,
+            opts.invert,
+            opts.distrust_metadata,
+            &opts.write,
+            overrides,
+            host,
+        )?;
+        host.invocation
+            .counter("tagsfilter_matched_nodes", result.nodes_matched);
+        host.invocation
+            .counter("tagsfilter_matched_ways", result.ways_matched);
+        host.invocation
+            .counter("tagsfilter_matched_relations", result.relations_matched);
         Ok(result)
     }
 }
@@ -1604,14 +1580,15 @@ mod tests {
         let expression_strs = [expression.to_owned()];
         let opts = TagsFilterOptions {
             expression_strs: &expression_strs,
-            omit_referenced: mode == "omit-referenced",
+            add_referenced: (mode != "omit-referenced").then_some(AddReferenced {
+                remove_tags: mode == "remove-tags",
+                parallelism: crate::host::Parallelism::Auto,
+            }),
             invert: mode == "invert",
-            remove_tags: mode == "remove-tags",
             write: WriteOptions {
                 force,
                 ..WriteOptions::default()
             },
-            parallelism: crate::host::Parallelism::Auto,
             distrust_metadata: mode == "distrust-metadata",
         };
         let output = dir.path().join("out.pbf");

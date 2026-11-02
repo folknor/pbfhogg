@@ -31,6 +31,16 @@ use crate::tunables::{
     CANDIDATE_CHANNEL_CAPACITY, DRAIN_CHANNEL_CAPACITY,
 };
 
+/// The `LocationsOnWays` mode of [`merge`]: the base declares way-node
+/// coordinates and the output keeps them current, with the setting that
+/// means something only there.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocationsOnWays {
+    /// Write `(0, 0)` for a way-node reference neither the OSC nor the base
+    /// supplies, instead of failing the run with `MissingNodeLocations`.
+    pub ignore_missing_nodes: bool,
+}
+
 /// Public command options.
 #[derive(Default)]
 pub struct MergeOptions {
@@ -38,10 +48,11 @@ pub struct MergeOptions {
     /// writer is this command's default backend, so a `Buffered` backend
     /// here builds `PbfWriter::to_path_parallel`.
     pub write: WriteOptions,
-    pub locations_on_ways: bool,
-    /// Permit unresolved way-node references to retain the legacy `(0, 0)`
-    /// fallback under `--locations-on-ways`.
-    pub ignore_missing_nodes: bool,
+    /// `Some` requires a base declaring `LocationsOnWays`, refreshes the
+    /// inline coordinates of its surviving ways and writes them on created and
+    /// modified ones; the output declares the feature too. `None` (the
+    /// default) writes ways without coordinates.
+    pub locations_on_ways: Option<LocationsOnWays>,
     /// Worker-pool size for the descriptor-first pipeline. `Auto` keeps the
     /// `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum
     /// 2 workers). `Fixed(n)` runs exactly `n`, one included: the scanner,
@@ -69,7 +80,7 @@ impl MergeOptions {
     ///
     /// `InvalidArgument` naming the refused option.
     pub fn validate(&self) -> Result<()> {
-        if self.write.force && self.locations_on_ways {
+        if self.write.force && self.locations_on_ways.is_some() {
             return Err(crate::Error::invalid_argument(
                 "apply-changes: force has no effect with locations_on_ways, which \
                  requires an indexed base (an unindexed base would silently lose \
@@ -225,11 +236,13 @@ pub(crate) fn merge_to<'a>(
                 direct_reads: direct_io,
                 force,
             },
-        locations_on_ways,
-        ignore_missing_nodes,
+        locations_on_ways: locations,
         parallelism,
         allow_version_regression,
     } = *opts;
+    // The stages carry the mode as these two flags.
+    let locations_on_ways = locations.is_some();
+    let ignore_missing_nodes = locations.is_some_and(|l| l.ignore_missing_nodes);
     // `validate` refused `force` with `locations_on_ways`: under force the
     // scanner tags every unindexed blob as a placeholder `Node` (its real
     // kind is not known until decompress), which defeats the node-to-way

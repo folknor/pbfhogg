@@ -134,8 +134,8 @@ fn run<'a>(
         Mode::Remove => removeid(input, output, &ids, &write, &overrides, host),
         Mode::Include | Mode::AddReferenced => {
             let opts = GetidOptions {
-                add_referenced: route.mode == Mode::AddReferenced,
-                remove_tags: false,
+                add_referenced: (route.mode == Mode::AddReferenced)
+                    .then_some(pbfhogg::getid::AddReferenced { remove_tags: false }),
                 report_found: false,
             };
             getid(input, output, &ids, &opts, &write, &overrides, host)
@@ -430,41 +430,5 @@ fn a_fifo_input_is_refused_in_every_mode() {
             !output.exists(),
             "{route:?}: a refused run publishes nothing"
         );
-    }
-}
-
-/// `remove_tags` without `add_referenced` is refused before the input is
-/// touched: ahead of a FIFO's refusal and of a missing input's.
-#[test]
-fn an_invalid_option_is_refused_before_the_input_is_touched() {
-    let dir = crate::common::test_scratch();
-    let mut inputs = vec![dir.path().join("missing.osm.pbf")];
-    #[cfg(unix)]
-    inputs.push(crate::common::make_fifo(dir.path(), "in.fifo"));
-    let ids = parse_ids(&["n1".to_string()]).expect("parse ids");
-    let opts = GetidOptions {
-        add_referenced: false,
-        remove_tags: true,
-        report_found: false,
-    };
-    for input in inputs {
-        let output = dir.path().join("out.osm.pbf");
-        let err = getid(
-            &input,
-            crate::common::out(&output),
-            &ids,
-            &opts,
-            &WriteOptions::default(),
-            &pbfhogg::HeaderOverrides::default(),
-            &crate::common::test_host(),
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{}: must be refused", input.display()));
-        assert!(
-            err.to_string().contains("remove_tags"),
-            "{}: {err}",
-            input.display()
-        );
-        assert!(!output.exists(), "{}", input.display());
     }
 }

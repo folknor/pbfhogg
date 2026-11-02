@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use pbfhogg::MemberId;
-use pbfhogg::tags_filter::{TagsFilterOptions, TagsFilterStats, tags_filter};
+use pbfhogg::tags_filter::{AddReferenced, TagsFilterOptions, TagsFilterStats, tags_filter};
 use pbfhogg::write::WriteOptions;
 
 use crate::common::{
@@ -159,15 +159,16 @@ fn run(
     let expressions = route.expressions();
     let opts = TagsFilterOptions {
         expression_strs: &expressions,
-        omit_referenced: route.omit_referenced,
+        add_referenced: (!route.omit_referenced).then_some(AddReferenced {
+            remove_tags: false,
+            parallelism: pbfhogg::Parallelism::Auto,
+        }),
         invert: route.invert,
-        remove_tags: false,
         write: WriteOptions {
             direct_reads: route.direct,
             force: route.unindexed,
             ..WriteOptions::default()
         },
-        parallelism: pbfhogg::Parallelism::Auto,
         distrust_metadata: route.distrust,
     };
     tags_filter(

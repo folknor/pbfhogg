@@ -214,8 +214,7 @@ fn derive_then_apply_roundtrip() {
     // apply_changes(base, delta) -> reconstructed
     let opts = pbfhogg::apply_changes::MergeOptions {
         write: forced(Compression::default()),
-        locations_on_ways: false,
-        ignore_missing_nodes: false,
+        locations_on_ways: None,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
     };
@@ -341,8 +340,7 @@ fn derive_then_apply_preserves_metadata() {
 
     let opts = pbfhogg::apply_changes::MergeOptions {
         write: forced(Compression::default()),
-        locations_on_ways: false,
-        ignore_missing_nodes: false,
+        locations_on_ways: None,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
     };
@@ -396,11 +394,9 @@ fn tags_filter_idempotence() {
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
         distrust_metadata: false,
         expression_strs: &exprs,
-        omit_referenced: true,
+        add_referenced: None,
         invert: false,
-        remove_tags: false,
         write: forced(Compression::default()),
-        parallelism: pbfhogg::Parallelism::Auto,
     };
 
     pbfhogg::tags_filter::tags_filter(
@@ -490,11 +486,12 @@ fn tags_filter_blob_layout_independence() {
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
         distrust_metadata: false,
         expression_strs: &exprs,
-        omit_referenced: false,
+        add_referenced: Some(pbfhogg::tags_filter::AddReferenced {
+            remove_tags: false,
+            parallelism: pbfhogg::Parallelism::Auto,
+        }),
         invert: false,
-        remove_tags: false,
         write: forced(Compression::default()),
-        parallelism: pbfhogg::Parallelism::Auto,
     };
     pbfhogg::tags_filter::tags_filter(
         &b1,
@@ -1059,11 +1056,12 @@ fn tags_filter_compression_level_parity() {
         let opts = pbfhogg::tags_filter::TagsFilterOptions {
             distrust_metadata: false,
             expression_strs: &exprs,
-            omit_referenced: false,
+            add_referenced: Some(pbfhogg::tags_filter::AddReferenced {
+                remove_tags: false,
+                parallelism: pbfhogg::Parallelism::Auto,
+            }),
             invert: false,
-            remove_tags: false,
             write: forced(*compression),
-            parallelism: pbfhogg::Parallelism::Auto,
         };
         pbfhogg::tags_filter::tags_filter(
             &input,

@@ -1383,11 +1383,11 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--input-kind <KIND>` | Input kind override: `pbf` or `osc` (autodetect from extension by default) |
-| `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only). Not with `--remove-tags` (no referenced objects to strip) or `-j` (no worker pool) |
+| `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only). Not with `--remove-tags` (no referenced objects to strip) or `-j` (its single pass decodes on the read pipeline's own pool, sized from the machine, which `-j` does not set) |
 | `--invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only). (`-i` used to be its short; `-i` now refuses here, naming `--invert-match`.) |
 | `--remove-tags` | Remove tags from referenced objects not directly matched (not with -R; PBF only). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
 | `-e, --expressions <FILE>` | Read filter expressions from file (one per line, # comments) |
-| `-j, --jobs <N>` | Worker threads for the two-pass mode's classify passes and its decode-and-filter pool, or in OSC mode for the workers filtering the document's batches (see [Worker threads](#worker-threads)). Refused with `-R`, whose single pass reads through the pipelined reader and has no worker pool |
+| `-j, --jobs <N>` | Worker threads for the two-pass mode's classify passes and its decode-and-filter pool, or in OSC mode for the workers filtering the document's batches (see [Worker threads](#worker-threads)). Refused with `-R`, whose single pass decodes on the read pipeline's own pool, sized from the machine, which `-j` does not set |
 | `--distrust-metadata` | Do not skip blobs on their `indexdata` or tag index; decode every blob. Blob-level tag-index skipping is a trust boundary with nothing on the other side of it - nothing validates a blob's tag index against its payload - so a file whose index omits a key its elements carry silently loses those elements from the output. This flag trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition (`--force` is not needed alongside it). Not valid in OSC mode, which has no blobs. `degrade --corrupt-tagdata` produces the file this flag exists for. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

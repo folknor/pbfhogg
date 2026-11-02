@@ -136,8 +136,7 @@ fn create_runs_are_cut_at_the_element_cap_and_written_in_order() {
                 force: !indexed,
                 ..pbfhogg::write::WriteOptions::default()
             },
-            locations_on_ways: false,
-            ignore_missing_nodes: false,
+            locations_on_ways: None,
             parallelism,
             allow_version_regression: false,
         };

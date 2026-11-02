@@ -343,13 +343,22 @@ pub fn merge_id_sets(a: &mut ElementIds, b: &ElementIds) {
 // Stats
 // ---------------------------------------------------------------------------
 
+/// The two-pass mode of [`getid`]: the requested objects plus the nodes of
+/// the requested ways (way-node dependencies only; relation members are not
+/// added), with the setting that means something only there.
+pub struct AddReferenced {
+    /// Strip tags from the added nodes that were not themselves requested.
+    /// A requested node keeps its tags even where a requested way also
+    /// references it.
+    pub remove_tags: bool,
+}
+
 /// Options for getid.
 pub struct GetidOptions {
-    /// Include referenced nodes of matching ways (two-pass).
-    pub add_referenced: bool,
-    /// Strip tags from referenced objects not explicitly requested.
-    /// Requires `add_referenced`; refused without it.
-    pub remove_tags: bool,
+    /// `Some` runs the two-pass mode that adds the nodes of requested ways.
+    /// `None` emits exact ID matches only; that mode has no setting of its
+    /// own, so there is nothing to refuse.
+    pub add_referenced: Option<AddReferenced>,
     /// Collect the requested IDs that were actually written, into
     /// [`GetidStats::found`].
     ///
@@ -409,7 +418,7 @@ impl GetidStats {
 
 /// Extract elements matching the given IDs.
 ///
-/// If `opts.add_referenced` is true, referenced nodes of matching ways are also
+/// With `opts.add_referenced` set, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
 ///
 /// Every route opens the input more than once, so the input must be a
@@ -474,14 +483,6 @@ fn getid_dispatched<'a>(
     min_blobs: u64,
     host: &crate::host::Entered<'_>,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
-    // Refused before the input is touched: without `add_referenced` no
-    // referenced object is emitted, so there is nothing to strip tags from.
-    if opts.remove_tags && !opts.add_referenced {
-        return Err(crate::Error::invalid_argument(
-            "getid: remove_tags has no effect without add_referenced, which is what \
-             emits the referenced objects it strips",
-        ));
-    }
     // Every route opens the input more than once, each open its own open
     // file description (the indexdata probe, the arm estimate, the walker or
     // the streaming reader; `add_referenced`'s pass-1 schedule walk, whose
@@ -489,9 +490,8 @@ fn getid_dispatched<'a>(
     // derived from this one pin, so a file renamed over the input mid-run
     // cannot be read partly from each: where `/proc/self/fd` reopens the pin
     // every open reaches the pinned file, otherwise on Unix a replaced input
-    // fails the run (`PinnedInput` says what it does off Unix). Taken after
-    // the option refusal above and before any other open of the input; a
-    // caller's pin is used as it is.
+    // fails the run (`PinnedInput` says what it does off Unix). Taken before
+    // any other open of the input; a caller's pin is used as it is.
     let pin = input.into().pin(host)?;
     let input = &pin;
     let has_indexdata = require_indexdata(
@@ -516,8 +516,17 @@ fn getid_dispatched<'a>(
     // blob count picked. An unindexed first data blob is refused by the probe
     // above before that, unless `--force`. reference/indexdata-trust.md,
     // "Missing and partial indexdata".
-    let (arm, result) = if opts.add_referenced {
-        let stats = getid_with_refs(input, output, ids, opts, write, overrides, host)?;
+    let (arm, result) = if let Some(add) = &opts.add_referenced {
+        let stats = getid_with_refs(
+            input,
+            output,
+            ids,
+            add,
+            opts.report_found,
+            write,
+            overrides,
+            host,
+        )?;
         (None, stats)
     } else {
         let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs, host)?;
@@ -1048,12 +1057,13 @@ fn filter_by_id_streaming(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn getid_with_refs(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
     ids: &ElementIds,
-    opts: &GetidOptions,
+    add: &AddReferenced,
+    report_found: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
@@ -1063,7 +1073,7 @@ fn getid_with_refs(
         passthrough_claimed: 0,
         ways_written: 0,
         relations_written: 0,
-        found: opts.report_found.then(ElementIds::empty),
+        found: report_found.then(ElementIds::empty),
     };
 
     // Pass 1: Collect ref node IDs from matching ways. Uses IdSet for O(1)
@@ -1118,7 +1128,7 @@ fn getid_with_refs(
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
-    let strip_tags = opts.remove_tags && has_dep_nodes;
+    let strip_tags = add.remove_tags && has_dep_nodes;
     host.invocation.marker("GETID_PASS1_END");
     // Cheap one-time iteration; gives the dep-set size before pass 2
     // starts so the counter survives a SIGKILL during pass 2.
@@ -1173,7 +1183,7 @@ fn getid_with_refs(
                 true,
                 dep_ref,
                 strip_tags,
-                opts.report_found,
+                report_found,
             )?;
             flush_local(&mut bb, &mut output)?;
             Ok((output, outcome))
@@ -1715,11 +1725,7 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), true);
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
-        let opts = GetidOptions {
-            add_referenced: true,
-            remove_tags: false,
-            report_found: false,
-        };
+        let add = AddReferenced { remove_tags: false };
         let output = dir.path().join("output.pbf");
         let staged = crate::output::Output::new(
             &output,
@@ -1733,7 +1739,8 @@ mod tests {
             &PinnedInput::pin(&input, &host).unwrap(),
             &staged,
             &ids,
-            &opts,
+            &add,
+            false,
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             &host,
@@ -1784,18 +1791,15 @@ mod tests {
             .unwrap()
         };
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
-        let opts = GetidOptions {
-            add_referenced: true,
-            remove_tags: false,
-            report_found: false,
-        };
+        let add = AddReferenced { remove_tags: false };
         refused(
             "add-referenced pass 1",
             getid_with_refs(
                 &pin,
                 &staged(),
                 &ids,
-                &opts,
+                &add,
+                false,
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 &host,
@@ -1900,8 +1904,7 @@ mod tests {
         let replacement = dir.path().join("replacement.pbf");
         let query = parse_ids(&["n1".to_owned(), "w10".to_owned()]).unwrap();
         let opts = GetidOptions {
-            add_referenced: false,
-            remove_tags: false,
+            add_referenced: None,
             report_found: false,
         };
         let run = |output: &Path, host: &crate::host::Host, direct: bool| {
@@ -2018,8 +2021,7 @@ mod tests {
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         let query = parse_ids(&["n1".to_owned(), "w10".to_owned()]).unwrap();
         let opts = GetidOptions {
-            add_referenced: false,
-            remove_tags: false,
+            add_referenced: None,
             report_found: false,
         };
         for (min_blobs, expected_arm) in [

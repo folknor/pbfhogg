@@ -31,7 +31,7 @@ mod streaming;
 mod upsert_cursors;
 mod window;
 
-pub use rewrite::{MergeOptions, merge};
+pub use rewrite::{LocationsOnWays, MergeOptions, merge};
 pub use stats::MergeStats;
 
 type Result<T> = super::Result<T>;

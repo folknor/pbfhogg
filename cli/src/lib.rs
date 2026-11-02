@@ -2789,16 +2789,20 @@ pub fn run() -> process::ExitCode {
                             direct_reads: io.direct_io,
                             force,
                         };
+                        // Clap has refused `-R` beside `--remove-tags` or an
+                        // explicit `-j`, so `-R` drops nothing here.
                         let opts = pbfhogg::tags_filter::TagsFilterOptions {
                             expression_strs: &expressions,
-                            omit_referenced,
+                            add_referenced: (!omit_referenced).then_some(
+                                pbfhogg::tags_filter::AddReferenced {
+                                    remove_tags,
+                                    parallelism: jobs,
+                                },
+                            ),
                             invert: invert_match,
-                            remove_tags,
                             write,
-                            parallelism: jobs,
                             distrust_metadata: distrust.distrust_metadata,
                         };
-                        opts.validate()?;
                         run_tags_filter(
                             &file,
                             output.open(&host)?,
@@ -3225,10 +3229,15 @@ pub fn run() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force,
                 };
+                // Clap has refused `--ignore-missing-nodes` without
+                // `--locations-on-ways`, so `None` drops nothing here.
                 let opts = pbfhogg::apply_changes::MergeOptions {
                     write,
-                    locations_on_ways,
-                    ignore_missing_nodes,
+                    locations_on_ways: locations_on_ways.then_some(
+                        pbfhogg::apply_changes::LocationsOnWays {
+                            ignore_missing_nodes,
+                        },
+                    ),
                     parallelism: jobs,
                     allow_version_regression,
                 };
@@ -4359,9 +4368,10 @@ fn run_getid(
         print_requested_ids(&id_set);
     }
 
+    // Clap has refused `--remove-tags` without `--add-referenced`, so the
+    // direct-match mode drops nothing here.
     let opts = pbfhogg::getid::GetidOptions {
-        add_referenced,
-        remove_tags,
+        add_referenced: add_referenced.then_some(pbfhogg::getid::AddReferenced { remove_tags }),
         report_found: verbose_ids,
     };
     let stats = pbfhogg::getid::getid(input, output, &id_set, &opts, write, overrides, host)?;
@@ -5219,8 +5229,7 @@ fn run_bench_merge(
             direct_reads: false,
             force: true,
         },
-        locations_on_ways: false,
-        ignore_missing_nodes: false,
+        locations_on_ways: None,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
     };

@@ -6,7 +6,7 @@ use crate::common::{
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,
     write_test_pbf,
 };
-use pbfhogg::getid::{GetidOptions, getid, parse_ids, removeid};
+use pbfhogg::getid::{AddReferenced, GetidOptions, getid, parse_ids, removeid};
 use pbfhogg::write::WriteOptions;
 use pbfhogg::{BlobDecode, BlobReader, Element};
 
@@ -25,16 +25,14 @@ fn ids(strs: &[&str]) -> Vec<String> {
 
 fn default_opts() -> GetidOptions {
     GetidOptions {
-        add_referenced: false,
-        remove_tags: false,
+        add_referenced: None,
         report_found: false,
     }
 }
 
 fn add_ref_opts() -> GetidOptions {
     GetidOptions {
-        add_referenced: true,
-        remove_tags: false,
+        add_referenced: Some(AddReferenced { remove_tags: false }),
         report_found: false,
     }
 }
@@ -189,8 +187,7 @@ fn getid_reports_found_ids_without_rereading_output() {
     // Asked for: n1 exists, n99 does not.
     let id_set = parse_ids(&ids(&["n1", "n99"])).expect("parse ids");
     let opts = GetidOptions {
-        add_referenced: false,
-        remove_tags: false,
+        add_referenced: None,
         report_found: true,
     };
     let stats = getid(
@@ -251,8 +248,7 @@ fn getid_found_ids_exclude_referenced_pull_ins() {
 
     let id_set = parse_ids(&ids(&["w10", "w11"])).expect("parse ids");
     let opts = GetidOptions {
-        add_referenced: true,
-        remove_tags: false,
+        add_referenced: Some(AddReferenced { remove_tags: false }),
         report_found: true,
     };
     let stats = getid(
@@ -1111,8 +1107,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
     // Nodes 2,3 are referenced-only → strip tags.
     let id_set = parse_ids(&ids(&["n1", "w10"])).expect("parse ids");
     let opts = GetidOptions {
-        add_referenced: true,
-        remove_tags: true,
+        add_referenced: Some(AddReferenced { remove_tags: true }),
         report_found: false,
     };
     let stats = getid(

@@ -32,6 +32,22 @@
   the bare rows: `stats` is a `TagCountStats` with `distinct_pairs` (every
   selected pair, before the count thresholds), `retained_pairs` (those the
   thresholds kept) and `write_summary`.
+- Settings that mean something in one mode only now live inside that
+  mode, so a combination that used to be refused or ignored at run time
+  cannot be written:
+  - `tags_filter::TagsFilterOptions` replaces `omit_referenced`,
+    `remove_tags` and `parallelism` with `add_referenced:
+    Option<tags_filter::AddReferenced { remove_tags, parallelism }>`.
+    `None` is the old `omit_referenced: true`. `TagsFilterOptions::validate`
+    is removed: it had nothing left to refuse.
+  - `getid::GetidOptions` replaces `add_referenced` and `remove_tags` with
+    `add_referenced: Option<getid::AddReferenced { remove_tags }>`; the
+    `InvalidArgument` for `remove_tags` without `add_referenced` is gone.
+  - `apply_changes::MergeOptions` replaces `locations_on_ways` and
+    `ignore_missing_nodes` with `locations_on_ways:
+    Option<apply_changes::LocationsOnWays { ignore_missing_nodes }>`.
+    `ignore_missing_nodes` without `locations_on_ways` used to be accepted
+    and ignored. The default is still `None`.
 
 ### Added
 

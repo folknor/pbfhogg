@@ -230,11 +230,12 @@ fn tags_filter_non_indexed_parity() {
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
         distrust_metadata: false,
         expression_strs: &expression_strs,
-        omit_referenced: false,
+        add_referenced: Some(pbfhogg::tags_filter::AddReferenced {
+            remove_tags: false,
+            parallelism: pbfhogg::Parallelism::Auto,
+        }),
         invert: false,
-        remove_tags: false,
         write: forced(),
-        parallelism: pbfhogg::Parallelism::Auto,
     };
     pbfhogg::tags_filter::tags_filter(
         &in_idx,
@@ -323,8 +324,7 @@ fn getid_include_non_indexed_parity() {
         .collect::<Vec<_>>();
     let id_set = pbfhogg::getid::parse_ids(&ids_vec).expect("parse ids");
     let opts = pbfhogg::getid::GetidOptions {
-        add_referenced: false,
-        remove_tags: false,
+        add_referenced: None,
         report_found: false,
     };
     let write = forced();
@@ -411,8 +411,7 @@ fn apply_changes_non_indexed_parity() {
 
     let opts = pbfhogg::apply_changes::MergeOptions {
         write: forced(),
-        locations_on_ways: false,
-        ignore_missing_nodes: false,
+        locations_on_ways: None,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
     };

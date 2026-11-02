@@ -121,8 +121,8 @@ mod apply_changes {
                 force: !locations_on_ways,
                 ..WriteOptions::default()
             },
-            locations_on_ways,
-            ignore_missing_nodes: false,
+            locations_on_ways: locations_on_ways
+                .then_some(pbfhogg::apply_changes::LocationsOnWays::default()),
             parallelism: pbfhogg::Parallelism::from_jobs(2),
             allow_version_regression: false,
         };
@@ -389,7 +389,7 @@ mod apply_changes {
 
     fn low_options(jobs: usize) -> MergeOptions {
         MergeOptions {
-            locations_on_ways: true,
+            locations_on_ways: Some(pbfhogg::apply_changes::LocationsOnWays::default()),
             parallelism: pbfhogg::Parallelism::from_jobs(jobs),
             ..MergeOptions::default()
         }
@@ -1411,7 +1411,9 @@ mod apply_changes {
                 &osc,
                 common::out(&output),
                 &MergeOptions {
-                    ignore_missing_nodes: true,
+                    locations_on_ways: Some(pbfhogg::apply_changes::LocationsOnWays {
+                        ignore_missing_nodes: true,
+                    }),
                     ..low_options(2)
                 },
                 &pbfhogg::HeaderOverrides::default(),
@@ -1597,7 +1599,9 @@ mod apply_changes {
                     &osc,
                     common::out(&output),
                     &MergeOptions {
-                        ignore_missing_nodes: ignore,
+                        locations_on_ways: Some(pbfhogg::apply_changes::LocationsOnWays {
+                            ignore_missing_nodes: ignore,
+                        }),
                         ..low_options(jobs)
                     },
                     &pbfhogg::HeaderOverrides::default(),

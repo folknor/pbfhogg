@@ -2064,6 +2064,29 @@ scan. Workers pread + decompress + classify in parallel, sending compact
 results back to the consumer. Write passes use pread-from-workers with full
 PrimitiveBlock lifecycle per worker.
 
+### Parent relations, integer bbox edges and plain nodes (bygg, 2026-11-03, against `4a3ba718`)
+
+The change that brought extract's membership to osmium's: complete-ways and
+smart close the relation set over parent relations (member-to-parent edges
+collected in the relation classify phase, sorted, walked from the matched
+set), every bbox membership test compares integers against one quantized box
+(simple's node classify included, where the f64 product comparison ran per
+node), and the sorted columnar classifier also walks plain Node messages.
+Planet, Europe box `-25.0,34.0,45.0,72.0`, `--bench 1` main-tree cells,
+interleaved, after `fstrim`; baseline = `4a3ba718` stored, variant = the same
+tree with the change, `--force`:
+
+| Strategy | baseline | variant | baseline peak | variant peak |
+|----------|----------|---------|---------------|--------------|
+| smart | 132.99 s (`d6c01405`), 132.56 s (`a49fcc12`) | 133.15 s (`dea99869`), 132.42 s (`39c9957b`) | 8.14 / 8.11 GB | 8.10 / 8.13 GB |
+| complete | 118.90 s (`f7cb91a2`) | 119.05 s (`ccaa5096`) | 4.92 GB | 4.93 GB |
+| simple | 108.37 s (`01fcae89`) | 108.15 s (`0a37fc61`) | - | - |
+
+All within noise. The parent closure (`PASS1_RELATION_PARENTS`) is 209 ms
+over 1 042 815 edges and adds 78 408 relations; the relation classify phase
+that collects the edges stays at 0.94 s. Variant UUIDs are dirty sidecar
+rows (`brokkr sidecar <uuid>`), not `results` rows.
+
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each

@@ -44,13 +44,13 @@ Extract by bounding box:
 pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8
 ```
 
-The default strategy is complete-ways (two passes, all way nodes included). For faster extraction with possible dangling refs:
+The default strategy is complete-ways (two passes, all way nodes included, and every relation containing an included relation). The box edges are inclusive. For faster extraction with possible dangling refs:
 
 ```sh
 pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8 --simple
 ```
 
-For complete multipolygon and boundary relations:
+For complete multipolygon and boundary relations (see [extract](../cli/commands.md#extract) for exactly what each strategy includes):
 
 ```sh
 pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8 --smart

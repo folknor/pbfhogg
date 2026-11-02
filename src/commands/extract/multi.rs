@@ -464,16 +464,22 @@ pub(super) fn try_extract_multi_single_pass(
                         Some(grid) => {
                             for &region in grid.candidates(lat, lon) {
                                 let region = region as usize;
-                                if regions[region].contains_decimicro(&bbox_ints[region], lat, lon)
-                                {
+                                if regions[region].contains_decimicro(
+                                    &inside_bbox_ints[region],
+                                    lat,
+                                    lon,
+                                ) {
                                     scratch[region].push(id);
                                 }
                             }
                         }
                         None => {
                             for region in 0..n {
-                                if regions[region].contains_decimicro(&bbox_ints[region], lat, lon)
-                                {
+                                if regions[region].contains_decimicro(
+                                    &inside_bbox_ints[region],
+                                    lat,
+                                    lon,
+                                ) {
                                     scratch[region].push(id);
                                 }
                             }

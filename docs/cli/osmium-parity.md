@@ -11,7 +11,7 @@ command count.
 |--------|---------|--------------|
 | `cat` | `cat` | Same |
 | `sort` | `sort` | Same |
-| `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags |
+| `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags; membership per strategy in [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
 | `export` | `export` | GeoJSON/GeoJSONSeq only; nodes and ways only (see below) |
 | `getid` | `getid` | pbfhogg also accepts named type/ID forms; bare IDs need `--default-type` |
@@ -245,6 +245,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
+| `extract -S, --option` | Strategy options are fixed: complete-ways always includes parent relations (osmium's `relations=true`), smart completes `multipolygon` and `boundary` (osmium's `types=multipolygon,boundary`), with no `complete-partial-relations` or `tags` filter. See [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `--index-type` | `sparse` (default), `external` (bounded-memory join with sequential I/O), `auto` (runtime routing; see `reference/pipeline.md`). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has

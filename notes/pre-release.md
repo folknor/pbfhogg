@@ -480,6 +480,25 @@ brokkr#88's rule refuses an axis flag only where no pbfhogg revision gives
 it effect. The library parameters stay either way (ignored `direct_io`
 parameters are not removed as dead).
 
+### WRK-149: extract polygon membership is not osmium's integer rule
+
+Bbox extract membership now matches osmium element for element (DEVIATIONS.md
+"extract: per-strategy membership against osmium"); polygons do not.
+osmium (`research/osmium-tool/src/extract/extract_polygon.cpp`) quantizes the
+polygon's vertices to decimicrodegrees, returns inside for a node equal to a
+segment endpoint, and decides the rest with an integer crossing test over
+y-bands. pbfhogg keeps the rings in f64 and runs `geo::point_in_ring` (f64
+even-odd, no vertex case) on `e7 * 1e-7`. A node on a vertex can therefore
+be excluded where osmium includes it (square `(0,0),(1,0),(1,1),(0,1)`,
+node `(1,1)`), cascading into ways and relations. Converging means
+quantizing rings at parse (`parse_ring`), an integer crossing test with
+the endpoint rule, and an antimeridian story for the integer domain
+(pbfhogg unwraps longitudes past 180, osmium does not), and it interacts
+with the recorded polygon differences already in the parity pages (every
+FeatureCollection feature, ring validation). The prefilters in
+`Region::contains_decimicro` stay sound under either rule. Once done, the
+brokkr verify filing for exact membership can take polygon regions too.
+
 ### WRK-037: ParallelGzipWriter window size
 
 At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB

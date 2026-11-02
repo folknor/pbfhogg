@@ -1508,8 +1508,10 @@ deferred ledger live in
   `IndexdataMismatch`) and diff's claimed-count trust are the other
   sites to cover.
 - [ ] Resolve or document known semantic differences in verify output.
-  Three commands have known diffs: extract (relation inclusion criteria),
-  diff (14-element version comparison), check-refs (occurrences vs unique).
+  Two commands have known diffs: diff (14-element version comparison),
+  check-refs (occurrences vs unique). extract is settled: its membership
+  rules and the two remaining osmium classes are in DEVIATIONS.md
+  "extract: per-strategy membership against osmium".
   See `brokkr verify all` output and README cross-validation section.
 - [ ] **CLI UX: scratch dir + mode naming, unified across the CLI** (raised
   2026-04-23, unresolved). Two related decisions, both of which should be

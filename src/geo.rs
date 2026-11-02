@@ -50,64 +50,226 @@ impl Bbox {
     }
 
     /// Returns `true` if the point (lat, lon) in degrees falls within this bbox.
+    ///
+    /// Membership is decided in decimicrodegrees, the unit PBF stores: the
+    /// point and every edge are each quantized by [`quantize_f64`] and the
+    /// integer box is inclusive on all four sides, so this agrees point for
+    /// point with [`BboxInt::inside_bbox`]. A nonfinite or unrepresentable
+    /// point is outside.
     #[cfg(feature = "commands")]
     pub(crate) fn contains(&self, lat: f64, lon: f64) -> bool {
+        match (quantize_f64(lat), quantize_f64(lon)) {
+            (Some(lat), Some(lon)) => BboxInt::inside_bbox(self).contains(lat, lon),
+            _ => false,
+        }
+    }
+
+    /// The raw f64 envelope test, no quantization. Only for prefiltering a
+    /// polygon's continuous f64 geometry, whose own predicate decides.
+    #[cfg(feature = "commands")]
+    pub(crate) fn envelope_contains(&self, lat: f64, lon: f64) -> bool {
         lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
     }
+
+    /// This box with each edge replaced by the decimal its text token
+    /// quantizes to (see [`quantize_decimal_text`]), stored as that
+    /// decimicrodegree over `1e7`. `None` when a token is not a decimal
+    /// number.
+    ///
+    /// For a box parsed from text, call after [`Self::try_new`] has validated
+    /// the f64 values the same tokens parse to, so a refusal names what the
+    /// user typed. The result is built directly rather than through
+    /// `try_new`: two distinct edges may quantize to the same column, which is
+    /// a valid one-column box. The stored f64 is `q / 1e7`, whose exact value
+    /// lies far inside the half-unit band, so [`quantize_f64`] maps it back
+    /// to `q` and every consumer derives the same integer box.
+    #[cfg(feature = "commands")]
+    pub(crate) fn quantized_from_tokens(&self, tokens: [&str; 4]) -> Option<Self> {
+        let [min_lon, min_lat, max_lon, max_lat] = tokens.map(quantize_decimal_text);
+        Some(Self {
+            min_lon: crate::coord_fmt::from_decimicro(min_lon?),
+            min_lat: crate::coord_fmt::from_decimicro(min_lat?),
+            max_lon: crate::coord_fmt::from_decimicro(max_lon?),
+            max_lat: crate::coord_fmt::from_decimicro(max_lat?),
+        })
+    }
 }
 
-// Spatial membership deliberately uses multiplication, matching reader geometry.
-// The text/OSC conversion divides for byte compatibility; sharing that function
-// would change which boundary nodes extraction includes.
-#[cfg(feature = "commands")]
-pub(crate) fn to_degrees(value: i32) -> f64 {
-    e7_to_deg(f64::from(value))
-}
-
-/// Smallest decimicrodegree value whose degree form is `>= limit`.
+/// Width of the band around a half-unit in which [`quantize_f64`] stops
+/// trusting the scaled product and decides from the exact binary value.
 ///
-/// The guess comes from scaling, then walks until the *forward* conversion
-/// satisfies the comparison in both directions, so the result is exact
-/// regardless of which way the two conversions round.
-#[allow(clippy::cast_possible_truncation)]
+/// For any f64 coordinate in the WGS84 domain, `v * 1e7` computed in f64
+/// differs from the exact product by under 1.2e-7 units (half an ulp at
+/// 1.8e9), so outside this band the product rounds the way the exact value
+/// does. A numeric proof constant, not a tunable.
 #[cfg(feature = "commands")]
-fn ceil_e7(limit: f64) -> i32 {
-    let mut v = deg_to_e7(limit).ceil().clamp(-2.1e9, 2.1e9) as i32;
-    while to_degrees(v) < limit {
-        match v.checked_add(1) {
-            Some(next) => v = next,
-            None => break,
-        }
+const HALF_STEP_BAND: f64 = 1e-6;
+
+/// The decimicrodegree an f64 coordinate quantizes to: the exact binary value
+/// of `v`, times `1e7`, rounded half away from zero. `None` when `v` is
+/// nonfinite or the result does not fit an `i32`.
+///
+/// This is the one f64-to-decimicrodegree conversion spatial membership uses,
+/// for box edges and for f64 points alike. An f64 derived from a stored
+/// decimicrodegree (by either `e7 * 1e-7` or `e7 / 1e7`) quantizes back to
+/// that integer, so a PBF point keeps its own column. Half away from zero is
+/// the rule libosmium applies to decimal text, so a decimal edge typed with at
+/// most seven decimals selects the same column under both tools.
+#[cfg(feature = "commands")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub(crate) fn quantize_f64(v: f64) -> Option<i32> {
+    if !v.is_finite() {
+        return None;
     }
-    while let Some(prev) = v.checked_sub(1) {
-        if to_degrees(prev) >= limit {
-            v = prev;
-        } else {
-            break;
-        }
+    let magnitude = deg_to_e7(v).abs();
+    if magnitude > f64::from(i32::MAX) + 1.0 {
+        return None;
     }
-    v
+    let floor = magnitude.floor();
+    let frac = magnitude - floor;
+    let k = floor as i64;
+    let rounded = if (frac - 0.5).abs() > HALF_STEP_BAND {
+        if frac > 0.5 { k + 1 } else { k }
+    } else if exact_at_least_half(v.abs(), k as u64) {
+        k + 1
+    } else {
+        k
+    };
+    let signed = if v < 0.0 { -rounded } else { rounded };
+    i32::try_from(signed).ok()
 }
 
-/// Largest decimicrodegree value whose degree form is `<= limit`.
-#[allow(clippy::cast_possible_truncation)]
+/// Whether the exact binary value `a` (nonnegative, finite) times `1e7` is at
+/// least `k + 0.5`, decided without rounding: with `a = m * 2^e`, compare
+/// `m * 2e7` against `(2k + 1) * 2^-e`.
+///
+/// Only reached inside [`HALF_STEP_BAND`], where `a * 1e7 >= ~0.5`, so
+/// `a >= ~5e-8` and `-e <= 78`: both sides fit a `u128`. A shift that would
+/// not fit means `a` is far below any half-unit.
 #[cfg(feature = "commands")]
-fn floor_e7(limit: f64) -> i32 {
-    let mut v = deg_to_e7(limit).floor().clamp(-2.1e9, 2.1e9) as i32;
-    while to_degrees(v) > limit {
-        match v.checked_sub(1) {
-            Some(prev) => v = prev,
-            None => break,
-        }
+#[allow(clippy::cast_possible_truncation)]
+fn exact_at_least_half(a: f64, k: u64) -> bool {
+    let bits = a.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (m, e) = if exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1_u64 << 52), exponent - 1075)
+    };
+    let half = u128::from(2 * k + 1);
+    let lhs = u128::from(m) * 20_000_000;
+    if e >= 0 {
+        // An integral value, so the product is an integer and never inside
+        // the band; answered for completeness. Every coordinate-sized
+        // integral f64 has `e <= 0`, so the shift is small.
+        return (lhs << e.unsigned_abs().min(32)) >= half;
     }
-    while let Some(next) = v.checked_add(1) {
-        if to_degrees(next) <= limit {
-            v = next;
+    let shift = e.unsigned_abs();
+    if shift > 94 {
+        return false;
+    }
+    lhs >= half << shift
+}
+
+/// The decimicrodegree a decimal text token quantizes to, rounding the exact
+/// decimal value half away from zero. `None` when the token is not a decimal
+/// number (Rust's float grammar without `inf` and `nan`: optional sign,
+/// digits with an optional point, optional exponent) or the result does not
+/// fit an `i32`.
+///
+/// For a plain decimal this is what libosmium's coordinate parser computes.
+/// It differs only for an exponent spelling whose mantissa carries digits past
+/// the eighth decimal: libosmium truncates the mantissa there before applying
+/// the exponent, this rounds the exact value.
+#[cfg(feature = "commands")]
+pub(crate) fn quantize_decimal_text(token: &str) -> Option<i32> {
+    let s = token.trim();
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(at) => (&s[..at], parse_exponent(&s[at + 1..])?),
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // value = digits * 10^(exponent - frac_len); scaled by 1e7.
+    let digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|b| b - b'0')
+        .skip_while(|&d| d == 0)
+        .collect();
+    let frac_len = i64::try_from(frac_part.len()).ok()?;
+    let scale = exponent - frac_len + 7;
+    let len = i64::try_from(digits.len()).ok()?;
+    let magnitude: u64 = if digits.is_empty() {
+        0
+    } else if scale >= 0 {
+        if len + scale > 10 {
+            return None;
+        }
+        let mut q = digits_value(&digits);
+        for _ in 0..scale {
+            q *= 10;
+        }
+        q
+    } else {
+        let keep = len + scale;
+        if keep < 0 {
+            0
         } else {
-            break;
+            let keep = usize::try_from(keep).ok()?;
+            if keep > 10 {
+                return None;
+            }
+            let round_up = digits.get(keep).is_some_and(|&d| d >= 5);
+            digits_value(&digits[..keep]) + u64::from(round_up)
         }
+    };
+    let magnitude = i64::try_from(magnitude).ok()?;
+    i32::try_from(if negative { -magnitude } else { magnitude }).ok()
+}
+
+/// Decimal value of at most ten digits.
+#[cfg(feature = "commands")]
+fn digits_value(digits: &[u8]) -> u64 {
+    digits.iter().fold(0_u64, |acc, &d| acc * 10 + u64::from(d))
+}
+
+/// A decimal exponent, saturated far beyond any coordinate's range so an
+/// absurd exponent still means "zero" or "out of range" rather than "not a
+/// number".
+#[cfg(feature = "commands")]
+fn parse_exponent(s: &str) -> Option<i64> {
+    let (negative, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    v
+    let value = digits.bytes().fold(0_i64, |acc, b| {
+        (acc * 10 + i64::from(b - b'0')).min(100_000)
+    });
+    Some(if negative { -value } else { value })
 }
 
 /// Integer bounding box in decimicrodegrees.
@@ -124,7 +286,8 @@ impl BboxInt {
     /// Conservative integer bounds: a strict superset of [`Self::inside_bbox`],
     /// widened by one decimicrodegree on each side. Use for blob-level
     /// candidate selection and as a polygon prefilter, where a false positive
-    /// costs work and a false negative loses data. Never for point membership.
+    /// costs work and a false negative loses data. Never for bbox point
+    /// membership.
     pub(crate) fn from_bbox(bbox: &Bbox) -> Self {
         let inside = Self::inside_bbox(bbox);
         Self {
@@ -135,16 +298,35 @@ impl BboxInt {
         }
     }
 
-    /// Exact integer bounds: `contains` on this box agrees, point for point,
-    /// with `bbox.contains(lat as f64 * 1e-7, lon as f64 * 1e-7)`. Use for
-    /// point membership, columnar classification, and for proving that a raw
-    /// blob can be passed through untouched.
+    /// Exact integer bounds: each edge quantized by [`quantize_f64`], so an
+    /// edge typed as a decimal selects the column that decimal names, and the
+    /// box is inclusive on all four sides, as osmium's is. `contains` on this
+    /// box agrees point for point with [`Bbox::contains`]. Use for point
+    /// membership, columnar classification, and for proving that a raw blob
+    /// can be passed through untouched.
+    ///
+    /// An edge that cannot be quantized (only reachable through a `Bbox`
+    /// built field by field, since [`Bbox::try_new`] refuses nonfinite and
+    /// out-of-domain values) yields an empty box.
     pub(crate) fn inside_bbox(bbox: &Bbox) -> Self {
-        Self {
-            min_lon: ceil_e7(bbox.min_lon),
-            min_lat: ceil_e7(bbox.min_lat),
-            max_lon: floor_e7(bbox.max_lon),
-            max_lat: floor_e7(bbox.max_lat),
+        match (
+            quantize_f64(bbox.min_lon),
+            quantize_f64(bbox.min_lat),
+            quantize_f64(bbox.max_lon),
+            quantize_f64(bbox.max_lat),
+        ) {
+            (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) => Self {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            },
+            _ => Self {
+                min_lon: i32::MAX,
+                min_lat: i32::MAX,
+                max_lon: i32::MIN,
+                max_lat: i32::MIN,
+            },
         }
     }
 
@@ -1282,6 +1464,127 @@ mod tests {
         ] {
             assert!(Bbox::try_new(values.0, values.1, values.2, values.3).is_err());
         }
+    }
+
+    /// Decimal text rounds its exact value half away from zero, as
+    /// libosmium's coordinate parser does for plain decimals.
+    #[test]
+    #[cfg(feature = "commands")]
+    fn decimal_text_quantizes_exactly() {
+        for (token, expected) in [
+            ("12.4", Some(124_000_000)),
+            ("55.6", Some(556_000_000)),
+            ("-0.00000005", Some(-1)),
+            ("0.00000005", Some(1)),
+            ("0.000000049999", Some(0)),
+            ("1.00000115", Some(10_000_012)),
+            ("1.0000000499999999", Some(10_000_000)),
+            ("179.99999994999999", Some(1_799_999_999)),
+            ("180", Some(1_800_000_000)),
+            ("+12.", Some(120_000_000)),
+            (".5", Some(5_000_000)),
+            ("0.000000001e2", Some(1)),
+            ("1.24e1", Some(124_000_000)),
+            ("1e-99999999999", Some(0)),
+            ("00012.40", Some(124_000_000)),
+            ("-0", Some(0)),
+            ("", None),
+            (".", None),
+            ("1e", None),
+            ("inf", None),
+            ("nan", None),
+            ("12,4", None),
+            ("1e3", None),
+            ("300", None),
+        ] {
+            assert_eq!(quantize_decimal_text(token), expected, "token {token:?}");
+        }
+    }
+
+    /// The f64 rule rounds the exact binary value, so it can disagree with
+    /// the decimal a token spells only past f64 precision - and it maps every
+    /// stored decimicrodegree, however converted to f64, back to itself.
+    #[test]
+    #[cfg(feature = "commands")]
+    fn f64_quantizes_its_exact_binary_value() {
+        assert_eq!(quantize_f64(12.4), Some(124_000_000));
+        // The f64 nearest 5e-8 is just below it, though its product with 1e7
+        // is exactly 0.5: the exact value rounds down, where the decimal
+        // text "0.00000005" rounds up.
+        assert_eq!(quantize_f64(-0.000_000_05), Some(0));
+        assert_eq!(quantize_f64(0.000_000_05), Some(0));
+        assert_eq!(quantize_decimal_text("0.00000005"), Some(1));
+        // Likewise 1.5e-7, whose product is exactly 1.5.
+        assert_eq!(quantize_f64(0.000_000_15), Some(1));
+        assert_eq!(quantize_f64(-0.000_000_15), Some(-1));
+        assert_eq!(quantize_f64(f64::NAN), None);
+        assert_eq!(quantize_f64(f64::INFINITY), None);
+        assert_eq!(quantize_f64(1e300), None);
+        // 1.00000005 is stored slightly below the decimal, and its f64
+        // product lands exactly on the half-unit: only the exact comparison
+        // gets this right.
+        assert_eq!(deg_to_e7(1.000_000_05), 10_000_000.5);
+        assert_eq!(quantize_f64(1.000_000_05), Some(10_000_000));
+        for e7 in [
+            -1_800_000_000_i32,
+            -899_999_999,
+            -1,
+            0,
+            1,
+            556_000_000,
+            124_000_000,
+            1_799_999_999,
+            1_800_000_000,
+        ] {
+            assert_eq!(quantize_f64(e7_to_deg(f64::from(e7))), Some(e7));
+            assert_eq!(quantize_f64(crate::coord_fmt::from_decimicro(e7)), Some(e7));
+        }
+    }
+
+    /// A box parsed from text selects the columns its tokens spell, and the
+    /// point test agrees with the integer box on every edge.
+    #[test]
+    #[cfg(feature = "commands")]
+    #[allow(clippy::unwrap_used)]
+    fn text_box_edges_are_inclusive_decimal_columns() {
+        let raw = Bbox::try_new(12.4, 55.6, 12.7, 55.8).unwrap();
+        let bbox = raw
+            .quantized_from_tokens(["12.4", "55.6", "12.7", "55.8"])
+            .unwrap();
+        let inside = BboxInt::inside_bbox(&bbox);
+        assert_eq!(
+            (
+                inside.min_lon,
+                inside.min_lat,
+                inside.max_lon,
+                inside.max_lat
+            ),
+            (124_000_000, 556_000_000, 127_000_000, 558_000_000)
+        );
+        for (lat, lon, expected) in [
+            (556_000_000, 125_000_000, true),
+            (555_999_999, 125_000_000, false),
+            (558_000_000, 127_000_000, true),
+            (558_000_001, 125_000_000, false),
+            (557_000_000, 124_000_000, true),
+            (557_000_000, 123_999_999, false),
+        ] {
+            assert_eq!(inside.contains(lat, lon), expected, "({lat}, {lon})");
+            assert_eq!(
+                bbox.contains(e7_to_deg(f64::from(lat)), e7_to_deg(f64::from(lon))),
+                expected,
+                "f64 point ({lat}, {lon})"
+            );
+        }
+        assert!(!bbox.contains(f64::NAN, 12.5));
+        // Two distinct edges can name one column: a valid one-column box.
+        let narrow = Bbox::try_new(12.4, 55.6, 12.400_000_04, 55.8)
+            .unwrap()
+            .quantized_from_tokens(["12.4", "55.6", "12.40000004", "55.8"])
+            .unwrap();
+        let narrow = BboxInt::inside_bbox(&narrow);
+        assert_eq!(narrow.min_lon, narrow.max_lon);
+        assert!(narrow.contains(557_000_000, 124_000_000));
     }
 
     #[test]

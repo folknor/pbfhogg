@@ -3,9 +3,11 @@ members = ["cli", "harness"]
 exclude = ["bench/osmpbf-baseline"]
 
 [workspace.dependencies]
-# Correctly-rounded float parsing keeps config and GeoJSON coordinates
-# identical to their CLI-string-parsed equivalents at bbox boundaries.
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+# Correctly-rounded float parsing keeps GeoJSON coordinates identical to
+# their CLI-string-parsed equivalents. raw_value lets extract --config read a
+# bbox edge's own number token, so it is quantized from its digits exactly as
+# a -b token is.
+serde_json = { version = "1.0.150", features = ["float_roundtrip", "raw_value"] }
 
 [workspace.package]
 version = "0.5.0"

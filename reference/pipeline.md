@@ -312,8 +312,16 @@ Two-pointer merge-join over two sorted PBFs. Three phases per element type (node
 
 Geographic extraction with three strategies:
 - `--simple` - single pass, blob-filter by bbox, may leave dangling refs
-- Default (complete-ways) - two passes: pass 1 collects way-referenced node IDs, pass 2 emits all
+- Default (complete-ways) - two passes: pass 1 collects way-referenced node IDs and matched relations, then closes the relation set over parent relations (every relation's relation-type members are recorded as member-to-parent edges during the relation classify phase, sorted, and walked from the matched set); pass 2 emits all
 - `--smart` - three passes: also completes multipolygon/boundary relation members
+
+The membership rules each strategy implements are stated in
+`docs/cli/commands.md` "### extract". Bbox membership is integer: every edge is
+quantized once (`geo::BboxInt::inside_bbox`, decimal text by
+`geo::quantize_decimal_text`, an f64 by `geo::quantize_f64`) and every
+classifier - element walk, dense columns plus plain nodes, the multi-extract
+grid, the raw-passthrough proof - compares stored decimicrodegrees against that
+one box.
 
 Multi-extract via `--config` JSON: single pass producing multiple output files.
 Node classification against N regions prunes candidates with a CSR grid

@@ -1317,6 +1317,36 @@ Extract elements within a geographic region (bounding box or polygon).
 
 Three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), `--smart` (three passes, completes multipolygon/boundary relations).
 
+Which elements each strategy writes:
+
+- **Inside the region.** A node is inside a bbox when its stored
+  decimicrodegree coordinates lie within the four edges, inclusive. Each edge
+  is the decimal it was typed as, rounded half away from zero to a
+  decimicrodegree, from its own text in both `-b` and `--config` (so `12.4`
+  is exactly column `124000000`, and a node on it is inside). A polygon region
+  uses an f64 ray cast; a node on its vertex or edge may fall outside.
+- **Matched.** A way is matched when at least one of its nodes is inside. A
+  relation is matched when it has a member node inside or a member way
+  matched; relation-type members do not match it.
+- **`--simple`**: the nodes inside, the matched ways (their other nodes are not
+  added) and the matched relations. Nothing else.
+- **complete-ways**: as simple, plus every node of every matched way, plus
+  every relation that has an included relation as a member, recursively to any
+  depth. A relation included as such a parent adds nothing else.
+- **`--smart`**: as complete-ways, plus, for every *matched* relation whose
+  first `type` tag is `multipolygon` or `boundary`, its member nodes and member
+  ways wherever they lie, and every node of those ways. Its relation-type
+  members, and the parents complete-ways adds, are included as relations but
+  not completed.
+
+These are osmium extract's `simple`, `complete_ways` and `smart`, element for
+element on a bbox, except that osmium's simple decides a relation on its first
+node or way member only and osmium's smart completes `multipolygon` alone
+unless given `-S types=multipolygon,boundary`. pbfhogg has no `-S` options. See
+[DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium).
+`--set-bounds` writes the region's envelope with each edge at the
+decimicrodegree it selects.
+
 Node blobs whose indexdata bbox misses the region are skipped unread, and the
 sorted-input schedules split blobs on their indexdata kind; both claims are
 believed. A node blob copied raw is first decoded to prove every node lies in
@@ -1347,8 +1377,8 @@ pbfhogg extract [OPTIONS] <FILE>
 | `--config <FILE>` | Multi-extract JSON config file. (`-c` used to be its short; `-c` now refuses here, naming `--config`.) |
 | `-d, --directory <DIR>` | Rebase config outputs under this directory (only with --config) |
 | `--simple` | Simple strategy (single pass). (`-s` used to be its short; `-s` now refuses here, naming `--simple`.) |
-| `--smart` | Smart strategy (three passes, complete relations) |
-| `--set-bounds` | Write the extract region bounding box to the output header instead of the input's. complete_ways and smart exceed it by design with the out-of-region nodes of selected ways |
+| `--smart` | Smart strategy (three passes, completes multipolygon and boundary relations) |
+| `--set-bounds` | Write the extract region bounding box, each edge at the decimicrodegree it selects, to the output header instead of the input's. complete_ways and smart exceed it by design with the out-of-region nodes of selected ways |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -1441,7 +1471,7 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-t, --type <TYPE>` | Export only these kinds: `node`, `way` or `node,way`. `relation` is refused |
 | `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
 | `--properties <KEYS>` | Comma-separated whitelist of tag property keys |
-| `-b, --bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
+| `-b, --bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`, inclusive, with each edge and each position at the decimicrodegree it rounds to, as for `extract`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
 | `--metadata` | Add available `@version`, `@timestamp`, `@changeset`, `@uid`, `@user`, and `@visible` properties |
 
 Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC

@@ -602,6 +602,118 @@ fn smart_ignores_non_qualifying_relations() {
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
 }
 
+/// Smart judges a relation by its first `type` tag, as osmium does.
+#[test]
+fn smart_completion_follows_the_first_type_tag() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let relations = vec![TestRelation {
+        id: 310,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "outer",
+            },
+        ],
+        tags: vec![("type", "route"), ("type", "multipolygon")],
+        meta: None,
+    }];
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
+    let c = read_all_elements(&output);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    assert_eq!(relation_ids(&c), vec![310]);
+}
+
+fn member_relation(id: i64) -> TestMember {
+    TestMember {
+        id: MemberId::Relation(id),
+        role: "",
+    }
+}
+
+/// Relations around the matched route 100 (member node 1, in the region):
+/// a parent, a grandparent, a parent stored before its child, a cycle
+/// through a self-member, a multipolygon parent that also lists way 11, a
+/// parent of the unmatched route 101, and a parent of an absent relation.
+fn parent_relations() -> Vec<TestRelation> {
+    let rel = |id: i64, members: Vec<TestMember>, kind: &'static str| TestRelation {
+        id,
+        members,
+        tags: vec![("type", kind)],
+        meta: None,
+    };
+    let mut relations = test_relations();
+    relations.extend([
+        rel(50, vec![member_relation(401)], "superroute"),
+        rel(400, vec![member_relation(100)], "route_master"),
+        rel(401, vec![member_relation(400)], "superroute"),
+        rel(402, vec![member_relation(101)], "route_master"),
+        rel(
+            403,
+            vec![member_relation(403), member_relation(401)],
+            "network",
+        ),
+        rel(
+            404,
+            vec![
+                member_relation(100),
+                TestMember {
+                    id: MemberId::Way(11),
+                    role: "outer",
+                },
+            ],
+            "multipolygon",
+        ),
+        rel(405, vec![member_relation(999)], "collection"),
+    ]);
+    relations.sort_by_key(|r| r.id);
+    relations
+}
+
+/// complete-ways and smart include every relation that has an included
+/// relation as a member, recursively and regardless of file order, as
+/// osmium's do; a parent pulls in nothing else, and smart does not complete
+/// a parent. Simple has no relation-to-relation step, also as osmium.
+#[test]
+fn complete_and_smart_include_parent_relations_recursively() {
+    let dir = crate::common::test_scratch();
+    for (layout, sorted) in [("sorted", true), ("unsorted", false)] {
+        let input = dir.path().join(format!("{layout}.osm.pbf"));
+        if sorted {
+            write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &parent_relations());
+        } else {
+            write_test_pbf(&input, &test_nodes(), &test_ways(), &parent_relations());
+        }
+        for (name, strategy) in [
+            ("complete", Strategy::CompleteWays),
+            ("smart", Strategy::Smart),
+        ] {
+            let out = dir.path().join(format!("{layout}-{name}.osm.pbf"));
+            run_extract(&input, &out, &RegionArg::Bbox(BBOX_STR), strategy);
+            let c = read_all_elements(&out);
+            assert_eq!(
+                relation_ids(&c),
+                vec![50, 100, 400, 401, 403, 404],
+                "{layout} {name}"
+            );
+            assert_eq!(way_ids(&c), vec![10, 12], "{layout} {name}");
+        }
+        let out = dir.path().join(format!("{layout}-simple.osm.pbf"));
+        run_extract(&input, &out, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+        assert_eq!(
+            relation_ids(&read_all_elements(&out)),
+            vec![100],
+            "{layout}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spatial blob filter
 // ---------------------------------------------------------------------------
@@ -1313,13 +1425,13 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
     assert!(resolved_dir.join("anchored.osm.pbf").exists());
 }
 
-/// The config path parses bbox floats with serde_json, the CLI `-b` path
-/// with std `FromStr`. serde_json's default float parse is best-effort
-/// and can land 1 ULP off the correctly-rounded value on 17-digit inputs
-/// like 12.639999999999999; after the floor/ceil decimicrodegree
-/// conversion that ULP becomes a whole coordinate step. Both parsers must
-/// retain the exact f64 boundary, without promoting the conservative blob
-/// bounds into point membership.
+/// `-b` and `--config` quantize a 17-digit edge to the same column.
+/// "12.639999999999999" names 126399999.99999999 decimicrodegrees, which
+/// rounds to column 126400000, so node 1 on that column is inside under
+/// both inputs. Each edge is quantized from its own token, so this no
+/// longer depends on how either parser rounds the token to an f64;
+/// `a_half_step_edge_quantizes_from_its_digits_in_cli_and_config` is the
+/// case where the f64 route would pick a different column.
 #[test]
 fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let dir = crate::common::test_scratch();
@@ -1327,14 +1439,7 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     let out_cli = dir.path().join("cli.osm.pbf");
     let config = dir.path().join("config.json");
 
-    // Node 1 sits on the ONE column whose membership depends on which f64
-    // the bbox string parses to. Correctly rounded, "12.639999999999999" is
-    // 0x1.947ae147ae147p+3, and `126_400_000 as f64 * 1e-7` is that exact
-    // value, so the node is inside. serde_json's best-effort parse (without
-    // the `float_roundtrip` feature) lands 1 ULP up on 12.64 =
-    // 0x1.947ae147ae148p+3, which excludes the column - so this node is the
-    // fixture that fails if the feature ever drops off. A node any lower is
-    // excluded under both parses and pins nothing. Node 2 is safely interior.
+    // Node 1 sits on the edge column. Node 2 is safely interior.
     let nodes = vec![
         TestNode {
             id: 1,
@@ -1377,8 +1482,7 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     assert_eq!(
         node_ids(&cli_elements),
         vec![1, 2],
-        "CLI -b parses with std FromStr (always correctly rounded), so the \
-         boundary column must be inside"
+        "the edge column must be inside"
     );
     assert_eq!(
         node_ids(&cfg_elements),
@@ -1387,26 +1491,27 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
     );
 }
 
-/// Boundary where the two decimicrodegree conversions genuinely disagree.
+/// A node exactly on a typed decimal edge is inside, and the column next to
+/// it is outside - at a boundary where f64 arithmetic cannot be trusted.
 ///
-/// `55.6 / 1e-7` is exactly `556_000_000`, but `556_000_000 as f64 * 1e-7`
-/// is strictly BELOW `55.6`. So a lower bound derived by division admits a
-/// node the f64 comparison every consumer runs would reject. A fixture at a
-/// round boundary such as 55.0 or 56.0 cannot see this: there the two
-/// conversions agree and the test passes either way.
+/// `556_000_000 as f64 * 1e-7` is strictly below `55.6`, so a membership
+/// test on that product excludes a node sitting on the 55.6 edge, while
+/// osmium, which quantizes the typed decimal, includes it. Every edge is
+/// quantized to the decimicrodegree its text names and compared
+/// inclusively. A fixture at a round boundary such as 55.0 cannot see the
+/// difference.
 ///
-/// The exclusion has to hold at every layer that decides membership -
+/// This has to hold at every layer that decides membership -
 /// element-by-element classification, the columnar bbox classifier used by
-/// `smart` and by multi-extract, and the raw-blob passthrough proof, which
-/// would copy the whole blob through untouched and smuggle the node in.
+/// complete-ways, `smart` and multi-extract, and the raw-blob passthrough
+/// proof, which copies a whole blob through untouched.
 #[test]
-fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
+fn bbox_edge_is_the_typed_decimal_column_inclusive() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
-    // Node 1 sits exactly on the integer column division produces for
-    // 55.6. Node 2 is the first column whose forward conversion is truly
-    // inside. Node 3 is interior, so no output is trivially empty.
+    // Node 1 sits exactly on 55.6. Node 2 is one column below it, outside.
+    // Node 3 is interior, so no output is trivially empty.
     let nodes = vec![
         TestNode {
             id: 1,
@@ -1417,7 +1522,7 @@ fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
         },
         TestNode {
             id: 2,
-            lat: 556_000_001,
+            lat: 555_999_999,
             lon: 126_500_000,
             tags: vec![],
             meta: None,
@@ -1446,10 +1551,30 @@ fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
         );
         assert_eq!(
             node_ids(&read_all_elements(&out)),
-            vec![2, 3],
-            "{name} must exclude the node below the exact 55.6 boundary"
+            vec![1, 3],
+            "{name} must include the node on the 55.6 edge and nothing below it"
         );
     }
+
+    // Without node 2 the blob's bbox touches the edge exactly, so the simple
+    // strategy nominates it for raw passthrough; the proof must agree that
+    // the edge node is inside.
+    let edge_only = dir.path().join("edge-only.osm.pbf");
+    let edge_nodes: Vec<TestNode> = nodes.into_iter().filter(|n| n.id != 2).collect();
+    write_test_pbf_sorted(&edge_only, &edge_nodes, &[], &[]);
+    let out = dir.path().join("edge-only-out.osm.pbf");
+    let result = run_extract(
+        &edge_only,
+        &out,
+        &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
+    assert_eq!(node_ids(&read_all_elements(&out)), vec![1, 3]);
+    let stderr = result.stderr_str();
+    assert!(
+        !stderr.contains("filtered instead of copied raw"),
+        "an edge-touching blob must verify for passthrough: {stderr}"
+    );
 
     let config = dir.path().join("config.json");
     std::fs::write(
@@ -1468,8 +1593,59 @@ fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
     run_extract_multi(&input, &config, Strategy::Simple);
     assert_eq!(
         node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
-        vec![2, 3],
-        "multi-extract must exclude the node below the exact 55.6 boundary"
+        vec![1, 3],
+        "multi-extract must include the node on the 55.6 edge"
+    );
+}
+
+/// An edge typed with more than seven decimals is quantized from its own
+/// digits, half away from zero, identically from `-b` text and from a
+/// `--config` number: `1.00000115` names column 10000012. Its nearest f64
+/// times 1e7 is 10000011.499999998, so any route through the f64 would
+/// pick 10000011 and admit node 1 below the edge.
+#[test]
+fn a_half_step_edge_quantizes_from_its_digits_in_cli_and_config() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 10_000_000,
+            lon: 10_000_011,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 10_000_000,
+            lon: 10_000_012,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+    let out = dir.path().join("cli.osm.pbf");
+    run_extract(
+        &input,
+        &out,
+        &RegionArg::Bbox("1.00000115,0.5,2,2"),
+        Strategy::Simple,
+    );
+    assert_eq!(node_ids(&read_all_elements(&out)), vec![2]);
+
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"cfg.osm.pbf","bbox":[1.00000115,0.5,2,2]}}]}}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("cfg.osm.pbf"))),
+        vec![2]
     );
 }
 
@@ -1834,12 +2010,12 @@ fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
     );
 }
 
-#[test]
-fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("plain.osm.pbf");
+/// A sorted input whose one data blob holds two plain (non-dense) Node
+/// messages, (id, lat, lon) = (1, 10, 20) and (2, 30, 40) decimicrodegrees,
+/// default granularity, no indexdata.
+fn write_plain_node_pbf(input: &Path) {
     let mut writer = PbfWriter::new(
-        std::fs::File::create(&input).expect("create input"),
+        std::fs::File::create(input).expect("create input"),
         Compression::default(),
     );
     writer
@@ -1850,8 +2026,7 @@ fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
                 .expect("header"),
         )
         .expect("write header");
-    // Empty string-table entry, then two plain Node messages:
-    // (id, lat, lon) = (1, 10, 20), (2, 30, 40), default granularity.
+    // Empty string-table entry, then the two plain Node messages.
     let block = [
         10, 2, 10, 0, 18, 16, 10, 6, 8, 2, 64, 20, 72, 40, 10, 6, 8, 4, 64, 60, 72, 80,
     ];
@@ -1859,7 +2034,47 @@ fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
         .write_primitive_block(&block)
         .expect("write plain nodes");
     writer.flush().expect("flush");
-    drop(writer);
+}
+
+/// complete-ways and smart classify a sorted bbox input's nodes from dense
+/// columns, which leave plain Node messages out; those must still be
+/// classified, or an in-region plain node and everything it would have
+/// matched is silently missing.
+#[test]
+fn complete_and_smart_classify_plain_nodes_on_sorted_input() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain.osm.pbf");
+    write_plain_node_pbf(&input);
+    for (name, strategy) in [
+        ("complete", Strategy::CompleteWays),
+        ("smart", Strategy::Smart),
+    ] {
+        for (case, bbox, expected) in [
+            ("all", "--bbox=-1,-1,1,1", vec![1, 2]),
+            ("partial", "--bbox=0,0,0.0000025,0.0000025", vec![1]),
+        ] {
+            let out = dir.path().join(format!("{name}-{case}.osm.pbf"));
+            let cli = CliInvoker::new()
+                .arg("extract")
+                .arg(&input)
+                .arg("-o")
+                .arg(&out)
+                .arg(bbox);
+            strategy_args(cli, strategy).assert_success();
+            assert_eq!(
+                node_ids(&read_all_elements(&out)),
+                expected,
+                "{name} {case} lost plain nodes"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain.osm.pbf");
+    write_plain_node_pbf(&input);
     let single = dir.path().join("single.osm.pbf");
     CliInvoker::new()
         .args(["extract", "--simple", "--bbox=-1,-1,1,1"])

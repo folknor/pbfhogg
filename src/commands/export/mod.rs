@@ -136,10 +136,11 @@ fn way_kind() -> TypeFilter {
     }
 }
 
-/// Node and way source positions retain the PBF's nanodegree precision, and
-/// the user's bbox is in degrees. Keep membership in that same precision:
-/// truncating node coordinates to decimicrodegrees can put a node on the
-/// opposite side of a bbox boundary from the same coordinate on a way.
+/// Node and way positions reach here as f64 degrees, and both go through the
+/// one point test, `Bbox::contains`, which rounds the point to its nearest
+/// decimicrodegree and compares it with the edges quantized as `extract
+/// --bbox` quantizes them, inclusively. A node and the same
+/// coordinate on a way therefore always land on the same side of the edge.
 fn way_hits_bbox(coords: &[(f64, f64)], bbox: &Bbox) -> bool {
     coords.iter().any(|&(lon, lat)| bbox.contains(lat, lon))
 }

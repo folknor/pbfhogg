@@ -29,8 +29,35 @@
   large for the format on the decode path is answered with advice to
   lower it unless the cap is already at its smallest; the header-only
   flags, which encode no data blob, no longer get that advice.
+- `extract` (complete-ways and `--smart`, single region or `--config`)
+  also writes every relation that has an included relation as a member,
+  recursively, as osmium extract's `complete_ways` and `smart` do: a route
+  inside the box now brings its route master and superroute. A relation
+  included that way adds nothing else, and smart does not complete it.
+  `--simple` is unchanged. On a European box of the planet that is 78 408
+  more relations, with the same wall time and peak memory.
+- A bbox edge in `extract` and `export --bbox` is the decimal it is typed
+  as, rounded half away from zero to a decimicrodegree, and inclusive: a
+  node exactly on `-b 12.4,...` is inside, as in osmium, where pbfhogg
+  used to exclude or include it by floating-point accident. `--config`
+  edges are read from their own number text the same way, so `-b` and
+  `--config` always agree. `--set-bounds` writes that quantized envelope.
+- `extract --smart` decides whether to complete a relation from its first
+  `type` tag, as osmium does, not from any `type` tag.
+- The extract membership rules per strategy, and the two places they
+  differ from osmium's (simple counts any member, not only the first;
+  smart completes `boundary` as well as `multipolygon`), are stated in
+  `docs/cli/commands.md` and DEVIATIONS.md. On a bbox, complete-ways now
+  writes exactly osmium's element set, and smart exactly that of
+  `osmium extract -s smart -S types=multipolygon,boundary`.
 
 **Library**
+
+- `extract::Bbox::contains` and `Region::contains` quantize the point and
+  the edges to decimicrodegrees and compare inclusively, so they agree
+  with what `extract` selects; a nonfinite point is outside.
+  `extract::parse_bbox` stores each edge at the decimicrodegree its text
+  names.
 
 - `tags_count::tags_count` refuses unindexed input only where
   `TagCountOptions::requires_indexdata` says so, and
@@ -205,6 +232,13 @@
   1 GB of rewritten output, kept as allocator free memory once the queue
   emptied. Planet peak memory is 2.0-2.2 GB, against 2.3-3.0 GB before,
   with the same wall time and output bytes.
+
+### Fixed
+
+- `extract` complete-ways and `--smart` on a sorted input with a bbox
+  dropped every node stored as a plain (non-dense) Node message, and with
+  it every way and relation that node would have matched. They are now
+  classified like dense nodes.
 
 ## 0.6.0 - 2026-10-30
 

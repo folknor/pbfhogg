@@ -11,7 +11,7 @@ command count.
 |--------|---------|--------------|
 | `cat` | `cat` | Same |
 | `sort` | `sort` | Same |
-| `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags |
+| `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags; membership per strategy in [DEVIATIONS](../DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
 | `getid` | `getid` | Same |
 | `getparents` | `getparents` | Same |
@@ -223,7 +223,7 @@ worth knowing about.
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
 | `-O, --overwrite` | `-O, --overwrite`, as in osmium: an existing output is refused without it. Unlike osmium a symlink is refused even with it | every command with an output |
-| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - first feature only; Osmosis `.poly` files are not accepted) | extract |
+| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area; an open ring is closed implicitly) | extract |
 
 ### Flags pbfhogg doesn't have
 
@@ -238,6 +238,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
+| `extract -S, --option` | Strategy options are fixed: complete-ways always includes parent relations (osmium's `relations=true`), smart completes `multipolygon` and `boundary` (osmium's `types=multipolygon,boundary`), with no `complete-partial-relations` or `tags` filter. See [DEVIATIONS](../DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `--index-type` | `sparse` (default), `external` (bounded-memory join with sequential I/O), `auto` (runtime routing; see [add-locations-to-ways](pipeline.md#add-locations-to-ways)). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has

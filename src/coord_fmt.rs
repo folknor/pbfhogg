@@ -1,16 +1,17 @@
 //! Shared coordinate conversion and formatting.
 
 /// Convert a decimicrodegree value to degrees, including fractional averages.
-/// Multiplication order is part of the spatial boundary comparison contract:
-/// `556_000_000 * 1e-7` is below `55.6`, even though `55.6 / 1e-7`
-/// is exactly `556_000_000`. Bounds must check the forward conversion.
+/// Not an exact conversion: `556_000_000 * 1e-7` lands below `55.6`. Bbox
+/// membership therefore never compares this product against an edge; it
+/// compares integers (`geo::BboxInt::inside_bbox`). Polygon ray casting and
+/// geometry use it as continuous f64.
 pub(crate) fn e7_to_deg(value: f64) -> f64 {
     value * 1e-7
 }
 
 /// Scale degrees to decimicrodegrees without choosing integer rounding.
-/// This is not an exact floating-point inverse of [`e7_to_deg`]; spatial
-/// bounds must correct their rounded guess against the forward conversion.
+/// Not an exact inverse of [`e7_to_deg`]; `geo::quantize_f64` decides the
+/// integer from the exact value when this product sits near a half-unit.
 pub(crate) fn deg_to_e7(value: f64) -> f64 {
     value * 1e7
 }

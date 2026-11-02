@@ -23,6 +23,14 @@ mod smart;
 pub use crate::geo::Bbox;
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
+///
+/// The values are validated as typed, then each edge is quantized from its
+/// own text to the decimicrodegree that decimal names, rounding half away
+/// from zero (see `geo::quantize_decimal_text`), and stored as that
+/// decimicrodegree over `1e7`. So `12.4` selects column `124000000` exactly,
+/// as osmium's parser does, rather than whatever an f64 product of it
+/// rounds to, and an edge typed with more than seven decimals is resolved
+/// from its digits, not from the nearest f64.
 // The messages show the bad input value, which is more useful to users than the
 // underlying ParseFloatError ("invalid float literal").
 pub fn parse_bbox(s: &str) -> Result<Bbox> {
@@ -50,7 +58,9 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
         .parse()
         .map_err(|_| Error::invalid_argument(format!("invalid max_lat: {}", parts[3])))?;
 
-    Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
+    Bbox::try_new(min_lon, min_lat, max_lon, max_lat)?
+        .quantized_from_tokens([parts[0], parts[1], parts[2], parts[3]])
+        .ok_or_else(|| Error::invalid_argument(format!("bbox is not four decimal numbers: {s}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +96,9 @@ impl Region {
         match self {
             Region::Bbox(bbox) => bbox.contains(lat, lon),
             Region::Polygon { polygons, bbox } => {
-                if !bbox.contains(lat, lon) {
+                // The polygon predicate is continuous f64 geometry; its
+                // envelope prefilter stays in the same coordinate model.
+                if !bbox.envelope_contains(lat, lon) {
                     return false;
                 }
                 polygon_contains(polygons, lon, lat)
@@ -96,19 +108,19 @@ impl Region {
 
     /// Fast containment test using decimicrodegree integer coordinates.
     ///
-    /// For bbox regions, uses pure integer comparison (4 i32 compares) - avoids
-    /// the i64→f64 conversion that `contains()` requires per node. For polygon
-    /// regions, the bbox fast-rejection uses integers; only points passing the
-    /// bbox test fall through to the f64 polygon ray-casting (with i32→f64
-    /// conversion done only for those points).
-    fn contains_decimicro(&self, bbox_int: &common::BboxInt, lat: i32, lon: i32) -> bool {
+    /// `exact` must be `BboxInt::inside_bbox(self.bbox())`, computed once by
+    /// the caller. For a bbox region it is the membership rule itself: four
+    /// integer compares against the quantized, inclusive box. For a polygon
+    /// it is only a prefilter, and a sound one for integer points: a point
+    /// one column outside a nearest-rounded edge lies at least half a
+    /// decimicrodegree outside the f64 vertex envelope, which the f64 ray
+    /// cast below never admits. Only points that pass fall through to the
+    /// polygon test.
+    fn contains_decimicro(&self, exact: &common::BboxInt, lat: i32, lon: i32) -> bool {
         match self {
-            // `bbox_int` is deliberately widened for conservative blob
-            // selection. Exact point membership must retain the user's f64
-            // boundary, or a point up to one e7 unit outside can match.
-            Region::Bbox(bbox) => bbox.contains(e7_to_deg(lat as f64), e7_to_deg(lon as f64)),
+            Region::Bbox(_) => exact.contains(lat, lon),
             Region::Polygon { polygons, .. } => {
-                if !bbox_int.contains(lat, lon) {
+                if !exact.contains(lat, lon) {
                     return false;
                 }
                 let lat_f64 = e7_to_deg(lat as f64);
@@ -472,6 +484,12 @@ fn parse_extract_config_text(
     let default_output_dir = configured_output_dir.as_deref().unwrap_or(config_dir);
     let resolve_dir = directory_override.unwrap_or(default_output_dir);
 
+    // The same document again, keeping each entry's raw text, so a bbox edge
+    // can be quantized from its own number token (see `parse_bbox`).
+    let raw_entries: Vec<&serde_json::value::RawValue> = raw_member(data, "extracts")
+        .and_then(|raw| serde_json::from_str(raw.get()).ok())
+        .ok_or_else(|| Error::internal("extract config: raw reparse disagrees with parse"))?;
+
     let mut slots = Vec::with_capacity(extracts_arr.len());
     let mut output_paths: Vec<std::path::PathBuf> = Vec::with_capacity(extracts_arr.len());
 
@@ -495,7 +513,7 @@ fn parse_extract_config_text(
         }
         output_paths.push(output_path.clone());
 
-        let region = parse_extract_geometry(entry, i, config_dir)?;
+        let region = parse_extract_geometry(entry, raw_entries.get(i).copied(), i, config_dir)?;
         let polygon_file = entry
             .get("polygon_file")
             .and_then(serde_json::Value::as_str)
@@ -532,9 +550,20 @@ fn rebase_config_output(output: &Path, old_root: &Path, new_root: &Path) -> Path
     new_root.join(relative)
 }
 
-/// Parse the geometry for a single extract entry in a config file.
+/// The raw text of `key` in the JSON object `text`, or `None` when `text` is
+/// not an object or has no such member. A repeated key resolves to its last
+/// occurrence, as `serde_json::Value` resolves it.
+fn raw_member<'a>(text: &'a str, key: &str) -> Option<&'a serde_json::value::RawValue> {
+    let map: std::collections::HashMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(text).ok()?;
+    map.get(key).copied()
+}
+
+/// Parse the geometry for a single extract entry in a config file. `raw` is
+/// the same entry's raw JSON text, from which bbox edges are quantized.
 fn parse_extract_geometry(
     entry: &serde_json::Value,
+    raw: Option<&serde_json::value::RawValue>,
     index: usize,
     config_dir: &Path,
 ) -> Result<Region> {
@@ -580,9 +609,29 @@ fn parse_extract_geometry(
         // The config is the input here, so a bad box is invalid data, not an
         // invalid argument: a deliberate reclassification that keeps the
         // `Bbox` refusal as the cause.
-        return Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
+        let validated = Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
+            .map_err(|e| Error::invalid_data_with(format!("extract[{index}] bbox"), e))?;
+        // Each edge is then quantized from its own number token, as a `-b`
+        // edge is, rather than from the f64 it parsed to: past seven decimals
+        // the f64 can sit on the other side of a half-unit than the digits do.
+        let tokens: Vec<&serde_json::value::RawValue> = raw
+            .and_then(|raw| raw_member(raw.get(), "bbox"))
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .filter(|tokens: &Vec<_>| tokens.len() == 4)
+            .ok_or_else(|| Error::internal("extract config: raw bbox disagrees with parse"))?;
+        return validated
+            .quantized_from_tokens([
+                tokens[0].get(),
+                tokens[1].get(),
+                tokens[2].get(),
+                tokens[3].get(),
+            ])
             .map(Region::Bbox)
-            .map_err(|e| Error::invalid_data_with(format!("extract[{index}] bbox"), e));
+            .ok_or_else(|| {
+                Error::invalid_data(format!(
+                    "extract[{index}] bbox edges must be decimal numbers"
+                ))
+            });
     }
 
     if has_polygon {
@@ -800,15 +849,27 @@ fn extract_multi_to(
 // ---------------------------------------------------------------------------
 
 /// Extraction strategy determining how referential completeness is handled.
+///
+/// Every strategy starts from the nodes inside the region (for a bbox: the
+/// node's decimicrodegree coordinates within the edges, each quantized to a
+/// decimicrodegree, inclusive on all four sides) and the ways with at least
+/// one of those nodes. A relation is *matched* when it has a member node
+/// inside the region or a member way among those ways. The strategies differ
+/// in what they add; `docs/cli/commands.md` "### extract" states the rules
+/// and their relation to osmium extract's strategies of the same names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtractStrategy {
-    /// Single pass. Fast but ways may reference nodes outside the extract.
+    /// Nodes in the region, ways with a node in the region (their other
+    /// nodes are not added, so ways may reference absent nodes), matched
+    /// relations. No relation-to-relation step.
     Simple,
-    /// Two passes. All nodes of matching ways are included.
+    /// As simple, plus every node of every included way, plus every relation
+    /// that has an included relation as a member, recursively.
     CompleteWays,
-    /// Three passes. Like CompleteWays, but additionally pulls in all way
-    /// members (and their nodes) of matched multipolygon/boundary relations,
-    /// even if those ways are outside the extract region.
+    /// As complete-ways, plus, for each directly matched relation whose
+    /// first `type` tag is `multipolygon` or `boundary`, its member nodes and
+    /// member ways (wherever they lie) and every node of those ways. Nested
+    /// relations and parent relations are not completed.
     Smart,
 }
 
@@ -872,12 +933,22 @@ impl ExtractStats {
 /// every extracted coordinate, unless `--set-bounds` asks for the region's
 /// envelope - which complete_ways and smart exceed by design with the
 /// out-of-region nodes of selected ways (osmium's `--set-bounds` does the
-/// same).
+/// same). That envelope is the effective one, each edge quantized to the
+/// decimicrodegree membership uses (`BboxInt::inside_bbox`), so it names the
+/// columns actually selected and is the same whether the box came from `-b`
+/// text, a `--config` entry or a library caller's f64.
 fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header::OutputFacts {
     use crate::commands::output_header::{Bbox as HeaderBbox, OutputFacts, Ways};
+    use crate::coord_fmt::from_decimicro;
     OutputFacts {
         bbox: if set_bounds {
-            HeaderBbox::Region(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            let q = common::BboxInt::inside_bbox(bbox);
+            HeaderBbox::Region(
+                from_decimicro(q.min_lon),
+                from_decimicro(q.min_lat),
+                from_decimicro(q.max_lon),
+                from_decimicro(q.max_lat),
+            )
         } else {
             HeaderBbox::Carry
         },
@@ -1407,6 +1478,12 @@ mod tests {
             .map(|b| (b.min_lat, b.max_lat, b.min_lon, b.max_lon))
             .collect();
         let grid = RegionGrid::build(&region_bboxes).expect("fixture within budget");
+        // Membership runs against the exact box; the grid above is built on
+        // the conservative one, a superset.
+        let bbox_ints: Vec<common::BboxInt> = regions
+            .iter()
+            .map(|r| common::BboxInt::inside_bbox(r.bbox()))
+            .collect();
 
         let n = regions.len();
         let mut linear = vec![Vec::<i64>::new(); n];

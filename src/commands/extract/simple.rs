@@ -55,7 +55,7 @@ fn classify_block_simple(
     block: &PrimitiveBlock,
     phase: ClassifyPhase,
     region: &Region,
-    bbox_int: &BboxInt,
+    exact_bbox: &BboxInt,
     bbox_node_ids: &mut IdSet,
     matched_way_ids: &mut IdSet,
     matched_relation_ids: &mut IdSet,
@@ -74,12 +74,16 @@ fn classify_block_simple(
     for element in block.elements_skip_metadata() {
         match (phase, &element) {
             (ClassifyPhase::Nodes, Element::DenseNode(dn))
-                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                if region.contains_decimicro(
+                    exact_bbox,
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                ) =>
             {
                 bbox_node_ids.set(dn.id());
             }
             (ClassifyPhase::Nodes, Element::Node(n))
-                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                if region.contains_decimicro(exact_bbox, n.decimicro_lat(), n.decimicro_lon()) =>
             {
                 bbox_node_ids.set(n.id());
             }
@@ -160,6 +164,7 @@ fn extract_simple_two_pass(
     let mut matched_relation_ids = IdSet::new();
 
     let bbox_int = BboxInt::from_bbox(region.bbox());
+    let exact_bbox = BboxInt::inside_bbox(region.bbox());
     let spatial_filter = spatial_blob_filter(&bbox_int);
 
     // One sweep per element kind. A single file-order sweep deciding all
@@ -202,7 +207,7 @@ fn extract_simple_two_pass(
                 &block,
                 phase,
                 region,
-                &bbox_int,
+                &exact_bbox,
                 &mut bbox_node_ids,
                 &mut matched_way_ids,
                 &mut matched_relation_ids,
@@ -308,8 +313,9 @@ fn extract_simple_single_pass(
 
     // Build schedule once, partition by element type.
     // Tag node blobs for raw passthrough if bbox region + no clean.
+    let exact_bbox = BboxInt::inside_bbox(region.bbox());
     let passthrough_bbox = if matches!(region, Region::Bbox(_)) && !clean.any() {
-        let inside = BboxInt::inside_bbox(region.bbox());
+        let inside = &exact_bbox;
         Some(crate::BlobBbox::new(
             inside.min_lat,
             inside.max_lat,
@@ -393,7 +399,7 @@ fn extract_simple_single_pass(
         let classify_schedule = scheduled(&node_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
         let region_ref = region;
-        let bbox_int_ref = &bbox_int;
+        let exact_bbox_ref = &exact_bbox;
         let node_schedule_ref = &node_schedule;
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
@@ -421,7 +427,7 @@ fn extract_simple_single_pass(
                 // selected.
                 let matching: Vec<i64> = tuples
                     .iter()
-                    .filter(|t| region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon))
+                    .filter(|t| region_ref.contains_decimicro(exact_bbox_ref, t.lat, t.lon))
                     .map(|t| t.id)
                     .collect();
                 let verified = if node_schedule_ref[position].passthrough == Passthrough::Candidate

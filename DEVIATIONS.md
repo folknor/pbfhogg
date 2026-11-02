@@ -298,19 +298,74 @@ as an object created and deleted between the two snapshots.
 completeness, and matches what `diff` reports; see "diff: content equality vs
 version ordering" above.
 
-## extract: relation inclusion criteria differences
+## extract: per-strategy membership against osmium
 
-**osmium behavior:** In complete-ways and smart strategies, osmium applies its own
-heuristics for which relations to include and which additional nodes/ways to pull
-in for relation completeness.
+The inclusion rules themselves are stated in `docs/cli/commands.md`
+"### extract". For a bbox region they match osmium extract's
+(osmium-tool `strategy_*.cpp`) except in the two places below; everything
+else - which nodes are inside, which ways and relations are matched, the
+recursive parent relations of complete_ways and smart, smart's completion of
+direct node and way members and their way nodes - is the same element set.
 
-**pbfhogg behavior:** extract has expected differences in relation inclusion criteria
-across all three strategies. Cross-validation shows 99.99% node/way match. In smart
-mode, pbfhogg includes more way-referenced nodes while osmium includes more relations.
+**osmium behavior (simple):** A relation is written when its *first* node or
+way member is in the extract; a later member does not count. Its manual says
+"all relations referencing any nodes or ways already included", and osmium
+fixed the identical early return for ways (a way starting outside the region)
+but not for relations.
 
-**Impact:** For the vast majority of use cases the output is equivalent. Edge cases
-near extract boundaries may see slightly different relation membership. The node/way
-coverage is effectively identical.
+**pbfhogg behavior (simple):** A relation is written when *any* member node is
+in the region or any member way is in the extract, as osmium documents and as
+its complete_ways and smart strategies do.
+
+**osmium behavior (smart):** Completes relations of `type=multipolygon` only,
+unless given `-S types=...`.
+
+**pbfhogg behavior (smart):** Completes `type=multipolygon` and
+`type=boundary`, judged by the first `type` tag as osmium judges it. The output
+equals `osmium extract -s smart -S types=multipolygon,boundary`. There are no
+`-S` options: `types`, `complete-partial-relations`, `tags` and complete_ways'
+`relations=false` are not offered.
+
+**Impact:** Simple can hold relations osmium omits, each with its first node or
+way member outside the extract and a later one inside. Smart holds the member
+ways of boundary relations that reach into the region, and their nodes, which
+osmium's default omits; on a city box that is the country, state and municipal
+boundary rings around it. Measured on bygg, 2026-11-03, on the
+denmark-20260220 and germany-20260224 extracts: denmark (box
+12.4,55.6,12.7,55.8) simple 127 extra relations, smart 394 extra ways and 56307
+extra nodes; germany (Berlin box 13.0,52.3,13.8,52.7) simple 628 extra
+relations, smart 3030 extra ways and 219769 extra nodes; no other membership
+difference in any strategy, and the smart outputs byte-identical (as OPL) to
+osmium's with `types=multipolygon,boundary`.
+
+**Rationale:** The simple rule follows osmium's documented behaviour rather than
+the early return it already fixed for ways. Boundary completion is pbfhogg's
+smart contract since the strategy was added: an administrative area cut at the
+extract edge is as broken a polygon as a multipolygon is, and pbfhogg's own
+`build-geocode-index` and `export` assemble `type=boundary` relations as areas.
+
+**Cross-validation:** The equality above is for bbox regions. Polygon regions
+use pbfhogg's own point-in-polygon test (see the next section), and an edge
+token written with an exponent is quantized from its exact value, where
+libosmium truncates the mantissa after eight decimals before applying the
+exponent; `0.000000001e2` is column 1 here and 0 there.
+
+## extract: polygon membership is pbfhogg's ray cast
+
+**osmium behavior:** A polygon extract quantizes the polygon's vertices to
+decimicrodegrees, includes a node equal to any vertex, and decides the rest
+with an integer crossing test.
+
+**pbfhogg behavior:** The polygon is kept in f64 degrees and a node is tested
+with an f64 even-odd ray cast, with no vertex or edge special case; a
+FeatureCollection contributes every feature, where osmium takes the first.
+
+**Impact:** A node lying exactly on a polygon vertex or edge can be excluded
+where osmium includes it, and every way and relation that would have matched
+through it with it. Interior membership agrees.
+
+**Rationale:** Not chosen; the polygon predicate has not been brought to
+osmium's integer rule. A bbox extract is unaffected.
 
 ## extract: multi-extract config path roots
 

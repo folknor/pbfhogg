@@ -123,7 +123,9 @@ enum UnsortedPhase {
 /// - `bbox_node_ids`: nodes within the bounding box
 /// - `matched_way_ids`: ways referencing at least one bbox node
 /// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
-/// - `matched_relation_ids`: relations with matched node/way members
+/// - `matched_relation_ids`: relations with a member node in the region or a
+///   member way matched, then every relation reaching one of those through
+///   relation-type members, recursively (see [`add_parent_relations`])
 ///
 /// The `handler` controls additional per-relation processing (e.g. smart
 /// strategy collects extra way/node IDs from multipolygon/boundary relations).
@@ -141,6 +143,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut matched_way_ids = IdSet::new();
     let mut all_way_node_ids = IdSet::new();
     let mut matched_relation_ids = IdSet::new();
+    // (member relation, parent relation) for every relation-type member of
+    // every relation, matched or not: the parent closure below walks it.
+    let mut parent_edges: Vec<(i64, i64)> = Vec::new();
+    // Point membership runs against the exact box; `bbox_int` is the
+    // conservative one, for blob selection only.
+    let exact_bbox = BboxInt::inside_bbox(region.bbox());
 
     // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
@@ -186,7 +194,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     match (phase, &element) {
                         (UnsortedPhase::Nodes, Element::DenseNode(dn))
                             if region.contains_decimicro(
-                                bbox_int,
+                                &exact_bbox,
                                 dn.decimicro_lat(),
                                 dn.decimicro_lon(),
                             ) =>
@@ -195,7 +203,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         }
                         (UnsortedPhase::Nodes, Element::Node(n))
                             if region.contains_decimicro(
-                                bbox_int,
+                                &exact_bbox,
                                 n.decimicro_lat(),
                                 n.decimicro_lon(),
                             ) =>
@@ -210,17 +218,19 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                                 all_way_node_ids.set(r);
                             }
                         }
-                        (UnsortedPhase::Relations, Element::Relation(r))
-                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                        {
-                            matched_relation_ids.set(r.id());
-                            handler.handle_relation(r);
+                        (UnsortedPhase::Relations, Element::Relation(r)) => {
+                            push_parent_edges(r, &mut parent_edges);
+                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
+                                matched_relation_ids.set(r.id());
+                                handler.handle_relation(r);
+                            }
                         }
                         _ => {}
                     }
                 }
             }
         }
+        add_parent_relations(&mut matched_relation_ids, parent_edges, host);
         return Ok(Pass1Result {
             bbox_node_ids,
             matched_way_ids,
@@ -337,10 +347,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     host.invocation.marker("PASS1_NODE_CLASSIFY_START");
     let use_columnar = matches!(region, Region::Bbox(_));
     // The columnar classifier decides point membership, not blob candidacy,
-    // so it must run against the exact box. `bbox_int` is deliberately
-    // widened and would admit nodes up to one decimicrodegree outside the
-    // requested bbox - the same defect fixed in the multi-extract classifier.
-    let exact_bbox = BboxInt::inside_bbox(region.bbox());
+    // so it runs against the exact box (`exact_bbox`). `bbox_int` is
+    // deliberately widened and would admit nodes up to one decimicrodegree
+    // outside the requested bbox.
+    let exact_bbox = &exact_bbox;
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &node_schedule,
@@ -362,12 +372,23 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     exact_bbox.max_lon,
                     ids,
                 );
+                // Dense columns deliberately exclude plain Node messages, so
+                // they are classified here; without this a plain node in the
+                // region, and every way and relation it would have matched,
+                // was missing from a sorted bbox extract.
+                for group in block.groups() {
+                    for node in group.nodes() {
+                        if exact_bbox.contains(node.decimicro_lat(), node.decimicro_lon()) {
+                            ids.push(node.id());
+                        }
+                    }
+                }
             } else {
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn)
                             if region.contains_decimicro(
-                                bbox_int,
+                                exact_bbox,
                                 dn.decimicro_lat(),
                                 dn.decimicro_lon(),
                             ) =>
@@ -376,7 +397,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         }
                         Element::Node(n)
                             if region.contains_decimicro(
-                                bbox_int,
+                                exact_bbox,
                                 n.decimicro_lat(),
                                 n.decimicro_lon(),
                             ) =>
@@ -450,12 +471,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         &shared_file,
         &relation_schedule,
         None,
-        || (IdSet::new(), IdSet::new(), IdSet::new()),
-        |block, (rel_ids, extra_way_ids, extra_node_ids)| {
+        || (IdSet::new(), IdSet::new(), IdSet::new(), Vec::new()),
+        |block, (rel_ids, extra_way_ids, extra_node_ids, edges)| {
             for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element
-                    && relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids)
-                {
+                let Element::Relation(r) = &element else {
+                    continue;
+                };
+                push_parent_edges(r, edges);
+                if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
                     rel_ids.set(r.id());
                     if collect_member_ids && is_smart_relation(r) {
                         for m in r.members() {
@@ -470,13 +493,17 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             }
             Ok(())
         },
-        |(worker_rel_ids, worker_extra_way_ids, worker_extra_node_ids)| {
+        |(worker_rel_ids, worker_extra_way_ids, worker_extra_node_ids, worker_edges)| {
             matched_relation_ids.merge(worker_rel_ids);
             handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
+            parent_edges.extend(worker_edges);
         },
         host,
     )?;
     host.invocation.marker("PASS1_RELATION_CLASSIFY_END");
+    host.invocation.marker("PASS1_RELATION_PARENTS_START");
+    add_parent_relations(&mut matched_relation_ids, parent_edges, host);
+    host.invocation.marker("PASS1_RELATION_PARENTS_END");
 
     Ok(Pass1Result {
         bbox_node_ids,
@@ -800,11 +827,77 @@ fn extract_block_pass3(
 // Relation type check
 // ---------------------------------------------------------------------------
 
-/// Returns true if the relation has a `type=multipolygon` or `type=boundary` tag.
+/// Returns true if the relation's `type` tag is `multipolygon` or `boundary`.
 ///
-/// These are the relation types whose way members should be fully included
-/// in the smart extraction strategy, along with all nodes those ways reference.
+/// These are the relation types whose direct node and way members the smart
+/// strategy pulls in, with every node of those ways. The first `type` key
+/// decides, as osmium's `tags()["type"]` does, so a relation carrying the
+/// key twice is judged by the same value under both tools.
+///
+/// osmium smart completes `multipolygon` alone unless given
+/// `-S types=multipolygon,boundary`. pbfhogg completes boundaries too, a
+/// recorded deviation (DEVIATIONS.md, "extract: smart completes boundary
+/// relations"): an administrative area cut at the extract edge is as broken
+/// a polygon as a multipolygon is, and `build-geocode-index` and `export`
+/// both assemble `type=boundary` relations as areas.
 fn is_smart_relation(r: &crate::Relation) -> bool {
     r.tags()
-        .any(|(k, v)| k == "type" && (v == "multipolygon" || v == "boundary"))
+        .find(|&(k, _)| k == "type")
+        .is_some_and(|(_, v)| v == "multipolygon" || v == "boundary")
+}
+
+/// Record a `(member, parent)` edge for every relation-type member of `r`.
+///
+/// Every relation contributes, matched or not: whether a parent is in the
+/// extract depends on its members' membership, which is only known once
+/// every relation blob has been classified.
+fn push_parent_edges(r: &crate::Relation, edges: &mut Vec<(i64, i64)>) {
+    let parent = r.id();
+    for m in r.members() {
+        if let MemberId::Relation(child) = m.id {
+            edges.push((child, parent));
+        }
+    }
+}
+
+/// Add every relation that has an already-included relation as a member,
+/// recursively to any depth: osmium extract's complete_ways and smart rule
+/// (`add_relation_parents`). A parent included this way pulls in nothing
+/// else - not its other members, and under smart it is not completed even
+/// when it is a multipolygon or boundary - exactly as in osmium.
+///
+/// A worklist seeded with every directly matched relation, over the edges
+/// sorted by member, so each relation is expanded once whatever the depth;
+/// cycles and self-membership end because a relation is only pushed when it
+/// is newly added.
+fn add_parent_relations(
+    included: &mut IdSet,
+    mut edges: Vec<(i64, i64)>,
+    host: &crate::host::Entered<'_>,
+) {
+    host.invocation
+        .counter("extract_relation_parent_edges", edges.len());
+    if edges.is_empty() {
+        host.invocation
+            .counter("extract_relations_from_parents", 0_u64);
+        return;
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut work: Vec<i64> = included.iter().collect();
+    let mut added: u64 = 0;
+    while let Some(child) = work.pop() {
+        let start = edges.partition_point(|&(c, _)| c < child);
+        for &(c, parent) in &edges[start..] {
+            if c != child {
+                break;
+            }
+            if included.set_if_new(parent) {
+                added += 1;
+                work.push(parent);
+            }
+        }
+    }
+    host.invocation
+        .counter("extract_relations_from_parents", added);
 }

@@ -92,37 +92,51 @@ pub(super) type CoordSlot = Arc<Mutex<FxHashMap<i64, (i32, i32)>>>;
 /// `Arc<loc_map>`, and signals the scanner.
 pub(super) type CoordSlots = Vec<CoordSlot>;
 
-/// Streaming pool configuration. Channels are passed separately so this
-/// struct can be `Clone` cheaply across worker startup.
+/// The worker pool's share of `--locations-on-ways`. Built with the
+/// scanner's and the drain's shares by `rewrite::wire_locations`, so either
+/// all of it is there or the mode is off.
+pub(super) struct WorkerLocations {
+    /// One slot per worker, sized to the pool's `worker_count`. Each worker
+    /// writes into `coord_slots[worker_id]`; the drain holds clones of every
+    /// slot and merges them at the node→way barrier.
+    pub coord_slots: CoordSlots,
+    /// Drain → workers post-barrier `loc_map`. Workers reading way/relation
+    /// blobs check `get()` on this; the scanner barrier protocol guarantees
+    /// the lock is set before any way descriptor is dispatched.
+    pub loc_map: LocMapHandle,
+    /// Node IDs the workers extract coordinates for: `extract_node_coords`
+    /// output is filtered against it so a worker's map does not grow with
+    /// every coordinate in the file.
+    pub needed: Arc<FxHashSet<i64>>,
+    /// The OSC's node upserts and deletes, for refreshing surviving base
+    /// ways' inline coordinates (`refresh.rs`). Empty when the OSC changes
+    /// no node; whether the mode is on is this payload's presence, never the
+    /// probe's emptiness.
+    pub probe: Arc<StaleProbe>,
+}
+
+/// One worker's view of [`WorkerLocations`]: its own coordinate slot and the
+/// shared resources.
+#[derive(Clone, Copy)]
+struct WorkerLoc<'a> {
+    slot: &'a CoordSlot,
+    loc_map: &'a LocMapHandle,
+    needed: &'a FxHashSet<i64>,
+    probe: &'a StaleProbe,
+}
+
+/// Streaming pool configuration. Channels are passed separately
+/// ([`StreamingChannels`]).
 pub(super) struct StreamingConfig {
     /// The run's pinned base; the pool opens one description of it.
     pub base: crate::read::input::PinnedInput,
     pub diff: Arc<SortedDiff>,
-    /// Number of worker threads. Should be `nproc - 2` (one each for the
-    /// scanner and drain).
+    /// Number of worker threads (`MergeOptions::parallelism`, one included).
     pub worker_count: usize,
-    /// `--locations-on-ways` mode. Workers extract node coords during
-    /// the node phase only if true.
-    pub locations_on_ways: bool,
-    /// Sized to `worker_count`. Each worker writes into `slots[worker_id]`;
-    /// the drain merges all slots at the node→way barrier. `None` when
-    /// `locations_on_ways` is false.
-    pub coord_slots: Option<CoordSlots>,
-    /// Drain → workers post-barrier `loc_map`. `None` when
-    /// `locations_on_ways` is false. Workers reading way/relation
-    /// blobs check `get()` on this; the scanner barrier protocol
-    /// guarantees the lock is set before any way descriptor is
-    /// dispatched.
-    pub loc_map_handle: Option<LocMapHandle>,
-    /// Set of node IDs the workers need to extract coords for. Workers
-    /// filter `extract_node_coords` output against this so we don't
-    /// blow per-worker RSS by capturing every coord in the file.
-    /// `None` when `locations_on_ways` is false.
-    pub needed_set: Option<Arc<FxHashSet<i64>>>,
-    /// The OSC's node upserts and deletes, for refreshing surviving base
-    /// ways' inline coordinates (`refresh.rs`). Empty without
-    /// `--locations-on-ways`.
-    pub probe: Arc<StaleProbe>,
+    /// `Some` under `--locations-on-ways`: workers extract node coordinates
+    /// in the node phase, search way blobs for stale inline coordinates and
+    /// write ways with locations once the map is published.
+    pub locations: Option<WorkerLocations>,
     /// Output compression. Workers frame each rewrite output via
     /// `frame_blob_pipelined` so the drain side avoids the writer's
     /// `rayon::spawn`-per-block dispatch (P1.5).
@@ -240,11 +254,7 @@ pub(super) fn run_workers(
         base,
         diff,
         worker_count,
-        locations_on_ways,
-        coord_slots,
-        loc_map_handle,
-        needed_set,
-        probe,
+        locations,
         compression,
         route,
         failure,
@@ -256,15 +266,17 @@ pub(super) fn run_workers(
     } = channels;
 
     // Setup failures publish while `drain_tx` is still bound here; it is
-    // dropped by the return that follows.
-    if locations_on_ways {
-        let slots_len = coord_slots.as_ref().map_or(0, Vec::len);
-        if slots_len != worker_count {
-            failure.publish(Error::internal(format!(
-                "streaming: locations_on_ways requires coord_slots.len()={worker_count}, got {slots_len}",
-            )));
-            return;
-        }
+    // dropped by the return that follows. The slots are built for this pool
+    // by `rewrite::wire_locations`, so a mismatch is a broken wiring, refused
+    // before any worker indexes its slot.
+    if let Some(loc) = locations.as_ref()
+        && loc.coord_slots.len() != worker_count
+    {
+        failure.publish(Error::internal(format!(
+            "streaming: {worker_count} workers but {} coordinate slots",
+            loc.coord_slots.len()
+        )));
+        return;
     }
 
     cancel.marker("MERGE_STREAMING_START");
@@ -296,15 +308,17 @@ pub(super) fn run_workers(
     std::thread::scope(|scope| {
         for worker_id in 0..worker_count {
             let drain_tx = drain_tx.clone();
-            let coord_slot = coord_slots.as_ref().map(|s| Arc::clone(&s[worker_id]));
-            let loc_map_handle = loc_map_handle.as_ref().map(Arc::clone);
-            let needed_set = needed_set.as_ref().map(Arc::clone);
+            let loc = locations.as_ref().map(|l| WorkerLoc {
+                slot: &l.coord_slots[worker_id],
+                loc_map: &l.loc_map,
+                needed: &l.needed,
+                probe: &l.probe,
+            });
             let file = &shared_file;
             let source = &source;
             let candidate_rx = &candidate_rx;
             let failure = &*failure;
             let diff = &*diff;
-            let probe = &*probe;
             let cancel = &cancel;
 
             scope.spawn(move || {
@@ -317,11 +331,7 @@ pub(super) fn run_workers(
                         &drain_tx,
                         counters,
                         diff,
-                        locations_on_ways,
-                        coord_slot.as_ref(),
-                        loc_map_handle.as_ref(),
-                        needed_set.as_deref(),
-                        probe,
+                        loc,
                         &compression,
                         route,
                         cancel,
@@ -368,11 +378,7 @@ fn worker_loop(
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     diff: &SortedDiff,
-    locations_on_ways: bool,
-    coord_slot: Option<&CoordSlot>,
-    loc_map_handle: Option<&LocMapHandle>,
-    needed_set: Option<&FxHashSet<i64>>,
-    probe: &StaleProbe,
+    loc: Option<WorkerLoc<'_>>,
     compression: &Compression,
     route: Route<()>,
     cancel: &crate::host::Recorder,
@@ -386,10 +392,14 @@ fn worker_loop(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut builder = WorkerBuilder::new(BlockBuilder::new());
+    // What a rewrite consults for stale inline coordinates when the mode is
+    // off: nothing. It is read only under `LocMode::Required`, so it never
+    // stands in for the mode itself.
+    let no_probe = StaleProbe::empty();
 
     // Per-worker coord accumulator: gathered locally then flushed to the
-    // shared slot in batches to amortise the mutex acquire. Empty when
-    // `locations_on_ways` is false.
+    // shared slot in batches to amortise the mutex acquire. Empty without
+    // `--locations-on-ways`.
     let mut local_coords: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
     let mut node_groups_scratch: Vec<(usize, usize)> = Vec::new();
     let mut refresh_scratch = RefreshScratch::default();
@@ -437,14 +447,11 @@ fn worker_loop(
                     &mut decompress_buf,
                     &mut st_scratch,
                     &mut gr_scratch,
-                    locations_on_ways,
+                    loc,
+                    &no_probe,
                     &mut local_coords,
                     &mut node_groups_scratch,
                     &mut refresh_scratch,
-                    coord_slot,
-                    loc_map_handle,
-                    needed_set,
-                    probe,
                     compression,
                     route,
                     &cancel.metrics().writer,
@@ -476,8 +483,8 @@ fn worker_loop(
     // run rather than silently losing coordinates. (A late node on a base
     // that lies about its order flushes into a slot after the merge; the
     // drain's order guard refuses it, so those coordinates are never
-    // needed.)
-    if locations_on_ways && !local_coords.is_empty() {
+    // needed.) Only the mode fills `local_coords`.
+    if !local_coords.is_empty() {
         return Err(Error::internal(format!(
             "streaming: {} node coordinates were extracted but never flushed \
              before the coordinate map was published",
@@ -508,14 +515,11 @@ fn handle_candidate(
     decompress_buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
-    locations_on_ways: bool,
+    loc: Option<WorkerLoc<'_>>,
+    no_probe: &StaleProbe,
     local_coords: &mut FxHashMap<i64, (i32, i32)>,
     node_groups_scratch: &mut Vec<(usize, usize)>,
     refresh_scratch: &mut RefreshScratch,
-    coord_slot: Option<&CoordSlot>,
-    loc_map_handle: Option<&LocMapHandle>,
-    needed_set: Option<&FxHashSet<i64>>,
-    probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
     metrics: &crate::write::metrics::WriterMetrics,
@@ -529,7 +533,10 @@ fn handle_candidate(
     // been passed through untouched: it is decompressed and searched for a
     // stale way without a full parse, and passed through as before when it
     // holds none (see `refresh::detect_stale_wire`).
-    let refresh_scan = locations_on_ways
+    // The probe a rewrite consults: the OSC's nodes under the mode, the empty
+    // one otherwise (read only under `LocMode::Required`).
+    let probe = loc.map_or(no_probe, |l| l.probe);
+    let refresh_scan = loc.is_some()
         && probe.has_upserts()
         && desc.kind == ElementKind::Way
         && desc.index.is_some()
@@ -613,7 +620,10 @@ fn handle_candidate(
         None
     };
 
-    if locations_on_ways && desc.kind == ElementKind::Node {
+    if let Some(loc) = loc
+        && desc.kind == ElementKind::Node
+    {
+        let needed = loc.needed;
         let t_extract = crate::counters::Stopwatch::start();
         let mut hits = 0u64;
         // Every node is decoded and validated; only the ones an OSC way
@@ -633,10 +643,10 @@ fn handle_candidate(
         // past a limit is accepted at the limit (`check --locations`
         // judges the exact value and reports it). OSC node coordinates
         // are domain-checked at OSC parse and replace base ones in the
-        // drain; `needed_set` holds no OSC-upserted node.
+        // drain; `needed` holds no OSC-upserted node.
         let mut out_of_domain: Option<(i64, i32, i32)> = None;
         extract_node_coords(decompress_buf, node_groups_scratch, |id, lat, lon| {
-            if needed_set.is_some_and(|ns| !ns.contains(&id)) {
+            if !needed.contains(&id) {
                 return;
             }
             if !crate::coord_pack::in_domain(lat, lon) {
@@ -713,10 +723,10 @@ fn handle_candidate(
     // whose output has been processed - the `local_coords` map is
     // private and the drain reads only the shared `CoordSlot`s. For
     // non-Node blobs `local_coords` is empty so this is a no-op.
-    if let Some(slot) = coord_slot
+    if let Some(loc) = loc
         && !local_coords.is_empty()
     {
-        flush_local_coords(slot, local_coords);
+        flush_local_coords(loc.slot, local_coords);
     }
 
     // On the --force path the scanner fills `desc` with a placeholder
@@ -775,7 +785,7 @@ fn handle_candidate(
         && inline_upserts.is_empty()
         && !must_reencode
         && !refresh_only
-        && locations_on_ways
+        && loc.is_some()
         && probe.has_upserts()
         && effective_kind == ElementKind::Way
     {
@@ -843,12 +853,11 @@ fn handle_candidate(
     // they see `LocMode::Pending`, under which writing a way is an error:
     // a way in a blob routed as nodes must never be written stripped of
     // its coordinates under a LocationsOnWays header.
-    let loc_arc = if locations_on_ways {
-        loc_map_handle.and_then(|h| h.get().cloned())
-    } else {
-        None
+    let loc_arc = loc.and_then(|l| l.loc_map.get().cloned());
+    let loc_mode = match loc {
+        None => LocMode::Off,
+        Some(_) => LocMode::on(loc_arc.as_deref()),
     };
-    let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = crate::counters::Stopwatch::start();
     // P1.5: the rewrite frames each output block in-line, on this worker,
@@ -865,7 +874,7 @@ fn handle_candidate(
         builder.task()?,
         inline_upserts,
         effective_kind,
-        loc,
+        loc_mode,
         probe,
         refresh_scratch,
         claim.as_ref(),

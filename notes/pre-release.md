@@ -482,19 +482,18 @@ or advise only when the run's decode path can produce a block, and say
 "the block cap" in the table). On the header-only passthrough no block is
 encoded, so the advice can only be wrong there.
 
-### WRK-141: apply-changes stage configs carry LocationsOnWays resources as loose Options
+### WRK-146: ADR-0005 still defaults broken internal invariants to debug_assert
 
-`MergeOptions` now takes `Option<LocationsOnWays>`, but `merge_to` turns it
-back into `locations_on_ways` and `ignore_missing_nodes` bools for the
-stages. `ScannerConfig` (`refresh_ways`, the barrier receiver, the boundary
-sender), `StreamingConfig` (`coord_slots`, `loc_map_handle`, `needed_set`,
-`probe`) and `DrainConfig` (`coord_slots`, `seeded_locations`, `barrier_tx`,
-`loc_map_out`, `loc_nodes_needed`, `ignore_missing_nodes`) each carry the
-mode's resources as separate Options beside the bool, so partly configured
-states are representable and surface as `Error::internal` ("locations_on_ways
-true but coord_slots is None"). Each stage's resources belong in one
-locations payload. Internal; on a measured path, so planet apply-changes -l
-walls before and after.
+`decisions/0005-latent-invariant-debug-asserts.md` (Accepted) makes
+`debug_assert!` plus a comment the default disposition for a latent
+internal invariant and rejects runtime enforcement for its per-blob cost.
+The maintainer's standing line in this file ("What the maintainer has made
+clear") is the opposite: for a broken internal invariant, a release-mode
+panic over a `debug_assert!`. The ADR is the durable record a reader will
+trust, and nothing amends or supersedes it. Needs the maintainer's ruling
+on how the two reconcile (for example: release-mode checks wherever the
+check is off the per-element path, `debug_assert!` only where it would
+cost per element), then an amended or superseding ADR.
 
 ### WRK-037: ParallelGzipWriter window size
 

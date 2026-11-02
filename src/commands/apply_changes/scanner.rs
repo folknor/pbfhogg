@@ -64,34 +64,40 @@ pub(super) struct ScannerChannels {
     pub route: Route<mpsc::SyncSender<DrainMessage>>,
 }
 
+/// The scanner's share of `--locations-on-ways`: the node→way barrier's two
+/// channel ends and the refresh routing rule. Built with the workers' and the
+/// drain's shares by `rewrite::wire_locations`, so either all of it is there
+/// or the mode is off.
+pub(super) struct ScannerLocations {
+    /// The OSC creates or modifies a node, so any way may hold a stale
+    /// inline coordinate: every indexed way blob goes to the workers to be
+    /// searched (`refresh.rs`), not only those whose range meets the diff.
+    pub refresh_ways: bool,
+    /// Drain → scanner signal. The drain sends one unit value after it has
+    /// processed the last node blob and published the merged `Arc<loc_map>`,
+    /// and keeps its sender until it returns, so a closed channel means the
+    /// drain has failed.
+    pub barrier_rx: mpsc::Receiver<()>,
+    /// The scanner's own sender on the drain channel, for its one
+    /// [`DrainMessage::NodeBoundary`], on both routes. Sent at the first
+    /// non-node descriptor or at EOF, so the drain knows when to merge
+    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way item to
+    /// trigger the transition. Owned by the scanner and dropped with it, so
+    /// it never keeps the drain channel open past the scanner's exit.
+    pub boundary_tx: mpsc::SyncSender<DrainMessage>,
+}
+
 /// Scanner configuration + I/O channels.
 pub(super) struct ScannerConfig<'a> {
     /// The run's pinned base; the walker opens its own description of it.
     pub base: &'a PinnedInput,
     pub diff: &'a SortedDiff,
-    /// True when `--locations-on-ways` is active. Enables the node→way
-    /// barrier: at the first way or relation descriptor the scanner waits
-    /// on `barrier_rx` for the drain's signal that `Arc<loc_map>` is
+    /// `Some` under `--locations-on-ways`, which enables the node→way
+    /// barrier: at the first way or relation descriptor the scanner sends its
+    /// node boundary, waits for the drain's signal that `Arc<loc_map>` is
     /// published, then dispatches it and every later descriptor.
-    pub locations_on_ways: bool,
-    /// Under `--locations-on-ways`, the OSC creates or modifies a node, so
-    /// any way may hold a stale inline coordinate: every indexed way
-    /// blob goes to the workers to be searched (`refresh.rs`), not only those
-    /// whose range meets the diff.
-    pub refresh_ways: bool,
+    pub locations: Option<ScannerLocations>,
     pub channels: ScannerChannels,
-    /// Drain → scanner signal. Present when `locations_on_ways` is true.
-    /// Drain sends one unit value after it has processed the last node
-    /// blob and published the merged `Arc<loc_map>`.
-    pub barrier_rx: Option<mpsc::Receiver<()>>,
-    /// The scanner's own sender on the drain channel, for its one
-    /// [`DrainMessage::NodeBoundary`], on both routes. Sent at the first
-    /// non-node descriptor or at EOF, so the drain knows when to merge
-    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way item to
-    /// trigger the transition. Present when `locations_on_ways` is true, and
-    /// dropped with the scanner, so it never keeps the drain channel open
-    /// past the scanner's exit.
-    pub boundary_tx: Option<mpsc::SyncSender<DrainMessage>>,
     /// One token per seq, taken before dispatch and returned by the drain
     /// once it has processed that seq (`window.rs`).
     pub window: WindowAdmit,
@@ -111,13 +117,11 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     let ScannerConfig {
         base,
         diff,
-        locations_on_ways,
-        refresh_ways,
+        locations,
         channels,
-        barrier_rx,
-        boundary_tx,
         mut window,
     } = cfg;
+    let refresh_ways = locations.as_ref().is_some_and(|l| l.refresh_ways);
     // The fast-path sender, present exactly on the splice route. Borrowed by
     // each `ScannerEmit::Drain` so an item can only be built where there is a
     // drain channel to send it on.
@@ -150,7 +154,6 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     // which the node boundary sent to the drain at the node→way transition
     // (or at EOF if no way blobs exist) is derived.
     let mut last_node_seq: Option<u64> = None;
-    let mut boundary_sent = false;
 
     loop {
         // Test-only: once the barrier has released the walk, hold here
@@ -244,7 +247,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         // each one and pass it through unchanged unless a way in it is stale
         // (`refresh.rs`). Like the node rule, this rests on the kind claim; a
         // way blob labelled otherwise is not searched.
-        let low_must_decompress = (locations_on_ways && matches!(kind, ElementKind::Node))
+        let low_must_decompress = (locations.is_some() && matches!(kind, ElementKind::Node))
             || (refresh_ways && matches!(kind, ElementKind::Way));
         let item = if let Some(drain_tx) = splice_tx
             && has_indexdata
@@ -294,15 +297,12 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         // descriptor are then dispatched directly. Every node descriptor
         // before it is already dispatched, which is all the drain needs to
         // reach the barrier.
-        if let Some(rx) = barrier_rx.as_ref()
+        if let Some(loc) = locations.as_ref()
             && !barrier_signalled
             && matches!(kind, ElementKind::Way | ElementKind::Relation)
         {
-            if let Some(tx) = boundary_tx.as_ref() {
-                send_boundary(tx, last_node_seq, host)?;
-                boundary_sent = true;
-            }
-            wait_for_barrier(rx, false, host)?;
+            send_boundary(&loc.boundary_tx, last_node_seq, host)?;
+            wait_for_barrier(&loc.barrier_rx, false, host)?;
             barrier_signalled = true;
             #[cfg(feature = "test-hooks")]
             {
@@ -349,12 +349,12 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
 
         // Having just dispatched, peek at the barrier channel without
         // blocking: a drain that has already failed has closed it.
-        if let Some(rx) = barrier_rx.as_ref() {
+        if let Some(loc) = locations.as_ref() {
             // Test-only: hold this poll until the drain has returned, so it
             // provably finds the channel closed.
             #[cfg(feature = "test-hooks")]
             host.invocation.faults().before_apply_changes_poll(seq - 1);
-            poll_barrier(rx, barrier_signalled, host)?;
+            poll_barrier(&loc.barrier_rx, barrier_signalled, host)?;
         }
     }
 
@@ -372,14 +372,14 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     // The boundary travels on the drain channel, so the drain sees it even
     // when it has already processed every node item, and publishes on that
     // receive; that is what unblocks this wait.
-    if locations_on_ways
-        && !boundary_sent
-        && let Some(tx) = boundary_tx.as_ref()
+    //
+    // An unsignalled barrier here means the boundary was never sent: the
+    // in-loop wait sends it and either takes the signal or returns an error.
+    if let Some(loc) = locations.as_ref()
+        && !barrier_signalled
     {
-        send_boundary(tx, last_node_seq, host)?;
-    }
-    if !barrier_signalled && let Some(rx) = barrier_rx.as_ref() {
-        wait_for_barrier(rx, true, host)?;
+        send_boundary(&loc.boundary_tx, last_node_seq, host)?;
+        wait_for_barrier(&loc.barrier_rx, true, host)?;
     }
 
     host.invocation.marker("MERGE_SCANNER_END");

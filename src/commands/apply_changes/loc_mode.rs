@@ -32,13 +32,11 @@ pub(super) enum LocMode<'a> {
 }
 
 impl<'a> LocMode<'a> {
-    /// Derive the mode from the run flag and whatever map is published.
-    pub(super) fn new(locations_on_ways: bool, map: Option<&'a LocMap>) -> Self {
-        match (locations_on_ways, map) {
-            (false, _) => Self::Off,
-            (true, Some(map)) => Self::Required(map),
-            (true, None) => Self::Pending,
-        }
+    /// The mode of a run with `--locations-on-ways` on: whatever map the
+    /// barrier has published, or `Pending` before it. A run with the mode off
+    /// is plain [`LocMode::Off`].
+    pub(super) fn on(map: Option<&'a LocMap>) -> Self {
+        map.map_or(Self::Pending, Self::Required)
     }
 
     /// Gate one way write. `Ok(None)` means write it refs-only,

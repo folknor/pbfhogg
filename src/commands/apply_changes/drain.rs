@@ -60,8 +60,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use rustc_hash::FxHashMap;
-
 use crate::ElementKind;
 use crate::commands::flush_passthrough_buf;
 use crate::error::{Error, Result};
@@ -71,7 +69,7 @@ use crate::writer::PbfWriter;
 
 use super::descriptor::{DrainItem, DrainMessage, Route};
 use super::failure::FailureSlot;
-use super::loc_mode::LocMode;
+use super::loc_mode::{LocMap, LocMode};
 use super::stats::MergeStats;
 use super::stream_output::{
     CreateEncoder, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
@@ -83,16 +81,75 @@ use super::window::WindowReturn;
 /// Drain → workers post-barrier `loc_map` handle. The drain calls
 /// `set` exactly once at the node→way barrier; way-phase workers read
 /// the published `Arc<FxHashMap>` to resolve OSC way refs.
-pub(super) type LocMapHandle = Arc<OnceLock<Arc<FxHashMap<i64, (i32, i32)>>>>;
+pub(super) type LocMapHandle = Arc<OnceLock<Arc<LocMap>>>;
 
-/// OSC-pre-seeded coords surrendered to the drain at setup time.
-/// Wrapped in a `Mutex<Option<...>>` so the drain can take ownership at
-/// the barrier through an immutable `&DrainConfig` borrow.
-pub(super) type SeededLocations = std::sync::Mutex<Option<FxHashMap<i64, (i32, i32)>>>;
+/// The drain's share of `--locations-on-ways`, everything the node→way
+/// barrier consumes. Built with the scanner's and the workers' shares by
+/// `rewrite::wire_locations`, so either all of it is there or the mode is
+/// off. [`DrainLocations::publish`] consumes it at the barrier.
+pub(super) struct DrainLocations {
+    /// Clones of every worker's coordinate slot, merged at the barrier.
+    pub coord_slots: CoordSlots,
+    /// OSC-pre-seeded coords (`NodeLocationIndex::build_from_diff`), the
+    /// seed the worker slots are merged into.
+    pub seeded: LocMap,
+    /// Drain → scanner barrier signal: one unit value after the map is
+    /// published. Kept until the drain returns (see [`PublishedLocations`]).
+    pub barrier_tx: mpsc::SyncSender<()>,
+    /// Where the merged map is published for way-phase workers.
+    pub loc_map_out: LocMapHandle,
+    /// The distinct node IDs the OSC's ways reference
+    /// (`NodeLocationIndex::total_referenced`). The merged map at the barrier
+    /// holds only such IDs, so its size against this is the run's unresolved
+    /// count, final at the barrier: nothing resolves later.
+    pub nodes_needed: u64,
+    /// Publish a map with unresolved references (they are written as
+    /// `(0, 0)`) instead of refusing at the barrier.
+    pub ignore_missing_nodes: bool,
+}
+
+/// What survives the barrier: the published map, for the drain's own create
+/// runs, and the barrier sender. The sender is held until the drain returns
+/// because the scanner's poll after each dispatch reads a closed barrier
+/// channel as a failed drain; dropping it at publication would fail every
+/// run.
+struct PublishedLocations {
+    map: Arc<LocMap>,
+    _barrier_tx: mpsc::SyncSender<()>,
+}
+
+/// The drain's `--locations-on-ways` state; absent when the mode is off.
+enum DrainLoc {
+    /// Before the barrier: node items only, ways would be written `Pending`.
+    Pending(DrainLocations),
+    Published(PublishedLocations),
+}
+
+impl DrainLoc {
+    /// The published map, if the barrier has run.
+    fn published_map(&self) -> Option<Arc<LocMap>> {
+        match self {
+            Self::Pending(_) => None,
+            Self::Published(p) => Some(Arc::clone(&p.map)),
+        }
+    }
+}
+
+/// How the drain writes ways in `loc`'s state. A free function over the one
+/// field so callers can hold it beside `&mut` borrows of the others.
+fn loc_mode(loc: Option<&DrainLoc>) -> LocMode<'_> {
+    match loc {
+        None => LocMode::Off,
+        Some(DrainLoc::Pending(_)) => LocMode::Pending,
+        Some(DrainLoc::Published(p)) => LocMode::Required(&p.map),
+    }
+}
 
 /// Drain configuration. The writer is passed separately to `run_drain`
 /// (it needs `&mut`, which doesn't compose with the immutable borrows
-/// of the rest of the config in the inner item-processing functions).
+/// of the rest of the config in the inner item-processing functions), and so
+/// is the `--locations-on-ways` payload, which the drain moves into its own
+/// state and consumes at the barrier.
 pub(super) struct DrainConfig<'a> {
     pub diff: &'a SortedDiff,
     /// Where create runs longer than one block are encoded and framed (the
@@ -111,36 +168,6 @@ pub(super) struct DrainConfig<'a> {
     /// to be owned for that long rather than merely happening to still be
     /// open.
     pub route: Route<crate::read::input::InputFile>,
-    /// `--locations-on-ways` mode is on. Drain merges `CoordSlots` at
-    /// the node→way barrier and signals the scanner.
-    pub locations_on_ways: bool,
-    /// Per-worker coord slots. Drain acquires every mutex at the
-    /// node→way barrier and merges into `loc_map_out`. `None` when
-    /// `locations_on_ways == false`.
-    pub coord_slots: Option<CoordSlots>,
-    /// OSC-pre-seeded coords (from `NodeLocationIndex::build_from_diff`).
-    /// Consumed at the barrier merge: drain extends this with every
-    /// worker slot before publishing the merged map. Wrapped in a
-    /// `Mutex<Option<...>>` so the drain can take ownership at the
-    /// barrier even though `cfg` is borrowed immutably elsewhere.
-    /// `None` when `locations_on_ways == false`.
-    pub seeded_locations: Option<SeededLocations>,
-    /// Drain → scanner barrier signal. Drain sends a single unit value
-    /// after merging coord slots and publishing `loc_map_out`.
-    /// `None` when `locations_on_ways == false`.
-    pub barrier_tx: Option<mpsc::SyncSender<()>>,
-    /// Published `Arc<loc_map>` for way-phase workers to read after the
-    /// barrier. Drain calls `set` once with the merged map. `None` when
-    /// `locations_on_ways == false`.
-    pub loc_map_out: Option<LocMapHandle>,
-    /// Under `--locations-on-ways`, the distinct node IDs the OSC's ways
-    /// reference (`NodeLocationIndex::total_referenced`). The merged map at
-    /// the barrier holds only such IDs, so its size against this is the
-    /// run's unresolved count, final at the barrier: nothing resolves later.
-    pub loc_nodes_needed: u64,
-    /// Publish a map with unresolved references (they are written as
-    /// `(0, 0)`) instead of refusing at the barrier.
-    pub ignore_missing_nodes: bool,
     /// First producer failure (scanner or worker pool, errors and caught
     /// panics alike). Polled every loop iteration and once
     /// after the drain channel disconnects; a published failure is
@@ -199,6 +226,7 @@ crate::counters::counter_set! {
 
 /// Run the drain to completion. Returns accumulated `MergeStats`.
 /// Called by `rewrite::merge`, which owns the mutable output writer.
+/// `locations` is `Some` under `--locations-on-ways`.
 ///
 /// Exits when `drain_rx` disconnects AND the reorder buffer is empty.
 /// If the channel closes with a seq gap, returns an error rather than
@@ -212,6 +240,7 @@ crate::counters::counter_set! {
 pub(super) fn run_drain(
     cfg: DrainConfig<'_>,
     channels: DrainChannels,
+    locations: Option<DrainLocations>,
     writer: &mut PbfWriter<FileWriter>,
     counters: &DrainCounters,
 ) -> Result<MergeStats> {
@@ -219,7 +248,10 @@ pub(super) fn run_drain(
 
     let DrainChannels { drain_rx, window } = channels;
 
-    let mut state = DrainState::new(CreateEncoder::new(cfg.create_executor, cfg.compression));
+    let mut state = DrainState::new(
+        CreateEncoder::new(cfg.create_executor, cfg.compression),
+        locations.map(DrainLoc::Pending),
+    );
     let mut stats = MergeStats::new();
     // The scanner's node boundary under `--locations-on-ways`, once
     // received: the exclusive end of the node seqs.
@@ -352,11 +384,17 @@ pub(super) fn run_drain(
         // boundary arrives after the drain has already processed every node
         // item, this check publishes on that receive, which is the case the
         // old separate boundary channel needed an idle re-poll for.
-        if cfg.locations_on_ways
-            && !state.barrier_done
+        if matches!(state.loc, Some(DrainLoc::Pending(_)))
             && node_end_seq.is_some_and(|end| state.next_seq >= end)
+            && let Some(DrainLoc::Pending(pending)) = state.loc.take()
         {
-            barrier_publish_loc_map(&cfg, &mut state, counters, &cancel)?;
+            // Taken and replaced in one step: a failed publication leaves
+            // the drain through this `?`, never with the state left empty.
+            state.loc = Some(DrainLoc::Published(pending.publish(
+                &cfg.failure,
+                counters,
+                &cancel,
+            )?));
         }
 
         // Exit as soon as all senders have closed. If the buffer is
@@ -417,8 +455,10 @@ pub(super) fn run_drain(
     // Cloned rather than borrowed from `state`: the trailing loop now takes
     // `&mut state` for the sortedness guard, so an outstanding `&state`
     // borrow across it would not compile. The clone is one Arc refcount.
-    let loc_map_owned = state.loc_map.clone();
-    let loc = LocMode::new(cfg.locations_on_ways, loc_map_owned.as_deref());
+    let trailing_loc = state.loc.as_ref().map(DrainLoc::published_map);
+    let loc = trailing_loc
+        .as_ref()
+        .map_or(LocMode::Off, |map| LocMode::on(map.as_deref()));
     for &kind in types_to_flush {
         let (cursor, upserts) = state.cursors.get(kind, cfg.diff);
         let run = &upserts[cursor..];
@@ -485,13 +525,11 @@ struct DrainState<'a> {
     /// Coalesced `OwnedBytes` passthrough chunks. Flushed as a single
     /// `write_raw_chunks` when broken.
     passthrough_chunks: Vec<Vec<u8>>,
-    /// Published loc_map after the barrier. Workers reading way blobs
-    /// see this through `cfg.loc_map_out`; the drain uses this clone
-    /// for its own gap-create / trailing-create paths in the way phase.
-    loc_map: Option<Arc<FxHashMap<i64, (i32, i32)>>>,
-    /// Set true once the node→way barrier has been crossed and
-    /// `loc_map_out` published. Stays true for the rest of the run.
-    barrier_done: bool,
+    /// `--locations-on-ways` state, `None` with the mode off: pending until
+    /// the node→way barrier, then the published map, which the drain's own
+    /// gap, transition and trailing creates are written against (workers
+    /// read it through their `LocMapHandle`).
+    loc: Option<DrainLoc>,
     /// Running (kind, `osm_id_key`) high-water mark across every item
     /// already dispatched. Drives [`check_output_order`]; see there for
     /// why this is a running max rather than a pairwise-adjacent check.
@@ -499,7 +537,7 @@ struct DrainState<'a> {
 }
 
 impl<'a> DrainState<'a> {
-    fn new(creates: CreateEncoder<'a>) -> Self {
+    fn new(creates: CreateEncoder<'a>, loc: Option<DrainLoc>) -> Self {
         Self {
             buffer: BTreeMap::new(),
             bytes_in_buffer: 0,
@@ -509,8 +547,7 @@ impl<'a> DrainState<'a> {
             creates,
             copy_range_run: None,
             passthrough_chunks: Vec::new(),
-            loc_map: None,
-            barrier_done: false,
+            loc,
             order_watermark: crate::osm_id::OrderWatermark::default(),
         }
     }
@@ -592,7 +629,7 @@ fn handle_type_transition(
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
+    let loc = loc_mode(state.loc.as_ref());
     let emitted = flush_remaining_upserts(
         prev,
         item_kind,
@@ -625,7 +662,7 @@ fn handle_gap_creates(
     }
     flush_copy_range(state, cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
-    let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
+    let loc = loc_mode(state.loc.as_ref());
     emit_gap_creates(
         item_kind,
         osm_first,
@@ -665,7 +702,7 @@ fn process_item(
     // drain: the scanner dispatches no way or relation descriptor until it
     // has the barrier signal, on both routes. A way or relation here would be
     // written with no map to resolve against, so the protocol is broken.
-    if cfg.locations_on_ways && !state.barrier_done && item_kind != ElementKind::Node {
+    if matches!(state.loc, Some(DrainLoc::Pending(_))) && item_kind != ElementKind::Node {
         return Err(Error::internal(format!(
             "drain: a {} item arrived before the node-to-way barrier",
             item_kind.as_str()
@@ -906,121 +943,109 @@ fn flush_copy_range(
     Ok(())
 }
 
-/// Merge per-worker `CoordSlots` into the published `Arc<FxHashMap>`,
-/// then signal the scanner over `barrier_tx`, or refuse the run when the
-/// map leaves OSC way references unresolved. Called exactly once under
-/// `--locations-on-ways`, from the barrier check in `run_drain`, once every
-/// seq below the scanner's node boundary is processed.
-fn barrier_publish_loc_map(
-    cfg: &DrainConfig<'_>,
-    state: &mut DrainState<'_>,
-    counters: &DrainCounters,
-    invocation: &crate::host::Recorder,
-) -> Result<()> {
-    invocation.marker("MERGE_DRAIN_BARRIER_START");
+impl DrainLocations {
+    /// Merge per-worker `CoordSlots` into the published `Arc<FxHashMap>`,
+    /// then signal the scanner over `barrier_tx`, or refuse the run when the
+    /// map leaves OSC way references unresolved. Called once under
+    /// `--locations-on-ways`, from the barrier check in `run_drain`, once every
+    /// seq below the scanner's node boundary is processed; it consumes the
+    /// pending state, so it cannot run twice. On an error the barrier sender
+    /// drops unsignalled with `self`, which stops a scanner waiting at the
+    /// barrier, and the drain returns that error.
+    fn publish(
+        self,
+        failure: &FailureSlot,
+        counters: &DrainCounters,
+        invocation: &crate::host::Recorder,
+    ) -> Result<PublishedLocations> {
+        invocation.marker("MERGE_DRAIN_BARRIER_START");
 
-    let slots = cfg
-        .coord_slots
-        .as_ref()
-        .ok_or_else(|| Error::internal("drain: locations_on_ways true but coord_slots is None"))?;
-    let loc_map_out = cfg
-        .loc_map_out
-        .as_ref()
-        .ok_or_else(|| Error::internal("drain: locations_on_ways true but loc_map_out is None"))?;
+        let Self {
+            coord_slots,
+            seeded,
+            barrier_tx,
+            loc_map_out,
+            nodes_needed,
+            ignore_missing_nodes,
+        } = self;
 
-    #[cfg(feature = "test-hooks")]
-    invocation.faults().before_apply_changes_coord_merge();
-
-    // Seed with OSC pre-seeded coords (from
-    // `NodeLocationIndex::build_from_diff`'s `locations`) before
-    // extending with per-worker accumulators. Take ownership via the
-    // Mutex so subsequent calls (defensive; barrier should fire once)
-    // see an empty map.
-    // The seeded map is drain-owned state taken once, never written
-    // concurrently, so poison there is moot. A worker slot recovered from
-    // poison does not validate its contents: see `flush_local_coords` for
-    // why a panicking worker still fails the run.
-    let mut merged: FxHashMap<i64, (i32, i32)> = cfg
-        .seeded_locations
-        .as_ref()
-        .and_then(|m| {
-            m.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-        })
-        .unwrap_or_default();
-    for slot in slots {
-        let mut local = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if merged.is_empty() {
-            std::mem::swap(&mut merged, &mut *local);
-        } else {
-            merged.extend(local.drain());
-        }
-    }
-
-    counters
-        .barrier_loc_map_size
-        .store(merged.len() as u64, Ordering::Relaxed);
-
-    // The missing-node refusal, at the earliest point the count is known:
-    // every node item is processed, nothing resolves after this merge, and
-    // no way has been written. Leaving through the drain's error exit drops
-    // the barrier sender unsignalled, so the scanner stops in its barrier
-    // wait (at the first way or relation, or at EOF), the workers are
-    // released, and `merge`
-    // publishes nothing. A producer failure already published, or a
-    // cancellation already requested, outranks the refusal: both are
-    // checked here, at the decision, since the drain's own checks ran
-    // before this receive's advance and merge.
-    let missing = cfg.loc_nodes_needed.saturating_sub(merged.len() as u64);
-    if missing != 0 && !cfg.ignore_missing_nodes {
-        // Test-only: a producer failure or a cancellation landing after the
-        // drain's per-receive checks, which the checks below must rank.
         #[cfg(feature = "test-hooks")]
-        {
-            let faults = invocation.faults();
-            if faults
-                .apply_changes_fail_at_refusal
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                cfg.failure.publish(Error::internal(
-                    "test-hooks: producer failure at the barrier refusal",
-                ));
-            }
-            if faults
-                .apply_changes_cancel_at_refusal
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                invocation.cancel();
+        invocation.faults().before_apply_changes_coord_merge();
+
+        // Seed with OSC pre-seeded coords (from
+        // `NodeLocationIndex::build_from_diff`'s `locations`) before
+        // extending with per-worker accumulators. A worker slot recovered from
+        // poison does not validate its contents: see `flush_local_coords` for
+        // why a panicking worker still fails the run.
+        let mut merged: LocMap = seeded;
+        for slot in &coord_slots {
+            let mut local = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if merged.is_empty() {
+                std::mem::swap(&mut merged, &mut *local);
+            } else {
+                merged.extend(local.drain());
             }
         }
-        if let Some(e) = cfg.failure.take() {
-            return Err(e);
+
+        counters
+            .barrier_loc_map_size
+            .store(merged.len() as u64, Ordering::Relaxed);
+
+        // The missing-node refusal, at the earliest point the count is known:
+        // every node item is processed, nothing resolves after this merge, and
+        // no way has been written. Leaving through the drain's error exit drops
+        // the barrier sender unsignalled, so the scanner stops in its barrier
+        // wait (at the first way or relation, or at EOF), the workers are
+        // released, and `merge`
+        // publishes nothing. A producer failure already published, or a
+        // cancellation already requested, outranks the refusal: both are
+        // checked here, at the decision, since the drain's own checks ran
+        // before this receive's advance and merge.
+        let missing = nodes_needed.saturating_sub(merged.len() as u64);
+        if missing != 0 && !ignore_missing_nodes {
+            // Test-only: a producer failure or a cancellation landing after the
+            // drain's per-receive checks, which the checks below must rank.
+            #[cfg(feature = "test-hooks")]
+            {
+                let faults = invocation.faults();
+                if faults
+                    .apply_changes_fail_at_refusal
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    failure.publish(Error::internal(
+                        "test-hooks: producer failure at the barrier refusal",
+                    ));
+                }
+                if faults
+                    .apply_changes_cancel_at_refusal
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    invocation.cancel();
+                }
+            }
+            if let Some(e) = failure.take() {
+                return Err(e);
+            }
+            invocation.check()?;
+            invocation.counter("merge_loc_missing", missing);
+            invocation.marker("MERGE_DRAIN_BARRIER_REFUSED");
+            return Err(crate::error::new_missing_node_locations(
+                missing,
+                crate::error::Unresolved::ChangedWayNodes,
+            ));
         }
-        invocation.check()?;
-        invocation.counter("merge_loc_missing", missing);
-        invocation.marker("MERGE_DRAIN_BARRIER_REFUSED");
-        return Err(crate::error::new_missing_node_locations(
-            missing,
-            crate::error::Unresolved::ChangedWayNodes,
-        ));
-    }
 
-    let arc = Arc::new(merged);
-    // OnceLock::set fails only if already set; under our own protocol
-    // the drain calls this exactly once, so a set failure is a bug,
-    // not a steady-state condition.
-    if loc_map_out.set(Arc::clone(&arc)).is_err() {
-        return Err(Error::internal(
-            "drain: loc_map_out already published - barrier ran twice?",
-        ));
-    }
-    state.loc_map = Some(arc);
-    state.barrier_done = true;
+        let map = Arc::new(merged);
+        // Only this consuming call sets the handle, and only once; another
+        // value there means something outside the barrier published a map.
+        if loc_map_out.set(Arc::clone(&map)).is_err() {
+            return Err(Error::internal(
+                "drain: the coordinate map was published before the barrier",
+            ));
+        }
 
-    if let Some(barrier_tx) = cfg.barrier_tx.as_ref() {
         #[cfg(feature = "test-hooks")]
         invocation.faults().before_apply_changes_barrier_send();
         // A scanner that succeeds always receives this before exiting, small
@@ -1037,8 +1062,11 @@ fn barrier_publish_loc_map(
             .faults()
             .apply_changes_barrier_signalled
             .store(true, Ordering::SeqCst);
-    }
 
-    invocation.marker("MERGE_DRAIN_BARRIER_END");
-    Ok(())
+        invocation.marker("MERGE_DRAIN_BARRIER_END");
+        Ok(PublishedLocations {
+            map,
+            _barrier_tx: barrier_tx,
+        })
+    }
 }

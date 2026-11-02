@@ -1,9 +1,9 @@
 //! Sparse node location index for `--locations-on-ways`.
 //!
 //! Now a setup-only helper: produces the OSC-pre-seeded `locations`
-//! map (handed to the drain as `seeded_locations`) and the still-needed
-//! `needed_set` (handed to the worker pool as a coord-extraction
-//! filter). The base-PBF prefill phase no longer exists - it has been
+//! map (handed to the drain as `DrainLocations::seeded`) and the
+//! still-needed `needed_set` (handed to the worker pool as
+//! `WorkerLocations::needed`, a coord-extraction filter). The base-PBF prefill phase no longer exists - it has been
 //! fused into the streaming worker pool's node phase, where workers
 //! opportunistically extract coords for `needed_set` IDs as they
 //! decompress node blobs.

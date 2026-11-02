@@ -14,15 +14,15 @@ use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 use crate::read::input::InputSource;
 
 use super::descriptor::{DrainMessage, Route};
-use super::drain::{
-    self, DrainChannels, DrainConfig, DrainCounters, LocMapHandle, SeededLocations,
-};
+use super::drain::{self, DrainChannels, DrainConfig, DrainCounters, DrainLocations, LocMapHandle};
 use super::failure::FailureSlot;
 use super::node_locations::NodeLocationIndex;
 use super::refresh::StaleProbe;
-use super::scanner::{self, ScannerChannels, ScannerConfig};
+use super::scanner::{self, ScannerChannels, ScannerConfig, ScannerLocations};
 use super::stats::MergeStats;
-use super::streaming::{self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters};
+use super::streaming::{
+    self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters, WorkerLocations,
+};
 
 use super::Result;
 
@@ -148,6 +148,54 @@ fn build_header_bytes(
     Ok(crate::commands::output_header::build_one(header, &facts, overrides, host)?.bytes)
 }
 
+/// What `--locations-on-ways` derives from the diff before the pipeline
+/// exists: the coordinate index and the refresh probe.
+struct LocationsSetup {
+    mode: LocationsOnWays,
+    index: NodeLocationIndex,
+    probe: StaleProbe,
+}
+
+/// Split one run's `--locations-on-ways` resources into the three stages'
+/// shares. The barrier channel's two ends, the coordinate slots (one per
+/// worker, the drain holding clones) and the map handle are created here
+/// together, so no stage can hold part of the mode without the rest. The
+/// caller moves each share into its stage before any thread starts and keeps
+/// none of them: the scanner's boundary sender and the drain's barrier sender
+/// signal by dropping with their stage.
+fn wire_locations(
+    setup: LocationsSetup,
+    worker_count: usize,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
+) -> (ScannerLocations, WorkerLocations, DrainLocations) {
+    let LocationsSetup { mode, index, probe } = setup;
+    let (barrier_tx, barrier_rx) = mpsc::sync_channel::<()>(1);
+    let coord_slots: CoordSlots = (0..worker_count)
+        .map(|_| Arc::new(Mutex::new(FxHashMap::default())))
+        .collect();
+    let loc_map: LocMapHandle = Arc::new(OnceLock::new());
+    let scanner = ScannerLocations {
+        refresh_ways: probe.has_upserts(),
+        barrier_rx,
+        boundary_tx: drain_tx.clone(),
+    };
+    let drain = DrainLocations {
+        coord_slots: coord_slots.iter().map(Arc::clone).collect(),
+        seeded: index.locations,
+        barrier_tx,
+        loc_map_out: Arc::clone(&loc_map),
+        nodes_needed: index.total_referenced,
+        ignore_missing_nodes: mode.ignore_missing_nodes,
+    };
+    let workers = WorkerLocations {
+        coord_slots,
+        loc_map,
+        needed: Arc::new(index.needed_set),
+        probe: Arc::new(probe),
+    };
+    (scanner, workers, drain)
+}
+
 /// Apply an OSC diff to a base PBF, producing an updated sorted PBF.
 ///
 /// Descriptor-first streaming pipeline: scanner walks blob headers via
@@ -240,9 +288,9 @@ pub(crate) fn merge_to<'a>(
         parallelism,
         allow_version_regression,
     } = *opts;
-    // The stages carry the mode as these two flags.
+    // The header and the stats read the mode as this flag; the stages get
+    // their shares of it from `wire_locations`.
     let locations_on_ways = locations.is_some();
-    let ignore_missing_nodes = locations.is_some_and(|l| l.ignore_missing_nodes);
     // `validate` refused `force` with `locations_on_ways`: under force the
     // scanner tags every unindexed blob as a placeholder `Node` (its real
     // kind is not known until decompress), which defeats the node-to-way
@@ -337,38 +385,25 @@ pub(crate) fn merge_to<'a>(
     // `prefill_from_base` here. Build_from_diff still produces the
     // OSC-pre-seeded coords (`locations`) and the still-needed-from-base
     // ID set (`needed_set`).
-    let (seeded_locations, needed_set, loc_stats_pre) = if locations_on_ways {
-        let idx = NodeLocationIndex::build_from_diff(&diff);
+    let loc_setup = locations.map(|mode| {
+        let index = NodeLocationIndex::build_from_diff(&diff);
         // Counted separately from the two maps: a referenced node the diff
         // deletes is in neither, and must still count as needed so that it
         // shows up as missing.
-        let total_needed = idx.total_referenced;
-        let seeded = idx.locations.len();
-        let still_needed = idx.needed_set.len();
+        let total_needed = index.total_referenced;
+        let seeded = index.locations.len();
+        let still_needed = index.needed_set.len();
         crate::host::diag!(
             host.diagnostics,
             Progress,
             "apply_changes.low_needed",
             "  locations on ways: {total_needed} node IDs needed, {seeded} from diff, {still_needed} from base"
         );
-        (
-            Some(idx.locations),
-            Some(Arc::new(idx.needed_set)),
-            (total_needed, seeded as u64, still_needed as u64),
-        )
-    } else {
-        (None, None, (0, 0, 0))
-    };
-    // The refresh probe for surviving base ways (`refresh.rs`): every node
-    // the OSC upserts or deletes, a filter over the diff's sorted node
-    // lists, kept apart from the coordinate map published at the barrier,
-    // whose size `loc_missing` is computed from.
-    let probe = Arc::new(if locations_on_ways {
-        StaleProbe::from_diff(&diff)
-    } else {
-        StaleProbe::empty()
-    });
-    if locations_on_ways {
+        // The refresh probe for surviving base ways (`refresh.rs`): every
+        // node the OSC upserts or deletes, a filter over the diff's sorted
+        // node lists, kept apart from the coordinate map published at the
+        // barrier, whose size `loc_missing` is computed from.
+        let probe = StaleProbe::from_diff(&diff);
         let probe_bytes = probe.heap_bytes();
         host.invocation
             .counter("merge_loc_refresh_probe_bytes", probe_bytes);
@@ -380,7 +415,19 @@ pub(crate) fn merge_to<'a>(
             "apply_changes.refresh_probe",
             "  inline location refresh probe: {probe_mb:.1} MB"
         );
-    }
+        LocationsSetup {
+            mode,
+            index,
+            probe,
+        }
+    });
+    let loc_stats_pre = loc_setup.as_ref().map_or((0, 0, 0), |s| {
+        (
+            s.index.total_referenced,
+            s.index.locations.len() as u64,
+            s.index.needed_set.len() as u64,
+        )
+    });
 
     let writer_setup_start = crate::counters::Stopwatch::start();
     // Apply-changes' output pass is writer-bound at default compression, so
@@ -470,29 +517,14 @@ pub(crate) fn merge_to<'a>(
         None => (Route::Owned, Route::Owned, Route::Owned),
     };
 
-    // --locations-on-ways barrier wiring. The scanner's node boundary goes
-    // to the drain on the drain channel itself, through the scanner's own
-    // sender (moved into the scanner, so it drops when the scanner does).
-    let (barrier_tx_opt, barrier_rx_opt, boundary_tx_opt) = if locations_on_ways {
-        let (b_tx, b_rx) = mpsc::sync_channel::<()>(1);
-        (Some(b_tx), Some(b_rx), Some(drain_tx.clone()))
-    } else {
-        (None, None, None)
-    };
-
-    let coord_slots: Option<CoordSlots> = if locations_on_ways {
-        Some(
-            (0..worker_count)
-                .map(|_| Arc::new(Mutex::new(FxHashMap::default())))
-                .collect(),
-        )
-    } else {
-        None
-    };
-    let loc_map_handle: Option<LocMapHandle> = if locations_on_ways {
-        Some(Arc::new(OnceLock::new()))
-    } else {
-        None
+    // --locations-on-ways: each stage's share, built together and moved into
+    // the stage configs below, so nothing here keeps a channel end alive.
+    let (scanner_locations, worker_locations, drain_locations) = match loc_setup {
+        Some(setup) => {
+            let (scanner, workers, drain) = wire_locations(setup, worker_count, &drain_tx);
+            (Some(scanner), Some(workers), Some(drain))
+        }
+        None => (None, None, None),
     };
 
     let worker_counters = Arc::new(WorkerCounters::new());
@@ -502,14 +534,11 @@ pub(crate) fn merge_to<'a>(
     let scanner_cfg = ScannerConfig {
         base: &base,
         diff: &diff,
-        locations_on_ways,
-        refresh_ways: locations_on_ways && probe.has_upserts(),
+        locations: scanner_locations,
         channels: ScannerChannels {
             candidate_tx,
             route: scanner_route,
         },
-        barrier_rx: barrier_rx_opt,
-        boundary_tx: boundary_tx_opt,
         window: window_admit,
     };
 
@@ -517,13 +546,7 @@ pub(crate) fn merge_to<'a>(
         base: base.clone(),
         diff: Arc::clone(&diff),
         worker_count,
-        locations_on_ways,
-        coord_slots: coord_slots
-            .as_ref()
-            .map(|s| s.iter().map(Arc::clone).collect()),
-        loc_map_handle: loc_map_handle.as_ref().map(Arc::clone),
-        needed_set: needed_set.as_ref().map(Arc::clone),
-        probe: Arc::clone(&probe),
+        locations: worker_locations,
         compression,
         route: worker_route,
         failure: Arc::clone(&failure),
@@ -542,13 +565,6 @@ pub(crate) fn merge_to<'a>(
         create_executor: (worker_count > 1).then_some(&host.executor),
         compression,
         route: drain_route,
-        locations_on_ways,
-        coord_slots,
-        barrier_tx: barrier_tx_opt,
-        loc_map_out: loc_map_handle,
-        seeded_locations: seeded_locations.map(|l| SeededLocations::new(Some(l))),
-        loc_nodes_needed: loc_stats_pre.0,
-        ignore_missing_nodes,
         failure: Arc::clone(&failure),
     };
     let drain_channels = DrainChannels {
@@ -587,9 +603,15 @@ pub(crate) fn merge_to<'a>(
             streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
         });
 
-        let drain_stats = drain::run_drain(drain_cfg, drain_channels, &mut writer, &drain_counters);
-        // Test-only: the drain has returned, so its config and channels,
-        // the barrier sender included, are dropped by now.
+        let drain_stats = drain::run_drain(
+            drain_cfg,
+            drain_channels,
+            drain_locations,
+            &mut writer,
+            &drain_counters,
+        );
+        // Test-only: the drain has returned, so its config, channels and
+        // locations state, the barrier sender included, are dropped by now.
         #[cfg(feature = "test-hooks")]
         host.invocation
             .faults()

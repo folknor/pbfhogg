@@ -549,7 +549,7 @@ fn node_phase(
         schedule,
         None,
         IdScratch::default,
-        |buffer, scratch| -> Result<(u64, Vec<i64>)> {
+        |_, buffer, scratch| -> Result<(u64, Vec<i64>)> {
             let (KindIds { .. }, accepted) =
                 buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
             replay_nodes(scratch, accepted.bytes(), &sets.nodes)
@@ -574,7 +574,7 @@ fn way_phase(
         schedule,
         None,
         Vec::new,
-        |buffer, ways| -> Result<WayBlobResult> {
+        |_, buffer, ways| -> Result<WayBlobResult> {
             let (WaySpans { .. }, accepted) =
                 buffer.project(|_, _| WaySpans::new(None, &mut *ways))?;
             judge_ways(ways, accepted.bytes(), sets, judge)
@@ -600,7 +600,7 @@ fn relation_phase(
         schedule,
         None,
         Vec::new,
-        |buffer, relations| -> Result<RelBlobResult> {
+        |_, buffer, relations| -> Result<RelBlobResult> {
             let (RelationSpans { .. }, accepted) =
                 buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
             judge_relations(relations, accepted.bytes(), sets, judge)
@@ -657,7 +657,7 @@ fn unindexed_phase(
         blobs,
         None,
         UnindexedScratch::default,
-        |buffer, scratch| -> Result<UnindexedBlobResult> {
+        |_, buffer, scratch| -> Result<UnindexedBlobResult> {
             let UnindexedScratch {
                 ids,
                 ways,

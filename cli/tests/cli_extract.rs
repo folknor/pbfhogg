@@ -1787,6 +1787,53 @@ fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
     );
 }
 
+/// A passthrough candidate whose block the decoder refuses must not reach
+/// the output through a raw copy. The first node blob's string table gets
+/// an invalid UTF-8 entry: its nodes, its dense-only shape and its honest
+/// indexdata bbox all qualify it for the copy, and only the block validator
+/// refuses it. Single-region and multi-extract both fail with the
+/// decoder's error and publish nothing.
+#[test]
+fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let broken = crate::common::adversarial::mutate_blob_payload(&pbf, 1, |payload| {
+        // The string table, holding its one empty entry, leads the block.
+        assert_eq!(payload[..4], [10, 2, 10, 0], "fixture string table");
+        payload.splice(..4, [10, 3, 10, 1, 0xFF]);
+    });
+    std::fs::write(&input, broken).expect("write broken fixture");
+    let refusal = "invalid UTF-8 at string table index 0";
+
+    let output = dir.path().join("single.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--bbox", BBOX_STR, "--simple"])
+        .assert_failure();
+    out.assert_stderr_contains(refusal);
+    assert!(!output.exists(), "nothing is published");
+
+    let config = multi_config(dir.path(), "multi-refused");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .args(["--simple", "--set-bounds"])
+        .assert_failure();
+    out.assert_stderr_contains(refusal);
+    assert!(
+        !dir.path().join("multi-refused.osm.pbf").exists(),
+        "nothing is published"
+    );
+}
+
 #[test]
 fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
     let dir = crate::common::test_scratch();

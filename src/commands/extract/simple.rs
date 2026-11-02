@@ -406,9 +406,10 @@ fn extract_simple_single_pass(
                 (
                     Vec::<crate::scan::node::NodeTuple>::new(),
                     Vec::<(usize, usize)>::new(),
+                    ValidateScratch::default(),
                 )
             },
-            |position, decompressed, (tuples, group_starts)| {
+            |position, decompressed, (tuples, group_starts, validate)| {
                 tuples.clear();
                 let kinds =
                     crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
@@ -425,7 +426,7 @@ fn extract_simple_single_pass(
                     .collect();
                 let verified = if node_schedule_ref[position].passthrough == Passthrough::Candidate
                 {
-                    verify_candidate(decompressed, tuples.len(), matching.len())?
+                    verify_candidate(decompressed, tuples.len(), matching.len(), validate)?
                 } else {
                     None
                 };
@@ -637,22 +638,36 @@ fn scheduled(descs: &[&BlobDesc]) -> Result<Vec<crate::scan::classify::Scheduled
         .collect()
 }
 
+/// String-table and group-range scratch for a candidate's validation.
+type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 /// Verify one passthrough candidate from its classify-phase decode: the
 /// observed node count when every scanned node landed in the region and the
 /// payload has the dense-only shape that makes the scan complete, else
 /// `None`. Occurrence counts, not set sizes: a duplicate id counts every
-/// time it would be copied.
+/// time it would be copied. `scratch` is the worker's string-table and
+/// group-range scratch for the validation, reused across blobs.
 fn verify_candidate(
     decompressed: &[u8],
     scanned: usize,
     matching: usize,
+    scratch: &mut ValidateScratch,
 ) -> crate::error::Result<Option<u64>> {
     if matching != scanned || !dense_only_payload(decompressed)? {
         return Ok(None);
     }
     // What the decode path would do with this blob; a block it rejects must
-    // not reach the output through a raw copy instead.
-    PrimitiveBlock::from_vec(decompressed.to_vec())?;
+    // not reach the output through a raw copy instead. The decoder's check,
+    // run on the payload where it lies: only the verdict is needed. No claim:
+    // the node scanner has refused under it, and a dense-only payload holds
+    // nodes alone. It replaced a copy into a dropped block; that copy ran
+    // only for nominated candidates, none on the planet bbox, and the same
+    // copy in check --locations measured within noise at planet
+    // (reference/performance.md, "Payloads validated where they lie").
+    let (st, groups) = scratch;
+    crate::read::block::validate_in_place(decompressed, st, groups, None, |_, _| {
+        crate::read::block::NoProjection
+    })?;
     Ok(Some(scanned as u64))
 }
 

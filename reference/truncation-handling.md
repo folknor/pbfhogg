@@ -171,7 +171,9 @@ The other contract sites are:
   `from_vec`, `from_vec_with_scratch`,
   `from_vec_pooled_with_scratch` and the decode pools - funnels
   through `BlockBuffer::project` and so through this check, as do
-  the projection scanners that build no block. Note that no
+  the projection scanners that build no block and the callers that
+  validate a borrowed payload in place (`validate_in_place`, the
+  check `BlockBuffer::project` runs). Note that no
   `PrimitiveBlock` constructor is a shape-5 site: they take
   already-decompressed bytes and cannot observe a decompression
   failure.
@@ -270,10 +272,11 @@ projections (`GroupProjection`) that build no block (`getid`
 builds one, from the validated bytes, only for a blob holding an
 element it writes), and stay
 inside the boundary by construction rather than by care: a
-projection runs through `BlockBuffer::project`, the same
-`validate_block` call, in the same order, that block construction
-runs with its empty projection, followed by the same kind-claim
-refusal. Lookups and specialised scanners (`inspect --show`,
+projection runs through `BlockBuffer::project` (or, on borrowed
+bytes, `validate_in_place`, which is the check `project` runs), the
+same `validate_block` call, in the same order, that block
+construction runs with its empty projection, followed by the same
+kind-claim refusal. Lookups and specialised scanners (`inspect --show`,
 `inspect --nodes`, `src/scan/node.rs`) are not bound by this
 paragraph; their own docs state what they check.
 

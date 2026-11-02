@@ -636,7 +636,7 @@ fn kind_phase(
         schedule,
         None,
         IdScratch::default,
-        |buffer, scratch| verify_blob(buffer, kind, atomic_ids, scratch),
+        |_, buffer, scratch| verify_blob(buffer, kind, atomic_ids, scratch),
         |seq, mut r| {
             settle_overflow(&mut overflow, &mut r, host);
             per_blob[seq] = Some(r);
@@ -679,7 +679,7 @@ fn unindexed_pass(
         blobs,
         None,
         IdScratch::default,
-        |buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
+        |_, buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
             let ((KindIds { .. }, groups), accepted) = buffer
                 .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
             let mut judges = KINDS.map(KindJudge::new);

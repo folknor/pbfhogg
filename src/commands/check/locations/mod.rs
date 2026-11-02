@@ -63,8 +63,8 @@
 //! The store budget bounds one partition's slot store and nothing else. On
 //! top of it: the key set (a bit set over the node-ID space, about 1.7 GB
 //! for a planet's node IDs) and its rank index, which follow the number of
-//! distinct IDs; each worker's decompressed blob, its validation copy and a
-//! fixed ID batch (`CHECK_LOCATIONS_KEY_BATCH`); and the retained violation
+//! distinct IDs; each worker's decompressed blob (validated where it lies,
+//! never copied) and a fixed ID batch (`CHECK_LOCATIONS_KEY_BATCH`); and the retained violation
 //! details, at most `max_errors` per blob in flight and in total, but every
 //! violation when `max_errors` is zero. Way scanning streams one reference
 //! at a time, so a long way costs no worker memory. No scratch disk is used.

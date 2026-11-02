@@ -388,10 +388,11 @@ fn cat_passthrough(
                                 // output unindexed, and the indexing recipe
                                 // this command is would loop: re-encode it
                                 // into single-kind indexed blocks instead.
-                                let (blocks, count) =
-                                    reencode_unclassifiable(&decompress_buf, declared)
-                                        .map_err(locate)?;
-                                decompress_buf.clear();
+                                let (blocks, count) = reencode_unclassifiable(
+                                    std::mem::take(&mut decompress_buf),
+                                    declared,
+                                )
+                                .map_err(locate)?;
                                 if blocks.is_empty() {
                                     blobs_omitted += 1;
                                 }
@@ -519,9 +520,11 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 ///   `WayMembers-v1` (the ordinary reindex arm refuses an unindexed way blob
 ///   there too). Pins the header does not declare are dropped.
 ///
-/// The cold arm owns everything it allocates: a copy of the payload (so the
-/// caller's decompression buffer keeps its capacity), the builder and the
-/// scratch vectors all live here.
+/// The cold arm owns everything it uses: the caller hands over its
+/// decompression buffer, which becomes the block (no copy of the payload),
+/// and the builder and the scratch vectors live here. The caller's next blob
+/// decompresses into a fresh buffer, which costs no more allocations than
+/// the copy did and saves the copy itself.
 ///
 /// These blocks are not refused: an empty block loses nothing of OSM
 /// content, kinds changing across groups is legal per the PBF spec and older
@@ -551,10 +554,10 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 #[inline(never)]
 #[allow(clippy::too_many_lines)]
 fn reencode_unclassifiable(
-    payload: &[u8],
+    payload: Vec<u8>,
     declared: Declared,
 ) -> crate::Result<(Vec<OwnedBlock>, u64)> {
-    let block = PrimitiveBlock::from_vec(payload.to_vec())?;
+    let block = PrimitiveBlock::from_vec(payload)?;
     let mut bb = BlockBuilder::new();
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();

@@ -2901,6 +2901,48 @@ retention of it, neither measured. It was not built. time-filter at the
 same commit builds no block (its decode phase projects), so it never
 appends.
 
+## Payloads validated where they lie (bygg, 2026-11-02, against `7feb4370`)
+
+`check --locations` validated every blob by copying the worker's
+decompressed payload into a fresh `Vec` and building a block from it
+(memcpy, allocation, the table append's regrowth, a free), only for the
+verdict. It now runs the validator on the borrowed bytes
+(`read::block::validate_in_place`). Planet
+`planet-20260223-altw-keep-untagged`, `brokkr check-locations --variant
+altw-keep-untagged --bench 1`, both arms built in the main tree (HEAD
+cells stored, change cells unstored `--force`), arm order alternated:
+
+| Pair | HEAD | Change |
+|---|---:|---:|
+| 1 (HEAD first) | 208.1 s (`586c7a63`) | 200.5 s |
+| 2 (change first) | 207.4 s (`13ddbf33`) | 201.9 s |
+| 3 (HEAD first) | 206.7 s (`c17025ee`) | 206.6 s |
+
+Neutral within noise: the medians differ by 2.6 %, pair 3 by nothing,
+and in pair 3 the node pass (the phase every blob is validated in) is
+19.9 s at 22.4 to 22.6 cores in both arms. Peak anon about 18.2 GB in
+both, set by the partition store. The work removed is one payload
+memcpy and allocation per blob, a few core-seconds against roughly
+4,500 core-seconds per run, so no visible wall delta was expected. The
+change landed as a simplification, not as a speedup: payload copies of
+this kind (a borrowed decompressed payload copied into a block that is
+built only to be validated or read once) are not worth hunting for wall
+time, here or at the other sites.
+Partition 1 is the run's noisiest phase: in some cells of either arm it
+takes 3 million major faults and about 15 s longer, with every phase
+after it unchanged.
+
+multi-extract's bbox-only node classify now runs one projection pool
+over every node blob (a passthrough candidate's validated bytes read
+for its dense-only check before the block is built) instead of a block
+pool for the rest and a raw pool that copied each candidate. Planet
+default 5-region simple config, main-tree builds: HEAD 88.5 s (control
+cell, not stored), change 88.2 s and 87.9 s; node classify 19.4 s in
+the HEAD cell and 18.9 s in the second change cell. That config nominates no candidate (no planet node blob's bbox
+lies inside a region), so this measures the restructured pass, not the
+removed copy; extract `--simple`'s candidate validation likewise never
+runs on the planet bbox and was not measured.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

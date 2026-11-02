@@ -297,7 +297,7 @@ pub fn parse_ids_from_pbf<'a>(
         &schedule,
         None,
         crate::read::project_ids::IdScratch::default,
-        |buffer, scratch| {
+        |_, buffer, scratch| {
             let (crate::read::project_ids::KindIds { .. }, accepted) = buffer
                 .project(|_, _| crate::read::project_ids::KindIds::new(all_kinds, &mut *scratch))?;
             let mut batch = IdBatch {
@@ -1096,7 +1096,7 @@ fn getid_with_refs(
             &schedule,
             None,
             Vec::new,
-            |buffer, ways| -> Result<Vec<i64>> {
+            |_, buffer, ways| -> Result<Vec<i64>> {
                 let (WaySpans { .. }, accepted) =
                     buffer.project(|_, _| WaySpans::new(Some(&ids.way_ids), &mut *ways))?;
                 let mut refs: Vec<i64> = Vec::new();

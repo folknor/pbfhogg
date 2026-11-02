@@ -998,7 +998,8 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// table's UTF-8 ([`validate_stringtable_utf8`]). Block construction is the
 /// projection that keeps nothing ([`NoProjection`]); a reader that needs
 /// less than a block (inspect, `check --ids`, getparents) passes its own
-/// [`GroupProjection`] through [`BlockBuffer::project`], so it refuses
+/// [`GroupProjection`] through [`BlockBuffer::project`], or through
+/// [`validate_in_place`] when it holds the bytes borrowed, so it refuses
 /// exactly the blocks construction refuses, with the same error, by running
 /// the same code rather than a copy of it.
 ///
@@ -1036,6 +1037,27 @@ fn validate_block<P: GroupProjection>(
     ))
 }
 
+/// Validate a block's bytes where they lie, borrowed: [`validate_block`]
+/// with `make`'s projection, then the refusal of a kind `claim` denies
+/// (`KindSet::refuse_under`, unlocated). This is all of
+/// [`BlockBuffer::project`]'s check, which runs it on the bytes it owns, so a
+/// caller that needs only the verdict, the [`BlockScan`] or a projection
+/// refuses exactly the blocks construction refuses, with the same error,
+/// without owning the bytes: no copy into a `Vec`, no offset tables
+/// appended to a buffer nobody reads them from. Ownership is needed only to
+/// become a block ([`ValidatedBlock::into_block`]).
+pub(crate) fn validate_in_place<P: GroupProjection>(
+    buffer: &[u8],
+    st: &mut Vec<(u32, u32)>,
+    groups: &mut Vec<(u32, u32)>,
+    claim: Option<crate::ElementKind>,
+    make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+) -> Result<(P, BlockScan)> {
+    let (projection, scan) = validate_block(buffer, st, groups, make)?;
+    scan.kinds.refuse_under(claim)?;
+    Ok((projection, scan))
+}
+
 /// What [`validate_block`] found in a block it accepted.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BlockScan {
@@ -1057,7 +1079,9 @@ pub(crate) struct BlockScan {
 /// [`block`](Self::block), which is `project` with [`NoProjection`] followed
 /// by [`ValidatedBlock::into_block`]: every `PrimitiveBlock` in the crate is
 /// built this way, so a projection and a block refuse the same input with the
-/// same error, and the kind-claim refusal follows validation in both.
+/// same error, and the kind-claim refusal follows validation in both. The
+/// check itself is [`validate_in_place`], which a caller holding borrowed
+/// bytes it will not build a block from calls directly.
 pub(crate) struct BlockBuffer<'w> {
     buffer: Vec<u8>,
     pool: Option<&'w std::sync::Arc<crate::blob::DecompressPool>>,
@@ -1107,10 +1131,7 @@ impl<'w> BlockBuffer<'w> {
             groups,
             claim,
         } = self;
-        let checked = validate_block(&buffer, st, groups, make).and_then(|(projection, scan)| {
-            scan.kinds.refuse_under(claim).map(|()| (projection, scan))
-        });
-        let (projection, scan) = match checked {
+        let (projection, scan) = match validate_in_place(&buffer, st, groups, claim, make) {
             Ok(accepted) => accepted,
             Err(e) => {
                 drop(crate::blob::pool_wrap(buffer, pool));
@@ -2511,12 +2532,24 @@ mod strict_validation_tests {
                 let projected = BlockBuffer::new(owned(), Some(&pool), &mut st, &mut gr, None)
                     .project(|_, _| NoProjection)
                     .map(drop);
+                let constructed = PrimitiveBlock::from_vec(input.clone()).map(drop);
+                assert_eq!(projected.is_ok(), constructed.is_ok(), "{what}");
+                returned(&what);
+
+                // The borrowed entry refuses what construction refuses,
+                // with the same error, and leaves the bytes as they were.
+                let borrowed = input.clone();
+                let in_place =
+                    super::validate_in_place(&borrowed, &mut st, &mut gr, None, |_, _| {
+                        NoProjection
+                    })
+                    .map(drop);
                 assert_eq!(
-                    projected.is_ok(),
-                    PrimitiveBlock::from_vec(input.clone()).is_ok(),
+                    in_place.as_ref().map_err(ToString::to_string),
+                    constructed.as_ref().map_err(ToString::to_string),
                     "{what}"
                 );
-                returned(&what);
+                assert_eq!(borrowed, input, "{what}: validated in place, untouched");
             }
         }
     }

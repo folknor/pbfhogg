@@ -101,10 +101,21 @@ pub(super) type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);
 /// [`PrimitiveBlock`](crate::PrimitiveBlock): group and element framing,
 /// tag, Info and DenseInfo arrays, dense `keys_vals`, way geometry and
 /// relation member arrays, string table UTF-8. The check calls it once per
-/// blob, so a file the reader refuses is refused here too.
+/// blob, so a file the reader refuses is refused here too. It runs the
+/// reader's own check on the worker's buffer where it lies, building no
+/// block: the check needs only the verdict, and the scanners read the same
+/// buffer afterwards. No claim is enforced here; the way scanner judges the
+/// one claim the check acts on. This replaced a copy of the payload into a
+/// built-and-dropped block; at planet the copy measured within noise of
+/// nothing (reference/performance.md, "Payloads validated where they
+/// lie"), so the borrowed check is kept because it does less, not because it
+/// is faster. There is no speed left to find in this call.
 pub(super) fn validate_block(block: &[u8], scratch: &mut ValidateScratch) -> Result<()> {
     let (st, gr) = scratch;
-    crate::PrimitiveBlock::from_vec_with_scratch(block.to_vec(), st, gr).map(drop)
+    crate::read::block::validate_in_place(block, st, gr, None, |_, _| {
+        crate::read::block::NoProjection
+    })
+    .map(drop)
 }
 
 /// Caller-owned scratch for a block's group positions, `(offset, len)` in

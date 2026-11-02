@@ -398,56 +398,45 @@ pub(super) fn try_extract_multi_single_pass(
             )
         };
 
-        // Passthrough candidates are classified from the raw bytes, so the
-        // structural check in `dense_only_payload` can see them. The pools
-        // report positions within each subset; `candidate_positions` maps a
-        // candidate's back to its node-schedule position, which the write
-        // phase below keys on.
-        let (candidate_positions, other_positions): (Vec<usize>, Vec<usize>) = (0..node_schedule
-            .len())
-            .partition(|&pos| node_blob_info[pos].passthrough == Passthrough::Candidate);
-        let candidate_schedule: Vec<ScheduledBlob> = candidate_positions
-            .iter()
-            .map(|&pos| node_schedule[pos])
-            .collect();
-        let other_schedule: Vec<ScheduledBlob> = other_positions
-            .iter()
-            .map(|&pos| node_schedule[pos])
-            .collect();
-
-        crate::scan::classify::parallel_classify_phase(
+        // One pass over every node blob. Each is validated as block
+        // construction validates it, refusing a contradicted kind claim
+        // (a candidate is scheduled as nodes, and the classifier reads only
+        // nodes), then built and classified. A passthrough candidate's
+        // validated bytes are also read for the structural check in
+        // `dense_only_payload` before the block is built: a block the decode
+        // path rejects is never copied raw, and the check sees the payload,
+        // not the offset tables a build appends. This one pass replaced a
+        // block pool for the rest and a raw pool that copied each candidate
+        // into a block; it is a simplification, measured neutral at planet
+        // (reference/performance.md, "Payloads validated where they lie").
+        let node_blob_info_ref = &node_blob_info;
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
-            &other_schedule,
+            &node_schedule,
             None,
             worker_init,
-            |block, (columns, scratch)| classify_columns(block, columns, scratch),
-            |_pos, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
-            host,
-        )?;
-        crate::scan::classify::parallel_scan_blobs_raw(
-            &shared_file,
-            &candidate_schedule,
-            None,
-            worker_init,
-            |position, bytes, (columns, scratch)| {
-                let eligible = dense_only_payload(bytes)?;
-                // What the decode path would do with this blob; a block it
-                // rejects must not be copied raw.
-                let block = PrimitiveBlock::from_vec(bytes.to_vec())?;
-                // A candidate is scheduled as nodes, and the classifier below
-                // reads only nodes.
-                block.refuse_foreign_kind(candidate_schedule[position].claim())?;
+            |position, buffer, (columns, scratch)| {
+                let (crate::read::block::NoProjection, validated) =
+                    buffer.project(|_, _| crate::read::block::NoProjection)?;
+                let eligible = if node_blob_info_ref[position].passthrough == Passthrough::Candidate
+                {
+                    Some(dense_only_payload(validated.bytes())?)
+                } else {
+                    None
+                };
+                let block = validated.into_block();
                 let region_ids = classify_columns(&block, columns, scratch)?;
                 // Occurrence counts, not set sizes: a duplicate id counts
                 // every time it is copied.
                 let observed = columns.len();
-                let verified = (eligible && region_ids.iter().all(|ids| ids.len() == observed))
-                    .then_some(observed as u64);
+                let verified = (eligible == Some(true)
+                    && region_ids.iter().all(|ids| ids.len() == observed))
+                .then_some(observed as u64);
                 Ok((region_ids, verified))
             },
             |pos, (region_ids, verified): (Vec<Vec<i64>>, Option<u64>)| {
                 merge_region_ids(&mut bbox_node_ids, region_ids);
-                verified_nodes[candidate_positions[pos]] = verified;
+                verified_nodes[pos] = verified;
             },
             host,
         )?;

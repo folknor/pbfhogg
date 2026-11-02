@@ -423,7 +423,11 @@ impl Walk<'_> {
                 sorted,
                 tagdata: tags.as_ref().and_then(serialize_tags),
             }),
-            None => kind_indexes(&self.decompress_buf, &self.host.invocation).map(Scanned::Kinds),
+            None => kind_indexes(
+                std::mem::take(&mut self.decompress_buf),
+                &self.host.invocation,
+            )
+            .map(Scanned::Kinds),
         }
     }
 }
@@ -483,10 +487,12 @@ fn serialize_tags(tags: &TagIndex) -> Option<Box<[u8]>> {
 /// the block's real error (the scan validates less than the decoder does).
 /// The bbox is left out, since these entries are rewritten, never copied.
 /// One cancellation check before the decode: the walk checks between blobs,
-/// and one block is bounded by the blob size limit.
-fn kind_indexes(block: &[u8], cancel: &crate::host::Invocation) -> Result<Vec<BlobIndex>> {
+/// and one block is bounded by the blob size limit. The caller hands over
+/// its decompression buffer, which becomes the block rather than being
+/// copied into one; its next blob decompresses into a fresh buffer.
+fn kind_indexes(block: Vec<u8>, cancel: &crate::host::Invocation) -> Result<Vec<BlobIndex>> {
     cancel.check()?;
-    let block = crate::PrimitiveBlock::from_vec(block.to_vec())?;
+    let block = crate::PrimitiveBlock::from_vec(block)?;
     let mut ranges: [Option<(i64, i64, u64)>; 3] = [None; 3];
     for element in block.elements() {
         let (kind, id) = match &element {

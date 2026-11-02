@@ -808,6 +808,8 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// (`BlockBuffer::project`, the validator and kind-claim refusal block
 /// construction runs, so the same blobs are refused with the same errors),
 /// and may build the block from the validated bytes where it needs one.
+/// `project` also gets the blob's schedule position, for a caller that
+/// treats some blobs differently (multi-extract's passthrough candidates).
 /// Errors are located at the blob as in `parallel_classify_phase`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_project_phase<S: Send, R: Send>(
@@ -815,7 +817,7 @@ pub(crate) fn parallel_project_phase<S: Send, R: Send>(
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    project: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
+    project: impl Fn(usize, crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
@@ -952,7 +954,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         schedule,
         threads,
         worker_init,
-        |buffer, state| classify(&buffer.block()?, state),
+        |_position, buffer, state| classify(&buffer.block()?, state),
         merge,
         host,
     )
@@ -967,7 +969,7 @@ fn run_unordered_decoded<S: Send, R: Send>(
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    work: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
+    work: impl Fn(usize, crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Send + Sync,
     merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
@@ -990,7 +992,7 @@ fn run_unordered_decoded<S: Send, R: Send>(
                 &mut local.st_scratch,
                 &mut local.gr_scratch,
             );
-            work(buffer, &mut local.state)
+            work(position, buffer, &mut local.state)
         },
         merge,
         host,
@@ -1688,7 +1690,7 @@ mod tests {
                     &nodes,
                     Some(2),
                     || (),
-                    project,
+                    |_, buffer, state: &mut ()| project(buffer, state),
                     |_, ()| {},
                     &host,
                 ),

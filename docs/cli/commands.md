@@ -255,20 +255,24 @@ never silently means something new:
 ## Worker threads
 
 `-j, --jobs <N>` has one rule on every command that has it: `0` (the default) sizes the worker
-pools automatically, `1` runs sequentially, `N` caps the worker pools at `N`
-threads. "Automatically" is each command's own sizing (a reserve of cores for
+pools automatically, `1` runs one worker (the command's sequential path where
+it has one), `N` caps the worker pools at `N` threads. The worker count does
+not include a command's own reader, scanner or drain threads, which run beside
+the workers at any `-j`. "Automatically" is each command's own sizing (a reserve of cores for
 its scanner, drain or writer threads, a minimum, a fallback when the host
 cannot say how many cores it has); `-j 0` and an omitted `-j` are the same.
 An explicit `-j` (any value, `0` included) is refused where it can have no
-effect: `tags-filter -R` and OSC-mode tags-filter, `inspect` outside
-`--nodes`. One exception to the rule:
+effect: `tags-filter -R`, `inspect` outside `--nodes`. One exception to the
+rule:
 
 - **diff**: with both inputs indexed, `N` workers merge the work units both
   inputs are streamed into, at any `N`; without indexdata the run is the
   sequential element stream, with a `Note:`.
 
 `apply-changes -j 1` runs one worker beside the scanner and drain threads;
-its automatic sizing still starts at two.
+its automatic sizing still starts at two. `merge-changes -j 1` and OSC-mode
+`tags-filter -j 1` run one worker beside the reader thread that frames each
+input.
 
 The other commands that run worker pools (sort, cat, repack, degrade,
 renumber, extract, add-locations-to-ways, getid, getparents, time-filter,
@@ -1326,7 +1330,7 @@ pbfhogg extract [OPTIONS] <FILE>
 
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
-With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, an explicit `-j`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it.
+With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it. One reader thread frames the OSC document and cuts it into batches; `-j` sizes the workers that filter the batches, and the output is the same at any `-j`.
 
 At least one expression is required, positional or from `-e`; an `-e` file holding none is refused, and so is a malformed expression, before the input is opened.
 
@@ -1375,7 +1379,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `--invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only). (`-i` used to be its short; `-i` now refuses here, naming `--invert-match`.) |
 | `--remove-tags` | Remove tags from referenced objects not directly matched (not with -R; PBF only). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
 | `-e, --expressions <FILE>` | Read filter expressions from file (one per line, # comments) |
-| `-j, --jobs <N>` | Worker threads for the two-pass mode's classify passes and its decode-and-filter pool (see [Worker threads](#worker-threads)). Refused with `-R`, whose single pass reads through the pipelined reader and has no worker pool |
+| `-j, --jobs <N>` | Worker threads for the two-pass mode's classify passes and its decode-and-filter pool, or in OSC mode for the workers filtering the document's batches (see [Worker threads](#worker-threads)). Refused with `-R`, whose single pass reads through the pipelined reader and has no worker pool |
 | `--distrust-metadata` | Do not skip blobs on their `indexdata` or tag index; decode every blob. Blob-level tag-index skipping is a trust boundary with nothing on the other side of it - nothing validates a blob's tag index against its payload - so a file whose index omits a key its elements carry silently loses those elements from the output. This flag trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition (`--force` is not needed alongside it). Not valid in OSC mode, which has no blobs. `degrade --corrupt-tagdata` produces the file this flag exists for. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

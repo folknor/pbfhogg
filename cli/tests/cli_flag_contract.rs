@@ -388,20 +388,6 @@ const REFUSALS: &[(&[&str], &str)] = &[
             "osc",
             "-o",
             "OUT",
-            "-j",
-            "0",
-            "x",
-        ],
-        "OSC mode",
-    ),
-    (
-        &[
-            "tags-filter",
-            "OSC",
-            "--input-kind",
-            "osc",
-            "-o",
-            "OUT",
             "--invert-match",
             "x",
         ],
@@ -548,7 +534,7 @@ const JOBS: &[JobsRow] = &[
         accepts: [false, false, false],
     },
     JobsRow {
-        label: "tags-filter OSC (takes no worker count)",
+        label: "tags-filter OSC",
         words: &[
             "tags-filter",
             "OSC",
@@ -560,7 +546,7 @@ const JOBS: &[JobsRow] = &[
             "-j",
             "J",
         ],
-        accepts: [false, false, false],
+        accepts: [true, true, true],
     },
     JobsRow {
         label: "inspect --nodes",

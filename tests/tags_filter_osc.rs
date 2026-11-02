@@ -67,6 +67,7 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
         &input,
         crate::common::out(&output),
         &exprs(&["highway=primary"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect("filter");
@@ -128,6 +129,7 @@ fn type_prefix_applies_to_create_modify_only() {
         &input,
         crate::common::out(&output),
         &exprs(&["w/amenity=bench"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect("filter");
@@ -171,6 +173,7 @@ fn multiple_expressions_use_or_semantics() {
         &input,
         crate::common::out(&output),
         &exprs(&["amenity", "shop"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect("filter");
@@ -215,6 +218,7 @@ fn plain_osc_input_is_accepted() {
         &input,
         crate::common::out(&output),
         &exprs(&["amenity"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect("filter");
@@ -239,6 +243,7 @@ fn truncated_osc_is_refused() {
         &input,
         crate::common::out(&output),
         &exprs(&["amenity"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect_err("a truncated OSC must not filter as a complete one");
@@ -269,6 +274,7 @@ fn node_without_usable_coords_is_refused() {
         &input,
         crate::common::out(&output),
         &exprs(&["amenity"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect_err("a node without coordinates must not be filtered to 0/0");
@@ -289,6 +295,7 @@ fn an_unrecognised_output_name_is_refused_before_any_work() {
         &input,
         crate::common::out(&output),
         &exprs(&["name"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect_err("only .osc and .osc.gz are accepted");
@@ -310,6 +317,7 @@ fn metadata_is_normalized() {
         &input,
         crate::common::out(&output),
         &exprs(&["name"]),
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .expect("filter");

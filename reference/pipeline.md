@@ -498,7 +498,10 @@ bytes, without building owned elements.
 
 `tags-filter --input-kind osc` runs on the same readers through
 `stream::collect`: workers render kept elements into nine (action, kind)
-groups, concatenated in input order into one document.
+groups, concatenated in input order into one document. Its one reader
+frames the document; `Fixed(n)` runs the workers on a pool of `n` built
+for the call and joined before the document is written, `Auto` on the
+host's executor.
 
 ---
 

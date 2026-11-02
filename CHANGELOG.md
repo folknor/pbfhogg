@@ -25,6 +25,15 @@
   (`process::cap_malloc_arenas`, `process::set_mmap_threshold`).
 - `host::FdPool::new` takes only the budget; the pool forwarded nothing
   else.
+- `tags_filter::osc::tags_filter_osc` takes a `Parallelism` after the
+  expressions: `Fixed(n)` runs the filtering workers on a pool of `n`
+  threads built for the call, `Auto` on `Host::executor` as before.
+
+### Added
+
+- `tags-filter --input-kind osc` accepts `-j`, which it refused: `-j N`
+  caps the workers filtering the document at `N` threads, and `-j 1` runs
+  one beside the reader thread. The output is the same at any `-j`.
 
 ### Changed
 

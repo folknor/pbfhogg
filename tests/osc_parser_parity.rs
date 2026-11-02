@@ -91,6 +91,7 @@ fn tags_filter_verdict(input: &Path, out: &Path) -> Verdict {
         input,
         crate::common::out_replace(out),
         &["highway=primary".to_string()],
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .map(|_| ())
@@ -540,6 +541,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
         &input,
         crate::common::out_replace(&filter_out),
         &["highway=primary".to_string()],
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .unwrap();
@@ -636,6 +638,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             &input,
             crate::common::out_replace(&filter_out),
             &["highway=primary".to_string()],
+            pbfhogg::Parallelism::Auto,
             &crate::common::test_host(),
         )
         .expect("tags-filter is the other re-emit path and must agree");
@@ -693,6 +696,7 @@ fn re_emit_sinks_escape_user_data_identically() {
         &input,
         crate::common::out_replace(&filter_out),
         &["highway=primary".to_string()],
+        pbfhogg::Parallelism::Auto,
         &crate::common::test_host(),
     )
     .unwrap();

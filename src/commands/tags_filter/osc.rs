@@ -168,16 +168,23 @@ impl TagsFilterOscStats {
 ///
 /// - `create` / `modify`: only matching elements are kept.
 /// - `delete`: all deletes are forwarded unconditionally.
+///
+/// `parallelism` sizes the filtering workers. `Fixed(n)` runs them on a
+/// dedicated rayon pool of `n` threads, joined before the document is
+/// written; `Auto` runs them on [`Host::executor`](crate::host::Host). The
+/// one reader thread that frames the document runs beside the workers at
+/// any setting, `Fixed(1)` included. The output does not depend on it.
 pub fn tags_filter_osc(
     input: &Path,
     output: impl crate::output::BindOutput,
     expression_strs: &[String],
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = tags_filter_osc_to(input, &output, expression_strs, host)?;
+    let result = tags_filter_osc_to(input, &output, expression_strs, parallelism, host)?;
     output.publish()?;
     Ok(result)
 }
@@ -205,23 +212,47 @@ pub(crate) fn tags_filter_osc_to(
     input: &Path,
     output: &crate::output::BoundOutput,
     expression_strs: &[String],
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterOscStats> {
     let is_gz = crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
     host.invocation.marker("TAGSFILTEROSC_START");
+    // A fixed parallelism gets a pool of the call's own, built and dropped on
+    // this thread, outside the scope it serves. `collect` enters the pool
+    // through `ThreadPool::scope`, which installs, so its coordinator runs on
+    // a worker and yields to the encode jobs while it waits: one thread is
+    // enough. Under `Auto` the host's executor runs the workers.
+    let fixed_pool = match parallelism.fixed() {
+        Some(n) => {
+            host.invocation.counter("tagsfilter_worker_count", n);
+            Some(crate::joined_pool::JoinedPool::build(
+                "tags-filter OSC worker pool",
+                n,
+                &host.invocation,
+            )?)
+        }
+        None => None,
+    };
+    let executor = fixed_pool.as_ref().map_or_else(
+        || host.executor.borrowed(),
+        |pool| crate::host::ExecutorRef::Pool(pool.pool()),
+    );
     let inputs = [input];
     let plan = stream::Plan {
         inputs: &inputs,
         is_gz: false,
         readers: 1,
-        executor: host.executor.borrowed(),
+        executor,
         cancel: &host.invocation,
     };
     let expressions = expressions.as_slice();
     let batches = stream::collect(&plan, &|batch: &LexBatch, path: &Path| {
         filter_batch(batch, path, expressions)
-    })?;
+    });
+    // Joined before the document is written, on success and failure alike.
+    drop(fixed_pool);
+    let batches = batches?;
     let batches: Vec<FilteredBatch> = batches.into_iter().flatten().collect();
     host.invocation.check()?;
     let mut stats = TagsFilterOscStats::default();
@@ -779,19 +810,62 @@ mod tests {
         )
     }
 
-    fn rendered(input: &Path, output: &Path, exprs: &[String]) -> (Vec<u8>, String) {
-        let stats = tags_filter_osc(
+    /// How a differential run is scheduled: a fixed pool of the call's own,
+    /// or `Auto` on the ambient executor or on a caller's one-thread pool.
+    #[derive(Clone, Copy, Debug)]
+    enum Schedule {
+        Fixed(usize),
+        AutoAmbient,
+        AutoCallerPool,
+    }
+
+    const SCHEDULES: [Schedule; 5] = [
+        Schedule::Fixed(1),
+        Schedule::Fixed(2),
+        Schedule::Fixed(8),
+        Schedule::AutoAmbient,
+        Schedule::AutoCallerPool,
+    ];
+
+    fn filter_with(
+        input: &Path,
+        output: &Path,
+        exprs: &[String],
+        schedule: Schedule,
+    ) -> Result<TagsFilterOscStats> {
+        let mut host = crate::host::Host::for_tests();
+        let parallelism = match schedule {
+            Schedule::Fixed(n) => crate::host::Parallelism::from_jobs(n),
+            Schedule::AutoAmbient => crate::host::Parallelism::Auto,
+            Schedule::AutoCallerPool => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .map_err(|e| crate::Error::internal(e.to_string()))?;
+                host.executor = crate::host::Executor::Pool(std::sync::Arc::new(pool));
+                crate::host::Parallelism::Auto
+            }
+        };
+        tags_filter_osc(
             input,
             crate::output::Output::new(
                 output,
                 crate::output::Overwrite::Replace,
                 &crate::host::Diagnostics::discard(),
-            )
-            .unwrap(),
+            )?,
             exprs,
-            &crate::host::Host::entered_for_tests(),
+            parallelism,
+            &host,
         )
-        .unwrap();
+    }
+
+    fn rendered(
+        input: &Path,
+        output: &Path,
+        exprs: &[String],
+        schedule: Schedule,
+    ) -> (Vec<u8>, String) {
+        let stats = filter_with(input, output, exprs, schedule).unwrap();
         let mut summary = Vec::new();
         stats.write_summary(&mut summary).unwrap();
         (
@@ -856,13 +930,67 @@ mod tests {
         ] {
             let plain = dir.path().join("out.osc");
             let a = owned(&input, &plain, &exprs);
-            let b = rendered(&input, &plain, &exprs);
-            assert!(a == b, "{exprs:?}");
             let gz = dir.path().join("out.osc.gz");
             let (a_bytes, a_stats) = owned(&input, &gz, &exprs);
-            let (b_bytes, b_stats) = rendered(&input, &gz, &exprs);
-            assert_eq!(a_stats, b_stats, "{exprs:?}");
-            assert!(decompress(&a_bytes) == decompress(&b_bytes), "{exprs:?}");
+            for schedule in SCHEDULES {
+                let b = rendered(&input, &plain, &exprs, schedule);
+                assert!(a == b, "{exprs:?} {schedule:?}");
+                let (b_bytes, b_stats) = rendered(&input, &gz, &exprs, schedule);
+                assert_eq!(a_stats, b_stats, "{exprs:?} {schedule:?}");
+                assert!(
+                    decompress(&a_bytes) == decompress(&b_bytes),
+                    "{exprs:?} {schedule:?}"
+                );
+            }
+        }
+    }
+
+    /// Many batches of well-formed elements, then `tail`.
+    fn many_batches_then(dir: &Path, name: &str, tail: &str, close: bool) -> std::path::PathBuf {
+        let count = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 10;
+        let mut body = String::from("<osmChange version=\"0.6\"><create>");
+        for k in 0..count {
+            body.push_str(&format!(
+                "<node id=\"{k}\" lat=\"1\" lon=\"2\"><tag k=\"highway\" v=\"primary\"/></node>"
+            ));
+        }
+        body.push_str(tail);
+        if close {
+            body.push_str("</create></osmChange>");
+        }
+        let input = dir.join(name);
+        std::fs::write(&input, body).unwrap();
+        input
+    }
+
+    /// A defect after many good batches fails the run at every schedule,
+    /// one worker included: one the workers' replay refuses (a coordinate
+    /// the lexer frames but does not read) and one the reader refuses (a
+    /// truncated document).
+    #[test]
+    fn a_late_defect_fails_the_run_at_every_schedule() {
+        let dir = crate::path_guard::tests::scratch();
+        let exprs = ["highway".to_string()];
+        let replay = many_batches_then(
+            dir.path(),
+            "replay.osc",
+            "<node id=\"-1\" lat=\"north\" lon=\"2\"/>",
+            true,
+        );
+        let truncated = many_batches_then(
+            dir.path(),
+            "truncated.osc",
+            "<node id=\"-2\" lat=\"1\"",
+            false,
+        );
+        let out = dir.path().join("out.osc");
+        for schedule in SCHEDULES {
+            let err = filter_with(&replay, &out, &exprs, schedule).unwrap_err();
+            assert!(err.to_string().contains("node -1"), "{schedule:?}: {err}");
+            assert!(
+                filter_with(&truncated, &out, &exprs, schedule).is_err(),
+                "{schedule:?}"
+            );
         }
     }
 }

@@ -464,13 +464,16 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-112: tags-filter --input-kind osc and -j
+### WRK-135: TagsFilterOptions keeps two-pass knobs beside omit_referenced
 
-The OSC filter now runs its workers on the host executor (the ambient pool
-under the CLI), but `tags_filter_osc` takes no `Parallelism` and the CLI
-still refuses `-j` with OSC input. Threading a `Parallelism` through (a
-fixed pool, as merge-changes builds) would let `-j` cap it like every other
-pooled command; that is a CLI contract change (flag contract table, docs).
+`TagsFilterOptions` carries `omit_referenced` as a bool beside
+`remove_tags` and `parallelism`, which mean something only in the two-pass
+mode; `validate()` refuses a set `remove_tags` or a fixed `parallelism` with
+`omit_referenced` at run time. The session's mode-enum ruling (knobs of one
+mode live inside that mode) says these belong in a mode enum (single pass
+versus two-pass with `remove_tags` and `parallelism`), which would make the
+refusal unrepresentable in the library and leave it to the CLI. Library API
+break; CHANGELOG.
 
 ### WRK-037: ParallelGzipWriter window size
 

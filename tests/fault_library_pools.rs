@@ -1,5 +1,6 @@
 //! The rayon pools the library builds for a call (the pipelined reader's
-//! decode pool, merge-changes' `Parallelism::Fixed` pool) are joined before
+//! decode pool, the `Parallelism::Fixed` pools of merge-changes and the OSC
+//! tags-filter) are joined before
 //! the call ends: on success, after a build that failed part way, and during
 //! an unwind. Each test parks every pool thread after its rayon main loop
 //! returns (`FaultPlan::hold_built_pool_threads`), waits until exactly the
@@ -222,6 +223,56 @@ fn merge_changes_partial_build_failure_joins_the_spawned_threads() {
     assert!(
         err.to_string()
             .contains("failed to build merge-changes worker pool"),
+        "{err}"
+    );
+}
+
+fn tags_filter_osc_held(
+    jobs: usize,
+    expected: u64,
+) -> pbfhogg::Result<pbfhogg::tags_filter::osc::TagsFilterOscStats> {
+    let (dir, first, _second) = merge_inputs();
+    let host = crate::common::test_host();
+    let invocation = host.invocation.clone();
+    run_held(&invocation, expected, move || {
+        pbfhogg::tags_filter::osc::tags_filter_osc(
+            &first,
+            crate::common::out(dir.path().join("filtered.osc.gz")),
+            &["highway".to_string()],
+            pbfhogg::Parallelism::from_jobs(jobs),
+            &host,
+        )
+    })
+}
+
+#[test]
+fn tags_filter_osc_fixed_pool_is_joined_before_it_returns() {
+    let stats = tags_filter_osc_held(2, 2).unwrap();
+    assert_eq!(stats.creates_in, 1);
+}
+
+#[test]
+fn tags_filter_osc_partial_build_failure_joins_the_spawned_threads() {
+    let (dir, first, _second) = merge_inputs();
+    let host = crate::common::test_host();
+    let invocation = host.invocation.clone();
+    invocation
+        .faults()
+        .built_pool_spawn_fail_at
+        .store(1, SeqCst);
+    let err = run_held(&invocation, 1, move || {
+        pbfhogg::tags_filter::osc::tags_filter_osc(
+            &first,
+            crate::common::out(dir.path().join("filtered.osc.gz")),
+            &["highway".to_string()],
+            pbfhogg::Parallelism::from_jobs(3),
+            &host,
+        )
+    })
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("failed to build tags-filter OSC worker pool"),
         "{err}"
     );
 }

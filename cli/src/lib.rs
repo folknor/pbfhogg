@@ -669,9 +669,10 @@ fn validate_tags_filter(
     } else {
         "detected from the file; pass --input-kind pbf if it is a PBF"
     };
-    // Each flag that only means something for a PBF: an OSC is XML, read by
-    // one parser thread, with no blobs, no indexdata and no PBF header.
-    let refused: [(bool, &str, &str); 9] = [
+    // Each flag that only means something for a PBF: an OSC is XML, with no
+    // blobs, no indexdata and no PBF header. `-j` is not among them: it sizes
+    // the OSC filter's workers too.
+    let refused: [(bool, &str, &str); 8] = [
         (
             *omit_referenced,
             "-R/--omit-referenced",
@@ -691,11 +692,6 @@ fn validate_tags_filter(
             distrust.distrust_metadata,
             "--distrust-metadata",
             "OSC input carries no blob metadata",
-        ),
-        (
-            given(matches, "tags-filter", "jobs"),
-            "-j/--jobs",
-            "the OSC filter takes no worker count",
         ),
         (
             header.is_set(),
@@ -1016,7 +1012,7 @@ fn parse_start_ids(value: &str) -> Result<StartIds, String> {
 
 /// The one help text of `-j/--jobs`, on every command that has it.
 const JOBS_HELP: &str = "Worker threads: 0 (default) sizes the worker pools automatically, \
-     1 runs sequentially, N caps the worker pools at N threads. For diff, N is also the number \
+     1 runs one worker (the sequential path where there is one), N caps the worker pools at N threads. For diff, N is also the number \
      of ID-range shards";
 
 /// `-j/--jobs`: `0` is auto, any other count a cap.
@@ -2784,7 +2780,7 @@ pub fn run() -> process::ExitCode {
                 let (kind, expressions) = tags_filter_kind.unwrap_or((InputKind::Pbf, Vec::new()));
                 match kind {
                     InputKind::Osc => {
-                        run_tags_filter_osc(&file, output.open(&host)?, &expressions, &host)
+                        run_tags_filter_osc(&file, output.open(&host)?, &expressions, jobs, &host)
                     }
                     InputKind::Pbf => {
                         let write = WriteOptions {
@@ -4021,9 +4017,16 @@ fn run_tags_filter_osc(
     changes: &std::path::Path,
     output: pbfhogg::Output,
     expressions: &[String],
+    parallelism: pbfhogg::Parallelism,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, expressions, host)?;
+    let stats = pbfhogg::tags_filter::osc::tags_filter_osc(
+        changes,
+        output,
+        expressions,
+        parallelism,
+        host,
+    )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.osc.summary"))?;
     Ok(())
 }

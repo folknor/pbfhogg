@@ -2167,6 +2167,19 @@ runs lose only the run directory's creation and were not measured: brokkr
 passes `--tmp-dir` to every merge-changes, which those command lines now
 refuse.
 
+### OSC tags-filter takes -j (bygg, 2026-11-02)
+
+`tags_filter_osc` takes a `Parallelism`: `Fixed(n)` runs the batch workers
+on a pool of `n` built for the call, `Auto` on the host executor as before,
+so the default path is the same code. Planet 4913 `w/highway=primary`,
+`--bench 1 --force` cells, both arms built in the main tree on `befcab8e`
+(baseline: the two changed source files checked out from HEAD). Baseline
+2.440, 2.429, 2.435, 2.418 s; variant 2.599, 2.514, 2.411, 2.419 s. The
+two slow variant cells were each the first after a rebuild, as was the
+baseline's 2.440 s; warm cells agree within 1 %. Variant peak anon 135 MB,
+2.6 cores. Output at `-j 1`, `-j 8` and the default is byte-identical
+(sha256). brokkr refuses `-j` on this shape, so no `-j` sweep was measured.
+
 ### Simplify and OSC tags-filter on the batch readers (bygg, 2026-10-31)
 
 `--simplify` used to parse each input on one thread into owned elements,

@@ -65,8 +65,10 @@
 //! for a planet's node IDs) and its rank index, which follow the number of
 //! distinct IDs; each worker's decompressed blob (validated where it lies,
 //! never copied) and a fixed ID batch (`CHECK_LOCATIONS_KEY_BATCH`); and the retained violation
-//! details, at most `max_errors` per blob in flight and in total, but every
-//! violation when `max_errors` is zero. Way scanning streams one reference
+//! details. With a non-zero `max_errors`, each completed per-blob list and
+//! the report hold at most `max_errors` entries, while an accumulator
+//! still collecting holds up to `max(2 * max_errors, 64)` before it trims
+//! back; with `max_errors` zero every violation is kept. Way scanning streams one reference
 //! at a time, so a long way costs no worker memory. No scratch disk is used.
 
 mod scan;
@@ -93,9 +95,13 @@ use self::store::{Plan, SlotState, Store, in_partition, range_meets, slots_for_b
 /// Options for [`check_locations`].
 #[derive(Debug, Clone, Copy)]
 pub struct CheckLocationsOptions {
-    /// Options shared with the other checks. `direct_io` is accepted and has
-    /// no effect: the parallel readers pread unaligned blob ranges.
-    pub check: super::CheckOptions,
+    /// Maximum number of violation details to retain in the report. Zero
+    /// means unlimited. Scanning and exact counting continue past it; see the
+    /// module docs for what it bounds in flight.
+    pub max_errors: usize,
+    /// Accepted and has no effect: the parallel readers pread unaligned blob
+    /// ranges.
+    pub direct_io: bool,
     /// Also require the inline coordinates of every node the file does not
     /// contain to agree across all references to it. See the module docs for
     /// what it establishes and what it costs.
@@ -783,7 +789,7 @@ fn check_locations_inner(
     // less available than the run can use.
     let available = host.resources.memory_available();
     let mut walk = walk(&pin, host)?;
-    let cap = opts.check.max_errors;
+    let cap = opts.max_errors;
     let mut details = Details::new(cap);
     let mut report = LocationsReport {
         agreement: opts.agreement,
@@ -1362,10 +1368,8 @@ mod budget_tests {
 
     fn opts(pinned: Option<u64>) -> CheckLocationsOptions {
         CheckLocationsOptions {
-            check: super::super::CheckOptions {
-                max_errors: 0,
-                direct_io: false,
-            },
+            max_errors: 0,
+            direct_io: false,
             agreement: false,
             store_budget_bytes: pinned,
         }

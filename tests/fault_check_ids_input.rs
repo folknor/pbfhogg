@@ -21,7 +21,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use pbfhogg::check::CheckOptions;
 use pbfhogg::check::verify_ids::{VerifyIdsOptions, verify_ids};
 use pbfhogg::read::input::{InputSource, PinnedInput};
 
@@ -86,10 +85,8 @@ fn run<'a>(
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<serde_json::Value> {
     let opts = VerifyIdsOptions {
-        check: CheckOptions {
-            max_errors: 0,
-            direct_io: route.direct,
-        },
+        max_errors: 0,
+        direct_io: route.direct,
         full: route.full,
         type_filter: route.ways_only.then_some(pbfhogg::TypeFilter {
             nodes: false,
@@ -312,14 +309,14 @@ fn every_check_uses_a_caller_pin_as_it_is() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    let opts = CheckOptions {
+    let opts = pbfhogg::check::index::CheckIndexOptions {
         max_errors: 0,
         direct_io: false,
     };
     let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
-        check: opts,
+        direct_io: false,
         check_relations: false,
-        show_ids: false,
+        show_ids: None,
     };
     for force_path in [true, false] {
         for check in ["ids", "index", "refs"] {

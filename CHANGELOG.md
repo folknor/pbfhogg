@@ -61,6 +61,16 @@
     Option<apply_changes::LocationsOnWays { ignore_missing_nodes }>`.
     `ignore_missing_nodes` without `locations_on_ways` used to be accepted
     and ignored. The default is still `None`.
+  - `check::CheckOptions` is removed, and with it the `check` field of
+    `check::verify_ids::VerifyIdsOptions`, `check::locations::CheckLocationsOptions`
+    and `check::refs::CheckRefsOptions`. Each check's options carry
+    `direct_io` directly; the ID, index and location checks carry
+    `max_errors` directly too, and `check::index::CheckIndexOptions` is a
+    struct of its own instead of another name for `CheckOptions`. The
+    reference check's limit moves into `show_ids:
+    Option<check::refs::ShowIds { max_errors }>`, which replaces the
+    `show_ids` bool; `max_errors` without `show_ids` used to be accepted
+    and ignored.
 
 ### Added
 

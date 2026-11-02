@@ -34,8 +34,14 @@ fn not_after(id: i64, prev: i64) -> bool {
 
 /// Configuration for the `verify_ids` command.
 pub struct VerifyIdsOptions {
-    /// Options shared with the index and reference checks.
-    pub check: super::CheckOptions,
+    /// Maximum number of violations to retain in the report. Zero means
+    /// unlimited. This bounds the detail list, not the check's working
+    /// memory: scanning and exact counting continue past it.
+    pub max_errors: usize,
+    /// Read the input's front (header and first-blob probe) with `O_DIRECT`.
+    /// The blob reads are parallel preads of unaligned blob ranges that
+    /// ignore it.
+    pub direct_io: bool,
     /// When true, use `IdSet` per type to detect duplicate IDs.
     /// Increases memory usage but catches duplicates that monotonicity alone cannot.
     pub full: bool,
@@ -507,7 +513,7 @@ fn verify_ids_streaming_parallel(
     host.invocation.marker("VERIFYIDS_SCAN_START");
 
     let (header_sorted, indexed) =
-        crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
+        crate::commands::input_front::sorted_and_indexed(pin, opts.direct_io, host)?;
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
@@ -522,7 +528,7 @@ fn verify_ids_streaming_parallel(
         schedules,
         &type_filter,
         [None, None, None],
-        opts.check.max_errors,
+        opts.max_errors,
         host,
     )?;
 
@@ -880,7 +886,7 @@ fn verify_ids_full_parallel(
     // parallel_classify_phase reads through its own descriptor, the
     // shared_file from build_classify_schedules_split.
     let (header_sorted, indexed) =
-        crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
+        crate::commands::input_front::sorted_and_indexed(pin, opts.direct_io, host)?;
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
@@ -932,7 +938,7 @@ fn verify_ids_full_parallel(
             type_filter.ways.then_some(&mut way_ids),
             type_filter.relations.then_some(&mut relation_ids),
         ],
-        opts.check.max_errors,
+        opts.max_errors,
         host,
     )?;
 

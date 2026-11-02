@@ -247,9 +247,13 @@ against `Resources::memory_available`.
 
 ### WRK-122: bz pbfhogg#42, apply-changes' residual step after the node-to-way transition
 
-Blocked on brokkr#108 (attribution needs the sidecars of several
-interleaved `--force` cells, and `brokkr sidecar dirty` keeps only the
-last one).
+Every unstored `--force` cell keeps its own sidecar under its own id
+(`brokkr sidecar <prefix>`; brokkr prints the id since `07f32a6`), so
+interleaved cells can be read after the fact. The 2026-11-02 cells at
+`2cd85f7e` are all still there: arm `45939525` is `e5698c1a`,
+`a814c474`, `f5ef47d0`, `9f84e4d7`; arm `9f1c8a11` is `78df81c4`,
+`b968047d`, `008f6838`, `0436e917`. The malloc dumps and diagnostic
+scripts from that attribution are in `.plans/wrk122/` (git-ignored).
 
 Attributed and partly removed (reference/performance.md, "apply-changes'
 memory step at the node-to-way transition"): the 32 threads are rayon's
@@ -449,19 +453,19 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-139: CheckRefsOptions carries settings check-refs never or only sometimes reads
+### WRK-144: check accepts an explicit --max-errors no selected check reads
 
-`check::refs::CheckRefsOptions` embeds the shared `CheckOptions`, so it
-carries `max_errors` beside `show_ids` although every read of
-`max_errors` in `refs.rs` (the `Judge`, `append_capped_missing_refs`, the
-deferred relation refs) is gated on `show_ids`: without it the limit has no
-effect. Same rule as the tags-filter, getid and apply-changes mode
-payloads: the limit belongs inside a `show_ids` payload (e.g.
-`missing_ids: Option<MissingIds { max_errors }>`). Keep the ignored
-`CheckOptions::direct_io` where it is: ignored `direct_io` parameters are
-deliberate plumbing for the deferred CLI-surface redesign (see "What the
-maintainer has made clear"), so this item does not stop embedding
-`CheckOptions` to drop it. Library API break; CHANGELOG.
+`check --refs --max-errors 5` without `--show-ids` is accepted and the
+value reaches nothing: the reference check retains details only under
+`--show-ids`, and no other check is selected. `validate_check` refuses
+the analogous orphans (`--show-ids` and `--check-relations` under
+`--ids` alone, `--full` and `--type` under `--refs` alone) and `-q` with
+an explicit `--max-errors`, so this is the one shaping flag the no-op
+rule misses. A refusal would fire only when `--max-errors` is given
+explicitly (the `given` provenance check), only `--refs` is selected and
+`--show-ids` is absent; the default 100 must stay silent. CLI behaviour
+change; CHANGELOG, `docs/cli/commands.md` check section, and a
+`cli_flag_contract` row.
 
 ### WRK-140: degrade takes block_cap on every route, read only when it decodes
 
@@ -552,17 +556,6 @@ pipelined writer, so it needs its own matched A/B.
 ---
 
 ## Tooling
-
-### WRK-070: bz pbfhogg#18, sidecar --compare and repeated phase names
-
-Settled 2026-11-02 on two planet check-locations cells (six
-`CHECKLOC_PARTITION_START` segments each): `brokkr sidecar --compare`
-aligns run A by position but shows run B's first occurrence on every
-repeated row, fabricating +39 to +78 % deltas. Filed as brokkr#107
-(ordinal pairing wanted), which blocks pbfhogg#18. Until it lands, read
-repeated spans (check-locations partitions, multi-input cat `--clean`
-per-kind rows) from each cell's own `--human` or `--durations` view, not
-from `--compare`. Close pbfhogg#18 and this entry when brokkr#107 ships.
 
 ### WRK-071: inspect rows stored under other command names
 

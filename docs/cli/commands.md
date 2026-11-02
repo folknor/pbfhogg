@@ -842,7 +842,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--agreement` | Also require every inline coordinate of a node the file does not contain to agree across the ways referencing it. Requires `--locations` |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check). Limits the kinds whose IDs are judged; type order is judged over every kind |
-| `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue [default: 100] |
+| `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue. The ref check retains details only under `--show-ids` [default: 100] |
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
@@ -1064,9 +1064,10 @@ unchanged). More than 16 planned partitions draw a
 warning naming the count and the budget. The budget bounds the store only:
 the key set (about 1.7 GB over a planet's node ID range) follows the number
 of distinct IDs; each worker holds its decompressed blob, a copy for
-validation and a fixed ID batch; and retained violation details are at most
-`--max-errors` per blob in flight and in total, but unbounded with
-`--max-errors 0`. No scratch disk is used. A planet that keeps every node has
+validation and a fixed ID batch; and retained violation details: with a
+non-zero `--max-errors`, at most that many per finished blob and in the
+report, and up to twice that (at least 64) in a list still collecting
+before it trims back; unbounded with `--max-errors 0`. No scratch disk is used. A planet that keeps every node has
 about 10 billion slots, about 85 GB of store: on a host with 28 GB free that
 is several partitions, so the way blobs are read several times and, the
 planet being sorted, each node blob about twice (in an unsorted file a node

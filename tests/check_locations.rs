@@ -12,7 +12,6 @@
 use std::path::Path;
 
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
-use pbfhogg::check::CheckOptions;
 use pbfhogg::check::locations::{
     CheckLocationsOptions, LocationViolationKind, LocationsReport, check_locations,
 };
@@ -85,10 +84,8 @@ impl Fixture {
 
 fn opts(agreement: bool, budget: Option<u64>) -> CheckLocationsOptions {
     CheckLocationsOptions {
-        check: CheckOptions {
-            max_errors: 0,
-            direct_io: false,
-        },
+        max_errors: 0,
+        direct_io: false,
         agreement,
         store_budget_bytes: budget,
     }
@@ -636,7 +633,7 @@ fn retained_details_are_the_first_in_file_order() {
     Fixture::new(vec![nodes], vec![ways[..20].to_vec(), ways[20..].to_vec()]).write(&path);
     for budget in [None, Some(1), Some(50)] {
         let mut o = opts(false, budget);
-        o.check.max_errors = 3;
+        o.max_errors = 3;
         let report = check_locations(&path, &o, &crate::common::test_host())
             .unwrap()
             .complete()
@@ -672,7 +669,7 @@ fn capped_node_details_are_the_smallest_ids_across_partitions() {
     .write(&path);
     for budget in [None, Some(1), Some(9)] {
         let mut o = opts(false, budget);
-        o.check.max_errors = 2;
+        o.max_errors = 2;
         let report = check_locations(&path, &o, &crate::common::test_host())
             .unwrap()
             .complete()

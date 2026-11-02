@@ -26,10 +26,8 @@ fn verify_node_ids_with_max_errors(
     max_errors: usize,
 ) -> pbfhogg::check::verify_ids::VerifyIdsReport {
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
-        check: pbfhogg::check::CheckOptions {
-            max_errors,
-            direct_io: false,
-        },
+        max_errors,
+        direct_io: false,
         full: false,
         type_filter: None,
     };
@@ -43,29 +41,25 @@ fn verify_node_ids(path: &std::path::Path) -> pbfhogg::check::verify_ids::Verify
     verify_node_ids_with_max_errors(path, 16)
 }
 
+/// `show_ids` is the `--show-ids` detail cap, `None` for no details.
 fn run_check_refs(
     path: &std::path::Path,
     check_relations: bool,
-    show_ids: bool,
-    max_errors: usize,
+    show_ids: Option<usize>,
 ) -> pbfhogg::Result<pbfhogg::check::refs::RefCheckResult> {
-    check_refs_outcome(path, check_relations, show_ids, max_errors)
+    check_refs_outcome(path, check_relations, show_ids)
         .map(|outcome| outcome.complete().expect("check_refs completes"))
 }
 
 fn check_refs_outcome(
     path: &std::path::Path,
     check_relations: bool,
-    show_ids: bool,
-    max_errors: usize,
+    show_ids: Option<usize>,
 ) -> pbfhogg::Result<pbfhogg::check::CheckOutcome<pbfhogg::check::refs::RefCheckResult>> {
     let opts = pbfhogg::check::refs::CheckRefsOptions {
-        check: pbfhogg::check::CheckOptions {
-            max_errors,
-            direct_io: false,
-        },
+        direct_io: false,
         check_relations,
-        show_ids,
+        show_ids: show_ids.map(|max_errors| pbfhogg::check::refs::ShowIds { max_errors }),
     };
     pbfhogg::check::refs::check_refs(path, &opts, &crate::common::test_host())
 }
@@ -162,7 +156,7 @@ fn relation(id: i64, member: MemberId) -> TestRelation {
 
 /// Expect `check --refs` to refuse `path` as invalid data, naming `needle`.
 fn assert_refs_refused(path: &std::path::Path, check_relations: bool, needle: &str) {
-    let Err(e) = run_check_refs(path, check_relations, false, 0) else {
+    let Err(e) = run_check_refs(path, check_relations, None) else {
         panic!("{}: check_refs must refuse it", path.display());
     };
     assert!(
@@ -237,7 +231,7 @@ fn check_refs_refuses_the_negative_ids_it_compares() {
 
     // Passing counterpart: a negative way ID with relations off feeds no
     // comparison, so it is not refused, and the file is otherwise valid.
-    let report = run_check_refs(&neg_way, false, false, 0).expect("way IDs are not tracked");
+    let report = run_check_refs(&neg_way, false, None).expect("way IDs are not tracked");
     assert!(report.is_valid());
     assert_eq!(report.way_count, 1);
 }
@@ -260,7 +254,7 @@ fn check_refs_refuses_an_unknown_member_type() {
     assert_refs_refused(&path, true, "r3 has member 99 of unsupported member type 7");
 
     // Without relations the member is never looked at.
-    let report = run_check_refs(&path, false, false, 0).expect("relations are not scanned");
+    let report = run_check_refs(&path, false, None).expect("relations are not scanned");
     assert!(report.is_valid());
 }
 
@@ -279,7 +273,7 @@ fn check_refs_counts_unique_missing_ids_per_category_across_blobs() {
     ];
     crate::common::write_multi_block_test_pbf(&path, &[node(1)], &ways, &rels, 1);
 
-    let report = run_check_refs(&path, true, true, 0).expect("check_refs");
+    let report = run_check_refs(&path, true, Some(0)).expect("check_refs");
     assert_eq!(report.missing_node_refs, 3, "n5, n6 and n7, each once");
     assert_eq!(
         report.missing_node_members, 1,
@@ -361,12 +355,9 @@ fn check_refs_resolves_ids_above_the_allocation() {
     for path in [&indexed, &unindexed] {
         let host = crate::common::test_host();
         let opts = pbfhogg::check::refs::CheckRefsOptions {
-            check: pbfhogg::check::CheckOptions {
-                max_errors: 0,
-                direct_io: false,
-            },
+            direct_io: false,
             check_relations: true,
-            show_ids: true,
+            show_ids: Some(pbfhogg::check::refs::ShowIds { max_errors: 0 }),
         };
         let report = pbfhogg::check::refs::check_refs(path, &opts, &host)
             .expect("check_refs")
@@ -403,7 +394,7 @@ fn check_refs_resolves_ids_above_the_allocation() {
     // so the overflow path is what resolved them above.
     let without = dir.path().join("without.osm.pbf");
     write_test_pbf_sorted(&without, &nodes[..1], &ways, &relations);
-    let report = run_check_refs(&without, true, false, 0).expect("check_refs");
+    let report = run_check_refs(&without, true, None).expect("check_refs");
     assert_eq!(report.missing_node_refs, 1);
     assert_eq!(report.missing_node_members, 1);
 }
@@ -418,10 +409,8 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
 
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
-        check: pbfhogg::check::CheckOptions {
-            max_errors: 0,
-            direct_io: false,
-        },
+        max_errors: 0,
+        direct_io: false,
         full: true,
         type_filter: None,
     };
@@ -518,7 +507,7 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         ],
     );
 
-    let report = run_check_refs(&input, true, true, 0).expect("check_refs with show_ids");
+    let report = run_check_refs(&input, true, Some(0)).expect("check_refs with show_ids");
 
     assert_eq!(report.node_count, 1);
     assert_eq!(report.way_count, 1);
@@ -576,7 +565,7 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         "show_ids should preserve every missing-ref occurrence, including duplicate relation members"
     );
 
-    let limited = run_check_refs(&input, true, true, 2).expect("check_refs with max_errors");
+    let limited = run_check_refs(&input, true, Some(2)).expect("check_refs with max_errors");
     assert_eq!(limited.missing_refs.len(), 2);
     assert_eq!(limited.total_missing(), report.total_missing());
     assert_eq!(
@@ -584,7 +573,7 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         "limiting displayed details must not limit the counts"
     );
 
-    let counts_only = run_check_refs(&input, true, false, 0).expect("check_refs without show_ids");
+    let counts_only = run_check_refs(&input, true, None).expect("check_refs without show_ids");
     assert!(
         counts_only.missing_refs.is_empty(),
         "show_ids=false should not materialize missing_refs"
@@ -677,10 +666,8 @@ fn verify_ids_limited(
     max_errors: usize,
 ) -> pbfhogg::check::CheckOutcome<pbfhogg::check::verify_ids::VerifyIdsReport> {
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
-        check: pbfhogg::check::CheckOptions {
-            max_errors,
-            direct_io: false,
-        },
+        max_errors,
+        direct_io: false,
         full,
         type_filter,
     };
@@ -695,7 +682,7 @@ fn the_relabel_fixture_fails_both_checks_honestly() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("honest.osm.pbf");
     write_relabel_fixture(&path);
-    let refs = run_check_refs(&path, false, false, 0).expect("check_refs");
+    let refs = run_check_refs(&path, false, None).expect("check_refs");
     assert_eq!(refs.missing_node_refs, 1, "n99");
     let ids = verify_ids_outcome(&path, true, None)
         .complete()
@@ -712,7 +699,7 @@ fn check_refs_stops_on_a_way_blob_claiming_another_kind() {
     let as_node = relabelled_way_blob(dir.path(), 0);
     for check_relations in [false, true] {
         assert_stopped(
-            check_refs_outcome(&as_node, check_relations, false, 0).expect("check_refs runs"),
+            check_refs_outcome(&as_node, check_relations, None).expect("check_refs runs"),
             pbfhogg::ElementKind::Node,
             &format!("claims node, check_relations {check_relations}"),
         );
@@ -720,13 +707,13 @@ fn check_refs_stops_on_a_way_blob_claiming_another_kind() {
 
     let as_relation = relabelled_way_blob(dir.path(), 2);
     assert_stopped(
-        check_refs_outcome(&as_relation, true, false, 0).expect("check_refs runs"),
+        check_refs_outcome(&as_relation, true, None).expect("check_refs runs"),
         pbfhogg::ElementKind::Relation,
         "claims relation, check_relations",
     );
     // Without `check_relations` no phase decodes a blob claiming relations:
     // the gap `check --index` covers, pinned so a change to it is deliberate.
-    let unseen = check_refs_outcome(&as_relation, false, false, 0)
+    let unseen = check_refs_outcome(&as_relation, false, None)
         .expect("check_refs runs")
         .complete()
         .expect("the relation-claimed blob is never decoded");
@@ -950,9 +937,9 @@ fn check_refs_judges_an_unindexed_file_as_its_indexed_twin_in_any_order() {
     ];
 
     for check_relations in [false, true] {
-        for show_ids in [false, true] {
+        for show_ids in [None, Some(0)] {
             let want = refs_summary(
-                &run_check_refs(&indexed, check_relations, show_ids, 0).expect("indexed"),
+                &run_check_refs(&indexed, check_relations, show_ids).expect("indexed"),
             );
             for (name, blobs) in &orders {
                 let path = dir.path().join(format!("{name}.osm.pbf"));
@@ -963,18 +950,16 @@ fn check_refs_judges_an_unindexed_file_as_its_indexed_twin_in_any_order() {
                     pbfhogg::host::Invocation::with_sink(std::sync::Arc::clone(&counters)
                         as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>);
                 let opts = pbfhogg::check::refs::CheckRefsOptions {
-                    check: pbfhogg::check::CheckOptions {
-                        max_errors: 0,
-                        direct_io: false,
-                    },
+                    direct_io: false,
                     check_relations,
-                    show_ids,
+                    show_ids: show_ids
+                        .map(|max_errors| pbfhogg::check::refs::ShowIds { max_errors }),
                 };
                 let report = pbfhogg::check::refs::check_refs(&path, &opts, &host)
                     .expect("check_refs")
                     .complete()
                     .expect("completes");
-                let what = format!("{name}, relations {check_relations}, show_ids {show_ids}");
+                let what = format!("{name}, relations {check_relations}, show_ids {show_ids:?}");
                 assert_eq!(refs_summary(&report), want, "{what}");
                 assert_eq!(counters.get("checkrefs_unindexed_blobs"), 5, "{what}");
                 assert_eq!(counters.get("checkrefs_node_blobs"), 0, "{what}");

@@ -15,21 +15,6 @@ pub mod locations;
 pub mod refs;
 pub mod verify_ids;
 
-/// Options shared by the ID, index, reference and location checks.
-#[derive(Debug, Clone, Copy)]
-pub struct CheckOptions {
-    /// Maximum number of detail entries to retain in this check.
-    /// Zero means unlimited. This bounds the report's detail list, not the
-    /// check's working memory: exact counting and deferred reference checks
-    /// retain intermediate data independently of this display limit.
-    pub max_errors: usize,
-    /// Read the input with `O_DIRECT` where the check supports it: the index
-    /// check's reads and the ID check's front read. The reference and
-    /// location checks, and the ID check's blob reads, are parallel preads of
-    /// unaligned blob ranges that ignore it.
-    pub direct_io: bool,
-}
-
 /// How a check over a file ended: it ran to completion, or it stopped at a
 /// blob whose decoded elements contradict the blob's indexdata kind claim.
 ///

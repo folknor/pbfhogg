@@ -2227,7 +2227,8 @@ enum Command {
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
         /// Retain at most N violation details per check (0 = unlimited);
-        /// the scan still runs to the end and the counts stay exact
+        /// the scan still runs to the end and the counts stay exact. The ref
+        /// check retains details only under --show-ids
         #[arg(long, default_value = "100")]
         max_errors: usize,
         /// Machine-readable JSON output. Not with -q, which drops the report
@@ -3612,10 +3613,8 @@ fn run_check(
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
-    let check_options = pbfhogg::check::CheckOptions {
-        max_errors,
-        direct_io,
-    };
+    // One --max-errors and one --direct-io go to every selected check, each
+    // of which retains its own details: there is no shared detail budget.
 
     // With two or more checks selected (a bare `check` is ids then refs) the
     // run is several library calls on one input, each opening it afresh, so
@@ -3654,7 +3653,8 @@ fn run_check(
             );
         }
         let opts = pbfhogg::check::locations::CheckLocationsOptions {
-            check: check_options,
+            max_errors,
+            direct_io,
             agreement,
             store_budget_bytes: None,
         };
@@ -3670,7 +3670,8 @@ fn run_check(
     let ids_report = if run_ids {
         use pbfhogg::check::verify_ids::VerifyIdsOptions;
         let opts = VerifyIdsOptions {
-            check: check_options,
+            max_errors,
+            direct_io,
             full,
             type_filter,
         };
@@ -3684,7 +3685,11 @@ fn run_check(
     };
 
     let index_report = if run_index {
-        let report = pbfhogg::check::index::check_index(input, &check_options, host)?;
+        let opts = pbfhogg::check::index::CheckIndexOptions {
+            max_errors,
+            direct_io,
+        };
+        let report = pbfhogg::check::index::check_index(input, &opts, host)?;
         if !report.passed() {
             failed = true;
         }
@@ -3703,10 +3708,12 @@ fn run_check(
                 ),
             );
         }
+        // Without --show-ids refs retains no details, so --max-errors (still
+        // read by the other checks a run may select) does not reach it.
         let opts = pbfhogg::check::refs::CheckRefsOptions {
-            check: check_options,
+            direct_io,
             check_relations,
-            show_ids,
+            show_ids: show_ids.then_some(pbfhogg::check::refs::ShowIds { max_errors }),
         };
         let result = pbfhogg::check::refs::check_refs(input, &opts, host)?;
         if !result.passed(pbfhogg::check::refs::RefCheckResult::is_valid) {

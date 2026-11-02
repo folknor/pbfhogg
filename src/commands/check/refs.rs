@@ -15,7 +15,7 @@ use crate::scan::classify::{
 };
 use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
-/// A single missing reference entry (populated when `show_ids` is true).
+/// A single missing reference entry (populated under `show_ids`).
 pub struct MissingRef {
     /// The missing element, e.g. "n123".
     pub missing_type: char,
@@ -38,8 +38,9 @@ pub struct RefCheckResult {
     /// May exceed `missing_relation_members` when multiple relations reference
     /// the same missing relation.
     pub missing_relation_member_occurrences: u64,
-    /// Missing reference occurrences retained for display when `show_ids` is
-    /// true. Limited by the shared `max_errors` value unless it is zero.
+    /// Missing reference occurrences retained under
+    /// [`CheckRefsOptions::show_ids`], at most [`ShowIds::max_errors`] unless
+    /// it is zero. Empty when `show_ids` is `None`.
     pub missing_refs: Vec<MissingRef>,
 }
 
@@ -73,7 +74,7 @@ struct WayBlobResult {
     missing_node_ref_occurrences: u64,
     /// The distinct missing node IDs, sorted (`sort_dedup`).
     missing_node_refs: Vec<i64>,
-    /// Populated only when `show_ids` is true.
+    /// Populated only under `show_ids`.
     missing_refs: Vec<MissingRef>,
 }
 
@@ -92,23 +93,35 @@ struct RelBlobResult {
     missing_node_members: Vec<i64>,
     missing_way_refs: Vec<i64>,
     deferred_relation_refs: Vec<i64>,
-    /// Parallel to `deferred_relation_refs`, populated only when `show_ids` is true.
+    /// Parallel to `deferred_relation_refs`, populated only under `show_ids`.
     deferred_relation_ref_sources: Vec<i64>,
-    /// Populated only when `show_ids` is true.
+    /// Populated only under `show_ids`.
     missing_refs: Vec<MissingRef>,
 }
 
 /// Options for [`check_refs`].
 #[derive(Debug, Clone, Copy)]
 pub struct CheckRefsOptions {
-    /// Options shared with the ID and index checks. `direct_io` is accepted
-    /// and has no effect: the check reads only through the schedule walk and
-    /// the parallel readers' unaligned blob preads.
-    pub check: super::CheckOptions,
+    /// Accepted and has no effect: the check reads only through the schedule
+    /// walk and the parallel readers' unaligned blob preads.
+    pub direct_io: bool,
     /// Also check relation member references.
     pub check_relations: bool,
-    /// Retain missing reference IDs up to `check.max_errors`, or all if zero.
-    pub show_ids: bool,
+    /// Retain each missing reference occurrence with the element referencing
+    /// it in [`RefCheckResult::missing_refs`]. `None` retains none; the
+    /// counts are the same either way.
+    pub show_ids: Option<ShowIds>,
+}
+
+/// Settings of [`CheckRefsOptions::show_ids`].
+#[derive(Debug, Clone, Copy)]
+pub struct ShowIds {
+    /// Maximum number of missing reference occurrences to retain. Zero means
+    /// unlimited. This bounds the detail list, not the check's working
+    /// memory: scanning and exact counting continue past it, and every
+    /// deferred relation-to-relation reference keeps its source until the
+    /// relation phase has judged it.
+    pub max_errors: usize,
 }
 
 /// Sort and deduplicate one blob's missing IDs in the worker, so the serial
@@ -249,8 +262,8 @@ fn append_capped_missing_refs(
 /// Two stores still grow with occurrences. Relation-to-relation members are
 /// deferred until every relation ID is known, one `i64` each (plus their
 /// source under `show_ids`); a valid file holds few, but nothing bounds
-/// them. And `max_errors` caps retained display details only when non-zero:
-/// `max_errors == 0` keeps one detail per missing occurrence.
+/// them. And [`ShowIds::max_errors`] caps retained display details only when
+/// non-zero: zero keeps one detail per missing occurrence.
 ///
 /// # Negative IDs
 ///
@@ -305,8 +318,16 @@ pub fn check_refs<'a>(
 #[derive(Clone, Copy)]
 struct Judge {
     check_relations: bool,
-    show_ids: bool,
-    max_errors: usize,
+    show_ids: Option<ShowIds>,
+}
+
+impl Judge {
+    /// Whether a missing reference found with `retained` details already
+    /// held is retained as one more.
+    fn keeps_detail(self, retained: usize) -> bool {
+        self.show_ids
+            .is_some_and(|show_ids| should_store_missing_ref(retained, show_ids.max_errors))
+    }
 }
 
 /// The ID sets every judgement reads, and the phases write.
@@ -356,9 +377,7 @@ fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Resu
                     return Err(negative_ref_error('w', wid, 'n', nref));
                 }
                 r.missing_node_refs.push(nref);
-                if judge.show_ids
-                    && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
-                {
+                if judge.keeps_detail(r.missing_refs.len()) {
                     r.missing_refs.push(MissingRef {
                         missing_type: 'n',
                         missing_id: nref,
@@ -402,9 +421,7 @@ fn judge_relations(
                             return Err(negative_ref_error('r', rid, 'n', id));
                         }
                         r.missing_node_members.push(id);
-                        if judge.show_ids
-                            && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
-                        {
+                        if judge.keeps_detail(r.missing_refs.len()) {
                             r.missing_refs.push(MissingRef {
                                 missing_type: 'n',
                                 missing_id: id,
@@ -421,9 +438,7 @@ fn judge_relations(
                             return Err(negative_ref_error('r', rid, 'w', id));
                         }
                         r.missing_way_refs.push(id);
-                        if judge.show_ids
-                            && should_store_missing_ref(r.missing_refs.len(), judge.max_errors)
-                        {
+                        if judge.keeps_detail(r.missing_refs.len()) {
                             r.missing_refs.push(MissingRef {
                                 missing_type: 'w',
                                 missing_id: id,
@@ -441,7 +456,10 @@ fn judge_relations(
                     }
                     r.rel_rel_members_deferred += 1;
                     r.deferred_relation_refs.push(id);
-                    if judge.show_ids {
+                    // Every deferred reference keeps its source, uncapped:
+                    // which of them turn out missing is known only after
+                    // the relation phase.
+                    if judge.show_ids.is_some() {
                         r.deferred_relation_ref_sources.push(rid);
                     }
                 }
@@ -508,8 +526,8 @@ impl Tally {
         for id in r.missing_node_refs {
             self.missing_nodes_in_ways.set(id);
         }
-        if judge.show_ids {
-            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, judge.max_errors);
+        if let Some(show_ids) = judge.show_ids {
+            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, show_ids.max_errors);
         }
     }
 
@@ -528,10 +546,10 @@ impl Tally {
             self.missing_ways_in_relations.set(id);
         }
         self.deferred_relation_refs.extend(r.deferred_relation_refs);
-        if judge.show_ids {
+        if let Some(show_ids) = judge.show_ids {
             self.deferred_relation_ref_sources
                 .extend(r.deferred_relation_ref_sources);
-            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, judge.max_errors);
+            append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, show_ids.max_errors);
         }
     }
 }
@@ -737,9 +755,8 @@ fn check_refs_inner(
     let judge = Judge {
         check_relations: opts.check_relations,
         show_ids: opts.show_ids,
-        max_errors: opts.check.max_errors,
     };
-    // `opts.check.direct_io` is accepted and has no effect: every read here
+    // `opts.direct_io` is accepted and has no effect: every read here
     // is the schedule walk or a `parallel_project_phase` pread of an
     // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
     // when the flag is given.
@@ -876,13 +893,12 @@ fn check_refs_inner(
         let mut missing_relation_members = IdSet::new();
         let mut occurrences: u64 = 0;
         // `deferred_relation_ref_sources` is parallel to
-        // `deferred_relation_refs` when `show_ids` is set, and empty otherwise.
+        // `deferred_relation_refs` under `show_ids`, and empty otherwise.
         for (i, &id) in tally.deferred_relation_refs.iter().enumerate() {
             if !sets.relations.get(id) {
                 missing_relation_members.set(id);
                 occurrences += 1;
-                if judge.show_ids && should_store_missing_ref(missing_refs.len(), judge.max_errors)
-                {
+                if judge.keeps_detail(missing_refs.len()) {
                     missing_refs.push(MissingRef {
                         missing_type: 'r',
                         missing_id: id,

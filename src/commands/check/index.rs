@@ -89,8 +89,15 @@ use crate::read::decompress::decompress_blob_data_into;
 use crate::read::frame::Frames;
 use crate::read::input::InputSource;
 
-/// Compatibility name for the options shared by all check modes.
-pub type CheckIndexOptions = super::CheckOptions;
+/// Options for [`check_index`].
+#[derive(Debug, Clone, Copy)]
+pub struct CheckIndexOptions {
+    /// Maximum number of violations to retain in the report. Zero means
+    /// unlimited. Scanning and the violation count continue past it.
+    pub max_errors: usize,
+    /// Read the input with `O_DIRECT`.
+    pub direct_io: bool,
+}
 
 /// One way a blob's stored metadata disagrees with the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]

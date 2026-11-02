@@ -124,8 +124,8 @@ impl StreamingBlocks {
     /// selected phases give, so no element of a selected kind can leave the
     /// stream unseen.
     ///
-    /// The elements of a dropped block are iterated to classify it but never
-    /// compared or printed, so element-level faults (a tag or role whose
+    /// A dropped block is classified by the kinds its validation counted;
+    /// its elements are never compared or printed, so element-level faults (a tag or role whose
     /// string index is out of range) and the order of elements within an
     /// excluded kind go unchecked: they cannot change an answer about the
     /// selected kinds. Decompression and block parsing still run
@@ -225,14 +225,19 @@ enum BlockKinds {
 
 /// Classify `block` by the elements [`PrimitiveBlock::elements`] yields - what
 /// a conversion would see - rather than by the first field of each group.
+/// Read from the kinds block construction's validation counted
+/// ([`PrimitiveBlock::kinds`]: one per plain node, way and relation message,
+/// and a dense group only when it holds an ID), which are exactly the kinds
+/// that walk yields, so the block is not walked a second time.
 fn element_kinds(block: &PrimitiveBlock) -> BlockKinds {
+    let kinds = block.kinds();
     let mut found: Option<ElementKind> = None;
-    for element in block.elements_skip_metadata() {
-        let kind = element_kind(&element);
-        match found {
-            None => found = Some(kind),
-            Some(k) if k == kind => {}
-            Some(_) => return BlockKinds::Several,
+    for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+        if kinds.has(kind) {
+            if found.is_some() {
+                return BlockKinds::Several;
+            }
+            found = Some(kind);
         }
     }
     found.map_or(BlockKinds::Empty, BlockKinds::One)
@@ -1032,7 +1037,9 @@ impl<'a> BlockPairSide<'a> {
 /// the index of the first element at or past its end (the block's length
 /// when none is), and the ID of the last element inside. Counted from the
 /// elements, so a clipped run's count is exact. Order within the block is
-/// trusted, as everywhere in the engine.
+/// trusted, as everywhere in the engine. It reads only IDs but walks the
+/// built block on purpose: the merge runs over that block next, and only
+/// the blocks a window edge crosses are clipped.
 fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>, Option<i64>) {
     let mut skip = 0usize;
     let mut len = 0usize;

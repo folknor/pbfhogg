@@ -398,6 +398,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     host.invocation.marker("PASS1_NODE_CLASSIFY_END");
 
     // Phase 2: Classify ways by ref intersection with bbox nodes.
+    //
+    // Deliberately a block walk, not a projection (shared by smart and
+    // complete). Reading each blob through `read::project_ids::WaySpans`
+    // was built and measured at planet (Europe bbox, smart): this phase
+    // stayed at 16.6-16.9 s, since every way's refs are scanned against the
+    // node set and that, not the message re-parse a projection removes, is
+    // its cost (reference/performance.md, "inspect --nodes reads through a
+    // projection").
     host.invocation.marker("PASS1_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
@@ -430,6 +438,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     host.invocation.marker("PASS1_WAY_CLASSIFY_END");
 
     // Phase 3: Classify relations by member intersection.
+    //
+    // A block walk on purpose: the whole phase is about 1 s at planet
+    // (0.9-1.2 s, bygg), so the re-parse a projection would remove sits
+    // under the noise floor of a 130 s run; smart also reads the relation
+    // tags (`is_smart_relation`).
     host.invocation.marker("PASS1_RELATION_CLASSIFY_START");
     let collect_member_ids = H::COLLECT_MEMBER_IDS;
     crate::scan::classify::parallel_classify_accumulate(
@@ -555,6 +568,11 @@ pub(super) fn extract_smart(
         // memory peak it was originally framed as fixing turned out to be
         // elsewhere (cold-arena-page residency cascade, addressed by the
         // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
+        // Deliberately a block walk. On `WaySpans` restricted to
+        // `extra_way_ids` this phase went from 10.1 s to 8.7 s at planet,
+        // but the command moved by under 1 % (131.9 s against 131.5 s
+        // median), noise for a 130 s run (reference/performance.md,
+        // "inspect --nodes reads through a projection").
         host.invocation.marker("SMART_PASS2_CLASSIFY_START");
         crate::scan::classify::parallel_classify_phase(
             &shared_file,

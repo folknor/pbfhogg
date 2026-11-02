@@ -506,7 +506,11 @@ pub(super) fn detect_stale_wire(
 }
 
 /// Detection on a way blob already parsed (and so validated) into a
-/// `PrimitiveBlock`, whose ways all survive the merge.
+/// `PrimitiveBlock`, whose ways all survive the merge. It walks that block
+/// rather than a projection on purpose: the block exists already (the
+/// precise check built it), so a projection would validate the blob a
+/// second time to save a walk, and a stale verdict needs the block for the
+/// rewrite.
 pub(super) fn detect_stale_block(
     block: &crate::PrimitiveBlock,
     probe: &StaleProbe,

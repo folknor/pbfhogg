@@ -551,6 +551,9 @@ fn extract_simple_single_pass(
 
     host.invocation.marker("SIMPLE_WAY_WRITE_END");
     // --- Phase 3: Classify relations + write (pread-from-workers) ---
+    // The classify is a block walk on purpose: about 0.3 s at planet, so
+    // the re-parse a projection would remove sits under the command's
+    // noise floor.
     host.invocation.marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {

@@ -197,8 +197,10 @@ cancellation is checked before each frame, not during its reads).
 These paths were evaluated and chose non-pipelined primitives, and
 should stay that way:
 
-- `inspect --nodes`, `inspect --tags` - `parallel_classify_accumulate`
-  / `_phase` (pread workers)
+- `inspect --nodes` - `parallel_project_accumulate` (pread workers, a
+  projection on the block validator)
+- `inspect --tags` - `parallel_classify_accumulate` / `_phase` (pread
+  workers)
 - `inspect` default / `inspect --indexed` - `HeaderWalker`
   (pread-only header walk)
 - `check --ids` (streaming and `--full`) and `check --refs` -

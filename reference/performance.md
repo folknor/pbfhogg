@@ -2995,9 +2995,9 @@ reservation and the serialization together. Even there the append is
 wall, a throughput share rather than a bound. Separate storage would not
 remove the table bytes, only move them; what it would remove is a moving
 realloc's transient old payload per active decoder and any allocator
-retention of it, neither measured. It was not built. time-filter at the
-same commit builds no block (its decode phase projects), so it never
-appends.
+retention of it, neither measured. It was not built. time-filter's
+snapshot path builds a block per blob on the ordered pool, so it
+appends like cat `--clean`; it was not measured separately.
 
 ## Payloads validated where they lie (bygg, 2026-11-02, against `7feb4370`)
 
@@ -3040,6 +3040,41 @@ the HEAD cell and 18.9 s in the second change cell. That config nominates no can
 lies inside a region), so this measures the restructured pass, not the
 removed copy; extract `--simple`'s candidate validation likewise never
 runs on the planet bbox and was not measured.
+
+## inspect --nodes reads through a projection (bygg, 2026-11-02, against `5ec5eefc`)
+
+`inspect --nodes` reads each node blob through a projection on the block
+validator (`NodeCoords`, on the accumulate pool's projection twin)
+instead of building a `PrimitiveBlock` and walking every node: a dense
+group's validated `lat` and `lon` arrays are decoded once the blob is
+accepted, where the element walk stepped `id`, `lat`, `lon` and
+`keys_vals` per node. Planet `planet-20260223-with-indexdata`, default
+`-j`, interleaved `--bench 1`, both arms built in the main tree (HEAD
+cells stored, change cells unstored `--force`), arm order alternated:
+
+| Pair | HEAD | Change |
+|---|---:|---:|
+| 1 (change first) | 26.03 s (`2dcddb68`) | 22.46 s |
+| 2 (HEAD first) | 25.98 s (`c4ad8414`) | 22.36 s |
+
+-14 % wall. The scan phase (after the 6.6-6.8 s schedule walk both arms
+share) went from 19.25 and 19.23 s at 25.3 cores to 15.60 and 15.71 s
+at 21.7 cores, reading about 3.8 GB/s; peak anon 308 to 296 MB.
+
+The same session measured the way passes that read only IDs and refs,
+moved onto `read::project_ids::WaySpans` and kept as block walks, since
+none moves its command past the noise floor (same arm protocol):
+
+| Command | HEAD | Projection probe | Phase, HEAD to probe |
+|---|---:|---:|---|
+| tags-filter `w/highway=primary` | 75.72, 75.77 s (`2612d0fa`, `d7b43157`) | 73.81, 74.22 s | way-dependency walk after its schedule loop 10.27, 10.24 to 8.68, 8.74 s |
+| extract `--smart`, Europe bbox | 132.05, 131.81 s (`abc90310`, `2b604dda`) | 131.94, 130.99 s | `PASS1_WAY_CLASSIFY` 16.78, 16.63 to 16.88, 16.85 s; `SMART_PASS2_CLASSIFY` 10.08, 10.06 to 8.64, 8.70 s |
+
+A pass that tests a few way IDs against a set gains about 1.5 s, the
+way-message re-parse a projection removes (2.3 % of tags-filter, under
+1 % of smart). A pass that scans every way's refs against a node set
+(smart and complete pass 1, multi-extract's way classify by the same
+shape) gains nothing measurable: the ref lookups are its cost.
 
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 

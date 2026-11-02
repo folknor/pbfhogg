@@ -86,6 +86,14 @@ fn blob_is_passthrough(kind: Option<crate::ElementKind>, keep_untagged_nodes: bo
 /// Every relation's ID goes to `walk`, memberless ones included, so the
 /// caller can hold the blob's claim to what it holds. The block holds only
 /// relations: both callers refuse a foreign kind first.
+///
+/// A built block on purpose, not a projection on the block validator: it
+/// reads the `type` tag as well as the members, and the scan is not worth
+/// moving. External runs it on its own thread beside stage 1's pass A
+/// (planet: about 10 s inside a 32 s pass A), off the critical path; sparse
+/// runs it on the parallel pool over the relation blobs only, which
+/// extract's relation classify reads in about 1 s at planet (an estimate:
+/// no planet sparse cell is recorded), under that command's noise floor.
 fn relation_member_ids(
     block: &PrimitiveBlock,
     want_nodes: bool,

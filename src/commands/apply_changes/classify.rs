@@ -67,6 +67,14 @@ pub(super) fn blob_walk(claim: Option<&BlobIndex>) -> BlobWalk<'_> {
 /// block has a matching diff ID). The worker separately checks for
 /// upserts inside the blob's range and rewrites it when any are present,
 /// so those creates are interleaved at their sorted positions.
+///
+/// It reads only IDs but walks a built block on purpose, not a projection
+/// on the block validator: almost every decoded candidate is a hit that
+/// needs the block for its rewrite (43,671 of 43,687 at planet seq 4913,
+/// bygg), so a projection would still build it, and the walk ends at the
+/// first hit. The whole check is about 83 of roughly 2,500 worker
+/// core-seconds there (`merge_streaming_precise_ns`), under the noise floor
+/// even if a projection removed all of it.
 pub(super) fn block_overlaps_diff(
     block: &PrimitiveBlock,
     ranges: &DiffRanges,

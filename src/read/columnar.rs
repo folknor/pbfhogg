@@ -10,6 +10,42 @@
 use super::region_grid::RegionGrid;
 use super::wire::{PackedSint64Iter, WireDenseNodes};
 
+/// A coordinate in decimicrodegrees from its absolute wire value (a dense
+/// group's cumulative delta sum, or a plain node's `lat` / `lon`): the
+/// element accessors' arithmetic step for step (`nano_lat` then
+/// `decimicro_lat`), nanodegrees = offset + granularity * value modulo
+/// 2^64, then / 100 truncating toward zero and narrowed by `as i32`.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn decimicro(offset: i64, granularity: i64, value: i64) -> i32 {
+    (offset.wrapping_add(granularity.wrapping_mul(value)) / 100) as i32
+}
+
+/// A dense group's coordinates in decimicrodegrees, in node order, decoded
+/// from its validated `lat` and `lon` arrays as [`DenseNodeColumns::decode_append`]
+/// and the dense element iterator decode them. The validator holds the two
+/// arrays to one length; the zip would stop at the shorter otherwise.
+pub(crate) fn dense_decimicro_coords<'a>(
+    lat_data: &'a [u8],
+    lon_data: &'a [u8],
+    granularity: i32,
+    lat_offset: i64,
+    lon_offset: i64,
+) -> impl Iterator<Item = (i32, i32)> + 'a {
+    let gran = i64::from(granularity);
+    let (mut lat, mut lon) = (0_i64, 0_i64);
+    PackedSint64Iter::new(lat_data)
+        .zip(PackedSint64Iter::new(lon_data))
+        .map(move |(dlat, dlon)| {
+            lat = lat.wrapping_add(dlat);
+            lon = lon.wrapping_add(dlon);
+            (
+                decimicro(lat_offset, gran, lat),
+                decimicro(lon_offset, gran, lon),
+            )
+        })
+}
+
 /// Decoded dense node columns - contiguous arrays of IDs and coordinates.
 ///
 /// All three arrays have the same length (`count`). Coordinates are in
@@ -72,7 +108,6 @@ impl DenseNodeColumns {
     /// that a disagreement cannot become an out-of-bounds index downstream,
     /// and `validate_block` in `block.rs` rejects the disagreement
     /// outright at block construction.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn decode_append(
         &mut self,
         dense: &WireDenseNodes<'_>,
@@ -111,15 +146,13 @@ impl DenseNodeColumns {
         let mut cumulative_lat: i64 = 0;
         for delta in PackedSint64Iter::new(dense.lat_data) {
             cumulative_lat = cumulative_lat.wrapping_add(delta);
-            let nano = lat_offset.wrapping_add(gran.wrapping_mul(cumulative_lat));
-            self.lats.push((nano / 100) as i32);
+            self.lats.push(decimicro(lat_offset, gran, cumulative_lat));
         }
 
         let mut cumulative_lon: i64 = 0;
         for delta in PackedSint64Iter::new(dense.lon_data) {
             cumulative_lon = cumulative_lon.wrapping_add(delta);
-            let nano = lon_offset.wrapping_add(gran.wrapping_mul(cumulative_lon));
-            self.lons.push((nano / 100) as i32);
+            self.lons.push(decimicro(lon_offset, gran, cumulative_lon));
         }
     }
 

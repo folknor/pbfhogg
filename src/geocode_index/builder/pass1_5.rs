@@ -426,6 +426,13 @@ pub(super) fn build_pass2_schedules(
     // A blob holding both nodes and ways (legal, never indexed by pbfhogg)
     // goes into both schedules; Phase 2a completes before Phase 2b starts,
     // so the in-blob order of the two kinds does not matter.
+    //
+    // This walk reads only node IDs and kinds, yet builds each block on
+    // purpose. It runs only on blobs without indexdata (`--force`), and an
+    // estimate says moving it to a projection (`read::project_ids::KindIds`
+    // plus the validated block's kinds) would not show: the same move cut
+    // check --ids' planet node scan by about 4 s, against a planet geocode
+    // build of over 300 s. Not measured on an unindexed planet build.
     if !unindexed.is_empty() {
         let mut found: Vec<Option<UnindexedBlobKinds>> = vec![None; unindexed.len()];
         crate::scan::classify::parallel_classify_phase(

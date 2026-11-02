@@ -576,6 +576,15 @@ pub(super) fn try_extract_multi_single_pass(
     // phase above (see `|| vec![Vec::<i64>::new(); n]` there). Pre-
     // instrumentation Japan 5-region bench showed this phase at 892 ms
     // with the prior `|| ()` + per-block `vec![Vec::new(); n]` allocation.
+    //
+    // Deliberately a block walk, not a projection. Not measured here: the
+    // estimate rests on extract smart's way classify, the same shape (every
+    // way's refs tested against a node set), which stayed at the same
+    // length on `read::project_ids::WaySpans` at planet. This loop adds the
+    // per-region membership tests on top, so the message re-parse a
+    // projection would remove is a smaller share still
+    // (reference/performance.md, "inspect --nodes reads through a
+    // projection").
     host.invocation.marker("MULTI_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
@@ -659,6 +668,10 @@ pub(super) fn try_extract_multi_single_pass(
     host.invocation.marker("MULTI_WAY_WRITE_END");
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
+    //
+    // A block walk on purpose: the phase is under 1 s at planet, so the
+    // re-parse a projection would remove sits under the command's noise
+    // floor.
     host.invocation.marker("MULTI_REL_CLASSIFY_START");
     crate::scan::classify::parallel_classify_accumulate(
         &shared_file,

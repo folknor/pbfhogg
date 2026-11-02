@@ -516,6 +516,14 @@ impl PrimitiveBlock {
         self.kinds.refuse_under(claim)
     }
 
+    /// The kinds of the elements [`elements`](Self::elements) yields, as
+    /// the construction-time validation counted them: a reader asking which
+    /// kinds a block holds reads them here rather than walking it.
+    #[inline]
+    pub(crate) fn kinds(&self) -> crate::element_kind::KindSet {
+        self.kinds
+    }
+
     /// How many elements [`elements`](Self::elements) yields: one per plain
     /// node, way and relation and one per dense ID, counted when the block
     /// was validated, so it is the decoded count, never a blob's claim.

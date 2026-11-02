@@ -220,7 +220,11 @@ against `Resources::memory_available`.
 
 ## Memory and throughput: structural work
 
-### WRK-122: apply-changes' residual step after the node-to-way transition
+### WRK-122: bz pbfhogg#42, apply-changes' residual step after the node-to-way transition
+
+Blocked on brokkr#108 (attribution needs the sidecars of several
+interleaved `--force` cells, and `brokkr sidecar dirty` keeps only the
+last one).
 
 Attributed and partly removed (reference/performance.md, "apply-changes'
 memory step at the node-to-way transition"): the 32 threads are rayon's
@@ -331,18 +335,20 @@ narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
 relation closure (a relation pass on the projection pools, then the way
 pass over the closed set) or record the deviation.
 
-### WRK-118: Remaining element walks that read only IDs and references
+### WRK-129: inspect --tags counts tags through a built block per blob
 
-check `--refs`, check `--ids`, getparents and getid now validate through
-projections (`src/read/project_ids.rs`, `ParentProbe`, getid's
-`SelectProbe`). Other callers still build blocks and walk
-`elements_skip_metadata` where they may read only IDs, refs or members:
-the geocode builder passes, tags-filter's ID collection, extract's
-classify phases, apply-changes' classify and refresh, the ALTW stages,
-inspect's node stats and the OSC merge join. Not audited one by one:
-first establish what each reads per element and what its walk costs at
-planet, then move the ones that pay onto a projection on the one
-validator.
+`inspect --tags` (`src/commands/tags_count/mod.rs`) builds every block and
+walks every element with `elements_skip_metadata`, resolving each tag's
+key and value strings, to count them. A planet run took 100.6 s at `-j 16`
+(`7855f2a4`, 627883d7, bygg), the slowest whole-file read among the
+inspect modes. The dense element walk is the cost the projection moves of
+check --ids, getparents and inspect --nodes removed (inspect --nodes -14 %
+at planet). A projection could count string-table index pairs per block
+(dense `keys_vals` runs and plain `keys`/`vals` arrays, read back after
+acceptance) and resolve each distinct index once per block, but the
+strings must still be resolved and validated as the block path does
+(CORRECTNESS.md on out-of-range indices). Unmeasured at the current tree:
+take a default `-j` planet cell and a hotpath split first.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 

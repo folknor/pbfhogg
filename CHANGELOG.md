@@ -54,6 +54,9 @@
   a blob holding an element it writes. On planet, `check --refs` went from
   38 s to 32 s and `getid --add-referenced` from 50 s to 41 s, with the
   same output, the same refusals and unchanged peak memory.
+- `inspect --nodes` reads each node blob without building it as a block,
+  keeping every check block construction makes. On planet it went from
+  26 s to 22.4 s, with the same refusals and slightly lower peak memory.
 - `check --ids` and `check --refs` read a wholly unindexed input once,
   not once per element kind, with the same reports. `check --refs` reads
   a blob again only where a reference missed in that read (its target not

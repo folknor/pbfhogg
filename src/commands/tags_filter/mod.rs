@@ -1201,6 +1201,12 @@ fn collect_relation_member_closure(
         // tops at ~80 MB even in the worst invert-match case;
         // measured 6.8 GB total for this phase). collect_way_node_deps
         // is the one that hit 24 GB and needed the per-blob shape.
+        //
+        // A block walk on purpose, an estimate rather than a measurement
+        // (no planet cell matches relations): one iteration reads only the
+        // relation blobs, which extract's relation classify reads in about
+        // 1 s at planet, so the re-parse a projection would remove sits
+        // under the noise floor even over a few iterations.
         let mut results: Vec<ClosureResult> = Vec::new();
         crate::scan::classify::parallel_classify_accumulate(
             &shared_file,
@@ -1318,6 +1324,14 @@ fn collect_way_node_dependencies(
     // (crate::block_builder) ways per blob, with about 10 refs per way,
     // the queued reference vectors occupy about 20 MB. Larger input
     // blocks or more refs per way increase this estimate.
+    //
+    // Deliberately a block walk, not a projection. Reading each blob
+    // through `read::project_ids::WaySpans` (with `only` the included set)
+    // was built and measured at planet `w/highway=primary`: the walk after
+    // its schedule loop went from 10.3 s to 8.7 s, but the command only
+    // from 75.7 s to 74.0 s (2.3 %, both pairs), under the noise floor this
+    // project does not chase (reference/performance.md, "inspect --nodes
+    // reads through a projection").
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,

@@ -259,7 +259,8 @@ error and the byte offset instead.
 
 This holds for consumers that report on fields the failing check
 does not touch. The full-decode modes of `inspect`'s scanning
-report, `check --ids`, `check --refs`, `getparents` and `getid`
+report, `inspect --nodes`, `check --ids`, `check --refs`,
+`getparents` and `getid`
 (on every blob it decodes) refuse a block with a
 malformed way `refs` array (or tag arrays, `Info`, string table
 UTF-8) even where nothing they report reads it: after a read
@@ -277,8 +278,8 @@ bytes, `validate_in_place`, which is the check `project` runs), the
 same `validate_block` call, in the same order, that block
 construction runs with its empty projection, followed by the same
 kind-claim refusal. Lookups and specialised scanners (`inspect --show`,
-`inspect --nodes`, `src/scan/node.rs`) are not bound by this
-paragraph; their own docs state what they check.
+`src/scan/node.rs`) are not bound by this paragraph; their own docs
+state what they check.
 
 The two dense-node arrays that array-length equality could not
 express are covered as well. `keys_vals` is a single flat array of

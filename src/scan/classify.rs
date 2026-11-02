@@ -21,6 +21,12 @@
 //!   for the whole scan and merged once at completion. Use for sparse
 //!   paths where the accumulator has a known small bound.
 //!
+//! The first three each have a projection twin
+//! ([`parallel_project_phase`], [`parallel_project_phase_ordered`],
+//! [`parallel_project_accumulate`]) whose worker hands the caller the
+//! decompressed `BlockBuffer` to validate through its own projection on the
+//! block validator instead of a built block.
+//!
 //! - [`parallel_scan_blobs_raw`]: same shape as `parallel_classify_phase`
 //!   but the worker hands the caller `&[u8]` of decompressed blob bytes,
 //!   skipping `PrimitiveBlock` construction. Use when the caller only
@@ -1425,6 +1431,53 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<()> + Send + Sync,
+    merge: impl FnMut(S),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    run_accumulate_decoded(
+        input,
+        schedule,
+        threads,
+        worker_init,
+        |buffer, state| classify(&buffer.block()?, state),
+        merge,
+        host,
+    )
+}
+
+/// [`parallel_classify_accumulate`] for a caller that reads each blob
+/// through a projection rather than a block, as [`parallel_project_phase`]
+/// is to [`parallel_classify_phase`]: `project` receives the blob's
+/// decompressed [`BlockBuffer`](crate::read::block::BlockBuffer) carrying
+/// the entry's claim, validates it with its own
+/// [`GroupProjection`](crate::read::block::GroupProjection)
+/// (`BlockBuffer::project`, so the same blobs are refused with the same
+/// errors as by block construction) and folds what it accepted into the
+/// worker's accumulator. Failure, cancellation and location as in
+/// `parallel_classify_accumulate`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_project_accumulate<S: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    project: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<()> + Send + Sync,
+    merge: impl FnMut(S),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    run_accumulate_decoded(input, schedule, threads, worker_init, project, merge, host)
+}
+
+/// The accumulate pool behind [`parallel_classify_accumulate`] and
+/// [`parallel_project_accumulate`]: each worker carries one `S` across all
+/// its blobs, hands each blob's decompressed buffer to `work`, and sends
+/// `S` once when the schedule is exhausted.
+fn run_accumulate_decoded<S: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    work: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<()> + Send + Sync,
     mut merge: impl FnMut(S),
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
@@ -1478,7 +1531,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
             let file = std::sync::Arc::clone(shared_file);
-            let classify_ref = &classify;
+            let work_ref = &work;
             let worker_init_ref = &worker_init;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
@@ -1510,10 +1563,9 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                             file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             let mut buf = crate::blob::pool_get(Some(&worker_pool), 0);
                             crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                            let block = entry
-                                .buffer(buf, &worker_pool, &mut st_scratch, &mut gr_scratch)
-                                .block()?;
-                            classify_ref(&block, &mut state)
+                            let buffer =
+                                entry.buffer(buf, &worker_pool, &mut st_scratch, &mut gr_scratch);
+                            work_ref(buffer, &mut state)
                         })()
                         .map_err(|e| input.locate_blob(entry, e))?;
                     }
@@ -1609,6 +1661,7 @@ mod tests {
     /// the blob; under `Unchecked` the same pools decode it as before, and
     /// the claimed-node schedule both modes build holds the lying blob.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one call per pool, side by side")]
     fn the_decoding_pools_refuse_a_contradicted_kind_claim() {
         let dir = crate::path_guard::tests::scratch();
         let path = write_way_blob_claiming_nodes(dir.path());
@@ -1708,6 +1761,18 @@ mod tests {
                     &host,
                 ),
                 "ordered projection",
+            );
+            check(
+                super::parallel_project_accumulate(
+                    &input,
+                    &nodes,
+                    Some(2),
+                    || (),
+                    project,
+                    |()| {},
+                    &host,
+                ),
+                "accumulate projection",
             );
         }
     }
@@ -2123,6 +2188,18 @@ mod tests {
         )
         .unwrap_err();
         check("accumulate", err);
+
+        let err = super::parallel_project_accumulate(
+            &input,
+            &schedule,
+            Some(2),
+            || (),
+            |buffer, ()| fails_on_target(&buffer.block()?),
+            |()| {},
+            &host,
+        )
+        .unwrap_err();
+        check("accumulate projection", err);
 
         // The raw pool hands over bytes; fail on the target's position by
         // the payload length the schedule recorded for it.

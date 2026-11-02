@@ -28,7 +28,8 @@ pub(crate) struct Span {
 }
 
 impl Span {
-    fn of(data: &[u8]) -> Self {
+    /// The position of `data`, a validated array of the blob being scanned.
+    pub(crate) fn of(data: &[u8]) -> Self {
         Span {
             at: data.as_ptr() as usize,
             len: data.len(),

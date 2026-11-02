@@ -406,7 +406,7 @@ fn write_low_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelat
 }
 
 /// Build a sorted fixture whose input blobs are deliberately *smaller*
-/// than the `--block-cap` the unsort tests use (4 elements/blob vs cap
+/// than the `--elements-per-blob` the unsort tests use (4 elements/blob vs cap
 /// 10). This is the regime that distinguishes the two unsort modes and
 /// reproduces the real-world bug: when input blobs are smaller than the
 /// cap, the buggy per-input-blob boundary flush confines the swap to one
@@ -421,12 +421,12 @@ fn write_unsort_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRe
     (nodes, ways, rels)
 }
 
-/// The `--block-cap` the unsort tests pass. Larger than the unsort
+/// The `--elements-per-blob` the unsort tests pass. Larger than the unsort
 /// fixture's 4-element input blobs so the two modes diverge.
 const UNSORT_CAP: &str = "10";
 
 /// Build a sorted fixture whose input blobs are deliberately *larger* than
-/// the `--block-cap` the large-blob test uses (20 elements/blob vs cap 5).
+/// the `--elements-per-blob` the large-blob test uses (20 elements/blob vs cap 5).
 /// This is the regime that exposed finding 1: one input blob carrying more
 /// than `cap` same-kind elements. Keying the swap to the `cap` boundary
 /// (the old shared logic) made `--unsort-intra` fill and flush an output
@@ -444,7 +444,7 @@ fn write_large_blob_unsort_fixture(
     (nodes, ways, rels)
 }
 
-/// The `--block-cap` the large-blob test passes. Smaller than the
+/// The `--elements-per-blob` the large-blob test passes. Smaller than the
 /// large-blob fixture's 20-element input blobs so a single input blob
 /// spans more than one output block.
 const LARGE_BLOB_CAP: &str = "5";
@@ -1395,11 +1395,11 @@ fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
 
 /// `--unsort` clears `Sort.Type_then_ID` and produces genuine cross-blob
 /// overlap: at least one adjacent same-kind blob pair whose indexdata ID
-/// ranges overlap, per kind that has more than `block_cap + 1` elements.
+/// ranges overlap, per kind that has more elements than the cap.
 ///
 /// The fixture packs input at 4 elements/blob and the run uses
-/// `--block-cap 10`, so input blobs are smaller than the cap. This is the
-/// regime that regressed before the fix (the per-input-blob boundary
+/// `--elements-per-blob 10`, so input blobs are smaller than the cap. This is
+/// the regime that regressed before the fix (the per-input-blob boundary
 /// flush confined the swap to one output blob and `detect_overlaps`
 /// returned zero). The central builder must now pack continuously across
 /// input blobs so the swap straddles a real output-blob boundary. The two
@@ -1419,7 +1419,7 @@ fn degrade_unsort_creates_adjacent_overlap_per_kind() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1509,7 +1509,7 @@ fn degrade_unsort_intra_creates_intra_blob_inversion() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort-intra")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1517,7 +1517,7 @@ fn degrade_unsort_intra_creates_intra_blob_inversion() {
 }
 
 /// `--unsort-intra` stays intra-blob even when a single input blob carries
-/// more than `--block-cap` same-kind elements (finding 1's regime). The
+/// more than `--elements-per-blob` same-kind elements (finding 1's regime). The
 /// fixture packs 20 elements/blob and the run caps output blocks at 5, so
 /// each input blob spans four output blocks. The old shared swap keyed to
 /// the cap boundary would have filled and flushed a block here, producing
@@ -1537,7 +1537,7 @@ fn degrade_unsort_intra_large_input_blobs_stay_intra_blob() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort-intra")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(LARGE_BLOB_CAP)
         .assert_success();
 
@@ -1631,7 +1631,7 @@ fn degrade_unsort_then_sort_round_trips() {
         .arg("-o")
         .arg(&unsorted)
         .arg("--unsort")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1686,7 +1686,7 @@ fn degrade_unsort_and_strip_indexdata_compose() {
         .arg(&output)
         .arg("--unsort")
         .arg("--strip-indexdata")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("5")
         .assert_success();
 
@@ -1718,7 +1718,7 @@ fn degrade_unsort_and_strip_locations_compose() {
         .arg(&output)
         .arg("--unsort")
         .arg("--strip-locations")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1746,7 +1746,7 @@ fn degrade_unsort_intra_and_strip_locations_compose() {
         .arg(&output)
         .arg("--unsort-intra")
         .arg("--strip-locations")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1774,7 +1774,7 @@ fn degrade_unsort_intra_and_strip_indexdata_compose() {
         .arg(&output)
         .arg("--unsort-intra")
         .arg("--strip-indexdata")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(UNSORT_CAP)
         .assert_success();
 
@@ -1836,7 +1836,7 @@ fn degrade_unsort_and_strip_tagdata_compose() {
         .arg(&output)
         .arg("--unsort")
         .arg("--strip-tagdata")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("5")
         .assert_success();
 
@@ -1851,7 +1851,7 @@ fn degrade_unsort_and_strip_tagdata_compose() {
 }
 
 /// `--strip-locations --strip-tagdata` composes on the decode path's
-/// non-unsort shape: with `--block-cap 10` against the fixture's 20-element
+/// non-unsort shape: with `--elements-per-blob 10` against the fixture's 20-element
 /// input blobs, workers pre-frame full cap-blocks via `frame_owned`, so this
 /// exercises the `frame_owned` tagdata=None path (distinct from the merge
 /// thread's batch path above). `LocationsOnWays` is cleared and no output
@@ -1872,7 +1872,7 @@ fn degrade_strip_locations_and_strip_tagdata_compose() {
         .arg(&output)
         .arg("--strip-locations")
         .arg("--strip-tagdata")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("10")
         .assert_success();
 
@@ -2163,7 +2163,7 @@ fn degrade_drop_ids_validates_arguments_and_total() {
     }
 }
 
-/// `--block-cap 0` is rejected up front.
+/// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {
     let dir = crate::common::test_scratch();
@@ -2178,7 +2178,7 @@ fn degrade_rejects_zero_block_cap() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("0")
         .assert_failure()
         .assert_stderr_contains("must be > 0");
@@ -2201,7 +2201,7 @@ fn degrade_bounds_preallocation_by_input_size() {
             .arg(&output)
             .arg("--overwrite")
             .arg(flag)
-            .arg("--block-cap")
+            .arg("--elements-per-blob")
             .arg(usize::MAX.to_string())
             .assert_success();
 
@@ -2225,7 +2225,7 @@ fn degrade_unsort_counts_a_trailing_held_element_once() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg(nodes.len().to_string())
         .assert_success()
         .assert_stderr_contains(&format!("Degraded {count} elements across"));
@@ -2233,7 +2233,7 @@ fn degrade_unsort_counts_a_trailing_held_element_once() {
     assert_eq!(normalized_count(&output), count);
 }
 
-/// `--unsort-intra --block-cap 1` is rejected: an intra-blob inversion
+/// `--unsort-intra --elements-per-blob 1` is rejected: an intra-blob inversion
 /// needs two same-kind elements in one output block, which a cap of 1
 /// cannot hold. Rejecting up front avoids a silent no-op that would still
 /// clear Sort.Type_then_ID.
@@ -2251,13 +2251,13 @@ fn degrade_unsort_intra_rejects_block_cap_one() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort-intra")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("1")
         .assert_failure()
-        .assert_stderr_contains("block-cap >= 2");
+        .assert_stderr_contains("--elements-per-blob >= 2");
 }
 
-/// `--unsort --block-cap 1` is supported (not a silent no-op): each output
+/// `--unsort --elements-per-blob 1` is supported (not a silent no-op): each output
 /// blob holds one element, and swapping the first two adjacent
 /// single-element blobs produces exactly one descending cross-blob step -
 /// the same overlap shape sort's detect_overlaps fires on.
@@ -2275,7 +2275,7 @@ fn degrade_unsort_accepts_block_cap_one() {
         .arg("-o")
         .arg(&output)
         .arg("--unsort")
-        .arg("--block-cap")
+        .arg("--elements-per-blob")
         .arg("1")
         .assert_success();
 
@@ -2334,7 +2334,13 @@ mod tier2 {
             .arg(&input)
             .arg("-o")
             .arg(&output)
-            .args(["--drop-ids", "10:16", "--unsort", "--block-cap", UNSORT_CAP])
+            .args([
+                "--drop-ids",
+                "10:16",
+                "--unsort",
+                "--elements-per-blob",
+                UNSORT_CAP,
+            ])
             .assert_success();
         assert_eq!(normalized_count(&output), input_count - 10);
         assert!(!read_header(&output).is_sorted());
@@ -2397,7 +2403,7 @@ fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
     for (kind, claimed) in [(0, "node"), (2, "relation")] {
         let input = relabelled_way_blob(dir.path(), kind);
         for (name, flags) in [
-            ("unsort", ["--unsort", "--block-cap", "10"]),
+            ("unsort", ["--unsort", "--elements-per-blob", "10"]),
             ("drop", ["--drop-ids", "5:1", "--strip-locations"]),
         ] {
             let output = dir.path().join(format!("out-{kind}-{name}.osm.pbf"));
@@ -2435,7 +2441,7 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
         .arg(&honest)
         .arg("-o")
         .arg(&output)
-        .args(["--unsort", "--block-cap", "10"])
+        .args(["--unsort", "--elements-per-blob", "10"])
         .assert_success();
     assert_eq!(normalized_count(&output), count);
 
@@ -2468,7 +2474,7 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
         .arg(&unindexed)
         .arg("-o")
         .arg(&forced)
-        .args(["--unsort", "--block-cap", "10", "--force"])
+        .args(["--unsort", "--elements-per-blob", "10", "--force"])
         .assert_success();
     assert_eq!(normalized_count(&forced), count);
 }

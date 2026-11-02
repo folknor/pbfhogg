@@ -268,7 +268,7 @@ fn usage_errors_exit_64() {
                 "-o",
                 fresh,
                 "--unsort-intra",
-                "--block-cap",
+                "--elements-per-blob",
                 "1",
             ],
             "a flag rule the CLI checks before dispatch",

@@ -193,7 +193,8 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["degrade", "IN", "-o", "OUT", "--strip-indexdata", "--force"],
         "--unsort",
     ),
-    // Only the decode path re-encodes, so only it has a block cap.
+    // Only the decode path re-encodes, so only it has an element cap: every
+    // header-only shape refuses an explicit one.
     (
         &[
             "degrade",
@@ -201,8 +202,21 @@ const REFUSALS: &[(&[&str], &str)] = &[
             "-o",
             "OUT",
             "--strip-indexdata",
-            "--block-cap",
+            "--elements-per-blob",
             "5",
+        ],
+        "--unsort",
+    ),
+    (
+        &[
+            "degrade",
+            "IN",
+            "-o",
+            "OUT",
+            "--strip-bbox",
+            "--corrupt-tagdata",
+            "--elements-per-blob",
+            "8000",
         ],
         "--unsort",
     ),
@@ -359,13 +373,44 @@ const REFUSALS: &[(&[&str], &str)] = &[
             "-o",
             "OUT",
             "--unsort-intra",
-            "--block-cap",
+            "--elements-per-blob",
             "1",
         ],
-        "--block-cap",
+        "--elements-per-blob",
     ),
     (&["check", "IN", "--refs", "--full"], "--ids"),
     (&["check", "IN", "--ids", "--show-ids"], "--refs"),
+    // The ref check alone retains no details without --show-ids, so an
+    // explicit cap, even one equal to the default, reaches nothing.
+    (
+        &["check", "IN", "--refs", "--max-errors", "5"],
+        "--show-ids",
+    ),
+    (
+        &["check", "IN", "--refs", "--max-errors", "100"],
+        "--show-ids",
+    ),
+    (
+        &["check", "IN", "--refs", "--json", "--max-errors", "0"],
+        "--show-ids",
+    ),
+    (
+        &[
+            "check",
+            "IN",
+            "--refs",
+            "--check-relations",
+            "--max-errors",
+            "5",
+        ],
+        "--show-ids",
+    ),
+    // The quiet refusal comes first: it would refuse the --show-ids the
+    // other one names.
+    (
+        &["check", "IN", "-q", "--refs", "--max-errors", "5"],
+        "cannot be used with",
+    ),
     (
         &[
             "tags-filter",
@@ -950,6 +995,48 @@ fn merge_changes_takes_tmp_dir_where_it_may_spill() {
         words.extend(["--tmp-dir", "DIR"]);
         let out = run(&argv(dir.path(), &words));
         reached_input(&out).unwrap_or_else(|why| panic!("-j {jobs:?}: {why}"));
+    }
+}
+
+/// `check --max-errors` is taken wherever a selected check retains details:
+/// the default pair, the ref check under `--show-ids`, and the ref check
+/// beside any other check. The ref check alone takes the default silently.
+#[test]
+fn check_takes_max_errors_wherever_a_selected_check_reads_it() {
+    let dir = crate::common::test_scratch();
+    let cases: &[&[&str]] = &[
+        &["check", "IN", "--refs"],
+        &["check", "IN", "--max-errors", "5"],
+        &["check", "IN", "--refs", "--show-ids", "--max-errors", "5"],
+        &["check", "IN", "--refs", "--ids", "--max-errors", "5"],
+        &["check", "IN", "--refs", "--index", "--max-errors", "5"],
+        &["check", "IN", "--refs", "--locations", "--max-errors", "5"],
+        &["check", "IN", "--ids", "--max-errors", "5"],
+    ];
+    for words in cases {
+        let out = run(&argv(dir.path(), words));
+        reached_input(&out).unwrap_or_else(|why| panic!("[{}] {why}", words.join(" ")));
+    }
+}
+
+/// `degrade --elements-per-blob` is taken with each decode-path flag, the
+/// flags whose re-encode it caps, alone or beside a header edit.
+#[test]
+fn degrade_takes_elements_per_blob_on_every_decode_path() {
+    let dir = crate::common::test_scratch();
+    let cases: &[&[&str]] = &[
+        &["--unsort"],
+        &["--unsort-intra"],
+        &["--strip-locations"],
+        &["--drop-ids", "1:1"],
+        &["--strip-indexdata", "--strip-locations"],
+    ];
+    for flags in cases {
+        let mut words = vec!["degrade", "IN", "-o", "OUT"];
+        words.extend_from_slice(flags);
+        words.extend(["--elements-per-blob", "5"]);
+        let out = run(&argv(dir.path(), &words));
+        reached_input(&out).unwrap_or_else(|why| panic!("[{}] {why}", words.join(" ")));
     }
 }
 

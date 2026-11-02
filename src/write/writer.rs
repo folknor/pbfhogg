@@ -1732,7 +1732,8 @@ mod tests {
     /// `PbfWriter::new` sync path, so a sync-mode writer kept emitting a body
     /// the crate's own reader refuses ("blob header declares datasize too
     /// big"), with exit zero. Both paths now share `frame_in_scratch`; this
-    /// pins the sync end of that. Same cap, same knob-naming error message.
+    /// pins the sync end of that, for the header blob it writes first: the
+    /// refusal names the OSMHeader part, which no element cap shrinks.
     #[test]
     fn the_sync_path_refuses_an_oversize_blob_body() {
         let cap = usize::try_from(crate::read::blob_wire::MAX_BLOB_DATASIZE).unwrap();
@@ -1744,8 +1745,14 @@ mod tests {
             .write_header(&body)
             .expect_err("a blob body past the datasize cap must not be written by the sync path");
         assert!(
-            matches!(err.kind(), ErrorKind::BlobTooLarge { .. }),
-            "the sync path must refuse with BlobTooLarge, got: {err}"
+            matches!(
+                err.kind(),
+                ErrorKind::BlobTooLarge {
+                    part: crate::OversizePart::OsmHeaderPayload,
+                    ..
+                }
+            ),
+            "the sync path must refuse the header blob as one, got: {err}"
         );
         w.flush().unwrap();
     }

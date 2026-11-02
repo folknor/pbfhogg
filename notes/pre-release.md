@@ -463,34 +463,22 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-144: check accepts an explicit --max-errors no selected check reads
+### WRK-148: check accepts --direct-io where no selected check reads it
 
-`check --refs --max-errors 5` without `--show-ids` is accepted and the
-value reaches nothing: the reference check retains details only under
-`--show-ids`, and no other check is selected. `validate_check` refuses
-the analogous orphans (`--show-ids` and `--check-relations` under
-`--ids` alone, `--full` and `--type` under `--refs` alone) and `-q` with
-an explicit `--max-errors`, so this is the one shaping flag the no-op
-rule misses. A refusal would fire only when `--max-errors` is given
-explicitly (the `given` provenance check), only `--refs` is selected and
-`--show-ids` is absent; the default 100 must stay silent. CLI behaviour
-change; CHANGELOG, `docs/cli/commands.md` check section, and a
-`cli_flag_contract` row.
-
-### WRK-145: degrade advises and documents its hidden --block-cap
-
-`docs/cli/commands.md` calls `degrade --block-cap` a hidden test
-instrument outside the supported surface, yet the CLI names it to users:
-`advice()` in `cli/src/lib.rs` sets `element_cap` to `--block-cap` for any
-degrade run (the arg has a default, so `try_contains_id` is always true),
-and `cli/src/exit_code.rs` answers `BlobTooLarge` with "; lower
---block-cap". The `--unsort` row of the degrade flag table also says a
-kind needs "more than `block-cap + 1` elements". Decide whether the cap is
-a supported knob (unhide it and document it, as repack's
-`--elements-per-blob` is) or a test instrument (advise nothing on degrade,
-or advise only when the run's decode path can produce a block, and say
-"the block cap" in the table). On the header-only passthrough no block is
-encoded, so the advice can only be wrong there.
+`check --refs --direct-io` and `check --locations --direct-io` (either
+alone, or the two together) are accepted, and each check prints a `Note:`
+that `--direct-io` has no effect on it (`run_check` in `cli/src/lib.rs`;
+the check table in `docs/cli/commands.md` documents the Note). The command
+line alone makes the flag ineffective there, which the Flag rules section
+of the same document says is refused (exit 64) and "never warned about or
+ignored", so the two passages contradict each other. Either refuse it in
+`validate_check` when no ID or index check is selected (the rule `--max-errors`
+now follows), or state the exception in Flag rules with its reason. Check
+first what brokkr passes: a `--direct-io` variant of `check-refs` or
+`check-locations` would turn into a usage error under a refusal, and
+brokkr#88's rule refuses an axis flag only where no pbfhogg revision gives
+it effect. The library parameters stay either way (ignored `direct_io`
+parameters are not removed as dead).
 
 ### WRK-037: ParallelGzipWriter window size
 

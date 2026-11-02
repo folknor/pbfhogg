@@ -517,7 +517,7 @@ const ROWS: &[Row] = &[
                 fx,
                 "degrade",
                 &[fx.path(f)],
-                &["--unsort", "--block-cap", "4"],
+                &["--unsort", "--elements-per-blob", "4"],
             )
         },
         expect: |f| {

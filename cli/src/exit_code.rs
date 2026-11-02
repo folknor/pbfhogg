@@ -116,8 +116,9 @@ pub struct Advice {
     /// What the command accepts for unindexed input (`--force`,
     /// `--allow-unindexed`), printed after the indexing recipe.
     pub indexdata: Option<&'static str>,
-    /// The element-cap flag that shrinks an oversized blob
-    /// (`--elements-per-blob`, `--block-cap`).
+    /// The element-cap flag that shrinks an oversized data blob
+    /// (`--elements-per-blob`), where the run encodes data blobs at a cap it
+    /// can still lower.
     pub element_cap: Option<&'static str>,
     /// Whether `--allow-version-regression` is on offer.
     pub allow_version_regression: bool,
@@ -202,7 +203,16 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
             }
             Some(hint)
         }
-        ErrorKind::BlobTooLarge { .. } => advice.element_cap.map(|flag| format!("; lower {flag}")),
+        // Only a data blob's parts: an element cap cannot shrink the
+        // OSMHeader, and a part added later earns the advice by being listed.
+        ErrorKind::BlobTooLarge {
+            part:
+                pbfhogg::OversizePart::Header
+                | pbfhogg::OversizePart::HeaderWayMembers
+                | pbfhogg::OversizePart::Body
+                | pbfhogg::OversizePart::Payload,
+            ..
+        } => advice.element_cap.map(|flag| format!("; lower {flag}")),
         ErrorKind::VersionRegression { .. } if advice.allow_version_regression => {
             Some("; pass --allow-version-regression to permit lower-version changes".to_owned())
         }
@@ -350,6 +360,55 @@ mod tests {
         let carried = io::Error::from(refused.context("publishing"));
         assert!(output_hint(&carried, &advice).is_some());
         assert_eq!(output_hint(&platform(), &advice), None);
+    }
+
+    /// An oversized data blob earns the element-cap advice the command line
+    /// offers; the OSMHeader blob, whose size its header fields set, never
+    /// does, whatever the command line offers.
+    #[test]
+    fn only_an_oversized_data_blob_earns_the_element_cap_advice() {
+        use super::output_hint;
+        use pbfhogg::writer::{Compression, PbfWriter};
+        let oversized = vec![0x5Au8; 32 * 1024 * 1024 + 1];
+        let offered = super::Advice {
+            element_cap: Some("--elements-per-blob"),
+            ..super::Advice::default()
+        };
+
+        let header = PbfWriter::new(Vec::new(), Compression::None)
+            .write_header(&oversized)
+            .expect_err("an oversized header blob is refused");
+        assert!(matches!(
+            header.kind(),
+            pbfhogg::ErrorKind::BlobTooLarge {
+                part: pbfhogg::OversizePart::OsmHeaderPayload,
+                ..
+            }
+        ));
+        assert_eq!(output_hint(&header, &offered), None);
+
+        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
+        let header_bytes = pbfhogg::block_builder::HeaderBuilder::new()
+            .build()
+            .expect("a default header builds");
+        writer
+            .write_header(&header_bytes)
+            .expect("a small header writes");
+        let data = writer
+            .write_primitive_block_no_indexdata(&oversized)
+            .expect_err("an oversized data blob is refused");
+        assert!(matches!(
+            data.kind(),
+            pbfhogg::ErrorKind::BlobTooLarge {
+                part: pbfhogg::OversizePart::Payload,
+                ..
+            }
+        ));
+        assert_eq!(
+            output_hint(&data, &offered).as_deref(),
+            Some("; lower --elements-per-blob")
+        );
+        assert_eq!(output_hint(&data, &super::Advice::default()), None);
     }
 
     /// A cancellation earns the interrupted status as the error itself or

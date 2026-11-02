@@ -807,11 +807,18 @@ pub enum OversizePart {
     /// The `BlobHeader`, which would fit without the `WayMembers-v1` bitmap;
     /// the bitmap cannot be dropped without misreporting way-member nodes.
     HeaderWayMembers,
-    /// The encoded `Blob` message.
+    /// The encoded `Blob` message of an `OSMData` blob. Element counts do not
+    /// bound it: one element can exceed it alone.
     Body,
-    /// The uncompressed `PrimitiveBlock`. Element counts do not bound it:
-    /// one element with a very large tag value can exceed it alone.
+    /// The uncompressed `PrimitiveBlock` of an `OSMData` blob. Element counts
+    /// do not bound it: one element with a very large tag value can exceed it
+    /// alone.
     Payload,
+    /// The uncompressed `HeaderBlock` of the `OSMHeader` blob. Its size comes
+    /// from the header's own fields, so no element cap bears on it.
+    OsmHeaderPayload,
+    /// The encoded `Blob` message of the `OSMHeader` blob.
+    OsmHeaderBody,
 }
 
 impl OversizePart {
@@ -832,12 +839,22 @@ impl OversizePart {
             OversizePart::Body => write!(
                 f,
                 "blob body is {size} bytes, must be smaller than {limit}; fewer elements \
-                 per blob shrink it"
+                 per blob shrink it unless single elements are this large"
             ),
             OversizePart::Payload => write!(
                 f,
                 "uncompressed blob payload is {size} bytes, must be at most {limit}; \
                  fewer elements per blob shrink it unless single elements are this large"
+            ),
+            OversizePart::OsmHeaderPayload => write!(
+                f,
+                "uncompressed OSMHeader block is {size} bytes, must be at most {limit}; \
+                 smaller header fields shrink it"
+            ),
+            OversizePart::OsmHeaderBody => write!(
+                f,
+                "OSMHeader blob body is {size} bytes, must be smaller than {limit}; \
+                 smaller header fields shrink it"
             ),
         }
     }

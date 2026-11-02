@@ -250,9 +250,11 @@ pub enum Unsort {
 /// transformations set is that re-encode alone.
 #[derive(Clone, Copy, Debug)]
 pub struct Reencode {
-    /// The per-block element cap. [`Reencode::default`] uses
-    /// [`DEFAULT_BLOCK_CAP`]; tests pass a smaller value so the unsort swaps
-    /// can be exercised on fixtures of modest size.
+    /// The per-block element cap: the most elements any output data blob
+    /// holds, and under [`Unsort::CrossBlob`] the boundary the swap
+    /// straddles. [`Reencode::default`] uses [`DEFAULT_BLOCK_CAP`]; a smaller
+    /// cap shrinks a block too large for the format, unless single elements
+    /// are that large, and lets the unsort swaps fire on small inputs.
     pub block_cap: std::num::NonZeroUsize,
     pub unsort: Option<Unsort>,
     /// The way coordinates every re-encode drops are the request

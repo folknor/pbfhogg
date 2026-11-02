@@ -26,6 +26,10 @@ use super::compression::Compression;
 
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 
+/// The `BlobHeader.type` of the header blob, whose size refusals are named
+/// apart from a data blob's.
+const OSM_HEADER: &str = "OSMHeader";
+
 /// Per-thread reusable blob framing scratch: header/body/compression buffers
 /// plus lazy-initialized zlib/zstd compressors. Reused across ordinary blobs
 /// to keep steady-state allocation flat. An oversized buffer is not retained
@@ -251,7 +255,15 @@ pub(super) fn frame_in_scratch<'a>(
 ) -> Result<ScratchFrame<'a>> {
     let t_compress = crate::counters::Stopwatch::start();
     scratch.trim_oversize_retained_buffers(metrics);
-    if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
+    // The OSMHeader block's size comes from its header fields, never from an
+    // element count, so its refusal names that part: a front end answers an
+    // OSMData refusal with its element cap, which cannot shrink a header.
+    let payload_part = if blob_type == OSM_HEADER {
+        OversizePart::OsmHeaderPayload
+    } else {
+        OversizePart::Payload
+    };
+    if let Err(error) = encode_blob_body(uncompressed, compression, payload_part, scratch) {
         scratch.trim_oversize_retained_buffers(metrics);
         return Err(error);
     }
@@ -323,7 +335,11 @@ fn encode_frame_header(
     // that caused it.
     if body_len as u64 >= MAX_BLOB_DATASIZE {
         return Err(crate::error::new_blob_too_large(
-            OversizePart::Body,
+            if blob_type == OSM_HEADER {
+                OversizePart::OsmHeaderBody
+            } else {
+                OversizePart::Body
+            },
             body_len as u64,
             MAX_BLOB_DATASIZE,
         ));
@@ -366,9 +382,13 @@ fn encode_frame_header(
 /// This is the sibling of `encode_blob_header_fields`, where the opposite rule
 /// holds: there the optional hint fields are genuinely optional and absence is
 /// meaningful. Here absence is not a spelling of anything.
+///
+/// `payload_part` is the part an oversized payload is reported as, which
+/// depends on the blob type the caller is framing.
 fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
+    payload_part: OversizePart,
     scratch: &mut FrameScratch,
 ) -> Result<()> {
     scratch.blob_buf.clear();
@@ -379,7 +399,7 @@ fn encode_blob_body(
     // is legal; the separate encoded-body limit can still reject its framing.
     if uncompressed.len() as u64 > MAX_BLOB_MESSAGE_SIZE {
         return Err(crate::error::new_blob_too_large(
-            OversizePart::Payload,
+            payload_part,
             uncompressed.len() as u64,
             MAX_BLOB_MESSAGE_SIZE,
         ));
@@ -733,8 +753,9 @@ mod tests {
             Compression::Zstd(1),
         ] {
             let mut scratch = FrameScratch::new();
-            let error = encode_blob_body(&payload, &compression, &mut scratch)
-                .expect_err("compression must not hide an oversized raw block");
+            let error =
+                encode_blob_body(&payload, &compression, OversizePart::Payload, &mut scratch)
+                    .expect_err("compression must not hide an oversized raw block");
             assert!(error.to_string().contains("uncompressed blob payload"));
             assert!(scratch.blob_buf.is_empty());
             assert!(scratch.compress_buf.is_empty());
@@ -789,7 +810,8 @@ mod tests {
             Compression::Zstd(1),
         ] {
             let mut scratch = FrameScratch::new();
-            encode_blob_body(&[], &compression, &mut scratch).expect("empty body must encode");
+            encode_blob_body(&[], &compression, OversizePart::Payload, &mut scratch)
+                .expect("empty body must encode");
             assert!(
                 !scratch.blob_buf.is_empty(),
                 "{compression:?}: an empty payload produced a Blob message \
@@ -819,7 +841,8 @@ mod tests {
     #[test]
     fn no_payload_bytes_reach_the_output_uncompressed() {
         let mut scratch = FrameScratch::new();
-        encode_blob_body(&[], &Compression::None, &mut scratch).expect("empty body must encode");
+        encode_blob_body(&[], &Compression::None, OversizePart::Payload, &mut scratch)
+            .expect("empty body must encode");
         assert_eq!(
             scratch.blob_buf.as_slice(),
             // Field 1, wire type 2 (0x0a), length 0.
@@ -1419,6 +1442,43 @@ mod tests {
             msg.contains("WayMembers-v1 bitmap cannot be dropped"),
             "the error must name the undroppable field, got: {msg}"
         );
+    }
+
+    /// An oversized OSMHeader blob is named apart from a data blob, through
+    /// the framing every writer uses, for both size guards: a payload over the
+    /// raw limit, and a legal payload whose uncompressed `Blob` framing takes
+    /// the body over its limit. A front end answers a data part with its
+    /// element cap, which cannot shrink a header.
+    #[test]
+    fn an_oversized_header_blob_is_named_apart_from_a_data_blob() {
+        let limit = usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits");
+        let over_raw = vec![0x5Au8; limit + 1];
+        let at_raw = vec![0x5Au8; limit];
+        for (blob_type, payload_part, body_part) in [
+            (
+                "OSMHeader",
+                OversizePart::OsmHeaderPayload,
+                OversizePart::OsmHeaderBody,
+            ),
+            ("OSMData", OversizePart::Payload, OversizePart::Body),
+        ] {
+            for (payload, want) in [(&over_raw, payload_part), (&at_raw, body_part)] {
+                let err = frame_blob(
+                    blob_type,
+                    payload,
+                    &Compression::None,
+                    None,
+                    &WriterMetrics::new(),
+                )
+                .expect_err("an oversized blob must not be framed");
+                assert_eq!(
+                    oversize_part_and_size(&err).0,
+                    want,
+                    "{blob_type}, {} payload bytes: {err}",
+                    payload.len()
+                );
+            }
+        }
     }
 
     fn oversize_part_and_size(err: &Error) -> (OversizePart, u64) {

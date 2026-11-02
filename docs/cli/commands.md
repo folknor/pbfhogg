@@ -855,7 +855,9 @@ shape the report, are refused with it.
 `--full` and `-t/--type` apply to the ID check and are rejected under
 `--refs` alone; `--check-relations` and `--show-ids` apply to the ref
 check and are rejected under `--ids` alone; `--agreement` is rejected
-without `--locations`. Violations exit `1`, not `2` - see
+without `--locations`. An explicit `--max-errors` is rejected under
+`--refs` alone without `--show-ids`, where no selected check retains
+details; the default is not. Violations exit `1`, not `2` - see
 [Exit codes](#exit-codes).
 
 **A false kind claim stops the check (exit 1).** `--refs`, `--ids` and
@@ -1251,7 +1253,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more than `block-cap + 1` elements). Triggers `sort`'s overlap-rewrite path. |
+| `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more elements than `--elements-per-blob`). Triggers `sort`'s overlap-rewrite path. |
 | `--unsort-intra` | Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with an internal ID-order inversion but non-overlapping blob ranges - the intra-blob shape `sort`'s overlap detector cannot see. Mutually exclusive with `--unsort`. |
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved; downstream `add-locations-to-ways` runs see a redundancy-free starting point. |
 | `--strip-indexdata` | Clear `BlobHeader.indexdata` on every OsmData blob. Forces commands into their `--force` / non-indexed fallback paths (`sort`, `getid`, `tags-filter`). Blob payloads are not decompressed. |
@@ -1261,6 +1263,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--corrupt-indexdata-kind` | Rotate the element *kind* declared by `BlobHeader.indexdata` on every OsmData blob - node to way to relation to node - leaving `min_id`, `max_id`, `count` and the bbox honest. The kind is what per-kind blob schedules (`build_classify_schedule`) select on, so unlike `--corrupt-indexdata` this is the corruption that makes a consumer skip a blob *outright* rather than misreport it, which is why the two are separate flags. It is what makes `tags-filter --distrust-metadata` testable through relation closure and way-dependency collection rather than only through the direct-match pass. Mutually exclusive with `--strip-indexdata`, combinable with `--corrupt-indexdata`, and rejected alongside every blob-re-encoding flag. |
 | `--strip-bbox` | Clear `HeaderBlock.bbox` (field 1). Header-only change; no OsmData blob is touched. Exercises `inspect`'s bbox handling (`extract_header_metadata`, the `inspect --get header.bbox` fast path) and downstream/external-consumer tolerance of a file with no declared extent. Does not affect `extract --bbox`, which derives its region from the CLI argument and prunes via per-blob `indexdata` bboxes rather than reading the header. |
 | `--drop-ids <N:SEED>` | Deterministically remove exactly N elements selected globally by kind, ID, and seed. Surviving references to removed elements intentionally dangle. |
+| `--elements-per-blob <N>` | Most elements in any output data blob on the decode path [default: 8000]. Output blobs follow the input's blob boundaries, except under `--unsort`, which packs each kind continuously to the cap, so the cap also places the `--unsort` swap. Must be > 0, and at least 2 with `--unsort-intra`. Requires `--unsort`, `--unsort-intra`, `--strip-locations` or `--drop-ids`; the header-only flags encode no data blob (a usage error otherwise, exit 64). |
 | `--force` | Proceed on unindexed input on the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`), which falls back to scanning every blob for every kind; slower. The header-only flags never refuse, so `--force` without a decode-path flag is an error. |
 | `--compression` | Compression of the blobs the run encodes [default: zlib]. The header-only flags encode only the OSMHeader blob; every data blob is copied with the compression it has |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -1270,17 +1273,18 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 
 **Implementation paths:** the header-only flags (`--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--corrupt-*`), with no `--unsort`/`--unsort-intra`/`--strip-locations`/`--drop-ids`, run as a header-and-blob-level passthrough: the input `HeaderBlock` payload is forwarded field-for-field via a surgical wire-level field stripper, with only the bbox (field 1) removed under `--strip-bbox` and each `--generator`/`--output-header` override replacing only the field it names, and raw OsmData frames are reframed by copying the original `BlobHeader` through byte-for-byte with only `indexdata` (field 2) and/or `tagdata` (field 4) cleared or replaced as targeted. This preserves every other header and blob-header field byte-for-byte - `source`, custom optional features, a non-default `writingprogram`, replication metadata, `WayMembers-v1`, and unknown/extension fields all survive, with or without an override. Any combination involving `--unsort`, `--unsort-intra`, `--strip-locations`, or `--drop-ids` decodes elements, re-encodes via `BlockBuilder`, and frames with `indexdata=None` when `--strip-indexdata` composes; `--strip-bbox` on this path clears the bbox from the rebuilt output header. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
 
-`degrade --block-cap` and `getparents --full-scan-min-blobs` are hidden
-(`hide = true`) test instruments: they override an internal threshold so
-the suite can fire a code path without building a full-scale fixture.
-They are not part of the supported surface and may change or disappear
-without a deprecation cycle. `--block-cap` is the decode path's cap, so
-given explicitly it needs one of `--unsort`, `--unsort-intra`,
-`--strip-locations` or `--drop-ids` (a usage error otherwise, exit 64).
-`--full-scan-min-blobs` is nevertheless
-range-checked at the CLI boundary (1 to 1,000,000,000): the library entry
-point behind it takes the value raw, and 0 is not a threshold - it pins the
-FullScan arm unconditionally.
+A blob too large for the format on the decode path is refused with advice
+to lower `--elements-per-blob`, as on `repack`, unless the cap is already
+at its smallest or the oversized blob is the OSMHeader, whose size its
+header fields set.
+
+`getparents --full-scan-min-blobs` is a hidden (`hide = true`) test
+instrument: it overrides an internal threshold so the suite can fire a
+code path without building a full-scale fixture. It is not part of the
+supported surface and may change or disappear without a deprecation
+cycle. It is nevertheless range-checked at the CLI boundary (1 to
+1,000,000,000): the library entry point behind it takes the value raw, and
+0 is not a threshold - it pins the FullScan arm unconditionally.
 
 `--recompress` from the design doc remains deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred.
 

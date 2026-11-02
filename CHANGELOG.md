@@ -19,6 +19,16 @@
   expressions name every element type (`highway`): it no longer refuses
   unindexed input there, and refuses `--force`. A script passing `--force`
   to such a command line drops it.
+- `check` refuses an explicit `--max-errors` (exit `64`) under `--refs`
+  alone without `--show-ids`, where the ref check retains no details and
+  no other check is selected, instead of accepting it unused. The default
+  is not affected, and every other selection still takes the flag.
+- `degrade --block-cap`, a hidden test flag, is now the supported
+  `--elements-per-blob`, the name `repack` gives the same per-blob element
+  cap, and is documented. `--block-cap` is no longer accepted. A blob too
+  large for the format on the decode path is answered with advice to
+  lower it unless the cap is already at its smallest; the header-only
+  flags, which encode no data blob, no longer get that advice.
 
 **Library**
 
@@ -80,8 +90,8 @@
     no longer both be asked for. `Some` selects the decode path, `None` the
     passthrough. A `Reencode` with none of its transformations set is
     accepted as a plain re-encode, and `Reencode::default` carries the
-    default block cap. The hidden `degrade --block-cap` test flag is now
-    refused without a decode-path flag (exit `64`).
+    default block cap. On the command line that cap is `degrade
+    --elements-per-blob`, refused without a decode-path flag (exit `64`).
 
 ### Added
 
@@ -91,6 +101,14 @@
 
 ### Changed
 
+- A blob refused as too large for the format names the OSMHeader apart
+  from a data blob: `OversizePart` gains `OsmHeaderPayload` and
+  `OsmHeaderBody`, whose messages say the header fields set its size,
+  where the OSMHeader used to be reported as `Payload` or `Body` with
+  "fewer elements per blob shrink it". A data blob's `Body` message now
+  also says a single element can be that large, as `Payload`'s did.
+  `repack` and `degrade` no longer advise lowering `--elements-per-blob`
+  for an oversized OSMHeader.
 - A refusal of unindexed input says what indexdata would have bought the
   run (skipping blobs by element type, ID range or node bounding box, or
   copying them whole) instead of calling the type, tag-key, ID or bbox

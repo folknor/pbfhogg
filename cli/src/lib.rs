@@ -564,12 +564,12 @@ fn validate_command(
         }
         Command::Degrade {
             unsort_intra,
-            block_cap,
+            elements_per_blob,
             ..
-        } if *unsort_intra && block_cap.get() < 2 => Err(usage(
+        } if elements_per_blob.get() < degrade_min_cap(*unsort_intra) => Err(usage(
             &["degrade"],
-            "--unsort-intra needs --block-cap >= 2: an intra-blob inversion requires at least \
-             two same-kind elements inside one output block",
+            "--unsort-intra needs --elements-per-blob >= 2: an intra-blob inversion requires at \
+             least two same-kind elements inside one output block",
         )),
         Command::Check { .. } => validate_check(command, matches, quiet).map(|()| None),
         // A quiet `inspect --indexed` prints nothing: its answer is the exit
@@ -966,6 +966,24 @@ fn validate_check(
             );
         }
     }
+    // The ID, index and location checks each retain up to --max-errors
+    // details; the ref check retains them only under --show-ids. With the
+    // ref check alone and no --show-ids an explicit cap reaches nothing (the
+    // default reaches nothing too, and is not a request). After the quiet
+    // refusal, which would refuse the --show-ids named here.
+    if given(matches, "check", "max_errors")
+        && run_refs
+        && !run_ids
+        && !*index
+        && !*locations
+        && !*show_ids
+    {
+        return refuse(
+            "--max-errors caps the violation details a check retains, and the ref check \
+             retains them only under --show-ids: add --show-ids, add --ids, --index or \
+             --locations, or omit --max-errors",
+        );
+    }
     Ok(())
 }
 
@@ -1020,8 +1038,8 @@ fn parse_bbox(value: &str) -> Result<pbfhogg::extract::Bbox, String> {
     pbfhogg::extract::parse_bbox(value).map_err(|e| e.to_string())
 }
 
-/// An element cap (`--elements-per-blob`, `--block-cap`): non-zero by type in
-/// the library, so zero is refused here, where the flag can be named.
+/// An element cap (`repack` and `degrade` `--elements-per-blob`): non-zero by
+/// type in the library, so zero is refused here, where the flag can be named.
 fn parse_element_cap(value: &str) -> Result<std::num::NonZeroUsize, String> {
     match value.parse::<usize>() {
         Ok(cap) => std::num::NonZeroUsize::new(cap).ok_or_else(|| "must be > 0".to_owned()),
@@ -1566,19 +1584,19 @@ enum Command {
         /// ID, and SEED. Format: N:SEED (for example 5000:42).
         #[arg(long = "drop-ids", value_name = "N:SEED", value_parser = parse_drop_ids)]
         drop_ids: Option<pbfhogg::degrade::DropSpec>,
-        /// Per-block element cap on the decode path. Hidden; used by
-        /// the test suite so `--unsort` can fire on small fixtures
-        /// without large fixtures per element kind. Only the decode path
-        /// re-encodes, so given explicitly it needs a decode-path flag (a
-        /// default is not an explicit value and does not trip `requires`).
+        /// Per-blob element cap on the decode path, the most elements any
+        /// output data blob holds. Output blobs follow the input's blob
+        /// boundaries, except under --unsort, which packs each kind
+        /// continuously to the cap. Only the decode path re-encodes, so given
+        /// explicitly it needs a decode-path flag
+        // The default is not an explicit value and does not trip `requires`.
         #[arg(
-            long = "block-cap",
+            long = "elements-per-blob",
             default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
             value_parser = parse_element_cap,
-            requires = "degrade_decode",
-            hide = true
+            requires = "degrade_decode"
         )]
-        block_cap: std::num::NonZeroUsize,
+        elements_per_blob: std::num::NonZeroUsize,
         /// Proceed on input without blob-level indexdata, which the decode
         /// path (--unsort, --unsort-intra, --strip-locations, --drop-ids)
         /// would otherwise refuse; it falls back to scanning every blob for
@@ -2564,17 +2582,55 @@ fn switch_on_offer(leaf: &clap::ArgMatches, id: &str) -> bool {
         .is_some_and(|on| !*on)
 }
 
+/// Whether a degrade command line takes the decode path, which re-encodes
+/// every element at its `--elements-per-blob` cap. These four flags are the
+/// `degrade_decode` group, and a `Reencode` holds exactly their
+/// transformations; the header-only passthrough encodes no data blob.
+fn degrade_reencodes(
+    unsort: bool,
+    unsort_intra: bool,
+    strip_locations: bool,
+    drop_ids: bool,
+) -> bool {
+    unsort || unsort_intra || strip_locations || drop_ids
+}
+
+/// The smallest `--elements-per-blob` a degrade re-encode accepts: an
+/// intra-blob inversion needs two same-kind elements in one output block.
+fn degrade_min_cap(unsort_intra: bool) -> usize {
+    if unsort_intra { 2 } else { 1 }
+}
+
+/// The element-cap advice for a blob too large to write: the command's cap
+/// flag where the run encodes data blobs at that cap and the cap can still
+/// be lowered. The hint answers only the data-blob parts of the refusal, so
+/// an oversized OSMHeader (whose size its fields set) never gets it.
+fn element_cap_advice(command: &Command) -> Option<&'static str> {
+    let lowerable = match command {
+        Command::Repack {
+            elements_per_blob, ..
+        } => elements_per_blob.get() > 1,
+        Command::Degrade {
+            unsort,
+            unsort_intra,
+            strip_locations,
+            drop_ids,
+            elements_per_blob,
+            ..
+        } => {
+            degrade_reencodes(*unsort, *unsort_intra, *strip_locations, drop_ids.is_some())
+                && elements_per_blob.get() > degrade_min_cap(*unsort_intra)
+        }
+        _ => false,
+    };
+    lowerable.then_some("--elements-per-blob")
+}
+
 /// What this command line can be advised to do after a typed refusal; see
 /// [`exit_code::Advice`].
 fn advice(command: &Command, matches: &clap::ArgMatches) -> exit_code::Advice {
     let leaf = leaf_matches(matches);
-    let element_cap = if leaf.try_contains_id("elements_per_blob").unwrap_or(false) {
-        Some("--elements-per-blob")
-    } else if leaf.try_contains_id("block_cap").unwrap_or(false) {
-        Some("--block-cap")
-    } else {
-        None
-    };
+    let element_cap = element_cap_advice(command);
     exit_code::Advice {
         indexdata: indexdata_advice(command, leaf),
         element_cap,
@@ -2774,7 +2830,7 @@ pub fn run() -> process::ExitCode {
                 corrupt_indexdata_kind,
                 strip_bbox,
                 drop_ids,
-                block_cap,
+                elements_per_blob,
                 force,
                 compression,
                 io,
@@ -2788,10 +2844,11 @@ pub fn run() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force,
                 };
-                // The decode-path flags (the `degrade_decode` group) are
-                // exactly the transformations a `Reencode` holds, so one of
-                // them given is what asks for the re-encode. Clap has already
-                // refused `--unsort` with `--unsort-intra`.
+                // One of the decode-path flags given is what asks for the
+                // re-encode (`degrade_reencodes`, which the advice shares).
+                // Clap has already refused `--unsort` with `--unsort-intra`.
+                let reencodes =
+                    degrade_reencodes(unsort, unsort_intra, strip_locations, drop_ids.is_some());
                 let unsort = if unsort {
                     Some(pbfhogg::degrade::Unsort::CrossBlob)
                 } else if unsort_intra {
@@ -2799,13 +2856,12 @@ pub fn run() -> process::ExitCode {
                 } else {
                     None
                 };
-                let reencode = (unsort.is_some() || strip_locations || drop_ids.is_some())
-                    .then_some(pbfhogg::degrade::Reencode {
-                        block_cap,
-                        unsort,
-                        strip_locations,
-                        drop_ids,
-                    });
+                let reencode = reencodes.then_some(pbfhogg::degrade::Reencode {
+                    block_cap: elements_per_blob,
+                    unsort,
+                    strip_locations,
+                    drop_ids,
+                });
                 let flags = pbfhogg::degrade::DegradeFlags {
                     reencode,
                     strip_indexdata,
@@ -5589,6 +5645,65 @@ mod short_flag_tests {
         let mut expected = expected;
         expected.sort();
         assert_eq!(documented, expected);
+    }
+}
+
+/// The element-cap advice after an oversized blob names the cap only where
+/// the command line encodes data blobs at it and could still lower it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod advice_tests {
+    use super::{Cli, cli_command, element_cap_advice};
+
+    fn element_cap(argv: &[&str]) -> Option<&'static str> {
+        let matches = cli_command()
+            .try_get_matches_from(std::iter::once("pbfhogg").chain(argv.iter().copied()))
+            .unwrap_or_else(|e| panic!("{argv:?} must parse:\n{}", e.render()));
+        let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+        element_cap_advice(&cli.command)
+    }
+
+    #[test]
+    fn the_cap_is_advised_where_the_run_encodes_data_blobs_at_a_lowerable_cap() {
+        let degrade = ["degrade", "in.pbf", "-o", "out.pbf"];
+        let cases: &[(&[&str], bool)] = &[
+            (&["repack", "in.pbf", "-o", "out.pbf"], true),
+            (
+                &[
+                    "repack",
+                    "in.pbf",
+                    "-o",
+                    "out.pbf",
+                    "--elements-per-blob",
+                    "1",
+                ],
+                false,
+            ),
+            // The passthrough encodes no data blob, whatever its default cap.
+            (&["--strip-indexdata"], false),
+            (&["--strip-bbox", "--corrupt-indexdata"], false),
+            // Each decode-path flag encodes at the cap.
+            (&["--unsort"], true),
+            (&["--unsort-intra"], true),
+            (&["--strip-locations"], true),
+            (&["--drop-ids", "1:1"], true),
+            (&["--strip-indexdata", "--strip-locations"], true),
+            // At the mode's smallest cap there is nothing to lower to.
+            (&["--unsort", "--elements-per-blob", "1"], false),
+            (&["--unsort", "--elements-per-blob", "2"], true),
+            (&["--unsort-intra", "--elements-per-blob", "2"], false),
+            (&["--unsort-intra", "--elements-per-blob", "3"], true),
+            (&["inspect", "in.pbf"], false),
+        ];
+        for (words, advised) in cases {
+            let argv: Vec<&str> = if words[0].starts_with("--") {
+                degrade.iter().chain(words.iter()).copied().collect()
+            } else {
+                words.to_vec()
+            };
+            let want = advised.then_some("--elements-per-blob");
+            assert_eq!(element_cap(&argv), want, "{argv:?}");
+        }
     }
 }
 

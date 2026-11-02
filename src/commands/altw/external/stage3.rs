@@ -2,7 +2,6 @@
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
 use super::super::Result;
-use super::radix::advise_dontneed_file;
 use crate::error::Error;
 
 use super::blob_bucket_index::{BlobBucketIntersection, classify_blobs_in_bucket};
@@ -14,7 +13,7 @@ use super::{COORD_SLOT_SIZE, RE_OFF_LAT, RE_OFF_LOCAL_SLOT_POS, RE_OFF_LON, RESO
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
 pub(super) struct SlotBucketRef {
-    pub(super) paths: Vec<std::path::PathBuf>,
+    pub(super) paths: Vec<crate::scratch::ScratchPath>,
     pub(super) entry_counts: Vec<u64>,
 }
 
@@ -279,7 +278,13 @@ pub(super) fn stage3_slot_reorder(
 
                         let t_open = crate::counters::Stopwatch::start();
                         data_buf.clear();
-                        let bucket_file = crate::read::input::open(&paths[bucket_idx])?;
+                        let bucket_file =
+                            crate::scratch::open(&paths[bucket_idx]).map_err(|e| {
+                                Error::from(e).context(format!(
+                                    "failed to open slot bucket {}",
+                                    paths[bucket_idx].display()
+                                ))
+                            })?;
                         t_open.record_ms(&c.open_ms);
 
                         let t_read = crate::counters::Stopwatch::start();
@@ -291,7 +296,7 @@ pub(super) fn stage3_slot_reorder(
                                 ))
                             },
                         )?;
-                        if advise_dontneed_file(&bucket_file, cancel) {
+                        if crate::fadvise::evict_scratch(&bucket_file, cancel) {
                             c.fadvise_calls.fetch_add(1, Relaxed);
                             c.fadvise_bytes.fetch_add(data_buf.len() as u64, Relaxed);
                         }

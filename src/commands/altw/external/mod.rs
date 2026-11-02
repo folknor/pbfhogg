@@ -1031,7 +1031,7 @@ pub(crate) fn external_join_in(
             crate::scratch::create_read_write(p, false)
                 .map(|file| {
                     crate::read::input::InputFile::from_parts(
-                        std::sync::Arc::new(file),
+                        std::sync::Arc::new(file.into_file()),
                         std::sync::Arc::from(p.as_ref()),
                     )
                 })
@@ -1070,8 +1070,8 @@ pub(crate) fn external_join_in(
         host.invocation
             .counter("extjoin_slot_buckets_nonempty", nonempty);
     }
-    let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
-        .map(|i| radix::slot_bucket_path(scratch, i).map(|p| p.to_path_buf()))
+    let slot_paths: Vec<crate::scratch::ScratchPath> = (0..slot_bucket_count)
+        .map(|i| radix::slot_bucket_path(scratch, i))
         .collect::<crate::Result<_>>()?;
     let slot_bucket_ref = SlotBucketRef {
         paths: slot_paths,

@@ -1429,7 +1429,8 @@ mod capability_tests {
 ///
 /// Every eviction of an input a run issues counts into its invocation's
 /// `fadvise_input_evictions` counter ([`Invocation::for_each_counter`]), so
-/// a run under `Keep` can be checked to have asked for none. Not every
+/// a run under `Keep` can be checked to have asked for none; an eviction the
+/// invocation can no longer count (it has sealed) is not issued. Not every
 /// command evicts under `Evict`: `cat`, which walks raw frames, leaves the
 /// page cache alone either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

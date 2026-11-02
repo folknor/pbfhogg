@@ -4,9 +4,10 @@
 //! Advice is a hint. The kernel may ignore it, and a failure (`ESPIPE` on a
 //! FIFO, `EINVAL` on a file with no page cache behind it) changes how fast a
 //! run is, never what it produces, so no caller handles one. Failures are
-//! counted instead: [`advise`] keeps the invocation's total and emits it as
-//! the `fadvise_failures` sidecar counter on every failure, so a run whose
-//! hints did not take effect can be told apart from one whose hints did.
+//! counted instead: every entry here keeps the invocation's total and emits
+//! it as the `fadvise_failures` sidecar counter on every failure, so a run
+//! whose hints did not take effect can be told apart from one whose hints
+//! did.
 //!
 //! Why the library may advise at all: ADR-0016 (`decisions/`) gives process
 //! state and shared-host policy to the caller, and input page-cache eviction
@@ -14,21 +15,44 @@
 //! only the library's own open file descriptions - their readahead window,
 //! their access pattern, or pages of the library's own scratch files - and
 //! changes nothing another descriptor or process sees beyond what the read
-//! itself would. Input eviction still goes through this helper; whether it
-//! happens at all is the caller's policy, decided before it gets here.
+//! itself would.
+//!
+//! # Three entries, one of them counted
+//!
+//! The `host.page-cache-keep.v1` library capability is proven by the
+//! invocation counter `fadvise_input_evictions` staying 0 under
+//! `PageCachePolicy::Keep`. That proof holds only if no input page can be
+//! dropped without the count, so the split is in the types, not in a
+//! convention:
+//!
+//! - [`advise`] takes a [`Hint`], which has no variant that drops pages.
+//! - [`evict_input`] is the only way to drop pages of an arbitrary `File`,
+//!   and it always counts. It fails closed: it holds a call on the invocation
+//!   across the syscall, and issues nothing when the invocation refuses one
+//!   (sealed), so no eviction can land after the count was snapshotted.
+//! - [`evict_scratch`] drops pages uncounted, and takes only a
+//!   [`ScratchFile`](crate::scratch::ScratchFile), which `crate::scratch`
+//!   alone mints, from a path inside the run's own scratch directory.
+//!
+//! Whether an input is evicted at all is the caller's policy, decided before
+//! it gets here; `brokkr.toml` text rules confine the entry points that arm
+//! input eviction, and [`evict_input`]'s callers, to the read path that
+//! implements the policy.
 //!
 //! The behaviour is the same in every Linux build. It used to compile only
 //! under the `linux-direct-io` or `linux-io-uring` features, a leftover from
 //! when `libc` was optional; those features now mean only `O_DIRECT` and
-//! `io_uring`. Off Linux [`advise`] does nothing.
+//! `io_uring`. Off Linux nothing here gives advice.
 //!
-//! `clippy.toml` bans `libc::posix_fadvise` everywhere else in the library.
+//! `clippy.toml` bans `libc::posix_fadvise` everywhere else in the library,
+//! and `libc::madvise` / `libc::posix_madvise` everywhere, so page reclaim
+//! advice on a mapping cannot route around the count either.
 
 use std::fs::File;
 
-/// The advice [`advise`] can give.
+/// Advice [`advise`] can give: none of it drops a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Advice {
+pub(crate) enum Hint {
     /// `POSIX_FADV_SEQUENTIAL`: a front-to-back read; Linux doubles the
     /// readahead window for the open file description.
     Sequential,
@@ -36,17 +60,18 @@ pub(crate) enum Advice {
     Random,
     /// `POSIX_FADV_WILLNEED`: start reading the range into the page cache.
     WillNeed,
-    /// `POSIX_FADV_DONTNEED` on the library's own scratch: drop the range's
-    /// clean cached pages. Dirty pages stay until written back, so a caller
-    /// that wants its own writes dropped syncs first. Never on an input: that
-    /// is [`Advice::EvictInput`].
-    DontNeed,
-    /// `POSIX_FADV_DONTNEED` on an input file, the one advice host policy
-    /// governs (`host::PageCachePolicy`). Every one issued counts into the
-    /// invocation's `fadvise_input_evictions`, which is how a caller (and the
-    /// library harness's `host.page-cache-keep.v1` proof) sees that a call
-    /// under `Keep` asked the kernel to drop nothing of its inputs.
+}
+
+/// Every advice the syscall below is given, private so that the two
+/// `POSIX_FADV_DONTNEED` variants are reachable only through their entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Advice {
+    Hint(Hint),
+    /// `POSIX_FADV_DONTNEED` on an input, counted ([`evict_input`]).
     EvictInput,
+    /// `POSIX_FADV_DONTNEED` on library scratch, uncounted
+    /// ([`evict_scratch`]).
+    EvictScratch,
 }
 
 /// Advise the kernel about `len` bytes of `file` from `offset`, where `len`
@@ -58,60 +83,19 @@ pub(crate) enum Advice {
 /// that clamps to nothing there). A nonzero `len` reaching past the largest
 /// offset is clamped to it rather than passed as zero, which would widen a
 /// finite request to the whole tail of the file. Neither `true` nor a
-/// successful return means any page was read or dropped.
+/// successful return means any page was read.
 #[cfg(target_os = "linux")]
 pub(crate) fn advise(
     file: &File,
     offset: u64,
     len: u64,
-    advice: Advice,
+    hint: Hint,
     invocation: &crate::host::Invocation,
 ) -> bool {
-    use std::os::unix::io::AsRawFd as _;
-
-    let max = off_t_max();
-    let Some(room) = max.checked_sub(offset) else {
+    let Some(range) = off_t_range(offset, len) else {
         return false;
     };
-    let len = if len == 0 {
-        0
-    } else {
-        match len.min(room) {
-            0 => return false,
-            clamped => clamped,
-        }
-    };
-    let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) else {
-        return false;
-    };
-    let flag = match advice {
-        Advice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
-        Advice::Random => libc::POSIX_FADV_RANDOM,
-        Advice::WillNeed => libc::POSIX_FADV_WILLNEED,
-        Advice::DontNeed | Advice::EvictInput => libc::POSIX_FADV_DONTNEED,
-    };
-    #[cfg(test)]
-    tests::record_attempt(advice);
-    if advice == Advice::EvictInput {
-        // Counted as issued, before the syscall and whatever it returns: a
-        // failed eviction under `Keep` must not read as none. Input eviction
-        // runs under the reader's admission (a call or a pipeline permit),
-        // so this nested mint is not refused; a sealed invocation records
-        // nothing, as for a failure.
-        if let Ok(call) = invocation.call() {
-            call.metrics()
-                .fadvise
-                .input_evictions
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    // The crate's one `posix_fadvise`.
-    #[allow(clippy::disallowed_methods)]
-    // Safety: the borrow keeps the descriptor open for the call, and the
-    // call only reads its arguments.
-    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, flag) };
-    // `posix_fadvise` returns the error number itself, not -1 and `errno`.
-    if rc != 0 {
+    if issue(file, range, Advice::Hint(hint)) != 0 {
         // Cold: a nested entry under whatever admits the caller (a
         // command's call, a reader method's, a pipeline thread's permit), so
         // never refused there; a sealed invocation records nothing.
@@ -120,6 +104,106 @@ pub(crate) fn advise(
         }
     }
     true
+}
+
+/// Drop `len` bytes of input `file` from `offset` from the page cache (`len`
+/// zero through the end of the file), counted into `invocation`'s
+/// `fadvise_input_evictions`. The one way the library drops pages of a file
+/// it did not create as scratch.
+///
+/// Counted as issued, before the syscall and whatever it returns: a failed
+/// eviction under `Keep` must not read as none. A range `off_t` cannot
+/// express is refused as in [`advise`] and counts nothing, since nothing is
+/// issued. Fails closed: the count and the syscall run under one call on
+/// `invocation`, held until the syscall has returned, so the invocation
+/// cannot seal between them; when it refuses the call (it has sealed),
+/// nothing is issued and this returns `false`. Input eviction normally runs
+/// under the reader's admission (a call or a pipeline permit), so the nested
+/// call is not refused there.
+#[cfg(target_os = "linux")]
+pub(crate) fn evict_input(
+    file: &File,
+    offset: u64,
+    len: u64,
+    invocation: &crate::host::Invocation,
+) -> bool {
+    let Some(range) = off_t_range(offset, len) else {
+        return false;
+    };
+    let Ok(call) = invocation.call() else {
+        return false;
+    };
+    call.metrics()
+        .fadvise
+        .input_evictions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if issue(file, range, Advice::EvictInput) != 0 {
+        call.metrics().fadvise.record_failure(&call);
+    }
+    drop(call);
+    true
+}
+
+/// Drop a scratch file's clean pages from the page cache, once its bytes
+/// have been read into memory (or, for a file this run wrote, synced: dirty
+/// pages stay until written back). Scratch is the library's own, so this is
+/// library scratch management, not the caller's page-cache policy
+/// (ADR-0016), and it is not counted as an input eviction; the
+/// [`ScratchFile`](crate::scratch::ScratchFile) argument is what keeps an
+/// input out of it. Returns whether the advice was given (`false` off
+/// Linux); a failure counts into `recorder`.
+#[cfg(target_os = "linux")]
+pub(crate) fn evict_scratch(
+    file: &crate::scratch::ScratchFile,
+    recorder: &crate::host::Recorder,
+) -> bool {
+    // The whole file: offset 0, length 0, always expressible.
+    if issue(file.as_file(), (0, 0), Advice::EvictScratch) != 0 {
+        recorder.metrics().fadvise.record_failure(recorder);
+    }
+    true
+}
+
+/// `offset` and `len` as `off_t`, clamped as [`advise`] describes, or `None`
+/// when the range cannot be expressed.
+#[cfg(target_os = "linux")]
+fn off_t_range(offset: u64, len: u64) -> Option<(libc::off_t, libc::off_t)> {
+    let room = off_t_max().checked_sub(offset)?;
+    let len = if len == 0 {
+        0
+    } else {
+        match len.min(room) {
+            0 => return None,
+            clamped => clamped,
+        }
+    };
+    Some((
+        libc::off_t::try_from(offset).ok()?,
+        libc::off_t::try_from(len).ok()?,
+    ))
+}
+
+/// The syscall, returning its result (the error number itself, not -1 and
+/// `errno`).
+#[cfg(target_os = "linux")]
+fn issue(file: &File, (offset, len): (libc::off_t, libc::off_t), advice: Advice) -> libc::c_int {
+    use std::os::unix::io::AsRawFd as _;
+
+    let flag = match advice {
+        Advice::Hint(Hint::Sequential) => libc::POSIX_FADV_SEQUENTIAL,
+        Advice::Hint(Hint::Random) => libc::POSIX_FADV_RANDOM,
+        Advice::Hint(Hint::WillNeed) => libc::POSIX_FADV_WILLNEED,
+        Advice::EvictInput | Advice::EvictScratch => libc::POSIX_FADV_DONTNEED,
+    };
+    #[cfg(test)]
+    tests::record_attempt(advice);
+    // The crate's one `posix_fadvise`.
+    #[allow(clippy::disallowed_methods)]
+    // Safety: the borrow keeps the descriptor open for the call, and the
+    // call only reads its arguments.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, flag)
+    }
 }
 
 /// The largest offset `off_t` holds, which is narrower than `u64` everywhere
@@ -135,8 +219,28 @@ pub(crate) fn advise(
     _file: &File,
     _offset: u64,
     _len: u64,
-    _advice: Advice,
+    _hint: Hint,
     _invocation: &crate::host::Invocation,
+) -> bool {
+    false
+}
+
+/// Off Linux there is no advice to give.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn evict_input(
+    _file: &File,
+    _offset: u64,
+    _len: u64,
+    _invocation: &crate::host::Invocation,
+) -> bool {
+    false
+}
+
+/// Off Linux there is no advice to give.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn evict_scratch(
+    _file: &crate::scratch::ScratchFile,
+    _recorder: &crate::host::Recorder,
 ) -> bool {
     false
 }
@@ -147,7 +251,7 @@ crate::counters::counter_set! {
         /// `posix_fadvise` calls that returned an error.
         failures => "fadvise_failures",
         /// `POSIX_FADV_DONTNEED` advice issued on an input file
-        /// ([`Advice::EvictInput`]), whatever the call returned.
+        /// ([`evict_input`]), whatever the call returned.
         input_evictions => "fadvise_input_evictions",
     }
     extra {
@@ -183,7 +287,7 @@ impl FadviseMetrics {
 #[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
-    use super::{Advice, advise, off_t_max};
+    use super::{Advice, Hint, advise, evict_input, off_t_max};
     use std::cell::RefCell;
 
     thread_local! {
@@ -196,9 +300,23 @@ pub(crate) mod tests {
         ATTEMPTS.with(|a| a.borrow_mut().push(advice));
     }
 
-    /// How many times `advice` has been attempted on this thread so far.
-    pub(crate) fn attempts(advice: Advice) -> usize {
+    fn attempts(advice: Advice) -> usize {
         ATTEMPTS.with(|a| a.borrow().iter().filter(|&&x| x == advice).count())
+    }
+
+    /// How many times `hint` has been attempted on this thread so far.
+    pub(crate) fn hint_attempts(hint: Hint) -> usize {
+        attempts(Advice::Hint(hint))
+    }
+
+    fn input_evictions(inv: &crate::host::Invocation) -> u64 {
+        let mut n = None;
+        inv.for_each_counter(|name, value| {
+            if name == "fadvise_input_evictions" {
+                n = Some(value);
+            }
+        });
+        n.unwrap()
     }
 
     #[test]
@@ -208,15 +326,40 @@ pub(crate) mod tests {
         std::fs::write(&path, b"x").unwrap();
         let file = crate::read::input::open(&path).unwrap();
         let max = off_t_max();
-        let before = attempts(Advice::WillNeed);
+        let before = hint_attempts(Hint::WillNeed);
         let inv = crate::host::Invocation::new();
-        assert!(!advise(&file, max + 1, 0, Advice::WillNeed, &inv));
+        assert!(!advise(&file, max + 1, 0, Hint::WillNeed, &inv));
         // A finite request at the last offset has no room left: advising it
         // would mean "through EOF".
-        assert!(!advise(&file, max, 1, Advice::WillNeed, &inv));
-        assert_eq!(attempts(Advice::WillNeed), before, "nothing was attempted");
-        assert!(advise(&file, 0, 0, Advice::WillNeed, &inv));
-        assert!(advise(&file, 1, u64::MAX, Advice::WillNeed, &inv));
-        assert_eq!(attempts(Advice::WillNeed), before + 2);
+        assert!(!advise(&file, max, 1, Hint::WillNeed, &inv));
+        assert_eq!(
+            hint_attempts(Hint::WillNeed),
+            before,
+            "nothing was attempted"
+        );
+        assert!(advise(&file, 0, 0, Hint::WillNeed, &inv));
+        assert!(advise(&file, 1, u64::MAX, Hint::WillNeed, &inv));
+        assert_eq!(hint_attempts(Hint::WillNeed), before + 2);
+    }
+
+    /// Every input eviction issued is counted, an unexpressible range is
+    /// neither issued nor counted, and a sealed invocation gets no eviction
+    /// at all rather than an uncounted one.
+    #[test]
+    fn input_evictions_are_counted_or_not_issued() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let file = crate::read::input::open(&path).unwrap();
+        let inv = crate::host::Invocation::new();
+        let before = attempts(Advice::EvictInput);
+        assert!(evict_input(&file, 0, 1, &inv));
+        assert!(!evict_input(&file, off_t_max() + 1, 0, &inv));
+        assert_eq!(attempts(Advice::EvictInput), before + 1);
+        assert_eq!(input_evictions(&inv), 1);
+
+        assert!(matches!(inv.seal(), crate::host::SealOutcome::Sealed(_)));
+        assert!(!evict_input(&file, 0, 1, &inv), "sealed: refused");
+        assert_eq!(attempts(Advice::EvictInput), before + 1, "nothing issued");
     }
 }

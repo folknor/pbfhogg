@@ -1373,6 +1373,48 @@ paths = ["src/commands/**/*.rs", "src/geocode_index/builder/**/*.rs", "src/scan/
 region = "code"
 message = "Command readers must inherit the caller's host"
 
+# Input page-cache eviction is the caller's policy (ADR-0016), and the
+# `host.page-cache-keep.v1` library capability rests on two facts: nothing
+# arms input eviction under `PageCachePolicy::Keep`, and every input eviction
+# counts into `fadvise_input_evictions`. The types carry the counting
+# (`crate::fadvise`: only `evict_input` drops an arbitrary file's pages, and
+# it always counts; uncounted eviction takes a `scratch::ScratchFile`). These
+# rules confine the entry points outside their owners: the reader opt-in
+# that arms eviction (bare identifiers, so method, path and function-value
+# spellings all match) to the read path that applies the host policy, the
+# reader's eviction step to the reader, and the counted eviction to that
+# step. What the owners do with them is checked in review and by the
+# harness's page-cache-keep scenario, not here.
+[[textlint]]
+name = "input-eviction-armed-only-by-the-reader"
+pattern = '\b(?:evict_page_cache|from_path_with_eviction)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/read/blob.rs", "src/read/reader.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/pipeline.rs", "src/read/header_walker.rs", "src/commands/mod.rs"]
+message = "input page-cache eviction is armed only by BlobReader and ElementReader, from the host's PageCachePolicy or a public caller's opt-in; library code inherits the caller's policy"
+
+[[textlint]]
+name = "input-eviction-step-only-in-the-reader"
+pattern = '\bevict_consumed_prefix\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/read/file_reader.rs", "src/read/blob.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/pipeline.rs", "src/read/header_walker.rs"]
+message = "FileReader::evict_consumed_prefix runs only from BlobReader's armed eviction step"
+
+[[textlint]]
+name = "counted-input-eviction-only-from-the-reader"
+pattern = '\bevict_input\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/fadvise.rs", "src/read/file_reader.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/blob.rs", "src/read/pipeline.rs", "src/read/header_walker.rs"]
+message = "fadvise::evict_input is called only by FileReader::evict_consumed_prefix, the reader's eviction under the caller's policy"
+
 # The library's shared rayon tasks run on the caller's `host::Executor`, never
 # on whatever pool happens to be ambient. Par-iterators cannot be matched by
 # text; each one is wrapped in `executor.install` and checked in review.

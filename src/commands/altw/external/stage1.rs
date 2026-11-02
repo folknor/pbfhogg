@@ -59,7 +59,7 @@ crate::counters::counter_set! {
 /// atomics are shared across workers; at ~583 K drains per planet run
 /// the fetch_add cost is noise.
 struct TimedShardWriter<'a> {
-    file: std::fs::File,
+    file: crate::scratch::ScratchFile,
     counters: &'a PassACounters,
 }
 
@@ -112,8 +112,8 @@ struct Stage1Local {
 /// Pass A's consumer: writes the ref-count and per-way refcount sidecars in
 /// blob order.
 struct Stage1Consumer<'a> {
-    sidecar_writer: BufWriter<std::fs::File>,
-    per_way_writer: BufWriter<std::fs::File>,
+    sidecar_writer: BufWriter<crate::scratch::ScratchFile>,
+    per_way_writer: BufWriter<crate::scratch::ScratchFile>,
     varint_buf: Vec<u8>,
     total_refs: u64,
     counters: &'a PassACounters,

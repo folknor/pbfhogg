@@ -54,9 +54,10 @@ impl FileReader {
     /// Advise away a consumed prefix using the currently owned file.
     /// Returns whether an advisory syscall was issued; O_DIRECT has no cache.
     /// The fd is borrowed only for this call, never cached by the caller.
-    /// This is the library's one eviction of an input: the advice counts into
-    /// `invocation`'s `fadvise_input_evictions` (and a failure into its
-    /// `fadvise_failures`).
+    /// This is the library's one eviction of an input, through
+    /// `fadvise::evict_input`: the advice counts into `invocation`'s
+    /// `fadvise_input_evictions` (and a failure into its `fadvise_failures`),
+    /// and none is issued under a sealed invocation.
     #[cfg(target_os = "linux")]
     pub(crate) fn evict_consumed_prefix(
         &self,
@@ -67,14 +68,7 @@ impl FileReader {
             // An empty prefix is not advised: length zero would mean the
             // whole file.
             Self::Buffered(reader) => {
-                offset != 0
-                    && crate::fadvise::advise(
-                        reader.get_ref(),
-                        0,
-                        offset,
-                        crate::fadvise::Advice::EvictInput,
-                        invocation,
-                    )
+                offset != 0 && crate::fadvise::evict_input(reader.get_ref(), 0, offset, invocation)
             }
             #[cfg(feature = "linux-direct-io")]
             Self::Direct(_) => false,
@@ -105,7 +99,7 @@ impl FileReader {
         invocation: &crate::host::Invocation,
     ) -> Result<Self> {
         let f = source.open()?;
-        crate::fadvise::advise(&f, 0, 0, crate::fadvise::Advice::Sequential, invocation);
+        crate::fadvise::advise(&f, 0, 0, crate::fadvise::Hint::Sequential, invocation);
         Ok(Self::Buffered(BufReader::with_capacity(
             crate::write::IO_BUF_BYTES,
             f,
@@ -245,7 +239,7 @@ impl Read for FileReader {
 #[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::fadvise::{Advice, tests::attempts};
+    use crate::fadvise::{Hint, tests::hint_attempts};
 
     /// Every Linux build hints sequential readahead on a buffered open. The
     /// hint used to compile only with the `O_DIRECT` or `io_uring` feature,
@@ -256,11 +250,11 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("in.bin");
         std::fs::write(&path, b"bytes").unwrap();
-        let before = attempts(Advice::Sequential);
+        let before = hint_attempts(Hint::Sequential);
         let _reader =
             super::FileReader::buffered_in(&path, &crate::host::Call::detached()).unwrap();
         assert_eq!(
-            attempts(Advice::Sequential),
+            hint_attempts(Hint::Sequential),
             before + 1,
             "FileReader::buffered_in must advise POSIX_FADV_SEQUENTIAL exactly once"
         );

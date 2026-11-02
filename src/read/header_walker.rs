@@ -345,13 +345,7 @@ impl HeaderWalker {
         // (workers may address disjoint shards). Sequential readahead
         // would pull blob bodies adjacent to each header into the page
         // cache and never be reused.
-        crate::fadvise::advise(
-            &file,
-            0,
-            0,
-            crate::fadvise::Advice::Random,
-            &host.invocation,
-        );
+        crate::fadvise::advise(&file, 0, 0, crate::fadvise::Hint::Random, &host.invocation);
         Ok(Self::over(Arc::new(file), file_size, path, host))
     }
 

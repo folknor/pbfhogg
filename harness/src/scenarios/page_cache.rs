@@ -5,7 +5,9 @@
 //! The observation is the library's `fadvise_input_evictions` counter in
 //! each call's sealed snapshot: every `POSIX_FADV_DONTNEED` the library asks
 //! for on an input is counted, issued, into the invocation of the call that
-//! asked, at the crate's one `posix_fadvise` (`Advice::EvictInput`). So the
+//! asked, through the library's one counted eviction (`fadvise::evict_input`,
+//! which issues nothing it could not count); the library's uncounted
+//! eviction takes only its own scratch files, by type. So the
 //! count is attributable to the call, not read off page-cache residency,
 //! which kernel reclaim and other processes move too. It is advice issued,
 //! not pages dropped: the claim is that a call on `Keep` asks for no

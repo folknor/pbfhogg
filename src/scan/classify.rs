@@ -350,7 +350,7 @@ impl WillneedPrefetch {
                 shared_file,
                 offset,
                 size,
-                crate::fadvise::Advice::WillNeed,
+                crate::fadvise::Hint::WillNeed,
                 &self.invocation,
             );
         }

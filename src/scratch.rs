@@ -399,16 +399,95 @@ fn random_u128() -> crate::Result<u128> {
     Ok(u128::from_le_bytes(bytes))
 }
 
+/// An open scratch file: a file every scratch opener below returns, and
+/// nothing else constructs, so holding one shows the descriptor was opened
+/// at a [`ScratchPath`], inside the run directory this run created. The
+/// field is private and there is no conversion from a `File`, and no
+/// `DerefMut` (which would let safe code swap an input in).
+///
+/// What it proves rests on the module's trust in the run directory: the
+/// opens are path based (see the module doc), so it shows where the file was
+/// opened, not that no link inside the private directory pointed elsewhere;
+/// the library never creates one.
+///
+/// The proof is what [`crate::fadvise::evict_scratch`] requires to drop
+/// pages without counting them as an input eviction. Reads, writes and
+/// `File` methods pass through; [`ScratchFile::into_file`] gives up the proof
+/// for a caller that has to own a plain `File`.
+#[derive(Debug)]
+pub(crate) struct ScratchFile(File);
+
+impl ScratchFile {
+    /// The file.
+    pub(crate) fn as_file(&self) -> &File {
+        &self.0
+    }
+
+    /// The plain file, without the proof.
+    pub(crate) fn into_file(self) -> File {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ScratchFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl AsRawFd for ScratchFile {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl io::Read for ScratchFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.0, buf)
+    }
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        io::Read::read_to_end(&mut self.0, buf)
+    }
+}
+
+impl io::Read for &ScratchFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut &self.0, buf)
+    }
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        io::Read::read_to_end(&mut &self.0, buf)
+    }
+}
+
+impl io::Write for ScratchFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.0, buf)
+    }
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        io::Write::write_vectored(&mut self.0, bufs)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.0)
+    }
+}
+
+impl io::Seek for ScratchFile {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        io::Seek::seek(&mut self.0, pos)
+    }
+}
+
 /// Create (or truncate) a scratch file for writing: a file the run itself
 /// owns, never an output. The command layer may not call `File::create`
 /// directly (outputs go through `crate::output`), so its scratch writes come
 /// through here, where the distinction is stated.
-pub(crate) fn create(path: &ScratchPath) -> io::Result<File> {
-    File::create(&path.path)
+pub(crate) fn create(path: &ScratchPath) -> io::Result<ScratchFile> {
+    File::create(&path.path).map(ScratchFile)
 }
 
 /// [`create`], retaining the path in any error.
-pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<File> {
+pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<ScratchFile> {
     create(path).map_err(|e| {
         crate::Error::from(e).context(format!(
             "failed to create scratch file {}",
@@ -420,13 +499,13 @@ pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<File> {
 /// Open a scratch file the run wrote, for reading back. The caller names
 /// the path in its error (it knows what the file holds); a `NotFound` stays
 /// matchable for the scratch a stage may legitimately not have written.
-pub(crate) fn open(path: &ScratchPath) -> io::Result<File> {
-    File::open(&path.path)
+pub(crate) fn open(path: &ScratchPath) -> io::Result<ScratchFile> {
+    File::open(&path.path).map(ScratchFile)
 }
 
 /// Open a scratch file for reading and writing, truncating it, or creating it
 /// exclusively when `exclusive` is set. Scratch only, as for [`create`].
-pub(crate) fn create_read_write(path: &ScratchPath, exclusive: bool) -> io::Result<File> {
+pub(crate) fn create_read_write(path: &ScratchPath, exclusive: bool) -> io::Result<ScratchFile> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
     if exclusive {
@@ -434,7 +513,7 @@ pub(crate) fn create_read_write(path: &ScratchPath, exclusive: bool) -> io::Resu
     } else {
         options.create(true).truncate(true);
     }
-    options.open(&path.path)
+    options.open(&path.path).map(ScratchFile)
 }
 
 // ---------------------------------------------------------------------------

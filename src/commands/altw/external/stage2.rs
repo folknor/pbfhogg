@@ -27,7 +27,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use super::super::Result;
-use super::radix::advise_dontneed_file;
 use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
@@ -165,7 +164,7 @@ fn prepare_bucket(
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
             .map_err(|e| named("read", e))?;
-        if advise_dontneed_file(&file, invocation) {
+        if crate::fadvise::evict_scratch(&file, invocation) {
             fadvise_calls += 1;
             fadvise_bytes += len as u64;
         }
@@ -216,7 +215,7 @@ fn prepare_bucket(
 /// Shared slot bucket writers protected by per-bucket mutexes.
 /// `slot_bucket_count` files total regardless of worker count.
 pub(super) struct SharedSlotBuckets {
-    writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+    writers: Vec<std::sync::Mutex<std::io::BufWriter<crate::scratch::ScratchFile>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
     /// Each bucket's file, for naming it in a failed write.
     paths: Vec<crate::scratch::ScratchPath>,
@@ -285,7 +284,7 @@ impl SharedSlotBuckets {
                 w.get_ref()
                     .sync_data()
                     .map_err(|e| self.sync_error(bucket, e))?;
-                advise_dontneed_file(w.get_ref(), invocation);
+                crate::fadvise::evict_scratch(w.get_ref(), invocation);
             }
         }
         Ok(())

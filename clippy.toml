@@ -74,9 +74,15 @@ disallowed-methods = [
     { path = "libc::pwritev", reason = "positioned writes go through std FileExt::write_all_at" },
     { path = "libc::read", reason = "use std::fs::File's Read, which issues the same read(2)" },
     { path = "libc::write", reason = "use std::fs::File's Write, which issues the same write(2)" },
-    # Page-cache advice has one owner, `crate::fadvise::advise`, which handles
-    # the off_t range, the platform gate and the failure counter once.
-    { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise::advise" },
+    # Page-cache advice has one owner, `crate::fadvise`, which handles the
+    # off_t range, the platform gate and the failure counter once, and counts
+    # every input eviction (the `host.page-cache-keep.v1` proof). Mapping
+    # advice can ask for reclaim too (MADV_PAGEOUT, MADV_COLD), so the raw
+    # madvise calls are refused with it; memmap2's own advice has no reclaim
+    # variant.
+    { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise" },
+    { path = "libc::madvise", reason = "reclaim advice would evict pages uncounted; page-cache advice goes through crate::fadvise" },
+    { path = "libc::posix_madvise", reason = "reclaim advice would evict pages uncounted; page-cache advice goes through crate::fadvise" },
     # A rayon pool the library builds is a `crate::joined_pool::JoinedPool`,
     # whose workers are joined, thread-local destructors included, before the
     # call that built it ends. rayon's own constructors leave the workers to

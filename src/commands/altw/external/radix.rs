@@ -38,22 +38,3 @@ pub(crate) fn slot_bucket_path(scratch: &RunScratch, index: usize) -> Result<Scr
 pub(crate) fn payload_path(scratch: &RunScratch, index: usize) -> Result<ScratchPath> {
     scratch.file(&format!("payloads-W{index}"))
 }
-
-// ---------------------------------------------------------------------------
-// File-level page-cache eviction helper
-// ---------------------------------------------------------------------------
-
-/// Advise the kernel to drop a scratch file's clean pages from the page
-/// cache, once its bytes have been read into memory (or, for a file this run
-/// wrote, synced). Scratch is the library's own, so this is library scratch
-/// management, not the caller's page-cache policy (ADR-0016), and it runs in
-/// every Linux build: it used to compile only with the `linux-direct-io`
-/// feature, which has nothing to do with it. Returns whether the advice was
-/// given (false off Linux), for the stage counters; a failure counts into
-/// `invocation`.
-pub(crate) fn advise_dontneed_file(
-    file: &std::fs::File,
-    invocation: &crate::host::Recorder,
-) -> bool {
-    crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::DontNeed, invocation)
-}

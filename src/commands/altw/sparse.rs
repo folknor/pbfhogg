@@ -104,7 +104,7 @@ fn open_anonymous_sparse_file(
             temp_path.display()
         ))
     })?;
-    Ok(file)
+    Ok(file.into_file())
 }
 
 // The slot encoding - biased latitude, presence bit, verbatim longitude -

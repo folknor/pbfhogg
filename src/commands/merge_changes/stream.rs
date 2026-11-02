@@ -446,7 +446,7 @@ enum Sink {
     /// Not the head yet and nothing written: no file made.
     Pending,
     /// Not the head yet: members appended to a scratch file.
-    Spill(ScratchPath, io::BufWriter<std::fs::File>),
+    Spill(ScratchPath, io::BufWriter<crate::scratch::ScratchFile>),
     /// Not the head yet, every member spilled: the file is closed.
     Closed(ScratchPath),
     /// The head input: members go to the output.

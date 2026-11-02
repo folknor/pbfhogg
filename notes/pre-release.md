@@ -575,15 +575,19 @@ denmark indexed cells put digest at 503 ms on `d2d8836a` against 701 ms on
 The ticket suggests a `--form content` run to separate drift from code.
 The recorded "no cost" claim for v2 needs re-checking against that.
 
-### WRK-074: Guard the input-eviction capability proof
+### WRK-136: Scratch read back through the input opener
 
-The `host.page-cache-keep.v1` capability's proof rests on
-`fadvise_input_evictions` counting every input eviction, which in turn
-rests on the variant split `Advice::EvictInput` versus `Advice::DontNeed`
-and an audit that `FileReader::evict_consumed_prefix` is the only input
-eviction. Nothing enforces that: a new eviction path through `DontNeed`
-would silently void the capability. A textlint or a type split would guard
-it.
+Scratch files are created through `crate::scratch` and come back as
+`ScratchFile`, the proof `fadvise::evict_scratch` requires, but five sites
+reopen scratch for reading through `crate::read::input::open` on a plain
+`Path`: the ref-count sidecar (`altw/external/stage4.rs`
+`load_ref_count_sidecar_in`), the per-way ref-count sidecar
+(`coord_payloads.rs` `load_per_way_refcount_sidecar_in`), and diff derive's
+fragments and spills (`derive.rs` `copy_checked`, `copy_raw`, the gzip
+member copy in the assembler). Harmless today (none evicts), but a reader
+that later wants to drop those pages cannot without first threading the
+`ScratchPath` through, and the input opener's error text calls them inputs.
+Thread `ScratchPath` to each and open with `crate::scratch::open`.
 
 ---
 

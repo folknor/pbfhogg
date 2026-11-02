@@ -6,7 +6,6 @@
 //! total change count.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -221,7 +220,7 @@ pub(crate) fn derive_changes_to(
 /// The run's change sink: the three action fragments, as scratch files the
 /// OSC assembly frames.
 struct ChangeSink {
-    w: ChangeWriters<io::BufWriter<File>>,
+    w: ChangeWriters<io::BufWriter<crate::scratch::ScratchFile>>,
     encoding: Fragments,
     creates_path: crate::scratch::ScratchPath,
     modifies_path: crate::scratch::ScratchPath,
@@ -296,7 +295,7 @@ enum Fragments {
 
 /// Copy a scratch file to the end of `dst`, checking the cancellation token
 /// between buffers: neither file observes it.
-fn copy_checked(src: &Path, dst: &mut File, cancel: &crate::host::Recorder) -> Result<()> {
+fn copy_checked(src: &Path, dst: &mut impl Write, cancel: &crate::host::Recorder) -> Result<()> {
     let mut src = crate::read::input::open(src)?;
     let mut buf = vec![0_u8; crate::tunables::DIFF_SPILL_COPY_BUFFER];
     loop {
@@ -426,7 +425,7 @@ const SECTIONS: [Section; 3] = [Section::Creates, Section::Modifies, Section::De
 /// queue once the unit's channel was full.
 struct Spill {
     path: crate::scratch::ScratchPath,
-    file: io::BufWriter<File>,
+    file: io::BufWriter<crate::scratch::ScratchFile>,
 }
 
 /// A derive unit's worker side: element XML formatted into memory, one

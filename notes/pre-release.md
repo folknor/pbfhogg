@@ -345,6 +345,14 @@ pass over the closed set) or record the deviation.
 
 ### WRK-131: inspect tags with its default thresholds at planet is unmeasured
 
+Parked behind WRK-137 (maintainer, 2026-11-02). Low value on its own: a
+bare planet run prints about 187 M rows, gigabytes of text no realistic
+caller wants, and the 10.8 GB counting table is the same at any
+threshold, so only the row build and serial sort are unmeasured. If
+WRK-137 adopts osmium's key-only rows, a bare run lists keys and this
+entry goes; if it confirms key=value rows, decide then whether the
+default is worth a measurement.
+
 Every brokkr `inspect --tags` cell passes `--min-count 999999999`, so no
 measured run builds output rows. With the default `--min-count 1` every
 distinct pair becomes a row: at planet 187.4 M `TagCount`s (counter
@@ -358,15 +366,15 @@ does not fit, the shape is to sort and print from the shards without
 owning the strings, which the public `Vec<TagCount>` return type rules
 out: a streaming or borrowed-row API.
 
-### WRK-132: inspect tags' summary line counts rows kept, not distinct values
+### WRK-138: inspect tags' unindexed Note says the type filter is a no-op
 
-`run_tags_count` (`cli/src/lib.rs`) prints `N distinct tag values` from the
-length of the result, which is the rows `--min-count` / `--max-count` kept:
-the denmark run with `-M 50 --type node` prints 3,009,986 where the file
-holds more distinct node pairs, and brokkr's cells print 0. Either word the
-line as rows printed or report the distinct-pair count, which the library
-does not return today (`tags_count_distinct_pairs` is a sidecar counter
-only). `cli/tests/cli_quiet.rs` asserts the line's wording.
+Without indexdata, `tags_count_inner` (`src/commands/tags_count/mod.rs`)
+passes `require_indexdata` the message "Without indexdata, the type filter
+is a no-op - all blobs are decompressed". Only the blob pruning is lost:
+`tally::TagRuns` still admits elements by kind, so `--type node --force`
+counts node tags only. Reword it to say every blob is decompressed, not
+that the filter does nothing; check the other `require_indexdata` callers'
+messages for the same claim.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 

@@ -465,7 +465,7 @@ mod tests {
                         (Err(a), Err(b)) => {
                             assert_eq!(a.to_string(), b.to_string(), "{what}, {how}, {n}");
                         }
-                        (Ok(block), Ok(rows)) => {
+                        (Ok(block), Ok((rows, _))) => {
                             let got: Counts = rows
                                 .into_iter()
                                 .map(|r| ((r.key, r.value), r.count))
@@ -498,6 +498,7 @@ mod tests {
         let got: Counts = table
             .into_counts(|_| true, &host.invocation)
             .unwrap()
+            .0
             .into_iter()
             .map(|r| ((r.key, r.value), r.count))
             .collect();
@@ -543,8 +544,9 @@ mod tests {
                 .add_blob(buffer, TypeFilter::all(), None, &table, &host.invocation)
                 .unwrap();
         }
-        let rows = table.into_counts(|_| true, &host.invocation).unwrap();
+        let (rows, stats) = table.into_counts(|_| true, &host.invocation).unwrap();
         assert_eq!(rows.len(), 600);
+        assert_eq!((stats.distinct_pairs, stats.retained_pairs), (600, 600));
         assert!(rows.iter().all(|r| r.key == "w0" && r.count == 2));
         let values: std::collections::BTreeSet<&str> =
             rows.iter().map(|r| r.value.as_str()).collect();

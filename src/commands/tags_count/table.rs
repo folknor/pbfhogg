@@ -18,7 +18,7 @@ use std::sync::{Mutex, MutexGuard};
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 
-use super::TagCount;
+use super::{TagCount, TagCountStats};
 use crate::error::{Error, Result};
 use crate::tunables::{TAGS_COUNT_ARENA_CHUNK_BYTES, TAGS_COUNT_SHARD_BITS};
 
@@ -240,16 +240,19 @@ impl CountTable {
             .map_err(|_| poisoned())
     }
 
-    /// Every pair whose count `keep` admits, as owned rows, unsorted. Retained
-    /// rows are counted before the result is reserved, so a threshold that
-    /// keeps few rows reserves few; each shard is freed once read, so the
-    /// rows never coexist with the whole table. Cancellation is checked per
-    /// shard.
+    /// Every pair whose count `keep` admits, as owned rows, unsorted, with
+    /// the run's figures: every distinct pair the table holds and how many
+    /// `keep` admitted. A pair lives in exactly one shard (shards split by
+    /// pair hash, pairs compare by bytes), so the sum of the shards' entries
+    /// is the exact distinct count. Retained rows are counted before the
+    /// result is reserved, so a threshold that keeps few rows reserves few;
+    /// each shard is freed once read, so the rows never coexist with the
+    /// whole table. Cancellation is checked per shard.
     pub(super) fn into_counts(
         self,
         keep: impl Fn(u64) -> bool,
         cancel: &crate::host::Recorder,
-    ) -> Result<Vec<TagCount>> {
+    ) -> Result<(Vec<TagCount>, TagCountStats)> {
         let shards = self
             .shards
             .into_iter()
@@ -260,7 +263,8 @@ impl CountTable {
         // arena bytes stored and reserved, and the two hash tables' own
         // allocations.
         let sum = |f: fn(&Shard) -> usize| shards.iter().map(f).sum::<usize>();
-        cancel.counter("tags_count_distinct_pairs", sum(|s| s.entries.len()));
+        let distinct_pairs = sum(|s| s.entries.len());
+        cancel.counter("tags_count_distinct_pairs", distinct_pairs);
         cancel.counter("tags_count_interned_keys", sum(|s| s.keys.len()));
         cancel.counter("tags_count_arena_len_bytes", sum(|s| s.arena.len()));
         cancel.counter("tags_count_arena_bytes", sum(|s| s.arena.capacity()));
@@ -293,7 +297,11 @@ impl CountTable {
                 });
             }
         }
-        Ok(rows)
+        let stats = TagCountStats {
+            distinct_pairs: distinct_pairs as u64,
+            retained_pairs: retained as u64,
+        };
+        Ok((rows, stats))
     }
 }
 

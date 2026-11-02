@@ -123,6 +123,7 @@ fn run<'a>(
         parallelism: pbfhogg::Parallelism::from_jobs(2),
     };
     Ok(tags_count(input, &opts, host)?
+        .rows
         .into_iter()
         .map(|t| (t.key, t.value, t.count))
         .collect())

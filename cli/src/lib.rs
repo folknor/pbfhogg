@@ -3887,7 +3887,7 @@ fn run_tags_count(
 
     use pbfhogg::text_quote::Quoted;
     let mut out = output::buffered();
-    for entry in &results {
+    for entry in &results.rows {
         // Tab-separated, the key and value as JSON-compatible literals: a tab
         // or newline in the text cannot break field or row framing.
         writeln!(
@@ -3900,11 +3900,9 @@ fn run_tags_count(
     }
     out.flush()?;
 
-    writeln!(
-        host.diagnostics.summary_writer("tags_count.summary"),
-        "{} distinct tag values",
-        results.len()
-    )?;
+    results
+        .stats
+        .write_summary(&mut host.diagnostics.summary_writer("tags_count.summary"))?;
     Ok(())
 }
 

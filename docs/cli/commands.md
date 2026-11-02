@@ -35,8 +35,9 @@ the command accepts.
 - **Dropped:** every `Note:`, every progress line, the command's closing
   summary (single- or multi-line, `apply-changes`' block, each region's line
   of `extract --config` and its opening `Multi-extract:` line, `inspect tags`'
-  `N distinct tag values`), and the developer lines some backends print
-  (`[altw external] ...`, the geocode builder's hotpath counters).
+  `N distinct key/value pairs counted, ...` line), and the developer lines
+  some backends print (`[altw external] ...`, the geocode builder's hotpath
+  counters).
 - **Kept:** every `Warning:` and the final `Error:` line, which explain the
   exit code, and clap's usage errors.
 - **Never touched:** what a command writes to `-o` (a quiet run writes the
@@ -763,6 +764,13 @@ key and the value, each a double-quoted literal escaped as in
 `120`, TAB, `"highway"`, TAB, `"primary"`. A tab or newline inside a key or value prints
 escaped, so splitting a row on tabs always yields three fields and each
 quoted field JSON-decodes to the original text.
+
+After the rows, one summary line on stderr gives two figures:
+`D distinct key/value pairs counted, K passed the count thresholds`. `D` is
+every distinct pair the run selected (after `--type` and the expressions),
+before `--min-count` and `--max-count`; `K` is how many of them those
+thresholds kept, which is the number of rows printed. Neither counts
+occurrences or distinct keys. `-q` drops the line (see [Quiet](#quiet)).
 
 `inspect tags` expressions use the same syntax as `tags-filter`, including
 element-type prefixes. For example, `w/highway=primary` counts that match only

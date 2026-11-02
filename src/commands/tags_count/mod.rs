@@ -18,6 +18,39 @@ pub struct TagCount {
     pub count: u64,
 }
 
+/// What [`tags_count`] returns: the rows, sorted, and what the run counted.
+pub struct TagCounts {
+    /// The pairs that passed the count thresholds, in the requested order.
+    pub rows: Vec<TagCount>,
+    /// Figures of the completed run. They are fixed when the run ends, so
+    /// they still hold after a caller drains or edits `rows`.
+    pub stats: TagCountStats,
+}
+
+/// What one [`tags_count`] run counted.
+pub struct TagCountStats {
+    /// Distinct key/value pairs the run selected and saw (after the type
+    /// filter and the expressions, before `min_count` and `max_count`): not
+    /// occurrences and not distinct keys.
+    pub distinct_pairs: u64,
+    /// Of `distinct_pairs`, how many passed `min_count` and `max_count`,
+    /// which is how many rows the run returned.
+    pub retained_pairs: u64,
+}
+
+impl TagCountStats {
+    /// The closing summary line: both figures, always, in one shape. It
+    /// carries no `=`: a harness scraping `key=value` lines from stderr
+    /// would otherwise read it as a metric.
+    pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "{} distinct key/value pairs counted, {} passed the count thresholds",
+            self.distinct_pairs, self.retained_pairs,
+        )
+    }
+}
+
 /// Sort order for tag count results.
 #[derive(Clone, Copy, Default)]
 pub enum TagCountSort {
@@ -50,7 +83,9 @@ pub struct TagCountOptions<'a> {
 ///
 /// If `type_filter` is set, only count tags on elements of those types.
 /// Results are sorted by count descending,
-/// then by key, then by value. Entries below `min_count` are excluded.
+/// then by key, then by value. Entries below `min_count` are excluded. The
+/// returned [`TagCountStats`] says how many distinct pairs were counted and
+/// how many of them the thresholds kept.
 ///
 /// If `expressions` is non-empty, only tags matching at least one
 /// expression are counted (same syntax as `tags-filter`).
@@ -85,7 +120,7 @@ pub fn tags_count<'a>(
     input: impl Into<InputSource<'a>>,
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
-) -> Result<Vec<TagCount>> {
+) -> Result<TagCounts> {
     let host = &host.enter()?;
     let input = input.into();
     host.invocation
@@ -96,7 +131,7 @@ fn tags_count_inner(
     input: InputSource<'_>,
     opts: &TagCountOptions<'_>,
     host: &crate::host::Entered<'_>,
-) -> Result<Vec<TagCount>> {
+) -> Result<TagCounts> {
     // Deliberately reuse tags-filter's expression grammar, including its
     // n/w/r type prefixes. osmium tags-count treats these strings as tag
     // matchers only, so `w/highway` has different meaning between the tools.
@@ -190,7 +225,7 @@ fn tags_count_inner(
     )?;
 
     host.invocation.marker("TAGSCOUNT_DRAIN_START");
-    let mut results = table.into_counts(
+    let (mut results, stats) = table.into_counts(
         |count| count >= opts.min_count && opts.max_count.is_none_or(|max| count <= max),
         &host.invocation,
     )?;
@@ -220,7 +255,10 @@ fn tags_count_inner(
 
     host.invocation.marker("TAGSCOUNT_DRAIN_END");
     host.invocation.marker("TAGSCOUNT_END");
-    Ok(results)
+    Ok(TagCounts {
+        rows: results,
+        stats,
+    })
 }
 
 /// Check if a tag matches any expression (respecting the element's type).

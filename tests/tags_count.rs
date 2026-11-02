@@ -43,8 +43,9 @@ fn basic_tag_counting() {
     }
     write_multi_block_test_pbf(&input, &nodes, &ways, &[], 100);
 
-    let counts =
-        tags_count(&input, &default_opts(), &crate::common::test_host()).expect("tags_count");
+    let counts = tags_count(&input, &default_opts(), &crate::common::test_host())
+        .expect("tags_count")
+        .rows;
 
     // With NameAsc sort, the order is amenity=cafe, highway=primary, shop=bakery.
     let find = |key: &str, value: &str| -> Option<&TagCount> {
@@ -55,6 +56,75 @@ fn basic_tag_counting() {
     assert_eq!(
         find("highway", "primary").expect("highway=primary").count,
         3
+    );
+}
+
+/// The run's figures: `distinct_pairs` is every selected pair, whatever the
+/// count thresholds keep, and only the type filter and expressions narrow
+/// it; `retained_pairs` is the rows returned. Neither moves when the caller
+/// edits the rows afterwards.
+#[test]
+fn stats_count_distinct_pairs_before_the_thresholds() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    // amenity=cafe 3 and shop=bakery 2 on nodes, highway=primary 3 on ways.
+    let mut nodes = generate_nodes(5, 1);
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.tags = if i < 3 {
+            vec![("amenity", "cafe")]
+        } else {
+            vec![("shop", "bakery")]
+        };
+    }
+    let mut ways = generate_ways(3, 1_000, 2, 1);
+    for w in &mut ways {
+        w.tags = vec![("highway", "primary")];
+    }
+    write_multi_block_test_pbf(&input, &nodes, &ways, &[], 100);
+    let host = crate::common::test_host();
+
+    let run = |opts: &TagCountOptions<'_>| {
+        let counts = tags_count(&input, opts, &host).expect("tags_count");
+        assert_eq!(
+            counts.stats.retained_pairs,
+            counts.rows.len() as u64,
+            "retained_pairs is the rows returned"
+        );
+        (counts.stats.distinct_pairs, counts.stats.retained_pairs)
+    };
+
+    // Every threshold sees the same three distinct pairs.
+    let mut opts = default_opts();
+    assert_eq!(run(&opts), (3, 3));
+    opts.min_count = 3;
+    assert_eq!(run(&opts), (3, 2));
+    opts.min_count = 4;
+    assert_eq!(run(&opts), (3, 0), "pairs counted, none passed");
+    opts.min_count = 0;
+    opts.max_count = Some(2);
+    assert_eq!(run(&opts), (3, 1));
+
+    // The type filter and the expressions narrow what is counted.
+    let mut opts = default_opts();
+    opts.type_filter = Some(pbfhogg::TypeFilter {
+        nodes: true,
+        ways: false,
+        relations: false,
+    });
+    assert_eq!(run(&opts), (2, 2));
+    let exprs = vec!["highway".to_string()];
+    let mut opts = default_opts();
+    opts.expressions = &exprs;
+    assert_eq!(run(&opts), (1, 1));
+
+    // The summary is the run's, not the rows' current state.
+    let mut counts = tags_count(&input, &default_opts(), &host).expect("tags_count");
+    counts.rows.clear();
+    let mut line = Vec::new();
+    counts.stats.write_summary(&mut line).expect("write");
+    assert_eq!(
+        String::from_utf8(line).expect("utf-8"),
+        "3 distinct key/value pairs counted, 3 passed the count thresholds\n"
     );
 }
 
@@ -81,10 +151,14 @@ fn tags_count_parallel_classify_parity() {
 
     let mut opts = default_opts();
     opts.parallelism = pbfhogg::Parallelism::from_jobs(1);
-    let seq = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count seq");
+    let seq = tags_count(&input, &opts, &crate::common::test_host())
+        .expect("tags_count seq")
+        .rows;
 
     opts.parallelism = pbfhogg::Parallelism::from_jobs(4);
-    let par = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count par");
+    let par = tags_count(&input, &opts, &crate::common::test_host())
+        .expect("tags_count par")
+        .rows;
 
     // Sort by (key, value) for order-independent comparison - NameAsc
     // sort above guarantees the orderings match, but be explicit.
@@ -140,7 +214,9 @@ fn an_unconstrainable_key_matcher_does_not_skip_blobs() {
     let exprs = vec!["amenity=cafe".to_string(), "*=yes".to_string()];
     let mut opts = default_opts();
     opts.expressions = &exprs;
-    let mut counts = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count");
+    let mut counts = tags_count(&input, &opts, &crate::common::test_host())
+        .expect("tags_count")
+        .rows;
     counts.sort_by_key(|t: &TagCount| (t.key.clone(), t.value.clone()));
     let got: Vec<_> = counts
         .into_iter()
@@ -219,7 +295,9 @@ fn tags_count_refuses_a_blob_holding_another_kind_than_it_claims() {
     let host = crate::common::test_host();
 
     let honest = claim_fixture(dir.path(), None);
-    let counts = tags_count(&honest, &default_opts(), &host).expect("honest claims run");
+    let counts = tags_count(&honest, &default_opts(), &host)
+        .expect("honest claims run")
+        .rows;
     assert_eq!(counts.len(), 2, "amenity=cafe and highway=primary");
 
     // No filter: every blob is scheduled, the way blob claims nodes.

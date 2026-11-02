@@ -28,6 +28,10 @@
 - `tags_filter::osc::tags_filter_osc` takes a `Parallelism` after the
   expressions: `Fixed(n)` runs the filtering workers on a pool of `n`
   threads built for the call, `Auto` on `Host::executor` as before.
+- `tags_count::tags_count` returns `TagCounts { rows, stats }` instead of
+  the bare rows: `stats` is a `TagCountStats` with `distinct_pairs` (every
+  selected pair, before the count thresholds), `retained_pairs` (those the
+  thresholds kept) and `write_summary`.
 
 ### Added
 
@@ -37,6 +41,11 @@
 
 ### Changed
 
+- `inspect tags` ends with `D distinct key/value pairs counted, K passed
+  the count thresholds` on stderr in place of `N distinct tag values`,
+  whose number was the rows printed, not distinct values: with
+  `--min-count` or `--max-count` narrowing the rows, the distinct-pair
+  count was not shown at all.
 - The CLI no longer caps glibc at two malloc arenas or pins
   `M_MMAP_THRESHOLD`. The cap made every worker's larger allocations
   queue on two locks. On planet, `build-geocode-index` went from 320 s to

@@ -62,10 +62,12 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     let mut opts = default_opts();
     opts.expressions = &exprs;
 
-    let with_index =
-        tags_count(&indexed, &opts, &crate::common::test_host()).expect("tags_count indexed");
-    let without_index =
-        tags_count(&no_tagdata, &opts, &crate::common::test_host()).expect("tags_count reference");
+    let with_index = tags_count(&indexed, &opts, &crate::common::test_host())
+        .expect("tags_count indexed")
+        .rows;
+    let without_index = tags_count(&no_tagdata, &opts, &crate::common::test_host())
+        .expect("tags_count reference")
+        .rows;
 
     let norm = |mut v: Vec<TagCount>| {
         v.sort_by_key(|t: &TagCount| (t.key.clone(), t.value.clone()));
@@ -124,6 +126,36 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     assert!(
         !unskipped.contains("blobs skipped by tag index"),
         "a file with no tag index has nothing to skip on: {unskipped}"
+    );
+}
+
+/// The closing summary on stderr names both figures: every distinct pair
+/// counted, and how many passed `--min-count`, which are the rows on stdout.
+#[test]
+fn summary_counts_distinct_pairs_and_the_rows_that_passed() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("summary.osm.pbf");
+    let mut nodes = generate_nodes(5, 1);
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.tags = if i < 3 {
+            vec![("amenity", "cafe")]
+        } else {
+            vec![("shop", "bakery")]
+        };
+    }
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
+
+    let out = CliInvoker::new()
+        .arg("inspect")
+        .arg("tags")
+        .arg(&input)
+        .arg("--min-count")
+        .arg("3")
+        .assert_success();
+    assert_eq!(out.stdout_str(), "3\t\"amenity\"\t\"cafe\"\n");
+    assert_eq!(
+        out.stderr_str(),
+        "2 distinct key/value pairs counted, 1 passed the count thresholds\n"
     );
 }
 

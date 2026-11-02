@@ -217,8 +217,8 @@ pub(super) fn stage3_slot_reorder(
                     // `altw_stage3_panic_at_bucket`. Simulates a mid-phase
                     // stage 3 worker crash. The surrounding `AbortOnDrop`
                     // guard calls `router.abort(...)` on unwind, waking
-                    // stage 4 waiters; `ScratchDir::drop` cleans up the
-                    // scratch tree. Release builds compile this out
+                    // stage 4 waiters; dropping the run's `RunScratch`
+                    // removes the scratch directory. Release builds compile this out
                     // entirely.
                     #[cfg(feature = "test-hooks")]
                     if cancel.faults().altw_stage3_panic_at_bucket.load(Relaxed) == bucket_idx {
@@ -411,7 +411,7 @@ fn emit_integrated_intersections(
     encode_scratch: &mut Vec<u8>,
     worker_id: u32,
     tmp_byte_pos: &mut u64,
-    tmp_file: &std::fs::File,
+    tmp_file: &crate::scratch::ScratchFile,
     counters: &Stage3Counters,
 ) -> crate::Result<()> {
     use std::os::unix::fs::FileExt as _;
@@ -526,7 +526,7 @@ fn emit_integrated_intersections(
 mod tests {
     use super::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
     use crate::commands::altw::external::coord_payloads::{
-        ConcurrentBlobLocationRouter, parse_per_way_refcount_sidecar_bytes,
+        ConcurrentBlobLocationRouter, PayloadFile, parse_per_way_refcount_sidecar_bytes,
     };
     use std::sync::Arc;
 
@@ -534,12 +534,18 @@ mod tests {
     fn empty_bucket_error_aborts_router_with_the_actual_error() {
         let per_way_rcs = parse_per_way_refcount_sidecar_bytes(&[1, 1], 1).expect("sidecar");
         let temp = crate::path_guard::tests::scratch();
-        let worker_path = temp.path().join("worker");
-        let worker_file = std::fs::File::create(&worker_path).expect("worker file");
-        let worker = crate::read::input::InputFile::from_parts(
-            Arc::new(worker_file),
-            Arc::from(worker_path.as_path()),
-        );
+        let scratch = crate::scratch::RunScratch::create(
+            temp.path(),
+            &crate::host::Host::entered_for_tests(),
+        )
+        .expect("run scratch");
+        let worker_path = scratch.file("payloads-W0").expect("name");
+        let worker = PayloadFile {
+            file: Arc::new(
+                crate::scratch::create_read_write(&worker_path, false).expect("worker file"),
+            ),
+            path: worker_path,
+        };
         let router = ConcurrentBlobLocationRouter::new(
             &per_way_rcs,
             vec![worker],

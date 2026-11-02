@@ -7,7 +7,6 @@
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
 use std::io::{self, Write};
-use std::path::Path;
 
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -295,8 +294,12 @@ enum Fragments {
 
 /// Copy a scratch file to the end of `dst`, checking the cancellation token
 /// between buffers: neither file observes it.
-fn copy_checked(src: &Path, dst: &mut impl Write, cancel: &crate::host::Recorder) -> Result<()> {
-    let mut src = crate::read::input::open(src)?;
+fn copy_checked(
+    src: &crate::scratch::ScratchPath,
+    dst: &mut impl Write,
+    cancel: &crate::host::Recorder,
+) -> Result<()> {
+    let mut src = crate::scratch::open_file(src)?;
     let mut buf = vec![0_u8; crate::tunables::DIFF_SPILL_COPY_BUFFER];
     loop {
         cancel.check()?;
@@ -868,9 +871,9 @@ fn assemble_osc(
     sink: &ChangeSink,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    let creates_path: &Path = &sink.creates_path;
-    let modifies_path: &Path = &sink.modifies_path;
-    let deletes_path: &Path = &sink.deletes_path;
+    let creates_path = &sink.creates_path;
+    let modifies_path = &sink.modifies_path;
+    let deletes_path = &sink.deletes_path;
     let (create_count, modify_count, delete_count) = (
         sink.w.create_count,
         sink.w.modify_count,
@@ -931,7 +934,7 @@ fn assemble_osc(
             };
             let glue = write_document(glue, paths, counts, &mut |glue, path| {
                 glue.emit_pending()?;
-                let mut fragment = crate::read::input::open(path)?;
+                let mut fragment = crate::scratch::open_file(path)?;
                 io::copy(&mut fragment, &mut glue.out).map_err(|e| {
                     Error::from(e).context(format!("failed to copy {}", path.display()))
                 })?;
@@ -950,8 +953,8 @@ fn assemble_osc(
 }
 
 /// Copy a plain fragment through to the document's sink.
-fn copy_raw<W: Write>(sink: &mut W, path: &Path) -> Result<()> {
-    let mut tmp = io::BufReader::new(crate::read::input::open(path)?);
+fn copy_raw<W: Write>(sink: &mut W, path: &crate::scratch::ScratchPath) -> Result<()> {
+    let mut tmp = io::BufReader::new(crate::scratch::open_file(path)?);
     io::copy(&mut tmp, sink)
         .map_err(|e| Error::from(e).context(format!("failed to copy {}", path.display())))?;
     Ok(())
@@ -998,9 +1001,9 @@ impl<W: Write> Write for GlueMembers<W> {
 /// hand the sink back for the caller to finish.
 fn write_document<W: Write>(
     sink: W,
-    [creates_path, modifies_path, deletes_path]: [&Path; 3],
+    [creates_path, modifies_path, deletes_path]: [&crate::scratch::ScratchPath; 3],
     [create_count, modify_count, delete_count]: [u64; 3],
-    copy: &mut dyn FnMut(&mut W, &Path) -> Result<()>,
+    copy: &mut dyn FnMut(&mut W, &crate::scratch::ScratchPath) -> Result<()>,
 ) -> Result<W> {
     let mut writer = Writer::new_with_indent(sink, b' ', 2);
 
@@ -1026,9 +1029,9 @@ fn write_document<W: Write>(
 fn copy_section<W: Write>(
     writer: &mut Writer<W>,
     tag: &str,
-    path: &Path,
+    path: &crate::scratch::ScratchPath,
     count: u64,
-    copy: &mut dyn FnMut(&mut W, &Path) -> Result<()>,
+    copy: &mut dyn FnMut(&mut W, &crate::scratch::ScratchPath) -> Result<()>,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());

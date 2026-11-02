@@ -465,12 +465,13 @@ admission and progress, never a host's RSS.
 carries `max_errors` beside `show_ids` although every read of
 `max_errors` in `refs.rs` (the `Judge`, `append_capped_missing_refs`, the
 deferred relation refs) is gated on `show_ids`: without it the limit has no
-effect. It also carries `CheckOptions::direct_io`, which the check accepts
-and ignores (its doc says so). Same rule as the tags-filter, getid and
-apply-changes mode payloads: the limit belongs inside a `show_ids` payload
-(e.g. `missing_ids: Option<MissingIds { max_errors }>`), and the check may
-stop embedding `CheckOptions` rather than reshape it for every check.
-Library API break; CHANGELOG.
+effect. Same rule as the tags-filter, getid and apply-changes mode
+payloads: the limit belongs inside a `show_ids` payload (e.g.
+`missing_ids: Option<MissingIds { max_errors }>`). Keep the ignored
+`CheckOptions::direct_io` where it is: ignored `direct_io` parameters are
+deliberate plumbing for the deferred CLI-surface redesign (see "What the
+maintainer has made clear"), so this item does not stop embedding
+`CheckOptions` to drop it. Library API break; CHANGELOG.
 
 ### WRK-140: degrade takes block_cap on every route, read only when it decodes
 
@@ -496,13 +497,6 @@ states are representable and surface as `Error::internal` ("locations_on_ways
 true but coord_slots is None"). Each stage's resources belong in one
 locations payload. Internal; on a measured path, so planet apply-changes -l
 walls before and after.
-
-### WRK-142: parse_ids_from_pbf takes a direct_io it ignores
-
-`getid::parse_ids_from_pbf(input, _direct_io, host)` accepts the flag and
-never reads it: the schedule walk it reads through has no O_DIRECT route
-here. Either honour it or drop the parameter (and the CLI's forwarding of
-`--direct-io` to the `-I` read). Library API break; CHANGELOG.
 
 ### WRK-037: ParallelGzipWriter window size
 
@@ -604,19 +598,19 @@ denmark indexed cells put digest at 503 ms on `d2d8836a` against 701 ms on
 The ticket suggests a `--form content` run to separate drift from code.
 The recorded "no cost" claim for v2 needs re-checking against that.
 
-### WRK-136: Scratch read back through the input opener
+### WRK-143: Scratch eviction has no test that it happens
 
-Scratch files are created through `crate::scratch` and come back as
-`ScratchFile`, the proof `fadvise::evict_scratch` requires, but five sites
-reopen scratch for reading through `crate::read::input::open` on a plain
-`Path`: the ref-count sidecar (`altw/external/stage4.rs`
-`load_ref_count_sidecar_in`), the per-way ref-count sidecar
-(`coord_payloads.rs` `load_per_way_refcount_sidecar_in`), and diff derive's
-fragments and spills (`derive.rs` `copy_checked`, `copy_raw`, the gzip
-member copy in the assembler). Harmless today (none evicts), but a reader
-that later wants to drop those pages cannot without first threading the
-`ScratchPath` through, and the input opener's error text calls them inputs.
-Thread `ScratchPath` to each and open with `crate::scratch::open`.
+altw external evicts its id shards (stage 2) and slot buckets (stage 3)
+through `fadvise::evict_scratch` and counts it in `s2_fadvise_calls`,
+`s2_fadvise_bytes`, `s3_fadvise_calls` and `s3_fadvise_bytes`. Nothing in
+`tests/`, `cli/tests/` or `harness/` reads those counters, and no test calls
+`evict_scratch`, so a change that silently stopped scratch eviction (a
+reader that lost its `ScratchFile`, a gate that never opens) would pass
+every check. Input eviction has its own pins (`fadvise_input_evictions` in
+`tests/host_contract.rs` and the harness `page-cache-keep` scenario);
+scratch eviction wants the matching one: an altw external run under the
+test host reporting nonzero `s2_fadvise_calls` and `s3_fadvise_calls` on
+Linux.
 
 ---
 

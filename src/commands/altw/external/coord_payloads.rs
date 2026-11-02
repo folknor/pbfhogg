@@ -36,8 +36,6 @@
 //! For each way, consume `2*ref_count` varints, unzigzag, accumulate running
 //! lat/lon. No per-way framing bytes.
 
-use std::path::Path;
-
 use super::super::Result;
 use super::COORD_SLOT_SIZE;
 use crate::error::Error;
@@ -92,12 +90,20 @@ enum StraddlerPartial {
     Right(Vec<u8>),
 }
 
+/// One stage 3 worker's payload file: a live scratch store, written by its
+/// stage 3 worker and read by stage 4 at once, so it stays the
+/// [`ScratchFile`](crate::scratch::ScratchFile) it was created as rather
+/// than being reopened. The path names it in a failed read or write.
+pub(super) struct PayloadFile {
+    pub(super) file: std::sync::Arc<crate::scratch::ScratchFile>,
+    pub(super) path: crate::scratch::ScratchPath,
+}
+
 /// Blob-ordered concurrent router. Stage 3 producers publish; stage 4
 /// consumers wait.
 pub(super) struct ConcurrentBlobLocationRouter {
-    /// Each stage-3 worker's payload file and its path (for naming it in a
-    /// failed read or write).
-    worker_files: Vec<crate::read::input::InputFile>,
+    /// Each stage-3 worker's payload file.
+    worker_files: Vec<PayloadFile>,
     slots: Vec<std::sync::Mutex<Option<BlobLocation>>>,
     // Partial-straddler staging. Only way-blob indices that actually
     // straddle a slot-bucket boundary appear in this map (a few hundred
@@ -154,7 +160,7 @@ impl ConcurrentBlobLocationRouter {
     /// `mark_producer_done` after stage 3 joins.
     pub(super) fn new(
         per_way_rcs: &PerWayRcs,
-        worker_files: Vec<crate::read::input::InputFile>,
+        worker_files: Vec<PayloadFile>,
         invocation: &crate::host::Recorder,
     ) -> Result<Self> {
         let num_way_blobs = per_way_rcs.num_blobs();
@@ -202,14 +208,14 @@ impl ConcurrentBlobLocationRouter {
     /// Shared write/read handle for a stage-3 worker's tmp file. Stage 3
     /// workers call `write_all_at` on this; stage 4 workers' preads
     /// come through `pread_blob_payload` on the same `&File`.
-    pub(super) fn worker_file(&self, worker_id: usize) -> &std::sync::Arc<std::fs::File> {
-        self.worker_files[worker_id].file()
+    pub(super) fn worker_file(&self, worker_id: usize) -> &crate::scratch::ScratchFile {
+        &self.worker_files[worker_id].file
     }
 
     /// The path of a stage-3 worker's payload file, for naming it in an
     /// error.
-    pub(super) fn worker_path(&self, worker_id: usize) -> &std::path::Path {
-        self.worker_files[worker_id].path()
+    pub(super) fn worker_path(&self, worker_id: usize) -> &crate::scratch::ScratchPath {
+        &self.worker_files[worker_id].path
     }
 
     /// Publish a fully-contained blob's payload location. Called by
@@ -479,11 +485,11 @@ impl ConcurrentBlobLocationRouter {
                 buf.resize(len, 0);
                 if len > 0 {
                     let worker = &self.worker_files[worker_id as usize];
-                    worker.file().read_exact_at(buf, byte_offset).map_err(|e| {
+                    worker.file.read_exact_at(buf, byte_offset).map_err(|e| {
                         Error::from(e).context(format!(
                             "failed to read way blob {blob_idx}'s payload at byte offset \
                              {byte_offset} of {}",
-                            worker.path().display()
+                            worker.path.display()
                         ))
                     })?;
                 }
@@ -707,21 +713,25 @@ pub(super) fn parse_per_way_refcount_sidecar_bytes(
 
 /// Load the per-way refcount sidecar into an indexed `PerWayRcs`.
 pub(super) fn load_per_way_refcount_sidecar_indexed(
-    path: &Path,
+    path: &crate::scratch::ScratchPath,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
     load_per_way_refcount_sidecar_in(path, num_way_blobs)
-        .map_err(|e| e.locate(crate::error::Location::in_file(path)))
+        .map_err(|e| e.locate(crate::error::Location::in_file(path.as_path())))
 }
 
-fn load_per_way_refcount_sidecar_in(path: &Path, num_way_blobs: usize) -> Result<PerWayRcs> {
-    let file = crate::read::input::open(path)?;
+fn load_per_way_refcount_sidecar_in(
+    path: &crate::scratch::ScratchPath,
+    num_way_blobs: usize,
+) -> Result<PerWayRcs> {
+    let file = crate::scratch::open_file(path)?;
     let data = if file.metadata()?.len() == 0 {
         RefCountBytes::Empty
     } else {
         // Safety: stage 1 has joined and closed its writers before this
         // read-only mapping is created. This run's private sidecar is never
-        // modified again, and ScratchDir is dropped after stage 3/4 join.
+        // modified again, and the run's `RunScratch` is dropped after stage
+        // 3/4 join.
         // Encoded bytes remain file-backed and reclaimable; anonymous memory
         // here is only (num_way_blobs + 1) * size_of::<usize>() for offsets.
         // Both stages revisit records out of order, so retaining these byte
@@ -1182,9 +1192,12 @@ mod tests {
     #[test]
     fn mapped_sidecar_matches_owned_records_and_handles_empty_input() {
         let dir = crate::path_guard::tests::scratch();
-        let path = dir.path().join("refcounts");
+        let scratch =
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
+                .expect("run scratch");
+        let path = scratch.file("per-way-refcounts").expect("name");
         let bytes = make_sidecar_bytes(&[&[0, 3, 128], &[], &[1]]);
-        std::fs::write(&path, &bytes).expect("write sidecar");
+        std::fs::write(path.as_path(), &bytes).expect("write sidecar");
         let mapped = load_per_way_refcount_sidecar_indexed(&path, 3).expect("map");
         let owned = parse_per_way_refcount_sidecar_bytes(&bytes, 3).expect("parse");
         for blob in 0..3 {
@@ -1192,7 +1205,7 @@ mod tests {
         }
         assert!(load_per_way_refcount_sidecar_indexed(&path, 2).is_err());
         drop(mapped);
-        std::fs::write(&path, b"").expect("empty sidecar");
+        std::fs::write(path.as_path(), b"").expect("empty sidecar");
         let empty = load_per_way_refcount_sidecar_indexed(&path, 0).expect("empty");
         assert_eq!(empty.num_blobs(), 0);
         assert!(load_per_way_refcount_sidecar_indexed(&path, 1).is_err());

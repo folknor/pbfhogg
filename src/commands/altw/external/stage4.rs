@@ -101,14 +101,20 @@ crate::counters::counter_set! {
 }
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
-pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+pub(super) fn load_ref_count_sidecar(
+    path: &crate::scratch::ScratchPath,
+    total_slots: u64,
+) -> Result<Vec<u64>> {
     load_ref_count_sidecar_in(path, total_slots)
-        .map_err(|e| e.locate(crate::error::Location::in_file(path)))
+        .map_err(|e| e.locate(crate::error::Location::in_file(path.as_path())))
 }
 
-fn load_ref_count_sidecar_in(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+fn load_ref_count_sidecar_in(
+    path: &crate::scratch::ScratchPath,
+    total_slots: u64,
+) -> Result<Vec<u64>> {
     use std::io::Read as _;
-    let file = crate::read::input::open(path)?;
+    let file = crate::scratch::open_file(path)?;
     let bytes = file.metadata()?.len();
     if bytes < 8 {
         return Err(Error::internal("ref count sidecar is too small"));
@@ -1389,10 +1395,13 @@ mod ref_count_sidecar_tests {
     #[test]
     fn streamed_prefixes_check_alignment_trailer_and_overflow() {
         let dir = crate::path_guard::tests::scratch();
-        let path = dir.path().join("refcounts");
+        let scratch =
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
+                .expect("run scratch");
+        let path = scratch.file("way-ref-counts").expect("name");
         let write = |counts: &[u64]| {
             let bytes: Vec<u8> = counts.iter().flat_map(|n| n.to_le_bytes()).collect();
-            std::fs::write(&path, bytes).expect("sidecar");
+            std::fs::write(path.as_path(), bytes).expect("sidecar");
         };
         write(&[3, 0, 2, 5]);
         assert_eq!(
@@ -1404,9 +1413,9 @@ mod ref_count_sidecar_tests {
         assert!(load_ref_count_sidecar(&path, 0).is_err());
         write(&[0]);
         assert!(load_ref_count_sidecar(&path, 0).expect("empty").is_empty());
-        std::fs::write(&path, [0_u8; 9]).expect("unaligned");
+        std::fs::write(path.as_path(), [0_u8; 9]).expect("unaligned");
         assert!(load_ref_count_sidecar(&path, 0).is_err());
-        std::fs::write(&path, b"").expect("short");
+        std::fs::write(path.as_path(), b"").expect("short");
         assert!(load_ref_count_sidecar(&path, 0).is_err());
     }
 }

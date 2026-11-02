@@ -232,8 +232,8 @@ fn build_geocode_index_to(
 /// Create (or truncate) one of the build's data files, buffered, naming the
 /// file in a failure: a bare "Permission denied" or "No space left on
 /// device" does not say which of the index's files it was. Every path is
-/// inside the build's own directories (the output's staging directory or a
-/// run-scratch bucket tree), so this is not a second output mechanism.
+/// inside the output's staging directory, so this is not a second output
+/// mechanism; the build's scratch buckets go through `crate::scratch`.
 #[allow(clippy::disallowed_methods)]
 pub(super) fn create_data_file(
     path: &std::path::Path,

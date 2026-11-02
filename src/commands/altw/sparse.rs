@@ -89,7 +89,7 @@ fn preallocate_sparse_file(file: &std::fs::File, _scratch_dir: &Path, bytes: u64
 fn open_anonymous_sparse_file(
     scratch: &crate::scratch::RunScratch,
     total_bytes: u64,
-) -> Result<std::fs::File> {
+) -> Result<crate::scratch::ScratchFile> {
     let temp_path = scratch.file("sparse-index")?;
     let file = crate::scratch::create_read_write(&temp_path, true).map_err(|e| {
         Error::from(e).context(format!(
@@ -104,7 +104,7 @@ fn open_anonymous_sparse_file(
             temp_path.display()
         ))
     })?;
-    Ok(file.into_file())
+    Ok(file)
 }
 
 // The slot encoding - biased latitude, presence bit, verbatim longitude -
@@ -121,7 +121,8 @@ pub(super) struct SparseArrayIndex {
     /// at `rank * 8`.
     referenced: RankedIdSet,
     mmap: memmap2::MmapMut,
-    _file: std::fs::File,
+    /// The unlinked store, kept as the scratch file it was created as.
+    _file: crate::scratch::ScratchFile,
 }
 
 impl SparseArrayIndex {

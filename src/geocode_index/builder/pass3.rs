@@ -25,6 +25,7 @@ use super::Result;
 use super::admin::AssembledPolygon;
 use super::pass2::SlimInterpWay;
 use crate::error::Error;
+use crate::scratch::{ScratchFile, ScratchPath, ScratchSubdir};
 
 use super::super::format::*;
 
@@ -295,31 +296,37 @@ fn bucket_for_cell(cell_id: u64) -> usize {
     (cell_id >> 56) as usize
 }
 
-fn bucket_path(bucket_dir: &Path, bucket: usize) -> std::path::PathBuf {
-    bucket_dir.join(format!("{bucket:03}"))
+fn bucket_path(bucket_dir: &ScratchSubdir, bucket: usize) -> Result<ScratchPath> {
+    bucket_dir.file(&format!("{bucket:03}"))
 }
 
 /// Name the bucket file in a write or flush failure. Called only on the
 /// error path, so the per-record success path is unchanged.
 #[cold]
-fn bucket_write_error(e: std::io::Error, bucket_dir: &Path, bucket: usize) -> crate::error::Error {
+fn bucket_write_error(
+    e: std::io::Error,
+    bucket_dir: &ScratchSubdir,
+    bucket: usize,
+) -> crate::error::Error {
     Error::from(e).context(format!(
-        "failed to write {}",
-        bucket_path(bucket_dir, bucket).display()
+        "failed to write scratch bucket {}/{bucket:03}",
+        bucket_dir.display()
     ))
 }
 
 /// Append `record` to the bucket file its cell id selects, creating that
 /// file on first use.
 fn write_bucket_record(
-    writers: &mut [Option<BufWriter<std::fs::File>>],
-    bucket_dir: &Path,
+    writers: &mut [Option<BufWriter<ScratchFile>>],
+    bucket_dir: &ScratchSubdir,
     record: BucketRecord,
 ) -> Result<()> {
     let bucket = bucket_for_cell(record.cell_id);
     let writer = match &mut writers[bucket] {
         Some(writer) => writer,
-        slot => slot.insert(super::create_data_file(&bucket_path(bucket_dir, bucket))?),
+        slot => slot.insert(BufWriter::new(crate::scratch::create_file(&bucket_path(
+            bucket_dir, bucket,
+        )?)?)),
     };
     writer
         .write_all(&record.to_bytes())
@@ -450,9 +457,9 @@ pub(super) fn bucketed_cell_assignment_fused(
     let coarse_bucket_dir = scratch.create_subdir(&format!("buckets-level{coarse_level}"))?;
 
     // Two sets of bucket writers (lazy).
-    let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> =
+    let mut fine_writers: Vec<Option<BufWriter<ScratchFile>>> =
         (0..GEOCODE_NUM_BUCKETS).map(|_| None).collect();
-    let mut coarse_writers: Vec<Option<BufWriter<std::fs::File>>> =
+    let mut coarse_writers: Vec<Option<BufWriter<ScratchFile>>> =
         (0..GEOCODE_NUM_BUCKETS).map(|_| None).collect();
 
     // Stage A: Chunked parallel compute at the FINE level; every emitted
@@ -488,7 +495,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                     // propagates the panic to the `.collect()` call site
                     // on the main thread; the run scratch directory
                     // holding `fine_bucket_dir` / `coarse_bucket_dir`
-                    // (ADR-0003) is swept on the unwind.
+                    // (ADR-0018) is removed on the unwind.
                     // Release builds compile this out entirely.
                     #[cfg(feature = "test-hooks")]
                     if cancel
@@ -689,6 +696,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     invocation.marker("GEOCODE_PASS3_STAGEB_FINE_START");
     let fine_count = run_stage_b(
         output_dir,
+        scratch,
         &fine_bucket_dir,
         fine_cells_file,
         fine_street_entries_file,
@@ -703,6 +711,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     invocation.marker("GEOCODE_PASS3_STAGEB_COARSE_START");
     let coarse_count = run_stage_b(
         output_dir,
+        scratch,
         &coarse_bucket_dir,
         coarse_cells_file,
         coarse_street_entries_file,
@@ -734,7 +743,8 @@ pub(super) fn bucketed_cell_assignment_fused(
 // bucket directory. Keep those assignments together at each call site.
 fn run_stage_b(
     output_dir: &Path,
-    bucket_dir: &Path,
+    scratch: &crate::scratch::RunScratch,
+    bucket_dir: &ScratchSubdir,
     cells_file: &str,
     street_entries_file: &str,
     addr_entries_file: &str,
@@ -765,17 +775,31 @@ fn run_stage_b(
             (window_start..window_end)
                 .into_par_iter()
                 .map(|bucket_idx| -> Result<Vec<BucketRecord>> {
-                    let bucket_path = bucket_path(bucket_dir, bucket_idx);
-                    if !bucket_path.exists() {
-                        return Ok(Vec::new());
-                    }
-                    let data = crate::read::input::read(&bucket_path)?;
-                    // A file in a run-scratch bucket tree, freed as soon as it
-                    // is read to give the space back; `RunScratch` removes
-                    // the tree afterwards and names only its direct children.
-                    #[allow(clippy::disallowed_methods)]
-                    let removed = std::fs::remove_file(&bucket_path);
-                    removed.map_err(|e| {
+                    let bucket_path = bucket_path(bucket_dir, bucket_idx)?;
+                    // A bucket no record selected was never created.
+                    let mut file = match crate::scratch::open(&bucket_path) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(Vec::new());
+                        }
+                        Err(e) => {
+                            return Err(Error::from(e).context(format!(
+                                "failed to open scratch bucket {}",
+                                bucket_path.display()
+                            )));
+                        }
+                    };
+                    let mut data = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut data).map_err(|e| {
+                        Error::from(e).context(format!(
+                            "failed to read scratch bucket {}",
+                            bucket_path.display()
+                        ))
+                    })?;
+                    drop(file);
+                    // Freed as soon as it is read to give the space back; the
+                    // tree itself is removed by the caller afterwards.
+                    scratch.unlink(&bucket_path).map_err(|e| {
                         Error::from(e).context(format!(
                             "failed to remove scratch bucket {}",
                             bucket_path.display()

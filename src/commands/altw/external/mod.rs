@@ -1019,35 +1019,29 @@ pub(crate) fn external_join_in(
     host.invocation.counter("s3_worker_count", num_workers);
 
     // Worker tmp files opened once here with read + write, wrapped in
-    // Arc<File> so stage 3 can `write_all_at` and stage 4 can
-    // `read_exact_at` on the same `&File`. `File` is `Sync` on Unix for
+    // Arc<ScratchFile> so stage 3 can `write_all_at` and stage 4 can
+    // `read_exact_at` on the same descriptor. `File` is `Sync` on Unix for
     // pread/pwrite so no extra locking is needed.
-    let worker_tmp_paths: Vec<crate::scratch::ScratchPath> = (0..num_workers)
-        .map(|i| radix::payload_path(scratch, i))
-        .collect::<crate::Result<_>>()?;
-    let worker_files: Vec<crate::read::input::InputFile> = worker_tmp_paths
-        .iter()
-        .map(|p| {
-            crate::scratch::create_read_write(p, false)
-                .map(|file| {
-                    crate::read::input::InputFile::from_parts(
-                        std::sync::Arc::new(file.into_file()),
-                        std::sync::Arc::from(p.as_ref()),
-                    )
-                })
-                .map_err(|e| {
-                    crate::Error::from(e).context(format!(
-                        "failed to create stage 3 payload file {}",
-                        p.display()
-                    ))
-                })
+    let worker_files: Vec<coord_payloads::PayloadFile> = (0..num_workers)
+        .map(|i| {
+            let path = radix::payload_path(scratch, i)?;
+            let file = crate::scratch::create_read_write(&path, false).map_err(|e| {
+                crate::Error::from(e).context(format!(
+                    "failed to create stage 3 payload file {}",
+                    path.display()
+                ))
+            })?;
+            Ok(coord_payloads::PayloadFile {
+                file: std::sync::Arc::new(file),
+                path,
+            })
         })
         .collect::<crate::Result<_>>()?;
 
     let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
         .map(|i| {
             let path = radix::slot_bucket_path(scratch, i)?;
-            Ok(std::fs::metadata(&path)
+            Ok(std::fs::metadata(path.as_path())
                 .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
                 .unwrap_or(0))
         })
@@ -1083,7 +1077,7 @@ pub(crate) fn external_join_in(
     // never publish.
     let router = coord_payloads::ConcurrentBlobLocationRouter::new(
         &per_way_rcs,
-        worker_files.clone(),
+        worker_files,
         &host.invocation,
     )?;
 

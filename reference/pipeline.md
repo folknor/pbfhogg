@@ -635,7 +635,11 @@ header walker would read as empty), FIFO, socket or character device is
 refused when the pin is taken. On Unix each pin holds one descriptor for the run. Off Unix,
 where `std` reports no device and inode, a pin holds only the path and
 nothing is verified. One-shot opens
-(`InputSource::Path`), and scratch files, resolve the path as before.
+(`InputSource::Path`) resolve the path as before. Scratch files are not
+inputs and are not pinned: they are created and read back through
+`crate::scratch`, by path inside the run directory (ADR-0018), and a store
+written and read at once, or unlinked once created, keeps the `ScratchFile`
+it was created as.
 
 A library entry point may take its input as an `InputSource` and turn it
 into a pin with `InputSource::pin`: a path is pinned there, a caller's pin is

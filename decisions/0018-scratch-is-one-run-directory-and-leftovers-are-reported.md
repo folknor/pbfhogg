@@ -21,7 +21,11 @@ directory.
   or nanosecond tags and no per-site naming of shards (`altw::external::radix`
   spells the shard, bucket and payload names once). Scratch files are only
   created at a `ScratchPath`, which only a `RunScratch` hands out and which
-  names a single component of its own directory; clippy.toml bans the
+  names a single component of its own directory, or of a subdirectory the
+  run made there for a stage with many files (the geocode builder's
+  buckets); they are read back through `crate::scratch` too, never through
+  the input openers, so every reader holds the `ScratchFile` that scratch
+  eviction (ADR-0016) requires; clippy.toml bans the
   directory- and file-removing and renaming `std::fs` functions,
   `std::process::id` and `std::env::temp_dir` across the library (outside
   `crate::scratch` and `crate::output`, which own them) and the CLI.

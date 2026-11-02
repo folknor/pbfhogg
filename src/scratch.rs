@@ -98,26 +98,74 @@ pub struct RunScratch {
 }
 
 /// A path inside a [`RunScratch`], the only kind of path scratch files are
-/// created at. Built by [`RunScratch::file`] and [`RunScratch::create_subdir`]
-/// from a single path component, so it cannot name anything outside the run
-/// directory, and it remembers which run issued it.
+/// created at and opened from. Built by [`RunScratch::file`] and
+/// [`ScratchSubdir::file`] from a single path component, so it cannot name
+/// anything outside the run directory, and it remembers which run issued it.
+///
+/// It does not dereference to a `Path`: a scratch path reaching an API that
+/// takes one (an input opener, a `std::fs` call) has to say
+/// [`as_path`](Self::as_path) at the call, so scratch read back through
+/// something other than this module is visible where it happens.
 #[derive(Debug, Clone)]
 pub(crate) struct ScratchPath {
     path: PathBuf,
     owner: u128,
 }
 
-impl std::ops::Deref for ScratchPath {
-    type Target = Path;
-    fn deref(&self) -> &Path {
+impl ScratchPath {
+    /// The path, for an API that needs one (naming it in an error, a
+    /// metadata probe). Opening goes through this module's openers.
+    pub(crate) fn as_path(&self) -> &Path {
         &self.path
+    }
+
+    /// The path for display in a message.
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
     }
 }
 
-impl AsRef<Path> for ScratchPath {
-    fn as_ref(&self) -> &Path {
-        &self.path
+/// A directory made inside a [`RunScratch`] by
+/// [`RunScratch::create_subdir`], for a stage with too many files to name in
+/// the run directory itself (the geocode builder's cell buckets). Its
+/// [`file`](Self::file) paths are [`ScratchPath`]s like the run directory's
+/// own, one level down.
+#[derive(Debug)]
+pub(crate) struct ScratchSubdir {
+    dir: ScratchPath,
+}
+
+impl ScratchSubdir {
+    /// A scratch file path inside this directory.
+    pub(crate) fn file(&self, name: &str) -> crate::Result<ScratchPath> {
+        check_name(name)?;
+        Ok(ScratchPath {
+            path: self.dir.path.join(name),
+            owner: self.dir.owner,
+        })
     }
+
+    /// The directory, for display in a message.
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
+        self.dir.display()
+    }
+}
+
+/// Refuse a scratch name that is not a single plain path component, or that
+/// is one of the run directory's own files.
+fn check_name(name: &str) -> crate::Result<()> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name == LOCK_NAME
+        || name == READY_NAME
+        || name.bytes().any(|b| b == b'/' || b == 0);
+    if bad {
+        return Err(crate::Error::internal(format!(
+            "invalid scratch file name {name:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl RunScratch {
@@ -206,17 +254,7 @@ impl RunScratch {
 
     /// A scratch file path inside the run directory.
     pub(crate) fn file(&self, name: &str) -> crate::Result<ScratchPath> {
-        let bad = name.is_empty()
-            || name == "."
-            || name == ".."
-            || name == LOCK_NAME
-            || name == READY_NAME
-            || name.bytes().any(|b| b == b'/' || b == 0);
-        if bad {
-            return Err(crate::Error::internal(format!(
-                "invalid scratch file name {name:?}"
-            )));
-        }
+        check_name(name)?;
         Ok(ScratchPath {
             path: self.path.join(name),
             owner: self.owner,
@@ -224,7 +262,7 @@ impl RunScratch {
     }
 
     /// Create a directory inside the run directory.
-    pub(crate) fn create_subdir(&self, name: &str) -> crate::Result<ScratchPath> {
+    pub(crate) fn create_subdir(&self, name: &str) -> crate::Result<ScratchSubdir> {
         let dir = self.file(name)?;
         fs::create_dir(&dir.path).map_err(|e| {
             crate::Error::from(e).context(format!(
@@ -232,13 +270,23 @@ impl RunScratch {
                 dir.path.display()
             ))
         })?;
-        Ok(dir)
+        Ok(ScratchSubdir { dir })
     }
 
     /// Delete a scratch file, returning the error. For the caller that needs
-    /// the deletion to have happened (an anonymous store).
+    /// the deletion to have happened (an anonymous store, a bucket freed as
+    /// it is read). A path another run issued is refused before anything is
+    /// touched, as [`remove`](Self::remove) refuses it.
     pub(crate) fn unlink(&self, path: &ScratchPath) -> io::Result<()> {
-        debug_assert_eq!(path.owner, self.owner);
+        if path.owner != self.owner {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to remove {}: it belongs to another scratch directory",
+                    path.path.display()
+                ),
+            ));
+        }
         fs::remove_file(&path.path)
     }
 
@@ -273,7 +321,8 @@ impl RunScratch {
 
     /// [`remove`](Self::remove) for a directory made by
     /// [`create_subdir`](Self::create_subdir), with everything in it.
-    pub(crate) fn remove_tree(&self, path: &ScratchPath) {
+    pub(crate) fn remove_tree(&self, dir: &ScratchSubdir) {
+        let path = &dir.dir;
         if path.owner != self.owner {
             crate::host::diag!(
                 self.diagnostics,
@@ -411,9 +460,12 @@ fn random_u128() -> crate::Result<u128> {
 /// the library never creates one.
 ///
 /// The proof is what [`crate::fadvise::evict_scratch`] requires to drop
-/// pages without counting them as an input eviction. Reads, writes and
-/// `File` methods pass through; [`ScratchFile::into_file`] gives up the proof
-/// for a caller that has to own a plain `File`.
+/// pages without counting them as an input eviction, so every reader of
+/// scratch holds one: a file closed after writing is reopened through
+/// [`open`] or [`open_file`], and a live store (a file written and read at
+/// once, or one unlinked once created) keeps the `ScratchFile` it was
+/// created as. Reads, writes, mappings and `File` methods pass through;
+/// there is deliberately no conversion back to an owned `File`.
 #[derive(Debug)]
 pub(crate) struct ScratchFile(File);
 
@@ -421,11 +473,6 @@ impl ScratchFile {
     /// The file.
     pub(crate) fn as_file(&self) -> &File {
         &self.0
-    }
-
-    /// The plain file, without the proof.
-    pub(crate) fn into_file(self) -> File {
-        self.0
     }
 }
 
@@ -501,6 +548,17 @@ pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<ScratchFile> {
 /// matchable for the scratch a stage may legitimately not have written.
 pub(crate) fn open(path: &ScratchPath) -> io::Result<ScratchFile> {
     File::open(&path.path).map(ScratchFile)
+}
+
+/// [`open`], retaining the path in any error, for a caller that has nothing
+/// to add about the file and no absence to tolerate.
+pub(crate) fn open_file(path: &ScratchPath) -> crate::Result<ScratchFile> {
+    open(path).map_err(|e| {
+        crate::Error::from(e).context(format!(
+            "failed to open scratch file {}",
+            path.path.display()
+        ))
+    })
 }
 
 /// Open a scratch file for reading and writing, truncating it, or creating it
@@ -1205,8 +1263,37 @@ mod tests {
         let theirs = b.file("keep").expect("name");
         create(&theirs).expect("create");
         a.remove(&theirs);
-        assert!(theirs.exists());
+        assert!(theirs.as_path().exists());
         assert_eq!(sink.0.lock().expect("sink").len(), 1);
+        let err = a.unlink(&theirs).expect_err("foreign unlink");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(theirs.as_path().exists());
+    }
+
+    /// A subdirectory's files are scratch paths of the run that made it:
+    /// created, reopened and unlinked through this module, refused by
+    /// another run, and removed with the tree.
+    #[test]
+    fn subdirectory_files_are_scratch_of_their_run() {
+        let parent = crate::path_guard::tests::scratch();
+        let a = RunScratch::create(parent.path(), &host()).expect("a");
+        let b = RunScratch::create(parent.path(), &host()).expect("b");
+        let sub = a.create_subdir("buckets").expect("subdir");
+        for bad in ["", "..", "x/y"] {
+            assert!(sub.file(bad).is_err(), "{bad:?}");
+        }
+        let path = sub.file("000").expect("name");
+        io::Write::write_all(&mut create_file(&path).expect("create"), b"rec").expect("write");
+        let mut back = Vec::new();
+        io::Read::read_to_end(&mut open_file(&path).expect("open"), &mut back).expect("read");
+        assert_eq!(back, b"rec");
+        assert!(b.unlink(&path).is_err());
+        a.unlink(&path).expect("unlink");
+        let err = open_file(&path).expect_err("gone");
+        assert!(err.to_string().contains("000"), "{err}");
+        create(&sub.file("001").expect("name")).expect("create");
+        a.remove_tree(&sub);
+        assert!(!sub.dir.path.exists());
     }
 
     #[test]
@@ -1514,9 +1601,9 @@ mod tests {
         let run = RunScratch::create(parent.path(), &h).expect("run");
         let path = run.path().to_path_buf();
         let sub = run.create_subdir("stuck").expect("subdir");
-        fs::write(sub.join("f"), b"x").expect("file");
+        create(&sub.file("f").expect("name")).expect("file");
         fs::set_permissions(
-            &sub.path,
+            &sub.dir.path,
             std::os::unix::fs::PermissionsExt::from_mode(0o500),
         )
         .expect("chmod");
@@ -1533,7 +1620,7 @@ mod tests {
         let scan = find_stale(parent.path());
         assert_eq!(scan.stale[0].observation, Observation::LockAvailable);
         fs::set_permissions(
-            &sub.path,
+            &sub.dir.path,
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .expect("chmod back");

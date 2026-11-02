@@ -263,6 +263,11 @@ fn id_file_token(raw: &str) -> Option<&str> {
 /// The input is opened once, and that one description serves the whole
 /// read, so a path reads one file without a pin. A caller that pins it
 /// anyway (the CLI pins every input before reading any) passes the pin.
+///
+/// `_direct_io` is accepted and not yet read: the schedule walk this reads
+/// through has no O_DIRECT route. The parameter is kept on purpose, as
+/// plumbing for the planned redesign of how `--direct-io` reaches each
+/// read; do not remove it as dead.
 pub fn parse_ids_from_pbf<'a>(
     input: impl Into<InputSource<'a>>,
     _direct_io: bool,

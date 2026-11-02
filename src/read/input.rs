@@ -28,8 +28,11 @@
 //! [`InputSource::Pinned`] open derived from it - a fresh description of the
 //! pinned file, verified against it before use. See [`PinnedInput`] for what
 //! it does and does not catch. A one-shot [`InputSource::Path`] open is what
-//! a single-pass reader, a library entry point handed a bare path, and every
-//! scratch file use.
+//! a single-pass reader and a library entry point handed a bare path use.
+//!
+//! Scratch is not an input and does not open here: a run's own files are
+//! created and read back through `crate::scratch`, whose `ScratchFile` is the
+//! proof scratch eviction requires (those opens resolve their path too).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

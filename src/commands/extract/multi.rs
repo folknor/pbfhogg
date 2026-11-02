@@ -966,14 +966,13 @@ impl MultiLocal {
 
 /// One task's output: each region's framed blobs, in region order and
 /// block order within a region, and each region's element count.
-type RegionFrames = (Vec<Vec<Vec<Vec<u8>>>>, Vec<u64>);
+type RegionFrames = (Vec<Vec<Vec<u8>>>, Vec<u64>);
 
 /// Compression and framing of the regions' blocks inside the pool's tasks.
 ///
 /// The bytes are the sync writer's own: both go through the one framing
 /// core with the block's given index, tagdata and way members. A frame
-/// travels as two chunks, length prefix plus BlobHeader and the Blob body,
-/// so the body is never copied into a contiguous buffer.
+/// travels as one whole owned buffer, the pipelined framing's shape.
 ///
 /// The pool's window is the regions' one shared bound: a task carries every
 /// region's frames for its input blob and returns its credit only once the
@@ -994,7 +993,7 @@ impl RegionFraming<'_> {
         &self,
         region: usize,
         blocks: impl Iterator<Item = OwnedBlock>,
-    ) -> Result<Vec<Vec<Vec<u8>>>> {
+    ) -> Result<Vec<Vec<u8>>> {
         let metrics = &self.invocation.metrics().writer;
         let mut frames = Vec::new();
         for block in blocks {
@@ -1006,7 +1005,7 @@ impl RegionFraming<'_> {
                 way_members,
             } = block;
             let indexdata = index.serialize();
-            let parts = crate::writer::frame_blob_pipelined(
+            let frame = crate::writer::frame_blob_pipelined(
                 &bytes,
                 &self.compression,
                 Some(indexdata.as_slice()),
@@ -1016,10 +1015,7 @@ impl RegionFraming<'_> {
             )
             .map_err(|e| e.writing(self.destinations[region]))?;
             drop(bytes);
-            let mut head = Vec::with_capacity(parts.prefix.len() + parts.header.len());
-            head.extend_from_slice(&parts.prefix);
-            head.extend_from_slice(&parts.header);
-            frames.push(vec![head, parts.blob]);
+            frames.push(frame);
         }
         Ok(frames)
     }
@@ -1036,7 +1032,7 @@ fn write_regions(
     for (i, frames) in region_frames.into_iter().enumerate() {
         *stat_field(&mut stats[i]) += counts[i];
         for frame in frames {
-            writers[i].write_raw_chunks(frame)?;
+            writers[i].write_raw_owned(frame)?;
         }
     }
     Ok(())

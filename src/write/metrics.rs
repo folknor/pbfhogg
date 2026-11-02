@@ -12,7 +12,9 @@ crate::counters::counter_set! {
         /// `frame_ns` and `compress_ns` are summed across whichever threads
         /// framed - the executor's workers on a pipelined writer, the caller
         /// on a synchronous one - so they are not components of any one
-        /// thread's wall time.
+        /// thread's wall time. `frame_ns` covers header encoding and, on
+        /// the pipelined path, the copy of header and body into the one
+        /// owned frame that crosses to the writer thread.
         pub frame_ns => "writer_frame_ns",
         pub compress_ns => "writer_compress_ns",
         pub pipeline_send_wait_ns => "writer_pipeline_send_wait_ns",
@@ -45,8 +47,8 @@ crate::counters::counter_set! {
         /// ready chunk (or the header frame) being handed to the backend's
         /// write path until that call returns, on the thread doing it - the
         /// pipelined writer thread, the constructor for a pipelined header,
-        /// or the caller of a synchronous writer. Includes flattening a
-        /// framed chunk, memcpy into the backend's buffers, syscalls,
+        /// or the caller of a synchronous writer. Includes memcpy into the
+        /// backend's buffers, syscalls,
         /// submission, backpressure waits (a full `BufWriter` flushing,
         /// io_uring waiting for a free registered buffer, the `pwrite` pool's
         /// round-robin send blocking on one worker's full queue, which is

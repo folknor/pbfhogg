@@ -46,8 +46,11 @@ pool join, fsync - stays with each backend, after the loop returns.
 This does not reverse the decision above. The loop is the composition of
 contracts this ADR already requires every backend to share
 (`check_stream_complete`, `record_recv_wait`, `time_handoff`,
-`record_accepted`); it flattens chunks into owned byte buffers but manages
-no backend buffer, alignment, submission or completion. What the decision rejects is a shared buffering and
+`record_accepted`); it hands each chunk's owned byte buffers to the sink
+but manages no backend buffer, alignment, submission or completion. (Until
+2026-11-01 it also flattened a writer-framed blob's separate header and body
+into one buffer; framing now produces the whole frame, so nothing is
+flattened on the writer thread.) What the decision rejects is a shared buffering and
 alignment core, and the four byte paths remain four implementations with
 their own guards. Sharing the loop by code rather than by convention is
 what keeps each writer counter meaning one thing on every backend: a

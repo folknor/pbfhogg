@@ -169,7 +169,7 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 `src/write/block_builder.rs` - accumulates elements into PBF blocks.
 
 - Default element cap from `block_builder::DEFAULT_ELEMENT_CAP`, one element type per block
-- `StringTable` with `FxHashMap<Rc<str>, u32>` dedup
+- `StringTable` over one byte arena, deduplicated with FxHash
 - Reusable wire scratch buffers (`wire.rs` encoding primitives)
 - Output: `OwnedBlock { bytes: Vec<u8>, index: BlobIndex, tagdata: Option<Vec<u8>>, way_members: Option<Vec<u8>> }` - serialized data + index + optional tagdata + optional BlobHeader field-5 way-member payload (`None` from every current producer)
 
@@ -780,16 +780,25 @@ full file per step: passthrough saves little there.
 
 **BlockBuilder** - `src/write/block_builder.rs`:
 - Dense node vectors pre-allocated up to the requested cap and preallocation budget
-- String table: `FxHashMap<Rc<str>, u32>` + `Vec<Rc<str>>` - one `Rc<str>` alloc per unique string, shared between map key and vec entry
+- String table: one byte arena plus `(start, end)` slots, deduplicated through a `hashbrown::HashTable` of slot numbers keyed by the slot's bytes - no allocation per string; `clear()` keeps the capacity
 - Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
-- `encode_buf` - serialized output, moved via `std::mem::take` (zero copy)
-- `take_owned()` - returns `(Vec<u8>, BlobIndex, Option<Vec<u8>>)`
+- Every retained buffer (dense vectors, wire scratch, string table, encode buffer) above `MAX_RETAINED_SCRATCH_CAPACITY` is released at the next block, so a builder kept for a whole run holds a fixed bound per buffer
+- `take()` / `take_encoded()` - lend the block from `encode_buf`, which stays with the builder
+- `take_owned()` - returns `OwnedBlock { bytes, index, tagdata, way_members }`, moving `encode_buf` out; the next block reserves the last owned block's length (capped) up front instead of regrowing from empty
+
+A builder is not tied to a blob. The re-encoding commands' ordered-pool
+workers (`cat --clean`, the time-filter snapshot path, repack's and degrade's
+full blocks) each keep one builder as worker-local state for the run and
+frame every block as it fills, straight from the builder's buffer
+(`commands::FramedBlocks`, a `BlockSink`), so no builder is preallocated per
+blob and no encode buffer changes hands. Producers that hand blocks to the
+writer keep `Vec<OwnedBlock>` (the other `BlockSink`).
 
 **PbfWriter** - `src/write/writer.rs`:
 - `FrameScratch` - `blob_buf`, `header_buf`, `compress_buf`, lazy-init `Compress`/`zstd::Compressor`
 - Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
 - `frame_in_scratch()` - the one framing implementation (size guards, header encoding, metrics); frames into the scratch in place
-- `frame_blob_into()` - pipelined hand-off: moves the framed header and body out of the scratch, leaving two replacement buffers at the warmed capacity (capped by the retention limit); no copy
+- `frame_blob_into()` - pipelined hand-off: copies the prefix, header and body into one exactly sized frame (timed into `writer_frame_ns`); the scratch keeps all its buffers, an outlier above the retention limit dropped once the frame is assembled. The frame travels as `OutputChunk::Raw` and no backend flattens anything
 - `write_framed_blob()` - sync hand-off: writes the parts straight from the scratch, no per-blob allocation after warmup
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
 - Pipelined writer thread - a sequence-number reorder buffer

@@ -427,19 +427,24 @@ const _: () = assert!(
 
 /// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks
 /// built under the default 8000-element cap are normally below this (each of
-/// the three buffers is sized by the block's raw or framed bytes; writer
-/// counters show few buffers capped at planet), so the cap only engages on
-/// outliers. It is independent of the read side's `DecompressPool` limit,
-/// whose buffers also carry inline tables; larger buffers are handed
-/// to the writer or dropped, then the thread-local scratch is allowed to warm
-/// up again. A run whose blocks all exceed it (repack with a raised
+/// the three frame buffers is sized by the block's raw or framed bytes;
+/// writer counters show few buffers capped at planet), so the cap only
+/// engages on outliers. It is independent of the read side's `DecompressPool`
+/// limit, whose buffers also carry inline tables; a larger buffer is dropped
+/// once its frame is assembled, then the thread-local scratch is allowed to
+/// warm up again. A run whose blocks all exceed it (repack with a raised
 /// `--elements-per-blob`) pays a fresh allocation per buffer per block, which
-/// is small next to compressing a block of that size. On the pipelined path
-/// the blob and header buffers are handed off and replaced on every blob
-/// regardless, so only `compress_buf` loses cross-blob reuse there; the sync
-/// writer path writes from all three in place and loses reuse on each. The
-/// three scratch Vecs therefore retain at most 12 MiB per `FrameScratch`, in
+/// is small next to compressing a block of that size. Both write paths keep
+/// all three buffers across blobs (the pipelined path copies them into one
+/// owned frame), so they retain at most 12 MiB per `FrameScratch`, in
 /// addition to the reused compressor state.
+///
+/// The same limit applies, per buffer, to everything a `BlockBuilder` keeps
+/// across blocks (its dense vectors, wire scratch, tag-key scratch, string
+/// table, encode buffer, and the reservation it makes after an owned take)
+/// and to the scratch vectors a worker keeps beside its builder, so a
+/// builder kept by a pool worker for a whole run holds a fixed bound per
+/// buffer rather than the largest of every block it met.
 pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Zlib worst-case output bound reserved up front: input + input >> this

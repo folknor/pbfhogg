@@ -412,9 +412,12 @@ fn getparents_pipelined(
 /// blob without one cannot raise any: `process_block` resolves strings only
 /// for the elements it selects.
 ///
-/// `BlockBuilder` holds `Rc<str>` (string table) and is not `Send`, so it
-/// cannot be worker state; each blob with a hit builds its own, flushed
-/// into a per-blob `Vec<OwnedBlock>` before returning.
+/// Each blob with a hit builds its own `BlockBuilder`, flushed into a
+/// per-blob `Vec<OwnedBlock>` before returning. Not because the builder is
+/// not `Send` (the ordered arm's worker state is built on the worker's
+/// thread and could hold one): a query hits few blobs, so a builder per hit
+/// costs next to nothing, and the fused arm (`for_each_fused_buffer`) has
+/// no per-worker state to keep one in.
 fn parents_in(
     buffer: crate::read::block::BlockBuffer<'_>,
     ids: &ElementIds,

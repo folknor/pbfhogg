@@ -19,13 +19,13 @@ use std::thread::JoinHandle;
 
 /// One unit of output the writer thread can consume, independent of backend.
 ///
-/// `Framed` is the common case (a compressed `OSMData` blob). `Raw` and
-/// `RawChunks` carry pre-framed bytes (passthrough). `CopyRange` asks the
-/// backend to splice bytes from another fd via `copy_file_range`.
+/// `Raw` is the common case: one whole frame, either assembled by a framing
+/// job (a compressed `OSMData` blob, see `framing::frame_blob_into`) or
+/// pre-framed by the caller. `RawChunks` carries several pre-framed buffers
+/// (passthrough). `CopyRange` asks the backend to splice bytes from another
+/// fd via `copy_file_range`.
 pub(crate) enum OutputChunk {
-    /// Framed blob parts, not yet concatenated.
-    Framed(FramedBlobParts),
-    /// Pre-framed raw blob bytes.
+    /// One whole frame's bytes.
     Raw(Vec<u8>),
     /// Multiple framed blob chunks, written sequentially. Avoids
     /// concatenating passthrough frames into a single Vec.
@@ -49,36 +49,6 @@ pub(crate) enum OutputChunk {
         offset: u64,
         len: u64,
     },
-}
-
-/// The three owned parts of a framed blob:
-/// `4 B big-endian header_len | BlobHeader | Blob protobuf body`.
-///
-/// Every backend flattens the parts into one buffer via
-/// [`into_vec`](Self::into_vec) before writing; none issues a scatter-gather
-/// write.
-pub(crate) struct FramedBlobParts {
-    pub(crate) prefix: [u8; 4],
-    pub(crate) header: Vec<u8>,
-    pub(crate) blob: Vec<u8>,
-}
-
-impl FramedBlobParts {
-    pub(crate) fn total_len(&self) -> u64 {
-        (self.prefix.len() + self.header.len() + self.blob.len()) as u64
-    }
-
-    /// Flatten the three parts into a single owned `Vec<u8>`.
-    ///
-    /// Compatibility escape hatch for callers that want one contiguous buffer.
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        let total_len = self.prefix.len() + self.header.len() + self.blob.len();
-        let mut out = Vec::with_capacity(total_len);
-        out.extend_from_slice(&self.prefix);
-        out.extend_from_slice(&self.header);
-        out.extend_from_slice(&self.blob);
-        out
-    }
 }
 
 /// A chunk with its sequence number, ready for the writer thread.
@@ -222,7 +192,7 @@ pub(crate) trait OutputSink {
 }
 
 /// Hand one ordered chunk to `sink`; the caller times it as one handoff.
-/// Every chunk is flattened to owned buffers, and accepted bytes are counted
+/// Every chunk arrives as owned buffers, and accepted bytes are counted
 /// per successful constituent operation (`writer_bytes_written`). A free
 /// function rather than a trait method, so no backend can override the
 /// bookkeeping.
@@ -238,7 +208,6 @@ fn hand_off<S: OutputSink>(
         Ok(())
     }
     match chunk {
-        OutputChunk::Framed(parts) => accept(sink, parts.into_vec(), metrics),
         OutputChunk::Raw(bytes) => accept(sink, bytes, metrics),
         OutputChunk::RawChunks(chunks) => chunks
             .into_iter()
@@ -269,9 +238,6 @@ pub(crate) fn write_accepted<W: Write + ?Sized>(
 }
 
 /// Default sink that wraps a [`FileWriter`] (buffered or O_DIRECT).
-///
-/// Flattens `Framed` chunks via [`FramedBlobParts::into_vec`] before handing
-/// them to the underlying writer.
 pub(crate) struct FileOutputSink {
     writer: FileWriter,
     finish: super::Finish,

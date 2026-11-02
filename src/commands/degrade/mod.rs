@@ -1177,16 +1177,33 @@ fn run_kind_phase(
         schedule,
         None,
         None,
-        || (),
-        |block, _state| -> PhaseResult {
+        // Each worker keeps one full-block builder and its refs scratch
+        // across blobs. Its preallocation is the default block's at most:
+        // the cap is user input, and the vectors grow if a block needs more.
+        || {
+            (
+                crate::commands::WorkerBuilder::new(BlockBuilder::with_element_cap_prealloc(
+                    cap,
+                    prealloc_bound.min(crate::tunables::DEFAULT_ELEMENT_CAP.get()),
+                )),
+                Vec::<i64>::new(),
+            )
+        },
+        |block, (worker, refs_buf)| -> PhaseResult {
             worker_decode_kind(
                 block,
                 kind,
                 cap,
                 flags,
-                &compression,
                 drop,
-                &host.invocation.metrics().writer,
+                worker.task()?,
+                refs_buf,
+                crate::commands::FramedBlocks::with_fields(
+                    compression,
+                    &host.invocation.metrics().writer,
+                    !flags.strip_indexdata,
+                    !flags.strip_tagdata,
+                ),
             )
         },
         |_position, out| {
@@ -1299,14 +1316,16 @@ fn run_kind_phase(
 /// apply the cap-1 swap.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 fn worker_decode_kind(
     block: &crate::PrimitiveBlock,
     kind: ElementKind,
     cap_nz: std::num::NonZeroUsize,
     flags: DegradeFlags,
-    compression: &Compression,
     drop: Option<&FxHashSet<i64>>,
-    metrics: &crate::write::metrics::WriterMetrics,
+    bb: &mut BlockBuilder,
+    refs_buf: &mut Vec<i64>,
+    mut framed: crate::commands::FramedBlocks<'_>,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
     // Trust: the schedules (drop selection included) are built with
@@ -1331,9 +1350,6 @@ fn worker_decode_kind(
         (total - tail, tail)
     };
 
-    let mut bb = BlockBuilder::with_element_cap_prealloc(cap_nz, total);
-    let mut output: Vec<OwnedBlock> = Vec::new();
-    let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {
         ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
         ElementKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
@@ -1341,7 +1357,6 @@ fn worker_decode_kind(
     };
 
     let mut idx: usize = 0;
-    let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         if !element_matches_kind(&element, kind, drop) {
@@ -1351,7 +1366,7 @@ fn worker_decode_kind(
         if idx < full_count {
             match (&element, kind) {
                 (Element::DenseNode(dn), ElementKind::Node) => {
-                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    ensure_node_capacity_local(bb, &mut framed)?;
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
@@ -1362,7 +1377,7 @@ fn worker_decode_kind(
                     );
                 }
                 (Element::Node(n), ElementKind::Node) => {
-                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    ensure_node_capacity_local(bb, &mut framed)?;
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
@@ -1373,31 +1388,22 @@ fn worker_decode_kind(
                     );
                 }
                 (Element::Way(w), ElementKind::Way) => {
-                    ensure_way_capacity_local(&mut bb, &mut output)?;
+                    ensure_way_capacity_local(bb, &mut framed)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                     // add_way drops inline LOW coords - the documented
                     // behaviour for the decode path regardless of
                     // --strip-locations.
-                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
                 }
                 (Element::Relation(r), ElementKind::Relation) => {
-                    ensure_relation_capacity_local(&mut bb, &mut output)?;
+                    ensure_relation_capacity_local(bb, &mut framed)?;
                     relation_members_into(r, &mut members_buf)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 }
                 _ => {}
-            }
-            for owned_block in output.drain(..) {
-                full_framed.push(frame_owned(
-                    owned_block,
-                    compression,
-                    flags.strip_indexdata,
-                    flags.strip_tagdata,
-                    metrics,
-                )?);
             }
         } else {
             match (&element, &mut tail) {
@@ -1411,17 +1417,11 @@ fn worker_decode_kind(
         idx += 1;
     }
 
-    // Flush any final full block from the worker BB.
-    flush_local(&mut bb, &mut output)?;
-    for owned_block in output.drain(..) {
-        full_framed.push(frame_owned(
-            owned_block,
-            compression,
-            flags.strip_indexdata,
-            flags.strip_tagdata,
-            metrics,
-        )?);
-    }
+    // Flush any final full block from the worker BB, framed under the same
+    // strip flags as every other flush.
+    flush_local(bb, &mut framed)?;
+    crate::commands::release_scratch(refs_buf);
+    let full_framed = framed.frames.into_iter().map(|(_, frame)| frame).collect();
 
     Ok(WorkerOutput { full_framed, tail })
 }
@@ -1544,41 +1544,6 @@ fn write_owned_to_central(
     }
 }
 
-fn frame_owned(
-    owned: OwnedBlock,
-    compression: &Compression,
-    strip_indexdata: bool,
-    strip_tagdata: bool,
-    metrics: &crate::write::metrics::WriterMetrics,
-) -> crate::Result<Vec<u8>> {
-    let OwnedBlock {
-        bytes: block_bytes,
-        index,
-        tagdata,
-        way_members,
-    } = owned;
-    let indexdata_buf = index.serialize();
-    let indexdata = if strip_indexdata {
-        None
-    } else {
-        Some(indexdata_buf.as_slice())
-    };
-    let tagdata = if strip_tagdata {
-        None
-    } else {
-        tagdata.as_deref()
-    };
-    let blob = frame_blob_pipelined(
-        &block_bytes,
-        compression,
-        indexdata,
-        tagdata,
-        way_members.as_deref(),
-        metrics,
-    )?;
-    Ok(blob.into_vec())
-}
-
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn frame_and_write_batch(
     batch: Vec<OwnedBlock>,
@@ -1614,15 +1579,14 @@ fn frame_and_write_batch(
                     } else {
                         tagdata.as_deref()
                     };
-                    let blob = frame_blob_pipelined(
+                    frame_blob_pipelined(
                         &block_bytes,
                         &compression,
                         indexdata,
                         tagdata,
                         way_members.as_deref(),
                         metrics,
-                    )?;
-                    Ok(blob.into_vec())
+                    )
                 },
             )
             .collect()

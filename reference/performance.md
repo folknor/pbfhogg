@@ -1438,6 +1438,62 @@ phase itself rather than bought with 98 s of wall. Not measured at
 planet: `check --locations`, the sort sweep on an input with runs, and
 `check --ids` without `--full`.
 
+### Encode storage kept across blocks (bygg, 2026-11-01, against `5789830e`)
+
+The change cells ran as uncommitted edits on `5789830e`; the change
+landed unaltered as the commit after it.
+
+The change: one string table per builder over a byte arena (no
+allocation per string, where the old table made an `Rc<str>` per unique
+string and freed them all at every block end); ordered-pool workers of
+`cat --clean`, the time-filter snapshot path, repack and degrade keep one
+`BlockBuilder` for the run and frame each block from its buffer; framing
+hands out one exactly sized frame instead of swapped-out header and body
+parts that the writer flattened; `take_owned` leaves a capped reservation
+for the next block. Outputs of cat `--clean`, repack (cap 8000 and 3000),
+degrade and time-filter on germany are byte-identical to `5789830e`.
+
+Arena cap (MALLOC_ARENA_MAX=2) on germany cat `--clean`: `5789830e` 16.9 s
+(`42a26ca1`) against 7.4 s uncapped; the change without its string table
+15.2 s (8.49 M futex calls at `5789830e` against 7.07 M); with it 7.4 s,
+the uncapped wall. The per-blob vectors were a tenth of the cap's cost;
+the string table's per-string allocations were the rest.
+
+Planet, interleaved `--bench 1` pairs, clean `5789830e` cells (stored)
+against the uncommitted tree (`--force`, not stored); walls in s, peak anon
+in MB:
+
+| command | `5789830e` wall | change wall | `5789830e` peak | change peak |
+|---|---:|---:|---:|---:|
+| cat `--clean version` | 151.1, 153.3 (`f687bd33`, `870e72f6`) | 154.0, 155.3 | 913, 898 | 838, 824 |
+| repack | 172.8, 170.6 (`f078a43a`, `43c3f0fc`) | 170.2, 169.0 | 1,934, 1,896 | 1,790, 1,804 |
+| degrade `--strip-locations` | 170.5, 171.9 (`e39f176d`, `32b0d647`) | 170.7, 171.3 | 1,914, 1,920 | 1,797, 1,775 |
+| time-filter | 134.3, 133.8 (`35a53690`, `ed16f718`) | 132.3, 131.8 | 766, 778 | 720, 719 |
+| getparents | 17.4, 15.6 (`a77c851b`, `4ca09dc3`) | 17.4, 15.7 | 283 | 277, 286 |
+| apply-changes (4913, `zstd:1`) | 129.5, 128.0, 126 (`86cd89b7`, `3e2ebea2`, `c6312436`) | 106.8, 106.5, 103.3 | 2,435, 2,304, 2,399 | 2,663, 3,270, 3,187 |
+| tags-filter (two-pass) | 76.6, 73.2 (`5513882e`, `c9788558`) | 74.2, 73.1 | 2,548 | 2,553, 2,550 |
+| multi-extract `--simple` (5 regions) | 128.0, 127.4 (`5d0090fc`, `58f8c8e1`) | 128.6, 127.1 | 9,989 | 9,914, 9,853 |
+| cat `--dedupe` | 217.1, 217.7 (`74c1a641`, `c072eb75`) | 215.6, 216.4 | 1,088, 1,086 | 1,131, 1,121 |
+| renumber | 131.6, 129.1 (`e785cfa9`, `6091aff9`) | 123.8, 133.2 | 3,314 | 3,331, 3,316 |
+
+Under MALLOC_ARENA_MAX=2 at planet: cat `--clean` 234.5 s (`f38d9391`)
+against 153.0 s, repack 266.9 s (`377506c5`) against 173.2 s - the
+change's capped walls equal its uncapped ones.
+
+Walls are flat within noise except apply-changes, 17 % faster: an
+apply-changes cell of the change with the old `Rc<str>` table ran 124.6 s
+and peaked at 2,508 MB, so both the wall and the peak below come from the
+arena table. Peaks fall 5 to 8 % on the four commands whose workers now
+keep a builder; cat `--dedupe` is about 3.5 % higher. apply-changes' peak
+rises 0.3 to 0.9 GB. Its timeline is flatter than `5789830e`'s (median
+1.76 GB against 1.94) until about 72 % of the run, when the process goes
+from 51 to 83 threads in both builds; there `5789830e` steps up about
+0.3 GB and the change about 1.1 GB, which stays resident to the end. Neither
+the encode reservation (removed: same peak) nor the string table's release
+limit (raised sixteenfold: same peak) explains the step; what the 32 new
+threads hold is not yet attributed. Its drain reorder buffer peaked lower
+(316 MB against 406) and its writer reorder higher (326 items against 169).
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

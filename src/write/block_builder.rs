@@ -32,6 +32,19 @@ pub(crate) struct OwnedBlock {
     pub way_members: Option<Vec<u8>>,
 }
 
+/// An encoded block lent from its [`BlockBuilder`]'s buffers: what
+/// [`BlockBuilder::take_encoded`] returns. Valid until the builder's next
+/// mutation.
+pub(crate) struct EncodedBlock<'a> {
+    /// Serialized `PrimitiveBlock` bytes.
+    pub bytes: &'a [u8],
+    /// Pre-computed blob index (element type, ID range, count).
+    pub index: BlobIndex,
+    /// Optional pre-serialized tagdata (`BlobHeader` field 4 tag key index).
+    pub tagdata: Option<&'a [u8]>,
+}
+
+use crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY;
 use protohoggr::{
     encode_bytes_field, encode_packed_bool, encode_packed_int32, encode_packed_sint32,
     encode_packed_sint64,
@@ -191,8 +204,13 @@ pub struct BlockBuilder {
     packed_lon_scratch: Vec<u8>, // way location lon encoding (single-pass)
     info_scratch: Vec<u8>,   // Info sub-message body
 
-    // Reusable encode buffer for take() - avoids allocating a fresh Vec<u8> per block.
+    // The block encode buffer. `take` and `take_encoded` lend it and keep it
+    // for the next block; `take_owned` moves it out, and the next block then
+    // reserves `encode_reserve` up front instead of regrowing from empty.
     encode_buf: Vec<u8>,
+    // Up-front reservation for the encode buffer after a `take_owned`: the
+    // last owned block's length plus slack, never above the retention limit.
+    encode_reserve: usize,
 
     // True when the string table has been pre-seeded from an input block (merge only).
     // Reset to false by take()/reset(). Checked by merge to re-seed after mid-block flushes.
@@ -327,6 +345,7 @@ impl BlockBuilder {
             info_scratch: Vec::new(),
 
             encode_buf: Vec::new(),
+            encode_reserve: 0,
 
             pre_seeded: false,
             poison: None,
@@ -800,12 +819,8 @@ impl BlockBuilder {
 
         // Tags: write raw indices directly - no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
-            debug_assert!(
-                usize::try_from(key_sid).is_ok_and(|sid| sid < self.string_table.strings.len())
-            );
-            debug_assert!(
-                usize::try_from(val_sid).is_ok_and(|sid| sid < self.string_table.strings.len())
-            );
+            debug_assert!(usize::try_from(key_sid).is_ok_and(|sid| sid < self.string_table.len()));
+            debug_assert!(usize::try_from(val_sid).is_ok_and(|sid| sid < self.string_table.len()));
             #[allow(clippy::cast_sign_loss)]
             self.tag_key_indices.insert(key_sid as u32);
             self.dense_keys_vals.push(key_sid);
@@ -818,8 +833,7 @@ impl BlockBuilder {
                 self.backfill_default_dense_metadata();
             }
             debug_assert!(
-                usize::try_from(meta.user_sid)
-                    .is_ok_and(|sid| sid < self.string_table.strings.len())
+                usize::try_from(meta.user_sid).is_ok_and(|sid| sid < self.string_table.len())
             );
             self.add_dense_metadata_raw(meta);
         } else if self.has_dense_metadata {
@@ -976,17 +990,13 @@ impl BlockBuilder {
             let mut cursor = crate::read::wire::Cursor::new(bytes);
             while !cursor.is_empty() {
                 let sid = cursor.read_varint().expect("valid packed string index");
-                assert!(
-                    usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.strings.len())
-                );
+                assert!(usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.len()));
             }
         }
         if let Some(info) = info {
             let info = crate::read::wire::WireInfo::parse(info).expect("valid raw metadata");
             if let Some(sid) = info.user_sid {
-                assert!(
-                    usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.strings.len())
-                );
+                assert!(usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.len()));
             }
         }
     }
@@ -1036,7 +1046,7 @@ impl BlockBuilder {
         debug_assert!(
             self.tag_key_indices
                 .iter()
-                .all(|&sid| (sid as usize) < self.string_table.strings.len())
+                .all(|&sid| (sid as usize) < self.string_table.len())
         );
 
         let kind = match block_type {
@@ -1062,8 +1072,15 @@ impl BlockBuilder {
             bbox,
         };
 
-        // All block types: direct wire-format encoding
+        // All block types: direct wire-format encoding. The previous block's
+        // bytes (lent by `take` / `take_encoded`) are dead from here, so this
+        // is where an outlier encode buffer is released - never in `reset`,
+        // which runs before the caller reads the block it just encoded.
+        if self.encode_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            self.encode_buf = Vec::new();
+        }
         self.encode_buf.clear();
+        self.encode_buf.reserve(self.encode_reserve);
 
         // PrimitiveBlock field 1: StringTable submessage
         self.string_table
@@ -1102,23 +1119,21 @@ impl BlockBuilder {
             // An empty string is still an explicit tag key; retain it.
             self.tag_key_scratch
                 .extend(self.tag_key_indices.iter().copied());
-            self.tag_key_scratch.sort_by(|&a, &b| {
-                self.string_table.strings[a as usize]
-                    .as_bytes()
-                    .cmp(self.string_table.strings[b as usize].as_bytes())
-            });
+            let strings = &self.string_table;
+            self.tag_key_scratch
+                .sort_by(|&a, &b| strings.get(a as usize).cmp(strings.get(b as usize)));
             if self.pre_seeded {
                 // Identity-preserving source tables can hold the same key at
                 // multiple indices. Tagdata encodes a set of key strings,
-                // so collapse equal strings after sorting their source slots.
-                let strings = &self.string_table.strings;
+                // so collapse equal strings (by content, not slot) after
+                // sorting their source slots.
                 self.tag_key_scratch
-                    .dedup_by(|a, b| strings[*a as usize] == strings[*b as usize]);
+                    .dedup_by(|a, b| strings.get(*a as usize) == strings.get(*b as usize));
             }
             crate::blob_meta::encode_tag_index(
                 self.tag_key_scratch
                     .iter()
-                    .map(|&idx| self.string_table.strings[idx as usize].as_bytes()),
+                    .map(|&idx| strings.get(idx as usize)),
             )
         };
 
@@ -1149,22 +1164,46 @@ impl BlockBuilder {
     /// BlobHeader tag key index. This eliminates the need for the writer to
     /// rescan the serialized bytes via `scan_block_ids` and `scan_block_tags`.
     ///
-    /// Unlike `take()`, this does not reuse the encode buffer across calls -
-    /// each call yields a fresh `Vec` and the internal buffer restarts empty.
-    /// The total allocation is the same as `take()` + `to_vec()` but the
-    /// `memcpy` is eliminated.
+    /// Unlike `take()`, this moves the encode buffer out: the caller owns
+    /// the bytes and may send them to another thread. The next block then
+    /// starts from a buffer reserved at this block's length plus an eighth
+    /// (at most the retention limit), so a long-lived builder pays one
+    /// allocation per owned block rather than regrowing from empty by
+    /// doubling. A caller that frames on the encoding thread should use
+    /// [`take_encoded`](Self::take_encoded), which allocates nothing.
     #[hotpath::measure]
     pub(crate) fn take_owned(&mut self) -> Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
             let tagdata = self.last_tagdata.take();
+            let bytes = std::mem::take(&mut self.encode_buf);
+            self.encode_reserve = bytes
+                .len()
+                .saturating_add(bytes.len() / 8)
+                .min(MAX_RETAINED_SCRATCH_CAPACITY);
             Ok(Some(OwnedBlock {
-                bytes: std::mem::take(&mut self.encode_buf),
+                bytes,
                 index,
                 tagdata,
                 way_members: None,
             }))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Serialize the current block and lend it, with its [`BlobIndex`] and
+    /// tagdata, from the builder's own buffers, which stay with the builder
+    /// for the next block. For callers that frame the block before touching
+    /// the builder again (a worker framing its own output), so no encode
+    /// buffer changes hands.
+    pub(crate) fn take_encoded(&mut self) -> Result<Option<EncodedBlock<'_>>> {
+        match self.encode_block()? {
+            Some(index) => Ok(Some(EncodedBlock {
+                bytes: &self.encode_buf,
+                index,
+                tagdata: self.last_tagdata.as_deref(),
+            })),
+            None => Ok(None),
         }
     }
 
@@ -1309,6 +1348,50 @@ impl BlockBuilder {
 
         // Reset string table (reuse allocation, clear content).
         self.string_table.clear();
+        self.release_outliers();
+    }
+
+    /// Drop every retained buffer that one block grew past the retention
+    /// limit (`MAX_RETAINED_SCRATCH_CAPACITY` per buffer, the frame scratch's
+    /// rule), back to empty, so a builder kept across blocks - a worker's,
+    /// for a whole run - holds a fixed bound per buffer rather than the
+    /// union of every outlier it ever met. A released buffer regrows only if
+    /// a later block needs it. Normal blocks never trip it: at the default
+    /// cap the dense vectors are 8 to 64 KB each.
+    ///
+    /// Runs inside [`reset`](Self::reset), so it excludes the two buffers
+    /// that still hold the block just encoded: `encode_buf` (released at the
+    /// start of the next `encode_block`) and `last_tagdata` (replaced there).
+    fn release_outliers(&mut self) {
+        const LIMIT: usize = MAX_RETAINED_SCRATCH_CAPACITY;
+        fn release<T>(v: &mut Vec<T>) {
+            if v.capacity().saturating_mul(std::mem::size_of::<T>()) > LIMIT {
+                *v = Vec::new();
+            }
+        }
+        release(&mut self.dense_ids);
+        release(&mut self.dense_lats);
+        release(&mut self.dense_lons);
+        release(&mut self.dense_keys_vals);
+        release(&mut self.dense_versions);
+        release(&mut self.dense_timestamps);
+        release(&mut self.dense_changesets);
+        release(&mut self.dense_uids);
+        release(&mut self.dense_user_sids);
+        release(&mut self.dense_visibles);
+        release(&mut self.group_buf);
+        release(&mut self.elem_scratch);
+        release(&mut self.packed_scratch);
+        release(&mut self.packed_vals_scratch);
+        release(&mut self.packed_lat_scratch);
+        release(&mut self.packed_lon_scratch);
+        release(&mut self.info_scratch);
+        release(&mut self.tag_key_scratch);
+        // Approximate: buckets times entry size, ignoring control bytes.
+        if self.tag_key_indices.capacity() * std::mem::size_of::<u32>() > LIMIT {
+            self.tag_key_indices = FxHashSet::default();
+        }
+        self.string_table.release_outliers(LIMIT);
     }
 }
 
@@ -1541,6 +1624,64 @@ mod tests {
         assert!(
             bb.take_owned().unwrap().is_some(),
             "matched refs and locations must encode exactly as before"
+        );
+    }
+
+    /// A builder kept across blocks (a worker's) lends the same bytes a
+    /// fresh builder hands out owned, and does not pin an outlier block's
+    /// buffers: after a block above the retention limit, the next ordinary
+    /// block leaves every buffer it grew within the limit again. An owned
+    /// take after an outlier reserves no more than the limit for the next
+    /// block either.
+    #[test]
+    fn a_reused_builder_lends_identical_bytes_and_releases_outliers() {
+        use crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY as LIMIT;
+        let big = "x".repeat(LIMIT + 1);
+        let encode = |bb: &mut BlockBuilder, value: &str| {
+            bb.add_way(7, [("note", value)], &[1, 2, 3], None);
+        };
+
+        let mut fresh = BlockBuilder::new();
+        encode(&mut fresh, "small");
+        let owned = fresh.take_owned().unwrap().unwrap();
+
+        let mut kept = BlockBuilder::new();
+        encode(&mut kept, &big);
+        assert!(kept.take_encoded().unwrap().is_some());
+        encode(&mut kept, "small");
+        {
+            let lent = kept.take_encoded().unwrap().unwrap();
+            assert_eq!(lent.bytes, owned.bytes.as_slice(), "same block bytes");
+            assert_eq!(lent.tagdata, owned.tagdata.as_deref(), "same tagdata");
+            assert_eq!(lent.index.count, owned.index.count);
+        }
+        assert!(
+            kept.encode_buf.capacity() <= LIMIT,
+            "outlier encode buffer released"
+        );
+        assert!(
+            kept.group_buf.capacity() <= LIMIT,
+            "outlier group buffer released"
+        );
+        assert!(
+            kept.elem_scratch.capacity() <= LIMIT,
+            "outlier scratch released"
+        );
+
+        let mut owning = BlockBuilder::new();
+        encode(&mut owning, &big);
+        let outlier = owning.take_owned().unwrap().unwrap();
+        assert!(outlier.bytes.len() > LIMIT);
+        assert!(
+            owning.encode_reserve <= LIMIT,
+            "reservation capped at the limit"
+        );
+        encode(&mut owning, "small");
+        let next = owning.take_owned().unwrap().unwrap();
+        assert_eq!(next.bytes, owned.bytes, "an owned take after an outlier");
+        assert!(
+            owning.encode_reserve < 1024,
+            "the reservation follows the last block"
         );
     }
 

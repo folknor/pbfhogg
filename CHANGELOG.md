@@ -72,6 +72,15 @@
   violations (exit `1`) where it used to pass. A blob holding several
   kinds in order passes. With `-t`, type order is still judged over every
   kind, as it already was on an indexed file. No cost on planet.
+- Re-encoding no longer allocates per string or per block: the block
+  string table keeps its strings in one buffer, and `cat --clean`,
+  `repack`, `degrade` and `time-filter` keep one encoder per worker for
+  the whole run. Under a two-arena glibc cap, as an embedder may set, the
+  slowdown is gone: on planet, `cat --clean` went from 235 s to 153 s and
+  `repack` from 267 s to 173 s, the same as uncapped. With default
+  arenas, `apply-changes` went from 128 s to 106 s, and its peak memory
+  rose from 2.3-2.4 GB to 2.7-3.3 GB; `cat --clean`, `repack`, `degrade`
+  and `time-filter` peak 5 to 8 % lower. Output bytes are unchanged.
 
 ## 0.6.0 - 2026-10-30
 

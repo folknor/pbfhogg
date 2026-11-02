@@ -145,7 +145,7 @@ pub struct FaultPlan {
 
     // --- io_uring writer (`write::uring_writer`) ---
     /// Dispatch count (1-based) at which the uring writer thread panics.
-    /// A dispatch is one handoff operation: a `Framed` or `Raw` chunk, each
+    /// A dispatch is one handoff operation: a `Raw` chunk, each
     /// piece of a `RawChunks`, a `CopyRange`. The header is not one.
     pub uring_panic_at_dispatch: AtomicU64,
     /// Handoff operations the uring writer thread has dispatched.

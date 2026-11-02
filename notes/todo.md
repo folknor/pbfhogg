@@ -1196,12 +1196,6 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
-- [ ] **Stale "BlockBuilder::new reserves nothing" comments (found
-  2026-10-30).** cat `--clean` and time-filter justify a fresh builder per
-  blob with "no heap reservation until elements are added", but
-  `BlockBuilder::new` preallocates its ten dense vectors at the 8000-element
-  cap (about 0.5 MB). Fix the comments, or the preallocation, with the
-  encode-side recycling item in notes/pre-release.md (WRK-020).
 - [ ] **A cold schedule header walk costs ~6 s at planet (found
   2026-10-30).** Cells that run without the headers in page cache spend
   about 6 s per schedule walk (getparents, check `--ids`, time-filter, cat,

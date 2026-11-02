@@ -355,11 +355,11 @@ impl FramingJob {
                 )
             })
         });
-        if let Ok(ref parts) = result {
+        if let Ok(ref frame) = result {
             metrics.payload_framed_items.fetch_add(1, Relaxed);
             metrics
                 .payload_framed_bytes
-                .fetch_add(parts.total_len(), Relaxed);
+                .fetch_add(frame.len() as u64, Relaxed);
             // Where the framing above actually ran, checked here on the
             // thread that ran it: a worker of the writer's own executor or
             // not. It must stay beside the framing call; moved to a wrapper
@@ -377,7 +377,10 @@ impl FramingJob {
         // closure has no `Result` to return it in. Record it so the
         // producer's next call can join and surface the real cause instead
         // of grinding on to `flush()`. See `WriterGone`.
-        if slot.send(result.map(OutputChunk::Framed)).is_err() {
+        // The frame travels as one whole buffer, assembled here on the
+        // framing thread; it was counted as a framed payload above, not as a
+        // raw one, because this slot was reserved by `write_osm_data`.
+        if slot.send(result.map(OutputChunk::Raw)).is_err() {
             writer_gone.record();
         }
         record_send_wait(t_send, metrics);

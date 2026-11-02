@@ -31,7 +31,7 @@ use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_sorted, writer_from_header,
 };
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::owned::{
     OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
     read_node, read_relation, read_way, relation_members_into,
@@ -400,44 +400,25 @@ fn time_filter_snapshot(
     type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats, Bounds)>;
     let mut previous_last: Option<OrderKey> = None;
 
-    // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
-    // Vec/HashMap initialisers; no heap reservation until elements are
-    // added), deliberately: see the function doc on builders that survive
-    // across blobs. Same pattern as cat --clean's worker. The ordered pool's
-    // window bounds the framed results alive between decode and write.
+    // Each worker keeps one BlockBuilder across blobs and frames every block
+    // as it fills, straight from the builder's buffer; the same worker shape
+    // as cat --clean's. The ordered pool's window bounds the framed results
+    // alive between decode and write.
     parallel_classify_phase_ordered(
         &shared_file,
         &schedule,
         None,
         None,
-        || (),
-        |block, _state| -> PhaseResult {
-            let mut bb = BlockBuilder::new();
-            let mut output: Vec<OwnedBlock> = Vec::new();
+        || crate::commands::WorkerBuilder::new(BlockBuilder::new()),
+        |block, worker| -> PhaseResult {
+            let bb = worker.task()?;
+            let mut output =
+                crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer);
             let mut bounds: Bounds = None;
             let block_stats =
-                filter_block_snapshot(block, cutoff_timestamp, &mut bb, &mut output, &mut bounds)?;
-            flush_local(&mut bb, &mut output)?;
-
-            let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
-            for OwnedBlock {
-                bytes: block_bytes,
-                index,
-                tagdata,
-                way_members,
-            } in output
-            {
-                let indexdata = index.serialize();
-                let blob = crate::writer::frame_blob_pipelined(
-                    &block_bytes,
-                    &compression,
-                    Some(indexdata.as_slice()),
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                    &host.invocation.metrics().writer,
-                )?;
-                framed.push(blob.into_vec());
-            }
+                filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, &mut bounds)?;
+            flush_local(bb, &mut output)?;
+            let framed = output.frames.into_iter().map(|(_, frame)| frame).collect();
             Ok((framed, block_stats, bounds))
         },
         |position, (framed, block_stats, bounds)| {
@@ -508,7 +489,7 @@ fn filter_block_snapshot(
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut impl crate::commands::BlockSink,
     bounds: &mut Option<(OrderKey, OrderKey)>,
 ) -> crate::Result<TimeFilterStats> {
     let mut stats = TimeFilterStats {
@@ -1020,7 +1001,7 @@ mod tests {
                         bbox: None,
                     };
                     writer
-                        .write_primitive_block_owned(OwnedBlock {
+                        .write_primitive_block_owned(crate::block_builder::OwnedBlock {
                             bytes: bytes.to_vec(),
                             index,
                             tagdata: None,

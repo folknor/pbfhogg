@@ -23,7 +23,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_header};
 
 use super::compression::Compression;
-use super::pipeline::FramedBlobParts;
 
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 
@@ -42,12 +41,6 @@ pub(super) struct FrameScratch {
     zlib_compressor: Option<(u32, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
     zstd_compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
-    /// Reuse capacity target for `blob_buf`, capped at
-    /// `MAX_RETAINED_SCRATCH_CAPACITY`.
-    blob_cap: usize,
-    /// Reuse capacity target for `header_buf`, capped at
-    /// `MAX_RETAINED_SCRATCH_CAPACITY`.
-    header_cap: usize,
 }
 
 impl FrameScratch {
@@ -58,43 +51,17 @@ impl FrameScratch {
             compress_buf: Vec::new(),
             zlib_compressor: None,
             zstd_compressor: None,
-            blob_cap: 0,
-            header_cap: 0,
         }
-    }
-
-    /// Hand out `buf`'s contents and leave a replacement behind. Preserve the
-    /// high-water capacity for ordinary blocks, but do not pin an outlier
-    /// buffer in this thread's scratch for the process lifetime.
-    ///
-    /// This is the capacity-preserving alternative to `buf.clone()`: the
-    /// caller receives the bytes without a copy, and the scratch slot keeps
-    /// its warmed-up capacity for ordinary blocks. Buffers above the 4 MiB
-    /// retention limit are handed out with their contents and capacity intact,
-    /// while the scratch slot starts empty for its next frame.
-    fn take_with_capacity(buf: &mut Vec<u8>, cap: &mut usize, metrics: &WriterMetrics) -> Vec<u8> {
-        let observed_capacity = buf.capacity();
-        if observed_capacity > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(observed_capacity, metrics);
-            *cap = 0;
-            return std::mem::take(buf);
-        }
-        *cap = (*cap)
-            .max(observed_capacity)
-            .min(MAX_RETAINED_SCRATCH_CAPACITY);
-        std::mem::replace(buf, Vec::with_capacity(*cap))
     }
 
     pub(super) fn trim_oversize_retained_buffers(&mut self, metrics: &WriterMetrics) {
         if self.blob_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
             Self::record_capped_capacity(self.blob_buf.capacity(), metrics);
             self.blob_buf = Vec::new();
-            self.blob_cap = 0;
         }
         if self.header_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
             Self::record_capped_capacity(self.header_buf.capacity(), metrics);
             self.header_buf = Vec::new();
-            self.header_cap = 0;
         }
         if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
             Self::record_capped_capacity(self.compress_buf.capacity(), metrics);
@@ -137,7 +104,7 @@ pub(crate) fn frame_blob(
     metrics: &WriterMetrics,
 ) -> Result<Vec<u8>> {
     let mut scratch = FrameScratch::new();
-    Ok(frame_blob_into(
+    frame_blob_into(
         blob_type,
         uncompressed,
         compression,
@@ -146,8 +113,7 @@ pub(crate) fn frame_blob(
         None,
         &mut scratch,
         metrics,
-    )?
-    .into_vec())
+    )
 }
 
 /// Compress and frame a blob using per-thread scratch buffers.
@@ -163,7 +129,7 @@ pub(crate) fn frame_blob_pipelined(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     metrics: &WriterMetrics,
-) -> Result<FramedBlobParts> {
+) -> Result<Vec<u8>> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
         frame_blob_into(
             "OSMData",
@@ -178,43 +144,41 @@ pub(crate) fn frame_blob_pipelined(
     })
 }
 
-/// Compress and frame a blob using reusable scratch buffers.
-///
-/// Returns owned buffers suitable for sending through a pipeline channel.
+/// Compress and frame a blob using reusable scratch buffers, returning the
+/// whole frame `[4-byte BE header_len][BlobHeader][Blob]` as one exactly
+/// sized `Vec<u8>`, ready for any backend to write as it stands.
 /// The framing itself is [`frame_in_scratch`]; this adds the hand-off.
 ///
 /// # Per-call cost
 ///
-/// The compression scratch (`compress_buf`) and both compressors are reused
-/// across calls and allocate nothing after warmup, except that a
-/// `compress_buf` grown past `MAX_RETAINED_SCRATCH_CAPACITY` is dropped after
-/// its blob. The two buffers that *are*
-/// handed to the caller - the `BlobHeader` and the `Blob` body - are swapped
-/// out rather than copied out, so each call allocates exactly two
-/// `Vec<u8>`s - the replacements installed in the scratch - and performs zero
-/// memcpys of blob-sized data.
+/// The scratch keeps all three of its buffers and both compressors, so
+/// after warmup a call allocates exactly one `Vec<u8>` - the frame - and
+/// copies the header and body into it once, timed into `writer_frame_ns`.
+/// A scratch buffer grown past `MAX_RETAINED_SCRATCH_CAPACITY` is dropped
+/// once its frame is assembled (and on every error return), so an outlier
+/// is not pinned on a long-lived executor thread.
 ///
-/// This block previously claimed the same steady-state behaviour while the
-/// code below cloned both buffers: two allocations *and* two full memcpys per
-/// blob, on the hottest write path there is.
+/// This replaced a hand-off of the header and body as separate buffers,
+/// swapped out of the scratch with two freshly allocated replacements
+/// installed behind them, which every backend then flattened into one
+/// buffer anyway - on the writer thread, for blocks the writer framed. That
+/// was three allocations and two copies of the body per frame, against one
+/// and one now.
 ///
-/// **The swap is not a measured speedup.** Six interleaved matched cells of
-/// `repack --dataset japan --compression none --bench 1` on `bygg` at commit
-/// `eea35d27` gave swap 8.6 / 8.6 / 8.3 s against clone 8.3 / 8.5 / 8.5 s -
-/// sign-inconsistent across the three pairs and inside the reported
-/// granularity. `--compression none` is the arrangement that maximizes the
-/// memcpy (the blob body is the whole uncompressed block), and it still did
-/// not show. The copies are also spread across rayon workers, so they dilute
-/// into wall time rather than adding to it. Keep the swap because the code
-/// now does what the doc says and because it removes real per-blob work, not
-/// because it made anything faster; do not cite a throughput win for it.
-///
-/// NOTE: Buffer recycling pool was attempted to eliminate this per-call
+/// NOTE: a buffer recycling pool was attempted to eliminate the per-call
 /// allocation via `Arc<Mutex<Vec<Vec<u8>>>>` shared between rayon workers and
 /// the writer thread. Regressed throughput by +12% (Germany, Compression::None)
-/// due to Mutex contention. The allocator's own thread-local caching handles
-/// the cross-thread alloc/free pattern better than an explicit pool.
-/// Measured at commit 2bf438c.
+/// due to Mutex contention. Measured at commit 2bf438c.
+///
+/// A bounded return path for frames, writer thread back to the framing
+/// workers, was considered again on 2026-11-01 and not built. Its case was
+/// that per-frame allocations above the tcache limit made a two-arena glibc
+/// cap cost 10 to 82 % of planet wall. Measurement put about a tenth of that
+/// on per-blob buffers and the rest on the block string table's
+/// per-string allocations; with the table on one byte arena, capped walls
+/// equal uncapped ones (planet cat `--clean` 153.0 s, repack 173.2 s, bygg),
+/// so the return path has no measured cost left to remove. Any gain under
+/// default arenas is untested.
 #[hotpath::measure]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn frame_blob_into(
@@ -226,8 +190,8 @@ pub(super) fn frame_blob_into(
     way_members: Option<&[u8]>,
     scratch: &mut FrameScratch,
     metrics: &WriterMetrics,
-) -> Result<FramedBlobParts> {
-    let prefix = frame_in_scratch(
+) -> Result<Vec<u8>> {
+    let framed = frame_in_scratch(
         blob_type,
         uncompressed,
         compression,
@@ -236,23 +200,15 @@ pub(super) fn frame_blob_into(
         way_members,
         scratch,
         metrics,
-    )?
-    .prefix;
-
-    // Swap out, do not clone. A plain `swap` would leave the scratch holding
-    // empty Vecs that re-grow from zero on every subsequent blob, which is why
-    // this used to clone; `take_with_capacity` preserves the warmed capacity
-    // for ordinary blocks, while the retention cap lets outliers warm up again
-    // on demand. The two per-blob memcpys stay gone.
-    let header =
-        FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap, metrics);
-    let blob =
-        FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap, metrics);
-    Ok(FramedBlobParts {
-        prefix,
-        header,
-        blob,
-    })
+    )?;
+    let t_assemble = crate::counters::Stopwatch::start();
+    let mut frame = Vec::with_capacity(4 + framed.header.len() + framed.blob.len());
+    frame.extend_from_slice(&framed.prefix);
+    frame.extend_from_slice(framed.header);
+    frame.extend_from_slice(framed.blob);
+    t_assemble.record_ns(&metrics.frame_ns);
+    scratch.trim_oversize_retained_buffers(metrics);
+    Ok(frame)
 }
 
 /// A blob framed in place: the three wire parts, the header and body still
@@ -270,12 +226,12 @@ pub(super) struct ScratchFrame<'a> {
 /// metrics - for both write paths, which differ only in what they do with
 /// the result:
 ///
-/// - [`frame_blob_into`] (pipelined, and `frame_blob`) swaps the two buffers
-///   out, because the parts cross a channel to the writer thread.
+/// - [`frame_blob_into`] (pipelined, and `frame_blob`) copies the parts into
+///   one owned frame, because the frame crosses a channel to the writer
+///   thread.
 /// - `PbfWriter::write_framed_blob` (sync) writes the parts straight from the
 ///   scratch, so after warmup it allocates nothing per blob. Routing it
-///   through `frame_blob_into` would cost it the two replacement buffers
-///   `take_with_capacity` installs on every call.
+///   through `frame_blob_into` would cost it the frame allocation and copy.
 ///
 /// The frame-assembly rules themselves (size limits, header encoding) are
 /// [`encode_frame_header`], shared with the passthrough reframe; compression,
@@ -913,17 +869,16 @@ mod tests {
         out
     }
 
-    /// Framing must hand out its buffers without copying them, and must not
-    /// leave the scratch to re-grow from zero.
-    ///
-    /// Both halves matter and each on its own is satisfiable by the bug the
-    /// other one describes: `clone()` preserves the scratch capacity but pays
-    /// two memcpys per blob, and a bare `swap` skips the memcpys but empties
-    /// the scratch. The observable proxy for "swapped, not cloned" is that
-    /// the scratch buffer no longer holds the bytes it just produced.
+    /// Pipelined framing hands out one exactly sized frame and keeps every
+    /// scratch buffer warm: the frame's bytes are the sync path's
+    /// `prefix | header | blob`, its capacity is its length (nothing over-
+    /// reserved travels to the writer), and a second, smaller blob reuses
+    /// the scratch without regrowing it. An outlier above the retention
+    /// limit is dropped once its frame is assembled.
     #[test]
-    fn framing_swaps_buffers_out_and_keeps_scratch_capacity() {
+    fn framing_hands_out_one_exact_frame_and_keeps_the_scratch() {
         let mut scratch = FrameScratch::new();
+        let metrics = WriterMetrics::new();
         let payload = vec![7u8; 64 * 1024];
         let first = frame_blob_into(
             "OSMData",
@@ -933,28 +888,33 @@ mod tests {
             None,
             None,
             &mut scratch,
-            &WriterMetrics::new(),
+            &metrics,
         )
         .expect("first blob must frame");
-        assert!(!first.blob.is_empty(), "framed blob must carry bytes");
-        assert!(
-            scratch.blob_buf.is_empty() && scratch.header_buf.is_empty(),
-            "buffers must be swapped out, not cloned out"
-        );
+        let expected: Vec<u8> = {
+            let mut probe = FrameScratch::new();
+            let parts = frame_in_scratch(
+                "OSMData",
+                &payload,
+                &Compression::None,
+                None,
+                None,
+                None,
+                &mut probe,
+                &metrics,
+            )
+            .expect("probe must frame");
+            [&parts.prefix[..], parts.header, parts.blob].concat()
+        };
+        assert_eq!(first, expected, "the frame is prefix, header and blob");
+        assert_eq!(first.capacity(), first.len(), "the frame is exactly sized");
         let warmed_blob_cap = scratch.blob_buf.capacity();
-        let warmed_header_cap = scratch.header_buf.capacity();
         assert!(
             warmed_blob_cap >= payload.len(),
-            "the replacement blob buffer must be reserved to the high-water \
-             capacity, got {warmed_blob_cap} for a {} byte payload",
-            payload.len()
+            "the scratch must keep its blob buffer, got {warmed_blob_cap}"
         );
-        assert!(
-            warmed_header_cap > 0,
-            "the replacement header buffer must be reserved, got 0"
-        );
+        assert!(scratch.header_buf.capacity() > 0, "header buffer kept");
 
-        // A second, smaller blob must neither re-grow nor shrink the scratch.
         let second = frame_blob_into(
             "OSMData",
             &[1, 2, 3],
@@ -963,14 +923,34 @@ mod tests {
             None,
             None,
             &mut scratch,
-            &WriterMetrics::new(),
+            &metrics,
         )
         .expect("second blob must frame");
-        assert_eq!(second.blob.len(), 5, "3 payload bytes plus tag and length");
         assert!(
-            scratch.blob_buf.capacity() >= warmed_blob_cap,
-            "scratch capacity regressed from {warmed_blob_cap} to {}",
-            scratch.blob_buf.capacity()
+            second.ends_with(&[0x0a, 3, 1, 2, 3]),
+            "raw field of 3 bytes"
+        );
+        assert_eq!(
+            scratch.blob_buf.capacity(),
+            warmed_blob_cap,
+            "a smaller blob reuses the scratch without regrowing it"
+        );
+
+        let big = vec![1u8; MAX_RETAINED_SCRATCH_CAPACITY + 1];
+        frame_blob_into(
+            "OSMData",
+            &big,
+            &Compression::None,
+            None,
+            None,
+            None,
+            &mut scratch,
+            &metrics,
+        )
+        .expect("outlier must frame");
+        assert!(
+            scratch.blob_buf.capacity() <= MAX_RETAINED_SCRATCH_CAPACITY,
+            "an outlier blob buffer is not retained"
         );
     }
 

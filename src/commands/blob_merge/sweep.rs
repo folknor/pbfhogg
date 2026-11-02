@@ -480,15 +480,14 @@ fn frame_owned(
         way_members,
     } = owned;
     let indexdata = index.serialize();
-    Ok(frame_blob_pipelined(
+    frame_blob_pipelined(
         &bytes,
         compression,
         Some(indexdata.as_slice()),
         tagdata.as_deref(),
         way_members.as_deref(),
         metrics,
-    )?
-    .into_vec())
+    )
 }
 
 /// Validate a dropped duplicate as a written element would be: its user, and

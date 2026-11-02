@@ -880,7 +880,7 @@ fn handle_candidate(
             way_members,
         } = owned;
         let indexdata = index.serialize();
-        let parts = frame_blob_pipelined(
+        let frame = frame_blob_pipelined(
             &block_bytes,
             compression,
             Some(&indexdata),
@@ -888,9 +888,8 @@ fn handle_candidate(
             way_members.as_deref(),
             metrics,
         )?;
-        // The raw block is freed before its frame is copied out.
         drop(block_bytes);
-        framed_chunks.push(parts.into_vec());
+        framed_chunks.push(frame);
         frame_ns += t_frame.elapsed_ns();
         Ok(())
     };

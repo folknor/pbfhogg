@@ -455,15 +455,25 @@ fn run_kind_phase(
         schedule,
         None,
         None,
-        || (),
-        |block, _state| -> PhaseResult {
+        // Each worker keeps one full-block builder and its scratch across
+        // blobs. Its preallocation is the default block's at most: the cap
+        // is user input, and the vectors grow if a block needs more.
+        || WorkerScratch {
+            builder: crate::commands::WorkerBuilder::new(BlockBuilder::with_element_cap_prealloc(
+                cap,
+                prealloc_bound.min(crate::tunables::DEFAULT_ELEMENT_CAP.get()),
+            )),
+            refs: Vec::new(),
+            locations: Vec::new(),
+        },
+        |block, scratch| -> PhaseResult {
             worker_split_blob(
                 block,
                 kind,
                 cap,
                 preserve_locations,
-                &compression,
-                &host.invocation.metrics().writer,
+                scratch,
+                crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer),
             )
         },
         |_position, item| {
@@ -611,10 +621,18 @@ fn encode_way_full_block(
     Ok(())
 }
 
+/// A repack worker's state across the blobs of one kind phase.
+struct WorkerScratch {
+    builder: crate::commands::WorkerBuilder,
+    refs: Vec<i64>,
+    locations: Vec<(i32, i32)>,
+}
+
 /// One worker's body: count matching elements, frame the leading
-/// `M - M%cap` elements as full blocks via a per-worker `BlockBuilder`,
-/// and ship the trailing `M%cap` elements as `Owned*` data for the merge
-/// thread to coalesce across input-blob boundaries.
+/// `M - M%cap` elements as full blocks via the worker's `BlockBuilder`
+/// (each framed into `framed` as it fills), and ship the trailing `M%cap`
+/// elements as `Owned*` data for the merge thread to coalesce across
+/// input-blob boundaries.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_split_blob(
@@ -622,8 +640,8 @@ fn worker_split_blob(
     kind: ElementKind,
     cap_nz: std::num::NonZeroUsize,
     preserve_locations: bool,
-    compression: &Compression,
-    metrics: &crate::write::metrics::WriterMetrics,
+    scratch: &mut WorkerScratch,
+    mut framed: crate::commands::FramedBlocks<'_>,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
     // Trust: the schedule put this blob in this kind's phase because its
@@ -652,13 +670,9 @@ fn worker_split_blob(
     let tail_size = total % cap;
     let full_count = total - tail_size;
 
-    // `cap` is user input; `total` is what this block actually holds. A block
-    // can never fill more than `total` slots, so that is the honest
-    // pre-allocation bound - `repack --elements-per-blob 9000000000000000000`
-    // must not ask for a 9-exabyte vector per worker.
-    let mut bb = BlockBuilder::with_element_cap_prealloc(cap_nz, total);
-    let mut output: Vec<OwnedBlock> = Vec::new();
-    let mut full_framed: Vec<Vec<u8>> = Vec::new();
+    let bb = scratch.builder.task()?;
+    let refs_buf = &mut scratch.refs;
+    let locations_buf = &mut scratch.locations;
     let mut tail: KindPayload = match kind {
         ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
         ElementKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
@@ -666,8 +680,6 @@ fn worker_split_blob(
     };
 
     let mut idx: usize = 0;
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         let is_match = matches!(
@@ -681,11 +693,11 @@ fn worker_split_blob(
         }
 
         if idx < full_count {
-            // Full-block path: re-encode through the per-worker builder
-            // exactly like v1. Frame any output produced by `ensure_*`.
+            // Full-block path: re-encode through the worker's builder; a
+            // block `ensure_*` flushes is framed into `framed` on the spot.
             match (&element, kind) {
                 (Element::DenseNode(dn), ElementKind::Node) => {
-                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    ensure_node_capacity_local(bb, &mut framed)?;
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
@@ -696,7 +708,7 @@ fn worker_split_blob(
                     );
                 }
                 (Element::Node(n), ElementKind::Node) => {
-                    ensure_node_capacity_local(&mut bb, &mut output)?;
+                    ensure_node_capacity_local(bb, &mut framed)?;
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
@@ -707,25 +719,16 @@ fn worker_split_blob(
                     );
                 }
                 (Element::Way(w), ElementKind::Way) => {
-                    ensure_way_capacity_local(&mut bb, &mut output)?;
-                    encode_way_full_block(
-                        &mut bb,
-                        w,
-                        &mut refs_buf,
-                        &mut locations_buf,
-                        preserve_locations,
-                    )?;
+                    ensure_way_capacity_local(bb, &mut framed)?;
+                    encode_way_full_block(bb, w, refs_buf, locations_buf, preserve_locations)?;
                 }
                 (Element::Relation(r), ElementKind::Relation) => {
-                    ensure_relation_capacity_local(&mut bb, &mut output)?;
+                    ensure_relation_capacity_local(bb, &mut framed)?;
                     relation_members_into(r, &mut members_buf)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 }
                 _ => {}
-            }
-            for owned_block in output.drain(..) {
-                full_framed.push(frame_owned(owned_block, compression, metrics)?);
             }
         } else {
             // Tail path: own and ship to the merge thread.
@@ -747,38 +750,12 @@ fn worker_split_blob(
     // Force-flush the final full block (if any). After processing
     // exactly `full_count` matching elements and `full_count` is a
     // multiple of `cap`, the BB holds the last cap elements unflushed.
-    flush_local(&mut bb, &mut output)?;
-    for owned_block in output.drain(..) {
-        full_framed.push(frame_owned(owned_block, compression, metrics)?);
-    }
+    flush_local(bb, &mut framed)?;
+    crate::commands::release_scratch(&mut scratch.refs);
+    crate::commands::release_scratch(&mut scratch.locations);
+    let full_framed = framed.frames.into_iter().map(|(_, frame)| frame).collect();
 
     Ok(WorkerOutput { full_framed, tail })
-}
-
-/// Frame a single `OwnedBlock` to wire bytes. Worker-side helper; uses
-/// the thread-local `PIPELINE_SCRATCH` so it's safe to call from any
-/// rayon / `parallel_classify_phase` worker.
-fn frame_owned(
-    owned: OwnedBlock,
-    compression: &Compression,
-    metrics: &crate::write::metrics::WriterMetrics,
-) -> crate::Result<Vec<u8>> {
-    let OwnedBlock {
-        bytes: block_bytes,
-        index,
-        tagdata,
-        way_members,
-    } = owned;
-    let indexdata = index.serialize();
-    let blob = frame_blob_pipelined(
-        &block_bytes,
-        compression,
-        Some(indexdata.as_slice()),
-        tagdata.as_deref(),
-        way_members.as_deref(),
-        metrics,
-    )?;
-    Ok(blob.into_vec())
 }
 
 /// Frame `batch` in parallel via rayon, then write the framed bytes in
@@ -807,15 +784,14 @@ fn frame_and_write_batch(
                  }|
                  -> Result<Vec<u8>> {
                     let indexdata = index.serialize();
-                    let blob = frame_blob_pipelined(
+                    frame_blob_pipelined(
                         &block_bytes,
                         &compression,
                         Some(indexdata.as_slice()),
                         tagdata.as_deref(),
                         way_members.as_deref(),
                         metrics,
-                    )?;
-                    Ok(blob.into_vec())
+                    )
                 },
             )
             .collect()

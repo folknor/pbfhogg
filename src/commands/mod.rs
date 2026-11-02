@@ -132,22 +132,150 @@ pub(crate) fn drain_batch_results<S>(
     Ok(())
 }
 
-/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
-///
-/// Like `flush_block` but writes to a `Vec<OwnedBlock>` instead of a
-/// `PbfWriter`, so it can be called from rayon worker threads.
-pub(crate) fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> Result<()> {
-    if let Some(owned) = bb.take_owned()? {
-        output.push(owned);
+/// Where a worker's finished blocks go when its [`BlockBuilder`] flushes: the
+/// receiving end of [`flush_local`] and the `ensure_*_capacity_local`
+/// helpers, so one element walk can either keep owned blocks for the writer
+/// to frame (`Vec<OwnedBlock>`) or frame each block on the spot from the
+/// builder's own buffer ([`FramedBlocks`]).
+pub(crate) trait BlockSink {
+    /// Take the builder's current block, if it holds one.
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()>;
+}
+
+/// Owned blocks, for a writer or a later stage to frame: each one moves the
+/// builder's encode buffer out (`BlockBuilder::take_owned`).
+impl BlockSink for Vec<OwnedBlock> {
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
+        if let Some(owned) = bb.take_owned()? {
+            self.push(owned);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Blocks framed as they complete, on the worker that built them: each
+/// block is framed straight from the builder's buffer
+/// (`BlockBuilder::take_encoded`), so no encode buffer changes hands and a
+/// task holds only compressed frames. The frames are written raw
+/// (`PbfWriter::write_raw_owned`), as the worker-framing commands always
+/// have.
+pub(crate) struct FramedBlocks<'a> {
+    compression: Compression,
+    metrics: &'a crate::write::metrics::WriterMetrics,
+    keep_indexdata: bool,
+    keep_tagdata: bool,
+    /// The frames so far, each with its block's kind, in flush order.
+    pub(crate) frames: Vec<(crate::ElementKind, Vec<u8>)>,
+}
+
+impl<'a> FramedBlocks<'a> {
+    /// Frames carrying the block's indexdata and tagdata.
+    pub(crate) fn new(
+        compression: Compression,
+        metrics: &'a crate::write::metrics::WriterMetrics,
+    ) -> Self {
+        Self::with_fields(compression, metrics, true, true)
+    }
+
+    /// Frames whose `BlobHeader` keeps or omits indexdata and tagdata.
+    pub(crate) fn with_fields(
+        compression: Compression,
+        metrics: &'a crate::write::metrics::WriterMetrics,
+        keep_indexdata: bool,
+        keep_tagdata: bool,
+    ) -> Self {
+        Self {
+            compression,
+            metrics,
+            keep_indexdata,
+            keep_tagdata,
+            frames: Vec::new(),
+        }
+    }
+}
+
+impl BlockSink for FramedBlocks<'_> {
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
+        if let Some(block) = bb.take_encoded()? {
+            let indexdata = block.index.serialize();
+            let frame = crate::writer::frame_blob_pipelined(
+                block.bytes,
+                &self.compression,
+                self.keep_indexdata.then_some(indexdata.as_slice()),
+                if self.keep_tagdata {
+                    block.tagdata
+                } else {
+                    None
+                },
+                None,
+                self.metrics,
+            )?;
+            self.frames.push((block.index.kind, frame));
+        }
+        Ok(())
+    }
+}
+
+/// A worker's long-lived block builder, kept across the tasks of an ordered
+/// pool as the worker's local state (built on the worker's own thread, so
+/// the builder need not be `Send`): its buffers stay warm from one input
+/// blob to the next instead of being preallocated and regrown per blob.
+/// Every builder buffer above the retention limit is released at each block
+/// (see `BlockBuilder::release_outliers`), so the worker keeps a fixed bound,
+/// not the union of every outlier it met.
+pub(crate) struct WorkerBuilder {
+    bb: BlockBuilder,
+}
+
+impl WorkerBuilder {
+    pub(crate) fn new(bb: BlockBuilder) -> Self {
+        Self { bb }
+    }
+
+    /// The builder for one task. A task that succeeded left it empty (every
+    /// task ends with an unconditional flush), and a task that failed ends
+    /// its worker (the ordered pool claims nothing after a failure), so a
+    /// builder still holding elements here is a broken invariant: refused,
+    /// rather than letting another blob's elements into this one's output.
+    pub(crate) fn task(&mut self) -> Result<&mut BlockBuilder> {
+        if !self.bb.is_empty() {
+            return Err(crate::error::Error::internal(
+                "a worker block builder began a task holding another task's elements",
+            ));
+        }
+        Ok(&mut self.bb)
+    }
+}
+
+/// Clear a worker scratch vector for the next task, releasing it if one
+/// task grew it past the retention limit, so it does not pin an outlier for
+/// the run (the rule `BlockBuilder` applies to its own buffers).
+pub(crate) fn release_scratch<T>(v: &mut Vec<T>) {
+    v.clear();
+    if v.capacity().saturating_mul(std::mem::size_of::<T>())
+        > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY
+    {
+        *v = Vec::new();
+    }
+}
+
+/// Flush the current block from a [`BlockBuilder`] into a worker's
+/// [`BlockSink`].
+///
+/// Like `flush_block` but never touches a `PbfWriter`, so it can be called
+/// from worker threads.
+pub(crate) fn flush_local<O: BlockSink + ?Sized>(
+    bb: &mut BlockBuilder,
+    output: &mut O,
+) -> Result<()> {
+    output.flush(bb)
 }
 
 /// Ensure the [`BlockBuilder`] has capacity for a node, flushing to local
 /// output if full. Used by rayon worker threads in parallel batch processing.
-pub(crate) fn ensure_node_capacity_local(
+pub(crate) fn ensure_node_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut O,
 ) -> Result<()> {
     if !bb.can_add_node() {
         flush_local(bb, output)?;
@@ -157,9 +285,9 @@ pub(crate) fn ensure_node_capacity_local(
 
 /// Ensure the [`BlockBuilder`] has capacity for a way, flushing to local
 /// output if full.
-pub(crate) fn ensure_way_capacity_local(
+pub(crate) fn ensure_way_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut O,
 ) -> Result<()> {
     if !bb.can_add_way() {
         flush_local(bb, output)?;
@@ -169,9 +297,9 @@ pub(crate) fn ensure_way_capacity_local(
 
 /// Ensure the [`BlockBuilder`] has capacity for a relation, flushing to local
 /// output if full.
-pub(crate) fn ensure_relation_capacity_local(
+pub(crate) fn ensure_relation_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut O,
 ) -> Result<()> {
     if !bb.can_add_relation() {
         flush_local(bb, output)?;

@@ -187,21 +187,27 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Residual memory above the README
 
-### WRK-010: cat --clean at 994 MB against 750 MB
+### WRK-010: cat --clean at 824-838 MB against 750 MB
 
-After `5bfa37ab` the peak sits in the relations phase. The 64-task window
-holds framed vectors, each worker builds a fresh `BlockBuilder` per blob
-(deliberate and measured, see "Facts learned the hard way"), and frames are
-copied with `FramedBlobParts::into_vec`. WRK-020 is the structural fix.
-Without the two-arena cap (gone since 2026-11-01) a planet cell peaked at
-918 MB, still in the relations phase.
+Planet `cat --clean version` peaks at 824 and 838 MB (bygg, 2026-11-01,
+the encode-storage change: one builder per worker for the run, one exactly
+sized frame per block, the string table on one byte arena), against
+898-913 MB at `5789830e` and the README's 750 MB. The 750 MB baseline
+(`f2315551`) predates the single ordered pass and ran under the two-arena
+cap. What holds the remaining 75-90 MB is unattributed: the 64-task window
+of owned frames is the obvious candidate, and which phase peaks has not
+been re-read since `5bfa37ab` put it in relations.
 
-### WRK-115: repack and degrade relation phase at 1.93 GB
+### WRK-115: repack and degrade relation phase at 1.8 GB
 
 With glibc's default arenas (the CLI's two-arena cap is gone; see
 reference/performance.md, "The CLI no longer caps malloc arenas") planet
-repack and degrade `--strip-locations` both peak at 1.93 GB in the
-relations phase, against 1.37 and 1.38 GB under the cap. In repack's
+repack and degrade `--strip-locations` peaked at 1.93 GB in the
+relations phase, against 1.37 and 1.38 GB under the cap. The
+encode-storage change (workers keep one builder, string table on one
+byte arena; reference/performance.md, "Encode storage kept across
+blocks") brought them to 1.79-1.80 and 1.78-1.80 GB; the rest of this
+entry describes the cells before it and has not been re-read since. In repack's
 uncapped cell that phase ran about 4 s at 8 cores with 65 threads, after
 a ways phase peaking at 1.19 GB; pinning `M_MMAP_THRESHOLD` alone gave
 repack 1.70 GB. Repack's ordered pool admits its default window (8 tasks
@@ -214,19 +220,47 @@ against `Resources::memory_available`.
 
 ## Memory and throughput: structural work
 
-### WRK-020: Encode-side recycling
+### WRK-122: apply-changes holds about 1 GB more after its thread step
 
-Encode into reusable worker storage, compress each block as it completes,
-frame into output storage with a bounded return path from the writer.
-`BlockBuilder::take_owned` takes `encode_buf`,
-`FrameScratch::take_with_capacity` allocates a replacement per handoff and
-`into_vec` copies the frame, so keeping a builder per worker alone recycles
-nothing. Reduces throughput's dependence on the host's allocator policy:
-per-blob buffers above the tcache limit are what made a two-arena cap add
-10 to 82 % wall at planet (reference/performance.md, "The CLI no longer
-caps malloc arenas"), and an embedder that caps arenas still pays it.
-`notes/todo.md` "Stale BlockBuilder::new reserves nothing comments" rides
-with it.
+The encode-storage change made planet apply-changes (4913, `zstd:1`) 17 %
+faster (128 s to 106 s on bygg) and raised its peak anon from 2.30-2.43 GB
+to 2.66-3.27 GB; a cell of the change with the old `Rc<str>` string table
+ran 124.6 s at 2.51 GB, so both come from the arena string table. Until
+about 72 % of the run the change's timeline is flatter than HEAD's (median
+1.76 against 1.94 GB). Then the process goes from 51 to 83 threads in both
+builds, HEAD steps up about 0.3 GB and the change about 1.1 GB, which stays
+resident to the end. The step persists under MALLOC_ARENA_MAX=2, so it
+reads as live data rather than arena retention. Ruled out: the builder's
+encode reservation (removed, same peak) and the 4 MiB retention limit on
+builder buffers (raised sixteenfold, same peak). Open: what the 32 threads
+started at that point are and what each holds - plausibly one string
+table and builder per new worker, whose arena keeps its high-water
+capacity up to the retention limit where the `Rc<str>` table freed per
+block. Its drain reorder buffer peaked lower (316 against 406 MB) and its
+writer reorder higher (326 against 169 items). Numbers in
+reference/performance.md, "Encode storage kept across blocks".
+
+### WRK-123: Dense-node block body copied twice in the encoder
+
+`BlockBuilder::encode_dense_nodes_group` encodes the DenseNodes message
+into `group_buf`, copies it into `elem_scratch` to wrap it as
+PrimitiveGroup field 2, then copies that into `encode_buf` as
+PrimitiveBlock field 2: two full copies of the node body (the largest
+message in a node block) per block, on every node-writing command. The
+nested lengths are computable before writing (the packed fields'
+lengths are known once encoded), so the body could be written once into
+`encode_buf` behind both length prefixes. Not measured; establish the
+cost per node blob at planet first, since it may sit under the 2-3 %
+floor.
+
+### WRK-124: apply-changes still hands its framing an owned buffer
+
+apply-changes' streaming path (`src/commands/apply_changes/streaming.rs`)
+passes an owned block buffer to its framing closure instead of lending the
+encoded block (`BlockBuilder::take_encoded`), as cat `--clean`, repack,
+degrade and the time-filter snapshot path now do through their per-worker
+builders. Likely one allocation and free per rewritten blob. Measure
+against WRK-122's step, since both sit on the same workers.
 
 ### WRK-022: Byte-budgeted fused task engine
 
@@ -432,7 +466,7 @@ anything beyond the documentation is wanted.
 `writer_reorder_high_water` (seq span) and `writer_reorder_filled_high_water`
 (occupied slots) are documented and recorded, but no counter gives the bytes
 held there, so memory attribution from them stays inferred. A byte peak needs
-per-chunk accounting across `Framed` / `Raw` / `RawChunks` (allocated
+per-chunk accounting across `Raw` / `RawChunks` (allocated
 capacity, not length), `CopyRange` (no bytes) and error slots, added on push
 and subtracted on pop in `deliver_in_order`; it is per blob on every
 pipelined writer, so it needs its own matched A/B.
@@ -716,6 +750,12 @@ an apply-changes and a renumber run for `13dd02aa`.
   total emitted after every pool run. `classify_unordered_desc_lock_wait_ns`
   is the shared-receiver mutex's own cost only while
   `classify_unordered_desc_recv_wait_ns` stays near zero.
+- The encode-storage change (2026-11-01, the commit after `5789830e`)
+  removed the writer's `Framed` chunk: every pipelined frame is now one
+  owned buffer, so `writer_frame_ns` gains the header-and-body copy the
+  writer thread used to do inside `writer_write_ns`, and multi-extract's
+  region frames are counted as raw items where they were raw chunks.
+  Writer counters split across it compare only with that in mind.
 - `5bfa37ab` changed decode-buffer sizing and pool retention everywhere:
   peak anon of any pool command compares across it only with that in mind.
 - Exit codes: `854f9465` split them (1 an answer, 2 a failure; before, both
@@ -821,10 +861,14 @@ What a session picking this up needs that is not written elsewhere:
 
 ## Facts learned the hard way
 
-- `BlockBuilder` holds `Rc<str>` and is not `Send`; the ordered pool builds
-  per-worker local state on the worker's own thread for this. A fresh
-  `BlockBuilder` per blob in cat `--clean`, time-filter and getparents is
-  deliberate and measured.
+- **The two-arena penalty was the string table** (2026-11-01): the block
+  string table's `Rc<str>` per unique string, freed in bulk at every block
+  end, carried about nine tenths of what `MALLOC_ARENA_MAX=2` cost the
+  re-encoding commands; per-blob buffers carried the rest. The earlier
+  claim here that a fresh `BlockBuilder` per blob was "deliberate and
+  measured" had no measurement behind it. Workers that re-encode every blob
+  now keep one builder for the run; getparents still builds one per hit
+  blob, because a query hits few blobs.
 - **glibc realloc** (`research/glibc/malloc/malloc.c`): an mmapped chunk
   grows by `mremap`; an arena chunk grows in place or moves. Freeing an
   mmapped chunk raises the process-wide `mmap_threshold` to its size (32 MiB

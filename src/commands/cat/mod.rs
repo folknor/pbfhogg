@@ -21,7 +21,6 @@ use super::{Result, flush_local};
 use crate::error::Error;
 use crate::read::frame::Frames;
 use crate::read::input::{InputSource, PinnedInput};
-use crate::writer::frame_blob_pipelined;
 
 /// Which metadata attributes to strip via `--clean`.
 #[derive(Clone, Copy, Default)]
@@ -805,7 +804,7 @@ fn cat_type_passthrough(
 fn process_block(
     block: &crate::PrimitiveBlock,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut impl super::BlockSink,
     tf: &TypeFilter,
     clean: &CleanAttrs,
     refs_buf: &mut Vec<i64>,
@@ -1033,44 +1032,31 @@ fn run_filtered_pass(
     let mut total_elements: u64 = 0;
     let mut phase = KindPhase::default();
 
-    // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
-    // Vec/HashMap initialisers; no heap reservation until elements are
-    // added), as before the worker state could hold a non-Send one: keeping
-    // one per worker would change what each worker retains between blobs. A
-    // failed blob ends the pool, located with its input and ordinal.
+    // Each worker keeps one BlockBuilder and its refs scratch across blobs
+    // (built on the worker's own thread, so the builder need not be Send),
+    // and frames every block as it fills, straight from the builder's
+    // buffer: no builder is preallocated per blob and no encode buffer
+    // changes hands. A failed blob ends the pool, located with its input and
+    // ordinal.
     let pass = crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,
         None,
         std::num::NonZeroUsize::new(crate::tunables::POOL_REORDER_CAPACITY_WIDE),
-        || (),
-        |block, _state| -> PassResult {
-            let mut bb = BlockBuilder::new();
-            let mut refs_buf: Vec<i64> = Vec::new();
-            let mut output: Vec<OwnedBlock> = Vec::new();
-            let count = process_block(block, &mut bb, &mut output, &tf, clean, &mut refs_buf)?;
-            flush_local(&mut bb, &mut output)?;
-
-            let mut framed: Vec<(ElementKind, Vec<u8>)> = Vec::with_capacity(output.len());
-            for OwnedBlock {
-                bytes: block_bytes,
-                index,
-                tagdata,
-                way_members,
-            } in output
-            {
-                let indexdata = index.serialize();
-                let blob = frame_blob_pipelined(
-                    &block_bytes,
-                    &compression,
-                    Some(indexdata.as_slice()),
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                    &host.invocation.metrics().writer,
-                )?;
-                framed.push((index.kind, blob.into_vec()));
-            }
-            Ok((framed, count))
+        || {
+            (
+                super::WorkerBuilder::new(BlockBuilder::new()),
+                Vec::<i64>::new(),
+            )
+        },
+        |block, (worker, refs_buf)| -> PassResult {
+            let bb = worker.task()?;
+            let mut output =
+                super::FramedBlocks::new(compression, &host.invocation.metrics().writer);
+            let count = process_block(block, bb, &mut output, &tf, clean, refs_buf)?;
+            flush_local(bb, &mut output)?;
+            super::release_scratch(refs_buf);
+            Ok((output.frames, count))
         },
         |_position, (framed, count)| {
             // Called in schedule order; a write error ends the pass at once.

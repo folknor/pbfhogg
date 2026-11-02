@@ -24,7 +24,8 @@ real data and its writer fixed. Multi-region extract admits its descriptors.
 The planet regressions found by the RAM pass below are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
-(apply-changes). The release itself still needs WRK-001 and WRK-003 to WRK-005.
+(apply-changes). The release itself still needs WRK-001, WRK-003 to WRK-005 and the
+maintainer's ruling in WRK-137.
 
 ---
 
@@ -82,6 +83,27 @@ actually gives, not an assumption:
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
   should give `check-index = "violations"`. Confirm each with one run first;
   brokkr#71 notes `--unsort` breaks ID order only on large enough inputs.
+
+### WRK-137: Maintainer ruling on inspect tags' key-only rows
+
+A decision for the maintainer before 0.6.0. osmium's `tags-count`
+(`research/osmium-tool/src/command_tags_count.cpp`) counts the key alone
+when an expression has no value matcher (`add_matcher` routes it to
+`m_keys_filter`), and with no expression at all it sets
+`m_keys_filter = osmium::TagsFilter{true}` and lists keys. pbfhogg's
+`inspect tags` always counts key=value pairs, three tab-separated fields
+per row: `inspect tags highway` prints one row per `highway` value where
+osmium prints one `highway` row.
+
+The docs now describe today's behaviour as a deliberate deviation
+(DEVIATIONS.md "inspect tags always counts key=value pairs", both
+osmium-parity pages), written 2026-11-02 without a ruling. Either confirm
+it, and this entry goes, or adopt osmium's key-only rows: a CLI output
+change (key-only rows need their own row shape, a two-field row or an
+empty value), a CHANGELOG entry, and those three doc passages rewritten.
+The counting engine (the sharded table landed in `befcab8e`) counts per
+key=value text; key-only rows would need a per-key tally beside it or a
+fold of each key's rows at output.
 
 ---
 
@@ -310,21 +332,6 @@ ledger does not bound pages glibc retains. apply-changes now bounds outstanding 
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-130: apply-changes -l refresh probe re-stores the diff's nodes in a hash map
-
-Under `--locations-on-ways`, `StaleProbe` (`apply_changes/refresh.rs`)
-holds every node the OSC upserts or deletes in an `FxHashMap<i64,
-ProbeEntry>` behind a Bloom filter: 100.1 MB at planet seq 4913
-(`merge_loc_refresh_probe_bytes`, bygg, 2026-11-02), for the whole run.
-`SortedDiff` already holds the same IDs sorted, with each upsert's record
-(and so its coordinates) one offset away. The Bloom filter turns away about
-all of the probes (about one way ref in ten thousand names a diff node), so
-a binary search over the sorted node lists behind the same filter may cost
-nothing measurable and would leave only the filter words, a few MB. The
-probe is random access from base way refs, so it is a lookup, not a merge;
-measure the hit path at planet before choosing. `NodeLocationIndex`'s
-`needed_set` and `locations` are separate and needed past setup.
-
 ### WRK-116: getid --add-referenced follows way refs only
 
 `getid --add-referenced` pulls in the nodes of requested ways and nothing
@@ -360,26 +367,6 @@ holds more distinct node pairs, and brokkr's cells print 0. Either word the
 line as rows printed or report the distinct-pair count, which the library
 does not return today (`tags_count_distinct_pairs` is a sidecar counter
 only). `cli/tests/cli_quiet.rs` asserts the line's wording.
-
-### WRK-133: osmium-parity docs miss inspect tags' counting difference
-
-With no expression osmium `tags-count` counts keys alone
-(`research/osmium-tool/src/command_tags_count.cpp`, `m_keys_filter =
-osmium::TagsFilter{true}`), and a key-only expression counts its key, not
-its key=value pairs; pbfhogg always counts key=value pairs and prints three
-fields per row. `docs/cli/osmium-parity.md` and
-`reference/osmium-parity.md` ("tags-count is now `inspect tags`") list
-only flag renames; DEVIATIONS.md records only the type-prefix difference.
-Record the counting difference (and the row escaping) or adopt osmium's
-key-only rows.
-
-### WRK-134: reference/performance.md planet table keeps a dead inspect --extended row
-
-The plantasjen planet table prints `inspect --extended` at 820.7 s
-(`19db1512`). Since the extended scan moved onto a validator projection it
-runs in about 27 s (reference/performance.md "Inspect --extended:
-validator-projection scan"; CHANGELOG says 27 s). Retire the row or point it
-at that section, as the `inspect --tags` row now points at its successor.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 

@@ -665,6 +665,20 @@ osmium. The pbfhogg parser is shared from `src/tag_expr.rs` by
 `src/commands/tags_count/mod.rs`; the behavior is described in the CLI
 reference.
 
+**`inspect tags` always counts key=value pairs.** Osmium's `tags-count`
+keeps two filters (`research/osmium-tool/src/command_tags_count.cpp`):
+`add_matcher` sends an expression with a value matcher to the tag filter,
+which counts key=value pairs, and a key-only expression to the key filter,
+which counts the key alone; with no expression at all it sets the key
+filter to match everything, so a bare `osmium tags-count` lists keys, not
+pairs. pbfhogg counts the key=value pairs the expression selects in every
+case, so a bare `inspect tags` lists every pair and `inspect tags highway`
+lists each `highway=*` value with its count where osmium prints one
+`highway` row. Each pbfhogg row is three tab-separated fields (count, key,
+value, the text fields quoted and escaped as the CLI reference describes),
+so osmium's key-only rows have no equivalent output here; summing a key's
+rows gives osmium's count.
+
 **An empty key is an error, not an empty-string match.** `get_string_matcher`
 returns `equal{""}` for an empty key, so osmium accepts `=value` and matches
 tags whose key is the empty string. pbfhogg rejects `=value` and `!=value` with

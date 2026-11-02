@@ -50,8 +50,9 @@
 //! - the rewrite's surviving-base-way writer (`element_writes.rs`), which
 //!   writes the refreshed coordinates through [`refreshed_locations`].
 
+use std::sync::Arc;
+
 use protohoggr::{encode_varint, zigzag_decode_64, zigzag_encode_64};
-use rustc_hash::FxHashMap;
 
 use crate::error::{Result, new_wire_error};
 use crate::osc::sorted::SortedDiff;
@@ -66,94 +67,144 @@ pub(super) enum ProbeEntry {
     Deleted,
 }
 
-/// Every node the OSC creates, modifies or deletes, with a small Bloom
-/// prefilter in front of the map: on real daily diffs about one way ref in
-/// ten thousand names such a node, so almost every probe is a miss.
+/// Every node the OSC creates, modifies or deletes: a Bloom filter over the
+/// node IDs in front of the run's [`SortedDiff`], which already holds them
+/// sorted with each upsert's record. On real daily diffs about one way ref
+/// in ten thousand names such a node, so almost every probe is a miss that
+/// the filter alone answers.
 ///
-/// The filter is blocked: both bits of a key live in one 64-bit word, so a
-/// probe costs one memory access. At 16 bits per key its false-positive rate
-/// is about 1.5%, and a false positive costs one map lookup.
+/// The probe is random access (one lookup per ref of a way, refs in no ID
+/// order), so an admitted ID is found by binary search, not by a cursor.
+/// The filter is blocked: the four bits of a key live in one 64-bit word, so
+/// a miss costs one memory access. At the default bits per key
+/// (`APPLY_CHANGES_REFRESH_FILTER_BITS_PER_KEY`) about 0.35 % of absent IDs
+/// pass it, and each costs a search of the upserts and then the deletes.
+///
+/// A separate hash map of the same nodes was dropped: at a planet daily
+/// diff it was 92 MB beside the 29 MB of sorted IDs the diff holds anyway,
+/// and the searches that replaced it measured within noise
+/// (reference/performance.md, "Inline-location refresh"). One filter, not
+/// one per list: a second filter word on every ref would cost the hot miss
+/// path more than the delete searches it saves.
 pub(super) struct StaleProbe {
+    /// `None` when the OSC carries no node, or without
+    /// `--locations-on-ways`: every lookup is a miss without touching memory.
+    nodes: Option<ProbeNodes>,
+}
+
+struct ProbeNodes {
+    diff: Arc<SortedDiff>,
     words: Vec<u64>,
     /// `64 - log2(words.len())`: the hash's top bits pick the word.
     shift: u32,
-    map: FxHashMap<i64, ProbeEntry>,
-    /// Entries that are [`ProbeEntry::Upserted`].
-    upserts: usize,
+    /// Where the positive IDs start in `upserts(Node)` and `deleted(Node)`.
+    /// OSM order puts 0 and the negatives first, so the positive suffix is
+    /// numerically sorted and is searched with plain integer comparisons.
+    upserts_positive: usize,
+    deleted_positive: usize,
 }
 
-/// Bits of filter per probe key.
-const FILTER_BITS_PER_KEY: usize = 16;
+const NODE: crate::ElementKind = crate::ElementKind::Node;
 
 #[inline]
 fn probe_hash(id: i64) -> u64 {
     id.cast_unsigned().wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-impl StaleProbe {
-    /// Build from the parsed OSC. The overlay holds one final state per node
-    /// (an upsert removes a delete and the reverse), so an ID is either
-    /// upserted or deleted, never both.
-    pub(super) fn from_diff(diff: &SortedDiff) -> Self {
-        let upserts = diff.upserts(crate::ElementKind::Node);
-        let deleted = diff.deleted(crate::ElementKind::Node);
-        let mut map: FxHashMap<i64, ProbeEntry> =
-            FxHashMap::with_capacity_and_hasher(upserts.len() + deleted.len(), Default::default());
-        for (i, &id) in upserts.iter().enumerate() {
-            let node = diff.node(i);
-            map.insert(
-                id,
-                ProbeEntry::Upserted(node.decimicro_lat(), node.decimicro_lon()),
-            );
-        }
-        for &id in deleted {
-            map.insert(id, ProbeEntry::Deleted);
-        }
-        Self::from_map(map)
+/// The position of `id` in `ids`, sorted by `osm_id_cmp` with its positive
+/// IDs starting at `positive`.
+#[inline]
+fn find(ids: &[i64], positive: usize, id: i64) -> Option<usize> {
+    if id > 0 {
+        ids[positive..]
+            .binary_search(&id)
+            .ok()
+            .map(|i| i + positive)
+    } else {
+        ids[..positive]
+            .binary_search_by(|&x| crate::osm_id::osm_id_cmp(x, id))
+            .ok()
     }
+}
 
-    /// A probe that matches nothing, for runs without `--locations-on-ways`.
-    pub(super) fn empty() -> Self {
-        Self::from_map(FxHashMap::default())
-    }
-
-    fn from_map(map: FxHashMap<i64, ProbeEntry>) -> Self {
-        let bits = (map.len() * FILTER_BITS_PER_KEY)
+impl ProbeNodes {
+    fn new(diff: &Arc<SortedDiff>) -> Self {
+        let upserts = diff.upserts(NODE);
+        let deleted = diff.deleted(NODE);
+        let keys = upserts.len() + deleted.len();
+        let bits = (keys * crate::tunables::APPLY_CHANGES_REFRESH_FILTER_BITS_PER_KEY)
             .next_power_of_two()
             .max(128);
         let words_len = bits / 64;
-        let shift = 64 - words_len.trailing_zeros();
-        let upserts = map
-            .values()
-            .filter(|e| matches!(e, ProbeEntry::Upserted(..)))
-            .count();
-        let mut probe = Self {
+        let mut nodes = Self {
             words: vec![0; words_len],
-            shift,
-            map,
-            upserts,
+            shift: 64 - words_len.trailing_zeros(),
+            upserts_positive: upserts.partition_point(|&id| id <= 0),
+            deleted_positive: deleted.partition_point(|&id| id <= 0),
+            diff: Arc::clone(diff),
         };
-        let keys: Vec<i64> = probe.map.keys().copied().collect();
-        for id in keys {
-            let (word, mask) = probe.slot(id);
-            probe.words[word] |= mask;
+        for &id in upserts.iter().chain(deleted) {
+            let (word, mask) = nodes.slot(id);
+            nodes.words[word] |= mask;
         }
-        probe
+        nodes
     }
 
+    /// The word and the four bits of `id`. The word comes from the hash's
+    /// top bits and the bit positions from bits 8 to 31, which do not
+    /// overlap while the filter has at most 2^32 words.
     #[inline]
     fn slot(&self, id: i64) -> (usize, u64) {
         let h = probe_hash(id);
         #[allow(clippy::cast_possible_truncation)]
         let word = (h >> self.shift) as usize;
-        let mask = (1u64 << ((h >> 20) & 63)) | (1u64 << ((h >> 26) & 63));
+        let mask = (1u64 << ((h >> 8) & 63))
+            | (1u64 << ((h >> 14) & 63))
+            | (1u64 << ((h >> 20) & 63))
+            | (1u64 << ((h >> 26) & 63));
         (word, mask)
+    }
+
+    #[inline]
+    fn admits(&self, id: i64) -> bool {
+        let (word, mask) = self.slot(id);
+        self.words[word] & mask == mask
+    }
+
+    /// The exact answer for an ID the filter admitted. The diff holds one
+    /// final state per node (an upsert removes a delete and the reverse), so
+    /// an ID found among the upserts is not among the deletes.
+    #[inline]
+    fn lookup(&self, id: i64) -> Option<ProbeEntry> {
+        if let Some(i) = find(self.diff.upserts(NODE), self.upserts_positive, id) {
+            let node = self.diff.node(i);
+            return Some(ProbeEntry::Upserted(
+                node.decimicro_lat(),
+                node.decimicro_lon(),
+            ));
+        }
+        find(self.diff.deleted(NODE), self.deleted_positive, id).map(|_| ProbeEntry::Deleted)
+    }
+}
+
+impl StaleProbe {
+    /// Build over the parsed OSC's nodes; the probe shares `diff`.
+    pub(super) fn from_diff(diff: &Arc<SortedDiff>) -> Self {
+        let any = !diff.upserts(NODE).is_empty() || !diff.deleted(NODE).is_empty();
+        Self {
+            nodes: any.then(|| ProbeNodes::new(diff)),
+        }
+    }
+
+    /// A probe that matches nothing, for runs without `--locations-on-ways`.
+    pub(super) fn empty() -> Self {
+        Self { nodes: None }
     }
 
     /// True when the OSC creates, modifies or deletes no node: no ref can hit
     /// the probe, so evaluating a way finds nothing.
     pub(super) fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.nodes.is_none()
     }
 
     /// True when the OSC creates or modifies some node, so a way can be
@@ -161,32 +212,35 @@ impl StaleProbe {
     /// cause a rewrite, so way blobs are not searched for them: the
     /// deleted-node diagnostic then covers only blobs rewritten anyway.
     pub(super) fn has_upserts(&self) -> bool {
-        self.upserts > 0
+        self.nodes
+            .as_ref()
+            .is_some_and(|n| !n.diff.upserts(NODE).is_empty())
     }
 
-    /// Heap bytes held by the filter and the map (capacity, one control byte
-    /// per bucket), an estimate like `CompactDiffOverlay::heap_size_estimate`.
+    /// Heap bytes the probe holds of its own: the filter. The sorted node
+    /// lists it searches belong to the diff and are counted there
+    /// (`merge_diff_heap_bytes`).
     pub(super) fn heap_bytes(&self) -> usize {
-        self.words.capacity() * std::mem::size_of::<u64>()
-            + self.map.capacity() * (std::mem::size_of::<(i64, ProbeEntry)>() + 1)
+        self.nodes
+            .as_ref()
+            .map_or(0, |n| n.words.capacity() * std::mem::size_of::<u64>())
     }
 
     /// Whether the Bloom filter alone admits `id` (test-only view of the
     /// prefilter the lookup consults first).
     #[cfg(test)]
     fn filter_admits(&self, id: i64) -> bool {
-        let (word, mask) = self.slot(id);
-        self.words[word] & mask == mask
+        self.nodes.as_ref().is_some_and(|n| n.admits(id))
     }
 
     /// What the OSC says about node `id`, if anything.
     #[inline]
     pub(super) fn get(&self, id: i64) -> Option<ProbeEntry> {
-        let (word, mask) = self.slot(id);
-        if self.words[word] & mask != mask {
+        let nodes = self.nodes.as_ref()?;
+        if !nodes.admits(id) {
             return None;
         }
-        self.map.get(&id).copied()
+        nodes.lookup(id)
     }
 }
 
@@ -551,14 +605,34 @@ mod tests {
         out
     }
 
+    /// A probe over a diff holding exactly `entries`, each ID once.
     fn probe(entries: &[(i64, ProbeEntry)]) -> StaleProbe {
-        StaleProbe::from_map(entries.iter().copied().collect())
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for &(id, entry) in entries {
+            match entry {
+                ProbeEntry::Upserted(lat, lon) => upserts.push((id, lat, lon)),
+                ProbeEntry::Deleted => deletes.push(id),
+            }
+        }
+        StaleProbe::from_diff(&Arc::new(SortedDiff::of_nodes(&upserts, &deletes)))
     }
 
     #[test]
     fn probe_filter_admits_every_key_and_rejects_most_absent_ones() {
-        let entries: Vec<(i64, ProbeEntry)> = (0..5000)
-            .map(|i| (i * 7919, ProbeEntry::Upserted(1, 2)))
+        // Clustered runs of consecutive IDs, as real node IDs are, with
+        // every fifth key a delete.
+        let entries: Vec<(i64, ProbeEntry)> = (0..20_000i64)
+            .map(|i| {
+                let id = (i / 100) * 1_000_003 + i % 100;
+                let entry = if i % 5 == 0 {
+                    ProbeEntry::Deleted
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    ProbeEntry::Upserted(i as i32, -(i as i32))
+                };
+                (id, entry)
+            })
             .collect();
         let p = probe(&entries);
         for &(id, entry) in &entries {
@@ -566,20 +640,62 @@ mod tests {
             assert_eq!(p.get(id), Some(entry));
         }
         // The filter itself, not the exact lookup behind it, turns away
-        // nearly every absent ID: about 1.5% at 16 bits per key.
-        let absent = (1..20_000).map(|i| i * 7919 + 1);
+        // nearly every absent ID: about 0.35 % at 16 bits and four bits per
+        // key; absent IDs both inside the clusters' gaps and far from them.
+        let absent = (0..200_000i64).map(|i| (i / 100) * 1_000_003 + 100 + i % 100 * 7);
         let admitted = absent.clone().filter(|&id| p.filter_admits(id)).count();
         assert!(
-            admitted < 20_000 / 20,
-            "{admitted} of 20000 absent IDs admitted"
+            admitted < 200_000 / 100,
+            "{admitted} of 200000 absent IDs admitted"
         );
         assert!(absent.into_iter().all(|id| p.get(id).is_none()));
 
         assert!(probe(&[]).is_empty());
         assert_eq!(probe(&[]).get(5), None);
+        assert_eq!(StaleProbe::empty().get(5), None);
+        assert_eq!(StaleProbe::empty().heap_bytes(), 0);
         let deletes = probe(&[(5, ProbeEntry::Deleted)]);
         assert!(!deletes.is_empty() && !deletes.has_upserts());
+        assert_eq!(deletes.get(5), Some(ProbeEntry::Deleted));
         assert!(p.has_upserts());
+    }
+
+    /// The exact lookup behind the filter finds IDs of every sign, the
+    /// extremes included, in lists whose positive suffix starts past zero,
+    /// and an ID absent from the upserts still finds its delete.
+    #[test]
+    fn probe_finds_every_sign_and_falls_through_to_deletes() {
+        let entries = [
+            (0, ProbeEntry::Upserted(1, 1)),
+            (-1, ProbeEntry::Deleted),
+            (-2, ProbeEntry::Upserted(i32::MIN, i32::MAX)),
+            (i64::MIN, ProbeEntry::Upserted(3, 3)),
+            (-7, ProbeEntry::Deleted),
+            (i64::MIN + 1, ProbeEntry::Deleted),
+            (4, ProbeEntry::Upserted(4, -4)),
+            (9, ProbeEntry::Deleted),
+            (i64::MAX, ProbeEntry::Upserted(-5, 5)),
+            (i64::MAX - 1, ProbeEntry::Deleted),
+        ];
+        let p = probe(&entries);
+        for &(id, entry) in &entries {
+            assert_eq!(p.get(id), Some(entry), "id {id}");
+        }
+        for id in [-3, -6, 1, 5, 8, 10, i64::MAX - 2, i64::MIN + 2] {
+            assert_eq!(p.get(id), None, "id {id}");
+        }
+        assert!(p.has_upserts());
+    }
+
+    /// The final state of each node decides: a delete then a create is an
+    /// upsert, an upsert then a delete is a delete.
+    #[test]
+    fn probe_reads_the_final_state_of_each_node() {
+        let diff =
+            SortedDiff::of_changes(&[(3, Some((1, 1))), (3, None), (6, None), (6, Some((2, 2)))]);
+        let p = StaleProbe::from_diff(&Arc::new(diff));
+        assert_eq!(p.get(3), Some(ProbeEntry::Deleted));
+        assert_eq!(p.get(6), Some(ProbeEntry::Upserted(2, 2)));
     }
 
     fn varint(v: u64, out: &mut Vec<u8>) {

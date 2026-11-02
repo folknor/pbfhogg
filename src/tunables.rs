@@ -504,6 +504,15 @@ pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 /// 32-thread executor busy through a batch.
 pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: usize = 64;
 
+/// Filter bits per OSC node in the `--locations-on-ways` refresh probe
+/// (`apply_changes/refresh.rs`), before rounding up to a power of two. The
+/// filter is the only state the probe holds beside the sorted diff, and it is
+/// consulted for every ref of every searched way, so it trades its size
+/// against the exact searches its false positives cost: at 16 bits and four
+/// bits per key in one word, about 0.35 % of absent IDs pass (8 MB at a
+/// planet daily diff).
+pub(crate) const APPLY_CHANGES_REFRESH_FILTER_BITS_PER_KEY: usize = 16;
+
 /// Drain `recv_timeout`: how long the drain blocks on an empty item channel
 /// before checking the producer failure slot and the cancellation token.
 /// The node boundary arrives on the item channel itself, so no polling is

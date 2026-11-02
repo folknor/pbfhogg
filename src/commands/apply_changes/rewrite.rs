@@ -347,8 +347,9 @@ pub(crate) fn merge_to<'a>(
         (None, None, (0, 0, 0))
     };
     // The refresh probe for surviving base ways (`refresh.rs`): every node
-    // the OSC upserts or deletes, kept apart from the coordinate map
-    // published at the barrier, whose size `loc_missing` is computed from.
+    // the OSC upserts or deletes, a filter over the diff's sorted node
+    // lists, kept apart from the coordinate map published at the barrier,
+    // whose size `loc_missing` is computed from.
     let probe = Arc::new(if locations_on_ways {
         StaleProbe::from_diff(&diff)
     } else {

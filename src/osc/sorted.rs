@@ -11,6 +11,9 @@
 //! turns the overlay into that order and drops the rest: per kind a sorted
 //! ID vector with a parallel vector of arena offsets, and a sorted vector of
 //! the deleted IDs, beside the unchanged arenas and the interned strings.
+//! The one random-order reader, the `--locations-on-ways` refresh probe,
+//! looks node IDs up in the same lists by binary search behind its own
+//! filter, so it holds no copy of them either.
 //!
 //! At planet (daily diff seq 4913, bygg) the parse-time lookups were about
 //! 120 MB (hash indexes 89.7 MB, deleted sets 10.0 MB, floors 19.0 MB, the
@@ -221,6 +224,37 @@ impl SortedDiff {
     /// superseded and deleted ones included, so not the surviving payload.
     pub(crate) fn arena_len_bytes(&self) -> usize {
         self.nodes.arena.len() + self.ways.arena.len() + self.relations.arena.len()
+    }
+}
+
+#[cfg(test)]
+impl SortedDiff {
+    /// A diff of node changes only, applied in order through the overlay's
+    /// own push and delete paths: `Some((lat, lon))` creates or modifies the
+    /// node with those decimicrodegrees (any `i32`, unchecked), `None`
+    /// deletes it. No change carries a version.
+    pub(crate) fn of_changes(changes: &[(i64, Option<(i32, i32)>)]) -> Self {
+        let meta = super::compact::ArenaMeta::default();
+        let mut overlay = super::CompactDiffOverlay::new();
+        for &(id, change) in changes {
+            match change {
+                Some((lat, lon)) => overlay.push_node(id, lat, lon, &[], &meta),
+                None => overlay.delete_node(id, &meta),
+            }
+            .expect("versionless node change");
+        }
+        overlay.into_sorted()
+    }
+
+    /// A diff upserting `upserts` (`(id, lat, lon)`) and deleting `deleted`,
+    /// which must not share an ID.
+    pub(crate) fn of_nodes(upserts: &[(i64, i32, i32)], deleted: &[i64]) -> Self {
+        let changes: Vec<(i64, Option<(i32, i32)>)> = upserts
+            .iter()
+            .map(|&(id, lat, lon)| (id, Some((lat, lon))))
+            .chain(deleted.iter().map(|&id| (id, None)))
+            .collect();
+        Self::of_changes(&changes)
     }
 }
 

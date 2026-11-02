@@ -345,8 +345,42 @@ about 6 s (126.5 s against 120.5 s) and the node phase shrinks by about
 244,817 refs in 58,701 ways (the read-only measurement predicted exactly
 that), searched 505 way blobs and rewrote 163 only for the refresh; on
 this base most way blobs are already rewritten for merge work.
-`loc_missing` 0. The refresh probe is 100 MB
+`loc_missing` 0. The refresh probe was 100 MB
 (`merge_loc_refresh_probe_bytes`), about the peak-anon difference.
+
+**The probe without its hash map (bygg, 2026-11-02).** That 100,139,008
+bytes was a 91.75 MB `FxHashMap` of the 3,587,829 node upserts and deletes
+(3,670,016 buckets of 25 bytes) behind an 8.39 MB filter, a copy of IDs
+`SortedDiff` already holds sorted. The probe is now the filter alone over
+the diff's node lists: an ID the filter admits is found by binary search in
+the upserts, then the deletes, and an upsert's coordinates are read from its
+record. The filter keeps its size (16 bits per key, rounded to a power of
+two) and sets four bits per key in its one word instead of two, which takes
+the modelled false-positive rate from about 1.3 % to about 0.35 % at this
+load, so about 44 M rather than 160 M of the about 12.4 B way-ref probes
+reach an exact search. `merge_loc_refresh_probe_bytes` is 8,388,608.
+
+Planet `altw-keep-untagged` (seq 4912) + OSC 4913, `--locations-on-ways`,
+interleaved `--bench 1` after `sudo fstrim -av`, both arms main-tree
+builds, base `b7956e2c` and the variant that commit plus the change, swapped
+by checkout. Rewrite is `merge_streaming_rewrite_ns` in core-seconds; setup
+anon is the peak through `CLI_COMMAND_START`, which ends after the probe is
+built.
+
+| cell | wall | peak anon | setup anon | rewrite | UUID |
+|---|---:|---:|---:|---:|---|
+| variant | 260.0 s | 3,299 MB | 625 MB | 1,273 | unstored |
+| base | 259.8 s | 3,324 MB | 727 MB | 1,252 | `72329201` |
+| base | 259.4 s | 3,357 MB | 754 MB | 1,262 | `213ac489` |
+| variant | 260.8 s | 3,213 MB | 687 MB | 1,267 | unstored |
+
+Walls agree within 0.5 %, and the way phase (the segment ending at
+`MERGE_SCANNER_BARRIER_WAIT_END`) is 113.0 s and 113.6 s against 112.9 s and
+112.8 s; rewrite core-seconds are about 1 % higher, the searches the map's
+lookups became. Setup anon falls by about 85 MB, the map less the run-to-run
+spread; peak anon stays inside the pbfhogg#42 burst's variance. Refresh
+counters are identical in all four cells (244,817 refs in 58,701 ways, 505
+way blobs searched, 163 rewritten only for the refresh).
 
 Plain merge (no `--locations-on-ways`, europe indexed + OSC 4715), the
 same interleaving: `8f8ef92a` 52.5 s and 25.0 s, `81f3fbe4` 50.7 s and
@@ -749,7 +783,7 @@ suite; the rest still carry their older commit in the Notes column.
 | inspect --tags --type node | `--bench 1` | 71.3 s | `047ac2f9` | |
 | inspect --tags --type way | `--bench 1` | 82.9 s | `959bda7c` | |
 | inspect --tags --type relation | `--bench 1` | 8.8 s | `8daf5f04` | |
-| inspect --extended | `--bench 1` | **820.7 s (13m41s)** | `19db1512` | full decode + extended counters |
+| inspect --extended | `--bench 1` | **820.7 s (13m41s)** | `19db1512` | full-decode era; superseded on bygg by "Inspect --extended: validator-projection scan" below |
 | sort (already-sorted input) | `--bench 1` | **147.0 s** | `e278faff` | commit `dcc445e`, 2026-07-14; was 132.3 s `b9c10a41` (`16e3694`). Regression flag CLOSED - see below |
 | sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` (`16e3694`) | **not re-pinned**: host `RLIMIT_MEMLOCK` soft limit is 8 MB, io_uring preflight needs >= 16 MB. Raise via `/etc/security/limits.conf` and re-queue |
 | tags-filter -R | `--bench 1` | 51.8 s | `cf116a6b` | |

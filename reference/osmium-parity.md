@@ -165,6 +165,11 @@ per-command shorts are long-only here and refuse naming the long flag:
 `--add-self`, `renumber -s` is `--start-id`, `extract -c` is `--config`,
 `cat -c` is `--clean`, and `fileinfo -e` (pbfhogg `inspect`) is `--extended`.
 
+The rows differ too: pbfhogg always counts key=value pairs, where osmium
+counts the key alone for an expression without a value matcher and lists
+keys when given no expression (DEVIATIONS.md, "inspect tags always counts
+key=value pairs").
+
 ### tags-filter-osc is now `tags-filter --input-kind osc`
 
 pbfhogg auto-detects OSC vs PBF input by content sniffing and file extension,

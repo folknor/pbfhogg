@@ -33,8 +33,8 @@ pub(crate) struct OwnedBlock {
 }
 
 /// An encoded block lent from its [`BlockBuilder`]'s buffers: what
-/// [`BlockBuilder::take_encoded`] returns. Valid until the builder's next
-/// mutation.
+/// [`BlockBuilder::lend_encoded`] hands its caller, for the duration of that
+/// call.
 pub(crate) struct EncodedBlock<'a> {
     /// Serialized `PrimitiveBlock` bytes.
     pub bytes: &'a [u8],
@@ -204,7 +204,7 @@ pub struct BlockBuilder {
     packed_lon_scratch: Vec<u8>, // way location lon encoding (single-pass)
     info_scratch: Vec<u8>,   // Info sub-message body
 
-    // The block encode buffer. `take` and `take_encoded` lend it and keep it
+    // The block encode buffer. `take` and `lend_encoded` lend it and keep it
     // for the next block; `take_owned` moves it out, and the next block then
     // reserves `encode_reserve` up front instead of regrowing from empty.
     encode_buf: Vec<u8>,
@@ -1073,7 +1073,7 @@ impl BlockBuilder {
         };
 
         // All block types: direct wire-format encoding. The previous block's
-        // bytes (lent by `take` / `take_encoded`) are dead from here, so this
+        // bytes (lent by `take` / `lend_encoded`) are dead from here, so this
         // is where an outlier encode buffer is released - never in `reset`,
         // which runs before the caller reads the block it just encoded.
         if self.encode_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
@@ -1170,7 +1170,7 @@ impl BlockBuilder {
     /// (at most the retention limit), so a long-lived builder pays one
     /// allocation per owned block rather than regrowing from empty by
     /// doubling. A caller that frames on the encoding thread should use
-    /// [`take_encoded`](Self::take_encoded), which allocates nothing.
+    /// [`lend_encoded`](Self::lend_encoded), which allocates nothing.
     #[hotpath::measure]
     pub(crate) fn take_owned(&mut self) -> Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
@@ -1191,20 +1191,36 @@ impl BlockBuilder {
         }
     }
 
-    /// Serialize the current block and lend it, with its [`BlobIndex`] and
-    /// tagdata, from the builder's own buffers, which stay with the builder
-    /// for the next block. For callers that frame the block before touching
-    /// the builder again (a worker framing its own output), so no encode
-    /// buffer changes hands.
-    pub(crate) fn take_encoded(&mut self) -> Result<Option<EncodedBlock<'_>>> {
-        match self.encode_block()? {
-            Some(index) => Ok(Some(EncodedBlock {
-                bytes: &self.encode_buf,
-                index,
-                tagdata: self.last_tagdata.as_deref(),
-            })),
-            None => Ok(None),
+    /// Serialize the current block and lend it to `use_block`, with its
+    /// [`BlobIndex`] and tagdata, from the builder's own buffers, which stay
+    /// with the builder for the next block. For callers that frame the block
+    /// before touching the builder again (a worker framing its own output),
+    /// so no encode buffer changes hands. Returns `None`, without calling
+    /// `use_block`, when the block is empty.
+    ///
+    /// Once `use_block` has returned, an encode buffer grown past
+    /// `MAX_RETAINED_SCRATCH_CAPACITY` by this block is released, so a
+    /// builder kept for a run never sits on its last outlier block between
+    /// tasks (the lent bytes are dead by then; `take`, whose borrow outlives
+    /// the call, leaves that release to the next `encode_block`). It is not
+    /// released when `use_block` fails: the caller is then failing its run
+    /// and drops the builder.
+    pub(crate) fn lend_encoded<R>(
+        &mut self,
+        use_block: impl FnOnce(EncodedBlock<'_>) -> Result<R>,
+    ) -> Result<Option<R>> {
+        let Some(index) = self.encode_block()? else {
+            return Ok(None);
+        };
+        let used = use_block(EncodedBlock {
+            bytes: &self.encode_buf,
+            index,
+            tagdata: self.last_tagdata.as_deref(),
+        })?;
+        if self.encode_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            self.encode_buf = Vec::new();
         }
+        Ok(Some(used))
     }
 
     /// Encode DenseNodes directly to wire format into `encode_buf`.
@@ -1629,7 +1645,8 @@ mod tests {
 
     /// A builder kept across blocks (a worker's) lends the same bytes a
     /// fresh builder hands out owned, and does not pin an outlier block's
-    /// buffers: after a block above the retention limit, the next ordinary
+    /// buffers: a lent outlier's encode buffer is released when the lend
+    /// ends, and after a block above the retention limit the next ordinary
     /// block leaves every buffer it grew within the limit again. An owned
     /// take after an outlier reserves no more than the limit for the next
     /// block either.
@@ -1647,14 +1664,21 @@ mod tests {
 
         let mut kept = BlockBuilder::new();
         encode(&mut kept, &big);
-        assert!(kept.take_encoded().unwrap().is_some());
+        let lent_len = kept.lend_encoded(|lent| Ok(lent.bytes.len())).unwrap();
+        assert!(lent_len.is_some_and(|len| len > LIMIT));
+        assert!(
+            kept.encode_buf.capacity() <= LIMIT,
+            "a lent outlier is released once its borrower is done"
+        );
         encode(&mut kept, "small");
-        {
-            let lent = kept.take_encoded().unwrap().unwrap();
+        kept.lend_encoded(|lent| {
             assert_eq!(lent.bytes, owned.bytes.as_slice(), "same block bytes");
             assert_eq!(lent.tagdata, owned.tagdata.as_deref(), "same tagdata");
             assert_eq!(lent.index.count, owned.index.count);
-        }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
         assert!(
             kept.encode_buf.capacity() <= LIMIT,
             "outlier encode buffer released"

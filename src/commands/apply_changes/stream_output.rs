@@ -149,7 +149,7 @@ impl<'a> CreateEncoder<'a> {
 /// Encode the creates `ids` (at most one block's worth) into the empty
 /// builder `bb` and frame the block, returning the frame (`None` when no id
 /// had a record) and the number of elements added. The builder's poison, if
-/// an addition was refused, surfaces through `take_encoded`.
+/// an addition was refused, surfaces through `lend_encoded`.
 fn encode_and_frame(
     bb: &mut BlockBuilder,
     kind: ElementKind,
@@ -184,21 +184,20 @@ fn encode_and_frame(
             }
         }
     }
-    let Some(block) = bb.take_encoded()? else {
-        return Ok((None, added));
-    };
-    let indexdata = block.index.serialize();
-    // No WayMembers, as `take_owned` gives none: the same frame the writer's
-    // own framing job made of these blocks.
-    let frame = frame_blob_pipelined(
-        block.bytes,
-        compression,
-        Some(&indexdata),
-        block.tagdata,
-        None,
-        metrics,
-    )?;
-    Ok((Some(frame), added))
+    let frame = bb.lend_encoded(|block| {
+        let indexdata = block.index.serialize();
+        // No WayMembers, as `take_owned` gives none: the same frame the
+        // writer's own framing job made of these blocks.
+        frame_blob_pipelined(
+            block.bytes,
+            compression,
+            Some(&indexdata),
+            block.tagdata,
+            None,
+            metrics,
+        )
+    })?;
+    Ok((frame, added))
 }
 
 /// Flush remaining upserts for the previous element type during a type

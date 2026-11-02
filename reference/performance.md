@@ -1559,6 +1559,39 @@ that burst (queued and running seqs, frames past the writer's handoff,
 worker scratch) is not measured; the drain's reorder bytes, the one
 counter that sees part of it, stayed near zero.
 
+### apply-changes' rewrite workers frame from their builder (bygg, 2026-11-02, against `cbf48cc8`)
+
+The change cells ran as uncommitted edits on `cbf48cc8`; the change
+landed unaltered as the commit after it.
+
+The change: each rewrite worker frames every output block straight from
+its builder's buffer (`commands::FramedBlocks`, `BlockBuilder::lend_encoded`)
+instead of moving the encode buffer out (`take_owned`) and framing the
+owned copy, so one allocation and free of about a raw block per output
+block is gone; `lend_encoded` drops an encode buffer grown past the
+retention limit once the block is framed, for every lender. Output bytes
+are unchanged (same encoder, same frame arguments).
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, after `fstrim`. Both arms built in the main tree
+(the clean arm by checking out the changed paths); run order change,
+HEAD, HEAD, change, change, HEAD, HEAD, change:
+
+| arm | walls (s) | peak anon (MB) |
+|---|---|---|
+| `cbf48cc8` (`72569ba1`, `2e184e4e`, `aef81466`, `84a9c263`) | 101.3, 112.2, 99.2, 103.3 | 2,199, 2,560, 2,763, 2,678 |
+| change | 96.2, 96.2, 101.5, 100.7 | 2,167, 2,327, 2,686, 2,503 |
+
+Medians 102.3 against 98.5 s and about 2,620 against 2,415 MB, with the
+ranges overlapping and one adjacent pair reversed: within the noise this
+page names for the session's other buffer changes. Minor faults in the
+streaming phase run 0.33-0.48 M on the change against 0.42-0.55 M on
+`cbf48cc8`. `merge_streaming_frame_ns` (framing only, excluding the
+encode, on both arms) is unchanged at about 660 core-seconds. The change
+landed as a simplification, not for its numbers; the arenas' free heap
+was not instrumented, so how much of apply-changes' residual step these
+buffers fed is not attributed.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

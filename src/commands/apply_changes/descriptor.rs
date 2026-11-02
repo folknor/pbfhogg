@@ -175,7 +175,8 @@ pub(super) enum DrainItem {
     /// spike (P1.5 in the plan). Stats merge as before.
     Rewritten {
         seq: u64,
-        framed_chunks: Vec<Vec<u8>>,
+        /// Each output block's frame with the block's kind, in output order.
+        framed_chunks: Vec<(ElementKind, Vec<u8>)>,
         kind: ElementKind,
         /// The input blob's range, verified exact by the rewrite's walk (or
         /// derived from an unindexed payload), not the output blocks'.
@@ -358,7 +359,11 @@ impl DrainItem {
             }
             DrainItem::OwnedBytes { frame_bytes, .. } => DESCRIPTOR_OVERHEAD + frame_bytes.len(),
             DrainItem::Rewritten { framed_chunks, .. } => {
-                DESCRIPTOR_OVERHEAD + framed_chunks.iter().map(Vec::len).sum::<usize>()
+                DESCRIPTOR_OVERHEAD
+                    + framed_chunks
+                        .iter()
+                        .map(|(_, chunk)| chunk.len())
+                        .sum::<usize>()
             }
             DrainItem::Omitted { .. } => DESCRIPTOR_OVERHEAD,
         }

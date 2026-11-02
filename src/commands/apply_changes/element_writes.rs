@@ -1,16 +1,17 @@
 //! Element-write helpers shared between OSC-diff emission and base-PBF
-//! passthrough. The `*_local` helpers flush to a local `Vec<OwnedBlock>` for
-//! the workers' rewrite tasks; the `add_osc_*` encoders add one element and
-//! leave capacity to the caller, as the drain's create runs
-//! (`stream_output.rs`) size every block themselves.
+//! passthrough. The `*_local` helpers flush into the rewrite task's own
+//! [`FramedBlocks`], which frames each block on the worker as it completes;
+//! the `add_osc_*` encoders add one element and leave capacity to the
+//! caller, as the drain's create runs (`stream_output.rs`) size every block
+//! themselves.
 
 use crate::PrimitiveBlock;
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::owned::{dense_node_raw_metadata, element_raw_metadata};
 
 use crate::commands::{
-    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
-    flush_local,
+    FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local,
 };
 
 use super::Result;
@@ -23,7 +24,7 @@ use super::refresh::{CoordFraming, StaleProbe, evaluate_way, refreshed_locations
 
 // Callers own merge-stat accounting and select the capacity/flush operation.
 // Keep worker-local output and the drain's create runs separate: a local
-// flush returns OwnedBlocks to the ordered drain, whereas a create run cuts
+// flush frames a block of the rewrite task, whereas a create run cuts
 // its own blocks. A common sink must not move flush boundaries, pre-seeding
 // or stats across those owners. Share only the post-capacity element encoding.
 
@@ -78,7 +79,7 @@ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactR
 
 pub(super) fn write_base_dense_node_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
@@ -100,7 +101,7 @@ pub(super) fn write_base_dense_node_local(
 
 pub(super) fn write_base_node_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
@@ -226,7 +227,7 @@ fn output_info<'b>(
 
 pub(super) fn write_base_way_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,
@@ -259,7 +260,7 @@ pub(super) fn write_base_way_local(
 /// output block declares, since a raw copy would be read back rescaled.
 pub(super) fn write_base_way_local_with_locations(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,
@@ -337,7 +338,7 @@ pub(super) fn write_base_way_local_with_locations(
 /// Write an OSC way, with LocationsOnWays coordinates when `loc` requires them.
 pub(super) fn write_osc_way_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     way: &crate::osc::CompactWayRef<'_>,
     loc: LocMode<'_>,
 ) -> Result<()> {
@@ -349,7 +350,7 @@ pub(super) fn write_osc_way_local(
 
 pub(super) fn write_base_relation_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,

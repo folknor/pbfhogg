@@ -845,7 +845,9 @@ fn dispatch_variant(
             // them through `write_raw_owned` so the writer's
             // rayon-spawn-per-block path (and its
             // `pipeline_send_wait_ns` blowup) is bypassed entirely.
-            for chunk in framed_chunks {
+            // Each chunk's kind is its output block's; placement above and
+            // the cursor use the input blob's `kind` and `id_range`.
+            for (_, chunk) in framed_chunks {
                 rewrite_bytes += chunk.len() as u64;
                 writer.write_raw_owned(chunk)?;
                 counters

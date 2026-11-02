@@ -234,7 +234,9 @@ writer-bound to worker-bound: in one cell live rose 1.0 to 2.1 GB over
 another nothing. Its owners are unmeasured: queued and running seqs (the
 drain channel's items are invisible to the reorder counter), frames past
 the writer's handoff (which no longer hold a sequence token), worker
-scratch. Attribute them before choosing a fix; a byte budget on in-flight
+scratch (read and decode buffers; the rewrite's encode buffer no longer
+changes hands per block, reference/performance.md "apply-changes'
+rewrite workers frame from their builder"). Attribute them before choosing a fix; a byte budget on in-flight
 seqs (WRK-022) would not cover frames downstream of the handoff. The
 start-up ramp produced one such burst too (a cell peaked at t=15 s). The
 attribution used an uncommitted diagnostic: `crate::debug::emit_mallinfo2`
@@ -255,17 +257,30 @@ lengths are known once encoded), so the body could be written once into
 cost per node blob at planet first, since it may sit under the 2-3 %
 floor.
 
-### WRK-124: apply-changes still hands its framing an owned buffer
+### WRK-127: apply-changes' parallel create runs build a fresh builder per block
 
-apply-changes' streaming path (`src/commands/apply_changes/streaming.rs`)
-passes an owned block buffer to its framing closure instead of lending the
-encoded block (`BlockBuilder::take_encoded`), as cat `--clean`, repack,
-degrade and the time-filter snapshot path now do through their per-worker
-builders. Likely one allocation and free per output block (the encode
-buffer `take_owned` moves out, a block's raw size each). The worker arenas
-are where WRK-122's residual free memory sits, so measure the arenas' free
-heap with it, not only the wall; WRK-122's attribution did not reach
-these buffers.
+`CreateEncoder::emit` (`src/commands/apply_changes/stream_output.rs`)
+encodes a run longer than one block with `par_chunks(cap)` on the
+executor and makes a `BlockBuilder::new()` per chunk, so up to
+`APPLY_CHANGES_CREATE_BATCH_BLOCKS` fresh builders per batch, each
+preallocating its dense vectors for the element cap: the per-block
+fresh-builder shape the re-encoding commands' workers left. At planet it
+is about 300 blocks at the node-to-way transition, so the cost is bounded
+and one-time; whether it shows in the transition's live burst is not
+measured. A builder per executor thread (thread-local, or `map_init`)
+would follow the worker rule, if the measurement says it matters.
+
+### WRK-128: apply-changes' worker scratch does not follow the release rule
+
+`worker_loop` (`src/commands/apply_changes/streaming.rs`) keeps
+`read_buf`, the group scratch vectors, `node_groups_scratch`,
+`local_coords` and `RefreshScratch` for the run without
+`commands::release_scratch`, so each worker pins the largest blob or
+block it ever met in each. The ordered-pool workers release past
+`MAX_RETAINED_SCRATCH_CAPACITY` per task. At planet blob sizes (p99 about
+2.7 MB) the bound is small; an input with outlier blobs would hold 30
+outliers per buffer for the rest of the run. Apply the rule per
+candidate, or record why these differ.
 
 ### WRK-022: Byte-budgeted fused task engine
 

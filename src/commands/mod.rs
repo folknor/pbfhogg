@@ -106,7 +106,7 @@ impl BlockSink for Vec<OwnedBlock> {
 
 /// Blocks framed as they complete, on the worker that built them: each
 /// block is framed straight from the builder's buffer
-/// (`BlockBuilder::take_encoded`), so no encode buffer changes hands and a
+/// (`BlockBuilder::lend_encoded`), so no encode buffer changes hands and a
 /// task holds only compressed frames. The frames are written raw
 /// (`PbfWriter::write_raw_owned`), as the worker-framing commands always
 /// have.
@@ -117,6 +117,9 @@ pub(crate) struct FramedBlocks<'a> {
     keep_tagdata: bool,
     /// The frames so far, each with its block's kind, in flush order.
     pub(crate) frames: Vec<(crate::ElementKind, Vec<u8>)>,
+    /// Wall time spent framing the blocks (index serialisation, compression
+    /// and blob framing; not their encoding), for callers that report it.
+    pub(crate) frame_ns: u64,
 }
 
 impl<'a> FramedBlocks<'a> {
@@ -141,13 +144,15 @@ impl<'a> FramedBlocks<'a> {
             keep_indexdata,
             keep_tagdata,
             frames: Vec::new(),
+            frame_ns: 0,
         }
     }
 }
 
 impl BlockSink for FramedBlocks<'_> {
     fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
-        if let Some(block) = bb.take_encoded()? {
+        bb.lend_encoded(|block| {
+            let t_frame = crate::counters::Stopwatch::start();
             let indexdata = block.index.serialize();
             let frame = crate::writer::frame_blob_pipelined(
                 block.bytes,
@@ -162,18 +167,24 @@ impl BlockSink for FramedBlocks<'_> {
                 self.metrics,
             )?;
             self.frames.push((block.index.kind, frame));
-        }
+            self.frame_ns += t_frame.elapsed_ns();
+            Ok(())
+        })?;
         Ok(())
     }
 }
 
-/// A worker's long-lived block builder, kept across the tasks of an ordered
-/// pool as the worker's local state (built on the worker's own thread, so
-/// the builder need not be `Send`): its buffers stay warm from one input
-/// blob to the next instead of being preallocated and regrown per blob.
-/// Every builder buffer above the retention limit is released at each block
-/// (see `BlockBuilder::release_outliers`), so the worker keeps a fixed bound,
-/// not the union of every outlier it met.
+/// A worker's long-lived block builder, kept across the tasks of a worker
+/// pool (an ordered pool's worker state, or apply-changes' rewrite workers)
+/// as the worker's local state, built on the worker's own thread, so the
+/// builder need not be `Send`: its buffers stay warm from one input blob to
+/// the next instead of being preallocated and regrown per blob. Every
+/// builder scratch buffer above the retention limit is released at each
+/// block, and the encode buffer once a lent block has been framed (see
+/// `BlockBuilder::release_outliers` and `BlockBuilder::lend_encoded`), so
+/// the worker keeps a fixed bound, not the union of every outlier it met.
+/// The last block's tag-key index is the one thing kept until the next
+/// block replaces it.
 pub(crate) struct WorkerBuilder {
     bb: BlockBuilder,
 }
@@ -185,9 +196,10 @@ impl WorkerBuilder {
 
     /// The builder for one task. A task that succeeded left it empty (every
     /// task ends with an unconditional flush), and a task that failed ends
-    /// its worker (the ordered pool claims nothing after a failure), so a
-    /// builder still holding elements here is a broken invariant: refused,
-    /// rather than letting another blob's elements into this one's output.
+    /// its worker (neither pool hands a worker more work after a failure),
+    /// so a builder still holding elements here is a broken invariant:
+    /// refused, rather than letting another blob's elements into this one's
+    /// output.
     pub(crate) fn task(&mut self) -> Result<&mut BlockBuilder> {
         if !self.bb.is_empty() {
             return Err(crate::error::Error::internal(

@@ -1,17 +1,21 @@
 //! Per-block rewrite loop: walks a decoded `PrimitiveBlock`, applies the OSC
 //! diff overlay element-by-element, interleaves inline upsert creates at
-//! their sorted positions, and hands each completed owned block to the
-//! worker's framing sink as it is flushed.
+//! their sorted positions, and frames each output block on the worker as it
+//! completes.
 
 use crate::ElementKind;
-use crate::block_builder::{BlockBuilder, OwnedBlock};
+use crate::blob_meta::BlobIndex;
+use crate::block_builder::BlockBuilder;
 use crate::osc::CompactDiffOverlay;
+use crate::writer::Compression;
 use crate::{Element, PrimitiveBlock};
 
-use crate::commands::{ensure_node_capacity_local, ensure_relation_capacity_local, flush_local};
+use crate::commands::{
+    FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local, flush_local,
+};
 
 use super::Result;
-use super::classify::BlobWalk;
+use super::classify::blob_walk;
 use super::element_writes::{
     BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation,
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
@@ -21,9 +25,13 @@ use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
-/// Output from `rewrite_block_parallel`: local stats. The blocks went to the
-/// caller's sink as they were completed.
+/// Output from `rewrite_block_parallel`: the blob's frames, from a rewrite
+/// whose walk has ended, and its local stats.
 pub(super) struct RewriteOutput {
+    /// Each output block's frame, with its kind, in output order.
+    pub(super) frames: Vec<(ElementKind, Vec<u8>)>,
+    /// Wall time spent framing those blocks, excluding their encoding.
+    pub(super) frame_ns: u64,
     pub(super) stats: MergeStats,
     /// Inline-coordinate refresh counts for the block's surviving base ways
     /// (all zero without `--locations-on-ways`).
@@ -40,7 +48,7 @@ fn emit_create_local(
     kind: ElementKind,
     diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut FramedBlocks<'_>,
     stats: &mut MergeStats,
     loc: LocMode<'_>,
 ) -> Result<()> {
@@ -69,8 +77,8 @@ fn emit_create_local(
     Ok(())
 }
 
-/// Rewrite one decoded base block on a worker, handing each completed output
-/// block to `sink` rather than a `PbfWriter`. Interleaves
+/// Rewrite one decoded base block on a worker, framing each completed output
+/// block there rather than handing it to a `PbfWriter`. Interleaves
 /// upserts at their sorted positions within the block - IDs that match base
 /// elements are modifications (handled by normal element processing); IDs that
 /// don't match are creates (emitted by the cursor).
@@ -81,17 +89,23 @@ fn emit_create_local(
 /// coordinates are refreshed against `probe` (see `refresh.rs`); `probe` is
 /// empty without `--locations-on-ways`.
 ///
-/// Every base element is observed by `walk`, a fresh one, so the block's
-/// order and claim are checked over all of it; the caller ends the walk once
-/// this returns. Nothing written here has left the worker by then.
+/// Every base element is observed by a walk of this rewrite's own, built
+/// from the blob's indexdata `claim` (`None` for an unindexed blob), so the
+/// block's order and claim are checked over all of it; the walk is ended
+/// here, after the last block is framed, so a framing error outranks a
+/// refusal only the walk's end can make. Frames come back only in an `Ok`
+/// result, so nothing of a rewrite that its walk refuses can leave the
+/// worker.
 ///
-/// Each completed block is handed to `sink` right after the element or
-/// create that completed it, in output order, so a blob's raw output is
-/// never resident all at once: a planet input blob holds some 200k elements
-/// and becomes ~27 output blocks, and accumulating them all before framing
-/// held each worker's whole raw output beside its framed copy. The sink
-/// frames into worker-local storage; nothing it produces may leave the
-/// worker before the caller has ended the walk.
+/// Each block is framed on the worker from the builder's own buffer the
+/// moment it completes (`FramedBlocks`), so a blob's raw output is never
+/// resident all at once and no encode buffer changes hands: a planet input
+/// blob holds some 200k elements and becomes ~27 output blocks, and
+/// accumulating them all before framing held each worker's whole raw output
+/// beside its framed copy. A completed block's framing error therefore
+/// surfaces at the flush that completes it, ahead of whatever fallible work
+/// the element's write helper does after that flush; it promises no other
+/// ordering against the element's errors.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -103,23 +117,12 @@ pub(super) fn rewrite_block_parallel(
     loc: LocMode<'_>,
     probe: &StaleProbe,
     scratch: &mut RefreshScratch,
-    walk: &mut BlobWalk<'_>,
-    sink: &mut dyn FnMut(OwnedBlock) -> Result<()>,
+    claim: Option<&BlobIndex>,
+    compression: &Compression,
+    metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<RewriteOutput> {
-    // Completed blocks wait here only until the next `hand_off`: one element
-    // or create can complete at most a couple (capacity check, then a
-    // pre-seed flush).
-    fn hand_off(
-        output: &mut Vec<OwnedBlock>,
-        sink: &mut dyn FnMut(OwnedBlock) -> Result<()>,
-    ) -> Result<()> {
-        for block in output.drain(..) {
-            sink(block)?;
-        }
-        Ok(())
-    }
-
-    let mut output: Vec<OwnedBlock> = Vec::new();
+    let mut walk = blob_walk(claim);
+    let mut output = FramedBlocks::new(*compression, metrics);
     let mut stats = MergeStats::new();
     let mut upsert_cursor: usize = 0;
     let mut base_writes = BaseWrites::new(block, probe, scratch);
@@ -149,7 +152,6 @@ pub(super) fn rewrite_block_parallel(
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
-            hand_off(&mut output, sink)?;
         }
         // Skip modification IDs (handled below by normal element processing)
         if upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] == elem_id {
@@ -221,7 +223,6 @@ pub(super) fn rewrite_block_parallel(
                 }
             }
         }
-        hand_off(&mut output, sink)?;
     }
 
     // Emit remaining upserts after the last element (trailing creates)
@@ -229,14 +230,15 @@ pub(super) fn rewrite_block_parallel(
         let cid = inline_upserts[upsert_cursor];
         upsert_cursor += 1;
         emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc)?;
-        hand_off(&mut output, sink)?;
     }
 
-    // Flush remaining elements in the BlockBuilder
+    // Flush remaining elements in the BlockBuilder, then end the walk.
     flush_local(bb, &mut output)?;
-    hand_off(&mut output, sink)?;
+    walk.finish()?;
 
     Ok(RewriteOutput {
+        frames: output.frames,
+        frame_ns: output.frame_ns,
         stats,
         refresh: base_writes.tally,
     })

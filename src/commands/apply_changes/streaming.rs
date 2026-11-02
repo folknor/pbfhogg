@@ -3,7 +3,8 @@
 //! Spawns `worker_count` long-lived threads that pull [`ScannedBlob`]
 //! candidates from the scanner over `candidate_rx` and emit
 //! [`DrainItem`]s to the drain over `drain_tx`. Each worker owns a
-//! thread-local [`BlockBuilder`], decompress and parse scratch buffers,
+//! thread-local [`BlockBuilder`] (a `WorkerBuilder`, kept for the run),
+//! decompress and parse scratch buffers,
 //! and (under `--locations-on-ways`) a private `FxHashMap` accumulator
 //! published into a per-worker `Arc<Mutex<_>>` slot for the drain to
 //! merge at the node→way barrier.
@@ -64,9 +65,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ElementKind;
 use crate::blob::decompress_blob_raw;
-use crate::block_builder::{BlockBuilder, OwnedBlock};
+use crate::block_builder::BlockBuilder;
+use crate::commands::WorkerBuilder;
 use crate::error::{Error, Result};
-use crate::writer::{Compression, frame_blob_pipelined, reframe_raw_with_index};
+use crate::writer::{Compression, reframe_raw_with_index};
 
 use super::classify::{blob_walk, block_overlaps_diff};
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
@@ -389,7 +391,7 @@ fn worker_loop(
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut bb = BlockBuilder::new();
+    let mut builder = WorkerBuilder::new(BlockBuilder::new());
 
     // Per-worker coord accumulator: gathered locally then flushed to the
     // shared slot in batches to amortise the mutex acquire. Empty when
@@ -436,7 +438,7 @@ fn worker_loop(
                     counters,
                     ranges,
                     diff,
-                    &mut bb,
+                    &mut builder,
                     &mut read_buf,
                     &decode_pool,
                     &mut decompress_buf,
@@ -508,7 +510,7 @@ fn handle_candidate(
     counters: &WorkerCounters,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
-    bb: &mut BlockBuilder,
+    builder: &mut WorkerBuilder,
     read_buf: &mut Vec<u8>,
     decode_pool: &std::sync::Arc<crate::blob::DecompressPool>,
     decompress_buf: &mut Vec<u8>,
@@ -857,60 +859,34 @@ fn handle_candidate(
     let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = crate::counters::Stopwatch::start();
-    // The rewrite's own walk: on a precise-check hit the walk above stopped
-    // at the hit, so this is the complete one, ended before any frame is
-    // sent.
-    let mut rewrite_walk = blob_walk(claim.as_ref());
-    // P1.5: frame each output block in-line via per-thread scratch so the
-    // drain side can `write_raw_owned` without the writer's
-    // `rayon::spawn`-per-block dispatch (which was the dominant
-    // contributor to `writer_pipeline_send_wait_ns` at planet). Each block
-    // is framed as soon as the rewrite completes it, so only one block's raw
-    // bytes are resident at a time; the frames stay in this worker until the
-    // walk has ended below. A framing error therefore can outrank a later
-    // walk refusal of the same blob; either way the run fails unpublished.
-    let mut framed_chunks: Vec<Vec<u8>> = Vec::new();
-    let mut frame_ns: u64 = 0;
-    let mut frame_sink = |owned: OwnedBlock| -> Result<()> {
-        let t_frame = crate::counters::Stopwatch::start();
-        let OwnedBlock {
-            bytes: block_bytes,
-            index,
-            tagdata,
-            way_members,
-        } = owned;
-        let indexdata = index.serialize();
-        let frame = frame_blob_pipelined(
-            &block_bytes,
-            compression,
-            Some(&indexdata),
-            tagdata.as_deref(),
-            way_members.as_deref(),
-            metrics,
-        )?;
-        drop(block_bytes);
-        framed_chunks.push(frame);
-        frame_ns += t_frame.elapsed_ns();
-        Ok(())
-    };
+    // P1.5: the rewrite frames each output block in-line, on this worker,
+    // so the drain side can `write_raw_owned` without the writer's
+    // `rayon::spawn`-per-block dispatch (which was the dominant contributor
+    // to `writer_pipeline_send_wait_ns` at planet). The rewrite makes its
+    // own complete walk (on a precise-check hit the walk above stopped at
+    // the hit) and returns frames only once that walk has ended, so a framing
+    // error can outrank a later walk refusal of the same blob; either way
+    // the run fails unpublished.
     let output = rewrite_block_parallel(
         &block,
         diff,
-        bb,
+        builder.task()?,
         inline_upserts,
         effective_kind,
         loc,
         probe,
         refresh_scratch,
-        &mut rewrite_walk,
-        &mut frame_sink,
+        claim.as_ref(),
+        compression,
+        metrics,
     )?;
-    rewrite_walk.finish()?;
     counters.rewrite_ns.fetch_add(
-        t_rewrite.elapsed_ns().saturating_sub(frame_ns),
+        t_rewrite.elapsed_ns().saturating_sub(output.frame_ns),
         Ordering::Relaxed,
     );
-    counters.frame_ns.fetch_add(frame_ns, Ordering::Relaxed);
+    counters
+        .frame_ns
+        .fetch_add(output.frame_ns, Ordering::Relaxed);
     counters
         .loc_refreshed_ways
         .fetch_add(output.refresh.ways, Ordering::Relaxed);
@@ -926,7 +902,7 @@ fn handle_candidate(
         drain_tx,
         DrainItem::Rewritten {
             seq: desc.seq,
-            framed_chunks,
+            framed_chunks: output.frames,
             kind: effective_kind,
             id_range: (effective_min_id, effective_max_id),
             observed_first: first,

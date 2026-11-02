@@ -783,13 +783,15 @@ full file per step: passthrough saves little there.
 - String table: one byte arena plus `(start, end)` slots, deduplicated through a `hashbrown::HashTable` of slot numbers keyed by the slot's bytes - no allocation per string; `clear()` keeps the capacity
 - Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
 - Every retained buffer (dense vectors, wire scratch, string table, encode buffer) above `MAX_RETAINED_SCRATCH_CAPACITY` is released at the next block, so a builder kept for a whole run holds a fixed bound per buffer
-- `take()` / `take_encoded()` - lend the block from `encode_buf`, which stays with the builder
+- `take()` - lends the block from `encode_buf`, which stays with the builder
+- `lend_encoded(f)` - lends the block, its index and tagdata to `f` for the duration of the call; once `f` has succeeded, an `encode_buf` grown past the retention limit is released, so a lender never keeps its last outlier block between tasks
 - `take_owned()` - returns `OwnedBlock { bytes, index, tagdata, way_members }`, moving `encode_buf` out; the next block reserves the last owned block's length (capped) up front instead of regrowing from empty
 
 A builder is not tied to a blob. The re-encoding commands' ordered-pool
 workers (`cat --clean`, the time-filter snapshot path, repack's and degrade's
-full blocks) each keep one builder as worker-local state for the run and
-frame every block as it fills, straight from the builder's buffer
+full blocks) and apply-changes' rewrite workers each keep one builder as
+worker-local state for the run (`commands::WorkerBuilder`) and frame every
+block as it fills, straight from the builder's buffer
 (`commands::FramedBlocks`, a `BlockSink`), so no builder is preallocated per
 blob and no encode buffer changes hands. Producers that hand blocks to the
 writer keep `Vec<OwnedBlock>` (the other `BlockSink`).

@@ -229,8 +229,33 @@ pub(crate) trait DecodeTransform: Sync {
 
 thread_local! {
     // Thread-local scratch buffers for a block's string table and group
-    // ranges. Rayon keeps them with its worker, avoiding a fresh pair of
-    // Vec<(u32, u32)> per blob.
+    // ranges, one pair per decode worker, avoiding a fresh pair of
+    // Vec<(u32, u32)> per blob. They live on the read's own decode pool,
+    // which is joined (thread-local destructors included) before the read
+    // ends, so what they retain lasts one read, never across reads; for
+    // `into_blocks_pipelined` that read runs in the background, so it lasts
+    // while a paused iterator holds the read open.
+    //
+    // They deliberately do not follow the release rule
+    // (`commands::release_scratch` against `MAX_RETAINED_SCRATCH_CAPACITY`)
+    // that apply-changes' worker scratch applies to its own copies of the
+    // same two lists. On the measured planet file the largest any worker
+    // reached was 2 MiB for the string table and 4 KiB for the groups
+    // (`pipeline_scratch_*_capacity_peak_bytes` of a planet pipelined read,
+    // bygg, 30 decode workers, at 82be10a4; table sizes are the data's),
+    // so the 4 MiB line would never fire there: the rule frees nothing on
+    // that input and the check would only be measured for its own cost.
+    // What each worker keeps below the line is the working set the next
+    // large block needs. Above the line, inputs the planet file does not
+    // contain (an entry is at least two wire bytes, so a 32 MiB block can
+    // grow the table to 128 MiB, four times its payload; hostile input, or
+    // a writer packing far more strings per block) would leave each worker
+    // that parsed one holding it for the rest of the read. Releasing would
+    // narrow that from workers x size to min(workers, decode_ahead) x size,
+    // a real gain only where decode_ahead is below the worker count (a
+    // caller's setting, or a host with more than decode_ahead + 2 CPUs).
+    // That is the cheap partial step if a bound on such input is wanted;
+    // a whole-read memory budget would be the stronger control.
     static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
     static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
 }
@@ -257,9 +282,8 @@ impl Decoder<'_> {
         ST_SCRATCH.with_borrow_mut(|st| {
             GR_SCRATCH.with_borrow_mut(|gr| {
                 let out = f(st, gr);
-                // Per-thread scratch retention is the iter-5 residual alloc
-                // bucket. Record current capacity in (u32, u32) pairs * 8
-                // bytes for the invocation's peak.
+                // Record the worker's retained capacity, (u32, u32) pairs
+                // x 8 bytes, for the invocation's peak.
                 self.metrics.record_scratch_capacity(
                     st.capacity().saturating_mul(8),
                     gr.capacity().saturating_mul(8),

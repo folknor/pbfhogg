@@ -448,18 +448,29 @@ FeatureCollection feature, ring validation). The prefilters in
 `Region::contains_decimicro` stay sound under either rule. Once done, the
 brokkr verify filing for exact membership can take polygon regions too.
 
-### WRK-150: the read pipeline's thread-local parse scratch is never released
+### WRK-151: the read pipeline's scratch counters cannot say what the pool retains
 
-`ST_SCRATCH` and `GR_SCRATCH` (`src/read/pipeline.rs`, thread-locals of the
-rayon decode workers) keep whatever capacity the largest block a thread
-parsed gave them, for the life of the pool thread, across invocations; only
-their peak is recorded (`pipeline_scratch_*_capacity_peak_bytes`). They are
-8 bytes per string-table entry or group, so on real data they stay far
-below `MAX_RETAINED_SCRATCH_CAPACITY`; a hostile block with a huge string
-table pins its size per pool thread. apply-changes' own copies of the same
-two vectors now follow the release rule (`WorkerScratch` in
-`apply_changes/streaming.rs`); applying `commands::release_scratch` after
-`with_scratch`'s closure is the obvious fix, cheap per blob, not measured.
+`pipeline_scratch_st_capacity_peak_bytes` / `_gr_` are a maximum over all
+decode workers of one worker's `ST_SCRATCH` / `GR_SCRATCH` capacity
+(`src/read/pipeline.rs`, `record_scratch_capacity` in
+`pipeline_metrics.rs`), so they bound one worker, not the pool. At planet
+(bygg, 82be10a4, uuid 4738d079) the max is 2 MiB, so the decode pool's
+total is anywhere up to 30 x 2 MiB against a peak anon near 295 MiB, and
+no stored number says where. To answer it: sum each worker's peak within
+a read (the scratch never shrinks, so that is what the pool holds just
+before it is joined) and take the maximum across reads if one scalar per
+invocation is wanted; adding successive reads would count pools already
+destroyed. The sum is accounting capacity, not removable peak anon: it can
+accumulate after the process peak, and projection-only readers need the
+scratch regardless, so it is an upper bound on the opportunity. Only if it
+is material against the read's peak, consider building a block's offset
+tables straight into its payload tail (count the entries, reserve payload
+plus tables once, scan into the split tail; borrowed `validate_in_place`
+and projections keep their own scratch), which removes the scratch that
+`WireBlock::inline_tables` copies from, at the cost of a count pass on
+every block, so it needs its own matched planet A/B. Releasing this
+scratch at `MAX_RETAINED_SCRATCH_CAPACITY` was considered and declined;
+the reasoning is at the thread-locals.
 
 ### WRK-037: ParallelGzipWriter window size
 

@@ -68,9 +68,7 @@ crate::counters::counter_set! {
         /// Maximum retained capacity (bytes) of the per-decode-thread
         /// `ST_SCRATCH` Vec (string-table entries in `scan_block_fields`):
         /// the largest any one decode thread has retained, not a sum across
-        /// threads (see [`PipelineMetrics::record_scratch_capacity`]). The iter-5 alloc
-        /// profile fingered this as the dominant residual alloc bucket
-        /// (~70 % at Japan, retained per-thread max-block-size capacity).
+        /// threads (see [`PipelineMetrics::record_scratch_capacity`]).
         pub scratch_st_capacity_peak_bytes => "pipeline_scratch_st_capacity_peak_bytes",
         /// Maximum retained capacity (bytes) of the per-decode-thread
         /// `GR_SCRATCH` Vec (group-range kv pairs).
@@ -97,10 +95,11 @@ impl PipelineMetrics {
     /// capacity; the global max ends up reflecting the thread that touched
     /// the largest blob.
     ///
-    /// We aggregate as a peak (single thread's worst case) rather
-    /// than a sum across threads because the per-thread retention is
-    /// what dominates - a sum would over-count if threads serially
-    /// touched smaller blobs after a big one.
+    /// This is one worker's worst case, not what the pool retains in
+    /// total: the scratch never shrinks during a read, so each worker
+    /// keeps its own largest capacity until the pool is joined, and the
+    /// pool's total is the sum of those per-worker peaks, which this
+    /// maximum does not give.
     pub fn record_scratch_capacity(&self, st_bytes: usize, gr_bytes: usize) {
         record_max(&self.scratch_st_capacity_peak_bytes, st_bytes as u64);
         record_max(&self.scratch_gr_capacity_peak_bytes, gr_bytes as u64);

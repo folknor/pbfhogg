@@ -16,6 +16,7 @@ use crate::coord_fmt::e7_to_deg;
 use super::format::*;
 
 mod admin;
+mod cover;
 mod interp;
 mod pass1;
 mod pass1_5;
@@ -87,21 +88,21 @@ impl Default for BuildConfig {
 
 impl BuildConfig {
     fn validate(&self) -> Result<()> {
-        // Street and coarse levels are bounded by the segment sampling budget,
-        // not the S2 format limit of 30. Cell covering samples each segment at
-        // a fraction of the cell width, so per-segment work doubles with every
-        // level. Reject before reading input so a long or antimeridian-crossing
-        // segment cannot turn a build into an unbounded walk.
+        // Street and coarse levels are bounded by the per-segment cell
+        // budget, not the S2 format limit of 30. A segment covers every cell
+        // it passes through, so per-segment work doubles with every level.
+        // Reject before reading input so a long segment cannot turn a build
+        // into an unbounded walk.
         // Each level is refused outside the S2 domain first, then by the
-        // budget the pass that uses it depends on: `cover_segment` asserts the
-        // sampling budget for every level it is handed, the admin one
-        // included. The unit tests in pass 3 pin `MAX_BUILD_S2_LEVEL` and
-        // `MAX_ADMIN_S2_LEVEL` to exactly these boundaries, so the messages'
-        // ranges are the refusals'.
+        // budget the pass that uses it depends on: the street cover asserts
+        // the cell budget for every segment, and the admin cover is bounded
+        // by the flood-fill cell budget. The unit tests pin
+        // `MAX_BUILD_S2_LEVEL` and `MAX_ADMIN_S2_LEVEL` to exactly these
+        // boundaries, so the messages' ranges are the refusals'.
         let s2_max = crate::geocode_index::format::S2_MAX_LEVEL;
         let max_level = crate::tunables::MAX_BUILD_S2_LEVEL;
         for (name, level) in [("street", self.street_level), ("coarse", self.coarse_level)] {
-            if level > s2_max || pass3::level_exceeds_sampling_budget(level) {
+            if level > s2_max || cover::level_exceeds_segment_cell_budget(level) {
                 return Err(Error::invalid_argument(format!(
                     "{name} S2 level must be in 0..={max_level}, got {level}. Levels above \
                      {max_level} exceed the builder's per-segment cell-covering budget."
@@ -109,10 +110,7 @@ impl BuildConfig {
             }
         }
         let admin_level = self.admin_level;
-        if admin_level > s2_max
-            || pass3::admin_level_exceeds_cell_budget(admin_level)
-            || pass3::level_exceeds_sampling_budget(admin_level)
-        {
+        if admin_level > s2_max || pass3::admin_level_exceeds_cell_budget(admin_level) {
             let max_level = pass3::MAX_ADMIN_S2_LEVEL;
             return Err(Error::invalid_argument(format!(
                 "admin S2 level must be in 0..={max_level}, got {admin_level}. Higher levels \

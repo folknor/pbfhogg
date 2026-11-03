@@ -166,6 +166,9 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   separate implementations; what they must share is shared explicitly and
   by name, and only two of the four ever duplicated the alignment logic
   that unification proposals cite.
+- [ADR-0015](0015-defer-s2-admin-region-coverer.md) - Defer the S2 admin
+  region coverer rewrite and keep the reader's interior bypass off.
+  Superseded by ADR-0022.
 
 Numbering gaps are deliberate, per the never-reuse rule: 0001 was a
 transient process note retired at the 0.3.0 release (commit `30ca861`);
@@ -205,3 +208,10 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   release panic (never in `Drop`), else drop a tautology with a comment.
   Input-reachable means an ADR-0004 refusal; `debug_assert!` only where a
   planet A/B measures real cost. Supersedes ADR-0005.
+- [ADR-0022](0022-admin-edges-are-covered-in-the-point-in-polygon-geometry.md) -
+  Geocode admin edge cells are a conservative cover of the reader's
+  point-in-polygon boundary (planar ring edges in its frame, the closing
+  edge, the antimeridian for unwrapped rings), so an interior-flagged cell
+  is wholly inside; the reader still tests every candidate, because the
+  flag is per cell, the query reads nine, and older indexes carry unsound
+  flags. Supersedes ADR-0015.

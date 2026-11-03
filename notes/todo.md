@@ -384,7 +384,7 @@ notes carry a CLOSED/STATUS header pointing back here.
 
 **Active arcs (large open engineering, pick deliberately)**
 
-- Geocode builder rewrite G1-G4 + two S2 spikes
+- Geocode builder rewrite G1-G4
   ([notes/geocode-build-opportunities.md](geocode-build-opportunities.md)).
 - GeoJSON export follow-ups ([notes/geojson-export-design.md](geojson-export-design.md)) -
   v1 shipped 2026-07-13 (ADR-0010); relations/MultiPolygon, raw-PBF index
@@ -919,43 +919,25 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   - **What a fix needs.** Either a topology-preserving simplifier (reject a
     candidate removal whose new segment crosses another segment of the same or a
     sibling ring), or a metric tolerance in place of the vertex cap so the error
-    is bounded in metres. The geocode `RegionCoverer` rewrite below would let
-    the cap become a tolerance, which is why the two are worth doing together.
+    is bounded in metres. Nothing in the admin cell cover forces a vertex
+    count: its work is linear in the stored edges.
   - **What is missing to act.** A fixture: a ring whose DP simplification at a
     given cap provably self-intersects, plus a query point whose containment
     flips. Without it any fix is unfalsifiable.
 
 ### Geocode index
 
-- [ ] **Admin coverage is sampled, not covered - the `RegionCoverer` rewrite.**
-  Deferred by
-  [ADR-0015](../decisions/0015-defer-s2-admin-region-coverer.md) until the selected
-  S2 implementation supplies polygon and loop regions usable by `RegionCoverer`,
-  or pbfhogg adopts one that does. The admin-interior, `cover_segment` and
-  `max-admin-vertices` findings are one problem in three hats: admin coverage is
-  built from ad-hoc sampling and a guessed seed instead of a real region
-  coverer, `research/traccar-geocoder/` is the precedent, and the reader's own
-  comment admits the interior flag is untrustworthy because of this - the
-  PIP-skip optimisation is disabled permanently to compensate. Replacing
-  `cover_segment` plus centroid flood-fill with `s2::RegionCoverer` over a
-  proper loop/polygon region would fix under-coverage, kill the duplicate
-  emissions, make the interior flag sound (re-enabling the PIP skip), remove the
-  level-hardcoded step table, and let the DP cap become a metric tolerance.
-  Everything else in that scope was repair work; this is the structural change.
-
-  Two stopgaps stand in front of it, both deliberate. The 256-step cap that
-  silently under-covered is gone, and the unbounded sampling that replaced it is
-  bounded by capping the configurable S2 levels at 19 - derived from a
-  per-segment budget of 2^24 samples and the widest separation two legal
-  coordinates can have. That is a stopgap with a proof attached, not a fix: a
-  `RegionCoverer` would make the level cap unnecessary, because an exact
-  traversal's cost scales with the cells actually covered rather than with the
-  cell width. Separately the sampler now unwraps the antimeridian - it unwraps
-  the far endpoint around the near one before stepping, so a 179.9E to 179.9W
-  segment is sampled as the 0.2-degree segment it is - which leaves
-  `MAX_SEGMENT_SPAN_DEG` of 405 a loose over-estimate against a true worst case
-  of about 255 degrees. Conservative in the safe direction, left alone
-  deliberately; a `RegionCoverer` retires the constant along with the sampler.
+- [ ] **Admin interior flags are sound; the reader cannot use them yet.** Since
+  2026-11-03 ([ADR-0022](../decisions/0022-admin-edges-are-covered-in-the-point-in-polygon-geometry.md),
+  superseding ADR-0015) the edge cells are a conservative cover of the
+  reader's own point-in-polygon boundary (`src/geocode_index/builder/cover.rs`),
+  so a flagged cell is wholly inside its polygon. Re-enabling a PIP skip
+  needs two things the index does not have: a header signal that its flags
+  come from that builder (older indexes carry flags on boundary cells), and a
+  reader that trusts only the query's own cell's flag, not the eight
+  neighbours'. A format change; measure the PIP cost it would save first.
+  The level cap (19) stays either way: an exact cover's work still doubles
+  per level, now bounded by a proved cell count rather than a sample count.
 
 ## Item/command-specific plans
 
@@ -979,16 +961,14 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
   - [x] ~~**#3 blob-filter skip-rate readout - MEASURED 2026-07-13**~~ from the existing planet bench `21ed8d7c` (2026-07-12, `a65cecc`, `--bench 3`): `getparents_blobs_skipped` 32,835 / `walk_actual_osmdata_blobs` 50,816 = **64.6 % of blobs skipped** (schedule 17,981; counters sum exactly). The CHANGELOG 0.3.0 "~85 % of blobs at planet scale" claim vs this 64.6 % is **RESOLVED as metric confusion, not an error to correct** - three different metrics collide: nodes are **~90 % of elements** (encoding-independent; ~10.4 B of 11.6 B), **64.6 % of blobs on the byte-packed primary planet** (node blobs avg ~317 k elements vs way blobs ~66 k, so way blobs are overrepresented in blob count), **~90 % of blobs on the 8k-uniform encoding** (blob share = element share when every blob holds 8,000 elements), and **~75 % of planet bytes** (the module doc's metric). The "~85 %" was element share mislabeled as blob share, written 2026-04-27 - months before repack and any blob-density awareness. **Decision (2026-07-13): CHANGELOG.md stays untouched** - historical release record, defensible under the element-share reading; this entry is the durable explanation. **Filter-semantics confirm CLOSED 2026-07-13.** `needed_blob_kinds` (`src/commands/getparents/mod.rs`) is sound for all seven non-empty query shapes: node queries scan way + relation blobs, way queries scan relation blobs (way blobs skipped - nothing references a way from a way), relation queries scan relation blobs only. The "parent relations of a node still needs way blobs" worry was a misconception - a relation parent of node N holds N *directly* as a member and is found in the relation blob; way blobs are needed on a node query in their own right (ways are direct parents of nodes), which `need_way_blobs` already covers. Key subtlety found: both scan arms share `needed_blob_kinds` (walker schedule + pipelined `BlobFilter`), so the pre-existing walker-vs-pipelined equality tests could NOT catch a wrong kind-mapping - both arms would drop the same parent. Pinned instead by four hand-computed-oracle tests over a relations-bearing fixture (`node_query_scans_relation_blobs_for_relation_parents`, `way_query_skips_way_blobs_but_finds_relation_parents`, `relation_query_scans_relation_blobs_only`, `add_self_node_query_emits_node_and_all_parent_kinds`). #3 fully resolved.
   - [x] ~~**#4 refs/members buf pre-sizing (<1 % wall).**~~ **CLOSED 2026-07-14 as SKIP - the decision rule fired exactly as predicted.** The gating `--alloc` profile ran at planet on the post-`783970a` HeaderWalker path (UUID `f83c8cf1`, `dcc445e`; none existed before). No churn in the refs/members buffers: `getparents::getparents` - the frame that owns `refs_buf` / `members_buf` - accounts for **2.2 MB of exclusive allocation, 0.07 % of the profile**. Decompression dominates as expected: `decompress_blob_raw` 2.0 GB / **59.9 %**, `parse_and_inline_with_scratch` 886.6 MB / 26.1 %, `blob_wire::parse` 465.1 MB / 13.7 %. Timing agrees (`parallel_classify_phase` 17.66 s of the 22.5 s wall; total alloc/dealloc 122.9 / 122.6 GB, diff 306.5 MB - no leak, no growth pattern). Pre-sizing a buffer responsible for 0.07 % of allocations cannot pay for the code. **Do not re-open**; the profile is the record. (Note the separate, unrelated `+16.8 %` getparents wall regression opened the same day - that one is a decode-path question, not an allocation question.)
 
-- [x] ~~**[notes/geocode-build-opportunities.md](geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. **G5 interpolation endpoint CSR LANDED 2026-07-13** (sorted CSR replaces the transient hashmap, built in parallel with parallel endpoint resolution; planet interp-resolve 30.6 s -> 2.76 s, ~11x - see CHANGELOG.md and git history for the commit). Remaining follow-ups in the note: G1-G4 architectural rewrites, two S2 spikes.
+- [x] ~~**[notes/geocode-build-opportunities.md](geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18**, planet 1255 s -> 432.9 s (-65%/2.9x), all 10 ranked items shipped. **G5 interpolation endpoint CSR LANDED 2026-07-13** (sorted CSR replaces the transient hashmap, built in parallel with parallel endpoint resolution; planet interp-resolve 30.6 s -> 2.76 s, ~11x - see CHANGELOG.md and git history for the commit). Remaining follow-ups in the note: G1-G4 architectural rewrites.
   - [ ] **Geocode reader interior-hint PIP skip was UNSOUND - investigated 2026-07-13, Fix A landed 2026-07-13, Fix B open.** The admin-cell interior high bit used to be honored as a PIP bypass (`is_interior || admin_polygon_contains(...)` in `src/geocode_index/reader.rs`, both `search_admin_ranked` and `search_admin_all`), introduced at `f365f7f` with a comment claiming "accepted approximation per spec". Investigation findings:
     - **The spec said the opposite.** The retired spec (`reverse-geocoding-spec.md`, deleted 2026-07-13, in git history; sections 3.4 and 4.11) defined the flag as a hint only - the reader "still performs a point-in-polygon test" on interior-flagged cells, using the flag for priority and same-level early exit, so a false flag costs wasted work, never a wrong answer. The "per spec" comment was a misreading.
     - **What `f365f7f` actually restored is the traccar-geocoder precedent.** `research/traccar-geocoder/server/src/main.rs` does the identical `is_interior || point_in_polygon(...)` over the query cell plus all 8 neighbors. Reader-side, pbfhogg was traccar parity.
     - **But traccar's builder makes that skip sound and pbfhogg's does not.** traccar (`builder/src/build_index.cpp` `cover_polygon`) uses S2's geometric `GetInteriorCovering(polygon)` AND erodes the interior by one cell ("only mark a cell interior if all its edge neighbors are also interior"). With erosion, any query cell adjacent to a flagged cell is itself fully inside the polygon, so neighbor-flag acceptance is correct (residual hole: erosion uses 4 edge neighbors while the reader iterates 8 including diagonals - a diagonal-neighbor gap even traccar's erosion doesn't close). pbfhogg's pass 3 (`src/geocode_index/builder/pass3.rs`) instead flood-fills from the centroid, tests only cell centers, excludes edge cells derived from the sampled 256-step-clamped `cover_segment` - no erosion, no geometric covering. pbfhogg inherited the optimization while dropping both of its preconditions.
-    - **Two concrete wrongness modes that existed in the pre-fix reader.** (1) Neighbor-cell acceptance: a query point in boundary cell C, outside polygon P, was accepted into P via an adjacent genuinely-interior cell N - fired for near-boundary queries within one admin-cell width (~8 km at level 10), and ranked mode's smallest-area-per-level then preferred the wrong-side polygon when it was smaller (e.g. standing in Germany near the border, Denmark won level 2). Wrong even with a perfect builder. (2) False interior flags: an edge cell missed by the sampled `cover_segment` whose center lies inside got flagged interior with the boundary running through it - the exact gap the open "exact S2 segment coverage" spike below tracks.
+    - **Two concrete wrongness modes that existed in the pre-fix reader.** (1) Neighbor-cell acceptance: a query point in boundary cell C, outside polygon P, was accepted into P via an adjacent genuinely-interior cell N - fired for near-boundary queries within one admin-cell width (~8 km at level 10), and ranked mode's smallest-area-per-level then preferred the wrong-side polygon when it was smaller (e.g. standing in Germany near the border, Denmark won level 2). Wrong even with a perfect builder. (2) False interior flags: an edge cell missed by the sampled `cover_segment` whose center lies inside got flagged interior with the boundary running through it. Closed 2026-11-03 by the conservative edge cover (ADR-0022).
     - **Fix A landed 2026-07-13: restore spec behavior.** Dropped the bypass at both call sites in `src/geocode_index/reader.rs` - both now always run `admin_polygon_contains`; `is_interior` is read but no longer influences the result. Regression test `admin_interior_hint_does_not_bypass_point_in_polygon` in `tests/geocode_index.rs` pins the neighbor-cell case: it asserts a query's own admin cell carries no interior flag while at least one cell in its 8-neighbor S2 neighborhood does, then checks both `query()` and `candidates()` reject the wrong-side match. Sound regardless of builder quality; cost is one ray-cast against a max-500-vertex simplified polygon per candidate entry.
-    - **Fix B (open, re-enables the optimization): traccar-parity builder.** Add interior erosion - using all 8 neighbors, not traccar's 4, to close the diagonal-neighbor hole confirmed above - and geometric interior covering to pass 3; then the reader skip becomes sound and can return as a measured optimization. Format-compatible (same flag bit) but requires an index rebuild; dovetails with the open "Spike: exact S2 segment coverage for Pass 3" item below.
-  - [ ] **Spike: exact S2 segment coverage for Pass 3.** `cover_segment` currently samples intermediate lat/lon points at 0.4 of the smallest cell width (no step cap; the level is bounded instead) plus the two vertex cells, and can miss a cell the segment clips near its corner. Prototype a proper S2 edge/cell traversal using `s2` 0.1.0 primitives (`RegionCoverer`, `Cell`, `Point`, `edgeutil::simple_crossing`, or equivalent direct cell-edge tests), then compare fine/coarse cell counts and geocode query results against the sampling path on Denmark/Europe before replacing it.
-  - [ ] **Spike: admin interior hints via S2 region coverage.** Admin indexing currently edge-covers rings and flood-fills from an arithmetic exterior vertex mean; concave polygons whose mean falls outside skip interior hints and pay more query-time PIP checks. Prototype a polygon `Region` or other `RegionCoverer::interior_covering` path that preserves the current edge-vs-interior on-disk semantics, handles holes, and measure admin cell count/PIP-hit changes before any format or behavior change.
+    - **Fix B (open, re-enables the optimization).** The builder half landed 2026-11-03: false interior flags (mode 2) are gone, because edge cells now cover the PIP boundary exactly (ADR-0022), so traccar's erosion and geometric interior covering are not needed for that. What remains is the reader half and the format signal, tracked in the "Admin interior flags are sound" item under "Geocode index" above: the neighbour-cell mode (1) is fixed by trusting only the query's own cell's flag, not by erosion.
 
 - [ ] **apply-changes** (plan note `apply-changes-opportunities.md` deleted 2026-07-13, content absorbed here; git history has the full record) - `apply-changes --locations-on-ways`. **P1 + P1.5 landed 2026-04-21 (`719f306`)**; parallel writer made the default 2026-04-21 (buffered path removed, `--parallel-writer` flag deleted). **Planet best: 80.9 s cross-disk + zstd:1** (-44 % vs 144.4 s pre-flip baseline; parallel pwrite, unaffected by the CopyRange bug). Same-disk zstd:1 best: **104.5 s** with parallel pwrite. The same-disk `--io-uring` column was re-measured 2026-04-26 at `16e3694` after the `fa8251d` CopyRange fix and is now uniformly slower than parallel pwrite at every same-disk compression level (none 137.5 s, zlib:6 137.4 s, zstd:1 126.3 s; UUIDs `9a5c25a7` / `70e5414b` / `0e6a5918`); the original 108.6 / 137.1 / 99.4 s numbers were tainted by the writer dropping a zero-page between OSMHeader and first OSMData blob. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer. Same-disk `--io-uring` no longer the recommended override; cross-disk `--compression none` + `--io-uring` is open until re-measured. Remaining open items: splice-in-place (#11, deferred - doesn't reduce output bytes on compressed output), multi-file output / RAID-0 (unlanded and lower priority given 80.9 s is comfortably inside any realistic production budget). **Note closed 2026-07-13** - its remaining items are tracked here now:
   - [x] ~~**#15 document zstd:1 as the internal-pipeline recommendation**~~ - DONE (found landed 2026-07-13): README.md and reference/performance.md both carry the `--compression zstd:1` recommendation for pipelines that skip osmium interop.

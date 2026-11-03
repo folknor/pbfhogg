@@ -1939,14 +1939,22 @@ geocode header. A missing value is stored as zero, and a present value outside
 the u32 range fails the build rather than being wrapped to a different source
 version.
 
+A way segment is the line straight in latitude and longitude between its two
+nodes, taken the shorter way around in longitude: the line a query measures
+its distance to. An admin boundary edge is the edge the query's
+point-in-polygon test uses. The index lists a street, interpolation way or
+admin polygon under every cell, at the street, coarse and admin levels, that
+such a line passes through (an index built by pbfhogg 0.5.0 or earlier can
+lack a cell the line only clips near its corner; rebuild to gain them).
+
 #### S2 level bounds
 
 All three cell levels are validated before any input is read, and a violation
 exits 2 with an explicit message:
 
 - Street and coarse levels must remain within the builder's segment-cover
-  budget. Cell covering samples each way segment at a fraction of the cell
-  width, so the sample count doubles at each level. The builder's rejection
+  budget. Cell covering emits every cell a way segment passes through, so the
+  cell count of a segment doubles at each level. The builder's rejection
   message reports its current upper bound and explains the budget.
 - Admin level must remain within the builder's polygon flood-fill budget.
   The number of cells considered grows by a factor of four at each level. The

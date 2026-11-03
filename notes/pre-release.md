@@ -383,23 +383,22 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-166: geocode segment cover can miss a cell clipped near its corner
+### WRK-173: geocode fine search radius reaches past the cells the reader reads
 
-Found 2026-11-03 while fixing the lon -180 endpoint gap. `cover_segment`
-(`src/geocode_index/builder/pass3.rs`) now always emits the cells holding
-both stored vertices, but between them it still samples at 0.4 of the
-smallest cell width, and a segment can pass through a cell near its corner
-for less than one step, so that cell is never emitted. For streets the
-reader's 3x3 neighbourhood usually still finds the segment; for admin
-polygons a missed edge cell whose centre is inside can be flood-filled as
-interior with the boundary running through it (harmless today because the
-reader runs point-in-polygon on every candidate, per ADR-0015, but it is
-what blocks trusting the interior flag). The fix is an exact edge-cell
-traversal, the open "Spike: exact S2 segment coverage" in `notes/todo.md`;
-note that an S2 polyline or RegionCoverer covers the geodesic, not the
-lat/lon-linear segment the sampler walks and `geo.rs` measures distance
-against, so the replacement needs one geometry contract for both sides
-before it is conservative.
+Found 2026-11-03 while replacing the segment sampler. The reader looks up
+the query's cell and its eight neighbours (`cell_neighborhood` in
+`src/geocode_index/reader.rs`) and keeps candidates within the search
+radius, default 75 m at the fine level (`GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M`,
+street level 17). The ring of neighbours is only guaranteed to reach one
+smallest cell width, `MIN_WIDTH(17)`, about 46 m: a street 46 to 75 m from
+the query can sit outside all nine cells, so the fine search can return a
+farther street, or none, while a nearer one lies within the radius (the
+coarse fallback fills a class only when the fine search found nothing).
+Decide whether the radius is a promise (then the neighbourhood must grow
+with radius / cell width, or the default level or radius change) or a
+cutoff (then the docs should say results are the nearest within the nine
+cells). A synthetic fixture with a street at 60 m beyond the block, and a
+farther one inside it, would pin it.
 
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 

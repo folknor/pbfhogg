@@ -139,7 +139,7 @@ impl Header {
         let admin = buf[10];
         // 30 is the S2 format limit, deliberately looser than the builder's
         // own `MAX_BUILD_S2_LEVEL`. The builder's cap comes from its segment
-        // sampling budget - a cost of *writing* an index, not a property of
+        // cover budget - a cost of *writing* an index, not a property of
         // one - so an index written at a higher level by some other producer
         // stays readable. Reading does no cell covering.
         if street > S2_MAX_LEVEL || coarse > S2_MAX_LEVEL || admin > S2_MAX_LEVEL {

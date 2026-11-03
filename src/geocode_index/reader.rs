@@ -1154,14 +1154,15 @@ impl Reader {
                     continue;
                 }
                 // The interior high bit is only a hint: the reader still runs the
-                // point-in-polygon test unconditionally. pbfhogg's builder (pass 3
-                // flood-fill, cell-center sampling, no interior erosion / geometric
-                // covering) does not guarantee that a flagged cell is fully inside
-                // the polygon, so honoring the flag as a PIP bypass would mis-attribute
-                // near-boundary and neighbor-cell queries. A false flag now only costs
-                // wasted work, never a wrong answer. Re-enabling the skip requires a
-                // builder that makes the interior hint sound through interior erosion
-                // and geometric covering.
+                // point-in-polygon test unconditionally (ADR-0022). The current
+                // builder flags a cell only when the whole cell is inside, but the
+                // flag still cannot bypass the test: it describes the cell it is
+                // stored on, while this loop applies the entries of all nine
+                // neighbourhood cells to the query, and an index built before the
+                // builder covered polygon edges exactly carries flags on cells the
+                // boundary runs through, with nothing in the file telling the two
+                // apart. A false flag here only costs wasted work, never a wrong
+                // answer.
                 if self.admin_polygon_contains(ctx, &poly) {
                     best_by_level[level] = (Some(poly_idx), poly.area);
                 }
@@ -1208,10 +1209,10 @@ impl Reader {
                 let Some(poly) = self.read_admin_polygon(poly_idx) else {
                     continue;
                 };
-                // Interior high bit is a hint only; always run the PIP test. The
-                // builder's flood-fill and cell-center sampling do not ensure flagged
-                // cells lie inside the polygon, so bypassing this test can misattribute
-                // near-boundary and neighbor-cell queries.
+                // Interior high bit is a hint only; always run the PIP test, for
+                // the reasons in `search_admin_ranked`: the flag is about its own
+                // cell, not the neighbour cells' queries, and older indexes carry
+                // unsound flags.
                 if self.admin_polygon_contains(ctx, &poly) {
                     result.push(AdminMatch {
                         admin_level: poly.admin_level,

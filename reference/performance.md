@@ -3101,6 +3101,18 @@ reading 4 to 7 GB more from disk than A and Stage A streets at 22.3 s. The
 stored 320 s planet cells from before the malloc arena change are no
 baseline for this build any more.
 
+### Conservative path cover replaces the segment sampler (bygg, 2026-11-03)
+
+The segment cover walks each lat/lon path's great-circle chords over the
+S2 grid of every face they reach instead of sampling at 0.4 of the smallest
+cell width. Planet, `--bench 1`: A is clean `7e7ede73` (`a450ea22`),
+179.2 s; B is the change on that commit, uncommitted (`--force`, not
+stored), 175.4 s. Pass 3 Stage A streets 18.9 s to 17.6 s (one sphere point
+per node instead of per segment end, no per-segment hash set), admin cells
+3.6 s to 2.9 s, Stage B fine 21.5 s to 22.3 s (more cells to group). Denmark
+at the same pair: fine cells 1,712,384 to 1,747,381 (+2.0 %, the cells the
+sampler missed), coarse 119,012 to 119,109, admin 1,223 to 1,231.
+
 ### Comparison with traccar-geocoder
 
 No directly comparable data - different hardware, different format, different

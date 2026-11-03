@@ -364,14 +364,36 @@ pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
 }
 
 /// Point-in-ring that handles rings crossing the antimeridian (±180° longitude).
+///
+/// The ring is tested in the frame [`pip_ring_frame`] returns: as given when
+/// no edge spans more than 180 degrees of longitude, otherwise with its
+/// longitudes unwrapped, and then at `px`, `px + 360` and `px - 360`. The
+/// planar edges of that frame (with [`point_in_ring`]'s implicit closing edge
+/// from the last vertex to the first) are the boundary this predicate has,
+/// together with the antimeridian itself for an unwrapped ring: the three
+/// retries are not periodic, so the answer can change across +/-180 where no
+/// edge runs. The geocode builder covers exactly that boundary.
 pub fn point_in_ring_with_antimeridian(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
-    if !ring_crosses_antimeridian(ring) {
-        return point_in_ring(px, py, ring);
+    match pip_ring_frame(ring) {
+        std::borrow::Cow::Borrowed(raw) => point_in_ring(px, py, raw),
+        std::borrow::Cow::Owned(unwrapped) => {
+            point_in_ring(px, py, &unwrapped)
+                || point_in_ring(px + 360.0, py, &unwrapped)
+                || point_in_ring(px - 360.0, py, &unwrapped)
+        }
     }
-    let unwrapped = unwrap_ring_longitudes(ring);
-    point_in_ring(px, py, &unwrapped)
-        || point_in_ring(px + 360.0, py, &unwrapped)
-        || point_in_ring(px - 360.0, py, &unwrapped)
+}
+
+/// The ring as [`point_in_ring_with_antimeridian`] tests it: borrowed and
+/// unchanged when [`ring_crosses_antimeridian`] is false, otherwise an owned
+/// copy with continuous longitudes. An owned frame means the predicate also
+/// retries the point at +/-360 degrees.
+pub(crate) fn pip_ring_frame(ring: &[(f64, f64)]) -> std::borrow::Cow<'_, [(f64, f64)]> {
+    if ring_crosses_antimeridian(ring) {
+        std::borrow::Cow::Owned(unwrap_ring_longitudes(ring))
+    } else {
+        std::borrow::Cow::Borrowed(ring)
+    }
 }
 
 /// Test if a point is inside a polygon with holes.

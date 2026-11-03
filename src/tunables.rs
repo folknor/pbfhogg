@@ -1015,27 +1015,19 @@ pub(crate) const OVERFLOW_COMPACT_MIN: usize = 1 << 20;
 /// Maximum number of distinct sample IDs kept for a build diagnostic.
 pub(crate) const DIAGNOSTIC_ID_SAMPLE_LIMIT: usize = 16;
 
-/// Per-segment sampling budget: 2^24 points. In the pathological case that
-/// is roughly 270 MB of dedup set on one rayon worker and a few seconds; in
-/// every real case - OSM segments are a small fraction of a degree - it is a
-/// handful of samples and the budget never comes near being spent.
-pub(crate) const MAX_SEGMENT_SAMPLES: f64 = 16_777_216.0;
+/// Per-segment cell budget for the street and interpolation cover: 2^24 raw
+/// cell entries, before deduplication. In the pathological case (a pole to
+/// pole segment half the globe wide) that is a 134 MB `Vec<u64>` on one rayon
+/// worker, twice that while it grows; every real OSM segment is a small
+/// fraction of a degree and covers a handful of cells.
+pub(crate) const MAX_SEGMENT_CELLS: f64 = 16_777_216.0;
 
-/// Segment span the sampling budget assumes, in the flat degree metric
-/// `cover_segment` measures with. `cover_segment` unwraps the far endpoint
-/// around the near one, so a legal segment spans at most 180 degrees of
-/// latitude by 180 of longitude, `hypot(180, 180)` = 254.6. The value is the
-/// bound without that unwrapping, `hypot(180, 360)` = 402.5, rounded up:
-/// conservative, and
-/// kept because lowering it would move `MAX_BUILD_S2_LEVEL`'s boundary.
-pub(crate) const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
-
-/// Highest S2 level accepted for the segment-sampled street and coarse cells.
+/// Highest S2 level accepted for the street and coarse cells.
 ///
-/// Pinned to `MAX_SEGMENT_SAMPLES` by `level_exceeds_sampling_budget` and by
-/// the unit test in pass 3, which walks every level and asserts this is
-/// exactly the boundary - raising the constant without raising the budget
-/// fails the test rather than reintroducing the hang.
+/// Pinned to `MAX_SEGMENT_CELLS` by `level_exceeds_segment_cell_budget` and by
+/// the unit test in the path cover, which walks every level and asserts this
+/// is exactly the boundary - raising the constant without raising the budget
+/// fails the test rather than reintroducing unbounded work.
 pub(crate) const MAX_BUILD_S2_LEVEL: u8 = 19;
 const _: () = assert!(MAX_BUILD_S2_LEVEL <= crate::geocode_index::format::S2_MAX_LEVEL);
 
@@ -1047,10 +1039,28 @@ const _: () = assert!(
     "the admin cell budget is documented as six faces times 4^10"
 );
 
-/// Factor of the globally smallest S2 cell width at a level that the segment
-/// sampling step uses: a little under half, so a cell the segment crosses
-/// well into is not stepped over (one it clips near a corner can be).
-pub(crate) const SEGMENT_STEP_WIDTH_FACTOR: f64 = 0.4;
+/// Largest distance, as a fraction of the globally smallest S2 cell width at
+/// the level, between a covered lat/lon path and the great-circle chords the
+/// path cover replaces it with. The cover dilates each chord by the distance
+/// it actually proves, so this only decides how finely a long or strongly
+/// curved path is cut: smaller means more chords, larger means more cells
+/// that lie near the path without touching it. At 1/1024 an ordinary street
+/// segment (a few hundred metres at most) is one chord at the default street
+/// level.
+pub(crate) const PATH_COVER_TOLERANCE_WIDTH_FRACTION: f64 = 1.0 / 1024.0;
+
+/// Absolute slack, in S2 face (u, v) units, added to every comparison of the
+/// path cover against the cell grid. It absorbs the f64 rounding of the
+/// projection, the clip and the index conversions (each of order 1e-15), so a
+/// path running on a cell boundary emits the cells on both sides. 1e-9 is
+/// about 6 mm on the ground.
+pub(crate) const PATH_COVER_UV_SLACK: f64 = 1e-9;
+
+/// Longest piece, in radians of the path's own (lat, lon) parameter
+/// (`sqrt(dlat^2 + dlon^2)`), the path cover turns into one chord. It keeps
+/// every chord far from antipodal and short enough that the cube faces it can
+/// reach are found by a fixed dot-product test.
+pub(crate) const PATH_COVER_MAX_PIECE_RAD: f64 = 0.1;
 
 /// Number of pass 3 buckets for bucketed cell assignment. Pass 3 buckets a
 /// cell by its top byte (`cell_id >> 56`), so this must stay 256.

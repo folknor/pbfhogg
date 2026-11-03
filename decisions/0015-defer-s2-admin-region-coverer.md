@@ -1,7 +1,7 @@
 # ADR-0015: Defer the S2 admin region coverer rewrite
 
 Date: 2026-08-20
-Status: Accepted
+Status: Superseded by 0022
 
 ## Decision
 

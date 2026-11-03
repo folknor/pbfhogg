@@ -490,6 +490,14 @@ state.
   panics or aborts the run.
 - `build-geocode-index` no longer deletes an input kept inside the index
   directory, and refuses an index its format cannot address.
+- `build-geocode-index` lists every street, interpolation way and admin
+  polygon under every S2 cell its lines pass through. It used to step along
+  each line at a fraction of a cell and miss a cell the line clips near its
+  corner, which about one street segment in six did at the default level;
+  a query in a cell next to the missed one could miss a street within the
+  search radius. The admin interior hint is now only set on cells wholly inside
+  their polygon (queries still test containment). The index format is
+  unchanged; rebuild to gain the cells.
 - Concurrent library runs no longer share scratch.
 - io_uring writers opened one after another no longer fail with ENOMEM.
 

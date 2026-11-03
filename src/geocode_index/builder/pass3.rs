@@ -12,17 +12,15 @@ use std::path::Path;
 use crate::coord_fmt::e7_to_deg;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
-use s2::metric::MIN_WIDTHMETRIC;
 
-use crate::geo;
 use crate::tunables::{
     ADMIN_CELL_COUNT_BUDGET, GEOCODE_ADDR_CHUNK, GEOCODE_INTERP_CHUNK, GEOCODE_NUM_BUCKETS,
-    GEOCODE_STAGE_B_SORT_WINDOW, GEOCODE_STREET_CHUNK, MAX_SEGMENT_SAMPLES, MAX_SEGMENT_SPAN_DEG,
-    SEGMENT_STEP_WIDTH_FACTOR,
+    GEOCODE_STAGE_B_SORT_WINDOW, GEOCODE_STREET_CHUNK,
 };
 
 use super::Result;
 use super::admin::AssembledPolygon;
+use super::cover::{Vertex, cover_path_raw, cover_segment};
 use super::pass2::SlimInterpWay;
 use crate::error::Error;
 use crate::scratch::{ScratchFile, ScratchPath, ScratchSubdir};
@@ -43,48 +41,20 @@ pub(super) struct AdminCellEntry {
 // S2 cell covering for line segments
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Segment sampling budget
+// The cover itself is `super::cover` (a conservative cover of the path linear
+// in lat/lon, the reader's geometry). Its work grows with the level: a
+// segment of a given length crosses twice as many cells per level. The work
+// is bounded at the only place it can be bounded without discarding coverage,
+// the level: `pack`/`unpack` (see `crate::coord_pack`) refuse any coordinate
+// outside +/-90 latitude and +/-180 longitude, and the far endpoint is
+// unwrapped around the near one, so the widest legal segment is fixed, its
+// cell bound (`cover::worst_case_segment_cells`) a pure function of the level, and
+// `MAX_BUILD_S2_LEVEL` is the largest level whose bound fits
+// `MAX_SEGMENT_CELLS`. `BuildConfig::validate` rejects anything higher with
+// an explicit error before a single blob is read.
 //
-// `cover_segment` walks a segment in steps of a fixed fraction of the
-// globally smallest S2 cell width for the level, so the sample count for one
-// segment is `segment_span / step(level)` and `step(level)` halves with every
-// level. The count therefore doubles per level, without limit.
-//
-// The previous implementation capped the walk at 256 steps, which bounded the
-// work but silently returned an incomplete cover for anything longer - the bug
-// this pass set out to fix. Lifting the cap without bounding the level trades
-// silent under-coverage for unbounded work: at level 30 a single
-// antimeridian-crossing segment needs on the order of 10^10 samples and the
-// same number of hash-set insertions, which is a hang and an OOM, not a build.
-//
-// Both are wrong, so the work is bounded at the only place where it can be
-// bounded without ever discarding coverage: the level. The segment span is not
-// data-dependent in the way it first appears - `pack`/`unpack` (see
-// `crate::coord_pack`) refuse any coordinate outside +/-90 latitude and +/-180
-// longitude, and the sampler measures the far endpoint after unwrapping it
-// around the near one (`wrapped_longitude_delta_e7`), so the longitude delta is
-// at most 180 degrees and two legal endpoints are at most `hypot(180, 180)`
-// (about 254.6) degrees apart in the flat metric this sampler measures with.
-// The budget's span, `MAX_SEGMENT_SPAN_DEG`, is 405 degrees: the bound before
-// unwrapping, `hypot(180, 360)`, rounded up. It is conservative, not wrong; it
-// is kept because lowering it would move the accepted level boundary. The
-// worst-case sample count is therefore a pure function of the level,
-// computable up front, and `MAX_BUILD_S2_LEVEL` is the largest level whose
-// worst case still fits the budget. `BuildConfig::validate` rejects anything
-// higher with an explicit error before a single blob is read.
-//
-// This is a bound, not the right long-term answer. Sampling a segment at
-// sub-cell resolution is inherently quadratic in the wrong places; the
-// structural fix is an exact S2 edge traversal, or an `S2RegionCoverer` over a
-// loop region as in `research/traccar-geocoder`. That rewrite remains deferred
-// in ADR-0015 (`decisions/0015-defer-s2-admin-region-coverer.md`); this builder
-// currently uses bounded segment sampling.
-// ---------------------------------------------------------------------------
-
-// The sampling and flood-fill budgets (`MAX_SEGMENT_SAMPLES`,
-// `MAX_SEGMENT_SPAN_DEG`, `MAX_BUILD_S2_LEVEL`, `ADMIN_CELL_COUNT_BUDGET`)
-// live in `crate::tunables`.
+// The budgets (`MAX_SEGMENT_CELLS`, `MAX_BUILD_S2_LEVEL`,
+// `ADMIN_CELL_COUNT_BUDGET`) live in `crate::tunables`.
 
 const fn max_admin_s2_level_for_cell_budget() -> u8 {
     let mut level = 0;
@@ -97,19 +67,10 @@ const fn max_admin_s2_level_for_cell_budget() -> u8 {
 }
 
 /// Highest S2 level that keeps even a whole-sphere admin polygon inside the
-/// flood-fill cell budget. Admin indexing visits interior cells, unlike the
-/// segment sampler bounded by `MAX_BUILD_S2_LEVEL`.
+/// flood-fill cell budget. Admin indexing visits interior cells, and its edge
+/// cells go into one set per polygon, so this one budget bounds its memory;
+/// its edge-cover work is linear in the polygon's stored edges.
 pub(in crate::geocode_index) const MAX_ADMIN_S2_LEVEL: u8 = max_admin_s2_level_for_cell_budget();
-
-// Admin polygon edges are covered by `cover_segment` at the admin level, so
-// that level is bounded by the segment sampling budget as well as by the
-// flood-fill budget. `BuildConfig::validate` checks both at run time; this
-// pins the constants so raising the admin budget past the sampling one fails
-// to compile.
-const _: () = assert!(
-    MAX_ADMIN_S2_LEVEL <= crate::tunables::MAX_BUILD_S2_LEVEL,
-    "the admin level ceiling must stay inside the segment sampling budget"
-);
 
 const fn admin_s2_cell_count_upper_bound(level: u8) -> u64 {
     if level > 30 {
@@ -129,146 +90,17 @@ pub(in crate::geocode_index) fn admin_level_exceeds_cell_budget(level: u8) -> bo
     admin_s2_cell_count_upper_bound(level) > ADMIN_CELL_COUNT_BUDGET
 }
 
-/// Sampling step for `level`, in degrees: a little under half the globally
-/// smallest S2 cell width at that level. That keeps a cell the segment crosses
-/// well into from being stepped over, but it is not a proof of a complete
-/// cover: a segment can clip a cell near its corner for less than one step
-/// and miss it. Only an exact edge traversal closes that.
-fn segment_step_degrees(level: u8) -> f64 {
-    MIN_WIDTHMETRIC.value(level).to_degrees() * SEGMENT_STEP_WIDTH_FACTOR
-}
-
-/// Fold a possibly-unwrapped longitude in degrees back into (-180, 180].
-fn normalize_longitude_degrees(lon_deg: f64) -> f64 {
-    let folded = (lon_deg + 180.0).rem_euclid(360.0) - 180.0;
-    // `rem_euclid` yields exactly -180.0 only for an input that is an exact
-    // multiple of 360 below it, so this is a representable-value test, not an
-    // approximate one.
-    #[allow(clippy::float_cmp)]
-    let on_west_edge = folded == -180.0;
-    if on_west_edge { 180.0 } else { folded }
-}
-
-/// Samples the longest legal segment would need at `level`.
-fn worst_case_segment_samples(level: u8) -> f64 {
-    MAX_SEGMENT_SPAN_DEG / segment_step_degrees(level)
-}
-
-/// Whether `level` can make a single segment exceed the sampling budget.
-pub(in crate::geocode_index) fn level_exceeds_sampling_budget(level: u8) -> bool {
-    worst_case_segment_samples(level) > MAX_SEGMENT_SAMPLES
-}
-
-/// Cover a line segment by sampling intermediate points to find the S2 cells
-/// the segment passes through at the given level.
-///
-/// Calls `emit(cell_id)` once for each distinct cell: the cells holding the
-/// two stored vertices always, and every cell a sample lands in.
-///
-/// `level` must have passed [`level_exceeds_sampling_budget`] - that is what
-/// `BuildConfig::validate` enforces for the street, coarse and admin levels.
-/// Given that, the sample count for any legal pair of endpoints is at most
-/// `MAX_SEGMENT_SAMPLES`. Were the formula and the coordinate domain ever to
-/// drift apart, the walk would have to either exceed the budget or stop short
-/// and return an incomplete cover silently, so the count is asserted instead.
-fn cover_segment(
-    lat1_e7: i32,
-    lon1_e7: i32,
-    lat2_e7: i32,
-    lon2_e7: i32,
-    level: u8,
-    mut emit: impl FnMut(u64),
-) {
-    let lat1 = e7_to_deg(lat1_e7 as f64);
-    let lon1 = e7_to_deg(lon1_e7 as f64);
-    let lat2 = e7_to_deg(lat2_e7 as f64);
-    let raw_lon2 = e7_to_deg(lon2_e7 as f64);
-    // Unwrap the far endpoint around the near one. A segment from 179.9 to
-    // -179.9 is 0.2 degrees wide, not 359.8: sampling it in the raw frame
-    // walks the long way around the globe and covers half the planet in
-    // cells. Sampled longitudes are normalized again below.
-    let lon2 = lon1
-        + e7_to_deg(
-            geo::wrapped_longitude_delta_e7(i64::from(lon2_e7) - i64::from(lon1_e7)) as f64,
-        );
-
-    // The endpoint cells are taken from the vertices exactly as stored, not
-    // from the samples, and seeded into the cover before and after the walk,
-    // so the cell a query at either vertex looks up is always emitted. The
-    // samples cannot promise that: `normalize_longitude_degrees` maps -180 to
-    // +180, and off the poles the antimeridian is S2 face 3's midline, where
-    // the sign of sin(+-pi) puts -180 and +180 in different cells at every
-    // level; the unwrapped `lon2` can be the +180 spelling of a -180 vertex;
-    // and both the fold and `lon1 + 1.0 * (lon2 - lon1)` can land an ulp off
-    // the vertex, across a cell edge. The t=0 and t=1 samples are skipped
-    // only when they are bit-identical to their vertex, so they would name
-    // the cell already seeded; where the fold or the interpolation moved the
-    // value they still run, and the seam twin of a vertex at -180 stays in
-    // the cover. On the usual segment that saves two cell computations.
-    let c1 = CellID::from(LatLng::from_degrees(lat1, lon1))
-        .parent(level as u64)
-        .0;
-    let c2 = CellID::from(LatLng::from_degrees(lat2, raw_lon2))
-        .parent(level as u64)
-        .0;
-
-    // Sample at less than half the globally-smallest S2 cell width for this
-    // level. Unlike the old hand-written table, this covers every valid level,
-    // and unlike the old 256-step cap it never returns a partial cover for a
-    // long segment: the work is bounded by rejecting the level, not by
-    // truncating the walk. See the budget commentary above.
-    let dlat = lat2 - lat1;
-    let dlon = lon2 - lon1;
-    let seg_len_deg = (dlat.powi(2) + dlon.powi(2)).sqrt();
-
-    let step_deg = segment_step_degrees(level);
-
-    let exact_steps = (seg_len_deg / step_deg).ceil();
-    assert!(
-        exact_steps <= MAX_SEGMENT_SAMPLES,
-        "cover_segment at level {level} wants {exact_steps} samples, over the \
-         {MAX_SEGMENT_SAMPLES} budget: BuildConfig::validate should have \
-         rejected this level"
-    );
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let steps = (exact_steps as usize).max(1);
-    let mut seen = rustc_hash::FxHashSet::default();
-    seen.insert(c1);
-    emit(c1);
-    for i in 0..=steps {
-        let t = i as f64 / steps as f64;
-        let lat = lat1 + t * (lat2 - lat1);
-        let lon = normalize_longitude_degrees(lon1 + t * (lon2 - lon1));
-        let is_vertex =
-            (i == 0 && lat.to_bits() == lat1.to_bits() && lon.to_bits() == lon1.to_bits())
-                || (i == steps
-                    && lat.to_bits() == lat2.to_bits()
-                    && lon.to_bits() == raw_lon2.to_bits());
-        if is_vertex {
-            continue;
-        }
-        let c = CellID::from(LatLng::from_degrees(lat, lon))
-            .parent(level as u64)
-            .0;
-        if seen.insert(c) {
-            emit(c);
-        }
-    }
-    if seen.insert(c2) {
-        emit(c2);
-    }
-}
-
 /// Cover at the fine level and emit each coarse parent once per segment.
+/// The coarse cover is the set of parents of the fine one, which is
+/// conservative because the fine one is: a coarse cell the path meets holds
+/// a fine cell the path meets.
 /// Common segments keep their coarse-cell set in a four-entry stack array;
 /// a hash set is allocated only when a segment reaches a fifth distinct
 /// coarse cell, so long segments remain correct without penalizing the usual
 /// short segments with another allocation.
 fn cover_segment_fused(
-    lat1_e7: i32,
-    lon1_e7: i32,
-    lat2_e7: i32,
-    lon2_e7: i32,
+    a: &Vertex,
+    b: &Vertex,
     fine_level: u8,
     coarse_level: u8,
     mut emit: impl FnMut(u64, Option<u64>),
@@ -277,7 +109,7 @@ fn cover_segment_fused(
     let mut coarse_n = 0usize;
     let mut coarse_overflow: Option<rustc_hash::FxHashSet<u64>> = None;
 
-    cover_segment(lat1_e7, lon1_e7, lat2_e7, lon2_e7, fine_level, |fine_cid| {
+    cover_segment(a, b, fine_level, |fine_cid| {
         let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
         let coarse_to_emit = if coarse_seen[..coarse_n].contains(&coarse_cid) {
             None
@@ -310,7 +142,9 @@ fn cover_way_segments(
     coarse_level: u8,
     mut emit: impl FnMut(u64, Option<u64>, u16),
 ) {
-    let mut iter = nodes.iter();
+    // Each node is placed on the sphere once and shared by the two segments
+    // it ends.
+    let mut iter = nodes.iter().map(|n| Vertex::new(n.lat_e7, n.lon_e7));
     let Some(mut prev) = iter.next() else {
         return;
     };
@@ -318,15 +152,9 @@ fn cover_way_segments(
         // The span holds at most u16::MAX nodes, so each segment index fits.
         #[allow(clippy::cast_possible_truncation)]
         let segment = seg_idx as u16;
-        cover_segment_fused(
-            prev.lat_e7,
-            prev.lon_e7,
-            next.lat_e7,
-            next.lon_e7,
-            fine_level,
-            coarse_level,
-            |fine, coarse| emit(fine, coarse, segment),
-        );
+        cover_segment_fused(&prev, &next, fine_level, coarse_level, |fine, coarse| {
+            emit(fine, coarse, segment);
+        });
         prev = next;
     }
 }
@@ -1031,8 +859,8 @@ pub(super) fn assign_admin_cells(
 ) -> Vec<AdminCellEntry> {
     use rayon::prelude::*;
 
-    // Per-polygon work is independent: edge-cell cover + centroid flood-fill
-    // read the polygon vertices in isolation and produce a disjoint set of
+    // Per-polygon work is independent: edge-cell cover + flood fill read the
+    // polygon vertices in isolation and produce a disjoint set of
     // `AdminCellEntry`s. `par_iter().flat_map_iter().collect()` preserves
     // input ordering so downstream `entries.sort_unstable_by_key(cell_id)`
     // in `write_admin_index` gives a byte-identical result to the sequential
@@ -1067,28 +895,26 @@ fn admin_cells_for_polygon(
 
     let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
 
-    // Producer invariant: assemble_rings emits only explicitly closed rings;
-    // simplify_ring retains both endpoints, including the repeated first point.
-    // Thus windows(2) includes the closing edge for exterior and hole rings.
-    // Adding another last-to-first segment would cover a zero-length edge on
-    // every produced ring. Generic parse_polygon_rings also accepts open rings,
-    // but this function consumes AssembledPolygon from the builder.
-    // Edge cells: cover each ring segment using cover_segment
+    // Edge cells: every cell the boundary of the reader's point-in-polygon
+    // predicate passes through. That predicate is
+    // `geo::point_in_ring_with_antimeridian` over these very rings (the
+    // reader parses the stored vertices the same way), so its boundary is
+    // each ring's planar edges in `geo::pip_ring_frame`, including
+    // `point_in_ring`'s implicit closing edge from the last vertex to the
+    // first (zero length for a closed ring as given, 360 degrees per turn for
+    // an unwrapped ring that winds around a pole), and, for an unwrapped
+    // ring, the antimeridian over the ring's latitude range: its +/-360
+    // retries are not periodic, so the answer can change across +/-180 where
+    // no edge runs (above and below the ring's latitudes every retry is
+    // outside, so the seam carries no change there). The antimeridian is a
+    // grid line of every S2 face it crosses, so that change only ever sits on
+    // cell boundaries; covering it keeps the closed cells on both sides out of
+    // the interior too. With all of it covered no cell outside `edge_cells`
+    // holds a change of the predicate, so the centre test below decides a
+    // whole cell.
     let mut edge_cells = rustc_hash::FxHashSet::default();
-    for v in poly.vertices.windows(2) {
-        if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL {
-            continue;
-        }
-        cover_segment(
-            v[0].lat_e7,
-            v[0].lon_e7,
-            v[1].lat_e7,
-            v[1].lon_e7,
-            admin_level,
-            |cid| {
-                edge_cells.insert(cid);
-            },
-        );
+    for ring in std::iter::once(&ext_f64).chain(hole_rings.iter()) {
+        cover_pip_ring_boundary(ring, admin_level, &mut edge_cells);
     }
 
     let mut entries: Vec<AdminCellEntry> = edge_cells
@@ -1150,6 +976,34 @@ fn admin_cells_for_polygon(
         }
     }
     entries
+}
+
+/// Insert into `cells` every cell at `level` on the boundary the point-in-ring
+/// test has for `ring` (`(lon, lat)` degrees, as `geo::point_in_ring` takes
+/// it); see `admin_cells_for_polygon`.
+fn cover_pip_ring_boundary(ring: &[(f64, f64)], level: u8, cells: &mut rustc_hash::FxHashSet<u64>) {
+    let frame = crate::geo::pip_ring_frame(ring);
+    let n = frame.len();
+    if n == 0 {
+        return;
+    }
+    for i in 0..n {
+        let (lon1, lat1) = frame[i];
+        let (lon2, lat2) = frame[(i + 1) % n];
+        cover_path_raw((lat1, lon1), (lat2, lon2), level, |cell| {
+            cells.insert(cell);
+        });
+    }
+    if matches!(frame, std::borrow::Cow::Owned(_)) {
+        let (lat_min, lat_max) = frame
+            .iter()
+            .fold((90.0f64, -90.0f64), |(lo, hi), &(_, lat)| {
+                (lo.min(lat), hi.max(lat))
+            });
+        cover_path_raw((lat_min, 180.0), (lat_max, 180.0), level, |cell| {
+            cells.insert(cell);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1069,15 @@ mod tests {
         assert!(chunk <= GEOCODE_ADDR_CHUNK);
     }
 
+    fn cover_e7(lat1: i32, lon1: i32, lat2: i32, lon2: i32, level: u8, emit: impl FnMut(u64)) {
+        cover_segment(
+            &Vertex::new(lat1, lon1),
+            &Vertex::new(lat2, lon2),
+            level,
+            emit,
+        );
+    }
+
     #[test]
     fn cover_segment_same_cell() {
         // Two very close points in Copenhagen - should be in the same S2 cell at level 17.
@@ -1224,7 +1087,7 @@ mod tests {
         let lon2 = 125_683_100;
 
         let mut cells = Vec::new();
-        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+        cover_e7(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
 
         assert_eq!(
             cells.len(),
@@ -1243,7 +1106,7 @@ mod tests {
         let lon2 = 125_700_000; // 12.5700
 
         let mut cells = Vec::new();
-        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+        cover_e7(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
 
         assert!(
             cells.len() >= 2,
@@ -1268,7 +1131,7 @@ mod tests {
             .0;
 
         let mut cells = Vec::new();
-        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+        cover_e7(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
 
         assert!(cells.contains(&c1), "first endpoint cell must be included");
         assert!(cells.contains(&c2), "second endpoint cell must be included");
@@ -1296,7 +1159,7 @@ mod tests {
                 .0
             };
             let mut cells = Vec::new();
-            cover_segment(lat1, lon1, lat2, lon2, 12, |c| cells.push(c));
+            cover_e7(lat1, lon1, lat2, lon2, 12, |c| cells.push(c));
             assert!(
                 cells.contains(&endpoint(lat1, lon1)),
                 "first endpoint cell missing for ({lat1}, {lon1}) -> ({lat2}, {lon2})"
@@ -1306,29 +1169,15 @@ mod tests {
                 "second endpoint cell missing for ({lat1}, {lon1}) -> ({lat2}, {lon2})"
             );
         }
-        // The +180 spelling of a -180 vertex is the cell across the seam; the
-        // normalised t=0 sample keeps it in the cover alongside the vertex's
-        // own cell.
-        let mut cells = Vec::new();
-        cover_segment(0, -1_800_000_000, 100_000_000, -1_800_000_000, 12, |c| {
-            cells.push(c);
-        });
-        let minus = CellID::from(LatLng::from_degrees(0.0, -180.0)).parent(12).0;
-        let plus = CellID::from(LatLng::from_degrees(0.0, 180.0)).parent(12).0;
-        assert_ne!(minus, plus, "fixture must sit on the face 3 seam");
-        assert!(
-            cells.contains(&plus),
-            "the seam twin must stay in the cover"
-        );
     }
 
-    /// The old implementation capped the walk at 256 steps, so it could emit
+    /// An early implementation capped the walk at 256 steps, so it could emit
     /// at most 257 cells for a segment of any length. The lower bound here is
     /// what makes that a failure rather than a pass.
     #[test]
     fn cover_segment_long_segment_is_complete_and_unique() {
         let mut cells = Vec::new();
-        cover_segment(
+        cover_e7(
             550_000_000,
             120_000_000,
             550_000_000,
@@ -1353,10 +1202,8 @@ mod tests {
     fn fused_segment_deduplicates_after_four_coarse_cells() {
         let mut entries = Vec::new();
         cover_segment_fused(
-            556_700_000,
-            125_600_000,
-            556_700_000,
-            135_000_000,
+            &Vertex::new(556_700_000, 125_600_000),
+            &Vertex::new(556_700_000, 135_000_000),
             17,
             14,
             |fine, coarse| entries.push((fine, coarse)),
@@ -1385,35 +1232,6 @@ mod tests {
         );
     }
 
-    /// `MAX_BUILD_S2_LEVEL` is not a taste judgement, it is exactly the
-    /// boundary of `MAX_SEGMENT_SAMPLES`. Walking every level and asserting
-    /// the boundary lands where the constant says it does means the constant
-    /// cannot be raised without raising the budget it is derived from - which
-    /// is the whole enforcement mechanism for the unbounded-work hazard.
-    #[test]
-    fn max_build_level_is_exactly_the_sampling_budget_boundary() {
-        for level in 0..=MAX_BUILD_S2_LEVEL {
-            assert!(
-                !level_exceeds_sampling_budget(level),
-                "level {level} is accepted but its worst case is {} samples, over the \
-                 {MAX_SEGMENT_SAMPLES} budget",
-                worst_case_segment_samples(level)
-            );
-        }
-        assert!(
-            level_exceeds_sampling_budget(MAX_BUILD_S2_LEVEL + 1),
-            "level {} must be over budget, otherwise the cap is lower than it needs to be \
-             and rejects levels that build fine",
-            MAX_BUILD_S2_LEVEL + 1
-        );
-        // The budget must actually bind somewhere below the S2 format limit,
-        // or the whole bound is vacuous.
-        assert!(
-            level_exceeds_sampling_budget(30),
-            "level 30 must be over budget: it is the level that motivated the bound"
-        );
-    }
-
     #[test]
     fn max_admin_level_is_exactly_the_flood_fill_cell_budget_boundary() {
         for level in 0..=MAX_ADMIN_S2_LEVEL {
@@ -1434,31 +1252,96 @@ mod tests {
         );
     }
 
-    /// The analytic worst case is only a bound if the implementation really
-    /// respects it. After the far endpoint is unwrapped around the near one
-    /// the longitude delta is at most 180 degrees, so the widest segment a
-    /// legal pair of coordinates can produce is pole to pole across half the
-    /// globe in longitude, `hypot(180, 180)` degrees; its actual emission
-    /// count must fall under `worst_case_segment_samples` for the level.
-    /// (Pole to pole from -180 to +180 is not it: that unwraps to a zero
-    /// longitude delta, a meridian.)
+    /// With the edge cover conservative in the point-in-polygon predicate's
+    /// own geometry, a cell flagged interior holds no change of that
+    /// predicate: every point of it is inside. Checked on a grid of points in
+    /// each flagged cell, for an ordinary ring with a hole, and for a ring
+    /// whose unwrapped longitudes span more than 360 degrees, where the
+    /// predicate's +/-360 retries change its answer across the antimeridian
+    /// with no edge there.
     #[test]
-    fn widest_legal_segment_stays_under_its_analytic_worst_case() {
-        const LEVEL: u8 = 12;
-        let mut emitted = 0usize;
-        cover_segment(-900_000_000, 0, 900_000_000, 1_800_000_000, LEVEL, |_| {
-            emitted += 1;
-        });
-        let bound = worst_case_segment_samples(LEVEL);
-        assert!(
-            (emitted as f64) <= bound,
-            "widest legal segment emitted {emitted} cells at level {LEVEL}, over the \
-             analytic bound of {bound}"
-        );
-        assert!(
-            emitted > 1_000,
-            "the widest legal segment must produce a real cover, got {emitted} cells"
-        );
+    fn interior_flagged_cells_are_wholly_inside() {
+        let ring = |pts: &[(i32, i32)]| -> Vec<NodeCoord> {
+            pts.iter()
+                .map(|&(lon_deg, lat_deg)| NodeCoord {
+                    lat_e7: lat_deg * 10_000_000,
+                    lon_e7: lon_deg * 10_000_000,
+                })
+                .collect()
+        };
+        let mut holed = ring(&[(0, 0), (9, 1), (10, 10), (1, 9), (0, 0)]);
+        holed.push(RING_SENTINEL);
+        holed.extend(ring(&[(3, 3), (6, 4), (5, 6), (3, 3)]));
+        let seam = ring(&[
+            (170, 0),
+            (-70, 30),
+            (50, 60),
+            (170, 60),
+            (-70, 60),
+            (50, 30),
+            (170, 0),
+        ]);
+        for (vertices, level) in [(holed, 7u8), (seam, 4u8)] {
+            let poly = AssembledPolygon {
+                admin_level: 8,
+                name_offset: 0,
+                country_code_offset: 0,
+                area: 1.0,
+                vertices,
+            };
+            let (ext, holes) = parse_polygon_rings(poly.vertices.iter().copied());
+            let hole_slices: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+            let entries = admin_cells_for_polygon(0, &poly, level);
+            let interior: Vec<_> = entries.iter().filter(|e| e.is_interior).collect();
+            assert!(!interior.is_empty(), "fixture must have interior cells");
+            if level == 4 {
+                // The antimeridian is a grid line of every face it crosses, so
+                // the predicate's change there sits on cell boundaries: the
+                // cells on its two sides at lat 45 hold opposite answers at
+                // the shared boundary point, and neither may be interior.
+                assert!(
+                    crate::geo::point_in_polygon(179.999, 45.0, &ext, &hole_slices)
+                        && !crate::geo::point_in_polygon(-179.999, 45.0, &ext, &hole_slices),
+                    "fixture must change its answer across the antimeridian at lat 45"
+                );
+                for lon in [179.999, -179.999] {
+                    let cell = CellID::from(LatLng::from_degrees(45.0, lon)).parent(4).0;
+                    assert!(
+                        entries.iter().any(|e| e.cell_id == cell && !e.is_interior),
+                        "the seam cell at lon {lon} must be an edge cell"
+                    );
+                }
+            }
+            for entry in interior {
+                let cell = s2::cell::Cell::from(CellID(entry.cell_id));
+                let corners: Vec<s2::point::Point> = (0..4).map(|k| cell.vertex(k)).collect();
+                const N: usize = 24;
+                for a in 0..=N {
+                    for b in 0..=N {
+                        let (s, t) = (a as f64 / N as f64, b as f64 / N as f64);
+                        let mix = |k: usize| corners[k].0;
+                        let v = mix(0) * ((1.0 - s) * (1.0 - t))
+                            + mix(1) * (s * (1.0 - t))
+                            + mix(2) * (s * t)
+                            + mix(3) * ((1.0 - s) * t);
+                        let ll = LatLng::from(s2::point::Point(v.normalize()));
+                        assert!(
+                            crate::geo::point_in_polygon(
+                                ll.lng.deg(),
+                                ll.lat.deg(),
+                                &ext,
+                                &hole_slices
+                            ),
+                            "interior cell {:x} at level {level} holds an outside point \
+                             ({}, {})",
+                            entry.cell_id,
+                            ll.lat.deg(),
+                            ll.lng.deg()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

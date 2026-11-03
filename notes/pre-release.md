@@ -383,22 +383,20 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-173: geocode fine search radius reaches past the cells the reader reads
+### WRK-174: interpolation endpoints are matched within nine street cells
 
-Found 2026-11-03 while replacing the segment sampler. The reader looks up
-the query's cell and its eight neighbours (`cell_neighborhood` in
-`src/geocode_index/reader.rs`) and keeps candidates within the search
-radius, default 75 m at the fine level (`GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M`,
-street level 17). The ring of neighbours is only guaranteed to reach one
-smallest cell width, `MIN_WIDTH(17)`, about 46 m: a street 46 to 75 m from
-the query can sit outside all nine cells, so the fine search can return a
-farther street, or none, while a nearer one lies within the radius (the
-coarse fallback fills a class only when the fine search found nothing).
-Decide whether the radius is a promise (then the neighbourhood must grow
-with radius / cell width, or the default level or radius change) or a
-cutoff (then the docs should say results are the nearest within the nine
-cells). A synthetic fixture with a street at 60 m beyond the block, and a
-farther one inside it, would pin it.
+Found 2026-11-03 measuring the geocode query search. The builder resolves an
+interpolation way's end numbers from address points in the endpoint's
+street-level cell and its eight neighbours
+(`src/geocode_index/builder/interp.rs`, the comment above the endpoint
+scan), so its reach is about one cell width and moves with
+`--street-level`: the Germany extract (`germany-20260224-seq4704`) resolves
+71 of 78 interpolation ways at the default level 17 and 77 of 78 at level
+16. An unresolved way never answers a query. The comment there records the
+policy as standing until endpoint matching has its own stated radius;
+decide that radius (and whether it should search in full, as the reader
+now does, ADR-0023) or say in the docs that endpoints must coincide within
+about a street cell.
 
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 

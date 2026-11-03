@@ -490,7 +490,7 @@ pub fn approx_distance_sq(
 /// antimeridian. Inputs produced from legal longitudes are at most 2 PI apart,
 /// but `rem_euclid` also keeps this total for larger finite inputs.
 #[inline]
-fn wrapped_longitude_delta(delta: f64) -> f64 {
+pub(crate) fn wrapped_longitude_delta(delta: f64) -> f64 {
     (delta + PI).rem_euclid(2.0 * PI) - PI
 }
 
@@ -539,7 +539,12 @@ pub fn e7_to_rad(e7: i32) -> f64 {
 ///
 /// All coordinates are in radians. `cos_lat` is precomputed.
 /// Returns `(t, distance_sq)` where `t ∈ [0, 1]` is the parameter along the
-/// segment and `distance_sq` is in radians².
+/// segment and `distance_sq` is in radians²: the smallest
+/// [`approx_distance_sq`] from the query to any point of the segment, which
+/// is the path from A to B in A's longitude frame (B taken the shorter way
+/// around). The geocode index lists a segment under every cell this path
+/// meets, and the reader's search relies on the distance being to a point on
+/// it.
 #[inline]
 pub fn point_to_segment_distance_sq(
     px: f64,
@@ -554,17 +559,67 @@ pub fn point_to_segment_distance_sq(
     // segment crossing +/-180 degrees is treated as almost a full world wide.
     let bx = ax + wrapped_longitude_delta(bx - ax);
     let px = ax + wrapped_longitude_delta(px - ax);
+    let near = project_on_segment(px, py, ax, ay, bx, by, cos_lat);
+
+    // The query's longitude is periodic, so the distance is the smallest over
+    // its images a full turn apart. The segment spans at most half a turn
+    // east or west of A and the image above lies within half a turn of A, so
+    // the only other image that can be nearer is the one a turn away on B's
+    // side, beyond B (the one on the far side of A is at least half a turn
+    // from every point of the segment, no nearer than the image above). Near
+    // a pole, where longitude costs little, it can win: a query at longitude
+    // -170 is 20 degrees from a segment ending at 170, not 170 degrees from
+    // its start at 0.
+    let other = if bx >= ax && px < ax {
+        px + 2.0 * PI
+    } else if bx < ax && px > ax {
+        px - 2.0 * PI
+    } else {
+        return near;
+    };
+    // That image is beyond B, so its longitude gap to B bounds its gap to
+    // every point of the segment.
+    let gap = (other - bx).abs() * cos_lat;
+    if gap * gap >= near.1 {
+        return near;
+    }
+    let far = project_on_segment(other, py, ax, ay, bx, by, cos_lat);
+    if far.1 < near.1 { far } else { near }
+}
+
+/// [`point_to_segment_distance_sq`] for one image of the query, every
+/// longitude already in one frame.
+#[inline]
+fn project_on_segment(
+    px: f64,
+    py: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+    cos_lat: f64,
+) -> (f64, f64) {
     let dx = (bx - ax) * cos_lat;
     let dy = by - ay;
     let len_sq = dx * dx + dy * dy;
 
-    let t = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
-        0.0
-    } else {
-        let dot = ((px - ax) * cos_lat) * dx + (py - ay) * dy;
-        dot / len_sq
-    };
-    let t = t.clamp(0.0, 1.0);
+    // Only a segment of no length in this metric (both ends at one point, or
+    // for a query at a pole, where longitude costs nothing, at one latitude)
+    // has nothing to project onto. However short a
+    // segment is otherwise, the quotient below is finite, and one that
+    // overflows clamps to an end: replacing a short segment by its ends would
+    // put a query on its middle at a positive distance.
+    if len_sq == 0.0 {
+        let to_a = approx_distance_sq(py, px, ay, ax, cos_lat);
+        let to_b = approx_distance_sq(py, px, by, bx, cos_lat);
+        return if to_b < to_a {
+            (1.0, to_b)
+        } else {
+            (0.0, to_a)
+        };
+    }
+    let dot = ((px - ax) * cos_lat) * dx + (py - ay) * dy;
+    let t = (dot / len_sq).clamp(0.0, 1.0);
 
     let closest_x = ax + t * (bx - ax);
     let closest_y = ay + t * (by - ay);
@@ -1111,6 +1166,53 @@ mod tests {
         );
         assert!((t - 0.5).abs() < 1e-12, "t={t}");
         assert!(distance < 1e-24, "distance={distance}");
+    }
+
+    /// Near a pole longitude costs little, so the query image a full turn
+    /// away can be the nearer one: at 89.99 N a query at -170 is 20 degrees
+    /// of longitude from the end at 170 of a segment from 0 to 170, not 170
+    /// degrees from its start.
+    #[test]
+    fn segment_distance_takes_the_nearest_longitude_image() {
+        let lat = 89.99_f64.to_radians();
+        let cos_lat = lat.cos();
+        for (q, a, b) in [(-170.0, 0.0, 170.0), (170.0, 0.0, -170.0)] {
+            let (t, distance) = point_to_segment_distance_sq(
+                f64::to_radians(q),
+                lat,
+                f64::to_radians(a),
+                lat,
+                f64::to_radians(b),
+                lat,
+                cos_lat,
+            );
+            let to_b =
+                approx_distance_sq(lat, f64::to_radians(q), lat, f64::to_radians(b), cos_lat);
+            assert!((t - 1.0).abs() < 1e-12, "query {q}: t={t}");
+            assert!(
+                (distance - to_b).abs() <= to_b * 1e-12,
+                "query {q}: {distance} != {to_b}"
+            );
+        }
+    }
+
+    /// A segment far shorter than the old degenerate threshold is still
+    /// projected onto: next to a pole, a query on either end or on its middle
+    /// is at distance zero, not at the distance to an end.
+    #[test]
+    fn tiny_segment_is_projected_onto() {
+        let lat = 89.999_999_9_f64.to_radians();
+        let cos_lat = lat.cos();
+        let step = 0.000_000_1_f64.to_radians();
+        for (query, t_expected) in [(0.0, 0.0), (step, 0.5), (2.0 * step, 1.0)] {
+            let (t, distance) =
+                point_to_segment_distance_sq(query, lat, 0.0, lat, 2.0 * step, lat, cos_lat);
+            assert!((t - t_expected).abs() < 1e-9, "query {query}: t={t}");
+            assert!(distance < 1e-40, "query {query}: distance={distance}");
+        }
+        // No length at all: the segment is its one point.
+        let (t, distance) = point_to_segment_distance_sq(step, lat, step, lat, step, lat, cos_lat);
+        assert_eq!((t, distance), (0.0, 0.0));
     }
 
     #[test]

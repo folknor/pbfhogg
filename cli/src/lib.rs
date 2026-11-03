@@ -2343,13 +2343,17 @@ enum Command {
             default_value_t = GeocodeBuildConfig::default().max_admin_vertices
         )]
         max_admin_vertices: u16,
-        /// Fine-level max search distance in meters
+        /// Fine-level search distance in meters: queries answer the nearest
+        /// closer than this; limited to a fixed number of cell widths at
+        /// --street-level
         #[arg(
             long,
             default_value_t = GeocodeBuildConfig::default().fine_search_radius_m
         )]
         search_radius: f32,
-        /// Coarse-level max search distance in meters
+        /// Coarse-level search distance in meters, the fallback for a class
+        /// with nothing within --search-radius; limited to a fixed number of
+        /// cell widths at --coarse-level
         #[arg(
             long,
             default_value_t = GeocodeBuildConfig::default().coarse_search_radius_m

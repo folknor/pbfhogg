@@ -1253,6 +1253,44 @@ fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
     );
 }
 
+/// Queries binary-search the cell files and test ID ranges against them, so
+/// cells out of order would read as missing ones: open refuses them.
+#[test]
+fn reader_rejects_cells_out_of_order() {
+    use pbfhogg::geocode_index::format::GeoCell;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build index");
+    let cells_path = index_dir.join("geo_cells.bin");
+    let mut cells = std::fs::read(&cells_path).expect("read cells");
+    assert!(
+        cells.len() >= 2 * GeoCell::SIZE,
+        "the fixture needs two fine cells"
+    );
+    let (first, rest) = cells.split_at_mut(GeoCell::SIZE);
+    first.swap_with_slice(&mut rest[..GeoCell::SIZE]);
+    std::fs::write(&cells_path, cells).expect("reorder cells");
+    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .err()
+        .expect("out-of-order cells must be a typed open error");
+    assert!(
+        err.to_string()
+            .contains("cell IDs are not strictly ascending"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Reader open-time validation must cover every offset-into-a-file
 /// relationship in the format, not just the geo entry lists. Validating some
 /// of the kinds and not the others is how a truncated file opens successfully
@@ -3201,5 +3239,289 @@ fn pass_two_a_refuses_a_way_blob_claiming_nodes() {
         dir.path(),
         pbfhogg::ElementKind::Node,
         pbfhogg::ElementKind::Way,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The search radius is searched in full
+//
+// The reader used to read only the query's cell and its eight neighbours, at
+// each level. Those nine cells reach about one smallest cell width from the
+// query (some 46 m at the default street level, 367 m at the default coarse
+// level), less than the default radii, so a street or address inside the
+// radius but outside the nine cells was passed over: for a farther one inside
+// them, or for nothing. The fixtures below place a record just there, found
+// by asking s2 which cells the query reads first.
+// ---------------------------------------------------------------------------
+
+/// The query's cell at `level` and its neighbours: the 3x3 block a query
+/// reads first.
+fn query_block(lat: f64, lon: f64, level: u8) -> Vec<u64> {
+    let (cell, mut cells) = admin_cell_neighborhood(lat, lon, level);
+    cells.push(cell);
+    cells
+}
+
+fn cell_at(lat: f64, lon: f64, level: u8) -> u64 {
+    s2::cellid::CellID::from(s2::latlng::LatLng::from_degrees(lat, lon))
+        .parent(u64::from(level))
+        .0
+}
+
+/// The point `metres` from `(lat, lon)` toward bearing `theta` (radians from
+/// north), in the reader's distance (latitude, and longitude scaled by the
+/// cosine of the query's latitude).
+fn toward(lat: f64, lon: f64, metres: f64, theta: f64) -> (f64, f64) {
+    let d = metres / pbfhogg::geo::EARTH_RADIUS_M;
+    (
+        lat + (d * theta.cos()).to_degrees(),
+        lon + (d * theta.sin() / lat.to_radians().cos()).to_degrees(),
+    )
+}
+
+fn to_e7(degrees: f64) -> i32 {
+    #[allow(clippy::cast_possible_truncation)]
+    let e7 = (degrees * 1e7).round() as i32;
+    e7
+}
+
+/// A short straight way crossing bearing `theta` at right angles, `metres`
+/// from the query, `half` metres to each side: its nearest point to the
+/// query is its middle, at `metres`. Returned as E7 endpoints.
+fn crossing(lat: f64, lon: f64, metres: f64, theta: f64, half: f64) -> [(i32, i32); 2] {
+    let (mid_lat, mid_lon) = toward(lat, lon, metres, theta);
+    let side = theta + std::f64::consts::FRAC_PI_2;
+    let ends = [half, -half].map(|h| {
+        let (dlat, dlon) = toward(lat, lon, h, side);
+        (to_e7(mid_lat + dlat - lat), to_e7(mid_lon + dlon - lon))
+    });
+    [ends[0], ends[1]]
+}
+
+/// Whether every sampled point of the way between `ends` lies in `cells`
+/// (`inside`), or none does (`!inside`).
+fn way_cells_all(ends: [(i32, i32); 2], level: u8, cells: &[u64], inside: bool) -> bool {
+    (0..=64).all(|k| {
+        let t = f64::from(k) / 64.0;
+        let lat = (f64::from(ends[0].0) + t * f64::from(ends[1].0 - ends[0].0)) / 1e7;
+        let lon = (f64::from(ends[0].1) + t * f64::from(ends[1].1 - ends[0].1)) / 1e7;
+        cells.contains(&cell_at(lat, lon, level)) == inside
+    })
+}
+
+/// A way's two ends, `(lat, lon)` in E7.
+type WayEnds = [(i32, i32); 2];
+
+/// A query near (35, 44) and a bearing from it along which a way crossing at
+/// `metres` lies wholly outside the query's 3x3 block at `level`, with, when
+/// `inside_metres` is given, a second bearing along which a way crossing at
+/// that distance lies wholly inside it. Near (35.26, 45), a corner of the S2
+/// cube, cells are near their smallest, so the block reaches least there.
+fn outside_block_geometry(
+    level: u8,
+    metres: f64,
+    half: f64,
+    inside_metres: Option<f64>,
+) -> (f64, f64, WayEnds, Option<WayEnds>) {
+    for step in 0..400 {
+        let lat = 35.0 + f64::from(step) * 0.000_13;
+        let lon = 44.0 + f64::from(step) * 0.000_07;
+        let block = query_block(lat, lon, level);
+        let bearings = (0..180).map(|k| f64::from(k) * std::f64::consts::TAU / 180.0);
+        let Some(outside) = bearings
+            .clone()
+            .map(|theta| crossing(lat, lon, metres, theta, half))
+            .find(|&ends| way_cells_all(ends, level, &block, false))
+        else {
+            continue;
+        };
+        let Some(inside_metres) = inside_metres else {
+            return (lat, lon, outside, None);
+        };
+        if let Some(inside) = bearings
+            .map(|theta| crossing(lat, lon, inside_metres, theta, half))
+            .find(|&ends| way_cells_all(ends, level, &block, true))
+        {
+            return (lat, lon, outside, Some(inside));
+        }
+    }
+    panic!("no query near (35, 44) has the geometry the test needs");
+}
+
+/// Nodes and a named residential way between `ends`, IDs from `id`.
+fn named_way(id: i64, ends: [(i32, i32); 2], name: &'static str) -> (Vec<TestNode>, TestWay) {
+    let nodes = ends
+        .iter()
+        .zip(id..)
+        .map(|(&(lat, lon), node)| TestNode {
+            id: node,
+            lat,
+            lon,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    let way = TestWay {
+        id,
+        refs: vec![id, id + 1],
+        tags: vec![("highway", "residential"), ("name", name)],
+        meta: None,
+    };
+    (nodes, way)
+}
+
+fn build_default_index(dir: &Path, nodes: &[TestNode], ways: &[TestWay]) -> std::path::PathBuf {
+    let input = dir.join("input.osm.pbf");
+    let index_dir = dir.join("index");
+    write_test_pbf_sorted(&input, nodes, ways, &[]);
+    build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build should succeed");
+    index_dir
+}
+
+/// A street 60 m away, outside the query's street-level neighbourhood, is
+/// nearer than one 70 m away inside it; both are within the default 75 m
+/// radius. The query must answer the nearer, not the one the neighbourhood
+/// happens to hold.
+#[test]
+fn fine_search_finds_the_nearer_street_outside_the_query_neighbourhood() {
+    let level = 17;
+    let (lat, lon, near, far) = outside_block_geometry(level, 60.0, 4.0, Some(70.0));
+    let far = far.expect("a far street inside the block");
+    let (mut nodes, near_way) = named_way(10, near, "Near Street");
+    let (far_nodes, far_way) = named_way(20, far, "Far Street");
+    nodes.extend(far_nodes);
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &[near_way, far_way]);
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let street = reader
+        .query(lat, lon)
+        .expect("valid query")
+        .street
+        .expect("a street within the radius");
+    assert_eq!(street.name, "Near Street", "{street:?}");
+    assert!((street.distance_m - 60.0).abs() < 0.5, "{street:?}");
+
+    let names: Vec<&str> = reader
+        .candidates(lat, lon)
+        .expect("valid query")
+        .streets
+        .iter()
+        .map(|street| street.name)
+        .collect();
+    assert!(
+        names.contains(&"Near Street") && names.contains(&"Far Street"),
+        "every street within the radius is a candidate: {names:?}"
+    );
+}
+
+/// With nothing within the fine radius, the coarse search answers. A street
+/// 800 m away and outside the query's coarse-level neighbourhood is within
+/// the default 1000 m coarse radius, and must be found.
+#[test]
+fn coarse_search_finds_a_street_outside_the_query_neighbourhood() {
+    let level = 14;
+    let (lat, lon, ends, _) = outside_block_geometry(level, 800.0, 20.0, None);
+    let (nodes, way) = named_way(10, ends, "Distant Street");
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &[way]);
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let street = reader
+        .query(lat, lon)
+        .expect("valid query")
+        .street
+        .expect("a street within the coarse radius");
+    assert_eq!(street.name, "Distant Street");
+    assert!((street.distance_m - 800.0).abs() < 2.0, "{street:?}");
+    let streets = reader.candidates(lat, lon).expect("valid query").streets;
+    assert!(
+        !streets.is_empty() && streets.iter().all(|street| street.name == "Distant Street"),
+        "the coarse candidates hold the street: {streets:?}"
+    );
+}
+
+/// Interpolation ways are rare, and a query skips the coarse search for them
+/// where no coarse cell near it lists one. An interpolation way 800 m away,
+/// outside the coarse neighbourhood, is near enough to be found.
+#[test]
+fn coarse_search_finds_an_interpolation_way_outside_the_query_neighbourhood() {
+    let level = 14;
+    let (lat, lon, ends, _) = outside_block_geometry(level, 800.0, 20.0, None);
+    let nodes: Vec<TestNode> = ends
+        .iter()
+        .zip([("10", 100), ("30", 101)])
+        .map(|(&(lat, lon), (number, id))| TestNode {
+            id,
+            lat,
+            lon,
+            tags: vec![("addr:housenumber", number), ("addr:street", "Far Interp")],
+            meta: None,
+        })
+        .collect();
+    let way = TestWay {
+        id: 200,
+        refs: vec![100, 101],
+        tags: vec![
+            ("addr:interpolation", "even"),
+            ("addr:street", "Far Interp"),
+        ],
+        meta: None,
+    };
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &[way]);
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let interpolation = reader
+        .query(lat, lon)
+        .expect("valid query")
+        .interpolation
+        .expect("an interpolation way within the coarse radius");
+    assert_eq!(interpolation.street, "Far Interp");
+    assert!(
+        (interpolation.distance_m - 800.0).abs() < 2.0,
+        "{interpolation:?}"
+    );
+}
+
+/// Next to a pole longitude costs little, so the nearest point of a street
+/// can be the end the query reaches across the antimeridian side: at 89.99 S
+/// a query at longitude -170 is about 388 m from the end at 170 of a street
+/// from longitude 0 to 170, and over 3 km from its start.
+#[test]
+fn polar_street_is_measured_to_its_nearest_end() {
+    let lat = -89.99;
+    let (nodes, way) = named_way(
+        10,
+        [(to_e7(lat), 0), (to_e7(lat), to_e7(170.0))],
+        "Polar Street",
+    );
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &[way]);
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let street = reader
+        .query(lat, -170.0)
+        .expect("valid query")
+        .street
+        .expect("the street's end is within the coarse radius");
+    assert_eq!(street.name, "Polar Street");
+    let expected = 20f64.to_radians() * lat.to_radians().cos() * pbfhogg::geo::EARTH_RADIUS_M;
+    assert!(
+        (street.distance_m - expected).abs() < 1.0,
+        "{street:?}, expected {expected}"
     );
 }

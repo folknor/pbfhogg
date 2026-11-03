@@ -215,3 +215,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   is wholly inside; the reader still tests every candidate, because the
   flag is per cell, the query reads nine, and older indexes carry unsound
   flags. Supersedes ADR-0015.
+- [ADR-0023](0023-geocode-search-radii-are-searched-in-full.md) - A geocode
+  search radius is a promise: the reader answers the nearest record closer
+  than it, wherever it lies, by reading the 3x3 block, proving how far that
+  reaches, and walking further only for classes that need it; a radius over
+  a fixed number of cell widths is refused at build and open. No format
+  change.

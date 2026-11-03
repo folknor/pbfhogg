@@ -857,8 +857,9 @@ pub(crate) const MAX_EXTRACTS: usize = 500;
 // ---------------------------------------------------------------------------
 
 /// Squared segment length below which a segment is treated as degenerate (a
-/// single point) by the cos-projection closest-point and Douglas-Peucker
-/// code.
+/// single point) by the Douglas-Peucker code. The geocode closest-point
+/// search does not use it: it measures to every point of a segment however
+/// short, since a query on one is at distance zero.
 pub(crate) const DEGENERATE_SEGMENT_EPSILON: f64 = 1e-30;
 
 /// Headroom, in segment placements, that `ring_search_budget` grants on top
@@ -1158,3 +1159,30 @@ pub(crate) const GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M: f32 = 75.0;
 
 /// Default coarse search radius of `BuildConfig`, in metres.
 pub(crate) const GEOCODE_DEFAULT_COARSE_SEARCH_RADIUS_M: f32 = 1000.0;
+
+/// Widest search radius, in smallest S2 cell widths at the radius's level,
+/// that a build accepts and a reader opens. A query reads every cell that
+/// can hold a point within the radius, roughly `(2 * ratio + 1)^2` cells per
+/// level searched, so this bounds the per-query work a header can ask for.
+/// The default radii are a few widths at their default levels; this leaves
+/// room for deliberately wide searches while refusing a radius that would
+/// make each query walk thousands of cells.
+pub(crate) const GEOCODE_MAX_RADIUS_CELL_WIDTHS: f64 = 32.0;
+
+/// Smallest width, in coarse search radii, of the cells the geocode reader
+/// proves a region empty with before a coarse search. The 3x3 block of such
+/// cells around a query reaches at least about one width, so at two radii it
+/// covers the coarse radius for nearly every query; a finer level would test
+/// emptiness more sharply but cover the radius less often.
+pub(crate) const GEOCODE_PRESENCE_CELL_RADII: f64 = 2.0;
+
+/// Cells a geocode query's search of one level keeps inline before its walk
+/// spills to the heap. A default radius reaches a few dozen cells at most,
+/// rejected border cells included, so the ordinary query allocates nothing.
+pub(crate) const GEOCODE_WALK_INLINE_CELLS: usize = 128;
+
+/// Slack, in radians, taken off each axis gap of the geocode reader's cell
+/// lower bound (about 6 micrometres on the ground), so float rounding in the
+/// gap and in the distance it is compared with can never lift the bound
+/// above a real distance.
+pub(crate) const GEOCODE_CELL_BOUND_SLACK_RAD: f64 = 1e-12;

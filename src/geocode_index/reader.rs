@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 
 use memmap2::Mmap;
 use rustc_hash::FxHashSet;
+use s2::cell::Cell;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 
@@ -18,6 +19,9 @@ use super::format::{
     SegmentRef, StreetWay, Table,
 };
 use crate::geo;
+use crate::tunables::{
+    GEOCODE_CELL_BOUND_SLACK_RAD, GEOCODE_PRESENCE_CELL_RADII, GEOCODE_WALK_INLINE_CELLS,
+};
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -194,6 +198,14 @@ pub struct Reader {
     header: Header,
     fine_max_dist_sq: f64,
     coarse_max_dist_sq: f64,
+    /// Level of the cells [`Reader::possibly_within`] proves a region empty
+    /// with: wide enough that the 3x3 block around a query usually reaches
+    /// past the coarse radius.
+    presence_level: u8,
+    /// IDs, ascending, of the coarse cells that list interpolation segments.
+    /// Interpolation ways are rare, so this is small, and it lets a query far
+    /// from any skip the coarse search for them.
+    coarse_interp_cells: Vec<u64>,
 
     geo_cells: Records<GeoCell>,
     street_entries: Lists<SegmentRef>,
@@ -275,7 +287,9 @@ impl Reader {
     /// is also part of build time. There is no unvalidated open: a caller that
     /// reopens an index it has just built or checksummed pays this pass again
     /// (a content checksum would not avoid it, since verifying one reads every
-    /// byte).
+    /// byte). Open also keeps in memory the IDs of the coarse cells that list
+    /// interpolation segments, eight bytes each, so a query can tell where
+    /// there are none near it.
     ///
     /// # Errors
     /// A file is missing, unreadable or malformed; the error names the
@@ -306,11 +320,19 @@ impl Reader {
         let fine_radius_m = header.fine_search_radius_m as f64;
         let coarse_radius_m = header.coarse_search_radius_m as f64;
 
-        let reader = Self {
+        let presence_level = (0..=header.coarse_cell_level)
+            .rev()
+            .find(|&level| {
+                format::min_cell_width_m(level) >= GEOCODE_PRESENCE_CELL_RADII * coarse_radius_m
+            })
+            .unwrap_or(0);
+        let mut reader = Self {
             #[cfg(feature = "test-hooks")]
             admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             fine_max_dist_sq: geo::meters_to_radians_sq(fine_radius_m),
             coarse_max_dist_sq: geo::meters_to_radians_sq(coarse_radius_m),
+            presence_level,
+            coarse_interp_cells: Vec::new(),
             header,
             geo_cells: Records::map(&path(format::FILE_GEO_CELLS))?,
             street_entries: Lists::map(&path(format::FILE_STREET_ENTRIES))?,
@@ -332,6 +354,13 @@ impl Reader {
             strings: format::mmap_or_empty(&path(format::FILE_STRINGS))?,
         };
         reader.validate_structure()?;
+        reader.coarse_interp_cells = reader
+            .coarse_geo_cells
+            .table()
+            .iter()
+            .filter(|cell| cell.interp_offset != format::NO_DATA_U64)
+            .map(|cell| cell.cell_id)
+            .collect();
         Ok(reader)
     }
 
@@ -536,8 +565,15 @@ impl Reader {
         addrs: &Lists<AddrEntry>,
         interps: &Lists<SegmentRef>,
     ) -> Result<()> {
+        // Queries binary-search the cells and test ID ranges against them,
+        // so out-of-order cells would read as missing ones.
+        let mut previous = None;
         for (index, cell) in cells.table().iter().enumerate() {
             (|| -> Result<()> {
+                if previous.is_some_and(|previous| previous >= cell.cell_id) {
+                    return Err(corrupt("cell IDs are not strictly ascending"));
+                }
+                previous = Some(cell.cell_id);
                 validate_list(addrs, cell.addr_offset, "address entry")?;
                 validate_list(streets, cell.street_offset, "street entry")?;
                 validate_list(interps, cell.interp_offset, "interpolation entry")
@@ -549,13 +585,21 @@ impl Reader {
 
     // -- Public query API ----------------------------------------------------
 
-    /// High-level query: nearest of each type, allocation-free on the hot path.
-    /// Internally iterates mmap'd entry lists without materializing Vecs.
+    /// High-level query: the nearest address, street and interpolation closer
+    /// than the index's fine search radius, each class independently; a class
+    /// with none there gets the nearest closer than the coarse radius, or
+    /// nothing. The answer is the nearest wherever in the radius it lies, not
+    /// only in cells next to the query's. Internally iterates mmap'd entry
+    /// lists without materializing Vecs.
     pub fn query(&self, lat: f64, lon: f64) -> std::result::Result<ReverseResult<'_>, QueryError> {
         let ctx = QueryContext::new(lat, lon)?;
         let mut best = BestTracker::new();
+        let present = self.present_kinds();
 
-        // Fine-level search
+        // Fine-level search. A class it finds nothing of near the query is
+        // left to the coarse search when that searches at least as far: the
+        // nearest within the coarse radius is then also the nearest within
+        // the fine one, when there is one there.
         self.search_level(
             &ctx,
             &self.geo_cells,
@@ -564,12 +608,22 @@ impl Reader {
             &self.interp_entries,
             self.header.street_cell_level,
             self.fine_max_dist_sq,
-            SearchKinds::ALL,
+            present,
+            self.coarse_max_dist_sq >= self.fine_max_dist_sq,
+            false,
             &mut best,
         );
 
         // Coarse fallback
-        if best.street.is_none() || best.addr.is_none() || best.interp.is_none() {
+        let missing = self.coarse_missing(
+            &ctx,
+            SearchKinds {
+                addr: present.addr && best.addr.is_none(),
+                street: present.street && best.street.is_none(),
+                interp: present.interp && best.interp.is_none(),
+            },
+        );
+        if missing.any() {
             self.search_level(
                 &ctx,
                 &self.coarse_geo_cells,
@@ -578,11 +632,9 @@ impl Reader {
                 &self.coarse_interp_entries,
                 self.header.coarse_cell_level,
                 self.coarse_max_dist_sq,
-                SearchKinds {
-                    addr: best.addr.is_none(),
-                    street: best.street.is_none(),
-                    interp: best.interp.is_none(),
-                },
+                missing,
+                false,
+                true,
                 &mut best,
             );
         }
@@ -631,7 +683,10 @@ impl Reader {
         })
     }
 
-    /// Low-level query: all candidates within radius, unranked.
+    /// Low-level query: every candidate closer than the fine search radius,
+    /// unranked; for a class with none there, every one closer than the
+    /// coarse radius. A segment listed under several cells can appear more
+    /// than once.
     pub fn candidates(
         &self,
         lat: f64,
@@ -639,6 +694,7 @@ impl Reader {
     ) -> std::result::Result<Candidates<'_>, QueryError> {
         let ctx = QueryContext::new(lat, lon)?;
         let mut cands = CandidateCollector::new();
+        let present = self.present_kinds();
 
         self.search_level(
             &ctx,
@@ -648,12 +704,21 @@ impl Reader {
             &self.interp_entries,
             self.header.street_cell_level,
             self.fine_max_dist_sq,
-            SearchKinds::ALL,
+            present,
+            false,
+            false,
             &mut cands,
         );
 
-        if cands.streets.is_empty() || cands.addresses.is_empty() || cands.interpolations.is_empty()
-        {
+        let missing = self.coarse_missing(
+            &ctx,
+            SearchKinds {
+                addr: present.addr && cands.addresses.is_empty(),
+                street: present.street && cands.streets.is_empty(),
+                interp: present.interp && cands.interpolations.is_empty(),
+            },
+        );
+        if missing.any() {
             self.search_level(
                 &ctx,
                 &self.coarse_geo_cells,
@@ -662,11 +727,9 @@ impl Reader {
                 &self.coarse_interp_entries,
                 self.header.coarse_cell_level,
                 self.coarse_max_dist_sq,
-                SearchKinds {
-                    addr: cands.addresses.is_empty(),
-                    street: cands.streets.is_empty(),
-                    interp: cands.interpolations.is_empty(),
-                },
+                missing,
+                false,
+                true,
                 &mut cands,
             );
         }
@@ -809,6 +872,10 @@ struct QueryContext {
     lat_rad: f64,
     lon_rad: f64,
     cos_lat: f64,
+    /// The query as an s2 sphere point, `[x, y, z]`.
+    point: [f64; 3],
+    /// The query's leaf cell; its ancestors are its cells at every level.
+    leaf: CellID,
 }
 
 impl QueryContext {
@@ -826,13 +893,21 @@ impl QueryContext {
             return Err(QueryError::LongitudeOutOfRange(lon));
         }
         let lat_rad = lat.to_radians();
+        let point = s2::point::Point::from(LatLng::from_degrees(lat, lon));
         Ok(Self {
             lat,
             lon,
             lat_rad,
             lon_rad: lon.to_radians(),
             cos_lat: lat_rad.cos(),
+            point: [point.0.x, point.0.y, point.0.z],
+            leaf: CellID::from(point),
         })
+    }
+
+    /// The query's cell at `level`, as `CellID::from(LatLng)` gives it.
+    fn cell(&self, level: u8) -> CellID {
+        self.leaf.parent(u64::from(level))
     }
 }
 
@@ -868,14 +943,19 @@ struct SearchKinds {
 }
 
 impl SearchKinds {
-    const ALL: Self = Self {
-        addr: true,
-        street: true,
-        interp: true,
-    };
+    fn any(self) -> bool {
+        self.addr || self.street || self.interp
+    }
 }
 
 trait SearchSink<'a> {
+    /// Distances (radians squared) below which a candidate of each class can
+    /// still change this sink: the admitted best so far for a nearest-of
+    /// sink, unbounded for one that keeps every candidate. The search takes
+    /// the smaller of this and the level's radius, and only shrinks it.
+    fn bounds(&self) -> ClassBounds;
+    /// The classes this sink holds a candidate of.
+    fn found(&self) -> SearchKinds;
     fn address(&mut self, reader: &'a Reader, index: u32, point: AddrPoint, dist_sq: f64);
     fn street(
         &mut self,
@@ -901,6 +981,22 @@ trait SearchSink<'a> {
 // emptiness. Recording an unusable candidate produces no result AND suppresses
 // the fallback that would have produced one.
 impl SearchSink<'_> for BestTracker {
+    fn bounds(&self) -> ClassBounds {
+        ClassBounds {
+            addr: self.addr.map_or(f64::MAX, |best| best.1),
+            street: self.street.map_or(f64::MAX, |best| best.3),
+            interp: self.interp.map_or(f64::MAX, |best| best.4),
+        }
+    }
+
+    fn found(&self) -> SearchKinds {
+        SearchKinds {
+            addr: self.addr.is_some(),
+            street: self.street.is_some(),
+            interp: self.interp.is_some(),
+        }
+    }
+
     fn address(&mut self, reader: &Reader, index: u32, _point: AddrPoint, dist_sq: f64) {
         if reader.read_addr_point(index).is_none() {
             return;
@@ -957,6 +1053,22 @@ impl SearchSink<'_> for BestTracker {
 }
 
 impl<'a> SearchSink<'a> for CandidateCollector<'a> {
+    fn bounds(&self) -> ClassBounds {
+        ClassBounds {
+            addr: f64::MAX,
+            street: f64::MAX,
+            interp: f64::MAX,
+        }
+    }
+
+    fn found(&self) -> SearchKinds {
+        SearchKinds {
+            addr: !self.addresses.is_empty(),
+            street: !self.streets.is_empty(),
+            interp: !self.interpolations.is_empty(),
+        }
+    }
+
     fn address(&mut self, reader: &'a Reader, _index: u32, point: AddrPoint, dist_sq: f64) {
         self.addresses.push(AddressMatch {
             lat_e7: point.lat_e7,
@@ -1031,17 +1143,16 @@ impl<'a> CandidateCollector<'a> {
 /// Maximum cells in a neighborhood: 1 center + up to 8 neighbors.
 const MAX_NEIGHBORHOOD: usize = 9;
 
-/// Returns the cell + all neighbors at the given level as a fixed-size array.
+/// Returns `cell` and its edge and corner neighbours at its `level` as a
+/// fixed-size array: the 3x3 block around it.
 ///
-/// S2 guarantees exactly 8 edge/corner neighbors for any non-face cell
-/// at any level, so the `min(MAX_NEIGHBORHOOD - 1)` and `take(...)`
-/// below are defensive clamps, not silent truncation: the S2 contract
-/// cannot produce more than 8 neighbors at this API level. If the
-/// upstream S2 crate ever changes that, update the constant to match.
-fn cell_neighborhood(lat: f64, lon: f64, level: u8) -> ([u64; MAX_NEIGHBORHOOD], usize) {
-    let ll = LatLng::from_degrees(lat, lon);
-    let cell = CellID::from(ll).parent(level as u64);
-    let neighbors = cell.all_neighbors(level as u64);
+/// A cell has at most 8 edge and corner neighbours, so the
+/// `min(MAX_NEIGHBORHOOD - 1)` and `take(...)` below are defensive clamps,
+/// not truncation. Next to a cube-face vertex only three cells meet at the
+/// corner and s2 may return the same neighbour twice; a repeated cell only
+/// repeats work.
+fn cell_neighborhood(cell: CellID, level: u8) -> ([u64; MAX_NEIGHBORHOOD], usize) {
+    let neighbors = cell.all_neighbors(u64::from(level));
     let mut cells = [0u64; MAX_NEIGHBORHOOD];
     cells[0] = cell.0;
     let count = 1 + neighbors.len().min(MAX_NEIGHBORHOOD - 1);
@@ -1051,13 +1162,302 @@ fn cell_neighborhood(lat: f64, lon: f64, level: u8) -> ([u64; MAX_NEIGHBORHOOD],
     (cells, count)
 }
 
+/// A cell the street-level or coarse search has reached, with its
+/// [`cell_lower_bound_sq`], and whether its entries were already read.
+#[derive(Clone, Copy, Default)]
+struct WalkCell {
+    id: u64,
+    lower_bound: f64,
+    searched: bool,
+}
+
+/// The cells one level's search has reached, in the order reached. The list
+/// is also the search's FIFO queue: entries before the cursor have been
+/// visited. The first `GEOCODE_WALK_INLINE_CELLS` live inline, so a search at
+/// a radius of a few cell widths allocates nothing; past that the walk spills
+/// to the heap, with a set for membership.
+struct CellWalk {
+    inline: [WalkCell; GEOCODE_WALK_INLINE_CELLS],
+    inline_len: usize,
+    spill: Vec<WalkCell>,
+    spill_ids: FxHashSet<u64>,
+}
+
+impl CellWalk {
+    fn new() -> Self {
+        Self {
+            inline: [WalkCell::default(); GEOCODE_WALK_INLINE_CELLS],
+            inline_len: 0,
+            spill: Vec::new(),
+            spill_ids: FxHashSet::default(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<WalkCell> {
+        if index < self.inline_len {
+            Some(self.inline[index])
+        } else {
+            self.spill.get(index - self.inline_len).copied()
+        }
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.inline[..self.inline_len].iter().any(|c| c.id == id)
+            || (!self.spill.is_empty() && self.spill_ids.contains(&id))
+    }
+
+    fn push(&mut self, cell: WalkCell) {
+        if self.inline_len < GEOCODE_WALK_INLINE_CELLS {
+            self.inline[self.inline_len] = cell;
+            self.inline_len += 1;
+        } else {
+            self.spill_ids.insert(cell.id);
+            self.spill.push(cell);
+        }
+    }
+}
+
+/// A lower bound on the reader's distance (`geo::approx_distance_sq`, in
+/// radians squared) from the query to any point of `cell`.
+///
+/// s2's `rect_bound` holds the latitude and longitude of every point of the
+/// cell (padded for its own rounding, full longitude when the cell holds a
+/// pole). A point of the cell is therefore at least the latitude gap from the
+/// query in latitude, and at least the circular longitude gap in longitude,
+/// so its distance is at least `lat_gap^2 + (cos(query lat) * lon_gap)^2`.
+fn cell_lower_bound_sq(ctx: &QueryContext, cell: CellID) -> f64 {
+    let rect = Cell::from(cell).rect_bound();
+    let lat_gap = if ctx.lat_rad < rect.lat.lo {
+        rect.lat.lo - ctx.lat_rad
+    } else if ctx.lat_rad > rect.lat.hi {
+        ctx.lat_rad - rect.lat.hi
+    } else {
+        0.0
+    };
+    let lon_gap = if rect.lng.contains(ctx.lon_rad) {
+        0.0
+    } else {
+        geo::wrapped_longitude_delta(rect.lng.lo - ctx.lon_rad)
+            .abs()
+            .min(geo::wrapped_longitude_delta(ctx.lon_rad - rect.lng.hi).abs())
+    };
+    let lat_gap = (lat_gap - GEOCODE_CELL_BOUND_SLACK_RAD).max(0.0);
+    let lon_gap = (lon_gap - GEOCODE_CELL_BOUND_SLACK_RAD).max(0.0) * ctx.cos_lat;
+    lat_gap * lat_gap + lon_gap * lon_gap
+}
+
+/// The coordinates `(w, u, v)` of the sphere point `p` in S2 face `face`'s
+/// frame: s2's `face_uv_to_xyz` inverted up to scale, so that `u / w` and
+/// `v / w` are the point's (u, v) on the face and `w` is its component along
+/// the face's axis. Each is one coordinate of `p` with a sign, so lengths and
+/// angles carry over unchanged.
+fn face_wuv(face: u8, p: [f64; 3]) -> (f64, f64, f64) {
+    let [x, y, z] = p;
+    match face {
+        0 => (x, y, z),
+        1 => (y, -x, z),
+        2 => (z, -x, -y),
+        3 => (-x, -z, -y),
+        4 => (-y, -z, x),
+        _ => (-z, y, x),
+    }
+}
+
+/// A lower bound on the reader's distance (radians squared) from the query
+/// to any point outside the 3x3 block of cells around its own cell `start`
+/// at `level`; 0 when the block crosses a face edge.
+///
+/// Inside one face the block is the square `[u_lo, u_hi] x [v_lo, v_hi]` in
+/// (u, v), and on the sphere the region where `u_lo * w <= u <= u_hi * w`
+/// and likewise for `v`: four half-spaces through the centre, whose boundary
+/// lies on the four great circles `u = c * w`, `v = c * w`. A path from the
+/// query out of the block crosses one, so a point outside is at least
+/// `g`, the angle from the query to the nearest of them, away on the
+/// sphere; its sine is `|u - c * w| / sqrt(1 + c^2)`. The cells' (u, v)
+/// bounds are s2's own, so a point inside the square lies in one of the nine
+/// cells (up to the slack taken off for rounding).
+///
+/// To the reader's distance `m` (with `c` the cosine of the query's
+/// latitude): by the haversine formula and `hav x <= x^2 / 4`,
+/// `hav(gc) <= dlat^2 / 4 + c * cos(lat') * dlon^2 / 4`, and
+/// `cos(lat') <= c + |dlat|`, so for a point with `m < r`,
+/// `hav(gc) <= (m^2 / 4) * (1 + r / c)`. Hence `gc < 2 asin(r / 2 * sqrt(1 +
+/// r / c))`, which is at most `g` for `r = 2 sin(g / 2) / sqrt(1 + g / c)`:
+/// every point within `r` of the query in the reader's distance is inside
+/// the block. Toward a pole `r` shrinks to 0 and the walk does the work.
+fn block_reach_sq(ctx: &QueryContext, start: CellID, level: u8) -> f64 {
+    // Leaf (i, j) coordinates run over 0..2^30 on a face, and a cell at
+    // `level` spans 2^(30 - level) of them (header levels are at most 30).
+    const FACE_SIDE: i64 = 1 << 30;
+    let size = FACE_SIDE >> u32::from(level.min(30));
+    let (face, i, j, _) = start.face_ij_orientation();
+    let (i0, j0) = (i64::from(i) & -size, i64::from(j) & -size);
+    // The block's low corner leaf and the leaf of its high corner cell.
+    let corners = (
+        i32::try_from(i0 - size),
+        i32::try_from(j0 - size),
+        i32::try_from(i0 + size),
+        i32::try_from(j0 + size),
+    );
+    let (Ok(lo_i), Ok(lo_j), Ok(hi_i), Ok(hi_j)) = corners else {
+        return 0.0;
+    };
+    if i0 - size < 0 || i0 + 2 * size > FACE_SIDE || j0 - size < 0 || j0 + 2 * size > FACE_SIDE {
+        return 0.0;
+    }
+    let level = u64::from(level);
+    let low = s2::cellid::ij_level_to_bound_uv(lo_i, lo_j, level);
+    let high = s2::cellid::ij_level_to_bound_uv(hi_i, hi_j, level);
+    let (w, u, v) = face_wuv(face, ctx.point);
+    let sine_to = |coord: f64, c: f64| (coord - c * w).abs() / c.mul_add(c, 1.0).sqrt();
+    let sine = sine_to(u, low.x.lo)
+        .min(sine_to(u, high.x.hi))
+        .min(sine_to(v, low.y.lo))
+        .min(sine_to(v, high.y.hi));
+    let g = (sine.min(1.0).asin() - GEOCODE_CELL_BOUND_SLACK_RAD).max(0.0);
+    if ctx.cos_lat <= 0.0 {
+        return 0.0;
+    }
+    let r = 2.0 * (g / 2.0).sin() / (1.0 + g / ctx.cos_lat).sqrt();
+    r * r
+}
+
+/// Per-class distance bounds (radians squared) of one level's search: a
+/// candidate of a class is worth looking for only below its bound, and a
+/// class the search does not want has bound 0, below every distance.
+#[derive(Clone, Copy)]
+struct ClassBounds {
+    addr: f64,
+    street: f64,
+    interp: f64,
+}
+
+impl ClassBounds {
+    fn reach(self) -> f64 {
+        self.addr.max(self.street).max(self.interp)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Search implementations
 // ---------------------------------------------------------------------------
 
 impl Reader {
-    /// Shared mmap traversal. The sink decides whether hits are ranked or
+    /// Classes the index holds records of: a class with none is never
+    /// searched, at either level.
+    fn present_kinds(&self) -> SearchKinds {
+        SearchKinds {
+            addr: self.header.addr_point_count > 0,
+            street: self.header.street_way_count > 0,
+            interp: self.header.interp_way_count > 0,
+        }
+    }
+
+    /// The classes the coarse search still has to look for, of those the fine
+    /// search left empty: interpolation is dropped where no coarse cell near
+    /// the query lists any, which is almost everywhere, so a query that found
+    /// everything else needs no coarse search at all.
+    fn coarse_missing(&self, ctx: &QueryContext, missing: SearchKinds) -> SearchKinds {
+        let radius = self.coarse_max_dist_sq;
+        let bounds = ClassBounds {
+            addr: radius,
+            street: radius,
+            interp: radius,
+        };
+        self.possibly_within(ctx, missing, bounds, false)
+    }
+
+    /// `kinds` without the classes certain to have no record within their
+    /// bound of the query, judged from the coarse cells under the 3x3 block
+    /// of `presence_level` cells around it. A record within a bound no
+    /// further than the block's reach ([`block_reach_sq`]) has a point inside
+    /// one of those cells, and the coarse cell holding that point lists it,
+    /// so it is a descendant of one: when no coarse cell of the class lies in
+    /// any of their ID ranges, there is none. Interpolation is tested against
+    /// the coarse cells that list interpolation segments, the other classes
+    /// (with `all_classes`) against all coarse cells.
+    fn possibly_within(
+        &self,
+        ctx: &QueryContext,
+        kinds: SearchKinds,
+        bounds: ClassBounds,
+        all_classes: bool,
+    ) -> SearchKinds {
+        if !kinds.interp && !(all_classes && (kinds.addr || kinds.street)) {
+            return kinds;
+        }
+        let level = self.presence_level;
+        let start = ctx.cell(level);
+        let reach_sq = block_reach_sq(ctx, start, level);
+        let (block, len) = cell_neighborhood(start, level);
+        let ranges = || {
+            block[..len].iter().map(|&id| {
+                let cell = CellID(id);
+                (cell.range_min().0, cell.range_max().0)
+            })
+        };
+        let interp_present = || {
+            ranges().any(|(lo, hi)| {
+                let first = self.coarse_interp_cells.partition_point(|&id| id < lo);
+                self.coarse_interp_cells
+                    .get(first)
+                    .is_some_and(|&id| id <= hi)
+            })
+        };
+        let any_present = || {
+            let cells = self.coarse_geo_cells.table();
+            ranges().any(|(lo, hi)| cells.any_key_between(lo, hi, |cell| cell.cell_id))
+        };
+        let interp = kinds.interp && (bounds.interp > reach_sq || interp_present());
+        let others = all_classes
+            && (kinds.addr || kinds.street)
+            && bounds.addr.max(bounds.street) <= reach_sq
+            && !any_present();
+        SearchKinds {
+            addr: kinds.addr && !others,
+            street: kinds.street && !others,
+            interp,
+        }
+    }
+
+    /// One level's search: every candidate of each wanted class nearer than
+    /// both `max_dist_sq` and the sink's bound for it, from every cell at
+    /// `level` that can hold one (ADR-0023). The sink decides whether hits are ranked or
     /// materialized; `kinds` lets coarse fallback fill only missing classes.
+    /// With `hand_off`, a class with no candidate in the query's 3x3 block is
+    /// not searched past it: the caller hands it to a later search that is
+    /// complete over a radius at least `max_dist_sq`.
+    ///
+    /// The 3x3 block around the query's own cell is read first. Past it no
+    /// point is nearer than [`block_reach_sq`], so a class whose bound is no
+    /// more than that is complete, which is the common case. Otherwise the
+    /// search walks outward from the block over edge neighbours, visiting a
+    /// cell only while its lower bound ([`cell_lower_bound_sq`]) is below some
+    /// wanted class's bound. That reaches every cell that can hold a
+    /// candidate:
+    ///
+    /// - A candidate at distance `d` has a point on its geometry at `d` from
+    ///   the query (an address point; for a segment, the closest point of the
+    ///   path `geo::point_to_segment_distance_sq` measures to). The builder
+    ///   lists the record under every cell that point lies in (a segment
+    ///   under every cell its path meets; indexes built before the exact
+    ///   cover can lack a cell a path clips near its corner), and that cell's
+    ///   lower bound is at most `d`.
+    /// - The points nearer than a bound form a set that is connected and
+    ///   open in latitude and periodic longitude. Cells are closed, so the
+    ///   cells meeting it are linked through cells meeting it by shared
+    ///   points, and where two of them share only a corner, that corner is in
+    ///   the set with every cell around it, which link up by edges. At a
+    ///   pole, whose cells' bounds span all longitudes, every cell at the
+    ///   pole is reached once the set reaches the pole, and they too link by
+    ///   edges. So the walk, which starts from every block cell (the query's
+    ///   own among them) and follows edges out of every cell below the bound,
+    ///   reaches each such cell.
+    /// - Bounds only shrink as candidates arrive, so a cell skipped for its
+    ///   bound earlier would be skipped now too.
+    ///
+    /// The walk needs no stored cell: it steps through cells that hold
+    /// nothing exactly as through cells that do.
     #[allow(clippy::too_many_arguments)]
     // The fine/coarse call sites pair already-open mmaps with their levels
     // and radii. A file-name descriptor alone cannot enforce that relationship.
@@ -1071,58 +1471,162 @@ impl Reader {
         level: u8,
         max_dist_sq: f64,
         kinds: SearchKinds,
+        hand_off: bool,
+        presence: bool,
         sink: &mut S,
     ) {
-        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, level);
         let geo_cells = geo_cells.table();
+        let start = ctx.cell(level);
+        let (block, block_len) = cell_neighborhood(start, level);
 
         // An entry naming a record that does not exist is skipped, not
         // reported: open certifies list spans but not entry contents (see
         // validate_structure for why), and only a corrupt or hand-edited
         // index can carry one. The segment distance helpers return f64::MAX
         // for the same case, which never passes the radius test.
-        for &cell_id in &cells[..count] {
-            let Some(gc) = geo_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
+        for &id in &block[..block_len] {
+            if let Some(gc) = geo_cells.find_by_key(id, |cell| cell.cell_id) {
+                self.search_cell(
+                    ctx,
+                    &gc,
+                    street_entries,
+                    addr_entries,
+                    interp_entries,
+                    max_dist_sq,
+                    kinds,
+                    sink,
+                );
+            }
+        }
+
+        // Past the block, only classes whose bound reaches beyond it.
+        let reach_sq = block_reach_sq(ctx, start, level);
+        let kinds = if hand_off {
+            let found = sink.found();
+            SearchKinds {
+                addr: kinds.addr && found.addr,
+                street: kinds.street && found.street,
+                interp: kinds.interp && found.interp,
+            }
+        } else {
+            kinds
+        };
+        let bounds_for = |kinds: SearchKinds, sink: &S| {
+            let own = sink.bounds();
+            let bound = |wanted: bool, own: f64| if wanted { own.min(max_dist_sq) } else { 0.0 };
+            ClassBounds {
+                addr: bound(kinds.addr, own.addr),
+                street: bound(kinds.street, own.street),
+                interp: bound(kinds.interp, own.interp),
+            }
+        };
+        if bounds_for(kinds, sink).reach() <= reach_sq {
+            return;
+        }
+        let kinds = if presence {
+            self.possibly_within(ctx, kinds, bounds_for(kinds, sink), true)
+        } else {
+            kinds
+        };
+        let bounds = |sink: &S| bounds_for(kinds, sink);
+        if bounds(sink).reach() <= reach_sq {
+            return;
+        }
+
+        let mut walk = CellWalk::new();
+        for &id in &block[..block_len] {
+            if !walk.contains(id) {
+                walk.push(WalkCell {
+                    id,
+                    lower_bound: 0.0,
+                    searched: true,
+                });
+            }
+        }
+        let mut cursor = 0;
+        while let Some(cell) = walk.get(cursor) {
+            cursor += 1;
+            let wanted = bounds(sink);
+            if cell.lower_bound >= wanted.reach() {
                 continue;
-            };
-
-            // Address points
-            if kinds.addr {
-                for entry in addr_entries.entries(gc.addr_offset).iter() {
-                    let idx = entry.addr_index;
-                    let Some(pt) = self.read_addr_point(idx) else {
-                        continue;
-                    };
-                    let dist_sq = geo::approx_distance_sq(
-                        ctx.lat_rad,
-                        ctx.lon_rad,
-                        geo::e7_to_rad(pt.lat_e7),
-                        geo::e7_to_rad(pt.lon_e7),
-                        ctx.cos_lat,
-                    );
-                    if dist_sq < max_dist_sq {
-                        sink.address(self, idx, pt, dist_sq);
-                    }
+            }
+            if !cell.searched
+                && let Some(gc) = geo_cells.find_by_key(cell.id, |cell| cell.cell_id)
+            {
+                self.search_cell(
+                    ctx,
+                    &gc,
+                    street_entries,
+                    addr_entries,
+                    interp_entries,
+                    max_dist_sq,
+                    SearchKinds {
+                        addr: cell.lower_bound < wanted.addr,
+                        street: cell.lower_bound < wanted.street,
+                        interp: cell.lower_bound < wanted.interp,
+                    },
+                    sink,
+                );
+            }
+            if cell.lower_bound >= bounds(sink).reach() {
+                continue;
+            }
+            for neighbour in CellID(cell.id).edge_neighbors() {
+                if !walk.contains(neighbour.0) {
+                    walk.push(WalkCell {
+                        id: neighbour.0,
+                        lower_bound: cell_lower_bound_sq(ctx, neighbour),
+                        searched: false,
+                    });
                 }
             }
+        }
+    }
 
-            // Street segments
-            if kinds.street {
-                for seg_ref in street_entries.entries(gc.street_offset).iter() {
-                    let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
-                    if dist_sq < max_dist_sq {
-                        sink.street(self, seg_ref, snap_lat, snap_lon, dist_sq);
-                    }
+    /// The candidates of one cell, for the classes `kinds` names.
+    #[allow(clippy::too_many_arguments)]
+    fn search_cell<'a, S: SearchSink<'a>>(
+        &'a self,
+        ctx: &QueryContext,
+        gc: &GeoCell,
+        street_entries: &Lists<SegmentRef>,
+        addr_entries: &Lists<AddrEntry>,
+        interp_entries: &Lists<SegmentRef>,
+        max_dist_sq: f64,
+        kinds: SearchKinds,
+        sink: &mut S,
+    ) {
+        if kinds.addr {
+            for entry in addr_entries.entries(gc.addr_offset).iter() {
+                let idx = entry.addr_index;
+                let Some(pt) = self.read_addr_point(idx) else {
+                    continue;
+                };
+                let dist_sq = geo::approx_distance_sq(
+                    ctx.lat_rad,
+                    ctx.lon_rad,
+                    geo::e7_to_rad(pt.lat_e7),
+                    geo::e7_to_rad(pt.lon_e7),
+                    ctx.cos_lat,
+                );
+                if dist_sq < max_dist_sq {
+                    sink.address(self, idx, pt, dist_sq);
                 }
             }
-
-            // Interpolation segments
-            if kinds.interp {
-                for seg_ref in interp_entries.entries(gc.interp_offset).iter() {
-                    let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
-                    if dist_sq < max_dist_sq {
-                        sink.interpolation(self, seg_ref, snap_lat, snap_lon, dist_sq);
-                    }
+        }
+        if kinds.street {
+            for seg_ref in street_entries.entries(gc.street_offset).iter() {
+                let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
+                if dist_sq < max_dist_sq {
+                    sink.street(self, seg_ref, snap_lat, snap_lon, dist_sq);
+                }
+            }
+        }
+        if kinds.interp {
+            for seg_ref in interp_entries.entries(gc.interp_offset).iter() {
+                let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
+                if dist_sq < max_dist_sq {
+                    sink.interpolation(self, seg_ref, snap_lat, snap_lon, dist_sq);
                 }
             }
         }
@@ -1134,7 +1638,8 @@ impl Reader {
     /// read but ignored as a PIP bypass; every candidate still runs
     /// admin_polygon_contains (see the comment below).
     fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
-        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
+        let level = self.header.admin_cell_level;
+        let (cells, count) = cell_neighborhood(ctx.cell(level), level);
         let admin_cells = self.admin_cells.table();
         let mut best_by_level: [(Option<u32>, f32); ADMIN_LEVEL_SLOTS] =
             [(None, f32::MAX); ADMIN_LEVEL_SLOTS];
@@ -1188,7 +1693,8 @@ impl Reader {
 
     /// All admin polygons containing the point (for candidates API).
     fn search_admin_all<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
-        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
+        let level = self.header.admin_cell_level;
+        let (cells, count) = cell_neighborhood(ctx.cell(level), level);
         let admin_cells = self.admin_cells.table();
         let mut result = Vec::new();
         let mut seen: FxHashSet<u32> = FxHashSet::default();
@@ -1540,6 +2046,173 @@ fn first_admin_attempt(seen: &mut FxHashSet<u32>, polygon_index: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed pseudo-random sequence in `[0, 1)`, so every run checks the
+    /// same points.
+    fn sequence(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// A query at `(lat, lon)` degrees.
+    fn query(lat: f64, lon: f64) -> QueryContext {
+        QueryContext::new(lat, lon).expect("valid query")
+    }
+
+    /// The point at reader distance `d` (radians) from `ctx` in direction
+    /// `theta`, as `(lat, lon)` degrees, or `None` past a pole.
+    fn offset(ctx: &QueryContext, d: f64, theta: f64) -> Option<(f64, f64)> {
+        let lat = ctx.lat_rad + d * theta.cos();
+        if lat.abs() > std::f64::consts::FRAC_PI_2 {
+            return None;
+        }
+        let lon = geo::wrapped_longitude_delta(ctx.lon_rad + d * theta.sin() / ctx.cos_lat);
+        Some((lat.to_degrees(), lon.to_degrees()))
+    }
+
+    #[test]
+    fn min_width_constant_is_s2s() {
+        for level in [0u8, 14, 17, 30] {
+            let ours = format::min_cell_width_m(level) / geo::EARTH_RADIUS_M;
+            let theirs = s2::metric::MIN_WIDTHMETRIC.value(level);
+            assert!((ours - theirs).abs() <= theirs * 1e-15, "level {level}");
+        }
+    }
+
+    /// `face_wuv` inverts s2's face projection: a point's (u, v) on its own
+    /// face lies in the (u, v) bounds of the leaf cell s2 puts it in.
+    #[test]
+    fn face_frame_matches_s2s_projection() {
+        let mut next = sequence(1);
+        for _ in 0..20_000 {
+            let lat = (next() * 2.0 - 1.0) * 90.0;
+            let lon = (next() * 2.0 - 1.0) * 180.0;
+            let ctx = query(lat, lon);
+            let (face, i, j, _) = ctx.leaf.face_ij_orientation();
+            let (w, u, v) = face_wuv(face, ctx.point);
+            assert!(w > 0.0, "{lat} {lon}");
+            let bound = s2::cellid::ij_level_to_bound_uv(i, j, 30);
+            let slack = 1e-12;
+            assert!(
+                (bound.x.lo - slack..=bound.x.hi + slack).contains(&(u / w))
+                    && (bound.y.lo - slack..=bound.y.hi + slack).contains(&(v / w)),
+                "{lat} {lon}: ({}, {}) outside its leaf",
+                u / w,
+                v / w
+            );
+        }
+    }
+
+    /// Every point nearer the query than `block_reach_sq` lies in one of the
+    /// nine cells the search reads first. Checked on points sampled in the
+    /// disk of that radius at street and coarse levels across the globe,
+    /// poles and face corners included; also that the bound is not vacuous.
+    #[test]
+    fn block_reach_is_a_lower_bound_on_leaving_the_block() {
+        let mut next = sequence(2);
+        for level in [10u8, 14, 17, 19] {
+            let mut reached = 0usize;
+            for _ in 0..4_000 {
+                let lat = (next() * 2.0 - 1.0) * 90.0;
+                let lon = (next() * 2.0 - 1.0) * 180.0;
+                let ctx = query(lat, lon);
+                let start = ctx.cell(level);
+                let reach_sq = block_reach_sq(&ctx, start, level);
+                if reach_sq > 0.0 {
+                    reached += 1;
+                }
+                let (block, len) = cell_neighborhood(start, level);
+                for k in 0..64 {
+                    // Half on the disk's rim, where the bound is tight.
+                    let fill = if k % 2 == 0 { 1.0 } else { next().sqrt() };
+                    let d = reach_sq.sqrt() * fill;
+                    let Some((plat, plon)) = offset(&ctx, d, std::f64::consts::TAU * next()) else {
+                        continue;
+                    };
+                    let cell = query(plat, plon).cell(level).0;
+                    assert!(
+                        block[..len].contains(&cell),
+                        "level {level}: query ({lat}, {lon}), point ({plat}, {plon}) at {d} \
+                         rad is outside the block, reach {}",
+                        reach_sq.sqrt()
+                    );
+                }
+            }
+            assert!(
+                reached > 3_900,
+                "level {level}: reach is 0 for too many queries"
+            );
+        }
+    }
+
+    /// No point of a cell is nearer the query than the cell's lower bound.
+    /// Points are sampled across cells around queries at several levels,
+    /// near the antimeridian and the poles as well as anywhere else.
+    #[test]
+    fn cell_lower_bound_holds_for_every_point_of_the_cell() {
+        let mut next = sequence(3);
+        for level in [6u8, 14, 17] {
+            for _ in 0..3_000 {
+                let lat = (next() * 2.0 - 1.0) * 90.0;
+                let lon = (next() * 2.0 - 1.0) * 180.0;
+                let ctx = query(lat, lon);
+                // A cell a few widths away, through a nearby point.
+                let width = format::min_cell_width_m(level) / geo::EARTH_RADIUS_M;
+                let Some((clat, clon)) =
+                    offset(&ctx, width * 4.0 * next(), std::f64::consts::TAU * next())
+                else {
+                    continue;
+                };
+                let cell = query(clat, clon).cell(level);
+                let lb = cell_lower_bound_sq(&ctx, cell);
+                let (face, i, j, _) = cell.face_ij_orientation();
+                let bound = s2::cellid::ij_level_to_bound_uv(i, j, u64::from(level));
+                for _ in 0..32 {
+                    let u = bound.x.lo + (bound.x.hi - bound.x.lo) * next();
+                    let v = bound.y.lo + (bound.y.hi - bound.y.lo) * next();
+                    let xyz = face_uv_xyz(face, u, v);
+                    let ll = LatLng::from(s2::point::Point(s2::r3::vector::Vector {
+                        x: xyz[0],
+                        y: xyz[1],
+                        z: xyz[2],
+                    }));
+                    let d = geo::approx_distance_sq(
+                        ctx.lat_rad,
+                        ctx.lon_rad,
+                        ll.lat.rad(),
+                        ll.lng.rad(),
+                        ctx.cos_lat,
+                    );
+                    assert!(
+                        lb <= d,
+                        "level {level}: query ({lat}, {lon}), cell point ({}, {}) at {d} below \
+                         the bound {lb}",
+                        ll.lat.deg(),
+                        ll.lng.deg()
+                    );
+                }
+            }
+        }
+    }
+
+    /// s2's `face_uv_to_xyz`, which `face_wuv` inverts.
+    fn face_uv_xyz(face: u8, u: f64, v: f64) -> [f64; 3] {
+        match face {
+            0 => [1.0, u, v],
+            1 => [-u, 1.0, v],
+            2 => [-u, -v, 1.0],
+            3 => [-1.0, -v, -u],
+            4 => [v, -1.0, -u],
+            _ => [v, u, -1.0],
+        }
+    }
 
     #[test]
     fn defensive_fixed_record_readers_expose_absence_in_their_types() {

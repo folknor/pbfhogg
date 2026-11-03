@@ -132,6 +132,16 @@ pbfhogg = { version = "0.5", default-features = false, features = ["geocode-read
 out-of-range latitude or longitude is a typed `QueryError` rather than a
 silently wrong cell lookup.
 
+`Reader::query` answers each class (address, street, interpolation) with the
+nearest record closer than the index's fine search radius, and for a class
+with none there the nearest closer than its coarse radius, or nothing.
+`Reader::candidates` lists every record closer than the fine radius, and for
+a class with none there every one closer than the coarse radius. Both search
+the whole radius, not only the cells next to the query's. Distances are the
+reader's flat approximation: latitude and longitude differences in radians,
+longitude scaled by the cosine of the query's latitude and taken the short
+way around, times the Earth's mean radius.
+
 The on-disk format is version 3. Readers reject older versions outright with a
 message naming `build-geocode-index` as the remedy, so an index built by an
 earlier release must be rebuilt rather than migrated - the index is a directory

@@ -1920,8 +1920,8 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--coarse-level <N>` | Fallback cell level for rural areas; must be below `--street-level`, within the builder's segment-cover limit. Default comes from the builder configuration |
 | `--admin-level <N>` | S2 cell level for admin boundaries, within the builder's work limit. Default comes from the builder configuration |
 | `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value. Default comes from the builder configuration |
-| `--search-radius <M>` | Fine-level max search distance in meters. Default comes from the builder configuration |
-| `--coarse-search-radius <M>` | Coarse-level max search distance in meters. Default comes from the builder configuration |
+| `--search-radius <M>` | Fine-level search distance in meters: a query answers the nearest street, address and interpolation closer than this. At most a fixed number of smallest cell widths at `--street-level` (see [Search radius bounds](#search-radius-bounds)). Default comes from the builder configuration |
+| `--coarse-search-radius <M>` | Coarse-level search distance in meters: the fallback for a class with nothing closer than `--search-radius`. At most a fixed number of smallest cell widths at `--coarse-level`. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `-O, --overwrite` | Replace an existing index (or empty directory) at `--output-dir` after the new build succeeds. Without it an existing `--output-dir` is refused before any work. Does not bypass the indexdata requirement |
 | `--staging-dir <DIR>` | Stage the new index in `DIR` instead of beside `--output-dir`; `DIR` must not lie inside `--output-dir` (see [Staging directory](#staging-directory)) |
@@ -1966,6 +1966,22 @@ exits 2 with an explicit message:
 The *reader* is deliberately looser and accepts levels up to the S2 limit of
 30, since reading does no cell covering: an index written at a higher level by
 another producer stays readable.
+
+#### Search radius bounds
+
+A query searches the whole of each radius: it answers the nearest street,
+address and interpolation closer than the fine radius, each on its own, and
+for a class with none there the nearest closer than the coarse radius,
+wherever in the radius it lies. Earlier versions read only the query's cell
+and its eight neighbours, which reach about one cell width, less than the
+default radii, so a nearer record could be passed over for a farther one or
+for nothing. That fix is in the reader and applies to existing indexes; the
+cells an older index lacks (above) still take a rebuild. The work a query does grows with the
+square of the radius over the cell width, so a radius wider than a fixed
+number of smallest cell widths at its own level is refused before any input
+is read, with a message naming the most that level allows, and a reader
+refuses to open an index whose header carries one. A longer reach belongs at
+a coarser level.
 
 #### Overwriting an existing index
 

@@ -938,6 +938,19 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   neighbours'. A format change; measure the PIP cost it would save first.
   The level cap (19) stays either way: an exact cover's work still doubles
   per level, now bounded by a proved cell count rather than a sample count.
+  The PIP cost is the query cost: admin point-in-polygon dominates every row
+  of the query latency table in `reference/performance.md` (Germany on-road
+  queries take about 113 us, Denmark about 22 us). The query's own admin cell
+  already lists every polygon containing it under an exact cover, so the
+  eight neighbours' entries are pure extra PIP work; the same header signal
+  would let the reader drop them.
+- [ ] **The geocode walk costs per cell, not per lookup.** Where a query's
+  answer lies past its 3x3 block, or nothing lies near (open sea), the
+  reader walks cells (ADR-0023), paying s2's `edge_neighbors` (about 77 ns,
+  a Hilbert decode and four encodes) and `Cell::rect_bound` (about 58 ns)
+  per cell; that is the +4 to +8 % on uniform bbox points in the latency
+  table. Walking in (face, i, j) arithmetic with a vertex cache would take
+  most of it off. Only worth it if sea-heavy or remote query mixes matter.
 
 ## Item/command-specific plans
 

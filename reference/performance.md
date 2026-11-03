@@ -3193,9 +3193,40 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
-Query latency not yet benchmarked. Both architectures use the same algorithm
-(S2 cell neighborhood + binary search + distance scoring on mmap'd data), so
-sub-millisecond latency is expected.
+### Query latency: the radius searched in full (bygg, 2026-11-03, on `edefd624`)
+
+brokkr has no geocode query command, so these come from an uncommitted
+probe example that opened one index and timed `Reader::query` over fixed
+pseudo-random points, alternating rounds of the new search ("walk") and of
+the old nine-cell search kept in the same build ("nine"), 3 to 6 rounds per
+cell. Per-query means, warm page cache; the host's speed drifted between
+cells, so compare within a row only:
+
+| Index | Points | nine | walk | Delta |
+|---|---|---:|---:|---:|
+| Denmark | Copenhagen bbox, uniform | 65.6 us | 66.2 us | noise |
+| Denmark | country bbox, a street within 75 m ("on road") | 22.5 us | 22.4 us | noise |
+| Denmark | country bbox, uniform (over half open sea) | 18.5 us | 20.0 us | +8 % |
+| Germany | Berlin bbox, uniform | 188 us | 194 us | +3 % |
+| Germany | country bbox, on road | 112.7 us | 113.5 us | noise |
+| Germany | country bbox, uniform | 90.6 us | 94.4 us | +4 % |
+
+Admin point-in-polygon dominates every row (Germany's admin polygons carry
+up to 16x the base vertex budget). The walk costs extra only where an answer
+lies beyond the 3x3 block's proved reach or nothing lies near at all, which
+is where the nine-cell search was wrong or incomplete: on the uniform
+Germany points it answered 8.4 % of streets and 10.4 % of addresses with
+nothing or a farther one (against indexes built at street level 16 and
+coarse level 12, whose nine cells reach past the radii, and which the walk
+matches exactly on 1.3 M class answers across both datasets). A first
+version that walked every cell within the radius on every query cost +27 %
+on the uniform Denmark points and +4 % on Germany on-road points (the coarse
+search for interpolation, absent nearly everywhere, ran on every query); the
+block bound and the presence test brought both rows down. The Berlin row
+predates the presence test.
+
+The build is unchanged: Denmark `--bench 3 --force`, 1770.6 ms against the
+stored `0bf93c83` at `7e7ede73`, 1929.8 ms.
 
 ## Diff between independent snapshots
 

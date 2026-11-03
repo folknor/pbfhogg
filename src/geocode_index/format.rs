@@ -154,9 +154,9 @@ impl Header {
         }
         let fine_search_radius_m = f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
         let coarse_search_radius_m = f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
-        validate_radius("search radius", fine_search_radius_m)
+        validate_radius("search radius", fine_search_radius_m, street)
             .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
-        validate_radius("coarse search radius", coarse_search_radius_m)
+        validate_radius("coarse search radius", coarse_search_radius_m, coarse)
             .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
         Ok(Self {
             format_version: version,
@@ -681,6 +681,21 @@ impl<'a, T: Record> Table<'a, T> {
         }
         None
     }
+
+    /// Whether a run sorted by `key_of` holds a record whose key lies in
+    /// `lo..=hi`.
+    #[inline]
+    pub fn any_key_between<F: Fn(&T) -> u64>(&self, lo: u64, hi: u64, key_of: F) -> bool {
+        let (mut first, mut end) = (0usize, self.len());
+        while first < end {
+            let mid = first + (end - first) / 2;
+            match self.get(mid) {
+                Some(record) if key_of(&record) < lo => first = mid + 1,
+                _ => end = mid,
+            }
+        }
+        self.get(first).is_some_and(|record| key_of(&record) <= hi)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -855,35 +870,84 @@ pub enum FormatError {
     InvalidMetadata(String),
 }
 
+/// S2's minimum cell width at level 0, in radians, for the quadratic
+/// projection s2 uses (`MIN_WIDTHMETRIC`'s derivative, `2 sqrt 2 / 3`); the
+/// width at level `L` is this times `2^-L`. Kept here because this module
+/// compiles without the `s2` dependency; a reader test pins it to s2's value.
+pub const S2_MIN_WIDTH_DERIV: f64 = 2.0 * std::f64::consts::SQRT_2 / 3.0;
+
+/// The smallest width of an S2 cell at `level`, in metres on the reader's
+/// sphere (`geo::EARTH_RADIUS_M`).
+pub fn min_cell_width_m(level: u8) -> f64 {
+    S2_MIN_WIDTH_DERIV * (-f64::from(level)).exp2() * crate::geo::EARTH_RADIUS_M
+}
+
 /// Shared by the builder's config validation and the reader's header parse,
 /// so both sides accept exactly the same radii. The caller supplies the error
 /// framing: a bad build config is not bad index metadata.
-pub(crate) fn validate_radius(name: &str, radius: f32) -> Result<(), RadiusError> {
+///
+/// A radius is searched in full: a query reads every cell at `level` that can
+/// hold a point within it, about `(2 * radius / width + 1)^2` cells. A radius
+/// over `GEOCODE_MAX_RADIUS_CELL_WIDTHS` smallest cell widths at its level is
+/// refused, so a header cannot turn each query into a walk over millions of
+/// cells; a longer reach belongs at a coarser level.
+pub(crate) fn validate_radius(name: &str, radius: f32, level: u8) -> Result<(), RadiusError> {
     if !radius.is_finite() || radius < 0.0 {
-        return Err(RadiusError {
+        return Err(RadiusError::NotFinite {
             name: name.to_owned(),
             radius,
+        });
+    }
+    let max = crate::tunables::GEOCODE_MAX_RADIUS_CELL_WIDTHS * min_cell_width_m(level);
+    if f64::from(radius) > max {
+        return Err(RadiusError::PastReach {
+            name: name.to_owned(),
+            radius,
+            level,
+            max,
         });
     }
     Ok(())
 }
 
-/// A search radius that is not a finite non-negative number. A neutral leaf:
-/// the builder config check classifies it as an invalid argument, the header
-/// parse as invalid index metadata.
+/// A search radius the index cannot carry. A neutral leaf: the builder config
+/// check classifies it as an invalid argument, the header parse as invalid
+/// index metadata.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RadiusError {
-    name: String,
-    radius: f32,
+pub(crate) enum RadiusError {
+    /// Not a finite non-negative number.
+    NotFinite { name: String, radius: f32 },
+    /// Wider than the reader searches at the radius's cell level.
+    PastReach {
+        name: String,
+        radius: f32,
+        level: u8,
+        max: f64,
+    },
 }
 
 impl std::fmt::Display for RadiusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} must be a finite non-negative number, got {}",
-            self.name, self.radius
-        )
+        match self {
+            Self::NotFinite { name, radius } => {
+                write!(
+                    f,
+                    "{name} must be a finite non-negative number, got {radius}"
+                )
+            }
+            Self::PastReach {
+                name,
+                radius,
+                level,
+                max,
+            } => write!(
+                f,
+                "{name} {radius} m is too wide for S2 level {level}: a query searches \
+                 every cell within the radius, and this level allows at most {max:.1} m \
+                 ({} smallest cell widths); use a coarser level or a smaller radius",
+                crate::tunables::GEOCODE_MAX_RADIUS_CELL_WIDTHS
+            ),
+        }
     }
 }
 
@@ -925,7 +989,18 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn leaf_errors_have_no_source() {
         use std::error::Error as _;
-        assert!(validate_radius("r", -1.0).unwrap_err().source().is_none());
+        assert!(
+            validate_radius("r", -1.0, 17)
+                .unwrap_err()
+                .source()
+                .is_none()
+        );
+        assert!(
+            validate_radius("r", 1e9, 17)
+                .unwrap_err()
+                .source()
+                .is_none()
+        );
         assert!(
             InterpolationType::try_from(9)
                 .unwrap_err()
@@ -1022,6 +1097,33 @@ mod tests {
                     "{name} radius {radius}: unexpected error: {err}"
                 );
             }
+        }
+    }
+
+    /// Each radius is bounded by the cell width at its own level: the fine
+    /// radius by the street level, the coarse radius by the coarse level.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn header_rejects_radii_past_the_searched_reach_of_their_level() {
+        let cap = crate::tunables::GEOCODE_MAX_RADIUS_CELL_WIDTHS;
+        for (name, byte, level) in [("fine", 16usize, 17u8), ("coarse", 20, 14)] {
+            let max = cap * min_cell_width_m(level);
+            let at = (max as f32).next_down();
+            let mut header = valid_header_bytes();
+            header[byte..byte + 4].copy_from_slice(&at.to_le_bytes());
+            assert!(
+                Header::from_bytes(&header).is_ok(),
+                "{name}: a radius within the cap must parse"
+            );
+            let past = (max as f32).next_up().next_up();
+            header[byte..byte + 4].copy_from_slice(&past.to_le_bytes());
+            let err =
+                Header::from_bytes(&header).expect_err("a radius past the cap must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("is too wide for S2 level {level}")),
+                "{name}: unexpected error: {err}"
+            );
         }
     }
 

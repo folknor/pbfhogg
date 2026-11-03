@@ -123,10 +123,18 @@ impl BuildConfig {
                 self.coarse_level, self.street_level
             )));
         }
-        validate_radius("search radius", self.fine_search_radius_m)
-            .map_err(Error::invalid_argument_from)?;
-        validate_radius("coarse search radius", self.coarse_search_radius_m)
-            .map_err(Error::invalid_argument_from)?;
+        validate_radius(
+            "search radius",
+            self.fine_search_radius_m,
+            self.street_level,
+        )
+        .map_err(Error::invalid_argument_from)?;
+        validate_radius(
+            "coarse search radius",
+            self.coarse_search_radius_m,
+            self.coarse_level,
+        )
+        .map_err(Error::invalid_argument_from)?;
         Ok(())
     }
 }
@@ -987,5 +995,18 @@ mod config_tests {
         config.fine_search_radius_m = 75.0;
         config.coarse_search_radius_m = f32::INFINITY;
         assert!(config.validate().is_err());
+        config.coarse_search_radius_m = 1000.0;
+        assert!(config.validate().is_ok(), "the defaults must validate");
+        // A radius is bounded by the cell width at its own level, so the
+        // default fine radius fails at a fine enough street level.
+        config.street_level = 19;
+        config.fine_search_radius_m = 1000.0;
+        let err = config
+            .validate()
+            .expect_err("1 km at level 19 is past the cap");
+        assert!(
+            err.to_string().contains("too wide for S2 level 19"),
+            "{err}"
+        );
     }
 }

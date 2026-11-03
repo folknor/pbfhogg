@@ -140,6 +140,9 @@ state.
 - `build-geocode-index` writes index format version 3 (rebuild existing
   indexes), splits `--force` into `--overwrite` and `--allow-unindexed`, and
   caps `--admin-level` at 10 and `--street-level` / `--coarse-level` at 19.
+  `--search-radius` and `--coarse-search-radius` are capped at a fixed
+  number of cell widths at their own level (see Fixed), and an index whose
+  header exceeds that no longer opens.
 - Indexdata is written as format v3; earlier pbfhogg releases read such files
   as unindexed.
 
@@ -498,6 +501,18 @@ state.
   search radius. The admin interior hint is now only set on cells wholly inside
   their polygon (queries still test containment). The index format is
   unchanged; rebuild to gain the cells.
+- Geocode queries search the whole fine and coarse search radius. They read
+  only the query's cell and its eight neighbours, which reach about one cell
+  width, less than the default radii, so a street, address or interpolation
+  way inside the radius was passed over for a farther one or for nothing; on
+  uniform points over Germany that was about one street answer in twelve,
+  mostly from the coarse search. A segment is also measured to its true
+  nearest point near the poles (across the antimeridian side) and when very
+  short. Applies to existing indexes; no rebuild needed for this fix.
+  `build-geocode-index` refuses a `--search-radius` or
+  `--coarse-search-radius` wider than a fixed number of cell widths at its
+  level, and the reader refuses an index whose header carries one, or whose
+  cell files are out of order.
 - Concurrent library runs no longer share scratch.
 - io_uring writers opened one after another no longer fail with ENOMEM.
 

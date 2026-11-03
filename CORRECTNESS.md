@@ -332,8 +332,8 @@ offending cell or way in the error message.
 today in practice:
 
 - Per-cell entry caps are well above observed density at street level
-  17 (~150 m cells) and coarse level 14 (~1 km cells in dense urban
-  areas).
+  17 (cells 46 to 83 m wide) and coarse level 14 (367 to 663 m), even
+  in dense urban areas.
 - Per-way `node_count` is well above the OSM convention cap of 2 000
   refs per way.
 

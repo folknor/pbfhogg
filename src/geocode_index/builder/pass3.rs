@@ -115,7 +115,10 @@ pub(in crate::geocode_index) fn admin_level_exceeds_cell_budget(level: u8) -> bo
 }
 
 /// Sampling step for `level`, in degrees: a little under half the globally
-/// smallest S2 cell width at that level, so no cell can be stepped over.
+/// smallest S2 cell width at that level. That keeps a cell the segment crosses
+/// well into from being stepped over, but it is not a proof of a complete
+/// cover: a segment can clip a cell near its corner for less than one step
+/// and miss it. Only an exact edge traversal closes that.
 fn segment_step_degrees(level: u8) -> f64 {
     MIN_WIDTHMETRIC.value(level).to_degrees() * SEGMENT_STEP_WIDTH_FACTOR
 }
@@ -141,10 +144,11 @@ pub(in crate::geocode_index) fn level_exceeds_sampling_budget(level: u8) -> bool
     worst_case_segment_samples(level) > MAX_SEGMENT_SAMPLES
 }
 
-/// Cover a line segment by sampling intermediate points to find all S2 cells
+/// Cover a line segment by sampling intermediate points to find the S2 cells
 /// the segment passes through at the given level.
 ///
-/// Calls `emit(cell_id)` once for each sampled cell the segment crosses.
+/// Calls `emit(cell_id)` once for each distinct cell: the cells holding the
+/// two stored vertices always, and every cell a sample lands in.
 ///
 /// `level` must have passed [`level_exceeds_sampling_budget`] - that is what
 /// `BuildConfig::validate` enforces. Given that, the sample count for any
@@ -162,6 +166,7 @@ fn cover_segment(
     let lat1 = e7_to_deg(lat1_e7 as f64);
     let lon1 = e7_to_deg(lon1_e7 as f64);
     let lat2 = e7_to_deg(lat2_e7 as f64);
+    let raw_lon2 = e7_to_deg(lon2_e7 as f64);
     // Unwrap the far endpoint around the near one. A segment from 179.9 to
     // -179.9 is 0.2 degrees wide, not 359.8: sampling it in the raw frame
     // walks the long way around the globe and covers half the planet in
@@ -171,8 +176,25 @@ fn cover_segment(
             geo::wrapped_longitude_delta_e7(i64::from(lon2_e7) - i64::from(lon1_e7)) as f64,
         );
 
-    let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
-    let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
+    // The endpoint cells are taken from the vertices exactly as stored, not
+    // from the samples, and seeded into the cover before and after the walk,
+    // so the cell a query at either vertex looks up is always emitted. The
+    // samples cannot promise that: `normalize_longitude_degrees` maps -180 to
+    // +180, and off the poles the antimeridian is S2 face 3's midline, where
+    // the sign of sin(+-pi) puts -180 and +180 in different cells at every
+    // level; the unwrapped `lon2` can be the +180 spelling of a -180 vertex;
+    // and both the fold and `lon1 + 1.0 * (lon2 - lon1)` can land an ulp off
+    // the vertex, across a cell edge. The t=0 and t=1 samples are skipped
+    // only when they are bit-identical to their vertex, so they would name
+    // the cell already seeded; where the fold or the interpolation moved the
+    // value they still run, and the seam twin of a vertex at -180 stays in
+    // the cover. On the usual segment that saves two cell computations.
+    let c1 = CellID::from(LatLng::from_degrees(lat1, lon1))
+        .parent(level as u64)
+        .0;
+    let c2 = CellID::from(LatLng::from_degrees(lat2, raw_lon2))
+        .parent(level as u64)
+        .0;
 
     // Sample at less than half the globally-smallest S2 cell width for this
     // level. Unlike the old hand-written table, this covers every valid level,
@@ -195,10 +217,20 @@ fn cover_segment(
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let steps = (exact_steps.min(MAX_SEGMENT_SAMPLES) as usize).max(1);
     let mut seen = rustc_hash::FxHashSet::default();
+    seen.insert(c1);
+    emit(c1);
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
         let lat = lat1 + t * (lat2 - lat1);
         let lon = normalize_longitude_degrees(lon1 + t * (lon2 - lon1));
+        let is_vertex =
+            (i == 0 && lat.to_bits() == lat1.to_bits() && lon.to_bits() == lon1.to_bits())
+                || (i == steps
+                    && lat.to_bits() == lat2.to_bits()
+                    && lon.to_bits() == raw_lon2.to_bits());
+        if is_vertex {
+            continue;
+        }
         let c = CellID::from(LatLng::from_degrees(lat, lon))
             .parent(level as u64)
             .0;
@@ -206,8 +238,9 @@ fn cover_segment(
             emit(c);
         }
     }
-    debug_assert!(seen.contains(&c1.0));
-    debug_assert!(seen.contains(&c2.0));
+    if seen.insert(c2) {
+        emit(c2);
+    }
 }
 
 /// Cover at the fine level and emit each coarse parent once per segment.
@@ -1218,6 +1251,54 @@ mod tests {
 
         assert!(cells.contains(&c1), "first endpoint cell must be included");
         assert!(cells.contains(&c2), "second endpoint cell must be included");
+    }
+
+    /// A vertex at exactly lon -180 off the poles sits on S2 face 3's
+    /// midline, where -180 and +180 land in different cells at every level.
+    /// The endpoint cells computed from the vertex as given must still be in
+    /// the cover, for a segment running along the antimeridian and for one
+    /// leaving it westward.
+    #[test]
+    fn cover_segment_includes_endpoint_cells_at_lon_minus_180() {
+        for (lat1, lon1, lat2, lon2) in [
+            (0, -1_800_000_000, 100_000_000, -1_800_000_000),
+            (100_000_000, -1_800_000_000, 0, -1_800_000_000),
+            (0, -1_800_000_000, 0, 1_799_000_000),
+            (0, 1_799_000_000, 0, -1_800_000_000),
+        ] {
+            let endpoint = |lat_e7: i32, lon_e7: i32| {
+                CellID::from(LatLng::from_degrees(
+                    f64::from(lat_e7) * 1e-7,
+                    f64::from(lon_e7) * 1e-7,
+                ))
+                .parent(12)
+                .0
+            };
+            let mut cells = Vec::new();
+            cover_segment(lat1, lon1, lat2, lon2, 12, |c| cells.push(c));
+            assert!(
+                cells.contains(&endpoint(lat1, lon1)),
+                "first endpoint cell missing for ({lat1}, {lon1}) -> ({lat2}, {lon2})"
+            );
+            assert!(
+                cells.contains(&endpoint(lat2, lon2)),
+                "second endpoint cell missing for ({lat1}, {lon1}) -> ({lat2}, {lon2})"
+            );
+        }
+        // The +180 spelling of a -180 vertex is the cell across the seam; the
+        // normalised t=0 sample keeps it in the cover alongside the vertex's
+        // own cell.
+        let mut cells = Vec::new();
+        cover_segment(0, -1_800_000_000, 100_000_000, -1_800_000_000, 12, |c| {
+            cells.push(c);
+        });
+        let minus = CellID::from(LatLng::from_degrees(0.0, -180.0)).parent(12).0;
+        let plus = CellID::from(LatLng::from_degrees(0.0, 180.0)).parent(12).0;
+        assert_ne!(minus, plus, "fixture must sit on the face 3 seam");
+        assert!(
+            cells.contains(&plus),
+            "the seam twin must stay in the cover"
+        );
     }
 
     /// The old implementation capped the walk at 256 steps, so it could emit

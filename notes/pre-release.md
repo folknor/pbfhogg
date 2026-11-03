@@ -519,28 +519,23 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-155: geocode segment cover may miss an endpoint cell at lon -180
+### WRK-166: geocode segment cover can miss a cell clipped near its corner
 
-Reasoned by the 2026-11-03 debug-assert audit, not run. `cover_segment`
-(`src/geocode_index/builder/pass3.rs`) computes the endpoint cells `c1` and
-`c2` from the raw and unwrapped longitudes but samples normalised ones
-(`normalize_longitude_degrees` maps -180 to +180). At exactly lon -180 with
-|lat| below about 45, S2 face 3's midline is the antimeridian and the sign
-of `sin(+-pi)` decides the side, so -180 and the normalised +180 land in
-different cells at every level: a segment along or west of -180 never
-samples `c1`. Antimeridian admin boundaries (Fiji, Kiribati) have such
-segments; the cost is a strip of boundary cells, so a query exactly at -180
-can miss. Separately `(lon + 180) - 180` is off by up to one ulp of 180, so
-a vertex within nanometres of a cell edge can miss its own cell. The two
-`debug_assert!`s that the endpoint cells were sampled would panic a debug
-build on that valid data, so they must not become release asserts. First a
-debug-build unit test, for example
-`cover_segment(0, -1_800_000_000, 100_000_000, -1_800_000_000, 12, ..)`;
-the existing `widest_legal_segment_stays_under_its_analytic_worst_case`
-uses -180 only at the poles, where the effect vanishes. If it fires: seed
-`seen` with `c1` and `c2` (or take the t=0 and t=1 samples from the raw
-endpoints) so endpoint coverage holds by construction, and drop the
-asserts.
+Found 2026-11-03 while fixing the lon -180 endpoint gap. `cover_segment`
+(`src/geocode_index/builder/pass3.rs`) now always emits the cells holding
+both stored vertices, but between them it still samples at 0.4 of the
+smallest cell width, and a segment can pass through a cell near its corner
+for less than one step, so that cell is never emitted. For streets the
+reader's 3x3 neighbourhood usually still finds the segment; for admin
+polygons a missed edge cell whose centre is inside can be flood-filled as
+interior with the boundary running through it (harmless today because the
+reader runs point-in-polygon on every candidate, per ADR-0015, but it is
+what blocks trusting the interior flag). The fix is an exact edge-cell
+traversal, the open "Spike: exact S2 segment coverage" in `notes/todo.md`;
+note that an S2 polyline or RegionCoverer covers the geodesic, not the
+lat/lon-linear segment the sampler walks and `geo.rs` measures distance
+against, so the replacement needs one geometry contract for both sides
+before it is conservative.
 
 ### WRK-157: BlockBuilder's poison-on-drop check can panic a debug build
 
@@ -716,7 +711,11 @@ Sites where a structural change removes the precondition:
   worst-case span as `hypot(180, 360)` degrees, but after
   `wrapped_longitude_delta_e7` the longitude delta is at most 180, so the
   real bound is `hypot(180, 180)`; the 405-degree budget is conservative,
-  not wrong, and the comment should say why.
+  not wrong, and the comment should say why. The test
+  `widest_legal_segment_stays_under_its_analytic_worst_case` has the same
+  staleness: its (-90, -180) to (90, 180) fixture unwraps to a zero
+  longitude delta, a pole-to-pole meridian, so it is not the widest legal
+  segment; the widest is about 180 degrees of latitude by 180 of longitude.
 
 ---
 

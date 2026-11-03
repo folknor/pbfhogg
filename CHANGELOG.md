@@ -284,6 +284,13 @@
   dropped every node stored as a plain (non-dense) Node message, and with
   it every way and relation that node would have matched. They are now
   classified like dense nodes.
+- `build-geocode-index` always indexes the cell holding each street and
+  admin boundary vertex. A vertex at exactly longitude -180 away from the
+  poles was indexed only in the cell across the antimeridian, so a query
+  just east of it whose neighbouring cells do not reach across the line
+  could miss that street or boundary, and a debug
+  build panicked on the valid input. Indexes built before this need a
+  rebuild to gain the cell; the format is unchanged.
 
 ## 0.6.0 - 2026-10-30
 

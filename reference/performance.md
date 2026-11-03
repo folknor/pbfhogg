@@ -2881,6 +2881,21 @@ mmap would thrash (same as dense ALTW).
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
 interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
 
+### Vertex cells seeded in the segment cover (bygg, 2026-11-03)
+
+`cover_segment` emits the cells holding both stored vertices directly
+instead of relying on the t=0 and t=1 samples to reach them, and skips
+those two samples when they are bit-identical to their vertex. Planet,
+`--bench 1`: A is clean `603068a1` (`5e1fbae5`), 177.1 s; B is the change
+on that commit, uncommitted (`--force`, not stored), 178.5 s, noise. Pass 3
+Stage A streets, the only phase that runs the per-segment cover, went
+20.5 s to 18.9 s: the skip saves two cell computations per segment, more
+than the two seeded insertions cost. A first B cell of the seeding without
+the skip ran 188.6 s, with Pass 2A and 2B (which never cover a segment)
+reading 4 to 7 GB more from disk than A and Stage A streets at 22.3 s. The
+stored 320 s planet cells from before the malloc arena change are no
+baseline for this build any more.
+
 ### Comparison with traccar-geocoder
 
 No directly comparable data - different hardware, different format, different

@@ -342,13 +342,12 @@ added a per-byte state machine to the per-node metadata arrays of
 every dense block. What holds for a narrowed value: string indices
 resolve through checked lookups (a negative one is an error), an
 out-of-range member type is represented as `MemberType::Unknown`,
-and the dense deltas accumulate with wrapping arithmetic. One
-exception: in a debug build, `BlockBuilder`'s raw-passthrough
-assertion (`debug_assert_raw_strings`) checks role indices as raw
-`u64`, so a role of `2^32 + n` that the reader resolves as string
-`n` trips it; release builds pass the bytes through. Renumber's raw
-relation rewriter dispatches on the same truncated member type, so
-the two paths agree.
+and the dense deltas accumulate with wrapping arithmetic.
+apply-changes' raw copy of a rewritten blob's elements checks each
+copied role and user index narrowed the same way, so a role of
+`2^32 + n` that the reader resolves as string `n` is copied as it
+is and judged as `n`. Renumber's raw relation rewriter dispatches on
+the same truncated member type, so the paths agree.
 
 The non-canonical form real files do carry is one this rule reads
 correctly: protohoggr before 0.5.0 converted the zigzagged `i32`

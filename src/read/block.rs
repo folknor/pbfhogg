@@ -675,8 +675,10 @@ impl PrimitiveBlock {
 
     /// Returns the string at the given string table index, or `None` if out of bounds.
     ///
-    /// Index 0 is always the empty string. Entries were validated as UTF-8 at
-    /// construction time.
+    /// Index 0 is conventionally the empty string (writers put it there, as
+    /// the dense end-of-tags marker), but construction does not require it:
+    /// the entry is returned as the file stores it. Entries were validated as
+    /// UTF-8 at construction time.
     pub fn string_table_entry(&self, index: usize) -> Option<&str> {
         self.block.stringtable.get(index).map(|bytes| {
             // SAFETY: All stringtable entries were validated as UTF-8 in
@@ -985,14 +987,16 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// No stringtable index is resolved (that is `str_from_stringtable`'s job,
 /// which is already fallible).
 ///
-/// Consequently a block accepted here is not a certificate that raw rewrite
+/// Consequently a block accepted here is not a certificate that its string
 /// indices are in table bounds. Enforcing that globally would change when
 /// out-of-range strings fail and require decoding regular-element keys and
 /// values, relation roles and Info/DenseInfo user indices even for readers
 /// that never access those strings (dense `keys_vals` is the one array this
 /// pass already decodes, for its run count and int32 width checks).
-/// Keep structural validation distinct from string resolution; do not infer
-/// a raw rewrite sanitization guarantee from successful construction.
+/// Keep structural validation distinct from string resolution. A raw
+/// rewrite, which copies indices without resolving them, checks the ones it
+/// copies itself (`BlockBuilder`'s raw adds, against the table they were
+/// pre-seeded from).
 ///
 /// No error raised here carries a byte offset. These sites sit below the
 /// framing layer and cannot know their position in the file; the enclosing
@@ -1677,10 +1681,9 @@ fn validate_way_geometry_arrays(way: &WireWay<'_>) -> Result<()> {
 /// `roles_sid` and `types` (int32) are counted, not width-checked: a value
 /// outside `i32` narrows with a cast, as protobuf specifies. The role then
 /// resolves through the checked string lookup and an unknown type is
-/// represented as `MemberType::Unknown`; the one exception is the debug-build
-/// raw-passthrough assertion in `BlockBuilder`, which reads roles as raw
-/// `u64`. Renumber's raw rewriter dispatches on the same truncated type. See
-/// `reference/truncation-handling.md`.
+/// represented as `MemberType::Unknown`. apply-changes' raw copy checks a
+/// role narrowed the same way, and renumber's raw rewriter dispatches on the
+/// same truncated type. See `reference/truncation-handling.md`.
 #[inline]
 fn validate_relation_member_arrays(relation: &WireRelation<'_>) -> Result<()> {
     let roles = packed_varint_count(relation.roles_sid_data)?;

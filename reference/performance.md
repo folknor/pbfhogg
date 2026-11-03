@@ -1845,6 +1845,37 @@ ahead of them is final, the string table itself, and dense vectors kept
 through the way phase (44.5 MB). Each of the last two is about 2 % of the
 peak.
 
+### apply-changes checks the string indices it copies (bygg, 2026-11-03, against `59802597`)
+
+The change: every string index a rewrite copies raw is checked against the
+source block's table (dense and plain node tag pairs and the dense user,
+already decoded; a way's or relation's values and roles in one varint pass
+each, its `Info` user by a scan for field 5, its keys inside the decode the
+tagdata tracking already made), and every flush resets the builder.
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, every arm built in the main tree (HEAD cells stored,
+variant cells `--force`), no trim of its own (the drive was trimmed that
+morning). Run order HEAD, first form, HEAD, first form, landed, HEAD,
+landed. Rewrite CPU is `merge_streaming_rewrite_ns` summed over the 30
+workers (encoding included, framing excluded).
+
+| arm | walls (s) | rewrite CPU (s) | peak anon (MB) |
+|---|---|---|---|
+| `59802597` (`efcd42fa`, `7be19856`, `f9ba5b99`) | 91.8, 91.8, 97.0 | 1,090, 1,092, 1,057 | 1,891, 1,942, 1,908 |
+| first form (sidecars `b742ac42`, `4143d48c`) | 94.0, 97.8 | 1,155, 1,132 | 1,942, 1,869 |
+| landed (sidecars `c486073d`, `d7f1ce89`) | 91.9, 91.1 | 1,076, 1,080 | 2,010, 1,929 |
+
+The first form left the builder unchanged on a refusal (dense pairs staged
+and walked twice), parsed each copied `Info` whole and checked keys in a
+pass of their own: about 50 s more rewrite CPU (43,671 of 50,816 blobs are
+rewritten, so most of the planet's 11.6 billion elements are copied), +4.5 %
+wall, above the noise floor. The landed form poisons the
+builder on a refusal instead, so each array is walked once, and reads only
+the `Info` user; its walls and rewrite CPU are inside HEAD's spread. The
+`--locations-on-ways` path, which copies ways through the same checks, was
+not measured.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

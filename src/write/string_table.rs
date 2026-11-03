@@ -74,6 +74,7 @@ impl StringTable {
     }
 
     /// Number of slots, slot zero included.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.slots.len()
     }
@@ -126,10 +127,15 @@ impl StringTable {
     /// Pre-seed from an input block's string table, populating the index map.
     ///
     /// After pre-seeding, input index N maps to output index N (identity).
-    /// Index 0 (empty string) is already present from `new()` and is skipped.
+    /// Index 0 (empty string) is already present from `new()` and is skipped;
+    /// the caller refuses a source whose slot zero is anything else
+    /// (`BlockBuilder::pre_seed_string_table`). A table that is not fresh is
+    /// cleared first, so the copy always starts at slot one.
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn pre_seed(&mut self, block: &PrimitiveBlock) {
-        debug_assert_eq!(self.slots.len(), 1, "pre-seed requires a fresh table");
+        if self.slots.len() != 1 {
+            self.clear();
+        }
         let len = block.string_table_len();
         for i in 1..len {
             if let Some(s) = block.string_table_entry(i) {

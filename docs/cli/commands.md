@@ -1735,6 +1735,13 @@ run fails (exit 2) and publishes nothing. See
 [indexdata-trust.md](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md), "Range, count and order claims
 refused at decode".
 
+A blob the run rewrites keeps its surviving elements' strings by copying their
+string table indices, and checks each one: a tag key or value, member role or
+user name index that lies past its block's string table, or a block whose
+string table does not begin with the empty string, fails the run (exit 2) and
+publishes nothing, the error naming the element, field and index. Blobs copied
+unchanged are not checked.
+
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the
 timestamp and sequence number, since the output is past them; set the new

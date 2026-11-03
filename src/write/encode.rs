@@ -407,20 +407,27 @@ pub(super) fn encode_relation_raw_bytes(
     encode_bytes_field(group_buf, 4, elem);
 }
 
-/// Decode packed varint uint32 values from raw bytes and insert them into a set.
+/// Decode a raw way's or relation's packed `keys` and insert each string
+/// index into `indices`, stopping at the first that is not below `seeded`
+/// (the source string table's length) and returning it.
 ///
-/// Used to extract string table key indices from raw way/relation keys_data
-/// (packed uint32 protobuf field) for tag key tracking.
-#[allow(clippy::cast_possible_truncation)]
-pub(super) fn collect_packed_varint_keys(data: &[u8], indices: &mut FxHashSet<u32>) {
-    let mut cur = protohoggr::Cursor::new(data);
-    while !cur.is_empty() {
-        if let Ok(val) = cur.read_varint() {
-            indices.insert(val as u32);
+/// The array comes from a `PrimitiveBlock`, whose construction checked its
+/// varints and that every one fits `u32` (`validate_tag_arrays`), so the
+/// decode is the reader's (`PackedUint32Iter`). Indices inserted before a
+/// refused one stay in the set; the caller poisons the builder on an error.
+pub(super) fn collect_checked_keys(
+    data: &[u8],
+    seeded: usize,
+    indices: &mut FxHashSet<u32>,
+) -> Result<(), u32> {
+    for sid in crate::read::wire::PackedUint32Iter::new(data) {
+        if usize::try_from(sid).is_ok_and(|s| s < seeded) {
+            indices.insert(sid);
         } else {
-            break;
+            return Err(sid);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -130,7 +130,7 @@ pub(super) fn rewrite_block_parallel(
     let inline_base = inline_upserts.start;
     let mut upsert_cursor: usize = 0;
 
-    bb.pre_seed_string_table(block);
+    bb.pre_seed_string_table(block)?;
 
     for element in block.elements() {
         let (elem_kind, elem_id) = element_kind_id(&element);

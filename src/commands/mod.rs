@@ -202,12 +202,13 @@ impl WorkerBuilder {
         Self { bb }
     }
 
-    /// The builder for one task. A task that succeeded left it empty (every
-    /// task ends with an unconditional flush), and a task that failed ends
-    /// its worker (neither pool hands a worker more work after a failure),
-    /// so a builder still holding elements here is a broken invariant:
-    /// refused, rather than letting another blob's elements into this one's
-    /// output.
+    /// The builder for one task. A task that succeeded left it reset (every
+    /// task ends with an unconditional flush, and a flush resets the builder
+    /// whether or not it had a block to encode, pre-seeded string table
+    /// included), and a task that failed ends its worker (neither pool hands
+    /// a worker more work after a failure), so a builder still holding
+    /// elements here is a broken invariant: refused, rather than letting
+    /// another blob's elements into this one's output.
     pub(crate) fn task(&mut self) -> Result<&mut BlockBuilder> {
         if !self.bb.is_empty() {
             return Err(crate::error::Error::internal(

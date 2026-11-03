@@ -86,17 +86,19 @@ pub(super) fn write_base_dense_node_local(
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
-        bb.pre_seed_string_table(block);
+        bb.pre_seed_string_table(block)?;
     }
     let meta = dense_node_raw_metadata(dn);
+    // Block construction keeps every dense index a nonnegative int32, so the
+    // cast is the identity.
     bb.add_node_raw(
         dn.id(),
         dn.decimicro_lat(),
         dn.decimicro_lon(),
-        dn.raw_tags(),
+        dn.raw_tags()
+            .map(|(k, v)| (k.cast_unsigned(), v.cast_unsigned())),
         meta.as_ref(),
-    );
-    Ok(())
+    )
 }
 
 pub(super) fn write_base_node_local(
@@ -115,18 +117,16 @@ pub(super) fn write_base_node_local(
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
-        bb.pre_seed_string_table(block);
+        bb.pre_seed_string_table(block)?;
     }
     let meta = element_raw_metadata(&node.info());
     bb.add_node_raw(
         node.id(),
         node.decimicro_lat(),
         node.decimicro_lon(),
-        node.raw_tags()
-            .map(|(k, v)| (k.cast_signed(), v.cast_signed())),
+        node.raw_tags(),
         meta.as_ref(),
-    );
-    Ok(())
+    )
 }
 
 /// What the raw writers of one source block's surviving base ways and
@@ -257,7 +257,7 @@ pub(super) fn write_base_way_local(
     ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
-        bb.pre_seed_string_table(block);
+        bb.pre_seed_string_table(block)?;
     }
     let info = output_info(way.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
     bb.add_way_raw_bytes(
@@ -266,8 +266,7 @@ pub(super) fn write_base_way_local(
         way.vals_data(),
         way.refs_data(),
         info,
-    );
-    Ok(())
+    )
 }
 
 /// Write a surviving base way under LocationsOnWays.
@@ -290,7 +289,7 @@ pub(super) fn write_base_way_local_with_locations(
     ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
-        bb.pre_seed_string_table(block);
+        bb.pre_seed_string_table(block)?;
     }
     let BaseWrites {
         framing,
@@ -342,7 +341,7 @@ pub(super) fn write_base_way_local_with_locations(
             lats,
             lons,
             info,
-        );
+        )
     } else {
         bb.add_way_raw_bytes_with_locations(
             way.id(),
@@ -352,9 +351,8 @@ pub(super) fn write_base_way_local_with_locations(
             way.lat_data(),
             way.lon_data(),
             info,
-        );
+        )
     }
-    Ok(())
 }
 
 /// Write an OSC way, with LocationsOnWays coordinates when `loc` requires them.
@@ -380,7 +378,7 @@ pub(super) fn write_base_relation_local(
     ensure_relation_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
-        bb.pre_seed_string_table(block);
+        bb.pre_seed_string_table(block)?;
     }
     let info = output_info(rel.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
     bb.add_relation_raw_bytes(
@@ -391,6 +389,5 @@ pub(super) fn write_base_relation_local(
         rel.memids_data(),
         rel.types_data(),
         info,
-    );
-    Ok(())
+    )
 }

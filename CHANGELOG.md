@@ -261,6 +261,18 @@
 
 ### Fixed
 
+- `apply-changes` could write wrong tags, roles and user names, with no
+  error, into the blobs it rewrote after a blob the diff deleted whole on
+  the same worker thread: the deleted blob's string table stayed behind and
+  the next rewrite's strings were read through it. A valid base and diff
+  were enough.
+- `apply-changes` refuses a rewritten blob holding a tag key or value,
+  member role or user name whose string table index lies past its block's
+  string table (exit 2, nothing published, the error naming the element),
+  and one whose string table does not begin with the empty string. Such an
+  index used to be copied into the output, where it could name an unrelated
+  string the diff added to the same block, and a tag key there panicked the
+  run.
 - `extract` complete-ways and `--smart` on a sorted input with a bbox
   dropped every node stored as a plain (non-dense) Node message, and with
   it every way and relation that node would have matched. They are now

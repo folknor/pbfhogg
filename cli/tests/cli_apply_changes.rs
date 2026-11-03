@@ -925,6 +925,90 @@ fn merge_delete_entire_block() {
     );
 }
 
+/// A blob the diff deletes whole, rewritten on the same worker as the next
+/// touched blob, must not leave its string table behind for that blob.
+///
+/// The fully deleted blob's rewrite adds no element, so its final flush
+/// encodes nothing; the builder still held that blob's pre-seeded table
+/// when the next rewrite on the worker pre-seeded its own, and the second
+/// table was appended behind the first: every copied string index of the
+/// next blob then named the deleted blob's strings. One worker forces both
+/// blobs onto the same builder.
+#[test]
+fn merge_delete_entire_block_keeps_the_next_rewrites_strings() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    {
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(1, 100_000_000, 100_000_000, [("gone", "one")], None);
+        bb.add_node(2, 200_000_000, 200_000_000, [("gone", "two")], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_node(10, 100_000_000, 100_000_000, [("survivor", "yes")], None);
+        bb.add_node(11, 110_000_000, 110_000_000, [("edited", "no")], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        writer.flush().expect("flush");
+    }
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="11" lat="11.0" lon="11.0" version="2">
+      <tag k="edited" v="yes"/>
+    </node>
+  </modify>
+  <delete>
+    <node id="1" version="2"/>
+    <node id="2" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            jobs: Some(1),
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        out.status.success(),
+        "apply-changes failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![10, 11]);
+    assert_eq!(
+        c.nodes[0].3,
+        vec![("survivor".to_string(), "yes".to_string())]
+    );
+    assert_eq!(
+        c.nodes[1].3,
+        vec![("edited".to_string(), "yes".to_string())]
+    );
+}
+
 #[test]
 fn merge_stats_accuracy() {
     let dir = crate::common::test_scratch();

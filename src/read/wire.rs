@@ -938,6 +938,46 @@ impl WireInfo {
 
         Ok(info)
     }
+
+    /// The user string index [`parse`](Self::parse) would return, for a
+    /// caller that needs nothing else from the message: apply-changes checks
+    /// the user of every way and relation it copies raw.
+    ///
+    /// The fast path covers what writers emit, an `Info` of varint fields
+    /// with one-byte tags: it finds each field's end by its terminating byte
+    /// and decodes only field 5, the last occurrence winning, as in `parse`.
+    /// Anything else (another wire type, a multi-byte tag, field zero, a
+    /// varint of ten bytes or one cut off) is handed to `parse`, which
+    /// decides it, error included, so the two cannot disagree.
+    #[inline]
+    pub fn user_sid_of(data: &[u8]) -> Result<Option<i32>> {
+        let mut user = None;
+        let mut i = 0;
+        while let Some(&tag) = data.get(i) {
+            // A one-byte tag (high bit clear) of wire type varint (low bits
+            // zero) naming a field above zero.
+            if tag & 0x87 != 0 || tag < 8 {
+                return Ok(Self::parse(data)?.user_sid);
+            }
+            let start = i + 1;
+            let Some(len) = data
+                .get(start..)
+                .and_then(|rest| rest.iter().position(|&b| b & 0x80 == 0))
+            else {
+                return Ok(Self::parse(data)?.user_sid);
+            };
+            if len >= 9 {
+                return Ok(Self::parse(data)?.user_sid);
+            }
+            i = start + len + 1;
+            if tag == 5 << 3 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let sid = Cursor::new(&data[start..i]).read_varint()? as i32;
+                user = Some(sid);
+            }
+        }
+        Ok(user)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1119,40 @@ mod tests {
         assert_eq!(info.timestamp, None);
         assert_eq!(info.changeset, None);
         assert_eq!(info.user_sid, None);
+    }
+
+    /// `user_sid_of` answers what `parse` answers, error included, on its
+    /// fast path (one-byte varint tags) and on every form it hands over: a
+    /// repeated user (last wins), a user of another wire type, a narrowed
+    /// user, a long varint, a multi-byte tag, field zero, a cut-off varint.
+    #[test]
+    fn user_sid_of_agrees_with_parse() {
+        let cases: [&[u8]; 12] = [
+            &[],
+            &[0x08, 0x01],
+            &[0x08, 0x01, 0x28, 0x07],
+            &[0x28, 0x09, 0x08, 0x01, 0x28, 0x03],
+            &[0x28, 0x03, 0x2A, 0x01, 0x09],
+            &[0x28, 0x81, 0x80, 0x80, 0x80, 0x10],
+            &[0x28, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F],
+            &[
+                0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x28, 0x02,
+            ],
+            &[0xA8, 0x01, 0x05, 0x28, 0x02],
+            &[0x00, 0x01, 0x28, 0x02],
+            &[0x28, 0x02, 0x10, 0x80],
+            &[0x28, 0x02, 0x0D, 1, 2, 3, 4],
+        ];
+        for data in cases {
+            // Compared as rendered, kind and message both.
+            let render = |r: Result<Option<i32>>| match r {
+                Ok(sid) => format!("ok {sid:?}"),
+                Err(e) => format!("err {:?} {e}", e.kind()),
+            };
+            let fast = render(WireInfo::user_sid_of(data));
+            let slow = render(WireInfo::parse(data).map(|info| info.user_sid));
+            assert_eq!(fast, slow, "{data:02x?}");
+        }
     }
 
     #[test]

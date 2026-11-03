@@ -84,9 +84,13 @@ actually gives, not an assumption:
   should give `check-index = "violations"`. Confirm each with one run first;
   brokkr#71 notes `--unsort` breaks ID order only on large enough inputs.
 
-### WRK-137: Maintainer ruling on inspect tags' key-only rows
+### WRK-137: inspect tags adopts osmium's key-only rows
 
-A decision for the maintainer before 0.6.0. osmium's `tags-count`
+Ruled by the maintainer 2026-11-03: adopt osmium's rule. No expression and
+a bare-key expression count keys (key-only rows); `key=*` and `key=value`
+count key=value pairs, so the value breakdown stays reachable. Ready to
+work: the row shape, the per-key tally or fold, the CHANGELOG entry and
+the three doc passages below. Background as it was written: osmium's `tags-count`
 (`research/osmium-tool/src/command_tags_count.cpp`) counts the key alone
 when an expression has no value matcher (`add_matcher` routes it to
 `m_keys_filter`), and with no expression at all it sets
@@ -118,6 +122,20 @@ trust, and nothing amends or supersedes it. Rule on how the two reconcile
 (for example: release-mode checks wherever the check is off the
 per-element path, `debug_assert!` only where it would cost per element);
 an amended or superseding ADR follows.
+
+The 2026-11-03 audit of every site (see "Invariant checks" below, and
+WRK-154 to WRK-159) found almost no release cost: the only per-element
+checks are the iterator ends (WRK-161) and apply-changes' raw-rewrite
+string checks, which turned out to be input checks living only in debug
+builds. Those are now release refusals, at noise cost on a planet A/B once
+each copied array is walked once (reference/performance.md, "apply-changes
+checks the string indices it copies").
+Proposed rule for the superseding ADR: release `assert!` by default for an
+internal invariant; `debug_assert!` only where a planet A/B shows the check
+costs more than noise; anything input-reachable is an `Err` (ADR-0004);
+prefer a structural fix where a type can carry the invariant.
+The maintainer will rule after WRK-160 to WRK-164 have been worked under
+spar (2026-11-03).
 
 ---
 
@@ -325,7 +343,8 @@ pass over the closed set) or record the deviation.
 
 ### WRK-131: inspect tags with its default thresholds at planet is unmeasured
 
-Parked behind WRK-137 (maintainer, 2026-11-02). Low value on its own: a
+WRK-137 was ruled for osmium's key-only rows (2026-11-03), so a bare run
+will list keys: delete this entry when WRK-137 lands. Low value on its own: a
 bare planet run prints about 187 M rows, gigabytes of text no realistic
 caller wants, and the 10.8 GB counting table is the same at any
 threshold, so only the row build and serial sort are unmeasured. If
@@ -499,6 +518,209 @@ states the general behaviour. The pool-level alternative (a task panic as an
 ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
+
+### WRK-154: unsorted stored tagdata gives a silently wrong tags-filter answer
+
+Found by the 2026-11-03 debug-assert audit, not reproduced.
+`TagIndex::deserialize` (`src/blob_meta/tag_index.rs`) reads the key list
+from `BlobHeader.tagdata` without checking order, but `has_any_key` uses
+`binary_search` and `has_any_prefix` uses `partition_point`. A stored index
+with the right key set in the wrong order makes
+`BlobFilter::wants_tag_index` say no for a key that is present, and
+`tags-filter` / `tags-count` skip the blob. ADR-0013 believes tagdata
+values; this is a format violation, not a lie about the payload. Also:
+`carried_tags_hold` in `src/commands/blob_merge.rs` sorts carried keys
+before comparing, so cat and merge pass such an index through unrepaired;
+and `check --index` (`diff_tagdata`) runs `binary_search` over the unsorted
+keys, so it flags the file as `TagKeysMissing` rather than
+`MalformedTagdata`. Fix: one compare against the previous key in the loop
+`deserialize` already runs, returning `None` (the existing decode-this-blob
+collapse) or a malformed-tagdata refusal on failure; check `--index`'s
+reporting follows. The scan-side `debug_assert!` in `from_sorted_keys`
+becomes structural (the constructor sorts and dedups itself) and goes.
+
+### WRK-155: geocode segment cover may miss an endpoint cell at lon -180
+
+Reasoned by the 2026-11-03 debug-assert audit, not run. `cover_segment`
+(`src/geocode_index/builder/pass3.rs`) computes the endpoint cells `c1` and
+`c2` from the raw and unwrapped longitudes but samples normalised ones
+(`normalize_longitude_degrees` maps -180 to +180). At exactly lon -180 with
+|lat| below about 45, S2 face 3's midline is the antimeridian and the sign
+of `sin(+-pi)` decides the side, so -180 and the normalised +180 land in
+different cells at every level: a segment along or west of -180 never
+samples `c1`. Antimeridian admin boundaries (Fiji, Kiribati) have such
+segments; the cost is a strip of boundary cells, so a query exactly at -180
+can miss. Separately `(lon + 180) - 180` is off by up to one ulp of 180, so
+a vertex within nanometres of a cell edge can miss its own cell. The two
+`debug_assert!`s that the endpoint cells were sampled would panic a debug
+build on that valid data, so they must not become release asserts. First a
+debug-build unit test, for example
+`cover_segment(0, -1_800_000_000, 100_000_000, -1_800_000_000, 12, ..)`;
+the existing `widest_legal_segment_stays_under_its_analytic_worst_case`
+uses -180 only at the poles, where the effect vanishes. If it fires: seed
+`seen` with `c1` and `c2` (or take the t=0 and t=1 samples from the raw
+endpoints) so endpoint coverage holds by construction, and drop the
+asserts.
+
+### WRK-157: BlockBuilder's poison-on-drop check can panic a debug build
+
+From the 2026-11-03 debug-assert audit. The check that a poisoned
+`BlockBuilder` had its poison surfaced before drop (the
+`cfg(debug_assertions)` state and Drop in `src/write/block_builder.rs`) is
+compiled into every debug build, not only tests, unlike the writers'
+forgot-to-flush checks, which are `cfg(test)` for the reason recorded at
+`PbfWriter`'s Drop: Drop cannot tell a forgotten take from a legitimate
+`?` bail-out, and a panic there replaces the caller's real error. Poison is
+input-reachable (a relation member type decoding as unknown, re-encoded
+through `add_relation`; a library caller passing mismatched refs and
+locations), so a debug build of the CLI or of a consumer can panic in Drop
+on bad input plus an unrelated error. Narrow it to `cfg(test)` like the
+writers, or drop it.
+
+### WRK-158: altw external slot bucket width is unchecked against u32
+
+From the 2026-11-03 debug-assert audit. `ResolvedEntry::write_to`
+(`src/commands/altw/external/mod.rs`) stores `slot_pos - bucket_start` as
+u32. `slot_bucket_count` is `total_slots / max_blob_slots` clamped to
+1..=`NUM_BUCKETS`, and the last bucket is up to twice the width;
+`validate_slot_layout` bounds a blob's span against the width but not the
+width against u32. With 256 buckets the width passes u32 at about 5.5e11
+way refs, about 50 times planet: legal input at extreme scale, which in
+release scatters coordinates into the wrong way slots silently. The only
+guard is a per-entry `debug_assert!` in stage 2. Fix: an encoding-limit
+`Err` in `validate_slot_layout`, once per run, in the style of
+`BucketLayout::new`'s node-id refusal, and drop the per-entry assert.
+
+### WRK-159: multi-extract masks a schedule length mismatch with min
+
+From the 2026-11-03 debug-assert audit. `src/commands/extract/multi.rs`
+takes `len = blob_info.len().min(schedule.len())`, which would drop
+trailing schedule blobs silently if the two vectors ever disagreed. They
+are pushed in pairs today, so it cannot happen; under the maintainer's
+rule (a silent wrong answer is worse than a loud failure) it should be a
+once-per-run `assert_eq!` or `Error::internal`.
+
+---
+
+## Invariant checks (from the 2026-11-03 debug-assert audit)
+
+Three read-only audits classified every `debug_assert!` and
+`cfg(debug_assertions)` site in production code (about 50) by invariant,
+reachability from input, release cost and disposition. The input-reachable
+and defect findings still open are WRK-154 to WRK-159 above. These entries carry the
+rest and assume WRK-146 rules for release assertions by default; if it
+rules otherwise, revisit them. The audit reports themselves were transient.
+
+### WRK-160: promote the free invariant checks to release assertions
+
+Sites whose check runs at most per blob, block, write chunk, phase or run,
+or per element with a cost the audit judged noise, and whose failure in
+release is silent wrong output, memory unsafety or an undiagnosed hang:
+
+- write: the string-table body-length check in `encode_to`, the dense
+  group non-empty check in `encode_block`, `AlignedBuffer::extend` and
+  `zero_pad_to` in `direct_writer.rs`, `buf_ptr`'s index check in
+  `uring_writer.rs` (the last three guard unsafe copies or pointer
+  arithmetic).
+- read: the iterator-end checks in `WayNodeLocationsIter`,
+  `RelMemberIter`, `MemberIdIter` (`elements.rs`) and `DenseNodeIter`
+  (`dense.rs`), each once per way, relation or dense group and each a silent
+  truncation if broken; `AlignedReadBuffer::consume` (`direct_reader.rs`,
+  guards an unsafe copy, and overflow checks are off in release so a
+  violation wraps into an out-of-bounds read); `par_fold_blobs`' budget
+  check (a violation is a deadlock); `ByteBudget::release` (runs in
+  `BatchCharge::drop`, also during unwinding, so a release panic there
+  aborts; rule on that knowingly, and the `saturating_sub` after it becomes
+  dead); `AscendingTally::holds`' non-negative claim (`tally.rs`).
+- commands: `cover_segment`'s sample-budget check (`pass3.rs`), the
+  geocode cell write-out's strictly-ascending check (`pass3.rs`; a violation
+  is an unsorted cell table that binary search silently misreads, the
+  highest stakes in the audit; `Error::internal` also fits, the function
+  returns `Result`), `blob_merge.rs`'s every-restructured-entry-is-rewritten
+  check, `stream_output.rs`'s empty-builder check.
+
+Every one runs well below per-element frequency except the iterator ends
+(about 1e9 per planet pass, one branch on an arm already taken). No sweep
+beyond this list.
+
+### WRK-161: TagIter and RawTagIter end checks need one planet A/B
+
+The keys-versus-vals end checks in `TagIter::next` and `RawTagIter::next`
+(`src/read/elements.rs`) run once per plain node, way or relation tag walk,
+about 1e9 per pass, inside `#[inline]` `next`s. The branch itself is
+negligible; the risk is code size or inlining. One matched planet A/B on a
+tag-heavy pass (tags-filter or inspect --tags) before promoting; keep the
+message static so the cold edge stays a bare panic call, and if it costs,
+route the end arm through a `#[cold]` helper like `validated` rather than
+staying debug-only. A violation silently drops trailing tags.
+
+### WRK-162: make the type carry the invariant instead of an assert
+
+Sites where a structural change removes the precondition:
+
+- `encode_optional_int32`, `_int64`, `_uint32` (`src/write/encode.rs`):
+  `field <= 15` becomes a const generic with a compile-time assert (the
+  only caller passes literals 1 to 5).
+- `Interleaved::new` (`src/ordered_pool.rs`): four callers build
+  `decode_at` with the same enumerate-filter idiom; an
+  `Interleaved::from_schedule(len, is_decode)` owning the positions removes
+  the strictly-increasing precondition and the duplication.
+- `filter_by_id` (`src/commands/getid/mod.rs`): include-or-invert plus a
+  scan arm becomes one enum, so invert with `FullScan` cannot be expressed
+  (`filter_by_id_streaming` implements include only; the illegal pair would
+  write the inverse output).
+- `read_aligned_in` (`src/read/direct_reader.rs`): read `align` from the
+  scratch instead of a parameter, with the power-of-two check once in
+  `AlignedScratch::new`.
+- `zlib_inflate_bounded` (`src/read/decompress.rs`): move the
+  spare-capacity clamp into it from its caller. Inside the loop the bound
+  also leans on `reserve_exact` allocating exactly, which std does not
+  promise; re-check capacity after each reserve.
+- `Error::invalid_argument_from` and `invalid_data_from`
+  (`src/error.rs`): a crate-private leaf marker trait on the parameter,
+  instead of a debug check that the error has no source. Not a release
+  assert: a violation only flattens a cause chain on an error already being
+  reported.
+- `bucket_width` (`src/commands/altw/external/mod.rs`): take
+  `NonZeroUsize` (or drop the check, see WRK-163).
+- Pin `MAX_ADMIN_S2_LEVEL <= MAX_BUILD_S2_LEVEL` with a const assert:
+  admin polygons go through `cover_segment` at the admin level, but
+  `validate` checks that level only against the flood-fill budget, so
+  raising `ADMIN_CELL_COUNT_BUDGET` would reopen the silent sample clamp.
+
+### WRK-163: drop vacuous or redundant debug assertions
+
+- `encode_to`'s total-length check (`src/write/string_table.rs`): a
+  tautology of `len_field_size`, and `total` only sizes a reserve.
+- `CoordStats::record_block`'s `max >= min` (`src/commands/inspect/node_stats.rs`),
+  computed from the same slice two lines up; the `unwrap_or` fallbacks
+  after it are dead too (`abs_diff` or plain u32 arithmetic removes them).
+- altw stage 2's tuple-order walk check (the `cfg(debug_assertions)` state
+  in `stage2.rs`): redundant with the release `AscendingTally` refusal at
+  extraction, which is stronger.
+- the geocode builder's two level-budget checks (`builder/mod.rs`): an
+  exhaustive unit test pins both relationships over the whole level domain.
+  Stronger alternative for the street and coarse one: make
+  `level_exceeds_sampling_budget` itself the `validate` refusal.
+- `bucket_width`'s `num_buckets > 0`: the only caller asserts the same in
+  release one line earlier.
+- `encode_way_raw_bytes`' keys-and-vals pairing check: guards nothing
+  `validate_tag_arrays` does not already refuse, and its two raw-encoder
+  siblings carry none; drop it, or put it on all three.
+
+### WRK-164: stale comments met during the assert audit
+
+- `src/read/reader.rs`: `pump_blobs`' rustdoc ("Sequential frame pump ...")
+  sits above `pump_cannot_wait_on_own_batch`, so it documents the wrong
+  function and `pump_blobs` has none.
+- `src/read/block.rs`, the `PrimitiveBlock` "Stringtable UTF-8 invariant"
+  doc says "At construction time (`new()`)"; there is no `new()`, the
+  construction path is `BlockBuffer::project` / `validate_block`.
+- `src/geocode_index/builder/pass3.rs`: the sample-budget comment gives the
+  worst-case span as `hypot(180, 360)` degrees, but after
+  `wrapped_longitude_delta_e7` the longitude delta is at most 180, so the
+  real bound is `hypot(180, 180)`; the 405-degree budget is conservative,
+  not wrong, and the comment should say why.
 
 ---
 

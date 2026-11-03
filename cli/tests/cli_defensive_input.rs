@@ -709,3 +709,367 @@ fn cat_clean_user_rescues_a_bad_user_string_index() {
     );
     assert!(output.exists());
 }
+
+// ---------------------------------------------------------------------------
+// apply-changes' raw rewrite of a touched base blob
+//
+// A base element the diff leaves alone, in a blob the diff touches, is
+// copied with its string indices unresolved into an output block whose
+// string table starts as a copy of its source block's. The diff's own
+// elements in that output block add their strings behind the copy, so a
+// source index at or past the source table either names one of them (a
+// valid file with the wrong string) or lies past everything (a tag key
+// there used to panic the run). Either is refused.
+// ---------------------------------------------------------------------------
+
+/// Which string index of [`write_raw_rewrite_pbf`]'s second element of a
+/// block is bad. The first element of each block is the one the diff
+/// modifies; the second is copied raw.
+#[derive(Clone, Copy, Debug)]
+enum RawSid {
+    DenseKey,
+    DenseVal,
+    DenseUser,
+    NodeKey,
+    NodeVal,
+    NodeUser,
+    WayKey,
+    WayVal,
+    WayUser,
+    RelationKey,
+    RelationRole,
+    RelationUser,
+}
+
+impl RawSid {
+    const ALL: [RawSid; 12] = [
+        RawSid::DenseKey,
+        RawSid::DenseVal,
+        RawSid::DenseUser,
+        RawSid::NodeKey,
+        RawSid::NodeVal,
+        RawSid::NodeUser,
+        RawSid::WayKey,
+        RawSid::WayVal,
+        RawSid::WayUser,
+        RawSid::RelationKey,
+        RawSid::RelationRole,
+        RawSid::RelationUser,
+    ];
+
+    /// The refusal's element and field, ahead of the index.
+    fn needle(self) -> &'static str {
+        match self {
+            RawSid::DenseKey => "node 2: tag key string index",
+            RawSid::DenseVal => "node 2: tag value string index",
+            RawSid::DenseUser => "node 2: user name string index",
+            RawSid::NodeKey => "node 4: tag key string index",
+            RawSid::NodeVal => "node 4: tag value string index",
+            RawSid::NodeUser => "node 4: user name string index",
+            RawSid::WayKey => "way 11: tag key string index",
+            RawSid::WayVal => "way 11: tag value string index",
+            RawSid::WayUser => "way 11: user name string index",
+            RawSid::RelationKey => "relation 21: tag key string index",
+            RawSid::RelationRole => "relation 21 member 0: role string index",
+            RawSid::RelationUser => "relation 21: user name string index",
+        }
+    }
+}
+
+/// Every block's string table: four entries, so index 4 is the first slot
+/// the diff's strings take in a rewritten block.
+const RAW_TABLE: [&str; 4] = ["", "k", "v", "u"];
+
+fn raw_string_table() -> Vec<u8> {
+    let mut table = Vec::new();
+    for s in RAW_TABLE {
+        bytes_field(1, s.as_bytes(), &mut table);
+    }
+    table
+}
+
+fn packed(values: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &v in values {
+        varint(v, &mut out);
+    }
+    out
+}
+
+fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)).cast_unsigned()
+}
+
+fn raw_block(group: &[u8]) -> Vec<u8> {
+    let mut block = Vec::new();
+    bytes_field(1, &raw_string_table(), &mut block);
+    bytes_field(2, group, &mut block);
+    block
+}
+
+/// Dense nodes 1 and 2, each tagged `k=v` with user `u`, except where
+/// `bad` puts `sid` into node 2.
+fn raw_dense_block(bad: Option<(RawSid, u64)>) -> Vec<u8> {
+    let pick = |which: RawSid, good: u64| match bad {
+        Some((b, sid)) if std::mem::discriminant(&b) == std::mem::discriminant(&which) => sid,
+        _ => good,
+    };
+    let (key, val, user) = (
+        pick(RawSid::DenseKey, 1),
+        pick(RawSid::DenseVal, 2),
+        pick(RawSid::DenseUser, 3),
+    );
+    let user = i64::try_from(user).expect("dense user index fits i64");
+    let mut info = Vec::new();
+    bytes_field(1, &packed(&[1, 1]), &mut info);
+    bytes_field(2, &packed(&[zigzag(100), 0]), &mut info);
+    bytes_field(3, &packed(&[zigzag(1), 0]), &mut info);
+    bytes_field(4, &packed(&[zigzag(1), 0]), &mut info);
+    bytes_field(5, &packed(&[zigzag(3), zigzag(user - 3)]), &mut info);
+    let lat = i64::from(LAT);
+    let lon = i64::from(LON);
+    let mut dense = Vec::new();
+    bytes_field(1, &packed(&[zigzag(1), zigzag(1)]), &mut dense);
+    bytes_field(5, &info, &mut dense);
+    bytes_field(8, &packed(&[zigzag(lat), 0]), &mut dense);
+    bytes_field(9, &packed(&[zigzag(lon), 0]), &mut dense);
+    bytes_field(10, &packed(&[1, 2, 0, key, val, 0]), &mut dense);
+    let mut group = Vec::new();
+    bytes_field(2, &dense, &mut group);
+    raw_block(&group)
+}
+
+/// Plain `Node` messages 3 and 4, as [`raw_dense_block`].
+fn raw_node_block(bad: Option<(RawSid, u64)>) -> Vec<u8> {
+    let pick = |which: RawSid, good: u64| match bad {
+        Some((b, sid)) if std::mem::discriminant(&b) == std::mem::discriminant(&which) => sid,
+        _ => good,
+    };
+    let mut group = Vec::new();
+    for (id, key, val, user) in [
+        (3, 1, 2, 3),
+        (
+            4,
+            pick(RawSid::NodeKey, 1),
+            pick(RawSid::NodeVal, 2),
+            pick(RawSid::NodeUser, 3),
+        ),
+    ] {
+        let mut node = Vec::new();
+        varint_field(1, zigzag(id), &mut node);
+        bytes_field(2, &packed(&[key]), &mut node);
+        bytes_field(3, &packed(&[val]), &mut node);
+        bytes_field(4, &info(user), &mut node);
+        varint_field(8, zigzag(i64::from(LAT)), &mut node);
+        varint_field(9, zigzag(i64::from(LON)), &mut node);
+        bytes_field(1, &node, &mut group);
+    }
+    raw_block(&group)
+}
+
+/// Ways 10 and 11 (refs 1, 2), as [`raw_dense_block`].
+fn raw_way_block(bad: Option<(RawSid, u64)>) -> Vec<u8> {
+    let pick = |which: RawSid, good: u64| match bad {
+        Some((b, sid)) if std::mem::discriminant(&b) == std::mem::discriminant(&which) => sid,
+        _ => good,
+    };
+    let mut group = Vec::new();
+    for (id, key, val, user) in [
+        (10, 1, 2, 3),
+        (
+            11,
+            pick(RawSid::WayKey, 1),
+            pick(RawSid::WayVal, 2),
+            pick(RawSid::WayUser, 3),
+        ),
+    ] {
+        let mut way = Vec::new();
+        varint_field(1, id, &mut way);
+        bytes_field(2, &packed(&[key]), &mut way);
+        bytes_field(3, &packed(&[val]), &mut way);
+        bytes_field(4, &info(user), &mut way);
+        bytes_field(8, &packed(&[zigzag(1), zigzag(1)]), &mut way);
+        bytes_field(3, &way, &mut group);
+    }
+    raw_block(&group)
+}
+
+/// Relations 20 and 21 (one node 1 member, role `v`), as
+/// [`raw_dense_block`].
+fn raw_relation_block(bad: Option<(RawSid, u64)>) -> Vec<u8> {
+    let pick = |which: RawSid, good: u64| match bad {
+        Some((b, sid)) if std::mem::discriminant(&b) == std::mem::discriminant(&which) => sid,
+        _ => good,
+    };
+    let mut group = Vec::new();
+    for (id, key, role, user) in [
+        (20, 1, 2, 3),
+        (
+            21,
+            pick(RawSid::RelationKey, 1),
+            pick(RawSid::RelationRole, 2),
+            pick(RawSid::RelationUser, 3),
+        ),
+    ] {
+        let mut relation = Vec::new();
+        varint_field(1, id, &mut relation);
+        bytes_field(2, &packed(&[key]), &mut relation);
+        bytes_field(3, &packed(&[2]), &mut relation);
+        bytes_field(4, &info(user), &mut relation);
+        bytes_field(8, &packed(&[role]), &mut relation);
+        bytes_field(9, &packed(&[zigzag(1)]), &mut relation);
+        bytes_field(10, &packed(&[0]), &mut relation);
+        bytes_field(4, &relation, &mut group);
+    }
+    raw_block(&group)
+}
+
+/// A sorted, indexed base of four blocks (dense nodes, plain nodes, ways,
+/// relations), each blob indexed for its valid form, with `bad`'s block's
+/// payload then swapped for the malformed one: the writer's tag scan
+/// refuses an out-of-range key, and an indexed blob is what apply-changes
+/// rewrites without scanning.
+fn write_raw_rewrite_pbf(path: &Path, bad: Option<(RawSid, u64)>) {
+    {
+        let mut writer = PbfWriter::new(
+            std::fs::File::create(path).expect("create input"),
+            Compression::default(),
+        );
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("header");
+        writer.write_header(&header).expect("write header");
+        for block in [
+            raw_dense_block(None),
+            raw_node_block(None),
+            raw_way_block(None),
+            raw_relation_block(None),
+        ] {
+            writer.write_primitive_block(&block).expect("block");
+        }
+        writer.flush().expect("flush");
+    }
+    let Some((which, _)) = bad else {
+        return;
+    };
+    let (frame, block) = match which {
+        RawSid::DenseKey | RawSid::DenseVal | RawSid::DenseUser => (1, raw_dense_block(bad)),
+        RawSid::NodeKey | RawSid::NodeVal | RawSid::NodeUser => (2, raw_node_block(bad)),
+        RawSid::WayKey | RawSid::WayVal | RawSid::WayUser => (3, raw_way_block(bad)),
+        RawSid::RelationKey | RawSid::RelationRole | RawSid::RelationUser => {
+            (4, raw_relation_block(bad))
+        }
+    };
+    let pbf = std::fs::read(path).expect("read input");
+    let pbf = mutate_blob_payload(&pbf, frame, |payload| *payload = block);
+    std::fs::write(path, pbf).expect("write input");
+}
+
+/// A diff modifying the first element of every block, with strings none
+/// of the base's tables hold.
+fn write_raw_rewrite_osc(path: &Path) {
+    let meta = r#"version="2" timestamp="2020-01-01T00:00:00Z" changeset="2" uid="2" user="osc""#;
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="55.0" lon="12.0" {meta}><tag k="name" v="new"/></node>
+    <node id="3" lat="55.0" lon="12.0" {meta}><tag k="name" v="new"/></node>
+    <way id="10" {meta}><nd ref="1"/><nd ref="2"/><tag k="name" v="new"/></way>
+    <relation id="20" {meta}><member type="node" ref="1" role="new"/><tag k="name" v="new"/></relation>
+  </modify>
+</osmChange>"#
+    );
+    let file = std::fs::File::create(path).expect("create osc");
+    let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+    enc.write_all(xml.as_bytes()).expect("write xml");
+    enc.finish().expect("finish gz");
+}
+
+fn run_raw_rewrite(dir: &Path, base: &Path) -> crate::invoker::CliOutput {
+    let osc = dir.join("diff.osc.gz");
+    write_raw_rewrite_osc(&osc);
+    CliInvoker::new()
+        .arg("apply-changes")
+        .arg(base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(dir.join("output.osm.pbf"))
+        .arg("--overwrite")
+        .run()
+}
+
+/// The valid form of the fixture rewrites every blob and succeeds, so the
+/// refusals below are about the bad index and nothing else.
+#[test]
+fn apply_changes_rewrites_the_valid_raw_rewrite_fixture() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_raw_rewrite_pbf(&base, None);
+    let out = run_raw_rewrite(dir.path(), &base);
+    assert!(
+        out.status.success(),
+        "the valid fixture must apply; stderr:\n{}",
+        out.stderr_str()
+    );
+    let c = crate::common::read_all_elements_with_coords(&dir.path().join("output.osm.pbf"));
+    let kv = vec![("k".to_string(), "v".to_string())];
+    let new = vec![("name".to_string(), "new".to_string())];
+    let node_tags: Vec<_> = c.nodes.iter().map(|n| (n.0, n.3.clone())).collect();
+    assert_eq!(
+        node_tags,
+        vec![
+            (1, new.clone()),
+            (2, kv.clone()),
+            (3, new.clone()),
+            (4, kv.clone())
+        ]
+    );
+    let way_tags: Vec<_> = c.ways.iter().map(|w| (w.0, w.2.clone())).collect();
+    assert_eq!(way_tags, vec![(10, new.clone()), (11, kv.clone())]);
+    let relations: Vec<_> = c
+        .relations
+        .iter()
+        .map(|r| (r.0, r.1[0].2.clone(), r.2.clone()))
+        .collect();
+    assert_eq!(
+        relations,
+        vec![(20, "new".to_string(), new), (21, "v".to_string(), kv)]
+    );
+}
+
+/// A string index of a copied base element at or past its source block's
+/// table is refused, naming the element, field and index: one inside the
+/// slots the diff's strings take behind the copied table (which used to
+/// name a diff string silently), one past those too (a tag key there used
+/// to panic), and, for a plain node's key, one at or past 2^31 (which the
+/// copy used to carry as a negative dense index).
+#[test]
+fn apply_changes_refuses_a_bad_string_index_in_a_rewritten_blob() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    for which in RawSid::ALL {
+        for sid in [4, 40] {
+            write_raw_rewrite_pbf(&base, Some((which, sid)));
+            let out = run_raw_rewrite(dir.path(), &base);
+            assert_refused(
+                &out,
+                &format!("{} {sid}", which.needle()),
+                &format!("{which:?} index {sid}"),
+            );
+            assert_eq!(out.status.code(), Some(2), "{which:?} index {sid}");
+            assert!(
+                !dir.path().join("output.osm.pbf").exists(),
+                "{which:?} index {sid}: a refused run publishes nothing"
+            );
+        }
+    }
+    write_raw_rewrite_pbf(&base, Some((RawSid::NodeKey, 1 << 31)));
+    let out = run_raw_rewrite(dir.path(), &base);
+    assert_refused(
+        &out,
+        &format!("{} {}", RawSid::NodeKey.needle(), 1u64 << 31),
+        "NodeKey index 2^31",
+    );
+}

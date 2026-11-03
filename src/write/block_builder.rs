@@ -51,7 +51,7 @@ use protohoggr::{
 };
 
 use super::encode::{
-    collect_packed_varint_keys, encode_relation, encode_relation_raw_bytes, encode_way,
+    collect_checked_keys, encode_relation, encode_relation_raw_bytes, encode_way,
     encode_way_raw_bytes, encode_way_raw_bytes_with_locations, encode_way_with_locations,
 };
 use super::string_table::StringTable;
@@ -212,9 +212,12 @@ pub struct BlockBuilder {
     // last owned block's length plus slack, never above the retention limit.
     encode_reserve: usize,
 
-    // True when the string table has been pre-seeded from an input block (merge only).
-    // Reset to false by take()/reset(). Checked by merge to re-seed after mid-block flushes.
-    pre_seeded: bool,
+    // The source block's string table length while the table is pre-seeded
+    // from it (`pre_seed_string_table`), so a raw string index can be checked
+    // against the slots it was copied with rather than the grown table.
+    // Cleared by every flush (`reset`); apply-changes' raw writers re-seed
+    // after a mid-block flush.
+    seeded: Option<usize>,
 
     // Sticky poison. Set by an `add_*` method that was handed input it cannot
     // encode without corrupting the output (a way whose ref and location
@@ -347,7 +350,7 @@ impl BlockBuilder {
             encode_buf: Vec::new(),
             encode_reserve: 0,
 
-            pre_seeded: false,
+            seeded: None,
             poison: None,
             #[cfg(debug_assertions)]
             poison_surfaced: false,
@@ -385,6 +388,15 @@ impl BlockBuilder {
     #[cold]
     #[inline(never)]
     fn refuse(&mut self, attempted: BlockType, id: i64) {
+        let reason = self.refusal(attempted, id);
+        self.poison(reason);
+    }
+
+    /// [`refuse`](Self::refuse)'s reason, which the raw adds return as an
+    /// error instead of poisoning.
+    #[cold]
+    #[inline(never)]
+    fn refusal(&self, attempted: BlockType, id: i64) -> String {
         let what = match attempted {
             BlockType::DenseNodes => "node",
             BlockType::Ways => "way",
@@ -392,7 +404,7 @@ impl BlockBuilder {
         };
         // A block of another kind is reported as that, whether or not it is
         // also full: its fullness is not why this element was refused.
-        let reason = match self.block_type {
+        match self.block_type {
             Some(held) if held != attempted => {
                 let held = match held {
                     BlockType::DenseNodes => "nodes",
@@ -409,8 +421,7 @@ impl BlockBuilder {
                  block when can_add returns false",
                 self.cap
             ),
-        };
-        self.poison(reason);
+        }
     }
 
     /// Track an element ID for BlobIndex min/max range.
@@ -443,12 +454,13 @@ impl BlockBuilder {
 
     /// Returns `true` if the string table has been pre-seeded from an input block.
     ///
-    /// Reset to `false` by `take()`. Used by merge to detect when raw string
-    /// table indices are valid (pre-seeded) vs when re-seeding is needed after
-    /// a mid-block flush.
+    /// Cleared by every flush, encoding or not. apply-changes' raw writers
+    /// use it to tell when the block in progress can take raw string
+    /// indices and when it must be flushed and re-seeded first (after a
+    /// mid-block flush, or behind diff elements that started a block).
     #[inline]
     pub(crate) fn is_pre_seeded(&self) -> bool {
-        self.pre_seeded
+        self.seeded.is_some()
     }
 
     /// Returns `true` if the block has reached its per-block element cap
@@ -772,38 +784,130 @@ impl BlockBuilder {
     }
 
     // -----------------------------------------------------------------------
-    // Raw-index methods for pre-seeded string table passthrough (merge only)
+    // Raw string indices, copied from a pre-seeded source block (apply-changes)
     // -----------------------------------------------------------------------
+    //
+    // apply-changes rewrites a base blob the diff touches by copying each
+    // surviving element's string indices unresolved: the output table starts
+    // as a slot-for-slot copy of the source block's (`pre_seed_string_table`),
+    // so source index N names output slot N. The diff's own elements in the
+    // same output block intern their strings behind that copy. A source index
+    // at or past the source table therefore does not stay out of range in the
+    // output: it names one of the diff's strings (a valid file with the wrong
+    // tag, role or user), or, past those too, a slot that does not exist (a
+    // tag key there would make the tagdata build index past the table).
+    // `PrimitiveBlock` construction checks the index widths but resolves no
+    // index (`validate_block`), so the raw adds check every index they copy
+    // against the seeded length and refuse a bad one with an error naming the
+    // element. A refusal also poisons the builder (already surfaced: the
+    // caller has the error), since the block in progress may hold part of
+    // the refused element: no later take can emit it. The raw adds are the
+    // only way a raw index enters a block, so the bound holds for every block
+    // they build.
+    //
+    // The comparison is the reader's own rule for each field: tag keys and
+    // values as the `u32` construction fits them to, relation roles and
+    // `Info` users as the `i32` they narrow to (negative refused, as
+    // `RelMember::role` and `Info::user` refuse it), dense users as the
+    // running sum of their deltas. Dense and plain nodes arrive with their
+    // indices decoded; a way or relation costs one varint pass over its
+    // values and roles, a scan of its `Info` for the user, and the key pass
+    // the tag key tracking already made.
 
     /// Pre-seed the string table from an input block for index passthrough.
     ///
-    /// After calling this, raw string table indices from the input block can be
-    /// written directly via the `add_*_raw` methods. Indices from the input block
-    /// map to the same indices in the output block (identity mapping).
+    /// After this, raw string indices from `block` can be written with the
+    /// `add_*_raw*` methods: the output table holds every source slot at its
+    /// source index (duplicates and empty strings included), and the methods
+    /// check each index against the source table's length.
     ///
-    /// Must be called on an empty `BlockBuilder` (after `new()` or `take()`).
-    pub(crate) fn pre_seed_string_table(&mut self, block: &PrimitiveBlock) {
-        debug_assert!(self.is_empty(), "pre_seed must be called on empty builder");
+    /// The builder must hold no element: its state is reset here (sticky
+    /// poison aside), so a builder left mid-way by a failed earlier task
+    /// starts clean. A source table whose slot zero is
+    /// missing or not the empty string is refused: an output block's slot
+    /// zero is always the empty string (it is the dense end-of-tags marker,
+    /// and the diff's elements and default dense metadata use index zero as
+    /// the empty user), so a source reference to a nonempty slot zero would
+    /// change meaning in the copy.
+    pub(crate) fn pre_seed_string_table(&mut self, block: &PrimitiveBlock) -> Result<()> {
+        if !self.is_empty() {
+            return Err(crate::error::Error::internal(
+                "a block builder holding elements was pre-seeded from another block",
+            ));
+        }
+        if block.string_table_entry(0) != Some("") {
+            return Err(crate::error::Error::invalid_data(
+                "a rewritten block's string table does not begin with the empty string",
+            ));
+        }
+        self.reset();
         self.string_table.pre_seed(block);
-        self.pre_seeded = true;
+        self.seeded = Some(block.string_table_len());
+        Ok(())
+    }
+
+    /// The source table length a raw index is checked against.
+    fn seeded_len(&self) -> Result<usize> {
+        self.seeded.ok_or_else(|| {
+            crate::error::Error::internal(
+                "a raw string index was added to a block builder that is not pre-seeded",
+            )
+        })
+    }
+
+    /// A raw add the current block cannot take (another kind, or full): an
+    /// error rather than [`refuse`](Self::refuse)'s poison, since the raw
+    /// adds already return one.
+    #[cold]
+    #[inline(never)]
+    fn raw_refusal(&self, attempted: BlockType, id: i64) -> crate::error::Error {
+        crate::error::Error::internal(self.refusal(attempted, id))
+    }
+
+    /// Refuse a raw add over a bad string index: the error goes back to the
+    /// caller, and the builder is poisoned with it, so the block in progress,
+    /// which may hold part of the refused element, is never emitted. The
+    /// poison counts as surfaced, since the caller has the error.
+    #[cold]
+    #[inline(never)]
+    fn refuse_raw_index(&mut self, err: crate::error::Error) -> crate::error::Error {
+        self.poison(err.to_string());
+        #[cfg(debug_assertions)]
+        {
+            self.poison_surfaced = true;
+        }
+        err
     }
 
     /// Add a dense node using pre-seeded string table indices.
     ///
-    /// `raw_tags` are `(key_sid, val_sid)` pairs from [`DenseNode::raw_tags()`].
-    /// The string table must have been pre-seeded from the same input block.
-    #[allow(clippy::cast_possible_wrap)]
+    /// `raw_tags` are `(key_sid, val_sid)` pairs as the reader yields them
+    /// (`DenseNode::raw_tags`, cast to `u32`, or a plain `Node`'s
+    /// `raw_tags`), from the block the table was pre-seeded from. An index
+    /// at or past that block's table, or a user index outside it, is an
+    /// error, and poisons the builder.
+    ///
+    /// A plain node's tag may have key index zero (the empty string), which
+    /// a dense node cannot carry: zero ends a dense node's tags. Such a key
+    /// is written as the empty string's nonzero slot (`StringTable::add`
+    /// never returns zero), which reads back as the same key.
     pub(crate) fn add_node_raw(
         &mut self,
         id: i64,
         decimicro_lat: i32,
         decimicro_lon: i32,
-        raw_tags: impl Iterator<Item = (i32, i32)>,
+        raw_tags: impl Iterator<Item = (u32, u32)>,
         metadata: Option<&RawMetadata>,
-    ) {
+    ) -> Result<()> {
         if !self.can_add_node() {
-            self.refuse(BlockType::DenseNodes, id);
-            return;
+            return Err(self.raw_refusal(BlockType::DenseNodes, id));
+        }
+        let seeded = self.seeded_len()?;
+        if let Some(meta) = metadata
+            && let Err(e) = check_signed_sid(meta.user_sid, seeded)
+        {
+            let e = e.context(raw_sid_context("node", id, "user name", meta.user_sid));
+            return Err(self.refuse_raw_index(e));
         }
         self.block_type = Some(BlockType::DenseNodes);
 
@@ -817,14 +921,25 @@ impl BlockBuilder {
         self.last_dense_lon = lon;
         self.track_coords(decimicro_lat, decimicro_lon);
 
-        // Tags: write raw indices directly - no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
-            debug_assert!(usize::try_from(key_sid).is_ok_and(|sid| sid < self.string_table.len()));
-            debug_assert!(usize::try_from(val_sid).is_ok_and(|sid| sid < self.string_table.len()));
-            #[allow(clippy::cast_sign_loss)]
-            self.tag_key_indices.insert(key_sid as u32);
-            self.dense_keys_vals.push(key_sid);
-            self.dense_keys_vals.push(val_sid);
+            if !index_in(key_sid, seeded) {
+                let e = bad_unsigned_sid("node", id, "tag key", key_sid);
+                return Err(self.refuse_raw_index(e));
+            }
+            if !index_in(val_sid, seeded) {
+                let e = bad_unsigned_sid("node", id, "tag value", val_sid);
+                return Err(self.refuse_raw_index(e));
+            }
+            let key_sid = if key_sid == 0 {
+                self.string_table.add("")
+            } else {
+                key_sid
+            };
+            self.tag_key_indices.insert(key_sid);
+            // Both are below a table length, which a block's byte limit
+            // keeps far below `i32::MAX`.
+            self.dense_keys_vals.push(key_sid.cast_signed());
+            self.dense_keys_vals.push(val_sid.cast_signed());
         }
         self.dense_keys_vals.push(0); // delimiter
 
@@ -832,9 +947,6 @@ impl BlockBuilder {
             if !self.has_dense_metadata && self.count > 0 {
                 self.backfill_default_dense_metadata();
             }
-            debug_assert!(
-                usize::try_from(meta.user_sid).is_ok_and(|sid| sid < self.string_table.len())
-            );
             self.add_dense_metadata_raw(meta);
         } else if self.has_dense_metadata {
             self.push_default_dense_metadata();
@@ -842,13 +954,35 @@ impl BlockBuilder {
 
         self.track_id(id);
         self.count += 1;
+        Ok(())
+    }
+
+    /// Check a raw way's or relation's copied values, member roles (empty for
+    /// a way) and `Info` user against the source table, and track its keys,
+    /// checked the same way; on a bad index the builder is poisoned.
+    fn check_raw_strings(
+        &mut self,
+        kind: &'static str,
+        id: i64,
+        keys: &[u8],
+        vals: &[u8],
+        roles: &[u8],
+        info: Option<&[u8]>,
+    ) -> Result<()> {
+        let seeded = self.seeded_len()?;
+        let checked = check_raw_values(kind, id, vals, roles, info, seeded).and_then(|()| {
+            collect_checked_keys(keys, seeded, &mut self.tag_key_indices)
+                .map_err(|sid| bad_unsigned_sid(kind, id, "tag key", sid))
+        });
+        checked.map_err(|e| self.refuse_raw_index(e))
     }
 
     /// Add a way using raw wire-format bytes from the input PBF.
     ///
     /// All byte slices are raw protobuf packed field content from the source
     /// `WireWay`, passed through without decode or re-encode. Requires a
-    /// pre-seeded string table (identity mapping of indices).
+    /// pre-seeded string table (identity mapping of indices); a string index
+    /// outside the source table is an error, and poisons the builder.
     pub(crate) fn add_way_raw_bytes(
         &mut self,
         id: i64,
@@ -856,16 +990,12 @@ impl BlockBuilder {
         vals_data: &[u8],
         refs_data: &[u8],
         info_data: Option<&[u8]>,
-    ) {
+    ) -> Result<()> {
         if !self.can_add_way() {
-            self.refuse(BlockType::Ways, id);
-            return;
+            return Err(self.raw_refusal(BlockType::Ways, id));
         }
-        #[cfg(debug_assertions)]
-        self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
+        self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
         self.block_type = Some(BlockType::Ways);
-        // Track tag key indices from raw packed varint keys
-        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_way_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
@@ -877,6 +1007,7 @@ impl BlockBuilder {
         );
         self.track_id(id);
         self.count += 1;
+        Ok(())
     }
 
     /// Add a way using raw wire-format bytes, including LocationsOnWays data.
@@ -893,15 +1024,12 @@ impl BlockBuilder {
         lat_data: &[u8],
         lon_data: &[u8],
         info_data: Option<&[u8]>,
-    ) {
+    ) -> Result<()> {
         if !self.can_add_way() {
-            self.refuse(BlockType::Ways, id);
-            return;
+            return Err(self.raw_refusal(BlockType::Ways, id));
         }
-        #[cfg(debug_assertions)]
-        self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
+        self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
         self.block_type = Some(BlockType::Ways);
-        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_way_raw_bytes_with_locations(
             &mut self.group_buf,
             &mut self.elem_scratch,
@@ -915,13 +1043,15 @@ impl BlockBuilder {
         );
         self.track_id(id);
         self.count += 1;
+        Ok(())
     }
 
     /// Add a relation using raw wire-format bytes from the input PBF.
     ///
     /// All byte slices are raw protobuf packed field content from the source
     /// `WireRelation`, passed through without decode or re-encode. Requires a
-    /// pre-seeded string table (identity mapping of indices).
+    /// pre-seeded string table (identity mapping of indices); a string index
+    /// outside the source table is an error, and poisons the builder.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_relation_raw_bytes(
         &mut self,
@@ -932,16 +1062,19 @@ impl BlockBuilder {
         memids_data: &[u8],
         types_data: &[u8],
         info_data: Option<&[u8]>,
-    ) {
+    ) -> Result<()> {
         if !self.can_add_relation() {
-            self.refuse(BlockType::Relations, id);
-            return;
+            return Err(self.raw_refusal(BlockType::Relations, id));
         }
-        #[cfg(debug_assertions)]
-        self.debug_assert_raw_strings(keys_data, vals_data, roles_sid_data, info_data);
+        self.check_raw_strings(
+            "relation",
+            id,
+            keys_data,
+            vals_data,
+            roles_sid_data,
+            info_data,
+        )?;
         self.block_type = Some(BlockType::Relations);
-        // Track tag key indices from raw packed varint keys
-        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_relation_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
@@ -955,50 +1088,7 @@ impl BlockBuilder {
         );
         self.track_id(id);
         self.count += 1;
-    }
-
-    // Raw fields intentionally bypass interning and decoding in release builds.
-    // Check the source-table contract here in debug builds, including values,
-    // roles and users that are not represented in tag_key_indices.
-    // Pre-seeding preserves slots, not validity: PrimitiveBlock construction
-    // checks structure and the keys/vals index width, but does not prove table
-    // bounds, and relation roles and Info users narrow as protobuf casts
-    // (reference/truncation-handling.md). This check reads roles as raw u64,
-    // so a malformed role of 2^32 + n that the reader resolves as string n
-    // still trips it in a debug build; release passes the bytes through.
-    // Thus release rewrites can preserve an invalid source sid. These internal
-    // methods promise identity passthrough, not sanitization. Making these
-    // assertions unconditional would decode values, roles and users again for
-    // every rewritten element. A strict policy belongs at block construction,
-    // covering tags, relation roles, Info users and delta-coded DenseInfo users
-    // together; it would change the current fallible string-access contract
-    // and add integer decoding to the byte-oriented structural validation.
-    // Retain that policy rather than add incomplete per-element validation.
-    #[cfg(debug_assertions)]
-    #[expect(
-        clippy::expect_used,
-        reason = "the raw bytes come from a PrimitiveBlock, whose construction checked packed varints and Info structurally; the string bounds asserted below are not checked there (see above)"
-    )]
-    fn debug_assert_raw_strings(
-        &self,
-        keys: &[u8],
-        vals: &[u8],
-        roles: &[u8],
-        info: Option<&[u8]>,
-    ) {
-        for bytes in [keys, vals, roles] {
-            let mut cursor = crate::read::wire::Cursor::new(bytes);
-            while !cursor.is_empty() {
-                let sid = cursor.read_varint().expect("valid packed string index");
-                assert!(usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.len()));
-            }
-        }
-        if let Some(info) = info {
-            let info = crate::read::wire::WireInfo::parse(info).expect("valid raw metadata");
-            if let Some(sid) = info.user_sid {
-                assert!(usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.len()));
-            }
-        }
+        Ok(())
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -1038,16 +1128,18 @@ impl BlockBuilder {
                 "BlockBuilder refused to encode a block: {reason}"
             )));
         }
-        let block_type = match self.block_type {
-            Some(t) => t,
-            None => return Ok(None),
+        let Some(block_type) = self.block_type else {
+            // Nothing to encode, but the builder is reset all the same, so
+            // every flush ends a block: a pre-seeded table left behind by a
+            // block that took no element (a blob the diff deletes whole)
+            // would otherwise be the next pre-seed's starting point.
+            self.reset();
+            return Ok(None);
         };
 
-        debug_assert!(
-            self.tag_key_indices
-                .iter()
-                .all(|&sid| (sid as usize) < self.string_table.len())
-        );
+        // Every tracked key is in the table: `add` returns slots it has, and
+        // the raw adds refuse a key at or past the seeded source table, which
+        // the table only grows from. The tagdata build below indexes them.
 
         let kind = match block_type {
             BlockType::DenseNodes => ElementKind::Node,
@@ -1121,7 +1213,7 @@ impl BlockBuilder {
             let strings = &self.string_table;
             self.tag_key_scratch
                 .sort_by(|&a, &b| strings.get(a as usize).cmp(strings.get(b as usize)));
-            if self.pre_seeded {
+            if self.seeded.is_some() {
                 // Identity-preserving source tables can hold the same key at
                 // multiple indices. Tagdata encodes a set of key strings,
                 // so collapse equal strings (by content, not slot) after
@@ -1348,7 +1440,7 @@ impl BlockBuilder {
         self.max_lon = i32::MIN;
         self.tag_key_indices.clear();
         self.has_dense_metadata = false;
-        self.pre_seeded = false;
+        self.seeded = None;
 
         self.last_dense_id = 0;
         self.last_dense_lat = 0;
@@ -1422,6 +1514,74 @@ impl BlockBuilder {
     }
 }
 
+/// Whether an unsigned raw string index (a tag key or value) names a slot of
+/// the source table.
+#[inline]
+fn index_in(sid: u32, seeded: usize) -> bool {
+    usize::try_from(sid).is_ok_and(|sid| sid < seeded)
+}
+
+/// Check a signed raw string index (a role or user) as the reader resolves
+/// it: negative is a wire error, as `RelMember::role` and `Info::user`
+/// report it, and past the source table is out of bounds.
+#[inline]
+fn check_signed_sid(sid: i32, seeded: usize) -> Result<()> {
+    match usize::try_from(sid) {
+        Ok(index) if index < seeded => Ok(()),
+        Ok(index) => Err(crate::error::new_stringtable_index_out_of_bounds(index)),
+        Err(_) => Err(crate::error::new_wire_error("negative string index")),
+    }
+}
+
+/// Check a raw way's or relation's tag values, member roles and `Info` user
+/// against `seeded` slots of the source table, as the reader decodes each
+/// (`PackedUint32Iter`, `PackedInt32Iter`, `WireInfo::user_sid_of`).
+#[inline]
+fn check_raw_values(
+    kind: &'static str,
+    id: i64,
+    vals: &[u8],
+    roles: &[u8],
+    info: Option<&[u8]>,
+    seeded: usize,
+) -> Result<()> {
+    for sid in crate::read::wire::PackedUint32Iter::new(vals) {
+        if !index_in(sid, seeded) {
+            return Err(bad_unsigned_sid(kind, id, "tag value", sid));
+        }
+    }
+    for (position, sid) in crate::read::wire::PackedInt32Iter::new(roles).enumerate() {
+        if let Err(e) = check_signed_sid(sid, seeded) {
+            return Err(e.context(format!(
+                "relation {id} member {position}: role string index {sid}"
+            )));
+        }
+    }
+    if let Some(info) = info
+        && let Some(sid) = crate::read::wire::WireInfo::user_sid_of(info)?
+        && let Err(e) = check_signed_sid(sid, seeded)
+    {
+        return Err(e.context(raw_sid_context(kind, id, "user name", sid)));
+    }
+    Ok(())
+}
+
+/// The context a refused raw string index carries: the element, the field
+/// and the index as the reader decodes it.
+#[cold]
+#[inline(never)]
+fn raw_sid_context(kind: &str, id: i64, field: &str, sid: impl std::fmt::Display) -> String {
+    format!("{kind} {id}: {field} string index {sid}")
+}
+
+/// A tag key or value index past the source table.
+#[cold]
+#[inline(never)]
+fn bad_unsigned_sid(kind: &str, id: i64, field: &str, sid: u32) -> crate::error::Error {
+    crate::error::new_stringtable_index_out_of_bounds(usize::try_from(sid).unwrap_or(usize::MAX))
+        .context(raw_sid_context(kind, id, field, sid))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1440,13 +1600,14 @@ mod tests {
         let source = PrimitiveBlock::from_vec(bytes).expect("valid source table");
         for kind in 0..4 {
             let mut bb = BlockBuilder::new();
-            bb.pre_seed_string_table(&source);
-            match kind {
+            bb.pre_seed_string_table(&source).expect("pre-seed");
+            let added = match kind {
                 0 => bb.add_node_raw(1, 0, 0, [(3, 5), (1, 4)].into_iter(), None),
                 1 => bb.add_way_raw_bytes(1, &[3, 1], &[5, 4], &[], None),
                 2 => bb.add_way_raw_bytes_with_locations(1, &[3, 1], &[5, 4], &[], &[], &[], None),
                 _ => bb.add_relation_raw_bytes(1, &[3, 1], &[5, 4], &[4], &[2], &[0], None),
-            }
+            };
+            added.expect("in-range raw indices");
             let bytes = bb.take().expect("encode raw rewrite").expect("one block");
             let output = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid output");
             let tagdata = bb.last_tagdata.as_deref().expect("tag key index");
@@ -1474,10 +1635,11 @@ mod tests {
     /// These used to `assert!`, so a caller that skipped `can_add_*` panicked
     /// the thread. Each path is driven separately - eight copies of the guard
     /// exist, and one left as an assert would leave the other seven green -
-    /// on a block of another kind, and the refusal must reach both emit
-    /// paths. The paired success is the first add on each fresh builder,
-    /// which the refusal must not have disturbed: the message names the
-    /// second element, not the first.
+    /// on a block of another kind. The public paths poison, and the refusal
+    /// must reach both emit paths; the raw paths return it as their error and
+    /// leave the block as it was, which then still encodes. The paired success
+    /// is the first add on each fresh builder, which the refusal must not have
+    /// disturbed: the message names the second element, not the first.
     #[test]
     fn every_add_path_refuses_a_block_of_another_kind() {
         let empty = std::iter::empty::<(&str, &str)>;
@@ -1496,26 +1658,278 @@ mod tests {
                 bb.add_way(1, empty(), &[1, 2], None);
                 "ways"
             };
-            match path {
-                0 => bb.add_node(7, 0, 0, empty(), None),
-                1 => bb.add_node_raw(7, 0, 0, std::iter::empty(), None),
-                2 => bb.add_way(7, empty(), &[1, 2], None),
-                3 => bb.add_way_with_locations(7, empty(), &[1], &[(0, 0)], None),
-                4 => bb.add_way_raw_bytes(7, &[], &[], &[2], None),
-                5 => bb.add_relation(7, empty(), &members, None),
-                6 => bb.add_way_raw_bytes_with_locations(7, &[], &[], &[2], &[0], &[0], None),
-                _ => bb.add_relation_raw_bytes(7, &[], &[], &[0], &[2], &[0], None),
+            let raw = match path {
+                0 => {
+                    bb.add_node(7, 0, 0, empty(), None);
+                    None
+                }
+                1 => Some(bb.add_node_raw(7, 0, 0, std::iter::empty(), None)),
+                2 => {
+                    bb.add_way(7, empty(), &[1, 2], None);
+                    None
+                }
+                3 => {
+                    bb.add_way_with_locations(7, empty(), &[1], &[(0, 0)], None);
+                    None
+                }
+                4 => Some(bb.add_way_raw_bytes(7, &[], &[], &[2], None)),
+                5 => {
+                    bb.add_relation(7, empty(), &members, None);
+                    None
+                }
+                6 => Some(bb.add_way_raw_bytes_with_locations(7, &[], &[], &[2], &[0], &[0], None)),
+                _ => Some(bb.add_relation_raw_bytes(7, &[], &[], &[0], &[2], &[0], None)),
+            };
+            let needle = format!(" 7 added to a block holding {held}");
+            if let Some(raw) = raw {
+                let msg = raw
+                    .expect_err("a raw add the block cannot take is an error")
+                    .to_string();
+                assert!(
+                    msg.contains(&needle),
+                    "path {path}: the error must name the element and the held kind, got: {msg}"
+                );
+                assert!(
+                    bb.take_owned().expect("unpoisoned").is_some(),
+                    "path {path}: the held block still encodes"
+                );
+                continue;
             }
             let msg = match bb.take_owned() {
                 Ok(_) => panic!("path {path}: a refused element must stop the block"),
                 Err(e) => e.to_string(),
             };
             assert!(
-                msg.contains(&format!(" 7 added to a block holding {held}")),
+                msg.contains(&needle),
                 "path {path}: the error must name the element and the held kind, got: {msg}"
             );
             assert!(bb.take().is_err(), "path {path}: take must refuse it too");
         }
+    }
+
+    /// A source table of `strings` as a block with no elements.
+    fn source_table(strings: &[&str]) -> PrimitiveBlock {
+        let mut table = Vec::new();
+        for s in strings {
+            protohoggr::encode_bytes_field_always(&mut table, 1, s.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        encode_bytes_field(&mut bytes, 1, &table);
+        PrimitiveBlock::from_vec(bytes).expect("valid source table")
+    }
+
+    /// A raw index is checked against the source table it was seeded from,
+    /// not the table the diff's strings grew, on every field and in both
+    /// orders (the diff's string before and after the copied element), and
+    /// a refused add poisons the builder, so the block is never emitted.
+    #[test]
+    fn raw_indices_past_the_source_table_are_refused_after_growth() {
+        let source = source_table(&["", "k", "v"]);
+        let user = |user_sid| RawMetadata {
+            version: 1,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user_sid,
+            visible: true,
+        };
+        let mut info = Vec::new();
+        for (field, value) in [(1u32, 1u64), (5, 3)] {
+            protohoggr::encode_tag(&mut info, field, protohoggr::WIRE_VARINT);
+            protohoggr::encode_varint(&mut info, value);
+        }
+        // The diff's element 1, of the case's kind; index 3 is the first
+        // slot its strings take.
+        let add_diff = |bb: &mut BlockBuilder, case: usize| {
+            let tags = [("name", "new")];
+            let members = [MemberData {
+                id: MemberId::Node(1),
+                role: "new",
+            }];
+            match case {
+                0..=3 => bb.add_node(1, 0, 0, tags, None),
+                4..=6 => bb.add_way(1, tags, &[1, 2], None),
+                _ => bb.add_relation(1, tags, &members, None),
+            }
+        };
+        for diff_first in [true, false] {
+            for case in 0..8 {
+                let mut bb = BlockBuilder::new();
+                bb.pre_seed_string_table(&source).expect("pre-seed");
+                if diff_first {
+                    add_diff(&mut bb, case);
+                }
+                let (result, needle) = match case {
+                    0 => (
+                        bb.add_node_raw(2, 0, 0, [(3, 2)].into_iter(), None),
+                        "node 2: tag key string index 3",
+                    ),
+                    1 => (
+                        bb.add_node_raw(2, 0, 0, [(1, 3)].into_iter(), None),
+                        "node 2: tag value string index 3",
+                    ),
+                    2 => (
+                        bb.add_node_raw(2, 0, 0, [(1, 2)].into_iter(), Some(&user(3))),
+                        "node 2: user name string index 3",
+                    ),
+                    3 => (
+                        bb.add_node_raw(2, 0, 0, [(1, 2)].into_iter(), Some(&user(-1))),
+                        "node 2: user name string index -1",
+                    ),
+                    4 => (
+                        bb.add_way_raw_bytes(2, &[3], &[2], &[2], None),
+                        "way 2: tag key string index 3",
+                    ),
+                    5 => (
+                        bb.add_way_raw_bytes(2, &[1], &[3], &[2], None),
+                        "way 2: tag value string index 3",
+                    ),
+                    6 => (
+                        bb.add_way_raw_bytes(2, &[1], &[2], &[2], Some(&info)),
+                        "way 2: user name string index 3",
+                    ),
+                    _ => (
+                        bb.add_relation_raw_bytes(2, &[1], &[2], &[3], &[2], &[0], None),
+                        "relation 2 member 0: role string index 3",
+                    ),
+                };
+                let msg = result
+                    .expect_err("an index past the source table")
+                    .to_string();
+                assert!(msg.contains(needle), "case {case}: got {msg}");
+                if !diff_first {
+                    add_diff(&mut bb, case);
+                }
+                let poisoned = bb.take().expect_err("a refused raw add poisons the block");
+                assert!(
+                    poisoned.to_string().contains(needle),
+                    "case {case}: the poison carries the refusal, got {poisoned}"
+                );
+            }
+        }
+    }
+
+    /// A plain node's tag with key index zero (the empty string) is written
+    /// under the empty string's nonzero slot, since zero ends a dense node's
+    /// tags, also when the source table holds nothing but slot zero.
+    #[test]
+    fn a_plain_node_empty_key_survives_the_dense_copy() {
+        let mut bb = BlockBuilder::new();
+        bb.pre_seed_string_table(&source_table(&[""]))
+            .expect("pre-seed");
+        bb.add_node_raw(1, 0, 0, [(0, 0)].into_iter(), None)
+            .expect("in range");
+        let bytes = bb.take().expect("encode").expect("one block");
+        let block = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid output");
+        let tags: Vec<_> = match block.elements().next().expect("one element") {
+            crate::Element::DenseNode(n) => n.tags().collect(),
+            _ => panic!("expected a dense node"),
+        };
+        assert_eq!(tags, [("", "")]);
+
+        let source = source_table(&["", "v"]);
+        let mut bb = BlockBuilder::new();
+        bb.pre_seed_string_table(&source).expect("pre-seed");
+        bb.add_node_raw(2, 0, 0, [(0, 1), (1, 0)].into_iter(), None)
+            .expect("in range");
+        let bytes = bb.take().expect("encode").expect("one block");
+        let block = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid output");
+        let nodes: Vec<(i64, Vec<(String, String)>)> = block
+            .elements()
+            .map(|e| match e {
+                crate::Element::DenseNode(n) => (
+                    n.id(),
+                    n.tags()
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect(),
+                ),
+                _ => panic!("expected a dense node"),
+            })
+            .collect();
+        assert_eq!(
+            nodes,
+            [(
+                2,
+                vec![
+                    (String::new(), "v".to_owned()),
+                    ("v".to_owned(), String::new())
+                ]
+            )]
+        );
+    }
+
+    /// A copied `Info` user is judged as the reader resolves it: the last
+    /// varint user field wins, so an earlier bad one it overrides passes and
+    /// a later bad one is refused; a user field of another wire type is not
+    /// a user.
+    #[test]
+    fn a_raw_info_user_is_judged_by_its_last_varint_field() {
+        use protohoggr::{WIRE_LEN, WIRE_VARINT, encode_tag, encode_varint};
+        let source = source_table(&["", "u"]);
+        let info = |users: &[u64], len_user: bool| {
+            let mut info = Vec::new();
+            encode_tag(&mut info, 1, WIRE_VARINT);
+            encode_varint(&mut info, 1);
+            for &user in users {
+                encode_tag(&mut info, 5, WIRE_VARINT);
+                encode_varint(&mut info, user);
+            }
+            if len_user {
+                encode_tag(&mut info, 5, WIRE_LEN);
+                encode_varint(&mut info, 1);
+                info.push(9);
+            }
+            info
+        };
+        for (users, len_user, ok) in [
+            (&[9, 1][..], false, true),
+            (&[1, 9][..], false, false),
+            (&[1][..], true, true),
+            (&[(1 << 32) | 1][..], false, true),
+        ] {
+            let mut bb = BlockBuilder::new();
+            bb.pre_seed_string_table(&source).expect("pre-seed");
+            let added = bb.add_way_raw_bytes(1, &[], &[], &[2], Some(&info(users, len_user)));
+            assert_eq!(added.is_ok(), ok, "users {users:?}, len_user {len_user}");
+        }
+    }
+
+    /// Pre-seeding refuses a source table whose slot zero is not the empty
+    /// string, and a builder holding elements.
+    #[test]
+    fn pre_seeding_refuses_a_nonempty_slot_zero_and_a_nonempty_builder() {
+        let mut bb = BlockBuilder::new();
+        assert!(
+            bb.pre_seed_string_table(&source_table(&["x", "k"]))
+                .is_err()
+        );
+        assert!(bb.pre_seed_string_table(&source_table(&[])).is_err());
+        bb.add_node(1, 0, 0, [("k", "v")], None);
+        assert!(bb.pre_seed_string_table(&source_table(&["", "k"])).is_err());
+        assert!(bb.take().expect("encode").is_some());
+    }
+
+    /// A flush with nothing to encode still ends the block: a pre-seeded
+    /// table that took no element is gone, so the next pre-seed starts at
+    /// slot one and a raw index names its own source string.
+    #[test]
+    fn an_empty_flush_clears_the_pre_seeded_table() {
+        let first = source_table(&["", "gone", "one"]);
+        let second = source_table(&["", "kept", "yes"]);
+        let mut bb = BlockBuilder::new();
+        bb.pre_seed_string_table(&first).expect("pre-seed");
+        assert!(bb.take().expect("encode").is_none());
+        assert!(!bb.is_pre_seeded(), "an empty flush resets the seed");
+        bb.pre_seed_string_table(&second).expect("pre-seed");
+        bb.add_node_raw(1, 0, 0, [(1, 2)].into_iter(), None)
+            .expect("in range");
+        let bytes = bb.take().expect("encode").expect("one block");
+        let block = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid output");
+        let tags: Vec<_> = match block.elements().next().expect("one element") {
+            crate::Element::DenseNode(n) => n.tags().collect(),
+            _ => panic!("expected a dense node"),
+        };
+        assert_eq!(tags, [("kept", "yes")]);
     }
 
     /// A full block refuses one more element of its own kind, and the

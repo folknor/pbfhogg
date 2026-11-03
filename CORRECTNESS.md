@@ -77,6 +77,16 @@ index with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
 bad role as empty when classifying boundary members.
 
+`apply-changes` copies the surviving elements of a blob it rewrites with their
+string indices unresolved, into an output block whose string table starts as
+the source block's, so it does not go through these iterators either. It
+checks every index it copies (tag keys and values, member roles, user names)
+against the source block's table and refuses one past it, naming the element,
+the field and the index: such an index would otherwise name one of the
+strings the diff's own elements add behind the copied table. It also refuses
+a rewritten block whose string table does not begin with the empty string.
+Blobs it copies unchanged are not decoded and not checked.
+
 `inspect tags` does not go through these iterators: it reads the raw index
 arrays through a projection on the block validator
 (`src/commands/tags_count/tally.rs`) and counts each element's tags by the

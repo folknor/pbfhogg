@@ -445,6 +445,18 @@ const _: () = assert!(
 /// and to the scratch vectors a worker keeps beside its builder, so a
 /// builder kept by a pool worker for a whole run holds a fixed bound per
 /// buffer rather than the largest of every block it met.
+///
+/// It also bounds an apply-changes worker's base-read buffer, which holds an
+/// input frame rather than a built block, so there the limit does not engage
+/// only on outliers: under `--locations-on-ways` an ordinary way frame
+/// exceeds it (planet LocationsOnWays blob p99 about 5.4 MB), and the buffer
+/// is dropped after about every way blob and regrown by the next. Measured at
+/// planet against a 16 MiB line that kept every frame, that churn (about
+/// 15,000 releases in 51,000 reads) cost no wall time above noise and lowered
+/// the run's peak anon by about 100 MB more (`reference/performance.md`,
+/// "apply-changes' worker scratch follows the release rule"). That is a
+/// measured outcome under glibc, not a property of the rule: freed capacity
+/// lowers the peak only as far as the allocator returns or reuses it.
 pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Zlib worst-case output bound reserved up front: input + input >> this

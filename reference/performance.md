@@ -1699,6 +1699,58 @@ change, HEAD, HEAD, change) ran 3.01 and 3.00 s against 3.05 and 3.06 s
 (`b0a5b51a`, `cffb4f7c`). Under `-l`, one pair: 261.8 s against 258.5 s
 (`44becd1a`), within noise, as the channel there never fills.
 
+### apply-changes' worker scratch follows the release rule (bygg, 2026-11-03, against `149944a1`)
+
+The change: every buffer an apply-changes worker keeps across blobs
+(`WorkerScratch` in `streaming.rs`) is checked once per blob against
+`MAX_RETAINED_SCRATCH_CAPACITY` (the decode buffer a clean refresh scan
+keeps, against the decode pool's limit); the base-read buffer grows by a
+fresh exact allocation instead of `resize`'s doubling; the barrier merge
+takes each worker's coordinate slot table whole, so it is freed instead of
+being drained and kept to the end of the run.
+
+Planet, OSC 4913, `--bench 1`, after `fstrim`, every arm built in the main
+tree (HEAD cells stored, variant cells `--force`). Two variants of the read
+buffer's limit were measured: a 16 MiB line that keeps every ordinary frame,
+and the common 4 MiB limit, which landed.
+
+`--locations-on-ways` on `planet-20260223-altw-keep-untagged`, run order
+16 MiB, 4 MiB, HEAD, HEAD, 4 MiB, 16 MiB:
+
+| arm | walls (s) | peak anon (MB) |
+|---|---|---|
+| `149944a1` (`e520509f`, `5b8be372`) | 263.6, 264.6 | 3,210, 3,244 |
+| 16 MiB (sidecars `a50f57df`, `8dc7b811`) | 266.1, 266.1 | 3,115, 3,127 |
+| 4 MiB, landed (sidecars `be19da76`, `1f7568cf`) | 265.4, 263.2 | 3,023, 3,008 |
+
+Walls are level (the 16 MiB arm's 2 s is under the noise floor). The 4 MiB
+line released the read buffer 15,162 times in 50,814 reads (17,273
+allocations against 202 at 16 MiB: about every way blob, whose frames
+under LocationsOnWays exceed 4 MiB), at no wall cost, and lowered the peak
+about 100 MB further than the 16 MiB line, both pairs on the same side. The
+summed per-worker read-buffer peaks are 253 and 251 MB, against about 351 MB
+of doubled buffers in the `eeb7ab6c` diagnostic; the barrier freed 134 MB of
+slot tables (`merge_drain_barrier_slot_bytes_freed`) that had stayed live
+beside the published map. Peak anon falls about 200 MB (6 %) from HEAD. That
+the released capacity lowers the peak is measured under glibc on this run,
+not a property of the rule.
+
+`--compression zstd:1` on the indexed planet, run order 16 MiB, HEAD, HEAD,
+HEAD, 16 MiB, 16 MiB, 4 MiB:
+
+| arm | walls (s) | peak anon (MB) |
+|---|---|---|
+| `149944a1` (`9eeb759c`, `86c9ec6d`, `f8421d6a`) | 92.6, 99.7, 96.6 | 2,105, 2,060, 2,078 |
+| 16 MiB (sidecars `6c0e9cb7`, `b522e35e`, `44a0b2c2`) | 92.3, 91.6, 99.1 | 2,136, 2,106, 2,093 |
+| 4 MiB, landed (sidecar `56649031`) | 92.6 | 2,059 |
+
+Neutral. No candidate frame there exceeds 4 MiB (zero releases at either
+line, so the two variants run identically); the read buffers' summed peak
+is 100 MB against the diagnostic's 150 to 170 MB, below what the peak
+resolves. The workers' other kept scratch (group, node-group and refresh
+scratch and the coordinate accumulator, `merge_streaming_scratch_peak_bytes`)
+peaks at 30 MB summed over 30 workers (38 MB under `-l`).
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

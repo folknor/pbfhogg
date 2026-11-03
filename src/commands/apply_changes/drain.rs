@@ -209,6 +209,12 @@ crate::counters::counter_set! {
         pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
         pub reorder_buffer_high_water_bytes => "merge_drain_reorder_buffer_high_water_bytes",
         pub barrier_loc_map_size => "merge_drain_barrier_loc_map_size",
+        /// Estimated bytes of the workers' coordinate slot tables the
+        /// barrier merge consumed and freed (a table moved whole into the
+        /// published map stays live and is not counted). Source storage
+        /// released, not a net saving: the published map grows as it takes
+        /// their entries.
+        pub barrier_slot_bytes_freed => "merge_drain_barrier_slot_bytes_freed",
         /// Cumulative time the drain spent in a receive that ended with the
         /// reorder buffer empty. Waits with later seqs buffered behind a
         /// missing head are not counted, so this is not a head-of-line stall
@@ -977,17 +983,34 @@ impl DrainLocations {
         // extending with per-worker accumulators. A worker slot recovered from
         // poison does not validate its contents: see `flush_local_coords` for
         // why a panicking worker still fails the run.
+        //
+        // Each slot's table is taken whole, leaving the slot an empty map
+        // with no allocation, and consumed outside its lock, so its storage
+        // is freed here. The workers keep the slots to the end of the run,
+        // and a drained table would otherwise hold its node-phase capacity
+        // (the worker's share of every kept coordinate) beside the published
+        // map through the whole way phase. No coordinate is lost: every node
+        // item flushed before it was sent, and only a node of a base lying
+        // about its order can flush after this, which the order guard
+        // refuses.
         let mut merged: LocMap = seeded;
+        let mut freed_bytes = 0u64;
         for slot in &coord_slots {
-            let mut local = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let local = std::mem::take(
+                &mut *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             if merged.is_empty() {
-                std::mem::swap(&mut merged, &mut *local);
+                merged = local;
             } else {
-                merged.extend(local.drain());
+                freed_bytes += super::streaming::map_table_bytes(&local) as u64;
+                merged.extend(local);
             }
         }
+        counters
+            .barrier_slot_bytes_freed
+            .store(freed_bytes, Ordering::Relaxed);
 
         counters
             .barrier_loc_map_size

@@ -270,12 +270,17 @@ rising from about 0.53 to 0.80 GB over the late node phase and at the
 node-to-way transition, and staying there to the end. The starting figure
 holds whatever of the parsed diff (about 530 MB) does not sit in mmapped
 chunks, which `uordblks` excludes; that split was not read. The growth is
-what matters. Candidates, none measured: the 30 workers' `BlockBuilder`
+what matters. Candidates: the 30 workers' `BlockBuilder`
 buffers (each released only past `MAX_RETAINED_SCRATCH_CAPACITY`, several
-per builder), the thread-local
+per builder) and the thread-local
 framing scratch of the workers and of the 32 executor threads built at the
-first create batch, `RefreshScratch` and the group scratch vectors.
-Count them the same way before choosing anything; with the drain-channel
+first create batch, neither measured. Ruled out at `149944a1` (bygg,
+counters added then): the workers' other kept scratch (`RefreshScratch`,
+the group and node-group scratch, the coordinate accumulator) peaks at
+30 MB summed over 30 workers (`merge_streaming_scratch_peak_bytes`), so
+it is not the growth. (Under `-l` the drained coordinate slot tables,
+134 MB, were part of that run's separate post-barrier growth; they are
+now freed at the merge.) Count the rest the same way before choosing anything; with the drain-channel
 backlog gone this is the largest unexplained live share of the peak. The
 diagnostic's patch is reproducible from the description in
 reference/performance.md, "apply-changes' drain channel held the node
@@ -306,24 +311,6 @@ is about 300 blocks at the node-to-way transition, so the cost is bounded
 and one-time; whether it shows in the transition's live burst is not
 measured. A builder per executor thread (thread-local, or `map_init`)
 would follow the worker rule, if the measurement says it matters.
-
-### WRK-128: apply-changes' worker scratch does not follow the release rule
-
-`worker_loop` (`src/commands/apply_changes/streaming.rs`) keeps
-`read_buf`, the group scratch vectors, `node_groups_scratch`,
-`local_coords` and `RefreshScratch` for the run without
-`commands::release_scratch`, so each worker pins the largest blob or
-block it ever met in each. The ordered-pool workers release past
-`MAX_RETAINED_SCRATCH_CAPACITY` per task. At planet blob sizes (p99 about
-2.7 MB) the bound is small; an input with outlier blobs would hold 30
-outliers per buffer for the rest of the run. Apply the rule per
-candidate, or record why these differ. Measured on bygg at `eeb7ab6c`
-(30 workers): the `read_buf`s hold 150-170 MB together on planet, and
-under `-l` (altw base) 157 MB in the node phase and 351 MB once way blobs
-start, about 11.7 MB per worker; `pread_into`'s `resize` grows capacity
-geometrically, so a buffer can hold up to twice the largest frame it
-read. A plain 4 MiB release rule would drop and regrow most of them on
-every planet blob, so the rule needs measuring, not just applying.
 
 ### WRK-022: Byte-budgeted fused task engine
 
@@ -498,6 +485,19 @@ with the recorded polygon differences already in the parity pages (every
 FeatureCollection feature, ring validation). The prefilters in
 `Region::contains_decimicro` stay sound under either rule. Once done, the
 brokkr verify filing for exact membership can take polygon regions too.
+
+### WRK-150: the read pipeline's thread-local parse scratch is never released
+
+`ST_SCRATCH` and `GR_SCRATCH` (`src/read/pipeline.rs`, thread-locals of the
+rayon decode workers) keep whatever capacity the largest block a thread
+parsed gave them, for the life of the pool thread, across invocations; only
+their peak is recorded (`pipeline_scratch_*_capacity_peak_bytes`). They are
+8 bytes per string-table entry or group, so on real data they stay far
+below `MAX_RETAINED_SCRATCH_CAPACITY`; a hostile block with a huge string
+table pins its size per pool thread. apply-changes' own copies of the same
+two vectors now follow the release rule (`WorkerScratch` in
+`apply_changes/streaming.rs`); applying `commands::release_scratch` after
+`with_scratch`'s closure is the obvious fix, cheap per blob, not measured.
 
 ### WRK-037: ParallelGzipWriter window size
 

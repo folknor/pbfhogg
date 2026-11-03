@@ -152,6 +152,28 @@ pub(super) struct RefreshScratch {
     pub(super) hits: Vec<(usize, (i32, i32))>,
 }
 
+impl RefreshScratch {
+    /// Clear every buffer for the next blob, releasing one a blob grew past
+    /// the retention limit (`commands::release_scratch`). Each holds one way's
+    /// worth, so on real data the limit never engages; it bounds a hostile
+    /// way with a huge ref list.
+    pub(super) fn release_outliers(&mut self) {
+        use crate::commands::release_scratch;
+        release_scratch(&mut self.info);
+        release_scratch(&mut self.lats);
+        release_scratch(&mut self.lons);
+        release_scratch(&mut self.hits);
+    }
+
+    /// Bytes of capacity the buffers hold.
+    pub(super) fn capacity_bytes(&self) -> usize {
+        self.info.capacity()
+            + self.lats.capacity()
+            + self.lons.capacity()
+            + self.hits.capacity() * std::mem::size_of::<(usize, (i32, i32))>()
+    }
+}
+
 /// Coordinate-refresh counts for surviving base ways.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RefreshTally {

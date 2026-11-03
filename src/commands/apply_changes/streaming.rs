@@ -88,7 +88,7 @@ pub(super) type CoordSlot = Arc<Mutex<FxHashMap<i64, (i32, i32)>>>;
 
 /// Per-worker shared coord accumulator slots. The drain holds clones of
 /// every slot; each worker writes only into its own. At the node→way
-/// barrier the drain acquires every mutex, drains the maps, merges into
+/// barrier the drain acquires every mutex, takes each map whole, merges into
 /// `Arc<loc_map>`, and signals the scanner.
 pub(super) type CoordSlots = Vec<CoordSlot>;
 
@@ -230,6 +230,27 @@ crate::counters::counter_set! {
         /// In-line framing wall summed across all workers (P1.5: avoids
         /// the writer's rayon-spawn-per-block dispatch).
         pub frame_ns => "merge_streaming_frame_ns",
+        /// The largest base-read buffer capacity each worker held, summed
+        /// over the workers. Sampled when a buffer is sized for a read, so a
+        /// frame an owned passthrough hands on counts too. A sum of
+        /// historical per-worker peaks, not the bytes held at any one moment:
+        /// a buffer released between blobs still counts at its peak.
+        pub read_buf_peak_bytes => "merge_streaming_read_buf_peak_bytes",
+        /// Reads that needed a fresh read buffer: the frame outgrew the one
+        /// held, or none was held (first read, after an owned passthrough
+        /// took it, or after a release).
+        pub read_buf_allocs => "merge_streaming_read_buf_allocs",
+        /// Read buffers dropped between blobs for exceeding
+        /// `MAX_RETAINED_SCRATCH_CAPACITY`.
+        pub read_buf_releases => "merge_streaming_read_buf_releases",
+        /// The largest capacity each worker's other kept scratch held at the
+        /// end of a blob, before the retention limit is applied (group
+        /// scratch, node-group scratch, refresh scratch and the coordinate
+        /// accumulator, its table estimated from its capacity), summed over
+        /// the workers: what one blob grew them to, not what they keep after
+        /// the release. Excludes the decode buffer, which the decode pool
+        /// accounts, the block builder and the coordinate slots.
+        pub scratch_peak_bytes => "merge_streaming_scratch_peak_bytes",
     }
 }
 
@@ -384,26 +405,16 @@ fn worker_loop(
     route: Route<()>,
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
-    let mut read_buf: Vec<u8> = Vec::new();
     // The decode buffer moves into each parsed block and comes back through
     // this worker's pool when the block drops, so one buffer serves every
     // candidate instead of a fresh allocation per blob.
     let decode_pool = crate::blob::DecompressPool::new(cancel);
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut scratch = WorkerScratch::default();
     let mut builder = WorkerBuilder::new(BlockBuilder::new());
     // What a rewrite consults for stale inline coordinates when the mode is
     // off: nothing. It is read only under `LocMode::Required`, so it never
     // stands in for the mode itself.
     let no_probe = StaleProbe::empty();
-
-    // Per-worker coord accumulator: gathered locally then flushed to the
-    // shared slot in batches to amortise the mutex acquire. Empty without
-    // `--locations-on-ways`.
-    let mut local_coords: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
-    let mut node_groups_scratch: Vec<(usize, usize)> = Vec::new();
-    let mut refresh_scratch = RefreshScratch::default();
 
     loop {
         let item = {
@@ -443,16 +454,10 @@ fn worker_loop(
                     counters,
                     diff,
                     &mut builder,
-                    &mut read_buf,
                     &decode_pool,
-                    &mut decompress_buf,
-                    &mut st_scratch,
-                    &mut gr_scratch,
+                    &mut scratch,
                     loc,
                     &no_probe,
-                    &mut local_coords,
-                    &mut node_groups_scratch,
-                    &mut refresh_scratch,
                     compression,
                     route,
                     &cancel.metrics().writer,
@@ -470,30 +475,183 @@ fn worker_loop(
                 // are present and are used as given: they are indexdata
                 // claims, believed and never checked against this
                 // undecoded blob (reference/indexdata-trust.md).
-                handle_owned_passthrough(file, &mut desc, drain_tx, counters, &mut read_buf)
+                handle_owned_passthrough(file, &mut desc, drain_tx, counters, &mut scratch.read)
                     .map_err(|e| blob_err(&desc, source, e))?;
             }
         }
-    }
-
-    // Nothing may be left to flush here. A successful scanner closes the
-    // candidate channel only after it has taken the barrier signal, so the
-    // drain has already merged every slot: coordinates flushed now would
-    // never reach the published map. Every node candidate flushes before it
-    // sends its item, so a leftover means that rule broke, and it fails the
-    // run rather than silently losing coordinates. (A late node on a base
-    // that lies about its order flushes into a slot after the merge; the
-    // drain's order guard refuses it, so those coordinates are never
-    // needed.) Only the mode fills `local_coords`.
-    if !local_coords.is_empty() {
-        return Err(Error::internal(format!(
-            "streaming: {} node coordinates were extracted but never flushed \
-             before the coordinate map was published",
-            local_coords.len()
-        )));
+        scratch.between_tasks(counters)?;
     }
 
     Ok(())
+}
+
+/// Storage a worker keeps from one blob to the next, and the rule for what
+/// it keeps.
+///
+/// Every buffer here follows a retention limit, checked once per blob after
+/// its handler returns, so no single blob pins its size in the worker for the
+/// rest of the run. The decode buffer follows the decode pool's own limit;
+/// everything else follows `MAX_RETAINED_SCRATCH_CAPACITY`, the limit the
+/// block builder applies to itself. The small scratch is sized by a block's
+/// string table, its groups, one way's refs or one node blob's kept
+/// coordinates, so on real data that limit never engages for it. The read
+/// buffer is different: it holds an input frame, and under
+/// `--locations-on-ways` ordinary way frames exceed the limit, so it is
+/// released after about every way blob and regrown by the next. That was
+/// measured at planet against a line that kept every frame, and the churn
+/// cost no wall time above noise while the released capacity lowered the
+/// peak (see `MAX_RETAINED_SCRATCH_CAPACITY` in `tunables.rs`), so the read
+/// buffer takes the common limit rather than one of its own.
+#[derive(Default)]
+struct WorkerScratch {
+    read: ReadBuf,
+    /// Owned here only between a decompress and the parse that moves it into
+    /// its block (whose drop returns it to the decode pool), or after a
+    /// refresh scan that passed its blob through without a parse; empty
+    /// (capacity 0) means fetch one from the pool.
+    decompress_buf: Vec<u8>,
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
+    /// Per-worker coord accumulator: one node blob's kept coordinates, flushed
+    /// into the worker's shared slot before the blob's item is sent. Empty
+    /// without `--locations-on-ways`.
+    local_coords: FxHashMap<i64, (i32, i32)>,
+    node_groups_scratch: Vec<(usize, usize)>,
+    refresh_scratch: RefreshScratch,
+    /// The largest `kept_bytes` seen, the share already added to
+    /// `scratch_peak_bytes`.
+    scratch_peak: usize,
+}
+
+impl WorkerScratch {
+    /// Apply the retention limits after a blob's handler returned.
+    ///
+    /// Refuses a coordinate accumulator still holding entries. Every node
+    /// candidate flushes before it sends its item, so a leftover means that
+    /// rule broke; once the scanner has taken the barrier signal the drain has
+    /// merged every slot, so coordinates flushed later would never reach the
+    /// published map, and the run fails rather than silently losing them. (A
+    /// late node on a base that lies about its order flushes into a slot
+    /// after the merge; the drain's order guard refuses it, so those
+    /// coordinates are never needed.)
+    fn between_tasks(&mut self, counters: &WorkerCounters) -> Result<()> {
+        use crate::commands::release_scratch;
+
+        if !self.local_coords.is_empty() {
+            return Err(Error::internal(format!(
+                "streaming: {} node coordinates were extracted but never flushed \
+                 before their blob's item was sent",
+                self.local_coords.len()
+            )));
+        }
+        let kept = self.kept_bytes();
+        if kept > self.scratch_peak {
+            counters
+                .scratch_peak_bytes
+                .fetch_add((kept - self.scratch_peak) as u64, Ordering::Relaxed);
+            self.scratch_peak = kept;
+        }
+
+        self.read.release_outlier(counters);
+        // The decode pool applies its limit when a parsed block returns the
+        // buffer; one a refresh scan kept without a parse is checked here
+        // against the same limit, and the next candidate refetches from the
+        // pool.
+        if self.decompress_buf.capacity() > crate::tunables::DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
+            self.decompress_buf = Vec::new();
+        }
+        release_scratch(&mut self.st_scratch);
+        release_scratch(&mut self.gr_scratch);
+        release_scratch(&mut self.node_groups_scratch);
+        self.refresh_scratch.release_outliers();
+        if map_table_bytes(&self.local_coords) > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY {
+            self.local_coords = FxHashMap::default();
+        }
+        Ok(())
+    }
+
+    /// Bytes of capacity the small scratch holds (everything but the read and
+    /// decode buffers).
+    fn kept_bytes(&self) -> usize {
+        let pair = std::mem::size_of::<(u32, u32)>();
+        (self.st_scratch.capacity() + self.gr_scratch.capacity()) * pair
+            + self.node_groups_scratch.capacity() * std::mem::size_of::<(usize, usize)>()
+            + self.refresh_scratch.capacity_bytes()
+            + map_table_bytes(&self.local_coords)
+    }
+}
+
+/// The worker's base-read buffer.
+///
+/// It grows exactly to the frame it is about to read, never doubling, and a
+/// growth is a fresh allocation rather than a reallocation: the read
+/// overwrites every byte, so there is nothing to copy, and a growth costs one
+/// allocation and a zero fill of the frame, the same order as the read itself,
+/// even over a run of steadily larger frames. A read within the capacity
+/// zero fills only the part beyond the previous frame's length.
+#[derive(Default)]
+struct ReadBuf {
+    buf: Vec<u8>,
+    /// The largest capacity held, the share already added to
+    /// `read_buf_peak_bytes`.
+    peak: usize,
+}
+
+impl ReadBuf {
+    /// Size the buffer to `len` and pread `len` bytes at `offset`, counted in
+    /// `blob_reads`.
+    fn read_at(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: usize,
+        counters: &WorkerCounters,
+    ) -> Result<()> {
+        counters.blob_reads.fetch_add(1, Ordering::Relaxed);
+        if len > self.buf.capacity() {
+            // Free the old buffer before allocating its replacement, so the
+            // two are never held at once.
+            drop(std::mem::take(&mut self.buf));
+            self.buf = Vec::with_capacity(len);
+            counters.read_buf_allocs.fetch_add(1, Ordering::Relaxed);
+            let capacity = self.buf.capacity();
+            if capacity > self.peak {
+                counters
+                    .read_buf_peak_bytes
+                    .fetch_add((capacity - self.peak) as u64, Ordering::Relaxed);
+                self.peak = capacity;
+            }
+        }
+        self.buf.resize(len, 0);
+        Ok(file.read_exact_at(&mut self.buf, offset)?)
+    }
+
+    /// Drop the buffer if a frame grew it past the retention limit. A
+    /// retained buffer keeps its contents and length.
+    fn release_outlier(&mut self, counters: &WorkerCounters) {
+        if self.buf.capacity() > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY {
+            self.buf = Vec::new();
+            counters.read_buf_releases.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Estimated bytes of a hash table's allocation from its capacity: hashbrown
+/// keeps a power-of-two bucket count at most seven-eighths full (below eight
+/// buckets, one bucket short of full), with one control byte per bucket plus
+/// one trailing group of control bytes. An estimate for the retention rule
+/// and the peak counter, not an allocator figure.
+pub(super) fn map_table_bytes<K, V>(map: &FxHashMap<K, V>) -> usize {
+    let capacity = map.capacity();
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        (capacity + 1).next_power_of_two()
+    } else {
+        (capacity.saturating_mul(8) / 7).next_power_of_two()
+    };
+    buckets.saturating_mul(std::mem::size_of::<(K, V)>() + 1) + 16
 }
 
 /// Slow-path candidate: pread body, decompress, coord extraction
@@ -501,7 +659,7 @@ fn worker_loop(
 #[allow(clippy::too_many_arguments)]
 // Sequential slow-path handler - the stages (pread, decompress, coord
 // extract, parse, precise check, rewrite) share enough scratch state
-// (read_buf, decompress_buf, group scratch, local_coords) that a split
+// (the worker's `WorkerScratch`) that a split
 // would fragment the descriptor pipeline without clarifying it.
 #[allow(clippy::too_many_lines)]
 fn handle_candidate(
@@ -511,21 +669,25 @@ fn handle_candidate(
     counters: &WorkerCounters,
     diff: &SortedDiff,
     builder: &mut WorkerBuilder,
-    read_buf: &mut Vec<u8>,
     decode_pool: &std::sync::Arc<crate::blob::DecompressPool>,
-    decompress_buf: &mut Vec<u8>,
-    st_scratch: &mut Vec<(u32, u32)>,
-    gr_scratch: &mut Vec<(u32, u32)>,
+    scratch: &mut WorkerScratch,
     loc: Option<WorkerLoc<'_>>,
     no_probe: &StaleProbe,
-    local_coords: &mut FxHashMap<i64, (i32, i32)>,
-    node_groups_scratch: &mut Vec<(usize, usize)>,
-    refresh_scratch: &mut RefreshScratch,
     compression: &Compression,
     route: Route<()>,
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
+    let WorkerScratch {
+        read,
+        decompress_buf,
+        st_scratch,
+        gr_scratch,
+        local_coords,
+        node_groups_scratch,
+        refresh_scratch,
+        scratch_peak: _,
+    } = scratch;
 
     // Under --locations-on-ways an OSC that moves a node makes every way
     // using it stale, whether or not the OSC touches the way. So the scanner
@@ -556,17 +718,18 @@ fn handle_candidate(
     // `CopyRange` or an unindexed blob's reframe needs.
     let whole_frame = refresh_scan || (!route.is_splice() && desc.index.is_some());
     let body = if whole_frame {
-        pread_into(file, read_buf, desc.frame_start, desc.frame_len, counters)?;
+        read.read_at(file, desc.frame_start, desc.frame_len, counters)?;
         desc.blob_offset
             .checked_add(desc.data_size)
-            .filter(|&end| end <= read_buf.len())
+            .filter(|&end| end <= read.buf.len())
             .map(|end| desc.blob_offset..end)
             .ok_or_else(|| Error::internal("streaming: blob body outside its frame"))?
     } else {
         let body_offset = desc.frame_start + desc.blob_offset as u64;
-        pread_into(file, read_buf, body_offset, desc.data_size, counters)?;
+        read.read_at(file, body_offset, desc.data_size, counters)?;
         0..desc.data_size
     };
+    let read_buf = &mut read.buf;
     let t_decompress = crate::counters::Stopwatch::start();
     if decompress_buf.capacity() == 0 {
         // The last parsed block took the buffer; fetch it back.
@@ -981,12 +1144,12 @@ fn handle_owned_passthrough(
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
-    read_buf: &mut Vec<u8>,
+    read: &mut ReadBuf,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
-    pread_into(file, read_buf, desc.frame_start, desc.frame_len, counters)?;
+    read.read_at(file, desc.frame_start, desc.frame_len, counters)?;
     // Read but never decoded: no observed first element.
-    pass_through_indexed(desc, drain_tx, counters, read_buf, Route::Owned, None)
+    pass_through_indexed(desc, drain_tx, counters, &mut read.buf, Route::Owned, None)
 }
 
 /// Pass an indexed blob through unchanged. On the splice route the drain
@@ -1037,20 +1200,6 @@ fn pass_through_indexed(
             verbatim: true,
         },
     )
-}
-
-/// Resize `buf` to `len` and pread `len` bytes at `offset`, counted in
-/// `blob_reads`.
-fn pread_into(
-    file: &std::fs::File,
-    buf: &mut Vec<u8>,
-    offset: u64,
-    len: usize,
-    counters: &WorkerCounters,
-) -> Result<()> {
-    counters.blob_reads.fetch_add(1, Ordering::Relaxed);
-    buf.resize(len, 0);
-    Ok(file.read_exact_at(buf, offset)?)
 }
 
 /// Compute the inline-upsert slice for one decoded blob: upserts whose OSM
@@ -1140,4 +1289,119 @@ fn blob_err(desc: &BlobDescriptor, source: &Arc<Path>, e: Error) -> Error {
             Some(desc.blob_index),
             Some(crate::ByteOffset(desc.frame_start)),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunables::{DECOMPRESS_POOL_MAX_RETAINED_CAPACITY, MAX_RETAINED_SCRATCH_CAPACITY};
+
+    fn input(len: usize) -> (tempfile::TempDir, std::fs::File) {
+        let dir = crate::path_guard::tests::scratch();
+        let file = tempfile::tempfile_in(dir.path()).expect("scratch file");
+        let bytes: Vec<u8> = (0..len).map(byte).collect();
+        file.write_all_at(&bytes, 0).expect("write input");
+        (dir, file)
+    }
+
+    /// The input's byte at offset `i`.
+    fn byte(i: usize) -> u8 {
+        u8::try_from(i % 251).expect("below 251")
+    }
+
+    fn load(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    /// The read buffer grows to exactly the frame it reads, allocates only
+    /// when a frame outgrows it, and a smaller frame reuses it.
+    #[test]
+    fn read_buffer_grows_exactly_and_only_on_a_larger_frame() {
+        let (_dir, file) = input(10_000);
+        let counters = WorkerCounters::new();
+        let mut read = ReadBuf::default();
+
+        read.read_at(&file, 0, 3_000, &counters).expect("read");
+        read.read_at(&file, 100, 3_001, &counters).expect("read");
+        let grown = read.buf.capacity();
+        assert!(
+            (3_001..6_000).contains(&grown),
+            "a growth is sized to the frame, not doubled: {grown}"
+        );
+        read.read_at(&file, 7, 1_000, &counters).expect("read");
+        assert_eq!(
+            read.buf.capacity(),
+            grown,
+            "a smaller frame reuses the buffer"
+        );
+        assert_eq!(read.buf.len(), 1_000);
+        let expected: Vec<u8> = (7..1_007).map(byte).collect();
+        assert_eq!(read.buf, expected);
+
+        assert_eq!(load(&counters.blob_reads), 3);
+        assert_eq!(load(&counters.read_buf_allocs), 2);
+        assert_eq!(load(&counters.read_buf_peak_bytes), grown as u64);
+        read.release_outlier(&counters);
+        assert_eq!(read.buf.len(), 1_000, "a retained buffer keeps its length");
+        assert_eq!(load(&counters.read_buf_releases), 0);
+    }
+
+    /// A read buffer past the retention limit is dropped between blobs; a
+    /// smaller one is kept.
+    #[test]
+    fn read_buffer_past_its_limit_is_released() {
+        let counters = WorkerCounters::new();
+        let mut read = ReadBuf {
+            buf: Vec::with_capacity(MAX_RETAINED_SCRATCH_CAPACITY / 2),
+            peak: 0,
+        };
+        read.release_outlier(&counters);
+        assert_ne!(read.buf.capacity(), 0);
+
+        read.buf = Vec::with_capacity(MAX_RETAINED_SCRATCH_CAPACITY + 1);
+        read.release_outlier(&counters);
+        assert_eq!(read.buf.capacity(), 0);
+        assert_eq!(load(&counters.read_buf_releases), 1);
+    }
+
+    /// Between blobs the small scratch past the scratch limit, and a kept
+    /// decode buffer past the decode pool's limit, are released; smaller
+    /// ones are kept, and the peak counter records what was held.
+    #[test]
+    fn between_tasks_releases_outliers_and_keeps_the_rest() {
+        let counters = WorkerCounters::new();
+        let mut scratch = WorkerScratch::default();
+        let pairs = MAX_RETAINED_SCRATCH_CAPACITY / std::mem::size_of::<(u32, u32)>();
+        scratch.st_scratch = Vec::with_capacity(pairs + 1);
+        scratch.gr_scratch = Vec::with_capacity(16);
+        scratch.decompress_buf = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1);
+        scratch.local_coords = FxHashMap::with_capacity_and_hasher(
+            MAX_RETAINED_SCRATCH_CAPACITY / std::mem::size_of::<(i64, (i32, i32))>(),
+            Default::default(),
+        );
+
+        scratch.between_tasks(&counters).expect("between tasks");
+        assert_eq!(scratch.st_scratch.capacity(), 0);
+        assert!(scratch.gr_scratch.capacity() >= 16);
+        assert_eq!(scratch.decompress_buf.capacity(), 0);
+        assert_eq!(scratch.local_coords.capacity(), 0);
+        assert!(load(&counters.scratch_peak_bytes) > 2 * MAX_RETAINED_SCRATCH_CAPACITY as u64);
+
+        scratch.decompress_buf = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY);
+        scratch.between_tasks(&counters).expect("between tasks");
+        assert_eq!(
+            scratch.decompress_buf.capacity(),
+            DECOMPRESS_POOL_MAX_RETAINED_CAPACITY
+        );
+    }
+
+    /// Coordinates still in the accumulator after a blob's handler returned
+    /// were never flushed, and fail the run.
+    #[test]
+    fn between_tasks_refuses_unflushed_coordinates() {
+        let counters = WorkerCounters::new();
+        let mut scratch = WorkerScratch::default();
+        scratch.local_coords.insert(7, (1, 2));
+        assert!(scratch.between_tasks(&counters).is_err());
+    }
 }

@@ -383,20 +383,43 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-174: interpolation endpoints are matched within nine street cells
+### WRK-175: the geocoder reads interpolation ways in a narrower shape than OSM's
 
-Found 2026-11-03 measuring the geocode query search. The builder resolves an
-interpolation way's end numbers from address points in the endpoint's
-street-level cell and its eight neighbours
-(`src/geocode_index/builder/interp.rs`, the comment above the endpoint
-scan), so its reach is about one cell width and moves with
-`--street-level`: the Germany extract (`germany-20260224-seq4704`) resolves
-71 of 78 interpolation ways at the default level 17 and 77 of 78 at level
-16. An unresolved way never answers a query. The comment there records the
-policy as standing until endpoint matching has its own stated radius;
-decide that radius (and whether it should search in full, as the reader
-now does, ADR-0023) or say in the docs that endpoints must coincide within
-about a street cell.
+Found 2026-11-03 while replacing the endpoint resolver with the
+address-on-the-end-node rule (ADR-0024). Two shapes the OSM addresses
+convention allows are not indexed:
+
+- The way classifier (`WayGeocodeFlags::classify` in `src/scan/way.rs`,
+  `is_interp: interpolation && street`) keeps an interpolation way only
+  when `addr:street` is on the way itself. The convention puts the full
+  address on the end nodes and leaves the way's `addr:street` optional, so
+  a way tagged that way is dropped at Pass 1.5 and Pass 2, silently. The
+  fix shape: classify on `addr:interpolation` alone, take the street from
+  the end nodes' addresses when both agree, and refuse a contradiction
+  with an explicit way street. The coordinate lookup in
+  `src/geocode_index/builder/interp.rs` is already street-agnostic. Germany
+  (`germany-20260224-seq4704`) has 78 ways with `addr:street` on the way;
+  how many carry only `addr:interpolation` is not measured.
+- Only the first and last node are read. A way with address nodes in its
+  interior (10 at the start, 20 in the middle, 40 at the end) is
+  interpolated 10..40 linearly over its whole length, so numbers between
+  the interior address and an end can be wrong; the convention splits the
+  range at every interior address node.
+
+Decide whether either is wanted before 0.6.0; both change which ways and
+numbers an index holds.
+
+### WRK-176: geocode strings with an interior NUL are published as their prefix
+
+Found 2026-11-03 in review of the interpolation resolver. The builder's
+string pool (`src/geocode_index/builder/strings.rs`) and the index's
+`strings.bin` are NUL-terminated, while PBF tags may hold a NUL (UTF-8
+allows it; only OSM XML cannot carry one). A street name or house number
+`10\0a` is interned under its own offset but every reader of that offset,
+the query answers included, sees `10`. The interpolation resolver refuses
+such a string (`StringPool::read_whole`); nothing else does. Decide
+whether the builder should refuse or skip a tag value holding a NUL, or
+whether the format should carry lengths; the latter is a format bump.
 
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 

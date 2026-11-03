@@ -3084,7 +3084,28 @@ mmap (file-backed, fits in RAM at Japan scale). At Europe/planet scale this
 mmap would thrash (same as dense ALTW).
 
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
-interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
+interpolation ways with `addr:interpolation` + `addr:street`; how many
+resolve is under "Interpolation ends from their own nodes" below.
+
+### Interpolation ends from their own nodes (bygg, 2026-11-03)
+
+The endpoint resolver takes each end's number from the same-street
+addresses at exactly the end node's coordinate (ADR-0024) instead of the
+nearest one in the end's street cell and its eight neighbours. The lookup
+holds only the address points at some end coordinate, found by one
+parallel pass over the address table against a set of end coordinates, in
+place of the S2 projection and sort of every address point. Planet,
+`--bench 1`: A is clean `7e7ede73` (`a450ea22`); B is the change on
+`76e9fd2f`, uncommitted (`--force`, not stored).
+`GEOCODE_PASS2_INTERP_RESOLVE` 1511 ms to 457 ms (index build 1494 ms to
+455 ms). Unresolved ways 24,534 to 34,049. Wall 179.0 s to 189.1 s, not
+attributed to this change: the phases that grew (Pass 3 Stage B fine
+21.5 s to 30.0 s, the tail after the admin index 15.7 s to 19.5 s) do not
+depend on how a way resolved, since Pass 3 lists resolved and unresolved
+ways alike, and the cover change between A and B (`edefd624`) moved Stage
+B fine only 21.5 s to 22.3 s in its own pair. Germany: 71
+of 78 resolved at street level 17 and 77 at level 16 before (level 16
+rerun on `76e9fd2f`), 7 at both levels after.
 
 ### Vertex cells seeded in the segment cover (bygg, 2026-11-03)
 

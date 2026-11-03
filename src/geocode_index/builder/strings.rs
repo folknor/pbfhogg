@@ -2,7 +2,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 pub(super) struct StringPool {
     overflowed: bool,
@@ -13,6 +13,11 @@ pub(super) struct StringPool {
     // Hash collisions are exceptional. Store extra offsets only for those
     // hashes and compare the bytes before reusing an offset.
     collisions: FxHashMap<u32, Vec<u32>>,
+    // Offsets of strings holding an interior NUL. The pool is NUL-terminated,
+    // so reading one back yields only its prefix; `read_whole` refuses them
+    // for a caller that must not act on a prefix. OSM XML cannot carry a NUL,
+    // so this is normally empty.
+    truncated: FxHashSet<u32>,
 }
 
 impl StringPool {
@@ -22,6 +27,7 @@ impl StringPool {
             data: Vec::new(),
             index: FxHashMap::default(),
             collisions: FxHashMap::default(),
+            truncated: FxHashSet::default(),
         };
         // Offset 0 = empty string
         pool.data.push(0);
@@ -58,9 +64,18 @@ impl StringPool {
         } else {
             self.index.insert(hash, offset);
         }
+        if s.as_bytes().contains(&0) {
+            self.truncated.insert(offset);
+        }
         self.data.extend_from_slice(s.as_bytes());
         self.data.push(0);
         offset
+    }
+
+    /// The string interned at `offset`, or None when it holds an interior
+    /// NUL and so reads back from the pool as a prefix of itself.
+    pub(super) fn read_whole(&self, offset: u32) -> Option<&str> {
+        (!self.truncated.contains(&offset)).then(|| read_string_from_pool(self, offset))
     }
 
     fn find_with_hash(&self, s: &str, hash: u64) -> Option<u32> {

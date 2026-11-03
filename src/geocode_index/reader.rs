@@ -764,8 +764,18 @@ impl Reader {
     /// before recording a hit so an unusable fine segment cannot suppress a
     /// usable coarse fallback. The unranked candidate API still checks each
     /// returned hit and avoids an eager all-ways cache at reader open.
+    ///
+    /// A range is usable when both ends are set and its mode
+    /// [steps](InterpolationType::steps) it. The builder writes no other
+    /// resolved range, but an index built before it checked parity can hold
+    /// one. Checking here, where the sinks admit a hit, keeps such a way from
+    /// shadowing the coarse fallback as well as from answering.
     fn interpolation_total_length(&self, iw: InterpWay) -> Option<f64> {
         if iw.start_number == 0 || iw.end_number == 0 {
+            return None;
+        }
+        let mode = InterpolationType::try_from(iw.interpolation_type).ok()?;
+        if !mode.steps(iw.start_number, iw.end_number) {
             return None;
         }
         let total_len = self.way_length_radians(&iw);
@@ -811,8 +821,8 @@ impl Reader {
         let acc_len = self.accumulated_length_radians(&iw, segment_index, snap_lat_e7, snap_lon_e7);
         let t = acc_len / total_len;
         let diff = iw.end_number as f64 - iw.start_number as f64;
-        // Even and odd both preserve start_number parity. Endpoint numbers
-        // remain authoritative, including imported ranges with mismatched tags.
+        // Even and odd step by two from start_number; interpolation_total_length
+        // has already refused a range whose ends do not both have that parity.
         let number = match InterpolationType::try_from(iw.interpolation_type).ok()? {
             InterpolationType::All => iw.start_number as f64 + (t * diff).round(),
             InterpolationType::Even | InterpolationType::Odd => {

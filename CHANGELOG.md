@@ -513,6 +513,20 @@ state.
   `--coarse-search-radius` wider than a fixed number of cell widths at its
   level, and the reader refuses an index whose header carries one, or whose
   cell files are out of order.
+- `build-geocode-index` takes an interpolation way's end numbers only from
+  the addresses on its end nodes (same street, same coordinate). It used to
+  borrow the nearest same-street address within the end's street-level cell
+  and its eight neighbours, so how many ways resolved moved with
+  `--street-level` (Germany 71 of 78 at 17, 77 at 16) and the numbers were
+  often a nearby house's: most such ways in Germany are closed outlines
+  answering one borrowed number. A way is also left unresolved, and never
+  answers, when coincident addresses at an end disagree, an end number is not
+  a plain positive integer (`57a`, `18-20`), an `even` or `odd` way's ends
+  have the other parity, or `addr:interpolation` is not `all`, `even` or
+  `odd`; those used to be read as their leading digits, or as `all`. Fewer
+  ways resolve (Germany 7 of 78 at any level). Queries on existing indexes
+  also refuse an `even` or `odd` range whose ends have the wrong parity,
+  which stepped past the end; rebuild for the rest.
 - Concurrent library runs no longer share scratch.
 - io_uring writers opened one after another no longer fail with ENOMEM.
 

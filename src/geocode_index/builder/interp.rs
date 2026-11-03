@@ -1,150 +1,141 @@
 //! Interpolation endpoint resolution (mmap-based).
+//!
+//! An interpolation way's start and end numbers are the house numbers of the
+//! address points at its two end nodes. OSM tags an interpolation way between
+//! two address nodes, so its end nodes are themselves the address points: the
+//! address of an end is the one whose stored coordinate equals the end node's,
+//! not the nearest one. Nothing here depends on a cell level or a distance.
+//!
+//! An endpoint resolves only when the same-street address points at its
+//! coordinate all carry one house-number string, and that string is a
+//! positive decimal number. A way resolves only when both ends do, its
+//! `addr:interpolation` is `all`, `even` or `odd`, and an `even` or `odd` way
+//! has both ends of that parity. Anything else leaves both numbers at the
+//! zero sentinel (see CORRECTNESS.md), so the way never answers a query: a
+//! borrowed, ambiguous or truncated number would be a silent wrong answer.
+//! ADR-0024 records the rule and the nearest-address search it replaced.
 
-use crate::coord_fmt::e7_to_deg;
 use rayon::prelude::*;
-use s2::cellid::CellID;
-use s2::latlng::LatLng;
+use rustc_hash::FxHashSet;
 
 use super::pass2::SlimInterpWay;
-use super::strings::{StringPool, read_string_from_pool};
+use super::strings::StringPool;
 
 use super::super::format::*;
 
-/// Compressed-sparse-row map from S2 cell IDs to address-point indices.
-///
-/// Built once per build, read-only during endpoint resolution, shareable
-/// across rayon workers without locks. Replaces the old transient
-/// `FxHashMap<u64, Vec<u32>>` (one heap `Vec` per cell) with three flat
-/// arrays.
-///
-/// Rows retain ascending address-point index order because endpoint resolution
-/// keeps the first candidate on equal-distance ties: on a distance tie (or
-/// multiple exact matches) the lowest addr index must win, matching the old
-/// hashmap which pushed indices in ascending scan order. A cell-only sort would
-/// leave intra-cell order arbitrary and silently change which house number a
-/// tied endpoint resolves to.
-struct CellAddrCsr {
-    /// Distinct cell ids, ascending. Binary-search key for `get`.
-    cell_ids: Vec<u64>,
-    /// Length `cell_ids.len() + 1`. Row `i` occupies
-    /// `values[offsets[i]..offsets[i + 1]]`.
-    /// This is u32 because every value is an address-point index and the
-    /// on-disk header caps the total address-point count at u32::MAX.
-    offsets: Vec<u32>,
-    /// Address-point indices, grouped by cell in `cell_ids` order, ascending
-    /// within each group.
-    values: Vec<u32>,
+/// A coordinate as an exact lookup key, longitude folded by
+/// [`crate::geo::normalize_longitude_e7`]: +180 and -180 degrees are one
+/// meridian, so an end node and an address point either side of that
+/// spelling are still at the same place.
+type CoordKey = (i32, i64);
+
+fn coord_key(lat_e7: i32, lon_e7: i32) -> CoordKey {
+    (
+        lat_e7,
+        crate::geo::normalize_longitude_e7(i64::from(lon_e7)),
+    )
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "Pass 2 refuses an address-point count over u32::MAX, and the CSR holds one value per address point"
-)]
-fn csr_offset(len: usize) -> u32 {
-    u32::try_from(len)
-        .expect("address CSR cannot exceed the u32 address-point count encoded by the index format")
+/// The address points that sit exactly on some interpolation end node,
+/// sorted by `(coordinate, address index)`. Built from the end-node
+/// coordinates first, so it holds only matched points, never the whole
+/// address table.
+struct EndpointAddrs {
+    rows: Vec<(CoordKey, u32)>,
 }
 
-impl CellAddrCsr {
-    /// Return the address-point indices projected into `cell_id`.
-    fn get(&self, cell_id: u64) -> &[u32] {
-        match self.cell_ids.binary_search(&cell_id) {
-            Ok(index) => {
-                let start = self.offsets[index] as usize;
-                let end = self.offsets[index + 1] as usize;
-                &self.values[start..end]
-            }
-            Err(_) => &[],
-        }
+impl EndpointAddrs {
+    /// The address-point indices whose coordinate equals `key`.
+    fn at(&self, key: CoordKey) -> impl Iterator<Item = u32> + '_ {
+        let first = self.rows.partition_point(|&(k, _)| k < key);
+        self.rows[first..]
+            .iter()
+            .take_while(move |&&(k, _)| k == key)
+            .map(|&(_, index)| index)
     }
 }
 
-/// Build the endpoint lookup index without per-cell allocations or locks.
-fn build_cell_addr_csr(
+/// The first and last node of a way that has at least two.
+fn way_ends(
+    way: &SlimInterpWay,
+    interp_nodes: Table<'_, NodeCoord>,
+) -> Option<(CoordKey, CoordKey)> {
+    // Not just a bounds guard: a one-node way would resolve both ends to
+    // the same point.
+    if way.node_count < 2 {
+        return None;
+    }
+    let nodes = interp_nodes
+        .span_at(way.node_file_offset, u64::from(way.node_count))
+        .ok()?;
+    let start = nodes.get(0)?;
+    let end = nodes.get(usize::from(way.node_count) - 1)?;
+    Some((
+        coord_key(start.lat_e7, start.lon_e7),
+        coord_key(end.lat_e7, end.lon_e7),
+    ))
+}
+
+fn build_endpoint_addrs(
+    interp_ways: &[SlimInterpWay],
     addr_points: Table<'_, AddrPoint>,
-    street_level: u8,
+    interp_nodes: Table<'_, NodeCoord>,
     executor: &crate::host::Executor,
-) -> CellAddrCsr {
-    // Drive the projection from an INDEXED source (a `usize` range is an
-    // IndexedParallelIterator, and `map` preserves that) so `collect` allocates
-    // the final Vec once and each worker fills its own contiguous span. Do not
-    // "simplify" this to `filter_map`: that is unindexed, so its `collect`
-    // stitches per-worker fragments in a second copy pass that can transiently
-    // hold ~2x the pair buffer. Every addr point projects to exactly one pair,
-    // so no filter is needed. This also avoids the reverted fold/reduce hashmap
-    // merge (commit 363c579) whose per-worker map union regressed the build.
+) -> EndpointAddrs {
+    let mut ends: FxHashSet<CoordKey> = FxHashSet::default();
+    for way in interp_ways {
+        if way.interpolation.is_some()
+            && let Some((start, end)) = way_ends(way, interp_nodes)
+        {
+            ends.insert(start);
+            ends.insert(end);
+        }
+    }
+    if ends.is_empty() {
+        return EndpointAddrs { rows: Vec::new() };
+    }
     #[expect(
         clippy::expect_used,
-        reason = "every index is below Table::len, and Pass 2 refuses an address-point count over u32::MAX"
+        reason = "Pass 2 refuses an address-point count over u32::MAX"
     )]
-    let mut pairs: Vec<(u64, u32)> = executor.install(|| {
+    let mut rows: Vec<(CoordKey, u32)> = executor.install(|| {
         (0..addr_points.len())
             .into_par_iter()
-            .map(|index| {
-                let point = addr_points
-                    .get(index)
-                    .expect("an index below Table::len names a whole record");
-                let lat_lng = LatLng::from_degrees(
-                    e7_to_deg(point.lat_e7 as f64),
-                    e7_to_deg(point.lon_e7 as f64),
-                );
-                let cell_id = CellID::from(lat_lng).parent(street_level as u64).0;
-                (
-                    cell_id,
-                    u32::try_from(index).expect("address count checked during Pass 2"),
-                )
+            .filter_map(|index| {
+                let point = addr_points.get(index)?;
+                let key = coord_key(point.lat_e7, point.lon_e7);
+                ends.contains(&key).then(|| {
+                    (
+                        key,
+                        u32::try_from(index).expect("address count checked during Pass 2"),
+                    )
+                })
             })
             .collect()
     });
-
-    // The index tie-break preserves the ascending insertion order of the old
-    // hashmap rows for exact and equal-distance endpoint candidates.
-    executor.install(|| pairs.par_sort_unstable_by_key(|&(cell_id, index)| (cell_id, index)));
-
-    let mut cell_ids = Vec::new();
-    let mut offsets = vec![0_u32];
-    let mut values = Vec::with_capacity(pairs.len());
-    let mut index = 0;
-    while index < pairs.len() {
-        let cell_id = pairs[index].0;
-        cell_ids.push(cell_id);
-        while index < pairs.len() && pairs[index].0 == cell_id {
-            values.push(pairs[index].1);
-            index += 1;
-        }
-        offsets.push(csr_offset(values.len()));
-    }
-
-    CellAddrCsr {
-        cell_ids,
-        offsets,
-        values,
-    }
+    rows.sort_unstable();
+    EndpointAddrs { rows }
 }
 
-/// Parse leading digits from a house number string (e.g., "42" from "42A").
-fn parse_house_number(s: &str) -> u32 {
-    let mut n = 0u32;
-    for b in s.bytes() {
-        if b.is_ascii_digit() {
-            n = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
-        } else {
-            break;
-        }
+/// Parse a house number that is entirely a positive decimal number. `42A`,
+/// `18-20` and `0` are refused rather than read as 42, 18 or a sentinel.
+fn parse_house_number(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    n
+    s.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-/// Resolve start/end house numbers for interpolation ways by matching
-/// their endpoints against nearby address points with the same street name.
-/// Reads address points from mmap'd addr_points.bin.
+/// Resolve start/end house numbers for interpolation ways from the address
+/// points at their end nodes (see the module documentation for the rule).
+/// Reads address points from mmap'd addr_points.bin. Returns the number of
+/// ways resolved.
 #[hotpath::measure]
 pub(super) fn resolve_interpolation_endpoints_mmap(
     interp_ways: &mut [SlimInterpWay],
     addr_points: Table<'_, AddrPoint>,
     interp_nodes: Table<'_, NodeCoord>,
     strings: &StringPool,
-    street_level: u8,
     executor: &crate::host::Executor,
     invocation: &crate::host::Recorder,
 ) -> u32 {
@@ -153,13 +144,13 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     }
 
     invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
-    let csr = build_cell_addr_csr(addr_points, street_level, executor);
+    let addrs = build_endpoint_addrs(interp_ways, addr_points, interp_nodes, executor);
     invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
     invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
     let resolved = executor.install(|| {
         interp_ways
             .par_iter_mut()
-            .map(|way| resolve_one_way(way, interp_nodes, addr_points, strings, &csr, street_level))
+            .map(|way| resolve_one_way(way, interp_nodes, addr_points, strings, &addrs))
             .sum()
     });
     invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
@@ -171,266 +162,263 @@ fn resolve_one_way(
     interp_nodes: Table<'_, NodeCoord>,
     addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
-    csr: &CellAddrCsr,
-    street_level: u8,
+    addrs: &EndpointAddrs,
 ) -> u32 {
-    // Not just a bounds guard: a one-node way would resolve both endpoints to
-    // the same point.
-    if way.node_count < 2 {
-        return 0;
-    }
-    let Ok(nodes) = interp_nodes.span_at(way.node_file_offset, u64::from(way.node_count)) else {
+    let Some(interpolation) = way.interpolation else {
         return 0;
     };
-    let (Some(start), Some(end)) = (nodes.get(0), nodes.get(usize::from(way.node_count) - 1))
-    else {
+    let Some((start, end)) = way_ends(way, interp_nodes) else {
         return 0;
     };
-    let start_hn = find_endpoint_house_number_mmap(
-        (start.lat_e7, start.lon_e7),
-        way.street_offset,
-        addr_points,
-        strings,
-        csr,
-        street_level,
-    );
-    let end_hn = find_endpoint_house_number_mmap(
-        (end.lat_e7, end.lon_e7),
-        way.street_offset,
-        addr_points,
-        strings,
-        csr,
-        street_level,
-    );
-    if let (Some(start), Some(end)) = (start_hn, end_hn) {
-        way.start_number = start;
-        way.end_number = end;
-        1
-    } else {
-        // Leave the zero sentinel when either endpoint does not match.
-        0
+    let number = |key| endpoint_house_number(key, way.street_offset, addr_points, strings, addrs);
+    let (Some(start), Some(end)) = (number(start), number(end)) else {
+        // Leave the zero sentinel when either endpoint does not resolve.
+        return 0;
+    };
+    // OSM requires an even or odd way's ends to follow its declared rule.
+    if !interpolation.steps(start, end) {
+        return 0;
     }
+    way.start_number = start;
+    way.end_number = end;
+    1
 }
 
-/// Find the house number of an address point near an interpolation endpoint.
-fn find_endpoint_house_number_mmap(
-    endpoint: (i32, i32),
+/// The house number of the address at an interpolation end node: the one
+/// house-number string every same-street address point at exactly `key`
+/// carries, parsed strictly. None when there is no such point, when they
+/// disagree (`10` beside `20`, or beside `10a`), or when the string is not a
+/// positive decimal number. Disagreement is judged on the strings before any
+/// parsing, so a refused spelling cannot hide a conflict.
+fn endpoint_house_number(
+    key: CoordKey,
     street_offset: u32,
     addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
-    csr: &CellAddrCsr,
-    street_level: u8,
+    addrs: &EndpointAddrs,
 ) -> Option<u32> {
-    // Endpoint admission is currently cell-based: this scans the street-level
-    // cell and its eight neighbors, so its geographic reach changes with
-    // street_level. The configured fine search radius applies to Reader query
-    // matching, not to endpoint resolution. Reusing it here would change which
-    // endpoints are serialized and which interpolation answers exist; keep
-    // this policy unchanged until endpoint matching has its own stated radius.
-    let (lat_e7, lon_e7) = endpoint;
-    let ll = LatLng::from_degrees(e7_to_deg(lat_e7 as f64), e7_to_deg(lon_e7 as f64));
-    let center = CellID::from(ll).parent(street_level as u64);
-
-    let mut best_idx: Option<u32> = None;
-    let mut best_dist_sq = i64::MAX;
-    let mut found_exact = false;
-
-    let mut check_cell = |cell_id: u64| {
-        for &idx in csr.get(cell_id) {
-            let Some(pt) = addr_points.get(idx as usize) else {
-                continue;
-            };
-            if pt.street_offset != street_offset {
-                continue;
-            }
-            let dlat = i64::from(pt.lat_e7) - i64::from(lat_e7);
-            // Same species as the pass3/reader antimeridian bugs: an S2 cell
-            // straddling +/-180 degrees holds points whose raw E7 longitudes
-            // differ by ~3.6e9. Unwrapped, the near candidate looks half a
-            // world away (and the raw i32 subtraction overflows outright).
-            let dlon =
-                crate::geo::wrapped_longitude_delta_e7(i64::from(pt.lon_e7) - i64::from(lon_e7));
-            let dist_sq = dlat * dlat + dlon * dlon;
-            let is_exact = dlat.abs() <= crate::tunables::INTERP_ENDPOINT_EXACT_TOLERANCE_E7
-                && dlon.abs() <= crate::tunables::INTERP_ENDPOINT_EXACT_TOLERANCE_E7;
-
-            if is_exact && !found_exact {
-                found_exact = true;
-                best_idx = Some(idx);
-                best_dist_sq = dist_sq;
-            } else if (is_exact || !found_exact) && dist_sq < best_dist_sq {
-                best_idx = Some(idx);
-                best_dist_sq = dist_sq;
-            }
-        }
-    };
-
-    check_cell(center.0);
-    for n in center.all_neighbors(street_level as u64) {
-        check_cell(n.0);
+    // Offset 0 is the empty string: a way without a street name has no
+    // street for its ends to agree with.
+    if street_offset == 0 {
+        return None;
     }
-
-    let idx = best_idx?;
-    let pt = addr_points.get(idx as usize)?;
-    let hn_str = read_string_from_pool(strings, pt.housenumber_offset);
-    let hn = parse_house_number(hn_str);
-    if hn > 0 { Some(hn) } else { None }
+    let mut housenumber: Option<u32> = None;
+    for index in addrs.at(key) {
+        let Some(point) = addr_points.get(index as usize) else {
+            continue;
+        };
+        if point.street_offset != street_offset {
+            continue;
+        }
+        // The pool interns each string once, so equal offsets are equal
+        // strings.
+        match housenumber {
+            None => housenumber = Some(point.housenumber_offset),
+            Some(offset) if offset == point.housenumber_offset => {}
+            Some(_) => return None,
+        }
+    }
+    // A string with an interior NUL reads back as a prefix (`10\0a` as
+    // `10`), which the strict parse would then accept.
+    parse_house_number(strings.read_whole(housenumber?)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn append_point(bytes: &mut Vec<u8>, point: AddrPoint) {
-        bytes.extend_from_slice(&point.to_bytes());
+    const STREET: &str = "Interp Street";
+
+    struct Fixture {
+        strings: StringPool,
+        addr_bytes: Vec<u8>,
+        node_bytes: Vec<u8>,
+        ways: Vec<SlimInterpWay>,
     }
 
-    fn cell_id(lat_e7: i32, lon_e7: i32, street_level: u8) -> u64 {
-        let lat_lng = LatLng::from_degrees(e7_to_deg(lat_e7 as f64), e7_to_deg(lon_e7 as f64));
-        CellID::from(lat_lng).parent(street_level as u64).0
-    }
-
-    #[test]
-    fn csr_get_matches_naive_hashmap_ordered() {
-        let street_level = 17;
-        let first_cell = (55_700_000, 125_030_000);
-        let second_cell = (-33_868_800, 151_209_300);
-        let mut bytes = Vec::new();
-        for (lat_e7, lon_e7) in [first_cell, second_cell, first_cell, second_cell, first_cell] {
-            append_point(
-                &mut bytes,
-                AddrPoint {
-                    lat_e7,
-                    lon_e7,
-                    housenumber_offset: 0,
-                    street_offset: 0,
-                    postcode_offset: 0,
-                },
-            );
+    impl Fixture {
+        fn new() -> Self {
+            let mut strings = StringPool::new();
+            strings.intern(STREET);
+            Self {
+                strings,
+                addr_bytes: Vec::new(),
+                node_bytes: Vec::new(),
+                ways: Vec::new(),
+            }
         }
 
-        let csr = build_cell_addr_csr(
-            Table::new(&bytes),
-            street_level,
-            &crate::host::Executor::Ambient,
-        );
-        assert_eq!(
-            csr.get(cell_id(first_cell.0, first_cell.1, street_level)),
-            &[0, 2, 4]
-        );
-        assert_eq!(
-            csr.get(cell_id(second_cell.0, second_cell.1, street_level)),
-            &[1, 3]
-        );
-        assert_eq!(csr.get(cell_id(0, 0, street_level)), &[] as &[u32]);
-    }
-
-    #[test]
-    fn csr_get_empty_input() {
-        let csr = build_cell_addr_csr(Table::new(&[]), 17, &crate::host::Executor::Ambient);
-        assert!(csr.cell_ids.is_empty());
-        assert_eq!(csr.offsets, vec![0]);
-        assert_eq!(csr.get(0), &[] as &[u32]);
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    #[should_panic(expected = "address CSR cannot exceed")]
-    fn csr_offset_refuses_truncation() {
-        let _ = csr_offset(u32::MAX as usize + 1);
-    }
-
-    /// An address point 0.0001 degrees away ACROSS the antimeridian must beat
-    /// one 0.0009 degrees away on the same side. Before the wrap fix the raw
-    /// i32 longitude subtraction saw the across-seam candidate as ~360 degrees
-    /// away (and overflowed i32 outright in debug builds), so the decoy won.
-    #[test]
-    fn endpoint_matching_takes_the_short_arc_across_the_antimeridian() {
-        let street_level = 17;
-        let endpoint = (100_000_000, 1_799_999_000); // 10N, 179.9999E
-        let mut strings = StringPool::new();
-        let near_across_seam = strings.intern("20");
-        let far_same_side = strings.intern("10");
-        let street_offset = strings.intern("Dateline Road");
-        let mut bytes = Vec::new();
-        // True delta 2000 e7-units, raw delta ~3.6e9 (would overflow i32).
-        append_point(
-            &mut bytes,
-            AddrPoint {
-                lat_e7: endpoint.0,
-                lon_e7: -1_799_999_000,
-                housenumber_offset: near_across_seam,
-                street_offset,
+        fn address(&mut self, (lat_e7, lon_e7): (i32, i32), housenumber: &str, street: &str) {
+            let point = AddrPoint {
+                lat_e7,
+                lon_e7,
+                housenumber_offset: self.strings.intern(housenumber),
+                street_offset: self.strings.intern(street),
                 postcode_offset: 0,
-            },
-        );
-        // True delta 9000 e7-units, same side.
-        append_point(
-            &mut bytes,
-            AddrPoint {
-                lat_e7: endpoint.0,
-                lon_e7: 1_799_990_000,
-                housenumber_offset: far_same_side,
-                street_offset,
-                postcode_offset: 0,
-            },
-        );
-
-        let csr = build_cell_addr_csr(
-            Table::new(&bytes),
-            street_level,
-            &crate::host::Executor::Ambient,
-        );
-        assert_eq!(
-            find_endpoint_house_number_mmap(
-                endpoint,
-                street_offset,
-                Table::new(&bytes),
-                &strings,
-                &csr,
-                street_level,
-            ),
-            Some(20)
-        );
-    }
-
-    #[test]
-    fn endpoint_tiebreak_picks_lowest_index() {
-        let street_level = 17;
-        let endpoint = (55_700_000, 125_030_000);
-        let mut strings = StringPool::new();
-        let low_index_house = strings.intern("10");
-        let high_index_house = strings.intern("20");
-        let street_offset = strings.intern("Interp Street");
-        let mut bytes = Vec::new();
-        for housenumber_offset in [low_index_house, high_index_house] {
-            append_point(
-                &mut bytes,
-                AddrPoint {
-                    lat_e7: endpoint.0,
-                    lon_e7: endpoint.1,
-                    housenumber_offset,
-                    street_offset,
-                    postcode_offset: 0,
-                },
-            );
+            };
+            self.addr_bytes.extend_from_slice(&point.to_bytes());
         }
 
-        let csr = build_cell_addr_csr(
-            Table::new(&bytes),
-            street_level,
-            &crate::host::Executor::Ambient,
+        fn way(&mut self, nodes: &[(i32, i32)], interpolation: Option<InterpolationType>) {
+            let node_file_offset = self.node_bytes.len() as u64;
+            for &(lat_e7, lon_e7) in nodes {
+                self.node_bytes
+                    .extend_from_slice(&NodeCoord { lat_e7, lon_e7 }.to_bytes());
+            }
+            self.ways.push(SlimInterpWay {
+                way_id: i64::try_from(self.ways.len()).expect("test way count") + 1,
+                node_file_offset,
+                street_offset: self.strings.intern(STREET),
+                interpolation,
+                node_count: u16::try_from(nodes.len()).expect("test way"),
+                start_number: 0,
+                end_number: 0,
+            });
+        }
+
+        /// Resolve every way; return each way's `(start, end)` numbers.
+        fn resolve(mut self) -> Vec<(u32, u32)> {
+            let host = crate::host::Host::entered_for_tests();
+            resolve_interpolation_endpoints_mmap(
+                &mut self.ways,
+                Table::new(&self.addr_bytes),
+                Table::new(&self.node_bytes),
+                &self.strings,
+                &host.executor,
+                &host.invocation,
+            );
+            self.ways
+                .iter()
+                .map(|way| (way.start_number, way.end_number))
+                .collect()
+        }
+    }
+
+    const A: (i32, i32) = (557_000_000, 125_000_000);
+    const B: (i32, i32) = (557_000_000, 125_060_000);
+
+    #[test]
+    fn ends_take_the_numbers_of_the_addresses_at_them() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(
+            &[A, (557_000_000, 125_030_000), B],
+            Some(InterpolationType::Even),
         );
-        assert_eq!(
-            find_endpoint_house_number_mmap(
-                endpoint,
-                street_offset,
-                Table::new(&bytes),
-                &strings,
-                &csr,
-                street_level,
-            ),
-            Some(10)
-        );
+        fx.way(&[B, A], Some(InterpolationType::All));
+        assert_eq!(fx.resolve(), vec![(10, 30), (30, 10)]);
+    }
+
+    /// The old resolver took the nearest same-street address within the
+    /// street-level cell and its eight neighbours, so an end one node away
+    /// from an address borrowed its number, and how far that reached moved
+    /// with the cell level. An address 1 E7 unit (about a centimetre) away is
+    /// not at the end.
+    #[test]
+    fn an_address_near_an_end_is_not_the_address_at_it() {
+        let mut fx = Fixture::new();
+        fx.address((A.0 + 1, A.1), "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn an_address_on_another_street_does_not_resolve_an_end() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", "Corner Street");
+        fx.address(B, "30", STREET);
+        fx.way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn coincident_addresses_that_disagree_refuse_the_end() {
+        for other in ["20", "10a"] {
+            let mut fx = Fixture::new();
+            fx.address(A, "10", STREET);
+            fx.address(A, other, STREET);
+            fx.address(B, "30", STREET);
+            fx.way(&[A, B], Some(InterpolationType::Even));
+            assert_eq!(fx.resolve(), vec![(0, 0)], "10 beside {other}");
+        }
+    }
+
+    #[test]
+    fn coincident_duplicates_of_one_number_resolve() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(A, "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(10, 30)]);
+    }
+
+    #[test]
+    fn a_number_that_is_not_a_positive_decimal_refuses_the_end() {
+        for bad in ["57a", "18-20", "0", "99999999999", " 10", "10\0a"] {
+            let mut fx = Fixture::new();
+            fx.address(A, bad, STREET);
+            fx.address(B, "30", STREET);
+            fx.way(&[A, B], Some(InterpolationType::All));
+            assert_eq!(fx.resolve(), vec![(0, 0)], "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ends_must_have_the_declared_parity() {
+        let cases = [
+            (InterpolationType::Even, "10", "13", false),
+            (InterpolationType::Even, "11", "21", false),
+            (InterpolationType::Even, "10", "20", true),
+            (InterpolationType::Odd, "10", "20", false),
+            (InterpolationType::Odd, "11", "21", true),
+            (InterpolationType::All, "10", "13", true),
+        ];
+        for (interpolation, start, end, resolves) in cases {
+            let mut fx = Fixture::new();
+            fx.address(A, start, STREET);
+            fx.address(B, end, STREET);
+            fx.way(&[A, B], Some(interpolation));
+            let got = fx.resolve();
+            assert_eq!(
+                got[0] != (0, 0),
+                resolves,
+                "{interpolation:?} {start}..{end}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_interpolation_mode_stays_unresolved() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, B], None);
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    /// An address stored at -180 degrees is at the same place as an end
+    /// node stored at +180.
+    #[test]
+    fn the_antimeridian_has_one_spelling() {
+        let mut fx = Fixture::new();
+        let east = (100_000_000, 1_800_000_000);
+        let west = (100_000_000, -1_800_000_000);
+        fx.address(west, "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[east, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(10, 30)]);
+    }
+
+    #[test]
+    fn parse_house_number_accepts_only_positive_decimals() {
+        assert_eq!(parse_house_number("42"), Some(42));
+        assert_eq!(parse_house_number("042"), Some(42));
+        assert_eq!(parse_house_number("4294967295"), Some(u32::MAX));
+        for bad in ["", "0", "00", "42A", "4294967296", "-1", "+1"] {
+            assert_eq!(parse_house_number(bad), None, "{bad:?}");
+        }
     }
 }

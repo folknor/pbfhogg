@@ -42,6 +42,21 @@ pub enum InterpolationType {
     Odd = 2,
 }
 
+impl InterpolationType {
+    /// Whether `start..end` is a range this mode can step: any two numbers
+    /// for `All`, two even ones for `Even`, two odd ones for `Odd`. The
+    /// reader steps an even or odd range by two from `start`, so an end of
+    /// the other parity yields numbers of the wrong parity or past the end
+    /// (`Even` 10..13 ends at 14).
+    pub(crate) fn steps(self, start: u32, end: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Even => start.is_multiple_of(2) && end.is_multiple_of(2),
+            Self::Odd => !start.is_multiple_of(2) && !end.is_multiple_of(2),
+        }
+    }
+}
+
 impl TryFrom<u8> for InterpolationType {
     type Error = FormatError;
 

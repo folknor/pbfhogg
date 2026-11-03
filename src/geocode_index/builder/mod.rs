@@ -637,7 +637,6 @@ fn build_generation(
         addr_points.table(),
         interp_nodes.table(),
         &strings,
-        config.street_level,
         &host.executor,
         &host.invocation,
     );
@@ -658,8 +657,11 @@ fn build_generation(
             host.diagnostics,
             Warning,
             "geocode.pass2.interp_unresolved",
-            "{unresolved_interpolation_count} interpolation ways have unresolved endpoints; \
-             way IDs (sample): {unresolved_interpolation_ids:?}"
+            "{unresolved_interpolation_count} interpolation ways are unresolved (an end with \
+             no same-street address on its node, coincident addresses that disagree, a \
+             number that is not a positive decimal, ends of the wrong parity, or an \
+             unsupported addr:interpolation value); way IDs (sample): \
+             {unresolved_interpolation_ids:?}"
         );
     }
     crate::host::diag!(
@@ -683,7 +685,10 @@ fn build_generation(
                 start_number: iw.start_number,
                 end_number: iw.end_number,
                 node_count: iw.node_count,
-                interpolation_type: iw.interpolation_type,
+                // An unsupported mode is never resolved, so its numbers are
+                // the zero sentinel and the reader never steps it; the
+                // record still needs a wire value `Reader::open` accepts.
+                interpolation_type: iw.interpolation.unwrap_or(InterpolationType::All) as u8,
             };
             iw_out.write_all(&rec.to_bytes())?;
         }

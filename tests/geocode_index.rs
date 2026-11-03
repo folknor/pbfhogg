@@ -496,14 +496,20 @@ fn write_synthetic_antimeridian_interpolation_input(path: &Path) {
     );
 }
 
-/// A near but UNRESOLVABLE interpolation way (node 131 carries no house
-/// number, so the way's end number stays 0) plus a farther resolvable one.
-/// The near way is inside the fine radius, the far one only inside coarse.
-fn write_synthetic_shadowed_interpolation_input(path: &Path) {
+/// A near `all` interpolation way plus a farther resolvable `even` one. With
+/// `near_end` None the near way is UNRESOLVABLE (node 131 carries no house
+/// number, so the way's end number stays 0); with a number it resolves
+/// 10..that. The near way is inside the fine radius, the far one only inside
+/// coarse.
+fn write_synthetic_shadowed_interpolation_input(path: &Path, near_end: Option<&'static str>) {
+    let near_end_tags = match near_end {
+        Some(number) => vec![("addr:housenumber", number), ("addr:street", "Near Street")],
+        None => vec![],
+    };
     write_test_pbf_sorted(
         path,
         &[
-            // ~10 m north of the query point: unresolvable.
+            // ~10 m north of the query point.
             TestNode {
                 id: 130,
                 lat: 557_000_898,
@@ -515,7 +521,7 @@ fn write_synthetic_shadowed_interpolation_input(path: &Path) {
                 id: 131,
                 lat: 557_000_898,
                 lon: 125_060_000,
-                tags: vec![],
+                tags: near_end_tags,
                 meta: None,
             },
             // ~100 m north of the query point: fully resolvable.
@@ -709,9 +715,11 @@ fn write_street_cell_overflow_input(path: &Path) {
 /// `src/geocode_index/builder/pass3.rs:599`.
 #[allow(clippy::cast_possible_wrap)]
 fn write_interp_cell_overflow_input(path: &Path) {
-    // Interp endpoints carry house numbers so endpoint resolution
-    // produces real entries (otherwise unresolved interp ways may
-    // be filtered before reaching the per-cell aggregation).
+    // Pass 3 lists every interpolation way under its cells, resolved or
+    // not, so these ways reach the per-cell cap without resolving (the end
+    // nodes carry no addr:street, so they are not address points). Should
+    // the builder ever stop listing unresolved ways, this fixture needs
+    // resolvable ones to keep exercising the cap.
     let nodes = vec![
         TestNode {
             id: 1,
@@ -2368,6 +2376,142 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     assert_eq!(cand_interp.house_number, 20);
 }
 
+/// Builders before the parity check could write an `even` range with an odd
+/// end (the old resolver borrowed the nearest same-street number). Stepping
+/// by two from the start then runs past the end: `even` 10..13 answers 14
+/// at the far end. The reader refuses such a range where its searches admit
+/// a hit, so the range neither answers nor shadows the coarse fallback.
+#[test]
+fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_shadowed_interpolation_input(&input, Some("30"));
+    build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            fine_search_radius_m: 30.0,
+            coarse_search_radius_m: 300.0,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build should succeed");
+    let (lat, lon) = (55.7, 12.503);
+    let query = |index_dir: &Path| {
+        let reader =
+            pbfhogg::geocode_index::reader::Reader::open(index_dir).expect("reader should open");
+        let answer = reader
+            .query(lat, lon)
+            .expect("valid query")
+            .interpolation
+            .map(|i| (i.street.to_owned(), i.house_number));
+        let candidates: Vec<String> = reader
+            .candidates(lat, lon)
+            .expect("valid query")
+            .interpolations
+            .iter()
+            .map(|c| c.street.to_owned())
+            .collect();
+        (answer, candidates)
+    };
+    let (built, _) = query(&index_dir);
+    assert_eq!(
+        built,
+        Some(("Near Street".to_owned(), 20)),
+        "as built, the near all 10..30 way answers"
+    );
+
+    // Rewrite the near way (record 0, the `all` one; the far way is `even`)
+    // as `even` 10..13: end_number is bytes 16..20 of a 23-byte record and
+    // the mode is byte 22 (format.rs pins the field offsets).
+    let path = index_dir.join("interp_ways.bin");
+    let mut bytes = std::fs::read(&path).expect("read interp_ways.bin");
+    assert_eq!(bytes.len(), 46, "two interpolation records");
+    assert_eq!(
+        (bytes[22], bytes[23 + 22]),
+        (0, 1),
+        "near is all, far is even"
+    );
+    bytes[16..20].copy_from_slice(&13u32.to_le_bytes());
+    bytes[22] = 1;
+    std::fs::write(&path, &bytes).expect("rewrite interp_ways.bin");
+
+    let (answer, candidates) = query(&index_dir);
+    assert_eq!(
+        answer,
+        Some(("Far Street".to_owned(), 20)),
+        "the wrong-parity near way must not answer or suppress the coarse fallback"
+    );
+    // A segment listed under several cells can appear more than once.
+    assert!(
+        !candidates.is_empty() && candidates.iter().all(|street| street == "Far Street"),
+        "only the far way is a candidate: {candidates:?}"
+    );
+}
+
+/// `addr:interpolation=alphabetic` (or a numeric step) is not a mode the
+/// reader steps; reading it as `all` would interpolate 10..30 as integers.
+#[test]
+fn an_unsupported_interpolation_mode_does_not_answer() {
+    for mode in ["alphabetic", "2"] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let index_dir = dir.path().join("index");
+        let address = |id: i64, lon: i32, number: &'static str| TestNode {
+            id,
+            lat: 557_000_000,
+            lon,
+            tags: vec![
+                ("addr:housenumber", number),
+                ("addr:street", "Interp Street"),
+            ],
+            meta: None,
+        };
+        write_test_pbf_sorted(
+            &input,
+            &[
+                address(100, 125_000_000, "10"),
+                address(101, 125_060_000, "30"),
+            ],
+            &[TestWay {
+                id: 200,
+                refs: vec![100, 101],
+                tags: vec![
+                    ("addr:interpolation", mode),
+                    ("addr:street", "Interp Street"),
+                ],
+                meta: None,
+            }],
+            &[],
+        );
+        let stats = build_index(
+            &pbfhogg::geocode_index::builder::BuildConfig {
+                input_path: input,
+                coarse_search_radius_m: 1.0,
+                ..Default::default()
+            },
+            &index_dir,
+            false,
+            &crate::common::test_host(),
+        )
+        .expect("build should succeed");
+        assert_eq!(stats.interp_ways, 1, "{mode}: the way is still indexed");
+        let reader =
+            pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+        assert!(
+            reader
+                .query(55.7000, 12.5030)
+                .expect("valid query")
+                .interpolation
+                .is_none(),
+            "{mode}: an unsupported mode must not answer"
+        );
+    }
+}
+
 #[test]
 fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
     let dir = crate::common::test_scratch();
@@ -2582,7 +2726,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
-    write_synthetic_shadowed_interpolation_input(&input);
+    write_synthetic_shadowed_interpolation_input(&input, None);
 
     let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {

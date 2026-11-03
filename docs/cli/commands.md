@@ -1947,6 +1947,17 @@ admin polygon under every cell, at the street, coarse and admin levels, that
 such a line passes through (an index built by pbfhogg 0.5.0 or earlier can
 lack a cell the line only clips near its corner; rebuild to gain them).
 
+An interpolation way (`addr:interpolation` with `addr:street` on the way)
+takes its start and end numbers from the address points on its first and
+last node: an address with the way's street whose coordinate equals the
+node's. No nearby address stands in for a missing one, and the cell levels
+play no part. The way is kept but never answers a query when either end
+has no such address, the addresses at an end carry different house numbers,
+an end's number is not a plain positive integer (`57a`, `18-20` and `0` are
+refused), an `even` or `odd` way's ends do not both have that parity, or
+`addr:interpolation` is anything but `all`, `even` or `odd`. The build
+warns with the count and a sample of way IDs.
+
 #### S2 level bounds
 
 All three cell levels are validated before any input is read, and a violation

@@ -50,8 +50,8 @@ use super::super::format::*;
 /// keeps the source way ID, file offset, count, and endpoint metadata.
 ///
 /// Interpolation endpoints must have positive house numbers. Endpoint matching
-/// rejects parsed zero values; serialized zero marks unresolved ways, so a
-/// real interpolation endpoint at house number 0 is unsupported (see
+/// rejects zero; serialized zero marks unresolved ways, so a real
+/// interpolation endpoint at house number 0 is unsupported (see
 /// CORRECTNESS.md). Fix shape if that is ever needed: persist a separate
 /// `resolved: bool` into [`crate::geocode_index::format::InterpWay`] and bump
 /// `FORMAT_VERSION`.
@@ -59,7 +59,10 @@ pub(super) struct SlimInterpWay {
     pub(super) way_id: i64,
     pub(super) node_file_offset: u64,
     pub(super) street_offset: u32,
-    pub(super) interpolation_type: u8,
+    /// The way's `addr:interpolation` mode; `None` for a value the reader
+    /// cannot step (`alphabetic`, a numeric step, anything but `all`,
+    /// `even` and `odd`), which is never resolved.
+    pub(super) interpolation: Option<InterpolationType>,
     pub(super) node_count: u16,
     pub(super) start_number: u32,
     pub(super) end_number: u32,
@@ -203,7 +206,7 @@ struct PendingStreet {
 struct PendingInterp {
     way_id: i64,
     street: Box<str>,
-    interpolation_type: u8,
+    interpolation: Option<InterpolationType>,
     coords: Vec<(i32, i32)>,
 }
 
@@ -331,10 +334,14 @@ fn classify_way_into(
     // path's `u16::try_from` - worker sets `state.error` on overflow.
     if is_interp {
         if coords.len() >= 2 {
-            let itype = match interp.unwrap_or("") {
-                "even" => InterpolationType::Even as u8,
-                "odd" => InterpolationType::Odd as u8,
-                _ => InterpolationType::All as u8,
+            // Only the modes the reader steps are accepted; reading any other
+            // value as `all` would interpolate an alphabetic or stepped range
+            // as consecutive integers.
+            let interpolation = match interp.unwrap_or("") {
+                "all" => Some(InterpolationType::All),
+                "even" => Some(InterpolationType::Even),
+                "odd" => Some(InterpolationType::Odd),
+                _ => None,
             };
             if u16::try_from(coords.len()).is_err() {
                 state.error = Some(Error::invalid_data(format!(
@@ -348,7 +355,7 @@ fn classify_way_into(
             state.interps.push(PendingInterp {
                 way_id,
                 street: addr_st.unwrap_or("").into(),
-                interpolation_type: itype,
+                interpolation,
                 coords,
             });
         }
@@ -673,7 +680,7 @@ pub(super) fn run_pass2(
                         way_id: pi.way_id,
                         node_file_offset: interp_node_offset,
                         street_offset,
-                        interpolation_type: pi.interpolation_type,
+                        interpolation: pi.interpolation,
                         node_count: nc,
                         // Zero marks endpoints that were not resolved.
                         start_number: 0,

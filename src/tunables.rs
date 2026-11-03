@@ -1138,10 +1138,6 @@ pub(crate) const ADMIN_VERTEX_MULTIPLIER_LEVEL_5: usize = 2;
 /// Admin vertex-budget multiplier for every other level.
 pub(crate) const ADMIN_VERTEX_MULTIPLIER_DEFAULT: usize = 1;
 
-/// Tolerance, in E7 units on each axis, under which an address point counts as
-/// exactly at an interpolation endpoint.
-pub(crate) const INTERP_ENDPOINT_EXACT_TOLERANCE_E7: i64 = 1;
-
 /// Default street-cell S2 level of `BuildConfig`.
 pub(crate) const GEOCODE_DEFAULT_STREET_LEVEL: u8 = 17;
 

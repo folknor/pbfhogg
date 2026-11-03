@@ -221,3 +221,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   reaches, and walking further only for classes that need it; a radius over
   a fixed number of cell widths is refused at build and open. No format
   change.
+- [ADR-0024](0024-interpolation-ends-take-the-address-on-their-node.md) - A
+  geocode interpolation way's end numbers are the addresses on its end
+  nodes (same street, equal coordinate), never a nearby address; an end
+  whose addresses disagree or whose number is not a positive integer, a
+  wrong-parity `even`/`odd` range and an unsupported mode leave the way
+  unresolved. No cell level or distance takes part. No format change.

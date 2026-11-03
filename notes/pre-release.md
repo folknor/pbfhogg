@@ -24,8 +24,8 @@ real data and its writer fixed. Multi-region extract admits its descriptors.
 The planet regressions found by the RAM pass below are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
-(apply-changes). The release itself still needs WRK-001, WRK-003 to WRK-005 and the
-maintainer's ruling in WRK-146.
+(apply-changes). The release itself still needs WRK-001 and WRK-003 to
+WRK-005.
 
 ---
 
@@ -83,46 +83,6 @@ actually gives, not an assumption:
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
   should give `check-index = "violations"`. Confirm each with one run first;
   brokkr#71 notes `--unsort` breaks ID order only on large enough inputs.
-
-### WRK-146: Maintainer ruling on ADR-0005 and release-mode invariant panics
-
-A decision for the maintainer before 0.6.0.
-`decisions/0005-latent-invariant-debug-asserts.md` (Accepted) makes
-`debug_assert!` plus a comment the default disposition for a latent
-internal invariant and rejects runtime enforcement for its per-blob cost.
-The maintainer's standing line in this file ("What the maintainer has made
-clear") is the opposite: for a broken internal invariant, a release-mode
-panic over a `debug_assert!`. The ADR is the durable record a reader will
-trust, and nothing amends or supersedes it. Rule on how the two reconcile
-(for example: release-mode checks wherever the check is off the
-per-element path, `debug_assert!` only where it would cost per element);
-an amended or superseding ADR follows.
-
-The 2026-11-03 audit of every site (and the input-reachable findings it
-filed) found almost no release cost: the only per-element checks were the
-parallel-array iterator ends and apply-changes' raw-rewrite string checks,
-which turned out to be input checks living only in debug builds. Those are
-now release refusals, at noise cost on a planet A/B once each copied array
-is walked once (reference/performance.md, "apply-changes checks the string
-indices it copies").
-Proposed rule for the superseding ADR: release `assert!` by default for an
-internal invariant; `debug_assert!` only where a planet A/B shows the check
-costs more than noise; anything input-reachable is an `Err` (ADR-0004);
-prefer a structural fix where a type can carry the invariant.
-The remaining audited sites have since been worked under spar, with
-ADR-0005 set aside as instructed: no `debug_assert!` is left in production
-code. Iterator ends panic through one cold helper (planet tags-filter
-neutral, reference/performance.md "Parallel-array iterator ends are
-checked in release"); Result-returning sites refuse with
-`Error::internal`; infallible ones release-assert (never in `Drop`);
-several became structural (budget charges, decode schedule, getid filter
-enum, const-generic field tags, a leaf-error whitelist, bounded zlib
-slices, safe aligned-buffer slices); tautologies were dropped. The
-commit message records each disposition. The rule as practised there:
-an internal failure propagates as `Error::internal` where the function
-returns `Result` and the failure prevents successful finalization with no
-reusable corrupted state left, and panics otherwise. The maintainer rules
-on the ADR from that.
 
 ---
 
@@ -411,30 +371,6 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-151: the read pipeline's scratch counters cannot say what the pool retains
-
-`pipeline_scratch_st_capacity_peak_bytes` / `_gr_` are a maximum over all
-decode workers of one worker's `ST_SCRATCH` / `GR_SCRATCH` capacity
-(`src/read/pipeline.rs`, `record_scratch_capacity` in
-`pipeline_metrics.rs`), so they bound one worker, not the pool. At planet
-(bygg, 82be10a4, uuid 4738d079) the max is 2 MiB, so the decode pool's
-total is anywhere up to 30 x 2 MiB against a peak anon near 295 MiB, and
-no stored number says where. To answer it: sum each worker's peak within
-a read (the scratch never shrinks, so that is what the pool holds just
-before it is joined) and take the maximum across reads if one scalar per
-invocation is wanted; adding successive reads would count pools already
-destroyed. The sum is accounting capacity, not removable peak anon: it can
-accumulate after the process peak, and projection-only readers need the
-scratch regardless, so it is an upper bound on the opportunity. Only if it
-is material against the read's peak, consider building a block's offset
-tables straight into its payload tail (count the entries, reserve payload
-plus tables once, scan into the split tail; borrowed `validate_in_place`
-and projections keep their own scratch), which removes the scratch that
-`WireBlock::inline_tables` copies from, at the cost of a count pass on
-every block, so it needs its own matched planet A/B. Releasing this
-scratch at `MAX_RETAINED_SCRATCH_CAPACITY` was considered and declined;
-the reasoning is at the thread-locals.
-
 ### WRK-037: ParallelGzipWriter window size
 
 At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB
@@ -500,33 +436,17 @@ lat/lon-linear segment the sampler walks and `geo.rs` measures distance
 against, so the replacement needs one geometry contract for both sides
 before it is conservative.
 
-### WRK-167: altw external stage 3 memory grows with the slot bucket width
-
-Found 2026-11-03 while bounding the slot bucket width against u32. The
-slot bucket count is fixed at 256 for any input past a few blobs, so each
-bucket is about refs / 256 slots wide, and every stage 3 worker holds one
-bucket's scatter buffer (8 bytes per slot) and its whole bucket file (12
-bytes per resolved record) at once: at planet (48.6M slots per bucket,
-`4cd2eddf` counters) about 0.4 GB plus up to 0.6 GB per worker. The
-backend's "bounded memory" is therefore linear in total refs, not
-bounded; at the 2^32 per-bucket encoding cap it is about 80 GB per worker.
-Scaling the slot bucket count with the total would bound both the memory
-and lift the 2^40 ref limit, but the count must stay at or below
-total / max_blob_slots (the two-piece straddler floor) and must keep stage
-2's per-bucket buffers and slot-bucket file count in budget. Not needed
-for any real input today; worth deciding before the backend is sold as
-bounded-memory at any scale.
-
-### WRK-165: tagdata written before 0.6.0 can omit an empty tag key
+### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 
 Found 2026-11-03 running `check --index` over the planet bench file
 (`planet-20260223-with-indexdata`, written by an older pbfhogg): every one
 of its 50,816 blobs carries tagdata, all well-formed, and exactly one
 (blob 32633, offset 61377444639) fails: "tagdata omits 1 key(s) the blob
 carries (e.g. "")". The builder used to drop an explicit empty tag key
-from tagdata; `dd37f62e` (2026-10-22, in 0.6.0) keeps it, and the
-CHANGELOG has no entry for that fix. Consequence: on files pbfhogg wrote
-before 0.6.0, a `tags-filter` expression naming the empty key can skip a
+from tagdata; `dd37f62e` (2026-10-22, after v0.5.0, unreleased) keeps it,
+and the CHANGELOG has no entry for that fix. Consequence: on files written
+by pbfhogg v0.5.0 or earlier, a `tags-filter` expression naming the empty
+key can skip a
 blob holding a match, silently. Decide whether 0.6.0's notes (or the
 indexdata guide) should say so and point at `check --index` and
 `cat --reindex` / `sort --distrust-metadata` as the repair, and whether
@@ -897,8 +817,8 @@ What a session picking this up needs that is not written elsewhere:
   on that ground). Such findings end as comments plus a reference-doc
   correction.
 - **A silent wrong answer is worse than a refusal.** An empty user or role,
-  a default metadata block, fewer nodes: refuse instead. For a broken
-  internal invariant, a release-mode panic over a `debug_assert!`.
+  a default metadata block, fewer nodes: refuse instead. A broken
+  internal invariant fails in release builds (ADR-0021).
 - **Follow protobuf's specified decoding where it costs nothing**, with
   osmium as the parity reference. Deviations are deliberate and recorded in
   DEVIATIONS.md.

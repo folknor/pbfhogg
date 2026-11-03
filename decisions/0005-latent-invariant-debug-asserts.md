@@ -1,7 +1,7 @@
 # ADR-0005: Cheap insurance for latent-only invariants
 
 Date: 2026-04-24
-Status: Accepted
+Status: Superseded by 0021
 
 ## Decision
 

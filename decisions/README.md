@@ -114,8 +114,9 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 ## Index
 
 - [ADR-0002](0002-negative-ids-rejected-project-wide.md) - Negative
-  input IDs rejected project-wide; hard reject in renumber and
-  getid, `debug_assert` in diff / derive shard planners, silent
+  input IDs rejected project-wide; hard reject in renumber, getid,
+  external altw, `check --locations` and `check --refs`, canonical
+  `id_order` windowing in the diff / derive work-unit planner, silent
   inheritance through `IdSet` for tags-filter / altw-external.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
   hygiene: `PathGuard` for run-owned paths, plus a counters-after-write
@@ -128,7 +129,7 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 - [ADR-0005](0005-latent-invariant-debug-asserts.md) - Cheap
   insurance for latent-only invariants: triage rule of
   `debug_assert` + comment / doc-only / drop-from-triage, no
-  blanket sweep.
+  blanket sweep. Superseded by ADR-0021.
 - [ADR-0006](0006-blob-count-threshold-dispatch.md) - `getid` and
   `getparents` dispatch on estimated OSMData blob count (bounded
   header probe): `HeaderWalker` below 150,000 blobs, full scan at or
@@ -198,3 +199,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   and once sealed admits nothing. Finalization runs no caller code: the
   snapshot, then the owned call sink's sealing emissions and terminal
   record, then Sealed.
+- [ADR-0021](0021-broken-internal-invariants-fail-in-release.md) - A
+  broken internal invariant fails in release builds: make the type carry
+  it, else `Error::internal` where the function returns `Result`, else a
+  release panic (never in `Drop`), else drop a tautology with a comment.
+  Input-reachable means an ADR-0004 refusal; `debug_assert!` only where a
+  planet A/B measures real cost. Supersedes ADR-0005.

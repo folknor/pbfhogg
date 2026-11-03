@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
@@ -256,39 +256,87 @@ thread_local! {
     // caller's setting, or a host with more than decode_ahead + 2 CPUs).
     // That is the cheap partial step if a bound on such input is wanted;
     // a whole-read memory budget would be the stronger control.
+    //
+    // What the whole pool holds is `pipeline_scratch_pool_capacity_peak_bytes`
+    // (the per-worker maxima above bound one worker only). Planet
+    // `inspect --extended` (bygg, 30 decode workers, on 26db96fe plus that
+    // counter) measured 31.6 MiB of capacity against a 277 MiB peak anon.
+    // Building a block's offset tables straight into its payload tail (a
+    // count pass per block, or resumable scanning into a growing payload)
+    // would remove this list only where the block is built: projections
+    // and `validate_in_place` read the tables from scratch, and so does
+    // that measured run, so it would remove none of those 31.6 MiB there.
+    // On the block-building paths (plain pipelined reads, geocode pass 1,
+    // time-filter, the fused altw and tags-filter transforms, getid's
+    // accepted projections) it would stop a large table staying on every
+    // worker that met one, but no peak there is set by this scratch, and it
+    // would cost a count pass or extra payload growth on every block plus a
+    // validator that reads the tables from two representations. Declined
+    // on that evidence, not as impossible: a workload whose peak is this
+    // scratch would reopen it.
     static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
     static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A data blob's decode, as the engine runs it on a decode worker: the
 /// decompression buffer from the run's pool, the worker's scratch (its
-/// retained capacity recorded for the invocation's peak) and the run's
-/// kind-claim refusal, whichever form the transform asks for.
+/// growth recorded for the invocation's peaks) and the run's kind-claim
+/// refusal, whichever form the transform asks for.
 pub(crate) struct Decoder<'a> {
     blob: &'a crate::blob::Blob,
     pool: &'a Arc<DecompressPool>,
     /// Refuse a decoded block that contradicts its blob's kind claim.
     refuse_kinds: bool,
     metrics: &'a PipelineMetrics,
+    /// The read's running sum of its decode workers' scratch capacity.
+    scratch_pool: &'a AtomicU64,
+}
+
+/// Byte capacity of a scratch list of `(u32, u32)` pairs.
+fn scratch_bytes(list: &Vec<(u32, u32)>) -> usize {
+    list.capacity().saturating_mul(size_of::<(u32, u32)>())
+}
+
+/// Records a worker's scratch growth over one blob when dropped, so growth
+/// made before a transform panics (which the task's `catch_unwind` turns
+/// into an error) is counted like any other: the lists keep that capacity
+/// for the rest of the read.
+struct ScratchGrowth<'s> {
+    st: &'s mut Vec<(u32, u32)>,
+    gr: &'s mut Vec<(u32, u32)>,
+    before: (usize, usize),
+    metrics: &'s PipelineMetrics,
+    scratch_pool: &'s AtomicU64,
+}
+
+impl Drop for ScratchGrowth<'_> {
+    fn drop(&mut self) {
+        let after = (scratch_bytes(self.st), scratch_bytes(self.gr));
+        if after != self.before {
+            self.metrics
+                .record_scratch_growth(self.scratch_pool, self.before, after);
+        }
+    }
 }
 
 impl Decoder<'_> {
-    /// Run `f` on the worker's two scratch lists, recording their retained
-    /// capacity.
+    /// Run `f` on the worker's two scratch lists, recording what they grew
+    /// by.
     fn with_scratch<R>(
         &self,
         f: impl FnOnce(&mut Vec<(u32, u32)>, &mut Vec<(u32, u32)>) -> R,
     ) -> R {
         ST_SCRATCH.with_borrow_mut(|st| {
             GR_SCRATCH.with_borrow_mut(|gr| {
-                let out = f(st, gr);
-                // Record the worker's retained capacity, (u32, u32) pairs
-                // x 8 bytes, for the invocation's peak.
-                self.metrics.record_scratch_capacity(
-                    st.capacity().saturating_mul(8),
-                    gr.capacity().saturating_mul(8),
-                );
-                out
+                let before = (scratch_bytes(st), scratch_bytes(gr));
+                let growth = ScratchGrowth {
+                    st,
+                    gr,
+                    before,
+                    metrics: self.metrics,
+                    scratch_pool: self.scratch_pool,
+                };
+                f(&mut *growth.st, &mut *growth.gr)
             })
         })
     }
@@ -430,6 +478,8 @@ struct DecodeTask<'scope, X: DecodeTransform> {
     source: Option<&'scope Arc<Path>>,
     /// The invocation's pipeline counters, borrowed like `source`.
     metrics: &'scope PipelineMetrics,
+    /// The read's running scratch sum, borrowed like `source`.
+    scratch_pool: &'scope AtomicU64,
     /// The run's fault plan (the decode gate), borrowed like `source`.
     #[cfg(feature = "test-hooks")]
     faults: &'scope crate::test_hooks::FaultPlan,
@@ -451,6 +501,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         transform,
         source,
         metrics,
+        scratch_pool,
         #[cfg(feature = "test-hooks")]
         faults,
     } = task;
@@ -473,6 +524,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
                 pool: &buffer_pool,
                 refuse_kinds,
                 metrics,
+                scratch_pool,
             };
             transform.apply(&blob, decode)
         }));
@@ -649,6 +701,10 @@ where
     let (decoded_tx, decoded_rx) =
         sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
 
+    // This read's decode workers' scratch capacity, summed as it grows
+    // (`PipelineMetrics::record_scratch_growth`); per read, because each
+    // read has its own decode pool.
+    let scratch_pool = &AtomicU64::new(0);
     // Declared before the scope so it drops after the scope has joined.
     let _emit = EmitOnDrop(metrics, invocation);
     let result = std::thread::scope(|scope| {
@@ -767,6 +823,7 @@ where
                                     transform,
                                     source,
                                     metrics,
+                                    scratch_pool,
                                     #[cfg(feature = "test-hooks")]
                                     faults,
                                 },
@@ -1148,6 +1205,58 @@ mod tests {
             finished_at_return,
             state.installed.load(Ordering::SeqCst),
             "every decode worker's teardown ends before the read returns"
+        );
+    }
+
+    /// The pool peak is the largest single read's sum over its workers,
+    /// never a sum across reads, and the per-worker maxima stay one
+    /// worker's.
+    #[test]
+    fn scratch_pool_peak_is_the_largest_reads_worker_sum() {
+        let metrics = PipelineMetrics::new();
+        let first = AtomicU64::new(0);
+        metrics.record_scratch_growth(&first, (0, 0), (64, 8));
+        metrics.record_scratch_growth(&first, (0, 0), (32, 8));
+        metrics.record_scratch_growth(&first, (32, 8), (128, 8));
+        let second = AtomicU64::new(0);
+        metrics.record_scratch_growth(&second, (0, 0), (100, 0));
+        let peak = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!(
+            peak(&metrics.scratch_pool_capacity_peak_bytes),
+            64 + 8 + 128 + 8
+        );
+        assert_eq!(peak(&metrics.scratch_st_capacity_peak_bytes), 128);
+        assert_eq!(peak(&metrics.scratch_gr_capacity_peak_bytes), 8);
+    }
+
+    /// Growth made before a transform panics is still counted: the worker
+    /// keeps that capacity for the rest of the read.
+    #[test]
+    fn scratch_growth_before_a_panic_is_counted() {
+        let metrics = PipelineMetrics::new();
+        let pool = AtomicU64::new(0);
+        let mut st = Vec::new();
+        let mut gr = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let growth = ScratchGrowth {
+                st: &mut st,
+                gr: &mut gr,
+                before: (0, 0),
+                metrics: &metrics,
+                scratch_pool: &pool,
+            };
+            growth.st.reserve_exact(16);
+            panic!("transform failed after growing the scratch");
+        }));
+        assert!(outcome.is_err());
+        let bytes = st.capacity() * size_of::<(u32, u32)>();
+        assert!(bytes >= 128);
+        assert_eq!(pool.load(Ordering::Relaxed), bytes as u64);
+        assert_eq!(
+            metrics
+                .scratch_pool_capacity_peak_bytes
+                .load(Ordering::Relaxed),
+            bytes as u64
         );
     }
 

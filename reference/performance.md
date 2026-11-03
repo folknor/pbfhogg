@@ -3396,6 +3396,32 @@ retention of it, neither measured. It was not built. time-filter's
 snapshot path builds a block per blob on the ordered pool, so it
 appends like cat `--clean`; it was not measured separately.
 
+## What the read pipeline's decode scratch holds (bygg, 2026-11-03, on `26db96fe`)
+
+The pipelined reader's decode workers each keep a string-table and a
+group-range scratch list for the whole read. Planet
+`planet-20260223-with-indexdata`, `inspect --extended --bench 1`, one
+unstored `--force` cell on `26db96fe` plus the
+`pipeline_scratch_pool_capacity_peak_bytes` counter (30 decode workers,
+25.2 average cores):
+
+| Counter or measure | Value |
+|---|---:|
+| `pipeline_scratch_pool_capacity_peak_bytes` (one read's workers summed) | 33,088,768 B (31.6 MiB) |
+| `pipeline_scratch_st_capacity_peak_bytes` (one worker) | 2,097,152 B |
+| `pipeline_scratch_gr_capacity_peak_bytes` (one worker) | 4,096 B |
+| Peak anon | 283,696 kB (277 MiB) |
+| Wall | 27.09 s |
+
+The pool sum is allocated capacity, 11 % of the read's peak anon at most
+(an upper bound on what is resident). This run's scan is a projection,
+which reads the tables from scratch, so building the tables straight into
+the payload tail would remove none of it; the reasoning for not building
+that is at the thread-locals in `src/read/pipeline.rs`. The wall is in
+line with the stored 26.80 s cell `5b8e6c29` (`179f1b7e`, not a matched
+pair); the counters record only when a list grows, a few dozen times per
+worker at most, instead of on every blob.
+
 ## Payloads validated where they lie (bygg, 2026-11-02, against `7feb4370`)
 
 `check --locations` validated every blob by copying the worker's

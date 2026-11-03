@@ -118,9 +118,10 @@ rejected project-wide"`.
   asked for it. Reverse the decision if a real ask surfaces.
 - **(c)** *[chosen]* - matches the existing `IdSet` design, ratifies
   what commit `ab01438` already established for renumber, and covers
-  the latent shard-planner sites at zero runtime cost. The
-  `debug_assert` catches misuse in tests; release builds trust the
-  upstream chain.
+  the latent shard-planner sites at zero runtime cost. (The shard
+  planner's `debug_assert` this originally leaned on is gone: the
+  work-unit planner orders negative IDs correctly, per the 2026-10-31
+  amendment, and ADR-0021 now rules out debug-only invariant checks.)
 
 If a real ask for JOSM staging-file interop surfaces, reopen this
 ADR as `Superseded by NNNN` and migrate to alternative (b).

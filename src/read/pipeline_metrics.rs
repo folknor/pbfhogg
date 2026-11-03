@@ -68,11 +68,20 @@ crate::counters::counter_set! {
         /// Maximum retained capacity (bytes) of the per-decode-thread
         /// `ST_SCRATCH` Vec (string-table entries in `scan_block_fields`):
         /// the largest any one decode thread has retained, not a sum across
-        /// threads (see [`PipelineMetrics::record_scratch_capacity`]).
+        /// threads (that is `scratch_pool_capacity_peak_bytes`).
         pub scratch_st_capacity_peak_bytes => "pipeline_scratch_st_capacity_peak_bytes",
         /// Maximum retained capacity (bytes) of the per-decode-thread
         /// `GR_SCRATCH` Vec (group-range kv pairs).
         pub scratch_gr_capacity_peak_bytes => "pipeline_scratch_gr_capacity_peak_bytes",
+        /// What one read's decode pool retains in scratch: the sum over
+        /// that read's decode workers of both lists' capacity (bytes), the
+        /// maximum over the invocation's pipelined reads. The scratch never
+        /// shrinks during a read, so the sum is what the pool holds just
+        /// before it is joined. It is the largest single read's pool, not
+        /// what overlapping reads of one invocation hold together, and it is
+        /// allocated capacity, not resident memory: pages past the most
+        /// entries a list has held need not be touched.
+        pub scratch_pool_capacity_peak_bytes => "pipeline_scratch_pool_capacity_peak_bytes",
         /// Number of decode tasks dispatched (one per OsmData blob).
         pub decode_tasks => "pipeline_decode_tasks",
         /// Number of blobs skipped pre-decompression by the index/tag filter
@@ -90,19 +99,33 @@ impl PipelineMetrics {
         record_max(&self.reorder_window_high_water, window as u64);
     }
 
-    /// Maximum for the named scratch field. Each decode worker calls this
-    /// at the end of every blob with its thread-local Vec's current
-    /// capacity; the global max ends up reflecting the thread that touched
-    /// the largest blob.
-    ///
-    /// This is one worker's worst case, not what the pool retains in
-    /// total: the scratch never shrinks during a read, so each worker
-    /// keeps its own largest capacity until the pool is joined, and the
-    /// pool's total is the sum of those per-worker peaks, which this
-    /// maximum does not give.
-    pub fn record_scratch_capacity(&self, st_bytes: usize, gr_bytes: usize) {
-        record_max(&self.scratch_st_capacity_peak_bytes, st_bytes as u64);
-        record_max(&self.scratch_gr_capacity_peak_bytes, gr_bytes as u64);
+    /// Record a decode worker's scratch growth over one blob: its two
+    /// lists' capacities in bytes `before` and `after` the blob, as
+    /// `(string table, groups)`. Called only when a capacity changed, so a
+    /// blob that grows nothing costs no atomic operation. The per-worker
+    /// maxima take `after`; `read_pool` is the read's own running sum of
+    /// its workers' capacities, which this moves by the change and whose
+    /// new total raises the invocation's pool peak. Each read's workers
+    /// start empty, so the largest total is the read's final pool sum, and
+    /// a maximum (not a sum) across reads never counts a pool already
+    /// joined.
+    pub fn record_scratch_growth(
+        &self,
+        read_pool: &AtomicU64,
+        before: (usize, usize),
+        after: (usize, usize),
+    ) {
+        record_max(&self.scratch_st_capacity_peak_bytes, after.0 as u64);
+        record_max(&self.scratch_gr_capacity_peak_bytes, after.1 as u64);
+        // The scratch never shrinks during a read, so the delta is a growth.
+        // Wrapping arithmetic would keep the running balance right if a
+        // capacity ever fell (the delta a two's-complement negative), but a
+        // list that grew and shrank within one blob would then peak unseen.
+        let before = (before.0 as u64).wrapping_add(before.1 as u64);
+        let after = (after.0 as u64).wrapping_add(after.1 as u64);
+        let delta = after.wrapping_sub(before);
+        let total = read_pool.fetch_add(delta, Relaxed).wrapping_add(delta);
+        record_max(&self.scratch_pool_capacity_peak_bytes, total);
     }
 
     /// Emit the invocation totals so far (see the module docs), after every

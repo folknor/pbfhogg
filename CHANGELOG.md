@@ -272,6 +272,16 @@ state.
 
 ### Changed
 
+- `getid --add-referenced` follows relation members as `osmium getid -r`
+  does: the members of requested relations, recursively through relations
+  in relations, then the nodes of every way requested or pulled in. It used
+  to add only the nodes of requested ways. `--remove-tags` now strips every
+  pulled-in object, ways and relations included, that was not itself
+  requested, and `-v` still reports requested IDs only. A query naming no
+  relation reads the file as before; one naming relations adds a read of
+  the relation blobs (about 0.3 s at planet), plus a second one only when a
+  relation in a relation is reached. Library: `getid::AddReferenced` and
+  `GetidStats::found` follow the same rules.
 - `apply-changes` is faster and holds less memory. On a planet daily diff
   (OSC 4913) on bygg it takes about 92 s at about 1.9 GB peak anon with
   `--compression zstd:1`, and with `--locations-on-ways` on a planet with

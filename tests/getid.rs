@@ -1148,6 +1148,181 @@ fn getid_remove_tags_strips_referenced_nodes() {
     );
 }
 
+/// Nodes 1..=9, ways 10 (nodes 1, 2), 11 (3, 4) and 12 (7, 8), and
+/// relations: 100 holds n5, w10 and r101; 101 holds w11, r102 and the
+/// absent r999; 102 holds n6 and r100 (a cycle back); 103 holds n7 and
+/// 104 holds r100 (a parent of 100, which following members never reaches).
+/// Every object is tagged, so stripping shows. Several blobs per kind, so
+/// the reference phases merge across blobs.
+fn write_relation_closure_fixture(path: &std::path::Path) {
+    use crate::common::TestMember;
+    use pbfhogg::MemberId;
+    let tags = || vec![("name", "x")];
+    let nodes: Vec<TestNode> = (1..=9)
+        .map(|id| TestNode {
+            id,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: tags(),
+            meta: None,
+        })
+        .collect();
+    let way = |id, refs: Vec<i64>| TestWay {
+        id,
+        refs,
+        tags: tags(),
+        meta: None,
+    };
+    let member = |id| TestMember { id, role: "r" };
+    let relation = |id, members: Vec<MemberId>| TestRelation {
+        id,
+        members: members.into_iter().map(member).collect(),
+        tags: tags(),
+        meta: None,
+    };
+    crate::common::write_test_pbf_impl(
+        path,
+        &nodes,
+        &[
+            way(10, vec![1, 2]),
+            way(11, vec![3, 4]),
+            way(12, vec![7, 8]),
+        ],
+        &[
+            relation(
+                100,
+                vec![
+                    MemberId::Node(5),
+                    MemberId::Way(10),
+                    MemberId::Relation(101),
+                ],
+            ),
+            relation(
+                101,
+                vec![
+                    MemberId::Way(11),
+                    MemberId::Relation(102),
+                    MemberId::Relation(999),
+                ],
+            ),
+            relation(102, vec![MemberId::Node(6), MemberId::Relation(100)]),
+            relation(103, vec![MemberId::Node(7)]),
+            relation(104, vec![MemberId::Relation(100)]),
+        ],
+        true,
+        Some(2),
+    );
+}
+
+/// What a getid run wrote, by kind, each element with whether it kept tags.
+fn written(path: &std::path::Path) -> Vec<(char, i64, bool)> {
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                out.push(match element {
+                    Element::DenseNode(dn) => ('n', dn.id(), dn.tags().next().is_some()),
+                    Element::Node(n) => ('n', n.id(), n.tags().next().is_some()),
+                    Element::Way(w) => ('w', w.id(), w.tags().next().is_some()),
+                    Element::Relation(r) => ('r', r.id(), r.tags().next().is_some()),
+                    _ => panic!("an element kind this test does not know"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `--add-referenced` follows relation members as osmium's `getid -r`
+/// does: the relation members of a requested relation transitively,
+/// through a cycle and past a member the file lacks, then the node and
+/// way members of every relation reached, then the nodes of every way
+/// requested or pulled in. Nothing that merely references a requested
+/// object (r104), and nothing unreferenced (w12, r103, n7, n8, n9), comes
+/// along. Requesting a relation the closure also reaches changes nothing.
+#[test]
+fn getid_add_referenced_follows_relation_members() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_relation_closure_fixture(&input);
+    let expected: Vec<(char, i64, bool)> = [
+        ('n', 1),
+        ('n', 2),
+        ('n', 3),
+        ('n', 4),
+        ('n', 5),
+        ('n', 6),
+        ('w', 10),
+        ('w', 11),
+        ('r', 100),
+        ('r', 101),
+        ('r', 102),
+    ]
+    .into_iter()
+    .map(|(kind, id)| (kind, id, true))
+    .collect();
+    for specs in [&["r100"][..], &["r100", "r102"][..], &["r100", "w10"][..]] {
+        let output = dir.path().join(format!("{}.osm.pbf", specs.join("-")));
+        run_getid(&input, &output, specs, &add_ref_opts()).expect("getid");
+        assert_eq!(written(&output), expected, "{specs:?}");
+    }
+
+    // A relation with no relation members takes only the first relation
+    // read: its node member and nothing else.
+    let output = dir.path().join("r103.osm.pbf");
+    run_getid(&input, &output, &["r103"], &add_ref_opts()).expect("getid");
+    assert_eq!(written(&output), vec![('n', 7, true), ('r', 103, true)]);
+}
+
+/// `--remove-tags` strips every pulled-in object, of any kind, as osmium's
+/// `-t` does, and only those: a requested object keeps its tags even where
+/// the closure also reaches it (w11 here). The found set holds requested
+/// IDs only, of every kind, so pulled-in ways and relations do not hide a
+/// miss.
+#[test]
+fn getid_remove_tags_strips_every_pulled_in_kind() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_relation_closure_fixture(&input);
+    let id_set = parse_ids(&ids(&["r100", "w11", "n3", "r998"])).expect("parse ids");
+    let opts = GetidOptions {
+        add_referenced: Some(AddReferenced { remove_tags: true }),
+        report_found: true,
+    };
+    let stats = getid(
+        &input,
+        crate::common::out(&output),
+        &id_set,
+        &opts,
+        &WriteOptions::default(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("getid");
+    assert_eq!(
+        written(&output),
+        vec![
+            ('n', 1, false),
+            ('n', 2, false),
+            ('n', 3, true),
+            ('n', 4, false),
+            ('n', 5, false),
+            ('n', 6, false),
+            ('w', 10, false),
+            ('w', 11, true),
+            ('r', 100, true),
+            ('r', 101, false),
+            ('r', 102, false),
+        ]
+    );
+    let found = stats.found.expect("report_found was set");
+    assert_eq!(found.node_ids.iter().collect::<Vec<_>>(), vec![3]);
+    assert_eq!(found.way_ids.iter().collect::<Vec<_>>(), vec![11]);
+    assert_eq!(found.relation_ids.iter().collect::<Vec<_>>(), vec![100]);
+}
+
 // ---------------------------------------------------------------------------
 // Multi-blob raw passthrough for `removeid` (the --invert path)
 // ---------------------------------------------------------------------------
@@ -1381,6 +1556,26 @@ fn getid_add_referenced_pass1_refuses_a_node_blob_claiming_ways() {
     assert!(!output.exists(), "nothing is published on a refusal");
 }
 
+/// `--add-referenced`'s relation read schedules relation blobs on the
+/// claim: a way blob claiming relations is decoded there and refused,
+/// rather than read as a relation blob holding no relations.
+#[test]
+fn getid_add_referenced_relation_phase_refuses_a_way_blob_claiming_relations() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claim(dir.path(), WAY_BLOB, 2);
+    let output = dir.path().join("out.osm.pbf");
+    let err = run_getid(&input, &output, &["r30"], &add_ref_opts())
+        .expect_err("a lying claim must be refused");
+    assert_contradiction(
+        &err,
+        pbfhogg::ElementKind::Relation,
+        pbfhogg::ElementKind::Way,
+        WAY_BLOB,
+        "add-referenced relation phase",
+    );
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
 /// Invert mode (`removeid`): the way blob claiming nodes is decoded when a
 /// removed node ID falls in its claimed range, and would be re-encoded
 /// without regard to the way enrichment the output header carries. It is
@@ -1421,6 +1616,7 @@ fn getid_honest_claims_are_not_refused() {
         ("include", &["n10", "w10"][..], default_opts()),
         ("add-referenced", &["n10", "w10"][..], add_ref_opts()),
         ("add-referenced-pass1", &["w10"][..], add_ref_opts()),
+        ("add-referenced-relations", &["r30"][..], add_ref_opts()),
     ] {
         let output = dir.path().join(format!("{name}.osm.pbf"));
         run_getid(&input, &output, specs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));

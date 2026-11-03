@@ -277,16 +277,22 @@ ledger does not bound pages glibc retains. apply-changes now bounds outstanding 
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-116: getid --add-referenced follows way refs only
+### WRK-169: A large free between phases leaves later phases arena-resident
 
-`getid --add-referenced` pulls in the nodes of requested ways and nothing
-else. osmium's `--add-referenced` also follows relation members (relations
-in relations, then the nodes and ways of those relations) before the way
-pass (`research/osmium-tool/src/command_getid.cpp`,
-`find_referenced_objects`). docs/cli/commands.md describes pbfhogg's
-narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
-relation closure (a relation pass on the projection pools, then the way
-pass over the closed set) or record the deviation.
+Found landing getid's relation closure (reference/performance.md, "getid
+--add-referenced follows relation members"): freeing a 17-33 MB `Vec`
+between two pread pools raised glibc's dynamic mmap threshold, so every
+later decompress buffer came from the malloc arenas and stayed resident
+once freed, +170-190 MB peak anon at planet with nothing live
+(`mallinfo2`: 541 MB arena, 0.2 MB in use). getid now keeps that store in
+its own anonymous mapping. The mechanism is not getid's: any multi-phase
+command that frees a large `Vec` (or retained decode buffers) between
+phases pays it, and the phase order decides by how much. Candidates by
+shape: `check --refs` (node, way, relation phases), tags-filter's closure
+and way-dependency phases, extract's passes. Survey with the
+`emit_mallinfo2` counters at phase boundaries (check --refs already emits
+them) before deciding between per-site mappings and a shared remedy; the
+library cannot tune the allocator itself (ADR-0016), the CLI could.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 
@@ -376,15 +382,6 @@ admission and progress, never a host's RSS.
 At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB
 of raw payload. Bounded, but not small; matters if anything reuses its
 sizing.
-
-### WRK-042: Per-blob summaries written by the producer
-
-A versioned per-blob extension carrying measured counts, ID boundaries,
-timestamp range, bbox and metadata coverage would let a repeated inspect
-skip decompression. Stored summaries are claims, so this is a second
-product ("a description from claims") beside the measurement; partial
-coverage could be filled by scanning only the blobs without one. Needs a
-design document first.
 
 ---
 

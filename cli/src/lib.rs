@@ -1849,7 +1849,7 @@ enum Command {
         /// Invert selection: remove listed IDs instead of keeping them
         #[arg(long)]
         invert: bool,
-        /// Include referenced nodes of matching ways (two-pass)
+        /// Include referenced objects: relation members (recursively) and way nodes
         #[arg(short = 'r', long = "add-referenced", conflicts_with = "invert")]
         add_referenced: bool,
         /// Remove tags from referenced objects not explicitly requested (requires -r)

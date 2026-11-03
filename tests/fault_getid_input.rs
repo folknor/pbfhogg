@@ -16,9 +16,11 @@
 //!   only; an unindexed one always takes the walker) and the walker. The
 //!   streaming full-scan arm needs an estimate no fixture reaches through
 //!   the public entry; a unit test in `src/commands/getid` covers it.
-//! - `add_referenced`: the probe, pass 1's schedule walk (only with a way
-//!   ID requested; its descriptor serves the classify pool) and pass 2's
-//!   reader.
+//! - `add_referenced`: the probe, pass 1's one schedule walk (only with a
+//!   way or relation ID requested; its descriptor serves every reference
+//!   phase, so the relation reads, the second of which runs only when a
+//!   relation in a relation is reached, open nothing of their own) and
+//!   pass 2's reader.
 //! - removeid: the probe and the walker.
 
 use std::path::{Path, PathBuf};
@@ -28,9 +30,11 @@ use pbfhogg::getid::{GetidOptions, GetidStats, getid, parse_ids, removeid};
 use pbfhogg::read::input::{InputSource, PinnedInput};
 use pbfhogg::write::WriteOptions;
 
+use pbfhogg::MemberId;
+
 use crate::common::{
-    TestWay, generate_nodes, generate_ways, snapshot_dir, write_multi_block_non_indexed_pbf,
-    write_multi_block_test_pbf, write_test_pbf_impl,
+    TestMember, TestRelation, TestWay, generate_nodes, generate_ways, snapshot_dir,
+    write_multi_block_non_indexed_pbf, write_multi_block_test_pbf, write_test_pbf_impl,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,9 +47,12 @@ enum Mode {
 #[derive(Clone, Copy, Debug)]
 struct Route {
     mode: Mode,
-    /// Whether a way ID is requested (with `add_referenced`, whether pass 1
-    /// runs).
+    /// Whether a way ID is requested.
     ways: bool,
+    /// Whether a relation ID is requested: one holding a way and a relation
+    /// that holds a node and a way, so with `add_referenced` both relation
+    /// reads and the way phase run. With `ways`, whether pass 1 runs.
+    relations: bool,
     /// The input carries no indexdata and the run is forced.
     unindexed: bool,
     direct: bool,
@@ -55,6 +62,7 @@ impl Route {
     const INCLUDE: Self = Self {
         mode: Mode::Include,
         ways: true,
+        relations: false,
         unindexed: false,
         direct: false,
     };
@@ -72,7 +80,7 @@ impl Route {
     fn opens(self) -> u64 {
         match self.mode {
             Mode::Include => 2 + u64::from(!self.unindexed),
-            Mode::AddReferenced => 2 + u64::from(self.ways),
+            Mode::AddReferenced => 2 + u64::from(self.ways || self.relations),
             Mode::Remove => 2,
         }
     }
@@ -82,11 +90,15 @@ impl Route {
         if self.ways {
             ids.push("w1002".to_string());
         }
+        if self.relations {
+            ids.push("r2000".to_string());
+        }
         ids
     }
 }
 
-/// Nodes 1..=100, 25 per blob, and five ways on nodes 1..=7.
+/// Nodes 1..=100, 25 per blob, five ways on nodes 1..=7, and relation 2000
+/// holding way 1003 and relation 2001, which holds node 50 and way 1004.
 fn write_input(path: &Path, route: Route) {
     let nodes = generate_nodes(100, 1);
     let ways: Vec<TestWay> = (0..5_i64)
@@ -97,10 +109,28 @@ fn write_input(path: &Path, route: Route) {
             meta: None,
         })
         .collect();
+    let member = |id| TestMember { id, role: "" };
+    let relations = [
+        TestRelation {
+            id: 2_000,
+            members: vec![
+                member(MemberId::Way(1_003)),
+                member(MemberId::Relation(2_001)),
+            ],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+        TestRelation {
+            id: 2_001,
+            members: vec![member(MemberId::Node(50)), member(MemberId::Way(1_004))],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+    ];
     if route.unindexed {
-        write_multi_block_non_indexed_pbf(path, &nodes, &ways, &[], 25);
+        write_multi_block_non_indexed_pbf(path, &nodes, &ways, &relations, 25);
     } else {
-        write_test_pbf_impl(path, &nodes, &ways, &[], true, Some(25));
+        write_test_pbf_impl(path, &nodes, &ways, &relations, true, Some(25));
     }
 }
 
@@ -306,7 +336,7 @@ fn include_reads_only_the_pinned_input() {
 #[test]
 fn add_referenced_reads_only_the_pinned_input() {
     check_route(Route::ADD_REFERENCED, 3);
-    // No way requested: no pass 1.
+    // No way or relation requested: no pass 1.
     check_route(
         Route {
             ways: false,
@@ -314,6 +344,19 @@ fn add_referenced_reads_only_the_pinned_input() {
         },
         2,
     );
+    // A relation and no way: one walk serves both relation reads and the
+    // way phase, indexed or forced on an input without indexdata.
+    for unindexed in [false, true] {
+        check_route(
+            Route {
+                ways: false,
+                relations: true,
+                unindexed,
+                ..Route::ADD_REFERENCED
+            },
+            3,
+        );
+    }
 }
 
 #[test]

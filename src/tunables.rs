@@ -870,6 +870,15 @@ pub(crate) const DEGENERATE_SEGMENT_EPSILON: f64 = 1e-30;
 pub(crate) const RING_SEARCH_EXTRA_STEPS: u64 = 1 << 20;
 
 // ---------------------------------------------------------------------------
+// getid
+// ---------------------------------------------------------------------------
+
+/// `getid --add-referenced`: records (16 bytes each) in the relation-closure
+/// edge store's first anonymous mapping, 1 MiB. The store doubles from
+/// there; a file without relations in relations never maps it at all.
+pub(crate) const GETID_EDGE_STORE_FIRST_RECORDS: usize = 1 << 16;
+
+// ---------------------------------------------------------------------------
 // Check and inspect
 // ---------------------------------------------------------------------------
 

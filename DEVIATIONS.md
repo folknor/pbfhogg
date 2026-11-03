@@ -584,7 +584,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
 PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
 preserves the sign and `getid` applies its own rejection afterward.
 
-**Residual divergence (tags-filter, add-locations-to-ways):**
+**Residual divergence (tags-filter, add-locations-to-ways, getid -r):**
 The shared root is `IdSet::set` in `src/idset.rs`, a silent
 no-op on negative ids, where osmium's equivalent paths abs-fold via
 `object.positive_id()` to collapse `-N` and `+N` into a single bit.
@@ -600,9 +600,15 @@ no-op on negative ids, where osmium's equivalent paths abs-fold via
   osmium's `add-locations-to-ways` abs-folds the member ref via
   `member.positive_ref()`, collapsing `-N` and `+N` member refs
   into the same retention decision.
+- `getid --add-referenced` silently **drops** a negative way ref or
+  relation member ref while following references (the ID never enters
+  the pulled-in set, and a relation-in-relation edge with a negative
+  end is never stored), so the object it names is not added. osmium's
+  `getid -r` abs-folds both (`positive_ref`), adding object `N` for a
+  reference to `-N`.
 
-Both behaviors are silent; neither matches the project-wide reject
-stance, and neither matches osmium's abs-fold. Promoting either to
+These behaviors are all silent; none matches the project-wide reject
+stance, and none matches osmium's abs-fold. Promoting any of them to
 a further hard-reject site is not planned: osmium's own behavior is
 also a silent miscount (just a *different* silent miscount), so
 neither tool offers a clean precedent for forced rejection here. A
@@ -827,6 +833,34 @@ removes one trailing `\r` before reading the line, so a CRLF file works.
 osmium sheds the `\r` only when a space or `#` cut happens to remove it, so it
 rejects `n123\r` and `n123#c\r` while accepting `n123 #c\r`, and rejects a
 line holding only `\r`, which pbfhogg skips.
+
+## getid: missing objects are reported, not an exit status
+
+`getid -r` follows references as osmium's does
+(`osmium-tool/src/command_getid.cpp`, `find_referenced_objects`): relation
+members recursively through relations in relations, the node and way
+members of every relation reached, then the nodes of every way requested or
+pulled in, and `--remove-tags` strips every pulled-in object of any kind
+that was not itself requested. Selection and tag stripping match osmium's
+output on real data; the differences are in what a missing object does.
+
+**osmium behavior:** every object still unfound at the end, requested or
+pulled in by `-r`, counts toward `Did not find N object(s)`, and any such
+object makes the command exit 1 (`return m_work_with_history ||
+no_ids(m_ids)`), unless `-H`. A relation whose member lies outside an
+extract therefore fails the run.
+
+**pbfhogg behavior:** `getid` exits 0 whenever it wrote its output, found
+or not. `-v, --verbose` reports the requested IDs that were not written,
+requested ones only: an object `-r` reached that the file lacks is not a
+miss (`print_missing_ids` in `cli/src/lib.rs`, fed by `record_found` in
+`src/commands/getid/mod.rs`, which records requested IDs of every kind).
+
+**Rationale:** on any extract, members cut off at the border are the normal
+case, so an exit status that fails on them reports the extract, not the
+query; and the requested-ID list is the one a caller can act on. A negative
+member reference is dropped where osmium abs-folds it, see "Negative input
+IDs rejected project-wide".
 
 ## PBF decoding: a repeated Info or DenseInfo is refused, not merged
 

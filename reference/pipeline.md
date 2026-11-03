@@ -359,7 +359,14 @@ encodings (see `reference/blob-density.md`). `getid --invert`
 (removeid) is pinned to the walker arm; its streaming full-scan
 counterpart doesn't exist yet.
 
-- `getid`: optional `--add-referenced` (two-pass, pulls in referenced nodes of matching ways).
+- `getid`: optional `--add-referenced`, as osmium's `getid -r`. Pass 1
+  follows the references from one header walk: when a relation is
+  requested, a read of the relation blobs collects the requested
+  relations' members and every relation-in-relation edge, the closure is
+  walked in memory, and a second relation read collects the node and way
+  members of the relations it reached (only when it reached one); then a
+  read of the way blobs collects the nodes of every way requested or
+  pulled in. Pass 2 writes the requested and pulled-in objects.
 - `getparents`: reverse-lookup of ways/relations referencing given IDs.
 
 ### add-locations-to-ways

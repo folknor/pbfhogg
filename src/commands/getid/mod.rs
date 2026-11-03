@@ -15,12 +15,13 @@ use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::block::BlockBuffer;
 use crate::read::header_walker::ScanArm;
-use crate::read::input::{InputSource, PinnedInput};
-use crate::read::project_ids::WaySpans;
+use crate::read::input::{InputFile, InputSource, PinnedInput};
+use crate::read::project_ids::{RelationSpans, WaySpans};
+use crate::scan::classify::ScheduledBlob;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
-use crate::{BlobFilter, Element, ElementKind, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementKind, ElementReader, MemberId, PrimitiveBlock};
 
 use super::Result;
 
@@ -58,6 +59,15 @@ impl ElementIds {
             ElementKind::Node => self.node_ids.set(id),
             ElementKind::Way => self.way_ids.set(id),
             ElementKind::Relation => self.relation_ids.set(id),
+        }
+    }
+
+    /// The set of one kind.
+    fn of(&self, kind: ElementKind) -> &IdSet {
+        match kind {
+            ElementKind::Node => &self.node_ids,
+            ElementKind::Way => &self.way_ids,
+            ElementKind::Relation => &self.relation_ids,
         }
     }
 }
@@ -348,19 +358,21 @@ pub fn merge_id_sets(a: &mut ElementIds, b: &ElementIds) {
 // Stats
 // ---------------------------------------------------------------------------
 
-/// The two-pass mode of [`getid`]: the requested objects plus the nodes of
-/// the requested ways (way-node dependencies only; relation members are not
-/// added), with the setting that means something only there.
+/// The reference-following mode of [`getid`], as osmium's `getid -r`: the
+/// requested objects plus everything they reference. The members of
+/// requested relations, recursively through relations in relations
+/// (cycle-safe), then the nodes of every way requested or pulled in. With
+/// the setting that means something only there.
 pub struct AddReferenced {
-    /// Strip tags from the added nodes that were not themselves requested.
-    /// A requested node keeps its tags even where a requested way also
-    /// references it.
+    /// Strip tags from every added object, of any kind, that was not itself
+    /// requested. A requested object keeps its tags even where something
+    /// else requested also references it.
     pub remove_tags: bool,
 }
 
 /// Options for getid.
 pub struct GetidOptions {
-    /// `Some` runs the two-pass mode that adds the nodes of requested ways.
+    /// `Some` runs the mode that adds referenced objects ([`AddReferenced`]).
     /// `None` emits exact ID matches only; that mode has no setting of its
     /// own, so there is nothing to refuse.
     pub add_referenced: Option<AddReferenced>,
@@ -423,8 +435,9 @@ impl GetidStats {
 
 /// Extract elements matching the given IDs.
 ///
-/// With `opts.add_referenced` set, referenced nodes of matching ways are also
-/// included (two-pass). Otherwise, only exact ID matches are output.
+/// With `opts.add_referenced` set, the objects the requested ones reference
+/// are also included ([`AddReferenced`]). Otherwise, only exact ID matches
+/// are output.
 ///
 /// Every route opens the input more than once, so the input must be a
 /// regular file (`InvalidArgument` otherwise) and is
@@ -490,8 +503,8 @@ fn getid_dispatched<'a>(
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     // Every route opens the input more than once, each open its own open
     // file description (the indexdata probe, the arm estimate, the walker or
-    // the streaming reader; `add_referenced`'s pass-1 schedule walk, whose
-    // descriptor serves the classify pool, and pass 2's reader), and each is
+    // the streaming reader; `add_referenced`'s one schedule walk, whose
+    // descriptor serves every reference phase, and pass 2's reader), and each is
     // derived from this one pin, so a file renamed over the input mid-run
     // cannot be read partly from each: where `/proc/self/fd` reopens the pin
     // every open reaches the pinned file, otherwise on Unix a replaced input
@@ -501,8 +514,9 @@ fn getid_dispatched<'a>(
     let input = &pin;
     // Every element is still matched against the requested IDs on a forced
     // run; what is lost is the blob skipping. The include paths skip on kind
-    // and ID range, `add_referenced`'s two passes on kind alone (pass 1 reads
-    // way blobs only; pass 2 skips the kinds nothing was requested of).
+    // and ID range, `add_referenced`'s passes on kind alone (the reference
+    // phases read relation and way blobs only; pass 2 skips the kinds
+    // nothing was requested or pulled in of).
     let reason = if opts.add_referenced.is_some() {
         "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
          element type, so blobs of types a pass does not need are decompressed too."
@@ -1097,81 +1111,68 @@ fn getid_with_refs(
         found: report_found.then(ElementIds::empty),
     };
 
-    // Pass 1: Collect ref node IDs from matching ways. Uses IdSet for O(1)
-    // lookups in pass 2 instead of BTreeSet's O(log n).
+    // Pass 1: follow the references, as osmium's `getid -r` does
+    // (`find_referenced_objects`): the members of requested relations,
+    // relations in relations closed transitively, then the nodes of every
+    // way requested or pulled in. Everything pulled in lands in `pulled`,
+    // which pass 2 selects from beside `ids`.
     host.invocation.marker("GETID_PASS1_START");
-    let mut dep_node_ids = crate::idset::IdSet::new();
-    let mut has_dep_nodes = false;
+    let mut pulled = ElementIds::empty();
 
-    if ids.way_ids.has_any() {
-        // Parallel classification: pread workers scan way blobs for matching
-        // way IDs and collect their node refs. A partially indexed file is
-        // refused here as on every getid path (see `getid_dispatched`).
-        let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+    if ids.way_ids.has_any() || ids.relation_ids.has_any() {
+        // One header walk sorts the blobs by kind for both reference
+        // phases, and its descriptor serves both pools. Unindexed input
+        // (only on a forced run) puts every blob in each phase's schedule.
+        // A partially indexed file is refused here as on every getid path
+        // (see `getid_dispatched`); a blob whose claim its contents
+        // contradict is refused when a phase decodes it.
+        let (schedules, shared_file, _) = crate::scan::classify::build_classify_schedules_split(
             input,
-            Some(crate::ElementKind::Way),
             crate::scan::classify::KindClaims::Refuse,
             host,
         )?;
+        let (_, way_schedule, relation_schedule) = schedules.into_replicated();
 
-        // Each blob is validated through `WaySpans` restricted to the
-        // requested ways (no block built; refused exactly as construction
-        // refuses), and only after it is accepted are those ways' refs
-        // decoded, sorted and deduplicated into a per-blob vector, which the
-        // consumer inserts into the one dependency set. A per-worker set
-        // would hold up to one node-range bitmap per worker on a broad
-        // query (`-I` naming every way); the per-blob vector is bounded by
-        // one blob's refs and empty for almost every blob of a narrow one.
-        crate::scan::classify::parallel_project_phase(
-            &shared_file,
-            &schedule,
-            None,
-            Vec::new,
-            |_, buffer, ways| -> Result<Vec<i64>> {
-                let (WaySpans { .. }, accepted) =
-                    buffer.project(|_, _| WaySpans::new(Some(&ids.way_ids), &mut *ways))?;
-                let mut refs: Vec<i64> = Vec::new();
-                for way in ways.iter() {
-                    refs.extend(way.refs(accepted.bytes())?);
-                }
-                refs.sort_unstable();
-                refs.dedup();
-                Ok(refs)
-            },
-            |_seq, refs| {
-                for r in refs {
-                    dep_node_ids.set(r);
-                }
-            },
-            host,
-        )?;
-        has_dep_nodes = dep_node_ids.has_any();
+        if ids.relation_ids.has_any() {
+            host.invocation.marker("GETID_RELATIONS_START");
+            close_relations(&shared_file, &relation_schedule, ids, &mut pulled, host)?;
+            host.invocation.marker("GETID_RELATIONS_END");
+            crate::debug::emit_mallinfo2(&host.invocation, "getid_after_relations");
+        }
+
+        // The way phase reads the requested ways and the pulled-in ones
+        // alike, so the requested ones join the pulled set: selection and
+        // tag stripping test `ids` first, so the overlap changes neither.
+        pulled.way_ids.merge_from(&ids.way_ids);
+        if pulled.way_ids.has_any() {
+            host.invocation.marker("GETID_WAYS_START");
+            collect_way_nodes(&shared_file, &way_schedule, &mut pulled, host)?;
+            host.invocation.marker("GETID_WAYS_END");
+            crate::debug::emit_mallinfo2(&host.invocation, "getid_after_ways");
+        }
     }
-    // When --remove-tags is set, referenced-only nodes (not explicitly requested)
-    // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
-    let strip_tags = add.remove_tags && has_dep_nodes;
     host.invocation.marker("GETID_PASS1_END");
-    // Cheap one-time iteration; gives the dep-set size before pass 2
-    // starts so the counter survives a SIGKILL during pass 2.
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        host.invocation
-            .counter("getid_dep_node_ids", dep_node_ids.iter().count());
-    }
+    // Cheap one-time iterations; give the pulled-set sizes before pass 2
+    // starts so the counters survive a SIGKILL during pass 2. The way and
+    // relation counts include requested IDs where the reference walk
+    // reached them.
+    host.invocation
+        .counter("getid_dep_node_ids", pulled.node_ids.iter().count());
+    host.invocation
+        .counter("getid_dep_way_ids", pulled.way_ids.iter().count());
+    host.invocation
+        .counter("getid_dep_relation_ids", pulled.relation_ids.iter().count());
 
-    // Pass 2: Write matching elements + dependent nodes (transform fused into
+    // Pass 2: Write requested and pulled-in elements (transform fused into
     // the decode workers).
     host.invocation.marker("GETID_PASS2_START");
     let reader = ElementReader::open_in(input, write.direct_reads, host)?.refusing_kind_claims();
-    // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
-    // ways and relations if none of theirs were requested. The references
-    // added are only the requested ways' nodes (pass 1), never relation
-    // members, so a way is written only when its own ID was requested, as
-    // `included_block` and `process_block` select.
+    // Skip the blob kinds nothing was requested or pulled in of.
+    // `included_block` and `process_block` select by the same union.
     let reader = reader.with_blob_filter(BlobFilter::new(
-        ids.node_ids.has_any() || has_dep_nodes,
-        ids.way_ids.has_any(),
-        ids.relation_ids.has_any(),
+        ids.node_ids.has_any() || pulled.node_ids.has_any(),
+        ids.way_ids.has_any() || pulled.way_ids.has_any(),
+        ids.relation_ids.has_any() || pulled.relation_ids.has_any(),
     ));
     let mut writer = writer_from_header(
         output,
@@ -1183,18 +1184,17 @@ fn getid_with_refs(
         host,
     )?;
 
-    let dep_ref = if has_dep_nodes {
-        Some(&dep_node_ids)
-    } else {
-        None
-    };
+    let pulled_ref = (!pulled.is_empty()).then_some(&pulled);
+    // `--remove-tags` strips every emitted object that was not itself
+    // requested, of any kind: those are exactly the pulled-in ones.
+    let strip_tags = add.remove_tags;
 
     // Almost every blob holds nothing selected; `included_block` answers that
     // from the validator's pass and builds the block only for a blob that
     // does.
     reader.for_each_fused_buffer(
         |buffer| {
-            let Some(block) = included_block(buffer, ids, dep_ref)? else {
+            let Some(block) = included_block(buffer, ids, pulled_ref)? else {
                 return Ok((Vec::new(), BlockOutcome::default()));
             };
             let mut bb = BlockBuilder::new();
@@ -1205,7 +1205,7 @@ fn getid_with_refs(
                 &mut output,
                 ids,
                 true,
-                dep_ref,
+                pulled_ref,
                 strip_tags,
                 report_found,
             )?;
@@ -1233,6 +1233,313 @@ fn getid_with_refs(
     Ok(stats)
 }
 
+/// What one relation blob contributes to the reference closure.
+#[derive(Default)]
+struct RelationRefs {
+    /// Node and way members of the relations the phase collects from.
+    nodes: Vec<i64>,
+    ways: Vec<i64>,
+    /// Relation members of the requested relations: the closure's seeds.
+    relations: Vec<i64>,
+    /// `(parent, child)` for every relation member of a relation that was
+    /// not requested, both ends non-negative: the edges the closure walks.
+    edges: Vec<(i64, i64)>,
+}
+
+/// Close the requested relations over their members into `pulled`: node
+/// and way members of every relation reached, and the reached relations
+/// themselves (any not requested), recursively through relations in
+/// relations.
+///
+/// At most two reads of the relation blobs, whatever the nesting depth, as
+/// osmium's `find_relations_in_relations` and
+/// `find_nodes_and_ways_in_relations`. The first collects the requested
+/// relations' members and every relation-to-relation edge of the other
+/// relations; the closure is then walked in memory from the requested
+/// relations' relation members (an explicit worklist, so a deep chain
+/// cannot exhaust the stack, and a relation is expanded once, so a cycle
+/// ends). The second runs only when the walk reached a relation that was
+/// not requested, and collects those relations' node and way members. A
+/// requested relation reached by the walk is not expanded again: the first
+/// read already took all its members. The parent test reads only `ids`,
+/// which nobody mutates, so which edges are kept does not depend on the
+/// order blobs complete in. A reached relation joins `pulled` whether or
+/// not the file holds it; pass 2 writes what exists.
+///
+/// The edge store holds one pair per relation member of a relation, file
+/// wide, which is the price of the two-read bound (a fixed-point loop over
+/// the relation blobs, as tags-filter's closure runs, stores nothing but
+/// reads them once per nesting level). At planet it is about a million
+/// pairs, some 17 MB. It lives in its own anonymous mapping
+/// ([`EdgeStore`]), released as soon as the closure is walked, not in a
+/// `Vec`: glibc raises its dynamic mmap threshold when a large mmapped
+/// block goes back through `free`, after which the decompress buffers of
+/// every later phase came from the malloc arenas instead of mmap and stayed
+/// resident once freed. Measured at planet (bygg, 2026-11-03), peak
+/// anonymous memory: 402 MB without a relation read, 572 to 591 MB with
+/// the store a `Vec` dropped here. The per-blob edge vectors the workers
+/// hand over are still `Vec`s, each bounded by one blob.
+///
+/// A negative member ID is dropped, as `IdSet::set` drops it (an edge with
+/// a negative end is never stored: no walk could reach or follow it);
+/// osmium abs-folds it (`positive_ref`). See DEVIATIONS.md "Negative input
+/// IDs rejected project-wide".
+fn close_relations(
+    shared_file: &InputFile,
+    schedule: &[ScheduledBlob],
+    ids: &ElementIds,
+    pulled: &mut ElementIds,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let mut seeds: Vec<i64> = Vec::new();
+    let mut edges = EdgeStore::default();
+    let mut store_failed: Option<Error> = None;
+    relation_phase(
+        shared_file,
+        schedule,
+        &ids.relation_ids,
+        true,
+        |refs| {
+            for id in refs.nodes {
+                pulled.node_ids.set(id);
+            }
+            for id in refs.ways {
+                pulled.way_ids.set(id);
+            }
+            seeds.extend(refs.relations);
+            if store_failed.is_none()
+                && let Err(e) = edges.extend(&refs.edges)
+            {
+                store_failed = Some(e);
+            }
+        },
+        host,
+    )?;
+    if let Some(e) = store_failed {
+        return Err(e);
+    }
+
+    host.invocation.counter("getid_relation_edges", edges.len());
+    host.invocation
+        .counter("getid_relation_edge_bytes", edges.mapped_bytes());
+    let edges = edges.sorted();
+    let mut added = false;
+    let mut worklist = seeds;
+    while let Some(id) = worklist.pop() {
+        if id < 0 || ids.relation_ids.get(id) || !pulled.relation_ids.set_if_new(id) {
+            continue;
+        }
+        added = true;
+        worklist.extend(edges.children(id));
+    }
+    drop(edges);
+
+    if added {
+        relation_phase(
+            shared_file,
+            schedule,
+            &pulled.relation_ids,
+            false,
+            |refs| {
+                for id in refs.nodes {
+                    pulled.node_ids.set(id);
+                }
+                for id in refs.ways {
+                    pulled.way_ids.set(id);
+                }
+            },
+            host,
+        )?;
+    }
+    Ok(())
+}
+
+/// The relation closure's `(parent, child)` edges, in an anonymous mapping
+/// of its own, grown geometrically by moving to a larger mapping, so that
+/// neither its growth nor its release goes through the malloc arenas (see
+/// [`close_relations`] for why). Each edge is 16 bytes, parent then child,
+/// both big-endian: both are non-negative, so the byte order of a record is
+/// the numeric order of the pair, and the records sort as byte arrays with
+/// no unsafe view of the mapping.
+#[derive(Default)]
+struct EdgeStore {
+    map: Option<memmap2::MmapMut>,
+    len: usize,
+}
+
+/// One stored edge.
+type EdgeRecord = [u8; 16];
+
+impl EdgeStore {
+    const FIRST_CAPACITY: usize = crate::tunables::GETID_EDGE_STORE_FIRST_RECORDS;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes mapped, used or not.
+    fn mapped_bytes(&self) -> usize {
+        self.map.as_ref().map_or(0, |m| m.len())
+    }
+
+    fn records(&self) -> &[EdgeRecord] {
+        let bytes = self.map.as_deref().unwrap_or(&[]);
+        &bytes.as_chunks::<16>().0[..self.len]
+    }
+
+    /// Append `edges`, growing the mapping when they do not fit.
+    fn extend(&mut self, edges: &[(i64, i64)]) -> Result<()> {
+        let needed = self
+            .len
+            .checked_add(edges.len())
+            .ok_or_else(|| Error::internal("getid edge store: record count overflows"))?;
+        let capacity = self.mapped_bytes() / size_of::<EdgeRecord>();
+        if needed > capacity {
+            let grown = needed
+                .max(capacity.saturating_mul(2))
+                .max(Self::FIRST_CAPACITY);
+            let bytes = grown
+                .checked_mul(size_of::<EdgeRecord>())
+                .ok_or_else(|| Error::internal("getid edge store: size overflows"))?;
+            let mut map = memmap2::MmapMut::map_anon(bytes)?;
+            let used = self.len * size_of::<EdgeRecord>();
+            if let Some(old) = &self.map {
+                map[..used].copy_from_slice(&old[..used]);
+            }
+            // The old mapping is unmapped here, not freed into an arena.
+            self.map = Some(map);
+        }
+        let Some(map) = self.map.as_mut() else {
+            return Ok(());
+        };
+        let records = &mut map.as_chunks_mut::<16>().0[self.len..needed];
+        for (record, &(parent, child)) in records.iter_mut().zip(edges) {
+            record[..8].copy_from_slice(&parent.to_be_bytes());
+            record[8..].copy_from_slice(&child.to_be_bytes());
+        }
+        self.len = needed;
+        Ok(())
+    }
+
+    /// The store sorted by parent, ready for [`Self::children`].
+    fn sorted(mut self) -> Self {
+        if let Some(map) = self.map.as_mut() {
+            map.as_chunks_mut::<16>().0[..self.len].sort_unstable();
+        }
+        self
+    }
+
+    /// The children of `parent`, from a [`Self::sorted`] store.
+    fn children(&self, parent: i64) -> impl Iterator<Item = i64> + '_ {
+        let key = parent.to_be_bytes();
+        let records = self.records();
+        let from = records.partition_point(|r| r[..8] < key[..]);
+        records[from..]
+            .iter()
+            .take_while(move |r| r[..8] == key[..])
+            .map(|r| {
+                let mut child = [0_u8; 8];
+                child.copy_from_slice(&r[8..]);
+                i64::from_be_bytes(child)
+            })
+    }
+}
+
+/// One read of the relation blobs: for each relation in `collect`, its
+/// node and way members, and with `seed_edges` also its relation members
+/// (as seeds) and every other relation's relation members (as edges).
+///
+/// Each blob is validated through `RelationSpans` (no block built; refused
+/// exactly as construction refuses, and a relation blob whose claim its
+/// contents contradict is refused) before anything it recorded is read.
+fn relation_phase(
+    shared_file: &InputFile,
+    schedule: &[ScheduledBlob],
+    collect: &IdSet,
+    seed_edges: bool,
+    mut merge: impl FnMut(RelationRefs),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    crate::scan::classify::parallel_project_phase(
+        shared_file,
+        schedule,
+        None,
+        Vec::new,
+        |_, buffer, relations| -> Result<RelationRefs> {
+            let (RelationSpans { .. }, accepted) =
+                buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
+            let mut refs = RelationRefs::default();
+            for relation in relations.iter() {
+                let collected = collect.get(relation.id);
+                if !collected && !seed_edges {
+                    continue;
+                }
+                for member in relation.members(accepted.bytes())? {
+                    match member {
+                        MemberId::Node(id) if collected => refs.nodes.push(id),
+                        MemberId::Way(id) if collected => refs.ways.push(id),
+                        MemberId::Relation(id) if seed_edges => {
+                            if collected {
+                                refs.relations.push(id);
+                            } else if relation.id >= 0 && id >= 0 {
+                                refs.edges.push((relation.id, id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(refs)
+        },
+        |_seq, refs| merge(refs),
+        host,
+    )
+}
+
+/// Add the node refs of every way in `pulled.way_ids` to `pulled.node_ids`.
+///
+/// Each blob is validated through `WaySpans` restricted to those ways (no
+/// block built; refused exactly as construction refuses), and only after it
+/// is accepted are those ways' refs decoded, sorted and deduplicated into a
+/// per-blob vector, which the consumer inserts into the one node set. A
+/// per-worker set would hold up to one node-range bitmap per worker on a
+/// broad query (`-I` naming every way); the per-blob vector is bounded by
+/// one blob's refs and empty for almost every blob of a narrow one.
+fn collect_way_nodes(
+    shared_file: &InputFile,
+    schedule: &[ScheduledBlob],
+    pulled: &mut ElementIds,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let ElementIds {
+        node_ids, way_ids, ..
+    } = pulled;
+    let way_ids = &*way_ids;
+    crate::scan::classify::parallel_project_phase(
+        shared_file,
+        schedule,
+        None,
+        Vec::new,
+        |_, buffer, ways| -> Result<Vec<i64>> {
+            let (WaySpans { .. }, accepted) =
+                buffer.project(|_, _| WaySpans::new(Some(way_ids), &mut *ways))?;
+            let mut refs: Vec<i64> = Vec::new();
+            for way in ways.iter() {
+                refs.extend(way.refs(accepted.bytes())?);
+            }
+            refs.sort_unstable();
+            refs.dedup();
+            Ok(refs)
+        },
+        |_seq, refs| {
+            for r in refs {
+                node_ids.set(r);
+            }
+        },
+        host,
+    )
+}
+
 /// The block of a decoded blob in include mode, or `None` when it holds no
 /// element include mode would emit.
 ///
@@ -1254,10 +1561,26 @@ fn getid_with_refs(
 fn included_block(
     buffer: BlockBuffer<'_>,
     ids: &ElementIds,
-    dep_node_ids: Option<&crate::idset::IdSet>,
+    pulled: Option<&ElementIds>,
 ) -> Result<Option<PrimitiveBlock>> {
-    let (probe, accepted) = buffer.project(|_, _| SelectProbe::new(ids, dep_node_ids))?;
+    let (probe, accepted) = buffer.project(|_, _| SelectProbe::new(ids, pulled))?;
     Ok(probe.hit.then(|| accepted.into_block()))
+}
+
+/// Whether `id` of `kind` is selected: requested, or pulled in by
+/// `--add-referenced`. The one test every selection gate applies.
+fn selected(ids: &ElementIds, pulled: Option<&ElementIds>, kind: ElementKind, id: i64) -> bool {
+    ids.of(kind).get(id) || pulled.is_some_and(|p| p.of(kind).get(id))
+}
+
+/// An element's kind and ID.
+fn element_key(element: &Element<'_>) -> (ElementKind, i64) {
+    match element {
+        Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
+        Element::Node(n) => (ElementKind::Node, n.id()),
+        Element::Way(w) => (ElementKind::Way, w.id()),
+        Element::Relation(r) => (ElementKind::Relation, r.id()),
+    }
 }
 
 /// Whether a block holds an element [`is_dominated`] selects: the same
@@ -1270,25 +1593,25 @@ fn included_block(
 /// stop, validation does not.
 struct SelectProbe<'q> {
     ids: &'q ElementIds,
-    dep_node_ids: Option<&'q crate::idset::IdSet>,
-    /// Whether any node can be selected: a requested node, or a dependent
+    pulled: Option<&'q ElementIds>,
+    /// Whether any node can be selected: a requested node, or a pulled-in
     /// one.
     any_nodes: bool,
     hit: bool,
 }
 
 impl<'q> SelectProbe<'q> {
-    fn new(ids: &'q ElementIds, dep_node_ids: Option<&'q crate::idset::IdSet>) -> Self {
+    fn new(ids: &'q ElementIds, pulled: Option<&'q ElementIds>) -> Self {
         Self {
             ids,
-            dep_node_ids,
-            any_nodes: ids.node_ids.has_any() || dep_node_ids.is_some_and(IdSet::has_any),
+            pulled,
+            any_nodes: ids.node_ids.has_any() || pulled.is_some_and(|p| p.node_ids.has_any()),
             hit: false,
         }
     }
 
-    fn node_selected(&self, id: i64) -> bool {
-        self.ids.node_ids.get(id) || self.dep_node_ids.is_some_and(|deps| deps.get(id))
+    fn selected(&self, kind: ElementKind, id: i64) -> bool {
+        selected(self.ids, self.pulled, kind, id)
     }
 }
 
@@ -1298,7 +1621,7 @@ impl crate::read::block::GroupProjection for SelectProbe<'_> {
         node: &crate::read::wire::WireNode<'_>,
         _info: Option<&crate::read::wire::WireInfo>,
     ) {
-        self.hit = self.hit || (self.any_nodes && self.node_selected(node.id));
+        self.hit = self.hit || (self.any_nodes && self.selected(ElementKind::Node, node.id));
     }
 
     fn way(
@@ -1306,7 +1629,7 @@ impl crate::read::block::GroupProjection for SelectProbe<'_> {
         way: &crate::read::wire::WireWay<'_>,
         _info: Option<&crate::read::wire::WireInfo>,
     ) {
-        self.hit = self.hit || self.ids.way_ids.get(way.id);
+        self.hit = self.hit || self.selected(ElementKind::Way, way.id);
     }
 
     fn relation(
@@ -1314,7 +1637,7 @@ impl crate::read::block::GroupProjection for SelectProbe<'_> {
         relation: &crate::read::wire::WireRelation<'_>,
         _info: Option<&crate::read::wire::WireInfo>,
     ) {
-        self.hit = self.hit || self.ids.relation_ids.get(relation.id);
+        self.hit = self.hit || self.selected(ElementKind::Relation, relation.id);
     }
 
     fn dense(
@@ -1326,51 +1649,31 @@ impl crate::read::block::GroupProjection for SelectProbe<'_> {
         self.hit = self.hit
             || (self.any_nodes
                 && crate::read::elements::WayRefIter::delta_decoded(dense.id_data)
-                    .any(|id| self.node_selected(id)));
+                    .any(|id| self.selected(ElementKind::Node, id)));
     }
 }
 
-/// Whether the element is covered by the query: requested by ID, or -
-/// for nodes under `--add-referenced` - pulled in as a way's node ref.
+/// Whether the element is covered by the query: requested by ID, or
+/// pulled in by `--add-referenced`.
 ///
 /// Include mode emits dominated elements; invert mode emits the rest.
-fn is_dominated(
-    ids: &ElementIds,
-    dep_node_ids: Option<&crate::idset::IdSet>,
-    element: &Element<'_>,
-) -> bool {
-    match element {
-        Element::DenseNode(dn) => {
-            ids.node_ids.get(dn.id()) || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
-        }
-        Element::Node(n) => {
-            ids.node_ids.get(n.id()) || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
-        }
-        Element::Way(w) => ids.way_ids.get(w.id()),
-        Element::Relation(r) => ids.relation_ids.get(r.id()),
-    }
+fn is_dominated(ids: &ElementIds, pulled: Option<&ElementIds>, element: &Element<'_>) -> bool {
+    let (kind, id) = element_key(element);
+    selected(ids, pulled, kind, id)
 }
 
 /// Note the element about to be written, if the user actually asked for
 /// it by ID.
 ///
-/// Only *requested* IDs count: in `--add-referenced` mode a node can be
-/// emitted because a matched way refers to it, which is not the same as
-/// the user having asked for it, and reporting those would make the
-/// "did not find" list go silent on genuine misses. Ways and relations
-/// reach the write path in include mode only when they matched
-/// directly, so they need no such guard.
+/// Only *requested* IDs count, of every kind: in `--add-referenced` mode a
+/// node, way or relation can be emitted because something requested
+/// references it, which is not the same as the user having asked for it,
+/// and reporting those would make the "did not find" list go silent on
+/// genuine misses.
 fn record_found(found: &mut Vec<(ElementKind, i64)>, ids: &ElementIds, element: &Element<'_>) {
-    match element {
-        Element::DenseNode(dn) if ids.node_ids.get(dn.id()) => {
-            found.push((ElementKind::Node, dn.id()));
-        }
-        Element::Node(n) if ids.node_ids.get(n.id()) => {
-            found.push((ElementKind::Node, n.id()));
-        }
-        Element::Way(w) => found.push((ElementKind::Way, w.id())),
-        Element::Relation(r) => found.push((ElementKind::Relation, r.id())),
-        _ => {}
+    let (kind, id) = element_key(element);
+    if ids.of(kind).get(id) {
+        found.push((kind, id));
     }
 }
 
@@ -1386,7 +1689,7 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     ids: &ElementIds,
     include: bool,
-    dep_node_ids: Option<&crate::idset::IdSet>,
+    pulled: Option<&ElementIds>,
     strip_tags: bool,
     report_found: bool,
 ) -> crate::Result<BlockOutcome> {
@@ -1399,7 +1702,7 @@ fn process_block(
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
-        let dominated = is_dominated(ids, dep_node_ids, &element);
+        let dominated = is_dominated(ids, pulled, &element);
         let emit = if include { dominated } else { !dominated };
         if !emit {
             continue;
@@ -1409,56 +1712,39 @@ fn process_block(
             record_found(&mut found, ids, &element);
         }
 
+        // `--remove-tags` (include mode only) strips an emitted object
+        // that was not itself requested, of any kind: one pulled in. A
+        // requested object keeps its tags even where it is also referenced.
+        let (kind, id) = element_key(&element);
+        let keep_tags = if strip_tags && !ids.of(kind).get(id) {
+            0
+        } else {
+            usize::MAX
+        };
+
         match &element {
             Element::DenseNode(dn) => {
                 ensure_node_capacity_local(bb, output)?;
-                // Strip tags from referenced-only nodes (dep but not explicit)
-                let strip = strip_tags
-                    && dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
-                    && !ids.node_ids.get(dn.id());
                 let meta = dense_node_metadata(dn)?;
-                if strip {
-                    bb.add_node(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        std::iter::empty::<(&str, &str)>(),
-                        meta.as_ref(),
-                    );
-                } else {
-                    bb.add_node(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        dn.tags(),
-                        meta.as_ref(),
-                    );
-                }
+                bb.add_node(
+                    dn.id(),
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    dn.tags().take(keep_tags),
+                    meta.as_ref(),
+                );
                 nodes += 1;
             }
             Element::Node(n) => {
                 ensure_node_capacity_local(bb, output)?;
-                let strip = strip_tags
-                    && dep_node_ids.is_some_and(|deps| deps.get(n.id()))
-                    && !ids.node_ids.get(n.id());
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                if strip {
-                    bb.add_node(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        std::iter::empty::<(&str, &str)>(),
-                        meta.as_ref(),
-                    );
-                } else {
-                    bb.add_node(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        n.tags(),
-                        meta.as_ref(),
-                    );
-                }
+                bb.add_node(
+                    n.id(),
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    n.tags().take(keep_tags),
+                    meta.as_ref(),
+                );
                 nodes += 1;
             }
             Element::Way(w) => {
@@ -1466,14 +1752,19 @@ fn process_block(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                bb.add_way(w.id(), w.tags().take(keep_tags), &refs_buf, meta.as_ref());
                 ways += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation(
+                    r.id(),
+                    r.tags().take(keep_tags),
+                    &members_buf,
+                    meta.as_ref(),
+                );
                 relations += 1;
             }
         }
@@ -1779,7 +2070,7 @@ mod tests {
 
     /// A file indexed on its node blob and not on its way blob is refused by
     /// the two walks that run before any output is written:
-    /// `--add-referenced`'s pass 1 classify walk (way IDs) and the `-I`
+    /// `--add-referenced`'s pass 1 schedule walk (a way ID requested) and the `-I`
     /// reader, each with the typed partial missing-indexdata error located
     /// at the way blob (ordinal 2: the header is 0, the node blob 1). The
     /// paths that refuse mid-write (both include arms, the invert walker,
@@ -2105,14 +2396,18 @@ mod tests {
             parse_ids(&specs).unwrap()
         })
         .collect();
-        let mut deps = crate::idset::IdSet::new();
+        // Pulled in beside the requests, of every kind: tagged ones among
+        // them, so stripping shows.
+        let mut deps = ElementIds::empty();
         for id in [3, 9, 11] {
-            deps.set(id);
+            deps.node_ids.set(id);
         }
+        deps.way_ids.set(20);
+        deps.relation_ids.set(31);
 
         let run = |block: &PrimitiveBlock,
                    ids: &ElementIds,
-                   dep: Option<&crate::idset::IdSet>,
+                   dep: Option<&ElementIds>,
                    strip: bool|
          -> crate::Result<String> {
             let mut bb = BlockBuilder::new();
@@ -2152,5 +2447,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The edge store keeps every pair across its growth (several moves
+    /// past the first mapping) and, sorted, answers each parent with
+    /// exactly its children, an unknown parent with none.
+    #[test]
+    fn edge_store_grows_sorts_and_answers_children() {
+        let mut store = EdgeStore::default();
+        assert_eq!(store.len(), 0);
+        let total = EdgeStore::FIRST_CAPACITY * 3 + 7;
+        let last = i64::try_from(total).unwrap();
+        // Parents descending, so sorting has work to do; parent p holds
+        // children 2p and 2p + 1. Appended in uneven batches.
+        let edges: Vec<(i64, i64)> = (0..last)
+            .rev()
+            .map(|i| (i / 2 + (1_i64 << 40), i))
+            .collect();
+        for batch in edges.chunks(10_007) {
+            store.extend(batch).unwrap();
+        }
+        assert_eq!(store.len(), total);
+        assert!(store.mapped_bytes() >= total * 16);
+        let store = store.sorted();
+        for parent in [0_i64, 1, 5_000, (last - 1) / 2] {
+            let mut got: Vec<i64> = store.children(parent + (1 << 40)).collect();
+            got.sort_unstable();
+            let want: Vec<i64> = [2 * parent, 2 * parent + 1]
+                .into_iter()
+                .filter(|&c| c < last)
+                .collect();
+            assert_eq!(got, want, "parent {parent}");
+        }
+        assert_eq!(store.children(7).count(), 0);
+        assert_eq!(EdgeStore::default().sorted().children(1).count(), 0);
     }
 }

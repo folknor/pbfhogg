@@ -1620,9 +1620,9 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
-| `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
-| `--remove-tags` | Remove tags from referenced objects. Requires `-r`, which is what emits them (so not with `--invert`). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
-| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`, and not with `-q`, which would drop both lists). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
+| `-r, --add-referenced` | Also include every object the listed ones reference, as osmium's `getid -r`: the members of listed relations, recursively through relations in relations, then the nodes of every way listed or pulled in. Reads the relation blobs up to twice and the way blobs once before the output pass (not with `--invert`) |
+| `--remove-tags` | Remove tags from the referenced objects of every kind that were not themselves listed; a listed object keeps its tags even where another references it. Requires `-r`, which is what emits them (so not with `--invert`). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
+| `-v, --verbose` | Print requested IDs, then report which were not found; only listed IDs are reported, not the objects `-r` reached that the file lacks (not with `--invert`, and not with `-q`, which would drop both lists). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |

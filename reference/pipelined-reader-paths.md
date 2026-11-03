@@ -144,7 +144,7 @@ cancellation is checked before each frame, not during its reads).
 - **Per-block work:** heavy - tag iteration, expression match
   against N expressions via `element_matches`, matching elements
   re-encoded through `BlockBuilder`
-- **Related:** the two-pass production path (`--add-referenced-ways`)
+- **Related:** the default path (without `-R`, following references)
   is separate and uses pread workers via `parallel_classify_phase`;
   it doesn't go through this code.
 

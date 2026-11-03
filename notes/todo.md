@@ -1809,6 +1809,13 @@ per-iteration allocations remain across the codebase, ordered by impact:
   bboxes are limited by chronological ID ordering (~30% skip for Denmark,
   not 50-80%). Geography-sorted way blobs (Hilbert curve) would give
   90%+ skip but breaks Sort.Type_then_ID. Multi-extract benefits most.
+- [ ] Per-blob summaries written by the producer (moved out of the
+  pre-release list 2026-11-03: a new product, not a fix). A versioned
+  per-blob extension carrying measured counts, ID boundaries, timestamp
+  range, bbox and metadata coverage would let a repeated inspect skip
+  decompression. Stored summaries are claims, so this is "a description
+  from claims" beside the measurement; partial coverage could be filled
+  by scanning only the blobs without one. Needs a design document first.
 - [x] Streaming pipeline composition - CLOSED, limited benefit.
   The codebase already does the most valuable composition (inline
   indexdata in all write paths). Multi-pass commands can't consume

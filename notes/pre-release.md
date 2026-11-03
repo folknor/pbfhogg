@@ -259,45 +259,21 @@ against `Resources::memory_available`.
 
 ## Memory and throughput: structural work
 
-### WRK-147: apply-changes' unattributed persistent live growth
-
-At planet (zstd:1, OSC 4913, 30 workers, `eeb7ab6c`) a diagnostic that
-counted the bytes of every pipeline stage (candidates, decode buffers in
-use, worker `read_buf`, idle decode-pool buffers, rewrite frames, the
-drain channel, the reorder map, the drain's current item, frames past the
-writer handoff) left live heap (`mallinfo2` `uordblks`) beyond their sum
-rising from about 0.53 to 0.80 GB over the late node phase and at the
-node-to-way transition, and staying there to the end. The starting figure
-holds whatever of the parsed diff (about 530 MB) does not sit in mmapped
-chunks, which `uordblks` excludes; that split was not read. The growth is
-what matters. Candidates: the 30 workers' `BlockBuilder`
-buffers (each released only past `MAX_RETAINED_SCRATCH_CAPACITY`, several
-per builder) and the thread-local
-framing scratch of the workers and of the 32 executor threads built at the
-first create batch, neither measured. Ruled out at `149944a1` (bygg,
-counters added then): the workers' other kept scratch (`RefreshScratch`,
-the group and node-group scratch, the coordinate accumulator) peaks at
-30 MB summed over 30 workers (`merge_streaming_scratch_peak_bytes`), so
-it is not the growth. (Under `-l` the drained coordinate slot tables,
-134 MB, were part of that run's separate post-barrier growth; they are
-now freed at the merge.) Count the rest the same way before choosing anything; with the drain-channel
-backlog gone this is the largest unexplained live share of the peak. The
-diagnostic's patch is reproducible from the description in
-reference/performance.md, "apply-changes' drain channel held the node
-phase's backlog".
-
-### WRK-123: Dense-node block body copied twice in the encoder
+### WRK-123: Dense-node block body still staged once in the encoder
 
 `BlockBuilder::encode_dense_nodes_group` encodes the DenseNodes message
-into `group_buf`, copies it into `elem_scratch` to wrap it as
-PrimitiveGroup field 2, then copies that into `encode_buf` as
-PrimitiveBlock field 2: two full copies of the node body (the largest
-message in a node block) per block, on every node-writing command. The
-nested lengths are computable before writing (the packed fields'
-lengths are known once encoded), so the body could be written once into
-`encode_buf` behind both length prefixes. Not measured; establish the
-cost per node blob at planet first, since it may sit under the 2-3 %
-floor.
+into `group_buf` and copies it once into `encode_buf` behind both length
+prefixes (the copy through `elem_scratch` that wrapped it as a
+PrimitiveGroup is gone). Writing the body straight into `encode_buf` needs
+the packed fields' lengths before they are written, so either a length
+pass over the dense vectors or a reserve-and-shift of each field; each
+packed field is still staged through `elem_scratch` too. At planet the
+node phase's `group_buf` is about 0.6 MB per worker (17-22 MB summed over
+apply-changes' 30 workers, reference/performance.md "apply-changes'
+retained encode storage, attributed"), so the memory left is under the
+noise floor; what is left is one copy of the node body per block on every
+node-writing command, whose wall cost is not measured and likely sits
+under the 2-3 % floor.
 
 ### WRK-127: apply-changes' parallel create runs build a fresh builder per block
 
@@ -309,7 +285,10 @@ preallocating its dense vectors for the element cap: the per-block
 fresh-builder shape the re-encoding commands' workers left. At planet it
 is about 300 blocks at the node-to-way transition, so the cost is bounded
 and one-time; whether it shows in the transition's live burst is not
-measured. A builder per executor thread (thread-local, or `map_init`)
+measured (the attribution diagnostic of 2026-11-03 counted these builders
+only at the end of each chunk, so their share of the transition, where the
+run's peak anon is set, is the one owner it left unmeasured). A builder
+per executor thread (thread-local, or `map_init`)
 would follow the worker rule, if the measurement says it matters.
 
 ### WRK-022: Byte-budgeted fused task engine

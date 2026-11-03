@@ -185,6 +185,14 @@ impl BlockSink for FramedBlocks<'_> {
 /// the worker keeps a fixed bound, not the union of every outlier it met.
 /// The last block's tag-key index is the one thing kept until the next
 /// block replaces it.
+///
+/// What a kept builder holds is its working set, one block's worth per
+/// buffer: at planet, hundreds of MB summed over apply-changes' rewrite
+/// workers, with every buffer under the limit (`reference/performance.md`,
+/// "apply-changes' retained encode storage, attributed"). That is the price
+/// of keeping it, measured against per-blob builders when this was adopted;
+/// lowering it means removing buffers that duplicate another's bytes, not
+/// releasing ones the next block needs again.
 pub(crate) struct WorkerBuilder {
     bb: BlockBuilder,
 }

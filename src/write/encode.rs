@@ -9,6 +9,20 @@ use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint, zigzag_e
 use super::block_builder::{MemberData, Metadata, member_type_value};
 use super::string_table::StringTable;
 
+/// Bytes `protohoggr::encode_varint` writes for `value`: one per started
+/// group of seven bits, and one for zero.
+pub(super) const fn varint_len(value: u64) -> usize {
+    let bits = 64 - (value | 1).leading_zeros() as usize;
+    bits.div_ceil(7)
+}
+
+/// Bytes a length-delimited field with a one-byte tag occupies around a
+/// `body_len`-byte body: the tag, the length varint and the body. `None` on
+/// overflow.
+pub(super) fn len_field_size(body_len: usize) -> Option<usize> {
+    (1 + varint_len(body_len as u64)).checked_add(body_len)
+}
+
 /// Encode an `int32` field unconditionally (even when value is 0).
 ///
 /// Writes the field tag + varint(0) even for the zero value. This differs from
@@ -412,7 +426,22 @@ pub(super) fn collect_packed_varint_keys(data: &[u8], indices: &mut FxHashSet<u3
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{encode_relation, encode_way, encode_way_with_locations};
+    use super::{encode_relation, encode_way, encode_way_with_locations, varint_len};
+
+    /// `varint_len` counts what `encode_varint` writes, at zero, at every
+    /// width transition and at the largest value.
+    #[test]
+    fn varint_len_matches_the_encoder_at_every_width() {
+        let mut values = vec![0u64, 1, u64::MAX];
+        for bits in (7..64).step_by(7) {
+            values.extend([(1u64 << bits) - 1, 1u64 << bits]);
+        }
+        for value in values {
+            let mut buf = Vec::new();
+            protohoggr::encode_varint(&mut buf, value);
+            assert_eq!(varint_len(value), buf.len(), "{value}");
+        }
+    }
     use crate::MemberId;
     use crate::read::wire::{Cursor, PackedSint64Iter, WireRelation, WireWay};
     use crate::write::block_builder::MemberData;

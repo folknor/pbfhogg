@@ -1648,7 +1648,8 @@ sidecar sessions `dbf409a4` and `dce4df1c`:
   frame one input blob's rewrite produced), against an empty channel at
   other times. Live heap followed it (0.9 GB with the channel empty, 1.7 to
   1.9 GB at its peaks) and the heap kept what it grew (arena 1.58 to 2.04
-  and 2.46 GB). The reorder map stayed under 0.1 GB, workers never blocked
+  and 2.46 GB). The reorder map reached about 0.27 GB at its high water
+  (stored counters of `dbf409a4`), workers never blocked
   sending, and frames past the writer's handoff held 5 to 25 MB (up to
   120 MB for a moment at the node-to-way transition).
 - It happens in the node phase, the start-up ramp included, and at the
@@ -1663,8 +1664,10 @@ sidecar sessions `dbf409a4` and `dce4df1c`:
 - Worker scratch is steady, not the burst: decode buffers in use 100 to
   160 MB, `read_buf` capacity 150 to 170 MB, idle pool buffers 0 to
   150 MB.
-- Not attributed: live heap beyond every counted stage rises from about
-  0.53 to 0.80 GB over the late node phase and the transition, and stays.
+- Not attributed then: live heap beyond every counted stage rises from
+  about 0.53 to 0.80 GB over the late node phase and the transition, and
+  stays. It is the workers' retained encode and framing storage
+  ("apply-changes' retained encode storage, attributed" below).
 
 Under `-l` (`planet-20260223-altw-keep-untagged`, session `5fd7df66`, 300 ms
 sampling) the drain is worker-bound for the whole run and the channel
@@ -1750,6 +1753,97 @@ is 100 MB against the diagnostic's 150 to 170 MB, below what the peak
 resolves. The workers' other kept scratch (group, node-group and refresh
 scratch and the coordinate accumulator, `merge_streaming_scratch_peak_bytes`)
 peaks at 30 MB summed over 30 workers (38 MB under `-l`).
+
+### apply-changes' retained encode storage, attributed (bygg, 2026-11-03, against `062d7cce`)
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`, 30 workers.
+
+**Attribution** (uncommitted diagnostic, two cells, sidecar sessions
+`95f7de9d` and `b7026a58`, which agree): one thread sampling `mallinfo2`
+every 200 ms beside the retained capacity of every owner the earlier
+diagnostic did not count, each reported by its owner as a delta into a
+process-wide atomic: every worker's `BlockBuilder` after each blob (split
+into dense vectors, wire scratch with `group_buf` and `elem_scratch` apart,
+string table bytes, slots and index, encode buffer), each framing thread's
+`FrameScratch` after each frame (blob, header and compression buffers, and
+the zstd context's `sizeof`), by thread role (worker, drain, executor),
+and the drain's own create builder. The earlier stages were counted again:
+frames from `frame_blob_pipelined` until the parallel writer's pool wrote
+them (rewrite results in progress, queued, reordered and past the writer
+handoff in one figure), decode buffers in use and idle in the pools, read
+buffers and the workers' small scratch. Capacities, not occupied bytes;
+`uordblks` also holds chunk overhead and tcache chunks, so the remainder is
+approximate.
+
+Summed over the 30 workers, MB, steady node phase / end of the node phase
+/ way phase:
+
+| owner | node | late node | way |
+|---|---|---|---|
+| `BlockBuilder` total | 320-334 | 455 | 503-532 |
+| of it: string table bytes, slots, index | 59, 55, 17 | 111, 58, 18 | 111, 60, 18 |
+| of it: `elem_scratch` | 71 | 112 | 112 |
+| of it: `group_buf` | 17 | 22 | 59-83 |
+| of it: encode buffer | 70-75 | 80-87 | 94-100 |
+| of it: dense vectors | 36-38 | 44.5 | 44.5 (unused in the way phase) |
+| `FrameScratch` buffers | 104-111 | 128 | 153-164 |
+| of it: compression buffer, blob buffer | 79, 31 | 95, 33 | 97, 56-65 |
+| zstd contexts | 17.5 | 17.5 | 17.5 |
+
+The 32 executor threads built at the node-to-way transition hold 24 MB of
+frame scratch and zstd contexts between them; the drain's builder 0.5 MB.
+What is left of `uordblks` after every counted stage and these owners is
+40 to 110 MB and flat for the whole run. So the earlier figure, 0.5 GB
+through the node phase rising to 0.8 GB, is this storage: 0.45 GB once the
+workers have seen their first blocks, growing as later node blocks (larger
+string tables: rewritten blocks keep their input block's whole table) and
+then the way phase's buffers raise each buffer's high water. Every buffer
+is under the 4 MiB release limit, so the rule works as designed; this is
+the working set of 30 kept builders. Not counted: the up to 32 per-chunk
+create builders an executor batch holds at the transition, live only
+during the batch (counted at their end only).
+
+Peak anon is set at the node-to-way transition: frames in flight burst to
+about 290 MB on top of this retained floor and the arena grows from 1.62
+to 1.84 GB, which stays.
+
+**The change**: two of these buffers held only a copy of bytes another
+retained buffer also held, and are gone. `StringTable::encode_to` writes
+the string table straight into the encode buffer behind a length computed
+from its slots, instead of staging the body in `elem_scratch` (which at
+planet was held at the size of the largest table a worker met), and the
+dense-node group is wrapped behind lengths computed from its body, one copy
+instead of two. `FrameScratch` keeps only the Blob body's few head bytes:
+the payload is read from the compression buffer (or the uncompressed
+block) when the frame is assembled or written, instead of being copied
+into a blob buffer first. Output bytes are unchanged.
+
+Interleaved main-tree cells after `fstrim`, order B, A, H, H, H, B, A, B,
+H, A, B (H = `062d7cce`, A = the string table and dense wrap alone, B =
+both changes):
+
+| arm | walls (s) | peak anon (MB) |
+|---|---|---|
+| `062d7cce` (`cd47ef65`, `7b961746`, `a764940a`, `6c65750e`) | 97.0, 103.7, 96.5, 95.6 | 2,032, 1,994, 2,148, 2,029 |
+| builder change alone (sidecars `fab96364`, `d02589ea`, `e35898fb`) | 95.3, 95.6, 98.5 | 1,903, 1,951, 2,071 |
+| both, landed (sidecars `0a74edf9`, `cae243bf`, `0fc8b513`, `b0b18472`) | 91.2, 92.8, 92.6, 97.7 | 1,917, 1,842, 1,927, 1,908 |
+
+Every cell of the landed change peaks below every HEAD cell: median about
+2,031 against 1,913 MB, -118 MB (6 %). Walls are not slower (medians 96.7
+and 92.7 s; not claimed as a speedup). The framing change's own increment
+over the builder change alone, about 38 MB of peak and 3 s of wall (faster
+in every adjacent pair), is under the noise floor on both counts; it
+landed as the removal of a duplicate retained buffer and a payload copy on
+every framing thread, not for its numbers.
+
+What remains of the retained storage is each buffer's share of one block,
+the rest of which no change here touches: the encode buffer, the
+compression buffer (reserved at the compression bound of the raw block),
+way and relation groups staged in `group_buf` before the string table
+ahead of them is final, the string table itself, and dense vectors kept
+through the way phase (44.5 MB). Each of the last two is about 2 % of the
+peak.
 
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 

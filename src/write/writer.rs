@@ -1379,21 +1379,21 @@ impl<W: Write> PbfWriter<W> {
         // framing closure does; the header frame is not a payload.
         if blob_type == "OSMData" {
             metrics.payload_framed_items.fetch_add(1, Relaxed);
-            metrics.payload_framed_bytes.fetch_add(
-                (frame.prefix.len() + frame.header.len() + frame.blob.len()) as u64,
-                Relaxed,
-            );
+            metrics
+                .payload_framed_bytes
+                .fetch_add(frame.len() as u64, Relaxed);
         }
-        // Write the 3 frame parts directly - no intermediate `out` Vec. One
+        // Write the frame parts directly - no intermediate `out` Vec. One
         // handoff; bytes counted per part, like every other backend.
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
         metrics.time_handoff(|| {
-            write_accepted(&mut *writer, &frame.prefix, metrics)?;
-            write_accepted(&mut *writer, frame.header, metrics)?;
-            write_accepted(&mut *writer, frame.blob, metrics)
+            frame
+                .parts()
+                .into_iter()
+                .try_for_each(|part| write_accepted(&mut *writer, part, metrics))
         })
     }
 }

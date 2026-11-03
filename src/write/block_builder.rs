@@ -1083,8 +1083,7 @@ impl BlockBuilder {
         self.encode_buf.reserve(self.encode_reserve);
 
         // PrimitiveBlock field 1: StringTable submessage
-        self.string_table
-            .encode_to(&mut self.encode_buf, &mut self.elem_scratch);
+        self.string_table.encode_to(&mut self.encode_buf)?;
 
         match block_type {
             BlockType::DenseNodes => {
@@ -1094,7 +1093,7 @@ impl BlockBuilder {
                 // Note: we do NOT set granularity, lat_offset, lon_offset, or
                 // date_granularity. Omitting them uses the protobuf defaults
                 // (granularity=100, offsets=0, date_gran=1000).
-                self.encode_dense_nodes_group();
+                self.encode_dense_nodes_group()?;
             }
             BlockType::Ways | BlockType::Relations => {
                 // PrimitiveBlock field 2: PrimitiveGroup submessage
@@ -1237,7 +1236,7 @@ impl BlockBuilder {
     ///   version (int32 packed, field 1), timestamp (sint64 packed, field 2),
     ///   changeset (sint64 packed, field 3), uid (sint32 packed, field 4),
     ///   user_sid (sint32 packed, field 5), visible (bool packed, field 6).
-    fn encode_dense_nodes_group(&mut self) {
+    fn encode_dense_nodes_group(&mut self) -> Result<()> {
         // Build the DenseNodes body into group_buf (reused scratch)
         self.group_buf.clear();
 
@@ -1318,12 +1317,24 @@ impl BlockBuilder {
             &self.dense_keys_vals,
         );
 
-        // Wrap DenseNodes as PrimitiveGroup field 2 (submessage)
-        self.elem_scratch.clear();
-        encode_bytes_field(&mut self.elem_scratch, 2, &self.group_buf);
-
-        // Write PrimitiveGroup as PrimitiveBlock field 2
-        encode_bytes_field(&mut self.encode_buf, 2, &self.elem_scratch);
+        // Write PrimitiveBlock field 2 (PrimitiveGroup) holding PrimitiveGroup
+        // field 2 (DenseNodes, the body in group_buf). Both lengths follow
+        // from the body's, so the body is copied once, straight behind the
+        // two prefixes, instead of being wrapped in a scratch buffer first.
+        // The body is never empty: a dense block holds at least one node, and
+        // its id field is written whatever the id.
+        debug_assert!(!self.group_buf.is_empty());
+        let overflow = || crate::error::Error::internal("dense node group length overflows usize");
+        let dense_len = self.group_buf.len();
+        let group_len = super::encode::len_field_size(dense_len).ok_or_else(overflow)?;
+        self.encode_buf
+            .reserve(super::encode::len_field_size(group_len).ok_or_else(overflow)?);
+        for len in [group_len, dense_len] {
+            protohoggr::encode_tag(&mut self.encode_buf, 2, protohoggr::WIRE_LEN);
+            protohoggr::encode_varint(&mut self.encode_buf, len as u64);
+        }
+        self.encode_buf.extend_from_slice(&self.group_buf);
+        Ok(())
     }
 
     fn reset(&mut self) {

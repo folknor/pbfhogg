@@ -804,6 +804,7 @@ full file per step: passthrough saves little there.
 - Dense node vectors pre-allocated up to the requested cap and preallocation budget
 - String table: one byte arena plus `(start, end)` slots, deduplicated through a `hashbrown::HashTable` of slot numbers keyed by the slot's bytes - no allocation per string; `clear()` keeps the capacity
 - Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
+- `encode_block` writes the string table and the dense-node group straight into `encode_buf` behind lengths computed first, so no scratch buffer stages a whole block's string table or group: `elem_scratch` holds one element's body or one packed field, `group_buf` the way or relation messages, or one dense group copied once
 - Every retained buffer (dense vectors, wire scratch, string table, encode buffer) above `MAX_RETAINED_SCRATCH_CAPACITY` is released at the next block, so a builder kept for a whole run holds a fixed bound per buffer
 - `take()` - lends the block from `encode_buf`, which stays with the builder
 - `lend_encoded(f)` - lends the block, its index and tagdata to `f` for the duration of the call; once `f` has succeeded, an `encode_buf` grown past the retention limit is released, so a lender never keeps its last outlier block between tasks
@@ -819,10 +820,10 @@ blob and no encode buffer changes hands. Producers that hand blocks to the
 writer keep `Vec<OwnedBlock>` (the other `BlockSink`).
 
 **PbfWriter** - `src/write/writer.rs`:
-- `FrameScratch` - `blob_buf`, `header_buf`, `compress_buf`, lazy-init `Compress`/`zstd::Compressor`
+- `FrameScratch` - `body_head` (the Blob body's few bytes ahead of its payload), `header_buf`, `compress_buf` (the compressed payload), lazy-init `Compress`/`zstd::Compressor`
 - Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
-- `frame_in_scratch()` - the one framing implementation (size guards, header encoding, metrics); frames into the scratch in place
-- `frame_blob_into()` - pipelined hand-off: copies the prefix, header and body into one exactly sized frame (timed into `writer_frame_ns`); the scratch keeps all its buffers, an outlier above the retention limit dropped once the frame is assembled. The frame travels as `OutputChunk::Raw` and no backend flattens anything
+- `frame_in_scratch()` - the one framing implementation (size guards, header encoding, metrics); frames in place as four borrowed parts (prefix, header, body head, payload), the payload left in `compress_buf` or, uncompressed, in the caller's block, never copied into the scratch
+- `frame_blob_into()` - pipelined hand-off: copies the four parts into one exactly sized frame (timed into `writer_frame_ns`); the scratch keeps all its buffers, an outlier above the retention limit dropped once the frame is assembled. The frame travels as `OutputChunk::Raw` and no backend flattens anything
 - `write_framed_blob()` - sync hand-off: writes the parts straight from the scratch, no per-blob allocation after warmup
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
 - Pipelined writer thread - a sequence-number reorder buffer

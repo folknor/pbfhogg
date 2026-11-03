@@ -14,7 +14,7 @@ use flate2::Compress;
 use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
 use flate2::Status;
-use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_int32_field};
+use protohoggr::{encode_bytes_field, encode_int32_field};
 
 use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 use crate::write::metrics::WriterMetrics;
@@ -35,11 +35,14 @@ const OSM_HEADER: &str = "OSMHeader";
 /// to keep steady-state allocation flat. An oversized buffer is not retained
 /// in a rayon thread for the process lifetime.
 pub(super) struct FrameScratch {
-    /// Blob protobuf body (raw/compressed data fields).
-    pub(super) blob_buf: Vec<u8>,
+    /// The Blob body's fields ahead of its payload bytes: `raw_size` and the
+    /// payload field's tag and length (a dozen bytes at most). The payload
+    /// itself is never copied in here; see [`ScratchFrame`].
+    pub(super) body_head: Vec<u8>,
     /// BlobHeader protobuf.
     pub(super) header_buf: Vec<u8>,
-    /// Intermediate compression output (zlib/zstd only).
+    /// Compression output (zlib/zstd only): the payload of a compressed
+    /// blob, read from here by whoever writes the frame.
     compress_buf: Vec<u8>,
     /// Reusable zlib compressor (lazy-initialized on first zlib blob).
     zlib_compressor: Option<(u32, Compress)>,
@@ -50,7 +53,7 @@ pub(super) struct FrameScratch {
 impl FrameScratch {
     pub(super) const fn new() -> Self {
         Self {
-            blob_buf: Vec::new(),
+            body_head: Vec::new(),
             header_buf: Vec::new(),
             compress_buf: Vec::new(),
             zlib_compressor: None,
@@ -58,22 +61,14 @@ impl FrameScratch {
         }
     }
 
+    /// Drop a buffer grown past `MAX_RETAINED_SCRATCH_CAPACITY`. Only
+    /// between frames: a [`ScratchFrame`] borrows the header and the payload
+    /// from here until its frame is written or assembled.
     pub(super) fn trim_oversize_retained_buffers(&mut self, metrics: &WriterMetrics) {
-        if self.blob_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.blob_buf.capacity(), metrics);
-            self.blob_buf = Vec::new();
-        }
         if self.header_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
             Self::record_capped_capacity(self.header_buf.capacity(), metrics);
             self.header_buf = Vec::new();
         }
-        if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.compress_buf.capacity(), metrics);
-            self.compress_buf = Vec::new();
-        }
-    }
-
-    fn trim_oversize_compress_buffer(&mut self, metrics: &WriterMetrics) {
         if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
             Self::record_capped_capacity(self.compress_buf.capacity(), metrics);
             self.compress_buf = Vec::new();
@@ -155,12 +150,14 @@ pub(crate) fn frame_blob_pipelined(
 ///
 /// # Per-call cost
 ///
-/// The scratch keeps all three of its buffers and both compressors, so
-/// after warmup a call allocates exactly one `Vec<u8>` - the frame - and
-/// copies the header and body into it once, timed into `writer_frame_ns`.
-/// A scratch buffer grown past `MAX_RETAINED_SCRATCH_CAPACITY` is dropped
-/// once its frame is assembled (and on every error return), so an outlier
-/// is not pinned on a long-lived executor thread.
+/// The scratch keeps its buffers and both compressors, so after warmup a
+/// call allocates exactly one `Vec<u8>` - the frame - and copies the header
+/// and body into it once, timed into `writer_frame_ns`: the payload straight
+/// from the compressor's output, or from `uncompressed` itself under
+/// `Compression::None`. A scratch buffer grown past
+/// `MAX_RETAINED_SCRATCH_CAPACITY` is dropped once its frame is assembled
+/// (and on every error return), so an outlier is not pinned on a long-lived
+/// executor thread.
 ///
 /// This replaced a hand-off of the header and body as separate buffers,
 /// swapped out of the scratch with two freshly allocated replacements
@@ -206,26 +203,58 @@ pub(super) fn frame_blob_into(
         metrics,
     )?;
     let t_assemble = crate::counters::Stopwatch::start();
-    let mut frame = Vec::with_capacity(4 + framed.header.len() + framed.blob.len());
-    frame.extend_from_slice(&framed.prefix);
-    frame.extend_from_slice(framed.header);
-    frame.extend_from_slice(framed.blob);
+    let mut frame = Vec::with_capacity(framed.len());
+    for part in framed.parts() {
+        frame.extend_from_slice(part);
+    }
     t_assemble.record_ns(&metrics.frame_ns);
     scratch.trim_oversize_retained_buffers(metrics);
     Ok(frame)
 }
 
-/// A blob framed in place: the three wire parts, the header and body still
-/// borrowed from the [`FrameScratch`] that produced them.
+/// A blob framed in place: the frame's wire parts in order, borrowed from
+/// the [`FrameScratch`] that produced them and, under `Compression::None`,
+/// from the block bytes themselves.
+///
+/// The Blob body is two parts, its head (`raw_size` and the payload field's
+/// tag and length) and its payload, so the payload is never copied into a
+/// scratch buffer of its own: a compressed payload stays in the
+/// compressor's output buffer and an uncompressed one in the caller's
+/// block. A body buffer holding a copy of the payload was a second retained
+/// buffer the size of the largest compressed block on every framing thread
+/// (about 2 MB on each of apply-changes' 30 planet workers), and one more
+/// copy of every frame's bytes.
 pub(super) struct ScratchFrame<'a> {
     /// The 4-byte big-endian `BlobHeader` length.
     pub(super) prefix: [u8; 4],
     pub(super) header: &'a [u8],
-    pub(super) blob: &'a [u8],
+    pub(super) body_head: &'a [u8],
+    pub(super) payload: &'a [u8],
 }
 
-/// Compress and frame a blob into `scratch.header_buf` / `scratch.blob_buf`,
-/// leaving both in place. The one owner of the framing rules - size limits,
+impl<'a> ScratchFrame<'a> {
+    /// The frame's bytes, in wire order: prefix, header, body head, payload.
+    pub(super) fn parts(&self) -> [&[u8]; 4] {
+        [&self.prefix, self.header, self.body_head, self.payload]
+    }
+
+    /// The frame's length in bytes.
+    pub(super) fn len(&self) -> usize {
+        self.parts().iter().map(|part| part.len()).sum()
+    }
+}
+
+/// Where a Blob body's payload bytes are: [`encode_blob_body`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadSource {
+    /// The uncompressed block itself (`Compression::None`).
+    Input,
+    /// `FrameScratch::compress_buf`.
+    Compressed,
+}
+
+/// Compress and frame a blob into `scratch`, leaving every part in place
+/// (see [`ScratchFrame`]). The one owner of the framing rules - size limits,
 /// header encoding and the `compress_ns` / `frame_ns` / `bytes_framed`
 /// metrics - for both write paths, which differ only in what they do with
 /// the result:
@@ -241,11 +270,13 @@ pub(super) struct ScratchFrame<'a> {
 /// [`encode_frame_header`], shared with the passthrough reframe; compression,
 /// scratch retention and the metrics stay here.
 ///
-/// On an error return, oversize retained buffers have been trimmed.
+/// On an error return, oversize retained buffers have been trimmed. On
+/// success they have not: the returned parts borrow them, so the caller
+/// trims once it has written or assembled the frame.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn frame_in_scratch<'a>(
     blob_type: &str,
-    uncompressed: &[u8],
+    uncompressed: &'a [u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
@@ -263,16 +294,23 @@ pub(super) fn frame_in_scratch<'a>(
     } else {
         OversizePart::Payload
     };
-    if let Err(error) = encode_blob_body(uncompressed, compression, payload_part, scratch) {
-        scratch.trim_oversize_retained_buffers(metrics);
-        return Err(error);
-    }
+    let source = match encode_blob_body(uncompressed, compression, payload_part, scratch) {
+        Ok(source) => source,
+        Err(error) => {
+            scratch.trim_oversize_retained_buffers(metrics);
+            return Err(error);
+        }
+    };
     t_compress.record_ns(&metrics.compress_ns);
     let t_frame = crate::counters::Stopwatch::start();
+    let payload_len = match source {
+        PayloadSource::Input => uncompressed.len(),
+        PayloadSource::Compressed => scratch.compress_buf.len(),
+    };
 
     let prefix = match encode_frame_header(
         blob_type,
-        scratch.blob_buf.len(),
+        scratch.body_head.len() + payload_len,
         indexdata,
         tagdata,
         way_members,
@@ -285,19 +323,18 @@ pub(super) fn frame_in_scratch<'a>(
             return Err(error);
         }
     };
-    // `compress_buf` is never handed off, so drop an outlier before the next
-    // blob can reuse this scratch. The error return above ran the full trim
-    // already.
-    scratch.trim_oversize_compress_buffer(metrics);
-
-    let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
-    t_frame.record_ns(&metrics.frame_ns);
-    metrics.bytes_framed.fetch_add(total_len as u64, Relaxed);
-    Ok(ScratchFrame {
+    let frame = ScratchFrame {
         prefix,
         header: &scratch.header_buf,
-        blob: &scratch.blob_buf,
-    })
+        body_head: &scratch.body_head,
+        payload: match source {
+            PayloadSource::Input => uncompressed,
+            PayloadSource::Compressed => &scratch.compress_buf,
+        },
+    };
+    t_frame.record_ns(&metrics.frame_ns);
+    metrics.bytes_framed.fetch_add(frame.len() as u64, Relaxed);
+    Ok(frame)
 }
 
 /// Encode the `BlobHeader` for a `body_len`-byte Blob body into `header_buf`
@@ -361,16 +398,19 @@ fn encode_frame_header(
     Ok(header_len.to_be_bytes())
 }
 
-/// Encode the Blob protobuf body (optionally compressed) into scratch buffers.
+/// Encode the Blob protobuf body (optionally compressed): its head into
+/// `scratch.body_head`, its payload compressed into `scratch.compress_buf`
+/// or left in `uncompressed`, as the returned [`PayloadSource`] says. The
+/// body is the head followed by the payload.
 ///
-/// Uses `compress_buf` as an intermediate for zlib/zstd compression output.
 /// Both zlib and zstd compressors are lazy-initialized and reused to avoid
 /// ~312 KB (zlib) or ~512 KB (zstd) of compressor state allocation per blob.
 ///
 /// # Why the payload field is always emitted
 ///
-/// The payload (`raw`, `zlib_data`, or `zstd_data`) is written with the
-/// `_always` encoder, not the skip-if-empty one. A `Blob` carries exactly one
+/// The payload field's head (`raw`, `zlib_data`, or `zstd_data`: tag and
+/// length) is always written, a zero length included, never skipped when
+/// the payload is empty. A `Blob` carries exactly one
 /// payload field and it is what identifies the blob's encoding; with
 /// skip-if-empty, a zero-length payload produced a `Blob` message with *no
 /// fields at all* for `Compression::None`, which no reader can distinguish
@@ -390,8 +430,8 @@ fn encode_blob_body(
     compression: &Compression,
     payload_part: OversizePart,
     scratch: &mut FrameScratch,
-) -> Result<()> {
-    scratch.blob_buf.clear();
+) -> Result<PayloadSource> {
+    scratch.body_head.clear();
     // Check once per blob, before compression or copying. The encoded-body
     // guard cannot catch a highly compressible oversized block. Element caps
     // do not bound bytes: even one element can carry a very large tag value.
@@ -408,10 +448,12 @@ fn encode_blob_body(
         Compression::None => {
             // Blob field 1: raw (bytes, len-delimited). Always emitted; see
             // the doc block.
-            encode_bytes_field_always(&mut scratch.blob_buf, blob::RAW, uncompressed);
+            encode_payload_field_head(&mut scratch.body_head, blob::RAW, uncompressed.len());
+            Ok(PayloadSource::Input)
         }
         Compression::Zlib(level) => {
             compress_zlib(uncompressed, *level, scratch)?;
+            Ok(PayloadSource::Compressed)
         }
         Compression::Zstd(level) => {
             let compressor = match &mut scratch.zstd_compressor {
@@ -440,16 +482,25 @@ fn encode_blob_body(
                 ))
             })?;
             // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(&mut scratch.blob_buf, blob::RAW_SIZE, raw_size);
+            encode_int32_field(&mut scratch.body_head, blob::RAW_SIZE, raw_size);
             // Blob field 7: zstd_data (bytes, len-delimited). Always emitted.
-            encode_bytes_field_always(
-                &mut scratch.blob_buf,
+            encode_payload_field_head(
+                &mut scratch.body_head,
                 blob::ZSTD_DATA,
-                &scratch.compress_buf,
+                scratch.compress_buf.len(),
             );
+            Ok(PayloadSource::Compressed)
         }
     }
-    Ok(())
+}
+
+/// The tag and length of a Blob payload field (`raw`, `zlib_data`,
+/// `zstd_data`) whose `len` bytes follow it, appended to `head`: what
+/// `encode_bytes_field_always` writes ahead of the bytes. Always written,
+/// a zero length included; see `encode_blob_body`.
+fn encode_payload_field_head(head: &mut Vec<u8>, field: u32, len: usize) {
+    protohoggr::encode_tag(head, field, protohoggr::WIRE_LEN);
+    protohoggr::encode_varint(head, len as u64);
 }
 
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
@@ -486,12 +537,12 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
             uncompressed.len()
         ))
     })?;
-    encode_int32_field(&mut scratch.blob_buf, blob::RAW_SIZE, raw_size);
+    encode_int32_field(&mut scratch.body_head, blob::RAW_SIZE, raw_size);
     // Blob field 3: zlib_data. Always emitted; see `encode_blob_body`.
-    encode_bytes_field_always(
-        &mut scratch.blob_buf,
+    encode_payload_field_head(
+        &mut scratch.body_head,
         blob::ZLIB_DATA,
-        &scratch.compress_buf,
+        scratch.compress_buf.len(),
     );
     Ok(())
 }
@@ -744,6 +795,60 @@ mod tests {
     use super::*;
     use crate::read::blob_wire::WireBlobHeader;
 
+    /// The Blob body `encode_blob_body` produced: its head, then its payload
+    /// from wherever the returned source says it is.
+    fn encoded_body(
+        uncompressed: &[u8],
+        compression: &Compression,
+        scratch: &mut FrameScratch,
+    ) -> Vec<u8> {
+        let source = encode_blob_body(uncompressed, compression, OversizePart::Payload, scratch)
+            .expect("body must encode");
+        let payload = match source {
+            PayloadSource::Input => uncompressed,
+            PayloadSource::Compressed => scratch.compress_buf.as_slice(),
+        };
+        [scratch.body_head.as_slice(), payload].concat()
+    }
+
+    /// The body head plus payload is exactly the Blob message the old
+    /// single-buffer encoder wrote (`raw_size` then the payload field), for
+    /// every compression. The uncompressed payload is never copied into the
+    /// scratch.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn body_head_and_payload_spell_the_whole_blob() {
+        use protohoggr::encode_bytes_field_always;
+        let block: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for compression in [
+            Compression::None,
+            Compression::Zlib(1),
+            Compression::Zstd(1),
+        ] {
+            let mut scratch = FrameScratch::new();
+            let body = encoded_body(&block, &compression, &mut scratch);
+            let mut expected = Vec::new();
+            match compression {
+                Compression::None => {
+                    encode_bytes_field_always(&mut expected, blob::RAW, &block);
+                    assert!(scratch.compress_buf.is_empty(), "no copy of a raw payload");
+                }
+                Compression::Zlib(_) | Compression::Zstd(_) => {
+                    let field = if matches!(compression, Compression::Zlib(_)) {
+                        blob::ZLIB_DATA
+                    } else {
+                        blob::ZSTD_DATA
+                    };
+                    let raw_size = i32::try_from(block.len()).expect("fits");
+                    encode_int32_field(&mut expected, blob::RAW_SIZE, raw_size);
+                    encode_bytes_field_always(&mut expected, field, &scratch.compress_buf);
+                }
+            }
+            assert_eq!(body, expected, "{compression:?}");
+            assert!(scratch.body_head.len() <= 12, "the head is a few bytes");
+        }
+    }
+
     #[test]
     fn oversized_raw_payload_is_refused_before_compression() {
         let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits") + 1];
@@ -757,7 +862,7 @@ mod tests {
                 encode_blob_body(&payload, &compression, OversizePart::Payload, &mut scratch)
                     .expect_err("compression must not hide an oversized raw block");
             assert!(error.to_string().contains("uncompressed blob payload"));
-            assert!(scratch.blob_buf.is_empty());
+            assert!(scratch.body_head.is_empty());
             assert!(scratch.compress_buf.is_empty());
             assert!(scratch.zlib_compressor.is_none());
             assert!(scratch.zstd_compressor.is_none());
@@ -793,9 +898,8 @@ mod tests {
     /// Said plainly, because an arm that cannot fail is worth exactly nothing
     /// unless its reader knows that. Zlib and zstd both turn a zero-byte
     /// input into a non-empty stream - a header and an end marker - so their
-    /// payload field is non-empty whichever encoder writes it, and reverting
-    /// those two call sites to `encode_bytes_field` would leave this test
-    /// green. `Compression::None` is the arm that carries the property: it is
+    /// payload field is non-empty however its head is written, and making
+    /// those two heads skip an empty payload would leave this test green. `Compression::None` is the arm that carries the property: it is
     /// the only path where the payload bytes are the block's bytes and are
     /// therefore empty when the block is. The compressed arms are kept as
     /// field-numbering and no-panic regression cover, not as evidence for the
@@ -810,10 +914,9 @@ mod tests {
             Compression::Zstd(1),
         ] {
             let mut scratch = FrameScratch::new();
-            encode_blob_body(&[], &compression, OversizePart::Payload, &mut scratch)
-                .expect("empty body must encode");
+            let body = encoded_body(&[], &compression, &mut scratch);
             assert!(
-                !scratch.blob_buf.is_empty(),
+                !body.is_empty(),
                 "{compression:?}: an empty payload produced a Blob message \
                  with no fields at all"
             );
@@ -823,7 +926,7 @@ mod tests {
                 Compression::Zlib(_) => 3,
                 Compression::Zstd(_) => 7,
             };
-            let present = present_field_numbers(&scratch.blob_buf);
+            let present = present_field_numbers(&body);
             assert!(
                 present.contains(&payload_field),
                 "{compression:?}: encoded Blob carries fields {present:?}, \
@@ -835,16 +938,15 @@ mod tests {
     /// The exact bytes of an empty uncompressed `Blob`.
     ///
     /// This is the assertion that actually bites for the `_always` rule:
-    /// swap `encode_bytes_field_always` back to `encode_bytes_field` in the
+    /// skip the payload field's head for an empty payload in the
     /// `Compression::None` arm of `encode_blob_body` and the output becomes
     /// zero bytes instead of these two.
     #[test]
     fn no_payload_bytes_reach_the_output_uncompressed() {
         let mut scratch = FrameScratch::new();
-        encode_blob_body(&[], &Compression::None, OversizePart::Payload, &mut scratch)
-            .expect("empty body must encode");
+        let body = encoded_body(&[], &Compression::None, &mut scratch);
         assert_eq!(
-            scratch.blob_buf.as_slice(),
+            body.as_slice(),
             // Field 1, wire type 2 (0x0a), length 0.
             &[0x0a, 0x00],
             "an empty uncompressed Blob must still spell out its `raw` field \
@@ -894,86 +996,106 @@ mod tests {
 
     /// Pipelined framing hands out one exactly sized frame and keeps every
     /// scratch buffer warm: the frame's bytes are the sync path's
-    /// `prefix | header | blob`, its capacity is its length (nothing over-
-    /// reserved travels to the writer), and a second, smaller blob reuses
-    /// the scratch without regrowing it. An outlier above the retention
-    /// limit is dropped once its frame is assembled.
+    /// `prefix | header | body head | payload`, its capacity is its length
+    /// (nothing over-reserved travels to the writer), and a second, smaller
+    /// blob reuses the scratch without regrowing it. An outlier above the
+    /// retention limit is dropped once its frame is assembled, not before:
+    /// the compressed payload is read from the scratch until then.
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn framing_hands_out_one_exact_frame_and_keeps_the_scratch() {
-        let mut scratch = FrameScratch::new();
-        let metrics = WriterMetrics::new();
-        let payload = vec![7u8; 64 * 1024];
-        let first = frame_blob_into(
-            "OSMData",
-            &payload,
-            &Compression::None,
-            None,
-            None,
-            None,
-            &mut scratch,
-            &metrics,
-        )
-        .expect("first blob must frame");
-        let expected: Vec<u8> = {
+        let frame = |payload: &[u8], compression: Compression, scratch: &mut FrameScratch| {
+            frame_blob_into(
+                "OSMData",
+                payload,
+                &compression,
+                None,
+                None,
+                None,
+                scratch,
+                &WriterMetrics::new(),
+            )
+            .expect("blob must frame")
+        };
+        let parts_of = |payload: &[u8], compression: Compression| -> Vec<u8> {
             let mut probe = FrameScratch::new();
             let parts = frame_in_scratch(
                 "OSMData",
-                &payload,
-                &Compression::None,
+                payload,
+                &compression,
                 None,
                 None,
                 None,
                 &mut probe,
-                &metrics,
+                &WriterMetrics::new(),
             )
             .expect("probe must frame");
-            [&parts.prefix[..], parts.header, parts.blob].concat()
+            parts.parts().concat()
         };
-        assert_eq!(first, expected, "the frame is prefix, header and blob");
-        assert_eq!(first.capacity(), first.len(), "the frame is exactly sized");
-        let warmed_blob_cap = scratch.blob_buf.capacity();
-        assert!(
-            warmed_blob_cap >= payload.len(),
-            "the scratch must keep its blob buffer, got {warmed_blob_cap}"
-        );
-        assert!(scratch.header_buf.capacity() > 0, "header buffer kept");
+        let payload = vec![7u8; 64 * 1024];
+        for compression in [Compression::None, Compression::Zstd(1)] {
+            let mut scratch = FrameScratch::new();
+            let first = frame(&payload, compression, &mut scratch);
+            assert_eq!(first, parts_of(&payload, compression), "{compression:?}");
+            assert_eq!(first.capacity(), first.len(), "the frame is exactly sized");
+            assert!(scratch.header_buf.capacity() > 0, "header buffer kept");
+        }
+        let raw = frame(&[1, 2, 3], Compression::None, &mut FrameScratch::new());
+        assert!(raw.ends_with(&[0x0a, 3, 1, 2, 3]), "raw field of 3 bytes");
 
-        let second = frame_blob_into(
-            "OSMData",
-            &[1, 2, 3],
-            &Compression::None,
-            None,
-            None,
-            None,
-            &mut scratch,
-            &metrics,
-        )
-        .expect("second blob must frame");
-        assert!(
-            second.ends_with(&[0x0a, 3, 1, 2, 3]),
-            "raw field of 3 bytes"
-        );
+        let mut scratch = FrameScratch::new();
+        frame(&payload, Compression::Zstd(1), &mut scratch);
+        let warmed = scratch.compress_buf.capacity();
+        assert!(warmed > 0, "the compressor's output buffer is kept");
+        frame(&[1, 2, 3], Compression::Zstd(1), &mut scratch);
         assert_eq!(
-            scratch.blob_buf.capacity(),
-            warmed_blob_cap,
+            scratch.compress_buf.capacity(),
+            warmed,
             "a smaller blob reuses the scratch without regrowing it"
         );
 
-        let big = vec![1u8; MAX_RETAINED_SCRATCH_CAPACITY + 1];
-        frame_blob_into(
-            "OSMData",
-            &big,
-            &Compression::None,
-            None,
-            None,
-            None,
-            &mut scratch,
-            &metrics,
-        )
-        .expect("outlier must frame");
+        let big: Vec<u8> = (0..MAX_RETAINED_SCRATCH_CAPACITY + 1)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        {
+            // The outlier's compression buffer really is past the limit while
+            // its frame borrows it: the trim has something to drop.
+            let mut probe = FrameScratch::new();
+            let parts = frame_in_scratch(
+                "OSMData",
+                &big,
+                &Compression::Zstd(1),
+                None,
+                None,
+                None,
+                &mut probe,
+                &WriterMetrics::new(),
+            )
+            .expect("outlier must frame");
+            assert!(parts.payload.len() > 1024, "incompressible payload");
+            assert!(probe.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY);
+        }
+        let framed = frame(&big, Compression::Zstd(1), &mut scratch);
+        let mut decoded = Vec::new();
+        {
+            // The assembled outlier frame carries the whole block: its body is
+            // read back from the frame and decompressed.
+            let header_len = u32::from_be_bytes(framed[..4].try_into().expect("prefix")) as usize;
+            let body = &framed[4 + header_len..];
+            let mut cursor = protohoggr::Cursor::new(body);
+            while let Some((field, _)) = cursor.read_tag().expect("tag") {
+                if field == blob::ZSTD_DATA {
+                    let data = cursor.read_len_delimited().expect("payload");
+                    decoded = zstd::bulk::decompress(data, big.len()).expect("zstd");
+                } else {
+                    cursor.read_varint().expect("raw_size");
+                }
+            }
+        }
+        assert_eq!(decoded, big, "outlier frame intact");
         assert!(
-            scratch.blob_buf.capacity() <= MAX_RETAINED_SCRATCH_CAPACITY,
-            "an outlier blob buffer is not retained"
+            scratch.compress_buf.capacity() <= MAX_RETAINED_SCRATCH_CAPACITY,
+            "an outlier compression buffer is not retained"
         );
     }
 

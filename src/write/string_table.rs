@@ -6,7 +6,7 @@ use std::hash::BuildHasher;
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 
-use protohoggr::{encode_bytes_field, encode_bytes_field_always};
+use protohoggr::encode_bytes_field_always;
 
 use crate::PrimitiveBlock;
 use crate::read::wire_schema::{primitive_block, string_table};
@@ -178,21 +178,97 @@ impl StringTable {
         }
     }
 
-    /// Encode the string table directly to wire format bytes.
+    /// Encode the string table as `PrimitiveBlock` field 1, appended to `buf`.
     ///
-    /// StringTable has one field: `repeated bytes s = 1;`
-    pub(super) fn encode_to(&self, buf: &mut Vec<u8>, scratch: &mut Vec<u8>) {
-        scratch.clear();
+    /// StringTable has one field: `repeated bytes s = 1;`, one entry per
+    /// slot, slot zero, duplicate and empty slots included (raw sid identity
+    /// depends on every one). The body's length is computed from the slots
+    /// first, so the entries are written once, straight into `buf`, behind
+    /// their length prefix. Staging the body in a scratch buffer and copying
+    /// it would keep a second retained buffer the size of the largest table
+    /// the builder met: rewritten blocks keep their input block's whole
+    /// table, and at planet that staging buffer was the largest retained
+    /// buffer of apply-changes' rewrite workers.
+    ///
+    /// The body is never empty (slot zero alone takes two bytes), so the
+    /// field is always written, as the skip-if-empty encoder this replaced
+    /// always wrote it.
+    pub(super) fn encode_to(&self, buf: &mut Vec<u8>) -> crate::error::Result<()> {
+        use super::encode::{len_field_size, varint_len};
+        let overflow = || crate::error::Error::internal("string table length overflows usize");
+        let mut body_len = 0usize;
         for &(start, end) in &self.slots {
-            encode_bytes_field_always(scratch, string_table::STRINGS, &self.bytes[start..end]);
+            body_len = len_field_size(end - start)
+                .and_then(|n| body_len.checked_add(n))
+                .ok_or_else(overflow)?;
         }
-        encode_bytes_field(buf, primitive_block::STRING_TABLE, scratch);
+        let total = len_field_size(body_len).ok_or_else(overflow)?;
+        buf.reserve(total);
+        protohoggr::encode_tag(buf, primitive_block::STRING_TABLE, protohoggr::WIRE_LEN);
+        protohoggr::encode_varint(buf, body_len as u64);
+        let body_start = buf.len();
+        for &(start, end) in &self.slots {
+            encode_bytes_field_always(buf, string_table::STRINGS, &self.bytes[start..end]);
+        }
+        debug_assert_eq!(buf.len() - body_start, body_len);
+        debug_assert_eq!(1 + varint_len(body_len as u64) + body_len, total);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protohoggr::encode_bytes_field;
+
+    /// The staged encoding `encode_to` replaced: the body built in a scratch
+    /// buffer, then copied behind its length.
+    fn staged(table: &StringTable) -> Vec<u8> {
+        let mut body = Vec::new();
+        for i in 0..table.len() {
+            encode_bytes_field_always(&mut body, string_table::STRINGS, table.get(i));
+        }
+        let mut out = b"prefix".to_vec();
+        encode_bytes_field(&mut out, primitive_block::STRING_TABLE, &body);
+        out
+    }
+
+    /// The direct encoding is byte-identical to the staged one across the
+    /// varint width transitions of an entry's length (127/128, 16383/16384)
+    /// and of the body's (the table grows through 128 and 16384 bytes), with
+    /// duplicate and empty pre-seeded slots kept, and appends after what the
+    /// buffer already holds.
+    #[test]
+    fn direct_encoding_matches_the_staged_one_across_length_widths() {
+        let long = |n: usize| "x".repeat(n);
+        let mut strings = Vec::new();
+        for s in ["", "key", "", "key"] {
+            encode_bytes_field_always(&mut strings, string_table::STRINGS, s.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        encode_bytes_field(&mut bytes, primitive_block::STRING_TABLE, &strings);
+        let block = PrimitiveBlock::from_vec(bytes).expect("valid string table");
+        let mut table = StringTable::new();
+        table.pre_seed(&block);
+        let check = |table: &StringTable| {
+            let mut out = b"prefix".to_vec();
+            table.encode_to(&mut out).expect("encodes");
+            assert_eq!(out, staged(table));
+        };
+        check(&table);
+        for n in [
+            1, 126, 127, 128, 129, 16_382, 16_383, 16_384, 16_385, 300_000,
+        ] {
+            table.add(&long(n));
+            check(&table);
+        }
+        let mut fresh = StringTable::new();
+        check(&fresh);
+        for i in 0..40 {
+            fresh.add(&format!("s{i}"));
+            check(&fresh);
+        }
+    }
 
     #[test]
     fn pre_seed_preserves_duplicate_and_empty_slots() {

@@ -426,18 +426,20 @@ const _: () = assert!(
 );
 
 /// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks
-/// built under the default 8000-element cap are normally below this (each of
-/// the three frame buffers is sized by the block's raw or framed bytes;
-/// writer counters show few buffers capped at planet), so the cap only
+/// built under the default 8000-element cap are normally below this (the
+/// frame scratch's header and compression buffers are sized by the block's
+/// header and compressed bytes; writer counters show few buffers capped at
+/// planet), so the cap only
 /// engages on outliers. It is independent of the read side's `DecompressPool`
 /// limit, whose buffers also carry inline tables; a larger buffer is dropped
 /// once its frame is assembled, then the thread-local scratch is allowed to
 /// warm up again. A run whose blocks all exceed it (repack with a raised
 /// `--elements-per-blob`) pays a fresh allocation per buffer per block, which
 /// is small next to compressing a block of that size. Both write paths keep
-/// all three buffers across blobs (the pipelined path copies them into one
-/// owned frame), so they retain at most 12 MiB per `FrameScratch`, in
-/// addition to the reused compressor state.
+/// both buffers across blobs (the pipelined path copies them into one owned
+/// frame; the body's few head bytes have a buffer of their own that never
+/// approaches the limit), so they retain at most 8 MiB per `FrameScratch`,
+/// in addition to the reused compressor state.
 ///
 /// The same limit applies, per buffer, to everything a `BlockBuilder` keeps
 /// across blocks (its dense vectors, wire scratch, tag-key scratch, string

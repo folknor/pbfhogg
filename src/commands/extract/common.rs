@@ -335,15 +335,12 @@ where
     // by the consumer between them, in schedule order. Only a verified blob
     // is copied raw. An unverified `Candidate` is decoded: its indexdata
     // claim alone is not grounds to skip the filter.
-    let decode_at: Vec<usize> = schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| !matches!(d.passthrough, Passthrough::Verified { .. }))
-        .map(|(i, _)| i)
-        .collect();
+    let decode_at = crate::ordered_pool::DecodeSchedule::from_items(schedule, |d| {
+        !matches!(d.passthrough, Passthrough::Verified { .. })
+    });
     let decode_at = &decode_at;
     let mut consumer = PreadConsumer {
-        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         schedule,
         file: &shared_file,
         frame_read_buf: Vec::new(),
@@ -370,7 +367,7 @@ where
             gr_scratch: Vec::new(),
         },
         |(), local: &mut PreadLocal, ordinal| {
-            let d = &schedule[decode_at[ordinal]];
+            let d = &schedule[decode_at.position(ordinal)];
             // Workers: pread -> decompress -> PrimitiveBlock -> extract -> OwnedBlocks.
             (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
                 local.read_buf.resize(d.size, 0);

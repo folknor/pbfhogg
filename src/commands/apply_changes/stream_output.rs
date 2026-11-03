@@ -173,7 +173,22 @@ fn encode_and_frame(
     compression: &Compression,
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<(Option<Vec<u8>>, u64)> {
-    debug_assert!(bb.is_empty() && run.len() <= DEFAULT_ELEMENT_CAP.get());
+    // Each block starts on an empty builder (a flush always resets it, and
+    // the parallel path makes a fresh one per block) and holds at most one
+    // block's worth: `emit` cuts runs at the cap. Either broken would put
+    // other elements into this block or overflow it.
+    if !bb.is_empty() {
+        return Err(crate::error::Error::internal(
+            "apply-changes create block started on a builder that still holds elements",
+        ));
+    }
+    if run.len() > DEFAULT_ELEMENT_CAP.get() {
+        return Err(crate::error::Error::internal(format!(
+            "apply-changes create run of {} elements is over the {}-element block cap",
+            run.len(),
+            DEFAULT_ELEMENT_CAP.get()
+        )));
+    }
     let added = run.len() as u64;
     for i in run {
         match kind {

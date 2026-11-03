@@ -50,24 +50,14 @@ impl CoordStats {
     }
 
     fn record_block(&mut self, values: &[i32]) {
-        if values.is_empty() {
+        let Some((&first, rest)) = values.split_first() else {
             return;
-        }
-        let mut min = values[0];
-        let mut max = values[0];
-        for &v in &values[1..] {
-            if v < min {
-                min = v;
-            }
-            if v > max {
-                max = v;
-            }
-        }
-        // max >= min guaranteed, and both are i32, so difference is in [0, u32::MAX].
-        // i32::MAX - i32::MIN = 4_294_967_295 = u32::MAX, so this always succeeds.
-        debug_assert!(max >= min, "CoordStats: max ({max}) < min ({min})");
-        let diff = u64::try_from(i64::from(max) - i64::from(min)).unwrap_or(0);
-        let range = u32::try_from(diff).unwrap_or(u32::MAX);
+        };
+        let (min, max) = rest
+            .iter()
+            .fold((first, first), |(min, max), &v| (min.min(v), max.max(v)));
+        // The distance between two i32s always fits a u32.
+        let range = max.abs_diff(min);
         let bits = bits_needed(range);
         self.bucket_counts[bucket_index(bits)] += 1;
         self.total_blocks += 1;

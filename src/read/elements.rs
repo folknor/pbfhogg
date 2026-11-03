@@ -534,10 +534,7 @@ impl Iterator for WayNodeLocationsIter<'_> {
                 // Construction (`validate_way_geometry_arrays` in `block.rs`)
                 // rejects lat and lon arrays of different lengths, so both
                 // end together.
-                debug_assert!(
-                    dlat.is_none() && dlon.is_none(),
-                    "way lat/lon arrays differ in length"
-                );
+                super::block::arrays_end_together(dlat.is_none() && dlon.is_none(), "way lat/lon");
                 None
             }
         }
@@ -670,9 +667,9 @@ impl<'a> Iterator for RelMemberIter<'a> {
                 // Construction (`validate_relation_member_arrays` in
                 // `block.rs`) rejects member arrays of different lengths, so
                 // all three end together.
-                debug_assert!(
+                super::block::arrays_end_together(
                     role_sid.is_none() && id.is_none(),
-                    "relation member arrays differ in length"
+                    "relation member",
                 );
                 None
             }
@@ -719,9 +716,12 @@ impl Iterator for MemberIdIter<'_> {
             (id, member_type) => {
                 // Construction (`validate_relation_member_arrays` in
                 // `block.rs`) rejects member arrays of different lengths.
-                debug_assert!(
+                // Every constructor pairs the arrays of one relation from a
+                // block that passed it (the element walk, and the projection
+                // scanners on their accepted blob).
+                super::block::arrays_end_together(
                     id.is_none() && member_type.is_none(),
-                    "relation member arrays differ in length"
+                    "relation member",
                 );
                 None
             }
@@ -765,10 +765,7 @@ impl<'a> Iterator for TagIter<'a> {
             (k, v) => {
                 // Construction (`validate_tag_arrays` in `block.rs`) rejects
                 // keys and vals arrays of different lengths.
-                debug_assert!(
-                    k.is_none() && v.is_none(),
-                    "tag key/value arrays differ in length"
-                );
+                super::block::arrays_end_together(k.is_none() && v.is_none(), "tag key/value");
                 None
             }
         }
@@ -852,10 +849,7 @@ impl Iterator for RawTagIter<'_> {
             (k, v) => {
                 // Construction (`validate_tag_arrays` in `block.rs`) rejects
                 // keys and vals arrays of different lengths.
-                debug_assert!(
-                    k.is_none() && v.is_none(),
-                    "tag key/value arrays differ in length"
-                );
+                super::block::arrays_end_together(k.is_none() && v.is_none(), "tag key/value");
                 None
             }
         }
@@ -989,6 +983,39 @@ mod tests {
         };
         let coords: Vec<_> = locations.map(|p| (p.nano_lat(), p.nano_lon())).collect();
         assert_eq!(coords, [(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)]);
+    }
+
+    /// Parallel arrays of different lengths cannot come out of block
+    /// construction, so an iterator over them is a broken invariant and
+    /// panics instead of silently dropping the longer array's tail. Built
+    /// here by hand, as nothing else can build one.
+    #[test]
+    #[should_panic(expected = "tag key/value arrays differ in length")]
+    fn mismatched_tag_arrays_panic_instead_of_ending_early() {
+        let keys = [1_u8, 2];
+        let vals = [1_u8];
+        let tags = RawTagIter {
+            key_indices: PackedUint32Iter::new(&keys),
+            val_indices: PackedUint32Iter::new(&vals),
+        };
+        for _ in tags {}
+    }
+
+    #[test]
+    #[should_panic(expected = "way lat/lon arrays differ in length")]
+    fn mismatched_way_location_arrays_panic_instead_of_ending_early() {
+        let lats = [2_u8, 2];
+        let lons = [2_u8];
+        let locations = WayNodeLocationsIter {
+            dlats: PackedSint64Iter::new(&lats),
+            dlons: PackedSint64Iter::new(&lons),
+            clat: 0,
+            clon: 0,
+            granularity: 1,
+            lat_offset: 0,
+            lon_offset: 0,
+        };
+        for _ in locations {}
     }
 
     #[test]

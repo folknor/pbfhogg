@@ -259,17 +259,25 @@ impl AscendingTally {
     }
 
     /// Whether the IDs added are in order and `claim` is exact for them.
-    /// Only meaningful for a claim whose `min_id` is not negative.
-    pub(crate) fn holds(&self, claim: &BlobIndex) -> bool {
-        debug_assert!(
-            claim.min_id >= 0,
-            "AscendingTally decides non-negative claims only"
-        );
-        !self.descended
+    ///
+    /// A claim whose `min_id` is negative is not one this check decides (an
+    /// `i64`-ascending walk is not canonical OSM order once negative IDs are
+    /// in it), so it is an internal error rather than a verdict: a caller
+    /// reaches here only after refusing negative claims itself, and a `false`
+    /// for one would read as "disproved" when it means "undecided".
+    pub(crate) fn holds(&self, claim: &BlobIndex) -> Result<bool> {
+        if claim.min_id < 0 {
+            return Err(Error::internal(format!(
+                "AscendingTally decides non-negative claims only, and was handed one \
+                 starting at id {}",
+                claim.min_id
+            )));
+        }
+        Ok(!self.descended
             && self.count != 0
             && self.count == claim.count
             && self.first == claim.min_id
-            && self.last == claim.max_id
+            && self.last == claim.max_id)
     }
 }
 
@@ -418,12 +426,13 @@ mod tests {
                 for &id in ids {
                     t.add(id);
                 }
+                let holds = t.holds(c).unwrap();
                 assert_eq!(
-                    t.holds(c),
+                    holds,
                     walk(ids, Some(c), required).is_ok(),
                     "{ids:?} under {c:?}"
                 );
-                if !t.holds(c) {
+                if !holds {
                     let e = replay_refusal(c, required, ids.iter().copied());
                     assert!(
                         !matches!(e.kind(), crate::ErrorKind::Internal { .. }),
@@ -432,5 +441,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A negative claim is not decided by the ascending check: it is an
+    /// internal error, never a `false` that would read as a disproved claim.
+    #[test]
+    fn a_negative_claim_is_refused_as_undecided() {
+        let mut t = AscendingTally::default();
+        t.add(-1);
+        let e = t.holds(&claim(-1, -1, 1)).unwrap_err();
+        assert!(matches!(e.kind(), crate::ErrorKind::Internal { .. }), "{e}");
     }
 }

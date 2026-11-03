@@ -336,22 +336,23 @@ impl Error {
         })
     }
 
-    /// Classify a crate-owned leaf error (no cause of its own, its `Display`
-    /// is the whole message, such as a range check) as an invalid argument.
-    /// A leaf with a cause, or a foreign error, keeps that cause reachable
-    /// through `source()` by being attached when the kind is built.
+    /// Classify a leaf error (no cause of its own, its `Display` is the whole
+    /// message, such as a range check) as an invalid argument. Only types on
+    /// the [`Leaf`] whitelist are accepted, so an error with a cause cannot be
+    /// flattened into a message here by accident; one with a cause keeps it
+    /// reachable through `source()` by being attached when the kind is built.
     #[cold]
     #[must_use]
-    pub(crate) fn invalid_argument_from(leaf: impl StdError) -> Error {
-        debug_assert!(leaf.source().is_none(), "a leaf has no cause");
+    #[allow(clippy::needless_pass_by_value)] // a `map_err` adapter: takes the error it replaces
+    pub(crate) fn invalid_argument_from(leaf: impl Leaf) -> Error {
         Error::invalid_argument(leaf.to_string())
     }
 
     /// [`Error::invalid_argument_from`] for invalid input content.
     #[cold]
     #[must_use]
-    pub(crate) fn invalid_data_from(leaf: impl StdError) -> Error {
-        debug_assert!(leaf.source().is_none(), "a leaf has no cause");
+    #[allow(clippy::needless_pass_by_value)] // a `map_err` adapter: takes the error it replaces
+    pub(crate) fn invalid_data_from(leaf: impl Leaf) -> Error {
         Error::invalid_data(leaf.to_string())
     }
 
@@ -1517,9 +1518,35 @@ mod platform_tests {
     }
 }
 
+/// An error with no cause of its own, whose `Display` is the whole message:
+/// what [`Error::invalid_argument_from`] and [`Error::invalid_data_from`]
+/// flatten into a message. A whitelist, not a proof: each implementation is
+/// a promise that the type's `source()` is `None`, kept beside the type (and
+/// covered by a test for the crate's own), and there is no blanket impl. The
+/// standard UTF-8 errors are on it by their documented structure.
+pub(crate) trait Leaf: StdError {}
+
+impl Leaf for Utf8Error {}
+impl Leaf for std::string::FromUtf8Error {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every whitelisted leaf the crate owns (the geocode ones are checked
+    /// in `geocode_index::format`) and the standard ones really have no
+    /// cause, so flattening them loses nothing.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn leaf_errors_have_no_source() {
+        let coord = crate::coord_pack::validate_lat("lat", 91.0).unwrap_err();
+        assert!(coord.source().is_none());
+        let time = crate::commands::parse_rfc3339_utc("not a time").unwrap_err();
+        assert!(time.source().is_none());
+        let from_utf8 = String::from_utf8(vec![0xff]).unwrap_err();
+        assert!(from_utf8.utf8_error().source().is_none());
+        assert!(from_utf8.source().is_none());
+    }
 
     fn invalid_data(msg: &'static str) -> Error {
         new_error(ErrorKind::InvalidData {

@@ -1894,6 +1894,32 @@ built in the main tree, no trim of its own. Run order variant, HEAD.
 
 Neutral: the variant is inside a single cell's noise.
 
+### Parallel-array iterator ends are checked in release (bygg, 2026-11-03, against `ebe69342`)
+
+The change: the end arm of every lockstep iterator over an element's
+parallel arrays (`TagIter`, `RawTagIter`, `WayNodeLocationsIter`,
+`RelMemberIter`, `MemberIdIter`, `DenseNodeIter`) checks in release that
+all its arrays ended together, through one inlined branch onto a cold,
+never-inlined panic with a static message; it was a `debug_assert!`. The
+same tree also carries the other invariant-check dispositions of that day
+(all per block, blob, chunk or run).
+
+Planet (`planet-20260223-with-indexdata`), the default `w/highway=primary`
+expression, `--bench 1`. Its way passes skip no blob on tagdata
+(`tagsfilter_single_pass_tagidx_skipped_blobs=0`), so every way's tags are
+walked through `TagIter`, twice. The A arm is the stored main-tree cell of
+the previous entry, whose `src/read/elements.rs` and `dense.rs` are
+identical to the variant's base `9c4d6c81`; the variant is `9c4d6c81`
+plus the change, built in the main tree. No trim of its own.
+
+| arm | wall (s) |
+|---|---|
+| `ebe69342` (`53d5f705`) | 77.7 |
+| variant (`--force`, sidecar `32433dfa`) | 74.1 |
+
+No cost: the variant is faster, by an amount within the run-to-run spread
+these cells show, so no gain is claimed either.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

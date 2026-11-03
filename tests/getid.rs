@@ -1152,9 +1152,9 @@ fn getid_remove_tags_strips_referenced_nodes() {
 // Multi-blob raw passthrough for `removeid` (the --invert path)
 // ---------------------------------------------------------------------------
 //
-// `filter_by_id` with `include = false` (the `removeid` entry) takes
-// the raw-passthrough path at `src/commands/getid/mod.rs:347-358` for
-// any OsmData blob whose ID range does not intersect the removal set.
+// `filter_by_id` in removal mode (the `removeid` entry) takes the
+// walker's raw-passthrough path for any OsmData blob whose ID range
+// does not intersect the removal set.
 // Blobs that DO intersect are decoded, filtered element-by-element,
 // and re-emitted. With existing tests using single-blob fixtures, the
 // raw-passthrough branch never fires under test - the intersection is

@@ -607,15 +607,16 @@ impl<R: Read + Send> ElementReader<R> {
 ///   normally (finding: spawn/`Read` panic deadlocks scoped cleanup).
 /// - a per-worker [`CancelGuard`] does the same if a worker unwinds, so a lone
 ///   `decode_threads(1)` worker cannot strand the pump in `ByteBudget::acquire`.
-/// - [`BatchCharge`] releases a worker's held budget on every batch exit -
-///   normal, decode error, or mid-fold panic - after freeing the compressed
+/// - every [`Batch`] carries the [`Charge`] for its bytes and releases it when
+///   it drops - pump-held, queued and never popped, or worker-held at normal
+///   end, decode error or mid-fold panic - after freeing the compressed
 ///   storage, so budget capacity never leaks and never frees before the bytes
 ///   it accounts for actually drop.
 ///
-/// The budget must admit the pump's next blob even when only its own
-/// undispatched batch still holds capacity (see [`pump_blobs`]); the
-/// production constants are checked at compile time, and any other
-/// combination by a debug assertion here.
+/// No combination of `budget_cap`, `batch_max_blobs` and `batch_max_bytes`
+/// can deadlock the pump on its own batch: it dispatches its partial batch
+/// before it ever waits for capacity (see [`pump_blobs`]), so the three are
+/// tuning only.
 #[allow(clippy::too_many_arguments)]
 fn par_fold_blobs<R, MP, RD, ID, T>(
     blob_iter: BlobReader<R>,
@@ -634,13 +635,9 @@ where
     ID: Fn() -> T + Sync + Send,
     T: Send,
 {
-    debug_assert!(
-        pump_cannot_wait_on_own_batch(budget_cap, batch_max_blobs, batch_max_bytes),
-        "par_fold_blobs budget {budget_cap} cannot hold a {batch_max_bytes}-byte \
-         partial batch plus one more blob"
-    );
-    let queue = Arc::new(BatchQueue::new());
-    let budget = Arc::new(ByteBudget::new(budget_cap));
+    // The budget outlives the queue: queued batches hold charges against it.
+    let budget = ByteBudget::new(budget_cap);
+    let queue = BatchQueue::new();
     // Nested under the caller's admission, so never refused there.
     let call = blob_iter.cancel_token().call()?;
     let pool = DecompressPool::new(&call);
@@ -668,11 +665,10 @@ where
 
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let budget = Arc::clone(&budget);
+            let (queue, budget) = (&queue, &budget);
             let pool = Arc::clone(&pool);
             handles.push(scope.spawn(move || -> Result<T> {
-                run_par_worker(&queue, &budget, &pool, source, map_op, identity, reduce_op)
+                run_par_worker(queue, budget, &pool, source, map_op, identity, reduce_op)
             }));
         }
 
@@ -726,54 +722,77 @@ where
     })
 }
 
-/// A count- and byte-bounded run of compressed OsmData blobs handed to a worker.
-struct Batch {
+/// A count- and byte-bounded run of compressed OsmData blobs handed to a
+/// worker, with the [`Charge`] admitted for them.
+///
+/// `blobs` is declared before `charge`, so on *any* drop - the pump's
+/// partial batch, a queued batch nobody pops, a worker's batch at normal
+/// end, decode error or a panic in `map_op`/`reduce_op` mid fold - the
+/// compressed storage is freed *before* the accounted bytes return to the
+/// [`ByteBudget`]. Releasing first would let the pump admit replacement bytes
+/// while the old allocations are still resident, transiently exceeding the
+/// in-flight cap.
+struct Batch<'b> {
     blobs: Vec<Blob>,
-    /// Sum of the retained byte weights admitted for `blobs`. Released back to
-    /// the [`ByteBudget`] as a unit once the worker finishes the batch.
+    charge: Charge<'b>,
+}
+
+impl<'b> Batch<'b> {
+    fn new(budget: &'b ByteBudget) -> Self {
+        Self {
+            blobs: Vec::new(),
+            charge: budget.empty_charge(),
+        }
+    }
+
+    /// The retained bytes admitted for the batch's blobs.
+    fn bytes(&self) -> u64 {
+        self.charge.bytes
+    }
+
+    /// Add `blob` with the charge admitted for it. Everything that can panic
+    /// is checked before the blob is stored, so the charge is never released
+    /// while its blob stays behind in the batch: after the checks the blob is
+    /// pushed and the charge's bytes move over, the incoming charge left
+    /// empty so its drop releases nothing.
+    fn add(&mut self, blob: Blob, mut charge: Charge<'b>) {
+        assert!(
+            std::ptr::eq(self.charge.budget, charge.budget),
+            "a blob's charge was admitted by another budget"
+        );
+        let Some(total) = self.charge.bytes.checked_add(charge.bytes) else {
+            panic!("batch byte accounting overflows u64");
+        };
+        self.blobs.push(blob);
+        charge.bytes = 0;
+        self.charge.bytes = total;
+    }
+}
+
+/// What a non-blocking admission found.
+enum TryAcquire<'b> {
+    Admitted(Charge<'b>),
+    /// The bytes do not fit until something releases.
+    WouldBlock,
+    /// The run is being cancelled.
+    Shutdown,
+}
+
+/// Bytes admitted by one [`ByteBudget`], returned to it when the charge
+/// drops. Made only by the budget's own acquisitions (and an empty one per
+/// batch), moved into a [`Batch`] and never copied, so the budget's `used`
+/// is exactly the bytes its live charges hold and a release can never take
+/// back more than was admitted.
+struct Charge<'b> {
+    budget: &'b ByteBudget,
     bytes: u64,
 }
 
-impl Batch {
-    fn new() -> Self {
-        Self {
-            blobs: Vec::new(),
-            bytes: 0,
-        }
-    }
-}
-
-/// RAII release of a worker's held batch budget.
-///
-/// Owns the batch for the duration of decode/fold so that on *any* exit -
-/// normal end of batch, decode error, or a panic in `map_op`/`reduce_op` mid
-/// fold - the compressed blob storage is freed *before* the accounted bytes are
-/// returned to the [`ByteBudget`]. Releasing before the storage drops would let
-/// the pump admit replacement bytes while the old allocations are still
-/// resident, transiently exceeding the in-flight cap.
-struct BatchCharge<'a> {
-    budget: &'a ByteBudget,
-    batch: Batch,
-}
-
-impl<'a> BatchCharge<'a> {
-    fn new(budget: &'a ByteBudget, batch: Batch) -> Self {
-        Self { budget, batch }
-    }
-
-    fn blobs(&self) -> &[Blob] {
-        &self.batch.blobs
-    }
-}
-
-impl Drop for BatchCharge<'_> {
+impl Drop for Charge<'_> {
     fn drop(&mut self) {
-        let bytes = self.batch.bytes;
-        // Free the compressed blob storage FIRST, then return capacity, so the
-        // pump can never admit replacement bytes while these allocations are
-        // still resident.
-        self.batch.blobs = Vec::new();
-        self.budget.release(bytes);
+        if self.bytes > 0 {
+            self.budget.release(self.bytes);
+        }
     }
 }
 
@@ -782,14 +801,14 @@ impl Drop for BatchCharge<'_> {
 /// closes the queue and shuts the budget down, waking the pump and every blocked
 /// worker so scoped-thread join can complete instead of deadlocking on a queue
 /// that would otherwise never be closed. A clean exit disarms it first.
-struct CancelGuard<'a> {
-    queue: &'a BatchQueue,
+struct CancelGuard<'a, 'b> {
+    queue: &'a BatchQueue<'b>,
     budget: &'a ByteBudget,
     armed: bool,
 }
 
-impl<'a> CancelGuard<'a> {
-    fn new(queue: &'a BatchQueue, budget: &'a ByteBudget) -> Self {
+impl<'a, 'b> CancelGuard<'a, 'b> {
+    fn new(queue: &'a BatchQueue<'b>, budget: &'a ByteBudget) -> Self {
         Self {
             queue,
             budget,
@@ -802,7 +821,7 @@ impl<'a> CancelGuard<'a> {
     }
 }
 
-impl Drop for CancelGuard<'_> {
+impl Drop for CancelGuard<'_, '_> {
     fn drop(&mut self) {
         if self.armed {
             self.budget.shutdown();
@@ -821,48 +840,24 @@ impl Drop for CancelGuard<'_> {
 /// error the pump has already obtained is never discarded because a worker
 /// happened to signal shutdown in the same window - read errors win over decode
 /// errors deterministically.
-/// Whether the pump can never wait in `ByteBudget::acquire` for capacity its
-/// own undispatched batch holds.
 ///
-/// The pump acquires a blob's weight before deciding whether to flush the
-/// batch it is building, so that batch's bytes are admitted but no worker can
-/// release them. Once every dispatched batch has released, the budget holds
-/// only the partial batch (at most `batch_max_bytes`, or one lone blob of up
-/// to `MAX_BLOB_DATASIZE` that exceeds it), and the next blob (at most
-/// `MAX_BLOB_DATASIZE`) must fit beside it or the pump waits forever. A
-/// one-blob batch is flushed as soon as it forms, so it never holds anything
-/// at an acquire.
-const fn pump_cannot_wait_on_own_batch(
-    budget_cap: u64,
-    batch_max_blobs: usize,
-    batch_max_bytes: u64,
-) -> bool {
-    use crate::read::blob_wire::MAX_BLOB_DATASIZE;
-    let held = if batch_max_bytes > MAX_BLOB_DATASIZE {
-        batch_max_bytes
-    } else {
-        MAX_BLOB_DATASIZE
-    };
-    batch_max_blobs <= 1 || budget_cap >= held + MAX_BLOB_DATASIZE
-}
-
-const _: () = assert!(
-    pump_cannot_wait_on_own_batch(
-        PAR_INFLIGHT_BUDGET,
-        PAR_BATCH_MAX_BLOBS,
-        PAR_BATCH_MAX_BYTES
-    ),
-    "PAR_INFLIGHT_BUDGET must hold a full partial batch plus one more blob"
-);
-
-fn pump_blobs<R: Read + Send>(
+/// The pump never waits for capacity while it holds an undispatched batch.
+/// Admission is tried without blocking first; only when the blob does not
+/// fit does the pump push its partial batch to the workers and then block.
+/// Every admitted byte is then in a batch a worker can finish, so once they
+/// all release, `used` reaches zero and the blocking acquire admits the
+/// blob whatever its weight. Without that, a budget smaller than a partial
+/// batch plus one more blob would leave the pump waiting on bytes only it
+/// could release. Under contention batches can leave smaller than the caps;
+/// that changes their shape, not what is decoded.
+fn pump_blobs<'b, R: Read + Send>(
     mut blob_iter: BlobReader<R>,
-    queue: &BatchQueue,
-    budget: &ByteBudget,
+    queue: &BatchQueue<'b>,
+    budget: &'b ByteBudget,
     batch_max_blobs: usize,
     batch_max_bytes: u64,
 ) -> Result<()> {
-    let mut batch = Batch::new();
+    let mut batch = Batch::new(budget);
     // Under the method's call; no admission per blob.
     while let Some(blob_result) = blob_iter.next_blob() {
         // Resolve the read result before consulting shutdown: an obtained
@@ -876,20 +871,29 @@ fn pump_blobs<R: Read + Send>(
             continue; // non-OsmData blobs carry no elements
         }
         let weight = blob.retained_len();
-        if !budget.acquire(weight) {
-            break; // a worker errored while we waited for capacity
-        }
+        let charge = match budget.try_acquire(weight) {
+            TryAcquire::Admitted(charge) => charge,
+            TryAcquire::Shutdown => break,
+            TryAcquire::WouldBlock => {
+                if !batch.blobs.is_empty() {
+                    queue.push(std::mem::replace(&mut batch, Batch::new(budget)));
+                }
+                match budget.acquire(weight) {
+                    Some(charge) => charge,
+                    None => break, // a worker errored while we waited for capacity
+                }
+            }
+        };
         // Byte cap is a hard cap: flush the current batch before a blob would
         // carry it past the target. A lone blob heavier than the whole target
         // still forms its own one-element batch (never split).
-        if !batch.blobs.is_empty() && batch.bytes.saturating_add(weight) > batch_max_bytes {
-            queue.push(std::mem::replace(&mut batch, Batch::new()));
+        if !batch.blobs.is_empty() && batch.bytes().saturating_add(weight) > batch_max_bytes {
+            queue.push(std::mem::replace(&mut batch, Batch::new(budget)));
         }
-        batch.bytes += weight;
-        batch.blobs.push(blob);
+        batch.add(blob, charge);
         // Count cap is exact: appended then flushed at the limit, never past it.
         if batch.blobs.len() >= batch_max_blobs {
-            queue.push(std::mem::replace(&mut batch, Batch::new()));
+            queue.push(std::mem::replace(&mut batch, Batch::new(budget)));
         }
     }
     if !batch.blobs.is_empty() {
@@ -906,10 +910,10 @@ fn pump_blobs<R: Read + Send>(
 /// A [`CancelGuard`] armed for the whole worker turns any unwind - through
 /// `identity`, `map_op`, or `reduce_op` - into a queue close plus budget
 /// shutdown, so a panicking worker (even the only one) cannot strand the pump
-/// blocked in `ByteBudget::acquire`. Held batch budget is released by
-/// [`BatchCharge`] regardless of how the batch exits.
+/// blocked in `ByteBudget::acquire`. Held batch budget is released by the
+/// batch's [`Charge`] regardless of how the batch exits.
 fn run_par_worker<MP, RD, ID, T>(
-    queue: &BatchQueue,
+    queue: &BatchQueue<'_>,
     budget: &ByteBudget,
     pool: &Arc<DecompressPool>,
     source: Option<&Arc<std::path::Path>>,
@@ -930,14 +934,13 @@ where
     while let Some(batch) = queue.pop() {
         if budget.is_shutdown() {
             // Free storage then release; shutdown is already signaled.
-            drop(BatchCharge::new(budget, batch));
+            drop(batch);
             break;
         }
-        // BatchCharge owns the batch: on normal end, decode error, or a mid-fold
+        // The batch owns its charge: on normal end, decode error, or a mid-fold
         // panic it frees the compressed storage before returning capacity.
-        let charge = BatchCharge::new(budget, batch);
         let mut decode_err: Option<crate::error::Error> = None;
-        for blob in charge.blobs() {
+        for blob in &batch.blobs {
             match blob.to_primitiveblock_inline_with_scratch(pool, &mut st_scratch, &mut gr_scratch)
             {
                 Ok(block) => {
@@ -952,16 +955,16 @@ where
             }
         }
         if let Some(e) = decode_err {
-            // Signal shutdown/close BEFORE dropping the charge (which releases
-            // this batch's bytes) so a blocked pump cannot slip one extra blob
+            // Signal shutdown/close BEFORE dropping the batch (whose charge
+            // releases its bytes) so a blocked pump cannot slip one extra blob
             // through the freed capacity on the way out.
             budget.shutdown();
             queue.close();
             cancel.disarm(); // cancellation performed explicitly above
-            drop(charge); // frees storage, then releases budget
+            drop(batch); // frees storage, then releases budget
             return Err(e);
         }
-        // Normal end of batch: charge drops here (frees storage, then releases).
+        // Normal end of batch: it drops here (frees storage, then releases).
     }
     // Clean drain: leave siblings to finish; do not shut the budget down.
     cancel.disarm();
@@ -971,17 +974,17 @@ where
 /// Closable multi-consumer queue of [`Batch`]es between the single frame pump
 /// and the decode workers. Memory is bounded by the [`ByteBudget`] the pump
 /// acquires before pushing, so the queue itself is unbounded in slot count.
-struct BatchQueue {
-    inner: Mutex<BatchQueueState>,
+struct BatchQueue<'b> {
+    inner: Mutex<BatchQueueState<'b>>,
     cond: Condvar,
 }
 
-struct BatchQueueState {
-    batches: VecDeque<Batch>,
+struct BatchQueueState<'b> {
+    batches: VecDeque<Batch<'b>>,
     closed: bool,
 }
 
-impl BatchQueue {
+impl<'b> BatchQueue<'b> {
     fn new() -> Self {
         Self {
             inner: Mutex::new(BatchQueueState {
@@ -992,7 +995,7 @@ impl BatchQueue {
         }
     }
 
-    fn push(&self, batch: Batch) {
+    fn push(&self, batch: Batch<'b>) {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         state.batches.push_back(batch);
         drop(state);
@@ -1011,7 +1014,7 @@ impl BatchQueue {
     /// Blocks until a batch is available or the queue is closed and drained.
     /// The condvar wait releases the lock, so a blocked consumer never stalls
     /// its peers.
-    fn pop(&self) -> Option<Batch> {
+    fn pop(&self) -> Option<Batch<'b>> {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if let Some(batch) = state.batches.pop_front() {
@@ -1036,6 +1039,9 @@ impl BatchQueue {
 /// This is the only case where `used` may exceed `cap`; while that blob is
 /// charged, every later acquire waits for its release.
 /// `shutdown` wakes a blocked pump so worker errors cancel the read promptly.
+///
+/// Admitted bytes leave as a [`Charge`] and come back only when it drops, so
+/// `used` is the bytes live charges hold and `release` cannot underflow.
 struct ByteBudget {
     state: Mutex<ByteBudgetState>,
     cond: Condvar,
@@ -1059,17 +1065,54 @@ impl ByteBudget {
         }
     }
 
-    /// Acquires `n` bytes of capacity, blocking until it fits. Returns `false`
-    /// if shutdown was signaled instead of admitting the bytes.
-    fn acquire(&self, n: u64) -> bool {
+    /// Whether `n` more bytes are admitted beside `used`: anything into an
+    /// empty budget, otherwise what fits under the cap (written so neither
+    /// side can overflow).
+    fn fits(&self, used: u64, n: u64) -> bool {
+        used == 0 || (used <= self.cap && n <= self.cap - used)
+    }
+
+    /// A charge of nothing against this budget, for an empty batch.
+    fn empty_charge(&self) -> Charge<'_> {
+        Charge {
+            budget: self,
+            bytes: 0,
+        }
+    }
+
+    /// Admits `n` bytes if they fit now, without waiting.
+    fn try_acquire(&self, n: u64) -> TryAcquire<'_> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.shutdown {
+            return TryAcquire::Shutdown;
+        }
+        if !self.fits(state.used, n) {
+            return TryAcquire::WouldBlock;
+        }
+        state.used += n;
+        TryAcquire::Admitted(Charge {
+            budget: self,
+            bytes: n,
+        })
+    }
+
+    /// Acquires `n` bytes of capacity, blocking until it fits. Returns `None`
+    /// if shutdown was signaled instead of admitting the bytes. Shutdown and
+    /// capacity are both rechecked under the lock on every wake, so a release
+    /// between a failed [`try_acquire`](Self::try_acquire) and this call is
+    /// never missed.
+    fn acquire(&self, n: u64) -> Option<Charge<'_>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.shutdown {
-                return false;
+                return None;
             }
-            if state.used == 0 || state.used + n <= self.cap {
+            if self.fits(state.used, n) {
                 state.used += n;
-                return true;
+                return Some(Charge {
+                    budget: self,
+                    bytes: n,
+                });
             }
             state = self
                 .cond
@@ -1078,14 +1121,11 @@ impl ByteBudget {
         }
     }
 
+    /// Returns a dropped charge's bytes. Only [`Charge`]'s drop calls it, with
+    /// bytes this budget admitted and nothing has released yet.
     fn release(&self, n: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        debug_assert!(
-            state.used >= n,
-            "ByteBudget released {n} bytes with only {} admitted",
-            state.used
-        );
-        state.used = state.used.saturating_sub(n);
+        state.used -= n;
         drop(state);
         self.cond.notify_one();
     }
@@ -1376,7 +1416,9 @@ impl Drop for PipelinedBlocks {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Batch, BatchQueue, ByteBudget, ElementReader, PipelinedBlocks, par_fold_blobs};
+    use super::{
+        Batch, BatchQueue, ByteBudget, ElementReader, PipelinedBlocks, TryAcquire, par_fold_blobs,
+    };
     use crate::error::{BlobError, ErrorKind};
     use std::io::{Cursor, Read};
     use std::sync::Arc;
@@ -1496,7 +1538,7 @@ mod tests {
     #[test]
     fn byte_budget_blocks_at_cap_until_release() {
         let budget = Arc::new(ByteBudget::new(10));
-        assert!(budget.acquire(6));
+        let held = budget.acquire(6).unwrap();
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -1504,7 +1546,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             ready_tx.send(()).unwrap();
             // 6 + 5 > 10 and the budget is non-empty, so this blocks.
-            let admitted = child.acquire(5);
+            let admitted = child.acquire(5).is_some();
             done_tx.send(admitted).unwrap();
         });
 
@@ -1514,7 +1556,7 @@ mod tests {
             "acquire must block while the budget is over cap"
         );
 
-        budget.release(6);
+        drop(held);
         assert!(
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             "acquire must succeed once capacity frees up"
@@ -1527,20 +1569,70 @@ mod tests {
         // A single legal blob larger than the whole cap must not deadlock: it is
         // admitted unconditionally when nothing else is in flight.
         let budget = ByteBudget::new(10);
-        assert!(budget.acquire(100));
+        assert!(budget.acquire(100).is_some());
+    }
+
+    /// A non-blocking admission tells capacity it lacks from a cancelled run,
+    /// a batch's charge accounts exactly what its blobs were admitted with,
+    /// and dropping the batch returns all of it.
+    #[test]
+    fn try_acquire_and_batch_charges_account_exactly() {
+        let budget = ByteBudget::new(10);
+        let TryAcquire::Admitted(first) = budget.try_acquire(6) else {
+            panic!("6 bytes fit an empty budget of 10");
+        };
+        assert!(matches!(budget.try_acquire(5), TryAcquire::WouldBlock));
+        let TryAcquire::Admitted(second) = budget.try_acquire(4) else {
+            panic!("6 + 4 fits a budget of 10");
+        };
+        let buf = build_pbf(2);
+        let ElementReader { mut blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+        let mut batch = Batch::new(&budget);
+        batch.add(blob_iter.next_blob().unwrap().unwrap(), first);
+        batch.add(blob_iter.next_blob().unwrap().unwrap(), second);
+        assert_eq!(batch.bytes(), 10);
+        assert!(matches!(budget.try_acquire(1), TryAcquire::WouldBlock));
+        drop(batch);
+        assert!(matches!(budget.try_acquire(10), TryAcquire::Admitted(_)));
+        budget.shutdown();
+        assert!(matches!(budget.try_acquire(1), TryAcquire::Shutdown));
+    }
+
+    /// A budget smaller than any two blobs, with batches of many blobs: the
+    /// pump holds its partial batch when the next blob does not fit, so it
+    /// must dispatch that batch before waiting, or it waits forever on bytes
+    /// only it could release.
+    #[test]
+    fn a_budget_below_a_partial_batch_still_completes() {
+        let buf = build_pbf(6);
+        let result = assert_completes("tiny budget", move || {
+            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            par_fold_blobs(
+                blob_iter,
+                2,
+                1, // every second blob would wait
+                64,
+                super::PAR_BATCH_MAX_BYTES,
+                |_e| 1_u64,
+                || 0_u64,
+                |a, b| a + b,
+            )
+        })
+        .expect("orchestration must not panic");
+        assert_eq!(result.unwrap(), 24, "6 blobs x 4 dense nodes");
     }
 
     #[test]
     fn byte_budget_shutdown_unblocks_acquirer() {
         let budget = Arc::new(ByteBudget::new(10));
-        assert!(budget.acquire(10));
+        let _held = budget.acquire(10).unwrap();
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let child = Arc::clone(&budget);
         let handle = std::thread::spawn(move || {
             ready_tx.send(()).unwrap();
-            let admitted = child.acquire(5);
+            let admitted = child.acquire(5).is_some();
             done_tx.send(admitted).unwrap();
         });
 
@@ -1558,8 +1650,9 @@ mod tests {
     #[test]
     fn batch_queue_drains_then_closes() {
         // pop() blocks on an empty open queue, so only pop after pushing/closing.
+        let budget = ByteBudget::new(1);
         let queue = BatchQueue::new();
-        queue.push(Batch::new());
+        queue.push(Batch::new(&budget));
         queue.close();
         assert!(queue.pop().is_some(), "queued batch drains after close");
         assert!(queue.pop().is_none(), "closed empty queue returns None");
@@ -1701,32 +1794,6 @@ mod tests {
             .par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
             .unwrap();
         assert_eq!(count, 12, "3 blobs x 4 dense nodes");
-    }
-
-    #[test]
-    fn pump_budget_rule_refuses_a_budget_its_own_batch_can_fill() {
-        use super::pump_cannot_wait_on_own_batch;
-        use crate::read::blob_wire::MAX_BLOB_DATASIZE;
-        // A one-blob batch never holds capacity at an acquire.
-        assert!(pump_cannot_wait_on_own_batch(1, 1, 4096));
-        // A multi-blob batch needs room for the largest partial batch (a lone
-        // maximum-size blob here) plus one more maximum-size blob.
-        assert!(pump_cannot_wait_on_own_batch(
-            2 * MAX_BLOB_DATASIZE,
-            2,
-            4096
-        ));
-        assert!(!pump_cannot_wait_on_own_batch(
-            2 * MAX_BLOB_DATASIZE - 1,
-            2,
-            4096
-        ));
-        // A byte target above the blob limit is what the partial batch holds.
-        assert!(!pump_cannot_wait_on_own_batch(
-            3 * MAX_BLOB_DATASIZE,
-            2,
-            3 * MAX_BLOB_DATASIZE
-        ));
     }
 
     #[test]

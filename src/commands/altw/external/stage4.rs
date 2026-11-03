@@ -465,12 +465,8 @@ pub(super) fn stage4_assembly(
     // workers of the ordered pool, which runs over them alone, so raw-frame
     // traffic never takes a worker, a channel slot or a window slot. This
     // mirrors extract's `pread_execute`.
-    let decode_at: Vec<usize> = schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| !d.is_passthrough)
-        .map(|(i, _)| i)
-        .collect();
+    let decode_at =
+        crate::ordered_pool::DecodeSchedule::from_items(&schedule, |d| !d.is_passthrough);
     let decode_at = &decode_at;
     let schedule = &schedule;
 
@@ -496,7 +492,7 @@ pub(super) fn stage4_assembly(
 
     let mut consumer = S4Consumer {
         router: coord_payloads_reader,
-        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         schedule,
         file: &shared_file,
         input,
@@ -524,7 +520,7 @@ pub(super) fn stage4_assembly(
     // init) aborts the router through the worker's own guard.
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
-        decode_at.len(),
+        decode_at.decode_count(),
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
@@ -564,7 +560,7 @@ pub(super) fn stage4_assembly(
             let guard = AbortOnDrop::new(coord_payloads_reader, "stage 4 worker");
             #[cfg(feature = "test-hooks")]
             host.invocation.faults().on_altw_stage4_work(ordinal);
-            let desc = &schedule[decode_at[ordinal]];
+            let desc = &schedule[decode_at.position(ordinal)];
             let file = &shared_file;
 
             // Only errors about the input frame itself are located
@@ -727,7 +723,7 @@ pub(super) fn stage4_assembly(
                         &mut tally,
                     )
                     .map_err(at_frame)?;
-                    if !tally.holds(&desc.claim) {
+                    if !tally.holds(&desc.claim)? {
                         return Err(at_frame(crate::blob_meta::replay_refusal(
                             &desc.claim,
                             super::blob_meta::EXTERNAL_ORDER,

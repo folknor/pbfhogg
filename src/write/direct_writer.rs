@@ -50,36 +50,42 @@ impl AlignedBuffer {
         self.capacity() - self.len
     }
 
-    /// The `len` bytes held.
-    fn as_slice(&self) -> &[u8] {
-        // Safety: `len <= capacity`, and the allocation is zeroed, so every
-        // byte is initialised.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    /// The whole allocation. The only unsafe view of it: every other access
+    /// indexes this slice, so the bounds check is the slice's own, in
+    /// release builds too, whatever `len` says.
+    fn whole(&self) -> &[u8] {
+        // Safety: the allocation is `capacity` zeroed (so initialised) bytes,
+        // owned by `self`, and `&self` excludes a writer.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.capacity()) }
     }
 
-    /// Append `data` to the buffer. Caller must ensure `data.len() <= remaining()`.
+    /// [`whole`](Self::whole), mutably.
+    fn whole_mut(&mut self) -> &mut [u8] {
+        // Safety: as `whole`, and `&mut self` makes the borrow exclusive.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity()) }
+    }
+
+    /// The `len` bytes held.
+    fn as_slice(&self) -> &[u8] {
+        &self.whole()[..self.len]
+    }
+
+    /// Append `data` to the buffer. The caller splits its writes at
+    /// [`remaining`](Self::remaining); data past it panics on the slice
+    /// bound rather than writing past the allocation.
     fn extend(&mut self, data: &[u8]) {
-        debug_assert!(data.len() <= self.remaining());
-        // Safety: we verified there is room, and ptr + len is within the allocation.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.ptr.as_ptr().add(self.len),
-                data.len(),
-            );
-        }
+        let len = self.len;
+        self.whole_mut()[len..][..data.len()].copy_from_slice(data);
         self.len += data.len();
     }
 
     /// Zero-fill from `self.len` up to `new_len`. Used for padding the final
-    /// aligned block.
+    /// aligned block; a `new_len` past the capacity panics on the slice
+    /// bound.
     fn zero_pad_to(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.capacity());
         if new_len > self.len {
-            // Safety: within allocation bounds.
-            unsafe {
-                std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, new_len - self.len);
-            }
+            let len = self.len;
+            self.whole_mut()[len..new_len].fill(0);
             self.len = new_len;
         }
     }

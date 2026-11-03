@@ -55,6 +55,7 @@ impl std::fmt::Display for CoordRangeError {
 }
 
 impl std::error::Error for CoordRangeError {}
+impl crate::error::Leaf for CoordRangeError {}
 
 /// Validate a named latitude in degrees, retaining the caller's field name.
 pub(crate) fn validate_lat(name: &str, value: f64) -> Result<(), CoordRangeError> {

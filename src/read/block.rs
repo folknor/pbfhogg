@@ -423,8 +423,8 @@ fn classify_group(data: &[u8]) -> BlockType {
 ///
 /// # Stringtable UTF-8 invariant
 ///
-/// At construction time (`new()`), every entry in the block's stringtable is validated
-/// with `std::str::from_utf8()`. This means all subsequent stringtable lookups
+/// At construction (`BlockBuffer::project`, through `validate_block`), every entry in
+/// the block's stringtable is validated with `std::str::from_utf8()`. This means all subsequent stringtable lookups
 /// (`str_from_stringtable()`) can use `from_utf8_unchecked` - eliminating 16-48K
 /// redundant UTF-8 validations per block (8000 elements × 2-6 tag lookups each).
 ///
@@ -1762,6 +1762,38 @@ fn construction_invariant_broken(what: &'static str, err: &dyn std::fmt::Display
     panic!(
         "{what} failed to parse after PrimitiveBlock construction validated it \
          (validate_block in block.rs): construction invariant broken: {err}"
+    )
+}
+
+/// The end of an iterator that walks parallel arrays of one element in
+/// lockstep: `all_ended` is whether every array ended on the same step.
+///
+/// Block construction (`validate_block`) refuses parallel arrays of
+/// different lengths (tag keys and values, way refs' lats and lons, relation
+/// roles, ids and types, dense ids, lats and lons) before any iterator can be
+/// built over them, so on a constructed block they always end together. A
+/// mismatch is therefore a broken construction invariant, not a property of
+/// the input, and it panics naming `what`, as [`validated`] does. Ending
+/// quietly instead would silently drop the longer array's trailing entries
+/// (a way's last locations, an element's last tags).
+///
+/// The success path is one branch; the failure path is a cold, never-inlined
+/// call with a static message, so the inlined `next`s carry no formatting.
+#[inline]
+#[track_caller]
+pub(super) fn arrays_end_together(all_ended: bool, what: &'static str) {
+    if !all_ended {
+        parallel_arrays_differ(what);
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn parallel_arrays_differ(what: &'static str) -> ! {
+    panic!(
+        "{what} arrays differ in length after PrimitiveBlock construction validated them \
+         (validate_block in block.rs): construction invariant broken"
     )
 }
 

@@ -256,9 +256,9 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 // Construction rejects id, lat and lon arrays of different
                 // lengths (`validate_block` in `block.rs`), so all
                 // three end together.
-                debug_assert!(
+                super::block::arrays_end_together(
                     did.is_none() && dlat.is_none() && dlon.is_none(),
-                    "dense id/lat/lon arrays differ in length"
+                    "dense id/lat/lon",
                 );
                 None
             }

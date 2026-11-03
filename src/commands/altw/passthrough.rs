@@ -397,17 +397,13 @@ pub(super) fn write_output_passthrough(
     // them alone; passthrough items are copied by the consumer between them,
     // in schedule order, so input element ordering (nodes -> ways ->
     // relations) is preserved.
-    let decode_at: Vec<usize> = schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| !d.is_passthrough)
-        .map(|(i, _)| i)
-        .collect();
+    let decode_at =
+        crate::ordered_pool::DecodeSchedule::from_items(&schedule, |d| !d.is_passthrough);
     host.invocation
-        .counter("altw_pass2_decode_items", decode_at.len());
+        .counter("altw_pass2_decode_items", decode_at.decode_count());
     host.invocation.counter(
         "altw_pass2_passthrough_items",
-        schedule.len() - decode_at.len(),
+        decode_at.passthrough_count(),
     );
     host.invocation
         .counter("altw_pass2_decode_threads", decode_threads);
@@ -434,7 +430,7 @@ pub(super) fn write_output_passthrough(
     let p2_recv_ns = std::sync::atomic::AtomicU64::new(0);
 
     let mut consumer = Pass2Consumer {
-        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         schedule,
         file: &shared_file,
         frame_read_buf: Vec::new(),
@@ -452,7 +448,7 @@ pub(super) fn write_output_passthrough(
     // arrival; the early return is the write-error exit.
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
-        decode_at.len(),
+        decode_at.decode_count(),
         &mut workers,
         crate::ordered_pool::PoolConfig {
             window: crate::ordered_pool::default_window(decode_threads),
@@ -466,7 +462,7 @@ pub(super) fn write_output_passthrough(
         },
         |_| WorkerScratch::new(&host.invocation),
         |(), scratch: &mut WorkerScratch, ordinal| {
-            let desc = &schedule[decode_at[ordinal]];
+            let desc = &schedule[decode_at.position(ordinal)];
             decode_one(
                 desc,
                 &shared_file,

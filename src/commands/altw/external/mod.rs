@@ -19,6 +19,7 @@
 //! input; see `reference/performance.md` for measurements. This path does not
 //! build a random-access node index.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::write::WriteOptions;
@@ -64,9 +65,8 @@ use stage4::stage4_assembly;
 /// lossless for any `node_id` inside `[0, max_node_id]`. At
 /// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
 /// six orders of magnitude under 2^32.
-fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
-    debug_assert!(num_buckets > 0, "num_buckets must be > 0");
-    max_node_id.div_ceil(num_buckets as u64).max(1)
+fn bucket_width(max_node_id: u64, num_buckets: NonZeroUsize) -> u64 {
+    max_node_id.div_ceil(num_buckets.get() as u64).max(1)
 }
 
 /// Layout used by stage-1 pass A and stage 2 to map a node id to its
@@ -95,7 +95,7 @@ fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
 pub(super) struct BucketLayout {
     pub(super) max_node_id: u64,
     pub(super) bucket_width: u64,
-    pub(super) num_buckets: usize,
+    pub(super) num_buckets: NonZeroUsize,
 }
 
 impl BucketLayout {
@@ -111,12 +111,13 @@ impl BucketLayout {
     /// instead would be wrong here - clamping an honest claim turns every
     /// node above the clamp into a missing location.
     pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Result<Self> {
-        assert!(num_buckets > 0, "num_buckets must be > 0");
+        let num_buckets = NonZeroUsize::new(num_buckets)
+            .ok_or_else(|| crate::Error::internal("external join bucket layout with no buckets"))?;
         let bw = bucket_width(max_node_id, num_buckets);
         // Largest bucket-local id `locate` can produce: `bw - 1` in every
         // bucket but the last, which absorbs the `div_ceil` remainder and
         // reaches `max_node_id - last_lo`.
-        let last_lo = (num_buckets as u64 - 1).saturating_mul(bw);
+        let last_lo = (num_buckets.get() as u64 - 1).saturating_mul(bw);
         let max_local = (bw - 1).max(max_node_id.saturating_sub(last_lo));
         if bw > MAX_BUCKET_WIDTH || max_local > u64::from(LOCAL_ID_MASK) {
             return Err(crate::Error::invalid_data(format!(
@@ -127,7 +128,7 @@ impl BucketLayout {
                  has no such limit; if it does not, the indexdata is wrong, and \
                  checking the file's blob metadata reports which blobs disagree \
                  with their contents.",
-                (num_buckets as u64).saturating_mul(MAX_BUCKET_WIDTH),
+                (num_buckets.get() as u64).saturating_mul(MAX_BUCKET_WIDTH),
                 MAX_BUCKET_WIDTH,
             )));
         }
@@ -152,7 +153,7 @@ impl BucketLayout {
         // max_node_id.
         #[allow(clippy::cast_possible_truncation)]
         let raw_idx = (node_id / self.bucket_width) as usize;
-        let bucket_idx = raw_idx.min(self.num_buckets - 1);
+        let bucket_idx = raw_idx.min(self.num_buckets.get() - 1);
         let bucket_lo = (bucket_idx as u64) * self.bucket_width;
         let offset = node_id - bucket_lo;
         // For node_id <= max_node_id and bucket_width <= 1<<30, the
@@ -232,7 +233,25 @@ mod max_node_id_tests {
 
 #[cfg(test)]
 mod bucket_math_tests {
-    use super::{BucketLayout, bucket_width};
+    use super::BucketLayout;
+
+    fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
+        let Some(num_buckets) = std::num::NonZeroUsize::new(num_buckets) else {
+            panic!("a test bucket count is nonzero");
+        };
+        super::bucket_width(max_node_id, num_buckets)
+    }
+
+    #[test]
+    fn a_layout_with_no_buckets_is_an_internal_error() {
+        let err = BucketLayout::new(1000, 0)
+            .err()
+            .expect("no buckets is refused");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Internal { .. }),
+            "{err}"
+        );
+    }
 
     #[test]
     fn bucket_width_handles_zero_max() {

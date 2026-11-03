@@ -98,19 +98,31 @@ trust, and nothing amends or supersedes it. Rule on how the two reconcile
 per-element path, `debug_assert!` only where it would cost per element);
 an amended or superseding ADR follows.
 
-The 2026-11-03 audit of every site (see "Invariant checks" below, and the
-input-reachable findings it filed beside them) found almost no release cost: the only per-element
-checks are the iterator ends (WRK-161) and apply-changes' raw-rewrite
-string checks, which turned out to be input checks living only in debug
-builds. Those are now release refusals, at noise cost on a planet A/B once
-each copied array is walked once (reference/performance.md, "apply-changes
-checks the string indices it copies").
+The 2026-11-03 audit of every site (and the input-reachable findings it
+filed) found almost no release cost: the only per-element checks were the
+parallel-array iterator ends and apply-changes' raw-rewrite string checks,
+which turned out to be input checks living only in debug builds. Those are
+now release refusals, at noise cost on a planet A/B once each copied array
+is walked once (reference/performance.md, "apply-changes checks the string
+indices it copies").
 Proposed rule for the superseding ADR: release `assert!` by default for an
 internal invariant; `debug_assert!` only where a planet A/B shows the check
 costs more than noise; anything input-reachable is an `Err` (ADR-0004);
 prefer a structural fix where a type can carry the invariant.
-The maintainer will rule after WRK-160 to WRK-164 have been worked under
-spar (2026-11-03).
+The remaining audited sites have since been worked under spar, with
+ADR-0005 set aside as instructed: no `debug_assert!` is left in production
+code. Iterator ends panic through one cold helper (planet tags-filter
+neutral, reference/performance.md "Parallel-array iterator ends are
+checked in release"); Result-returning sites refuse with
+`Error::internal`; infallible ones release-assert (never in `Drop`);
+several became structural (budget charges, decode schedule, getid filter
+enum, const-generic field tags, a leaf-error whitelist, bounded zlib
+slices, safe aligned-buffer slices); tautologies were dropped. The
+commit message records each disposition. The rule as practised there:
+an internal failure propagates as `Error::internal` where the function
+returns `Result` and the failure prevents successful finalization with no
+reusable corrupted state left, and panics otherwise. The maintainer rules
+on the ADR from that.
 
 ---
 
@@ -520,132 +532,6 @@ indexdata guide) should say so and point at `check --index` and
 `cat --reindex` / `sort --distrust-metadata` as the repair, and whether
 the brokkr planet dataset should be reindexed so `check --index` passes on
 it.
-
----
-
-## Invariant checks (from the 2026-11-03 debug-assert audit)
-
-Three read-only audits classified every `debug_assert!` and
-`cfg(debug_assertions)` site in production code (about 50) by invariant,
-reachability from input, release cost and disposition. The input-reachable
-and defect findings still open are entries of their own above. These entries carry the
-rest and assume WRK-146 rules for release assertions by default; if it
-rules otherwise, revisit them. The audit reports themselves were transient.
-
-### WRK-160: promote the free invariant checks to release assertions
-
-Sites whose check runs at most per blob, block, write chunk, phase or run,
-or per element with a cost the audit judged noise, and whose failure in
-release is silent wrong output, memory unsafety or an undiagnosed hang:
-
-- write: the string-table body-length check in `encode_to`, the dense
-  group non-empty check in `encode_block`, `AlignedBuffer::extend` and
-  `zero_pad_to` in `direct_writer.rs`, `buf_ptr`'s index check in
-  `uring_writer.rs` (the last three guard unsafe copies or pointer
-  arithmetic).
-- read: the iterator-end checks in `WayNodeLocationsIter`,
-  `RelMemberIter`, `MemberIdIter` (`elements.rs`) and `DenseNodeIter`
-  (`dense.rs`), each once per way, relation or dense group and each a silent
-  truncation if broken; `AlignedReadBuffer::consume` (`direct_reader.rs`,
-  guards an unsafe copy, and overflow checks are off in release so a
-  violation wraps into an out-of-bounds read); `par_fold_blobs`' budget
-  check (a violation is a deadlock); `ByteBudget::release` (runs in
-  `BatchCharge::drop`, also during unwinding, so a release panic there
-  aborts; rule on that knowingly, and the `saturating_sub` after it becomes
-  dead); `AscendingTally::holds`' non-negative claim (`tally.rs`).
-- commands: `cover_segment`'s sample-budget check (`pass3.rs`), the
-  geocode cell write-out's strictly-ascending check (`pass3.rs`; a violation
-  is an unsorted cell table that binary search silently misreads, the
-  highest stakes in the audit; `Error::internal` also fits, the function
-  returns `Result`), `blob_merge.rs`'s every-restructured-entry-is-rewritten
-  check, `stream_output.rs`'s empty-builder check.
-
-Every one runs well below per-element frequency except the iterator ends
-(about 1e9 per planet pass, one branch on an arm already taken). No sweep
-beyond this list.
-
-### WRK-161: TagIter and RawTagIter end checks need one planet A/B
-
-The keys-versus-vals end checks in `TagIter::next` and `RawTagIter::next`
-(`src/read/elements.rs`) run once per plain node, way or relation tag walk,
-about 1e9 per pass, inside `#[inline]` `next`s. The branch itself is
-negligible; the risk is code size or inlining. One matched planet A/B on a
-tag-heavy pass (tags-filter or inspect --tags) before promoting; keep the
-message static so the cold edge stays a bare panic call, and if it costs,
-route the end arm through a `#[cold]` helper like `validated` rather than
-staying debug-only. A violation silently drops trailing tags.
-
-### WRK-162: make the type carry the invariant instead of an assert
-
-Sites where a structural change removes the precondition:
-
-- `encode_optional_int32`, `_int64`, `_uint32` (`src/write/encode.rs`):
-  `field <= 15` becomes a const generic with a compile-time assert (the
-  only caller passes literals 1 to 5).
-- `Interleaved::new` (`src/ordered_pool.rs`): four callers build
-  `decode_at` with the same enumerate-filter idiom; an
-  `Interleaved::from_schedule(len, is_decode)` owning the positions removes
-  the strictly-increasing precondition and the duplication.
-- `filter_by_id` (`src/commands/getid/mod.rs`): include-or-invert plus a
-  scan arm becomes one enum, so invert with `FullScan` cannot be expressed
-  (`filter_by_id_streaming` implements include only; the illegal pair would
-  write the inverse output).
-- `read_aligned_in` (`src/read/direct_reader.rs`): read `align` from the
-  scratch instead of a parameter, with the power-of-two check once in
-  `AlignedScratch::new`.
-- `zlib_inflate_bounded` (`src/read/decompress.rs`): move the
-  spare-capacity clamp into it from its caller. Inside the loop the bound
-  also leans on `reserve_exact` allocating exactly, which std does not
-  promise; re-check capacity after each reserve.
-- `Error::invalid_argument_from` and `invalid_data_from`
-  (`src/error.rs`): a crate-private leaf marker trait on the parameter,
-  instead of a debug check that the error has no source. Not a release
-  assert: a violation only flattens a cause chain on an error already being
-  reported.
-- `bucket_width` (`src/commands/altw/external/mod.rs`): take
-  `NonZeroUsize` (or drop the check, see WRK-163).
-- Pin `MAX_ADMIN_S2_LEVEL <= MAX_BUILD_S2_LEVEL` with a const assert:
-  admin polygons go through `cover_segment` at the admin level, but
-  `validate` checks that level only against the flood-fill budget, so
-  raising `ADMIN_CELL_COUNT_BUDGET` would reopen the silent sample clamp.
-
-### WRK-163: drop vacuous or redundant debug assertions
-
-- `encode_to`'s total-length check (`src/write/string_table.rs`): a
-  tautology of `len_field_size`, and `total` only sizes a reserve.
-- `CoordStats::record_block`'s `max >= min` (`src/commands/inspect/node_stats.rs`),
-  computed from the same slice two lines up; the `unwrap_or` fallbacks
-  after it are dead too (`abs_diff` or plain u32 arithmetic removes them).
-- altw stage 2's tuple-order walk check (the `cfg(debug_assertions)` state
-  in `stage2.rs`): redundant with the release `AscendingTally` refusal at
-  extraction, which is stronger.
-- the geocode builder's two level-budget checks (`builder/mod.rs`): an
-  exhaustive unit test pins both relationships over the whole level domain.
-  Stronger alternative for the street and coarse one: make
-  `level_exceeds_sampling_budget` itself the `validate` refusal.
-- `bucket_width`'s `num_buckets > 0`: the only caller asserts the same in
-  release one line earlier.
-- `encode_way_raw_bytes`' keys-and-vals pairing check: guards nothing
-  `validate_tag_arrays` does not already refuse, and its two raw-encoder
-  siblings carry none; drop it, or put it on all three.
-
-### WRK-164: stale comments met during the assert audit
-
-- `src/read/reader.rs`: `pump_blobs`' rustdoc ("Sequential frame pump ...")
-  sits above `pump_cannot_wait_on_own_batch`, so it documents the wrong
-  function and `pump_blobs` has none.
-- `src/read/block.rs`, the `PrimitiveBlock` "Stringtable UTF-8 invariant"
-  doc says "At construction time (`new()`)"; there is no `new()`, the
-  construction path is `BlockBuffer::project` / `validate_block`.
-- `src/geocode_index/builder/pass3.rs`: the sample-budget comment gives the
-  worst-case span as `hypot(180, 360)` degrees, but after
-  `wrapped_longitude_delta_e7` the longitude delta is at most 180, so the
-  real bound is `hypot(180, 180)`; the 405-degree budget is conservative,
-  not wrong, and the comment should say why. The test
-  `widest_legal_segment_stays_under_its_analytic_worst_case` has the same
-  staleness: its (-90, -180) to (90, 180) fixture unwraps to a zero
-  longitude delta, a pole-to-pole meridian, so it is not the widest legal
-  segment; the widest is about 180 degrees of latitude by 180 of longitude.
 
 ---
 

@@ -1394,9 +1394,9 @@ impl BlockBuilder {
         // field 2 (DenseNodes, the body in group_buf). Both lengths follow
         // from the body's, so the body is copied once, straight behind the
         // two prefixes, instead of being wrapped in a scratch buffer first.
-        // The body is never empty: a dense block holds at least one node, and
-        // its id field is written whatever the id.
-        debug_assert!(!self.group_buf.is_empty());
+        // Both fields are written whatever the body's length; a dense block
+        // holds at least one node, so the body is never empty and the output
+        // is what the skip-if-empty wrapper this replaced wrote too.
         let overflow = || crate::error::Error::internal("dense node group length overflows usize");
         let dense_len = self.group_buf.len();
         let group_len = super::encode::len_field_size(dense_len).ok_or_else(overflow)?;

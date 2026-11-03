@@ -23,47 +23,44 @@ pub(super) fn len_field_size(body_len: usize) -> Option<usize> {
     (1 + varint_len(body_len as u64)).checked_add(body_len)
 }
 
+/// The one-byte varint-field tag of field `FIELD`. A field number outside
+/// `1..=15` (zero is not a protobuf field; above 15 the tag takes two bytes)
+/// fails to compile.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+const fn varint_tag<const FIELD: u32>() -> u8 {
+    const {
+        assert!(
+            FIELD >= 1 && FIELD <= 15,
+            "a one-byte tag needs a field number in 1..=15"
+        );
+    }
+    (FIELD << 3) as u8 // wire type 0 (varint)
+}
+
 /// Encode an `int32` field unconditionally (even when value is 0).
 ///
 /// Writes the field tag + varint(0) even for the zero value. This differs from
 /// `encode_int32_field` which skips zero values (matching non-optional fields).
-/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn encode_optional_int32(buf: &mut Vec<u8>, field: u32, value: i32) {
-    debug_assert!(
-        field <= 15,
-        "single-byte tag requires field <= 15, got {field}"
-    );
-    buf.push((field << 3) as u8); // wire type 0 (varint)
+#[allow(clippy::cast_sign_loss)]
+fn encode_optional_int32<const FIELD: u32>(buf: &mut Vec<u8>, value: i32) {
+    buf.push(varint_tag::<FIELD>());
     encode_varint(buf, value as i64 as u64);
 }
 
 /// Encode an `int64` field unconditionally (even when value is 0).
-///
-/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn encode_optional_int64(buf: &mut Vec<u8>, field: u32, value: i64) {
-    debug_assert!(
-        field <= 15,
-        "single-byte tag requires field <= 15, got {field}"
-    );
-    buf.push((field << 3) as u8);
+#[allow(clippy::cast_sign_loss)]
+fn encode_optional_int64<const FIELD: u32>(buf: &mut Vec<u8>, value: i64) {
+    buf.push(varint_tag::<FIELD>());
     encode_varint(buf, value as u64);
 }
 
 /// Encode a `uint32` field unconditionally (even when value is 0).
-///
-/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
-fn encode_optional_uint32(buf: &mut Vec<u8>, field: u32, value: u32) {
-    debug_assert!(
-        field <= 15,
-        "single-byte tag requires field <= 15, got {field}"
-    );
-    buf.push((field << 3) as u8);
+fn encode_optional_uint32<const FIELD: u32>(buf: &mut Vec<u8>, value: u32) {
+    buf.push(varint_tag::<FIELD>());
     encode_varint(buf, u64::from(value));
 }
 
@@ -78,15 +75,15 @@ pub(super) fn encode_info_to(
 ) {
     info.clear();
     // Field 1: version (optional int32) - always present
-    encode_optional_int32(info, 1, meta.version);
+    encode_optional_int32::<1>(info, meta.version);
     // Field 2: timestamp (optional int64) - always present
-    encode_optional_int64(info, 2, meta.timestamp);
+    encode_optional_int64::<2>(info, meta.timestamp);
     // Field 3: changeset (optional int64) - always present
-    encode_optional_int64(info, 3, meta.changeset);
+    encode_optional_int64::<3>(info, meta.changeset);
     // Field 4: uid (optional int32) - always present
-    encode_optional_int32(info, 4, meta.uid);
+    encode_optional_int32::<4>(info, meta.uid);
     // Field 5: user_sid (optional uint32) - always present
-    encode_optional_uint32(info, 5, string_table.add(meta.user));
+    encode_optional_uint32::<5>(info, string_table.add(meta.user));
     // Field 6: visible (optional bool) - only emit when false
     // When visible=true, the current code leaves info.visible as None (prost skips it).
     // When visible=false, it sets Some(false), and prost writes tag + varint(0).
@@ -248,7 +245,9 @@ pub(super) fn encode_way_with_locations<'t>(
 /// Encode a Way from raw wire-format bytes (zero decode/reencode passthrough).
 ///
 /// All byte slices are raw protobuf packed field content from `WireWay`,
-/// written directly with field tag + length prefix.
+/// written directly with field tag + length prefix. That the keys and vals
+/// arrays pair up is the source block's: construction refuses arrays of
+/// different lengths (`validate_tag_arrays`), as for every raw encoder here.
 pub(super) fn encode_way_raw_bytes(
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
@@ -258,12 +257,6 @@ pub(super) fn encode_way_raw_bytes(
     refs_data: &[u8],
     info_data: Option<&[u8]>,
 ) {
-    debug_assert!(
-        keys_data.is_empty() == vals_data.is_empty(),
-        "keys/vals must be paired: keys={} vals={} bytes",
-        keys_data.len(),
-        vals_data.len(),
-    );
     elem.clear();
     encode_int64_field(elem, 1, id);
     encode_bytes_field(elem, 2, keys_data);

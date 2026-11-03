@@ -543,11 +543,9 @@ fn getid_dispatched<'a>(
             input,
             output,
             ids,
-            true,
-            Ways::Reencoded,
+            Filter::Include(arm),
             write,
             overrides,
-            arm,
             opts.report_found,
             host,
         )?;
@@ -626,14 +624,25 @@ pub(crate) fn removeid_to<'a>(
         input,
         output,
         ids,
-        false,
-        ways,
+        Filter::Remove(ways),
         write,
         overrides,
-        ScanArm::Walker,
         false,
         host,
     )
+}
+
+/// What [`filter_by_id`] does with the requested IDs, and how it scans.
+/// Removal runs only on the walker arm: the streaming full-scan arm
+/// implements include mode alone, so a removal on it is not expressible.
+#[derive(Clone, Copy)]
+enum Filter {
+    /// Write the requested elements, scanning on the given arm. Every way
+    /// blob written is re-encoded.
+    Include(ScanArm),
+    /// Write everything but the requested elements, on the walker, with
+    /// what the copied way blobs are.
+    Remove(Ways),
 }
 
 // ---------------------------------------------------------------------------
@@ -649,35 +658,38 @@ fn filter_by_id(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
     ids: &ElementIds,
-    include: bool,
-    ways: Ways,
+    filter: Filter,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    arm: ScanArm,
     report_found: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
-    match arm {
-        ScanArm::Walker => filter_by_id_walker(
-            input,
-            output,
-            ids,
-            include,
-            ways,
-            write,
-            overrides,
-            report_found,
-            host,
-        ),
-        ScanArm::FullScan => {
-            debug_assert!(
-                include,
-                "the streaming full-scan arm implements include mode only; \
-                 removeid is pinned to ScanArm::Walker"
+    let (include, ways) = match filter {
+        Filter::Include(ScanArm::FullScan) => {
+            return filter_by_id_streaming(
+                input,
+                output,
+                ids,
+                write,
+                overrides,
+                report_found,
+                host,
             );
-            filter_by_id_streaming(input, output, ids, write, overrides, report_found, host)
         }
-    }
+        Filter::Include(ScanArm::Walker) => (true, Ways::Reencoded),
+        Filter::Remove(ways) => (false, ways),
+    };
+    filter_by_id_walker(
+        input,
+        output,
+        ids,
+        include,
+        ways,
+        write,
+        overrides,
+        report_found,
+        host,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1845,11 +1857,9 @@ mod tests {
                 &PinnedInput::pin(input, host).unwrap(),
                 &staged,
                 &query,
-                true,
-                super::Ways::Reencoded,
+                super::Filter::Include(arm),
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
-                arm,
                 false,
                 host,
             )

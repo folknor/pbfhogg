@@ -92,28 +92,33 @@ impl BuildConfig {
         // a fraction of the cell width, so per-segment work doubles with every
         // level. Reject before reading input so a long or antimeridian-crossing
         // segment cannot turn a build into an unbounded walk.
+        // Each level is refused outside the S2 domain first, then by the
+        // budget the pass that uses it depends on: `cover_segment` asserts the
+        // sampling budget for every level it is handed, the admin one
+        // included. The unit tests in pass 3 pin `MAX_BUILD_S2_LEVEL` and
+        // `MAX_ADMIN_S2_LEVEL` to exactly these boundaries, so the messages'
+        // ranges are the refusals'.
+        let s2_max = crate::geocode_index::format::S2_MAX_LEVEL;
         let max_level = crate::tunables::MAX_BUILD_S2_LEVEL;
         for (name, level) in [("street", self.street_level), ("coarse", self.coarse_level)] {
-            if level > max_level {
+            if level > s2_max || pass3::level_exceeds_sampling_budget(level) {
                 return Err(Error::invalid_argument(format!(
                     "{name} S2 level must be in 0..={max_level}, got {level}. Levels above \
                      {max_level} exceed the builder's per-segment cell-covering budget."
                 )));
             }
-            debug_assert!(
-                !pass3::level_exceeds_sampling_budget(level),
-                "level {level} passed validation but exceeds the sampling budget"
-            );
         }
-        if pass3::admin_level_exceeds_cell_budget(self.admin_level) {
+        let admin_level = self.admin_level;
+        if admin_level > s2_max
+            || pass3::admin_level_exceeds_cell_budget(admin_level)
+            || pass3::level_exceeds_sampling_budget(admin_level)
+        {
             let max_level = pass3::MAX_ADMIN_S2_LEVEL;
             return Err(Error::invalid_argument(format!(
-                "admin S2 level must be in 0..={max_level}, got {}. Higher levels exceed the \
-                 per-polygon flood-fill cell budget.",
-                self.admin_level
+                "admin S2 level must be in 0..={max_level}, got {admin_level}. Higher levels \
+                 exceed the per-polygon flood-fill cell budget."
             )));
         }
-        debug_assert!(self.admin_level <= pass3::MAX_ADMIN_S2_LEVEL);
         if self.coarse_level >= self.street_level {
             return Err(Error::invalid_argument(format!(
                 "coarse S2 level ({}) must be less than street S2 level ({})",

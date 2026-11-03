@@ -472,52 +472,96 @@ impl<T, F: FnMut(usize, T) -> crate::Result<()>> OrderedConsumer<T> for ConsumeF
 /// are therefore the full schedule's: a passthrough frame before a failed
 /// decode is still written, and can still fail, first.
 ///
-/// It borrows the decode positions, so the workers can index the same slice
-/// to find their task's output position.
+/// It borrows a [`DecodeSchedule`], which the workers share to find their
+/// task's output position.
 pub(crate) struct Interleaved<'a> {
-    /// Output position of each decode item, strictly increasing.
-    decode_at: &'a [usize],
-    /// Length of the full output schedule.
-    len: usize,
+    schedule: &'a DecodeSchedule,
+    /// The decode ordinal `before` expects next; `decode_count` once
+    /// [`rest`](Self::rest) has run, so nothing can be emitted after it.
+    ordinal: usize,
     /// The first output position not yet emitted.
     next: usize,
 }
 
-impl<'a> Interleaved<'a> {
-    /// `decode_at` lists the output position of each decode item, in order;
-    /// every other position below `len` is passthrough.
-    pub(crate) fn new(decode_at: &'a [usize], len: usize) -> Self {
-        debug_assert!(
-            decode_at.windows(2).all(|w| w[0] < w[1]) && decode_at.last().is_none_or(|&p| p < len),
-            "decode positions must be strictly increasing and inside the schedule"
-        );
+/// Which positions of an output schedule are decode items, by output
+/// position. Built by one walk over the schedule, so the positions are
+/// strictly increasing and inside it by construction.
+pub(crate) struct DecodeSchedule {
+    /// Output position of each decode item, strictly increasing.
+    positions: Vec<usize>,
+    /// Length of the full output schedule.
+    len: usize,
+}
+
+impl DecodeSchedule {
+    /// The positions of `items` that `is_decode` picks; every other position
+    /// is passthrough.
+    pub(crate) fn from_items<T>(items: &[T], mut is_decode: impl FnMut(&T) -> bool) -> Self {
         Self {
-            decode_at,
-            len,
+            positions: items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| is_decode(item))
+                .map(|(i, _)| i)
+                .collect(),
+            len: items.len(),
+        }
+    }
+
+    /// Number of decode items: the pool's task count.
+    pub(crate) fn decode_count(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Number of passthrough positions.
+    pub(crate) fn passthrough_count(&self) -> usize {
+        self.len - self.positions.len()
+    }
+
+    /// The output position of decode item `ordinal`.
+    pub(crate) fn position(&self, ordinal: usize) -> usize {
+        self.positions[ordinal]
+    }
+}
+
+impl<'a> Interleaved<'a> {
+    pub(crate) fn new(schedule: &'a DecodeSchedule) -> Self {
+        Self {
+            schedule,
+            ordinal: 0,
             next: 0,
         }
     }
 
     /// Number of decode items: the pool's task count.
     pub(crate) fn decode_count(&self) -> usize {
-        self.decode_at.len()
+        self.schedule.decode_count()
     }
 
     /// The passthrough positions before decode item `ordinal` not yet
-    /// emitted; afterwards the decode item itself counts as emitted. Called
-    /// once per ordinal, in order.
+    /// emitted; afterwards the decode item itself counts as emitted. The pool
+    /// hands its items over once each, in ordinal order, before `rest`; any
+    /// other order would emit positions twice or skip them, so it panics.
     pub(crate) fn before(&mut self, ordinal: usize) -> std::ops::Range<usize> {
-        let at = self.decode_at[ordinal];
+        assert!(
+            ordinal == self.ordinal && ordinal < self.schedule.decode_count(),
+            "decode item {ordinal} delivered out of order (expected {} of {})",
+            self.ordinal,
+            self.schedule.decode_count()
+        );
+        let at = self.schedule.position(ordinal);
         let range = self.next..at;
         self.next = at + 1;
+        self.ordinal += 1;
         range
     }
 
     /// The trailing passthrough positions after the last decode item (the
-    /// whole schedule when there is none).
+    /// whole schedule when there is none). Ends the walk.
     pub(crate) fn rest(&mut self) -> std::ops::Range<usize> {
-        let range = self.next..self.len;
-        self.next = self.len;
+        let range = self.next..self.schedule.len;
+        self.next = self.schedule.len;
+        self.ordinal = self.schedule.decode_count();
         range
     }
 }

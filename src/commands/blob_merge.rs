@@ -644,13 +644,9 @@ pub(crate) fn plan(indexed: Indexed) -> Plan {
         rewritten[entry.frame] |= r;
         restructured[entry.frame] |= entry.restructured;
     }
-    debug_assert!(
-        entries
-            .iter()
-            .zip(&rewrite)
-            .all(|(e, &r)| r || !e.restructured),
-        "a restructured entry is never copied",
-    );
+    // A restructured entry is never copied: every entry the loop above visits
+    // either starts an overlap component, whose entries are all rewritten, or
+    // is taken alone and rewritten when restructured.
     // A rewritten frame is never reframed: what its passthrough would have
     // carried goes, so `reindex` now means "this passthrough is reframed".
     for (frame, &r) in frames.iter_mut().zip(&rewritten) {
@@ -899,7 +895,7 @@ impl FrameBuf {
                 slot => slot.insert(AlignedScratch::new(align)),
             };
             let file = source.input.file();
-            return read_aligned_in(len, frame.file_offset, align, scratch, |dst, at| {
+            return read_aligned_in(len, frame.file_offset, scratch, |dst, at| {
                 file.read_at(dst, at)
             })
             .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)));

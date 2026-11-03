@@ -402,12 +402,20 @@ pub(super) fn stage2_node_join(
                 let mut slot_counts: Vec<u64> = vec![0; slot_bucket_count];
 
                 loop {
-                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                    if err_ref
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+                    {
                         break;
                     }
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
-                    if bucket_idx >= NUM_BUCKETS { break; }
-                    if id_bucket_counts[bucket_idx] == 0 { continue; }
+                    if bucket_idx >= NUM_BUCKETS {
+                        break;
+                    }
+                    if id_bucket_counts[bucket_idx] == 0 {
+                        continue;
+                    }
 
                     let result: crate::Result<()> = (|| {
                         // Cancellation is checked per bucket and per node
@@ -454,13 +462,11 @@ pub(super) fn stage2_node_join(
                         // allowed), so both predicates are monotone and
                         // intersecting blobs form a contiguous slice.
                         #[allow(clippy::cast_sign_loss)]
-                        let lo_blob = mapping_ref.partition_point(|b| {
-                            (b.max_id as u64) < bucket_lo
-                        });
+                        let lo_blob =
+                            mapping_ref.partition_point(|b| (b.max_id as u64) < bucket_lo);
                         #[allow(clippy::cast_sign_loss)]
-                        let hi_blob = mapping_ref.partition_point(|b| {
-                            (b.min_id as u64) < bucket_hi
-                        });
+                        let hi_blob =
+                            mapping_ref.partition_point(|b| (b.min_id as u64) < bucket_hi);
 
                         let t_resolve = crate::counters::Stopwatch::start();
                         let mut record_ptr = 0usize;
@@ -486,18 +492,22 @@ pub(super) fn stage2_node_join(
                             node_read_buf.resize(blob.data_size, 0);
                             // Input failures are located with the input and
                             // the blob's payload offset (cold).
-                            let in_input =
-                                |e: Error| input_pbf.locate_at(blob.data_offset, e);
-                            pbf_file.read_exact_at(&mut node_read_buf, blob.data_offset)
-                                .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
+                            let in_input = |e: Error| input_pbf.locate_at(blob.data_offset, e);
+                            pbf_file
+                                .read_exact_at(&mut node_read_buf, blob.data_offset)
+                                .map_err(|e| {
+                                    in_input(Error::from(e).context("stage2 node pread"))
+                                })?;
                             t_pr.record_ms(&c.node_pread_ms);
                             t_pr.record_ns(&c.node_pread_ns);
                             c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
 
                             let t_dc = crate::counters::Stopwatch::start();
                             crate::blob::decompress_blob_raw(
-                                &node_read_buf, &mut node_decompress_buf,
-                            ).map_err(|e| in_input(e.context("stage2 node decompress")))?;
+                                &node_read_buf,
+                                &mut node_decompress_buf,
+                            )
+                            .map_err(|e| in_input(e.context("stage2 node decompress")))?;
                             t_dc.record_ms(&c.node_decompress_ms);
                             t_dc.record_ns(&c.node_decompress_ns);
 
@@ -525,12 +535,13 @@ pub(super) fn stage2_node_join(
                                     tally.add(id);
                                     node_tuples.push(NodeTuple { id, lat, lon });
                                 },
-                            ).map_err(|e| in_input(e.context("stage2 node extract")))?;
+                            )
+                            .map_err(|e| in_input(e.context("stage2 node extract")))?;
                             kinds
                                 .refuse_under(Some(crate::ElementKind::Node))
                                 .map_err(in_input)?;
                             let claim = blob.claim();
-                            if !tally.holds(&claim) {
+                            if !tally.holds(&claim)? {
                                 return Err(in_input(crate::blob_meta::replay_refusal(
                                     &claim,
                                     super::blob_meta::EXTERNAL_ORDER,
@@ -568,14 +579,13 @@ pub(super) fn stage2_node_join(
                             // missing-ref behaviour.
                             //
                             // Order inside the blob was checked on
-                            // extraction above (a blob out of order would
-                            // make this walk pass present nodes, which would
-                            // go out as missing locations), so the
-                            // debug_assert below only restates it.
+                            // extraction above, over every tuple (a blob out
+                            // of order would make this walk pass present
+                            // nodes, which would go out as missing
+                            // locations), so the walk relies on it.
                             let t_walk = crate::counters::Stopwatch::start();
-                            let blob_actual_upper: Option<u64> = node_tuples
-                                .last()
-                                .and_then(|t| u64::try_from(t.id).ok());
+                            let blob_actual_upper: Option<u64> =
+                                node_tuples.last().and_then(|t| u64::try_from(t.id).ok());
                             let mut tuple_ptr = 0usize;
                             // Pin decision cached for the current run of equal
                             // masked ids. Records with the same id are
@@ -583,11 +593,10 @@ pub(super) fn stage2_node_join(
                             // spans blobs, so the run is computed once at its
                             // start and every record in it inherits the result.
                             let mut run_pin_cache: Option<(u32, bool)> = None;
-                            #[cfg(debug_assertions)]
-                            let mut prev_tuple_id: Option<i64> = None;
                             while record_ptr < bkt.records.len() {
                                 let record = &bkt.records[record_ptr];
-                                let global_id = bucket_lo + u64::from(record.local_node_id & LOCAL_ID_MASK);
+                                let global_id =
+                                    bucket_lo + u64::from(record.local_node_id & LOCAL_ID_MASK);
                                 let upper = match blob_actual_upper {
                                     Some(u) => u,
                                     None => break,
@@ -599,17 +608,6 @@ pub(super) fn stage2_node_join(
                                 while tuple_ptr < node_tuples.len()
                                     && (node_tuples[tuple_ptr].id as u64) < global_id
                                 {
-                                    #[cfg(debug_assertions)]
-                                    {
-                                        let t_id = node_tuples[tuple_ptr].id;
-                                        if let Some(p) = prev_tuple_id {
-                                            debug_assert!(
-                                                t_id >= p,
-                                                "extract_node_tuples non-monotonic: {p} then {t_id}",
-                                            );
-                                        }
-                                        prev_tuple_id = Some(t_id);
-                                    }
                                     tuple_ptr += 1;
                                 }
                                 #[allow(clippy::cast_sign_loss)]
@@ -744,11 +742,15 @@ pub(super) fn stage2_node_join(
                         // Track max live buffer bytes for this worker.
                         {
                             let worker_bytes = loader.data_buf.capacity() as u64
-                                + (loader.records.capacity() * std::mem::size_of::<IdRecord>()) as u64
+                                + (loader.records.capacity() * std::mem::size_of::<IdRecord>())
+                                    as u64
                                 + node_read_buf.capacity() as u64
                                 + node_decompress_buf.capacity() as u64
-                                + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
-                                + (node_group_starts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
+                                + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>())
+                                    as u64
+                                + (node_group_starts.capacity()
+                                    * std::mem::size_of::<(usize, usize)>())
+                                    as u64
                                 + slot_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
                             record_max(&c.max_worker_buf_bytes, worker_bytes);
                         }
@@ -756,7 +758,9 @@ pub(super) fn stage2_node_join(
                         // Flush non-empty local buffers to shared writers.
                         let mut nonempty_count: u64 = 0;
                         for sb in 0..slot_bucket_count {
-                            if slot_bufs[sb].is_empty() { continue; }
+                            if slot_bufs[sb].is_empty() {
+                                continue;
+                            }
                             nonempty_count += 1;
                             let t_lock = crate::counters::Stopwatch::start();
                             let mut w = crate::counters::lock_recording_wait(
@@ -772,12 +776,12 @@ pub(super) fn stage2_node_join(
                             t_wr.record_ms(&c.slot_flush_write_ms);
                             c.slot_bytes_written.fetch_add(flush_bytes, Relaxed);
                             c.slot_flush_calls.fetch_add(1, Relaxed);
-                            slot_buckets.entry_counts[sb]
-                                .fetch_add(slot_counts[sb], Relaxed);
+                            slot_buckets.entry_counts[sb].fetch_add(slot_counts[sb], Relaxed);
                             slot_bufs[sb].clear();
                             slot_counts[sb] = 0;
                         }
-                        c.nonempty_slot_buckets_total.fetch_add(nonempty_count, Relaxed);
+                        c.nonempty_slot_buckets_total
+                            .fetch_add(nonempty_count, Relaxed);
 
                         // Recycle the records buffer for the next bucket.
                         loader.records = bkt.records;

@@ -62,12 +62,17 @@ pub(super) struct AdminCellEntry {
 // bounded without ever discarding coverage: the level. The segment span is not
 // data-dependent in the way it first appears - `pack`/`unpack` (see
 // `crate::coord_pack`) refuse any coordinate outside +/-90 latitude and +/-180
-// longitude, so two legal endpoints are at most `hypot(180, 360)` degrees apart
-// in the flat metric this sampler measures with. The worst-case sample count is
-// therefore a pure function of the level, computable up front, and
-// `MAX_BUILD_S2_LEVEL` is the largest level whose worst case still fits the
-// budget. `BuildConfig::validate` rejects anything higher with an explicit
-// error before a single blob is read.
+// longitude, and the sampler measures the far endpoint after unwrapping it
+// around the near one (`wrapped_longitude_delta_e7`), so the longitude delta is
+// at most 180 degrees and two legal endpoints are at most `hypot(180, 180)`
+// (about 254.6) degrees apart in the flat metric this sampler measures with.
+// The budget's span, `MAX_SEGMENT_SPAN_DEG`, is 405 degrees: the bound before
+// unwrapping, `hypot(180, 360)`, rounded up. It is conservative, not wrong; it
+// is kept because lowering it would move the accepted level boundary. The
+// worst-case sample count is therefore a pure function of the level,
+// computable up front, and `MAX_BUILD_S2_LEVEL` is the largest level whose
+// worst case still fits the budget. `BuildConfig::validate` rejects anything
+// higher with an explicit error before a single blob is read.
 //
 // This is a bound, not the right long-term answer. Sampling a segment at
 // sub-cell resolution is inherently quadratic in the wrong places; the
@@ -95,6 +100,16 @@ const fn max_admin_s2_level_for_cell_budget() -> u8 {
 /// flood-fill cell budget. Admin indexing visits interior cells, unlike the
 /// segment sampler bounded by `MAX_BUILD_S2_LEVEL`.
 pub(in crate::geocode_index) const MAX_ADMIN_S2_LEVEL: u8 = max_admin_s2_level_for_cell_budget();
+
+// Admin polygon edges are covered by `cover_segment` at the admin level, so
+// that level is bounded by the segment sampling budget as well as by the
+// flood-fill budget. `BuildConfig::validate` checks both at run time; this
+// pins the constants so raising the admin budget past the sampling one fails
+// to compile.
+const _: () = assert!(
+    MAX_ADMIN_S2_LEVEL <= crate::tunables::MAX_BUILD_S2_LEVEL,
+    "the admin level ceiling must stay inside the segment sampling budget"
+);
 
 const fn admin_s2_cell_count_upper_bound(level: u8) -> u64 {
     if level > 30 {
@@ -151,10 +166,11 @@ pub(in crate::geocode_index) fn level_exceeds_sampling_budget(level: u8) -> bool
 /// two stored vertices always, and every cell a sample lands in.
 ///
 /// `level` must have passed [`level_exceeds_sampling_budget`] - that is what
-/// `BuildConfig::validate` enforces. Given that, the sample count for any
-/// legal pair of endpoints is at most `MAX_SEGMENT_SAMPLES`; the clamp below
-/// is unreachable defense in depth against the formula and the domain drifting
-/// apart, and the debug assertion fires in tests if they ever do.
+/// `BuildConfig::validate` enforces for the street, coarse and admin levels.
+/// Given that, the sample count for any legal pair of endpoints is at most
+/// `MAX_SEGMENT_SAMPLES`. Were the formula and the coordinate domain ever to
+/// drift apart, the walk would have to either exceed the budget or stop short
+/// and return an incomplete cover silently, so the count is asserted instead.
 fn cover_segment(
     lat1_e7: i32,
     lon1_e7: i32,
@@ -208,14 +224,14 @@ fn cover_segment(
     let step_deg = segment_step_degrees(level);
 
     let exact_steps = (seg_len_deg / step_deg).ceil();
-    debug_assert!(
+    assert!(
         exact_steps <= MAX_SEGMENT_SAMPLES,
         "cover_segment at level {level} wants {exact_steps} samples, over the \
          {MAX_SEGMENT_SAMPLES} budget: BuildConfig::validate should have \
          rejected this level"
     );
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let steps = (exact_steps.min(MAX_SEGMENT_SAMPLES) as usize).max(1);
+    let steps = (exact_steps as usize).max(1);
     let mut seen = rustc_hash::FxHashSet::default();
     seen.insert(c1);
     emit(c1);
@@ -765,8 +781,8 @@ pub(super) fn bucketed_cell_assignment_fused(
 ///
 /// Runs byte-identically to the pre-parallel sequential Stage B because
 /// the serial group+write phase walks the bucket-ordered
-/// `sorted_buckets` Vec, preserving the debug_assert on cross-bucket
-/// cell_id monotonicity.
+/// `sorted_buckets` Vec, so cell ids ascend across buckets; each cell is
+/// checked against the one before it before anything of it is written.
 #[allow(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
@@ -866,6 +882,17 @@ fn run_stage_b(
                 }
                 let group = &entries[group_start..i];
                 let cell_token = CellID(cell_id);
+                // The reader binary-searches the cell table, so a cell not
+                // above the one before it would be silently misread. Bucket
+                // choice by the id's top byte plus the per-bucket sort make
+                // this hold; checked before any of the cell's lists is written.
+                if total_cells != 0 && cell_id <= prev_cell_id {
+                    return Err(Error::internal(format!(
+                        "geocode Stage B: cell {cell_token} ({cell_id}) is not above the \
+                         previous cell {} ({prev_cell_id})",
+                        CellID(prev_cell_id)
+                    )));
+                }
 
                 streets.clear();
                 addrs.clear();
@@ -965,12 +992,6 @@ fn run_stage_b(
                     interp_offset: interp_count.map_or(NO_DATA_U64, |_| interp_byte_offset),
                 };
                 cells_out.write_all(&gc.to_bytes())?;
-                debug_assert!(
-                    cell_id > prev_cell_id || total_cells == 0,
-                    "bucket ordering violated: cell {} ({cell_id}) <= prev {} ({prev_cell_id})",
-                    CellID(cell_id),
-                    CellID(prev_cell_id),
-                );
                 prev_cell_id = cell_id;
                 total_cells = total_cells.checked_add(1).ok_or_else(|| {
                     Error::invalid_data("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")
@@ -1414,21 +1435,20 @@ mod tests {
     }
 
     /// The analytic worst case is only a bound if the implementation really
-    /// respects it. A full-longitude segment is the widest thing a legal pair
-    /// of coordinates can produce, so its actual emission count must fall
-    /// under `worst_case_segment_samples` for the level.
+    /// respects it. After the far endpoint is unwrapped around the near one
+    /// the longitude delta is at most 180 degrees, so the widest segment a
+    /// legal pair of coordinates can produce is pole to pole across half the
+    /// globe in longitude, `hypot(180, 180)` degrees; its actual emission
+    /// count must fall under `worst_case_segment_samples` for the level.
+    /// (Pole to pole from -180 to +180 is not it: that unwraps to a zero
+    /// longitude delta, a meridian.)
     #[test]
     fn widest_legal_segment_stays_under_its_analytic_worst_case() {
         const LEVEL: u8 = 12;
         let mut emitted = 0usize;
-        cover_segment(
-            -900_000_000,
-            -1_800_000_000,
-            900_000_000,
-            1_800_000_000,
-            LEVEL,
-            |_| emitted += 1,
-        );
+        cover_segment(-900_000_000, 0, 900_000_000, 1_800_000_000, LEVEL, |_| {
+            emitted += 1;
+        });
         let bound = worst_case_segment_samples(LEVEL);
         assert!(
             (emitted as f64) <= bound,

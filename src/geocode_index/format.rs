@@ -888,6 +888,7 @@ impl std::fmt::Display for RadiusError {
 }
 
 impl std::error::Error for RadiusError {}
+impl crate::error::Leaf for RadiusError {}
 
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -909,6 +910,7 @@ impl std::fmt::Display for FormatError {
 }
 
 impl std::error::Error for FormatError {}
+impl crate::error::Leaf for FormatError {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -917,6 +919,20 @@ impl std::error::Error for FormatError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two leaf errors here have no cause, as their `Leaf` impls promise.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn leaf_errors_have_no_source() {
+        use std::error::Error as _;
+        assert!(validate_radius("r", -1.0).unwrap_err().source().is_none());
+        assert!(
+            InterpolationType::try_from(9)
+                .unwrap_err()
+                .source()
+                .is_none()
+        );
+    }
 
     fn valid_header_bytes() -> [u8; HEADER_SIZE] {
         Header {

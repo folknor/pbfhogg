@@ -102,9 +102,16 @@ impl AlignedBufferPool {
         })
     }
 
-    /// Pointer to the start of buffer at `index`.
+    /// Pointer to the start of buffer at `index`. Indices come from the
+    /// free list (`0..count`) and the completions' user data, which carry the
+    /// index of a submitted buffer back; one outside the pool would make the
+    /// offset below point past the allocation, so it panics instead.
     fn buf_ptr(&self, index: u16) -> *mut u8 {
-        debug_assert!((index) < self.count);
+        assert!(
+            index < self.count,
+            "io_uring buffer index {index} outside the pool of {}",
+            self.count
+        );
         // Safety: index < count, so offset is within the allocation.
         unsafe { self.base.as_ptr().add(index as usize * self.buf_size) }
     }

@@ -1015,9 +1015,13 @@ pub(crate) const DIAGNOSTIC_ID_SAMPLE_LIMIT: usize = 16;
 /// handful of samples and the budget never comes near being spent.
 pub(crate) const MAX_SEGMENT_SAMPLES: f64 = 16_777_216.0;
 
-/// Largest separation two legal coordinates can have in the flat degree
-/// metric `cover_segment` measures with: `hypot(180, 360)` = 402.5, rounded
-/// up. Latitude spans at most 180 degrees and longitude at most 360.
+/// Segment span the sampling budget assumes, in the flat degree metric
+/// `cover_segment` measures with. `cover_segment` unwraps the far endpoint
+/// around the near one, so a legal segment spans at most 180 degrees of
+/// latitude by 180 of longitude, `hypot(180, 180)` = 254.6. The value is the
+/// bound without that unwrapping, `hypot(180, 360)` = 402.5, rounded up:
+/// conservative, and
+/// kept because lowering it would move `MAX_BUILD_S2_LEVEL`'s boundary.
 pub(crate) const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
 
 /// Highest S2 level accepted for the segment-sampled street and coarse cells.
@@ -1038,7 +1042,8 @@ const _: () = assert!(
 );
 
 /// Factor of the globally smallest S2 cell width at a level that the segment
-/// sampling step uses: a little under half, so no cell can be stepped over.
+/// sampling step uses: a little under half, so a cell the segment crosses
+/// well into is not stepped over (one it clips near a corner can be).
 pub(crate) const SEGMENT_STEP_WIDTH_FACTOR: f64 = 0.4;
 
 /// Number of pass 3 buckets for bucketed cell assignment. Pass 3 buckets a

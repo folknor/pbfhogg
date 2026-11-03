@@ -847,6 +847,7 @@ impl std::fmt::Display for TimestampError {
 }
 
 impl std::error::Error for TimestampError {}
+impl crate::error::Leaf for TimestampError {}
 
 /// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, the OSM XML
 /// timestamp format) into Unix epoch seconds.

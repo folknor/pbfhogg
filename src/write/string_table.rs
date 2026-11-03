@@ -200,7 +200,7 @@ impl StringTable {
     /// field is always written, as the skip-if-empty encoder this replaced
     /// always wrote it.
     pub(super) fn encode_to(&self, buf: &mut Vec<u8>) -> crate::error::Result<()> {
-        use super::encode::{len_field_size, varint_len};
+        use super::encode::len_field_size;
         let overflow = || crate::error::Error::internal("string table length overflows usize");
         let mut body_len = 0usize;
         for &(start, end) in &self.slots {
@@ -216,8 +216,15 @@ impl StringTable {
         for &(start, end) in &self.slots {
             encode_bytes_field_always(buf, string_table::STRINGS, &self.bytes[start..end]);
         }
-        debug_assert_eq!(buf.len() - body_start, body_len);
-        debug_assert_eq!(1 + varint_len(body_len as u64) + body_len, total);
+        // The length prefix went out before the body, so a body of another
+        // length is a corrupt block. Refused here, the encode fails and the
+        // block is never handed out.
+        let written = buf.len() - body_start;
+        if written != body_len {
+            return Err(crate::error::Error::internal(format!(
+                "string table body is {written} bytes but its length prefix says {body_len}"
+            )));
+        }
         Ok(())
     }
 }

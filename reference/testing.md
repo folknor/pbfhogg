@@ -286,12 +286,6 @@ files.
 
 ### Tests that do not run everywhere
 
-- `sorted_flag_but_unsorted_nodes_panics` (`tests/read_paths.rs`)
-  checks that the debug monotonicity assertion fires on unsorted
-  nodes under a declared `Sort.Type_then_ID`. It is gated on
-  `cfg(debug_assertions)`, not `#[ignore]`, so a build without debug
-  assertions compiles it out and it cannot be run there at all; its
-  doc comment says why the gate replaced `#[ignore]`.
 - The O_DIRECT and io_uring tests exist only in the `all` sweep (the
   one build with `linux-direct-io` and `linux-io-uring`) and skip and
   pass on a typed platform refusal: O_DIRECT where the scratch

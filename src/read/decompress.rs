@@ -242,68 +242,44 @@ fn zstd_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
 /// a function of what previous blobs happened to need, so a buffer that already
 /// carries more than `MAX_BLOB_MESSAGE_SIZE` of spare capacity would let a bomb
 /// inflate to that capacity in a single call, before the loop ever re-checked.
-/// A bound a caller's allocation history can defeat is not a bound, so the
-/// spare capacity is brought under the budget first and only then inflated
-/// into.
+/// The same holds after every reserve: the loop asks for at most the bytes
+/// left in the budget, but `reserve_exact` does not promise to allocate no
+/// more. So whenever the capacity reaches past the budget - on entry, or
+/// after a reserve - the rest of the stream is inflated into an explicitly
+/// bounded slice instead ([`zlib_inflate_into_slice`]), whose length, not the
+/// allocation, caps every step. No caller precondition remains.
 // MAX_BLOB_MESSAGE_SIZE is 32 MiB, so the cast is exact on any target this
 // crate builds for; the same allow covers `clamp_capacity_hint` above.
 #[allow(clippy::cast_possible_truncation)]
 fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     let budget = MAX_BLOB_MESSAGE_SIZE as usize + 1;
-
-    if buf.capacity() - buf.len() > budget {
-        // Rare: only reachable when a pooled buffer has been grown past 32 MiB
-        // of spare capacity by an earlier blob. Inflate through a fresh
-        // destination - whose capacity starts at zero and is grown only by the
-        // budget-respecting loop below - then append. The extra copy costs
-        // nothing on the hot path because the branch is not taken there.
-        let mut bounded = Vec::new();
-        zlib_inflate_bounded(compressed, &mut bounded, budget)?;
-        buf.extend_from_slice(&bounded);
-        return Ok(());
-    }
-
-    zlib_inflate_bounded(compressed, buf, budget)
-}
-
-/// Inflate `compressed` onto the end of `buf`, producing at most `budget` bytes.
-///
-/// # Precondition
-///
-/// `buf.capacity() - buf.len() <= budget`. This is what makes the budget real:
-/// `decompress_vec` writes up to `capacity`, so an oversized spare capacity
-/// would overshoot the budget within a single call no matter what the loop
-/// checks afterwards. [`zlib_decompress_into`] establishes the precondition;
-/// the `debug_assert` pins it for any future caller.
-#[allow(clippy::cast_possible_truncation)] // total_in delta bounded by input.len() (usize)
-fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> Result<()> {
     ZLIB_DECOMPRESS.with_borrow_mut(|decompress| {
         decompress.reset(true);
         let start = buf.len();
-        let limit = start + budget;
-        debug_assert!(
-            buf.capacity() <= limit,
-            "zlib_inflate_bounded requires spare capacity within the budget"
-        );
+        let limit = start
+            .checked_add(budget)
+            .ok_or_else(|| Error::internal("zlib destination offset overflows usize"))?;
         let mut input = compressed;
         loop {
             if buf.len() >= limit {
-                // Inflation is stopped at the detection point rather than run
-                // to completion, so the true decompressed size is unknown by
-                // design; `size` reports the one-byte-past-the-cap boundary.
-                // For a payload that is merely one byte over, that is the exact
-                // size - matching the Raw and Zstd branches.
-                buf.truncate(limit);
-                return Err(new_blob_error(BlobError::MessageTooBig {
-                    size: MAX_BLOB_MESSAGE_SIZE + 1,
-                }));
+                return Err(zlib_too_big(buf, limit));
             }
             if buf.len() == buf.capacity() {
-                // Double, but never reserve past the bound: `decompress_vec`
-                // fills to `capacity`, so capacity is what actually caps a
-                // single inflate step's output.
+                // Double, but never ask past the bound.
                 let want = buf.capacity().max(4096).min(limit - buf.len());
                 buf.reserve_exact(want);
+            }
+            if buf.capacity() > limit {
+                // Rare: a caller's buffer an earlier blob grew past the
+                // budget's worth of spare capacity (the decode pool drops
+                // buffers above `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`, under
+                // the budget, so its buffers never get here), or an allocator
+                // that gave more than was asked for.
+                let pos = buf.len();
+                let (pos, result) = zlib_inflate_into_slice(decompress, input, buf, pos, limit);
+                buf.truncate(pos);
+                result?;
+                return zlib_size_within_cap(start, pos);
             }
             let before_in = decompress.total_in();
             let before_out = buf.len();
@@ -316,25 +292,91 @@ fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> 
                 break;
             }
             if consumed == 0 && buf.len() == before_out {
-                // No input consumed, no output produced, no stream end: the
-                // deflate stream cannot be completed from the bytes we have.
-                return Err(Error::io_kind(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "zlib stream ended before the final deflate block: \
-                         {} compressed bytes consumed, {} bytes decompressed",
-                        decompress.total_in(),
-                        buf.len() - start
-                    ),
-                ));
+                return Err(zlib_truncated(decompress, buf.len() - start));
             }
         }
-        let size = (buf.len() - start) as u64;
-        if size > MAX_BLOB_MESSAGE_SIZE {
-            return Err(new_blob_error(BlobError::MessageTooBig { size }));
-        }
-        Ok(())
+        zlib_size_within_cap(start, buf.len())
     })
+}
+
+/// Inflate the rest of `input` into `buf[pos..limit]` - `buf` resized to
+/// `limit` once, zeroing at most the budget - so no step can write past
+/// `limit` whatever `buf`'s capacity. Returns the end of the decompressed
+/// bytes and the outcome; the caller truncates `buf` to that end on every
+/// outcome, so the zero fill never shows as content.
+#[allow(clippy::cast_possible_truncation)] // the deltas are bounded by input.len() and limit - pos
+fn zlib_inflate_into_slice(
+    decompress: &mut flate2::Decompress,
+    mut input: &[u8],
+    buf: &mut Vec<u8>,
+    mut pos: usize,
+    limit: usize,
+) -> (usize, Result<()>) {
+    buf.resize(limit, 0);
+    let result = loop {
+        if pos >= limit {
+            break Err(new_blob_error(BlobError::MessageTooBig {
+                size: MAX_BLOB_MESSAGE_SIZE + 1,
+            }));
+        }
+        let before_in = decompress.total_in();
+        let before_out = decompress.total_out();
+        let status =
+            match decompress.decompress(input, &mut buf[pos..limit], flate2::FlushDecompress::None)
+            {
+                Ok(status) => status,
+                Err(e) => break Err(Error::invalid_data_with("zlib decompress error", e)),
+            };
+        let consumed = (decompress.total_in() - before_in) as usize;
+        let produced = (decompress.total_out() - before_out) as usize;
+        input = &input[consumed..];
+        pos += produced;
+        if matches!(status, flate2::Status::StreamEnd) {
+            // The size refusal is the caller's (`zlib_size_within_cap`): a
+            // stream may end on the call that reached `limit`.
+            break Ok(());
+        }
+        if consumed == 0 && produced == 0 {
+            // `total_out` counts from the stream's reset, like the caller's
+            // `buf.len() - start`.
+            break Err(zlib_truncated(decompress, decompress.total_out() as usize));
+        }
+    };
+    (pos, result)
+}
+
+/// The output passed the cap: inflation stopped at the detection point
+/// rather than ran to completion, so the true decompressed size is unknown by
+/// design; `size` reports the one-byte-past-the-cap boundary. For a payload
+/// that is merely one byte over, that is the exact size - matching the Raw
+/// and Zstd branches.
+fn zlib_too_big(buf: &mut Vec<u8>, limit: usize) -> Error {
+    buf.truncate(limit);
+    new_blob_error(BlobError::MessageTooBig {
+        size: MAX_BLOB_MESSAGE_SIZE + 1,
+    })
+}
+
+/// No input consumed, no output produced, no stream end: the deflate stream
+/// cannot be completed from the bytes we have.
+fn zlib_truncated(decompress: &flate2::Decompress, decompressed: usize) -> Error {
+    Error::io_kind(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+            "zlib stream ended before the final deflate block: \
+             {} compressed bytes consumed, {decompressed} bytes decompressed",
+            decompress.total_in(),
+        ),
+    )
+}
+
+/// Refuse a stream that ended past the cap.
+fn zlib_size_within_cap(start: usize, end: usize) -> Result<()> {
+    let size = (end - start) as u64;
+    if size > MAX_BLOB_MESSAGE_SIZE {
+        return Err(new_blob_error(BlobError::MessageTooBig { size }));
+    }
+    Ok(())
 }
 
 /// Decompress raw blob bytes into a caller-provided buffer.
@@ -1121,15 +1163,68 @@ mod tests {
         );
     }
 
+    /// The bounded-slice path, which a buffer whose capacity reaches past the
+    /// budget takes, must give the hot path's answers at the cap boundary and
+    /// on broken streams, keep the bytes before `buf.len()`, and never leave
+    /// its zero fill behind as content.
+    #[test]
+    fn the_bounded_slice_path_keeps_the_hot_path_verdicts() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+        let oversized = || {
+            let mut buf = Vec::with_capacity(cap * 2 + 4096);
+            buf.extend_from_slice(b"prefix");
+            buf
+        };
+        // Exactly at the cap: accepted whole.
+        let mut buf = oversized();
+        super::zlib_decompress_into(&zlib_compress(&vec![7u8; cap]), &mut buf)
+            .expect("an exact-cap stream decodes");
+        assert_eq!(buf.len(), 6 + cap);
+        assert_eq!(&buf[..6], b"prefix");
+        assert!(buf[6..].iter().all(|&b| b == 7));
+        // One byte over: refused at the cap boundary, truncated to it.
+        let mut buf = oversized();
+        assert_too_big(
+            super::zlib_decompress_into(&zlib_compress(&vec![7u8; cap + 1]), &mut buf),
+            MAX_BLOB_MESSAGE_SIZE + 1,
+        );
+        assert!(buf.len() <= 6 + cap + 1);
+        // Truncated: an error, and nothing past what was decompressed.
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = zlib_compress(&payload);
+        let mut buf = oversized();
+        assert!(
+            super::zlib_decompress_into(&compressed[..compressed.len() / 2], &mut buf).is_err(),
+            "a truncated stream is refused"
+        );
+        assert!(buf.len() < 6 + payload.len());
+        assert_eq!(
+            &buf[6..],
+            &payload[..buf.len() - 6],
+            "only decompressed bytes remain"
+        );
+        // Malformed: an error, the zero fill gone.
+        let mut garbage = compressed.clone();
+        for b in &mut garbage[2..40] {
+            *b ^= 0x5A;
+        }
+        let mut buf = oversized();
+        assert!(super::zlib_decompress_into(&garbage, &mut buf).is_err());
+        assert!(
+            buf.len() < 6 + cap,
+            "the zero fill must not stay as content"
+        );
+    }
+
     /// The bounded-destination path must still decode a legitimate blob
     /// correctly, not just refuse bombs.
     ///
     /// A pre-sized buffer routes through a different branch of
     /// `zlib_decompress_into` than the hot path does, and that branch inflates
-    /// into a fresh vector and appends. Appending is the part that can go
+    /// into a bounded slice of the buffer. Appending is the part that can go
     /// wrong: `zlib_decompress_into` appends at `buf.len()`, and the rare
-    /// branch has to reproduce that through a temporary. Getting it wrong
-    /// would corrupt output rather than fail loudly.
+    /// branch has to start its slice there. Getting it wrong would corrupt
+    /// output rather than fail loudly.
     ///
     /// Both levels are checked. Every public entry point clears its
     /// destination, so the append contract is only observable by calling

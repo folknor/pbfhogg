@@ -827,17 +827,13 @@ where
     // entirely - the consumer writes their raw frame to all N writers
     // between the decoded ones. Other blobs, including any unsettled
     // candidate, go through the parallel decode workers.
-    let len = blobs.len();
-    let decode_at: Vec<usize> = blobs
-        .iter()
-        .enumerate()
-        .filter(|(_, blob)| !matches!(blob.passthrough, Passthrough::Verified { .. }))
-        .map(|(position, _)| position)
-        .collect();
+    let decode_at = crate::ordered_pool::DecodeSchedule::from_items(blobs, |blob| {
+        !matches!(blob.passthrough, Passthrough::Verified { .. })
+    });
 
-    let pt = len - decode_at.len();
+    let pt = decode_at.passthrough_count();
     if pt > 0 {
-        let dc = decode_at.len();
+        let dc = decode_at.decode_count();
         crate::host::diag!(
             host.diagnostics,
             Progress,
@@ -854,7 +850,7 @@ where
     );
     let decode_at = &decode_at;
     let mut consumer = MultiNodeConsumer {
-        interleaved: crate::ordered_pool::Interleaved::new(decode_at, len),
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         blobs,
         input,
         frame_buf: Vec::new(),
@@ -873,7 +869,7 @@ where
         },
         |_| MultiLocal::new(n, &host.invocation),
         |(), local: &mut MultiLocal, ordinal| {
-            let entry = &blobs[decode_at[ordinal]].entry;
+            let entry = &blobs[decode_at.position(ordinal)].entry;
             let block = local.decode(input, entry)?;
             local
                 .classify(&block, n, &block_fn, framing)

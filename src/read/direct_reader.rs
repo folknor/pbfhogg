@@ -63,15 +63,24 @@ impl AlignedReadBuffer {
         self.len - self.pos
     }
 
-    /// Pointer to the current read position.
-    fn read_ptr(&self) -> *const u8 {
-        // Safety: pos <= len <= capacity, so ptr + pos is within the allocation.
-        unsafe { self.ptr.as_ptr().add(self.pos) }
+    /// The unread bytes, `pos..len`. Indexed from the whole allocation, so a
+    /// broken `pos <= len <= capacity` panics on the slice bound instead of
+    /// reading outside it.
+    fn unread(&self) -> &[u8] {
+        // Safety: the allocation is `capacity` zeroed (so initialised) bytes,
+        // owned by `self`, and `&self` excludes a writer.
+        let whole = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.capacity()) };
+        &whole[self.pos..self.len]
     }
 
-    /// Advance the read position by `n` bytes.
+    /// Advance the read position by `n` bytes. `remaining` and the skip
+    /// arithmetic built on it subtract `pos` from `len`, which would wrap
+    /// past the end, so a consume beyond the unread bytes is refused here.
     fn consume(&mut self, n: usize) {
-        debug_assert!(n <= self.remaining());
+        assert!(
+            n <= self.remaining(),
+            "direct read buffer consumed past its unread bytes"
+        );
         self.pos += n;
     }
 
@@ -263,11 +272,7 @@ impl DirectReader {
             }
         }
         let n = out.len().min(self.buf.remaining());
-        // Safety: read_ptr() is valid for remaining() bytes, and `out` for
-        // `n <= out.len()`; the buffer and `out` are distinct allocations.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.buf.read_ptr(), out.as_mut_ptr(), n);
-        }
+        out[..n].copy_from_slice(&self.buf.unread()[..n]);
         self.buf.consume(n);
         Ok(n)
     }
@@ -328,8 +333,13 @@ pub(crate) struct AlignedScratch {
 
 impl AlignedScratch {
     /// An empty buffer whose allocations are aligned to `align`, a power of
-    /// two.
+    /// two (what `crate::direct_io` resolves for a file; the aligned reads
+    /// mask with `align - 1`, so anything else is refused here, once).
     pub(crate) fn new(align: usize) -> Self {
+        assert!(
+            align.is_power_of_two(),
+            "direct I/O alignment {align} is not a power of two"
+        );
         Self { align, alloc: None }
     }
 
@@ -368,11 +378,11 @@ impl Drop for AlignedScratch {
 }
 
 /// Fill `out` exactly with the bytes at `offset`, through `pread` calls that
-/// each keep `align` (a power of two) in file offset, buffer address and
-/// length, as `O_DIRECT` requires.
+/// each keep `scratch`'s alignment (a power of two) in file offset, buffer
+/// address and length, as `O_DIRECT` requires.
 ///
 /// The bytes are read over the enclosing aligned span into `scratch` (whose
-/// allocations are aligned to `align`) and only the requested part is copied
+/// allocations keep that alignment) and only the requested part is copied
 /// out. The read stops as soon as the requested bytes are present: the
 /// span's padding exists to make the calls legal, so a range ending at the
 /// file's end inside an aligned block is a complete read. A short transfer is
@@ -388,14 +398,13 @@ impl Drop for AlignedScratch {
 pub(crate) fn read_aligned(
     out: &mut [u8],
     offset: u64,
-    align: usize,
     scratch: &mut AlignedScratch,
     pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
 ) -> io::Result<()> {
     if out.is_empty() {
         return Ok(());
     }
-    let read = read_aligned_in(out.len(), offset, align, scratch, pread)?;
+    let read = read_aligned_in(out.len(), offset, scratch, pread)?;
     out.copy_from_slice(read);
     Ok(())
 }
@@ -406,14 +415,14 @@ pub(crate) fn read_aligned(
 pub(crate) fn read_aligned_in(
     len: usize,
     offset: u64,
-    align: usize,
     scratch: &mut AlignedScratch,
     mut pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
 ) -> io::Result<&[u8]> {
     if len == 0 {
         return Ok(&[]);
     }
-    debug_assert!(align.is_power_of_two() && align == scratch.align);
+    // A power of two, checked once in `AlignedScratch::new`.
+    let align = scratch.align;
     let overflow = || io::Error::new(io::ErrorKind::InvalidInput, "direct read range overflows");
     let align64 = u64::try_from(align).map_err(|_| overflow())?;
     let start = offset & !(align64 - 1);
@@ -456,7 +465,7 @@ pub(crate) fn read_aligned_in(
 /// it through an `Arc`, stays on the thread that made it.
 pub(crate) struct DirectPositional {
     file: File,
-    align: usize,
+    /// Owns the file's direct I/O alignment too.
     scratch: RefCell<AlignedScratch>,
 }
 
@@ -466,7 +475,6 @@ impl DirectPositional {
     pub(crate) fn new(file: File, align: usize) -> Self {
         Self {
             file,
-            align,
             scratch: RefCell::new(AlignedScratch::new(align)),
         }
     }
@@ -476,7 +484,7 @@ impl DirectPositional {
     pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         let mut scratch = self.scratch.borrow_mut();
-        read_aligned(buf, offset, self.align, &mut scratch, |dst, at| {
+        read_aligned(buf, offset, &mut scratch, |dst, at| {
             self.file.read_at(dst, at)
         })
     }
@@ -503,7 +511,7 @@ mod tests {
         let mut scratch = AlignedScratch::new(ALIGN);
         let mut out = vec![0xEE_u8; want];
         let mut calls = 0_usize;
-        let result = read_aligned(&mut out, offset, ALIGN, &mut scratch, |dst, at| {
+        let result = read_aligned(&mut out, offset, &mut scratch, |dst, at| {
             assert_eq!(at % ALIGN as u64, 0, "unaligned offset {at}");
             assert_eq!(dst.as_ptr() as usize % ALIGN, 0, "unaligned buffer");
             assert_eq!(dst.len() % ALIGN, 0, "unaligned length {}", dst.len());
@@ -598,7 +606,7 @@ mod tests {
         let mut scratch = AlignedScratch::new(ALIGN);
         for offset in [u64::MAX - 1, u64::MAX - ALIGN as u64 + 2] {
             let mut out = [0_u8; 4];
-            let err = read_aligned(&mut out, offset, ALIGN, &mut scratch, |_, _| {
+            let err = read_aligned(&mut out, offset, &mut scratch, |_, _| {
                 panic!("a read was issued for an overflowing range")
             })
             .unwrap_err();

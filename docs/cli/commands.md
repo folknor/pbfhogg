@@ -1325,7 +1325,17 @@ Which elements each strategy writes:
   is the decimal it was typed as, rounded half away from zero to a
   decimicrodegree, from its own text in both `-b` and `--config` (so `12.4`
   is exactly column `124000000`, and a node on it is inside). A polygon region
-  uses an f64 ray cast; a node on its vertex or edge may fall outside.
+  is decided in decimicrodegrees by osmium's rule: each vertex is rounded as
+  libosmium rounds it, `round(v * 1e7)`; outer rings are oriented
+  counterclockwise and holes clockwise; a node on any vertex is inside; any
+  other node is decided by an integer crossing test in which every ring of
+  one Polygon or MultiPolygon shares one parity (a hole is a second crossing,
+  overlapping members cancel). A node on an edge between vertices is
+  therefore decided exactly as in osmium: on a simple ring it is inside
+  unless the edge is horizontal with the region only below it. The features
+  of a FeatureCollection are unioned, an open ring is
+  closed, and a polygon crossing the antimeridian is supported; see
+  [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-polygon-input-beyond-osmium).
 - **Matched.** A way is matched when at least one of its nodes is inside. A
   relation is matched when it has a member node inside or a member way
   matched; relation-type members do not match it.
@@ -1341,7 +1351,7 @@ Which elements each strategy writes:
   not completed.
 
 These are osmium extract's `simple`, `complete_ways` and `smart`, element for
-element on a bbox, except that osmium's simple decides a relation on its first
+element on a bbox and on a polygon osmium reads the same way, except that osmium's simple decides a relation on its first
 node or way member only and osmium's smart completes `multipolygon` alone
 unless given `-S types=multipolygon,boundary`. pbfhogg has no `-S` options. See
 [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium).

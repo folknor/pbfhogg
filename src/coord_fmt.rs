@@ -3,8 +3,9 @@
 /// Convert a decimicrodegree value to degrees, including fractional averages.
 /// Not an exact conversion: `556_000_000 * 1e-7` lands below `55.6`. Bbox
 /// membership therefore never compares this product against an edge; it
-/// compares integers (`geo::BboxInt::inside_bbox`). Polygon ray casting and
-/// geometry use it as continuous f64.
+/// compares integers (`geo::BboxInt::inside_bbox`), as extract's polygon
+/// membership does. The geocode index's ray casting and other geometry use
+/// it as continuous f64.
 pub(crate) fn e7_to_deg(value: f64) -> f64 {
     value * 1e-7
 }

@@ -55,8 +55,29 @@
   `docs/cli/commands.md` and DEVIATIONS.md. On a bbox, complete-ways now
   writes exactly osmium's element set, and smart exactly that of
   `osmium extract -s smart -S types=multipolygon,boundary`.
+- `extract` with a polygon (`-p` or a `--config` `polygon` or
+  `polygon_file`) decides membership by osmium's integer rule: a node on a
+  vertex is inside and a node on an edge is decided as osmium decides it,
+  where the floating-point test used to drop about half of the nodes on the
+  boundary. A boundary exported from OSM has every vertex on a node, so this
+  is visible on ordinary input: on four Danish municipality boundaries
+  pbfhogg used to miss 413 to 4617 boundary nodes and up to 100 ways each,
+  and now writes osmium's element set exactly (complete-ways and smart; simple
+  differs only by its documented relation rule). The rings of one
+  MultiPolygon share one parity, so overlapping members cancel as in osmium
+  (except in a geometry crossing the antimeridian, whose members are
+  unioned); separate FeatureCollection features are still unioned. A
+  polygon crossing the antimeridian whose ring circles a pole or spans 360
+  degrees is now refused. Polygon extracts are also faster: a 9694-vertex boundary on
+  Denmark takes 0.35 s instead of 1.26 s.
 
 **Library**
+
+- `extract::Region::Polygon` holds a prepared `extract::Polygon`, built
+  once by `Polygon::new` from geometries of `PolygonRings` (one entry per
+  GeoJSON Polygon or MultiPolygon), which validates the rings as the GeoJSON
+  reader does. The `polygons` and `bbox` fields are gone; `Polygon::bbox`
+  returns the region's integer envelope.
 
 - `extract::Bbox::contains` and `Region::contains` quantize the point and
   the edges to decimicrodegrees and compare inclusively, so they agree

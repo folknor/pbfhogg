@@ -1822,7 +1822,7 @@ per-iteration allocations remain across the codebase, ordered by impact:
   2026-07-16: GeoJSON only.** `extract --polygon` dispatches
   unconditionally to `parse_geojson` (`src/commands/extract/mod.rs`),
   which accepts a bare Polygon/MultiPolygon geometry, a Feature, or a
-  FeatureCollection (first feature only; holes supported as interior
+  FeatureCollection (every feature, unioned; holes supported as interior
   rings). Osmosis `.poly` files are NOT accepted anywhere - they fail at
   the JSON parse. This is a parity difference vs osmium, whose
   `extract -p` accepts `.poly`, GeoJSON, and OSM files; now recorded in

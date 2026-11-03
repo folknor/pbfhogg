@@ -344,28 +344,67 @@ smart contract since the strategy was added: an administrative area cut at the
 extract edge is as broken a polygon as a multipolygon is, and pbfhogg's own
 `build-geocode-index` and `export` assemble `type=boundary` relations as areas.
 
-**Cross-validation:** The equality above is for bbox regions. Polygon regions
-use pbfhogg's own point-in-polygon test (see the next section), and an edge
-token written with an exponent is quantized from its exact value, where
-libosmium truncates the mantissa after eight decimals before applying the
-exponent; `0.000000001e2` is column 1 here and 0 there.
+**Cross-validation:** The equality above holds for bbox regions and for
+polygon regions osmium reads the same way (see the next section for the
+polygon input pbfhogg reads differently). A bbox edge token written with an
+exponent is quantized from its exact value, where libosmium truncates the
+mantissa after eight decimals before applying the exponent;
+`0.000000001e2` is column 1 here and 0 there. Polygon membership was
+measured on bygg, 2026-11-03, against osmium on denmark-20260220 with four
+municipality boundaries exported from the same file (Copenhagen with its
+Frederiksberg hole, Frederiksberg, Aarhus, Odense; 814 to 9694 vertices, every
+vertex a node location) and on germany-20260224 with the Berlin boundary:
+complete_ways and smart (`-S types=multipolygon,boundary`) write exactly
+osmium's element sets, single and through `--config`, and simple differs
+only by the relations described above.
 
-## extract: polygon membership is pbfhogg's ray cast
+## extract: polygon input beyond osmium
 
-**osmium behavior:** A polygon extract quantizes the polygon's vertices to
-decimicrodegrees, includes a node equal to any vertex, and decides the rest
-with an integer crossing test.
+Polygon membership itself is osmium's (`docs/cli/commands.md` "### extract"
+states the rule): vertices rounded as libosmium rounds them, rings oriented as
+osmium orients them, a node on a vertex inside, the rest by osmium's integer
+crossing test with one parity over every ring of a geometry. The differences
+are in which polygon input is accepted and what it means.
 
-**pbfhogg behavior:** The polygon is kept in f64 degrees and a node is tested
-with an f64 even-odd ray cast, with no vertex or edge special case; a
-FeatureCollection contributes every feature, where osmium takes the first.
+**osmium behavior:** A FeatureCollection contributes its first feature only.
+An open GeoJSON ring is used as given, without a closing segment. Polygons
+crossing the antimeridian are documented as unsupported; an edge from 179 to
+-179 is taken as spanning the globe. A coordinate array must hold exactly two
+numbers, and a coordinate is checked after rounding, so `180.00000001` is
+accepted as 180. A ring of zero signed area, such as a symmetric bow-tie, is
+accepted.
 
-**Impact:** A node lying exactly on a polygon vertex or edge can be excluded
-where osmium includes it, and every way and relation that would have matched
-through it with it. Interior membership agrees.
+**pbfhogg behavior:** Every feature of a FeatureCollection is read, and
+features are unioned; the rings within one feature's Polygon or MultiPolygon
+share osmium's single parity. An open ring is closed by repeating its first
+position, and its orientation is judged on the closed ring. A geometry with
+an edge spanning more than 180 degrees of longitude is unwrapped: each member
+polygon's outer ring is unwrapped from its first vertex, each hole is moved by
+whole turns into its own outer ring's longitude window, members are unioned
+instead of sharing a parity, and a node is tested at its own longitude and one
+turn east and west; the region's box spans every longitude. A crossing ring
+whose unwrapped path does not close (it circles a pole) or that spans 360
+degrees is refused. A coordinate array may carry a third number (altitude),
+which is ignored. A coordinate outside the WGS84 domain before rounding, and
+a ring of zero signed area, are refused.
 
-**Rationale:** Not chosen; the polygon predicate has not been brought to
-osmium's integer rule. A bbox extract is unaffected.
+**Impact:** A FeatureCollection of several features selects their union
+where osmium selects the first. An open ring selects what its closed form
+encloses; osmium's result for it has no closing edge. A polygon crossing the
+antimeridian selects both sides of it. The refusals are errors, never a
+different extract.
+
+**Rationale:** A FeatureCollection of several regions is far more often
+meant as their union than as its first member. An open ring is a common
+GeoJSON slip, and closing it is the only reading with an interior. Splitting a
+region at the antimeridian, as osmium's manual asks, is a burden pbfhogg can
+carry for the user. A ring of zero signed area is a line, a point, or a
+self-crossing ring whose lobes cancel (a symmetric bow-tie still has an
+even-odd interior); refusing it treats that cancellation as the input
+mistake it nearly always is, rather than extracting from it. Refusing a
+coordinate outside the domain keeps one domain check for every coordinate
+pbfhogg reads. None of this changes a polygon osmium supports, as
+a closed, non-crossing single geometry.
 
 ## extract: multi-extract config path roots
 

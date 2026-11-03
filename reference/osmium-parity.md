@@ -223,7 +223,7 @@ worth knowing about.
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
 | `-O, --overwrite` | `-O, --overwrite`, as in osmium: an existing output is refused without it. Unlike osmium a symlink is refused even with it | every command with an output |
-| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area; an open ring is closed implicitly) | extract |
+| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, unioned, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area, and each coordinate must lie in the WGS84 domain before rounding; an open ring is closed implicitly; a polygon may cross the antimeridian. Membership is osmium's integer rule; see [DEVIATIONS](../DEVIATIONS.md#extract-polygon-input-beyond-osmium)) | extract |
 
 ### Flags pbfhogg doesn't have
 

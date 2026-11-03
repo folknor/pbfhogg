@@ -20,7 +20,7 @@ mod grid_parity {
     use pbfhogg::MemberId;
     use pbfhogg::cat::CleanAttrs;
     use pbfhogg::commands::extract::{
-        Bbox, ExtractStrategy, PolygonRings, Region, extract_multi, parse_bbox,
+        ExtractStrategy, Polygon, PolygonRings, Region, extract_multi, parse_bbox,
     };
     use pbfhogg::write::WriteOptions;
 
@@ -91,8 +91,8 @@ mod grid_parity {
     fn poly_region(i: usize) -> Region {
         let (lon0, lat0) = tile_origin(i);
         let (max_lon, max_lat) = (lon0 + 4.0, lat0 + 6.0);
-        Region::Polygon {
-            polygons: vec![PolygonRings {
+        Region::Polygon(
+            Polygon::new(&[vec![PolygonRings {
                 exterior: vec![
                     (lon0, lat0),
                     (max_lon, lat0),
@@ -101,14 +101,9 @@ mod grid_parity {
                     (lon0, lat0),
                 ],
                 holes: vec![],
-            }],
-            bbox: Bbox {
-                min_lon: lon0,
-                min_lat: lat0,
-                max_lon,
-                max_lat,
-            },
-        }
+            }]])
+            .unwrap(),
+        )
     }
 
     fn run_config<F>(

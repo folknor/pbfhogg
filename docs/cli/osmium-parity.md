@@ -225,12 +225,14 @@ worth knowing about.
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
 | `-O, --overwrite` | `-O, --overwrite`, as in osmium: an existing output is refused without it. Unlike osmium a symlink is refused even with it | every command with an output |
-| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area; an open ring is closed implicitly) | extract |
+| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, unioned, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area, and each coordinate must lie in the WGS84 domain before rounding; an open ring is closed implicitly; a polygon may cross the antimeridian) | extract |
 
 For extract polygons, pbfhogg does not validate ring self-intersections.
-Accepted self-crossing rings use even-odd ray crossing, matching osmium's
-extractor. The non-zero-area check still rejects rings whose signed area
-cancels to zero, including a symmetric bow-tie.
+Membership is osmium's integer rule, so accepted self-crossing rings are
+decided by the same crossing parity as in osmium's extractor, node for node.
+The non-zero-area check still rejects rings whose signed area cancels to
+zero, including a symmetric bow-tie. See
+[DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-polygon-input-beyond-osmium).
 
 ### Flags pbfhogg doesn't have
 

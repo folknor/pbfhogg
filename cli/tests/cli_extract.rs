@@ -460,6 +460,56 @@ fn polygon_from_geojson_file() {
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
 
+/// A node on a polygon vertex is inside, as in osmium, under every strategy
+/// and through `--config`: a boundary exported from OSM has every vertex on a
+/// node. Node 2 sits on the triangle's apex, node 3 on its horizontal base
+/// (inside: the region lies above it), node 4 one column above the apex,
+/// outside.
+#[test]
+fn polygon_vertex_and_edge_nodes_follow_osmium() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        node(1, 557_000_000, 125_000_000),
+        node(2, 559_000_000, 125_500_000),
+        node(3, 555_000_000, 126_000_000),
+        node(4, 559_000_001, 125_500_000),
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+    for (name, strategy) in [
+        ("simple", Strategy::Simple),
+        ("complete", Strategy::CompleteWays),
+        ("smart", Strategy::Smart),
+    ] {
+        let out = dir.path().join(format!("{name}.osm.pbf"));
+        run_extract(&input, &out, &RegionArg::Polygon(&geojson), strategy);
+        assert_eq!(node_ids(&read_all_elements(&out)), vec![1, 2, 3], "{name}");
+    }
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"m.osm.pbf","polygon_file":"region.geojson"}}]}}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        vec![1, 2, 3]
+    );
+}
+
 #[test]
 fn polygon_rejects_degenerate_exterior_without_publishing_output() {
     let dir = crate::common::test_scratch();

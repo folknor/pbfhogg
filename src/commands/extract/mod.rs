@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::cat::CleanAttrs;
-use crate::coord_fmt::e7_to_deg;
 use crate::error::Error;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
@@ -13,6 +12,7 @@ use super::{HeaderOverrides, Result};
 mod common;
 mod complete;
 mod multi;
+mod polygon;
 mod simple;
 mod smart;
 
@@ -21,6 +21,7 @@ mod smart;
 // ---------------------------------------------------------------------------
 
 pub use crate::geo::Bbox;
+pub use polygon::{Polygon, PolygonRings};
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
 ///
@@ -71,38 +72,22 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
 pub enum Region {
     /// Rectangular bounding box.
     Bbox(Bbox),
-    /// Polygon with optional holes (and precomputed bounding box for fast rejection).
-    /// Coordinates are (lon, lat) pairs in degrees, following GeoJSON convention.
-    Polygon {
-        /// All polygons (exterior ring + holes each). For simple Polygon, this has one entry.
-        /// For MultiPolygon, one entry per polygon.
-        polygons: Vec<PolygonRings>,
-        /// Precomputed bounding box of all exterior rings (for fast rejection).
-        bbox: Bbox,
-    },
-}
-
-/// A single polygon: exterior ring + optional holes.
-pub struct PolygonRings {
-    /// Exterior ring: Vec of (lon, lat) in degrees.
-    pub exterior: Vec<(f64, f64)>,
-    /// Interior rings (holes): Vec of rings, each a Vec of (lon, lat).
-    pub holes: Vec<Vec<(f64, f64)>>,
+    /// Prepared polygon region (see [`Polygon`]): osmium extract's integer
+    /// point-in-polygon rule over one or more unioned geometries.
+    Polygon(Polygon),
 }
 
 impl Region {
     /// Returns true if the point (lat, lon) in degrees falls within this region.
+    ///
+    /// A bbox quantizes the point by `geo::quantize_f64`, a polygon by the
+    /// vertex rule `round(v * 1e7)`; both map an f64 made from a stored
+    /// decimicrodegree back to that integer, so this agrees with what
+    /// `extract` selects for every PBF node.
     pub fn contains(&self, lat: f64, lon: f64) -> bool {
         match self {
             Region::Bbox(bbox) => bbox.contains(lat, lon),
-            Region::Polygon { polygons, bbox } => {
-                // The polygon predicate is continuous f64 geometry; its
-                // envelope prefilter stays in the same coordinate model.
-                if !bbox.envelope_contains(lat, lon) {
-                    return false;
-                }
-                polygon_contains(polygons, lon, lat)
-            }
+            Region::Polygon(polygon) => polygon.contains_degrees(lat, lon),
         }
     }
 
@@ -111,21 +96,13 @@ impl Region {
     /// `exact` must be `BboxInt::inside_bbox(self.bbox())`, computed once by
     /// the caller. For a bbox region it is the membership rule itself: four
     /// integer compares against the quantized, inclusive box. For a polygon
-    /// it is only a prefilter, and a sound one for integer points: a point
-    /// one column outside a nearest-rounded edge lies at least half a
-    /// decimicrodegree outside the f64 vertex envelope, which the f64 ray
-    /// cast below never admits. Only points that pass fall through to the
-    /// polygon test.
+    /// it is the integer envelope of every geometry, so a sound prefilter;
+    /// the polygon's own integer test decides the rest.
     fn contains_decimicro(&self, exact: &common::BboxInt, lat: i32, lon: i32) -> bool {
         match self {
             Region::Bbox(_) => exact.contains(lat, lon),
-            Region::Polygon { polygons, .. } => {
-                if !exact.contains(lat, lon) {
-                    return false;
-                }
-                let lat_f64 = e7_to_deg(lat as f64);
-                let lon_f64 = e7_to_deg(lon as f64);
-                polygon_contains(polygons, lon_f64, lat_f64)
+            Region::Polygon(polygon) => {
+                exact.contains(lat, lon) && polygon.contains_decimicro(lat, lon)
             }
         }
     }
@@ -134,27 +111,10 @@ impl Region {
     pub fn bbox(&self) -> &Bbox {
         match self {
             Region::Bbox(bbox) => bbox,
-            Region::Polygon { bbox, .. } => bbox,
+            Region::Polygon(polygon) => polygon.bbox(),
         }
     }
 }
-
-/// Check if any polygon in the list contains the point (px=lon, py=lat).
-fn polygon_contains(polygons: &[PolygonRings], px: f64, py: f64) -> bool {
-    polygons.iter().any(|p| polygon_rings_contains(p, px, py))
-}
-
-/// Check if a single polygon (exterior + holes) contains the point.
-/// Borrows hole slices without allocating a temporary list. Crossing rings
-/// still unwrap per query: these public vectors can be mutated by callers, so
-/// a parse-time cache would become stale. Prepared geometry needs an immutable
-/// owning API before it can safely replace this representation.
-fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
-    crate::geo::point_in_polygon_rings(px, py, &poly.exterior, poly.holes.iter().map(Vec::as_slice))
-}
-
-// Delegate to geo module; used by tests and bbox_from_polygons.
-use crate::geo::ring_crosses_antimeridian;
 
 // ---------------------------------------------------------------------------
 // GeoJSON parsing
@@ -165,7 +125,8 @@ use crate::geo::ring_crosses_antimeridian;
 /// Accepts:
 /// - A bare Geometry with type "Polygon" or "MultiPolygon"
 /// - A Feature with a Polygon/MultiPolygon geometry
-/// - A FeatureCollection whose Polygon/MultiPolygon features are all included
+/// - A FeatureCollection whose Polygon/MultiPolygon features are all
+///   included, unioned (osmium takes the first feature only)
 ///
 /// A failure to read or parse the file names it.
 pub fn parse_geojson(path: &Path) -> Result<Region> {
@@ -177,7 +138,7 @@ fn parse_geojson_text(data: &str) -> Result<Region> {
     let value: serde_json::Value =
         serde_json::from_str(data).map_err(|e| Error::invalid_data_with("invalid GeoJSON", e))?;
     let geometries = extract_geometries(&value)?;
-    let mut polygons = Vec::new();
+    let mut prepared = Vec::with_capacity(geometries.len());
     for geometry in geometries {
         let geo_type = geometry
             .get("type")
@@ -186,10 +147,9 @@ fn parse_geojson_text(data: &str) -> Result<Region> {
         let coords = geometry
             .get("coordinates")
             .ok_or_else(|| Error::invalid_data("geometry missing 'coordinates' field"))?;
-        polygons.extend(parse_geometry_by_type(geo_type, coords)?);
+        prepared.push(parse_geometry_by_type(geo_type, coords)?);
     }
-    let bbox = bbox_from_polygons(&polygons)?;
-    Ok(Region::Polygon { polygons, bbox })
+    Ok(Region::Polygon(Polygon::new(&prepared)?))
 }
 
 /// Navigate Feature/FeatureCollection to find the geometry object.
@@ -276,13 +236,8 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
     let points = ring
         .as_array()
         .ok_or_else(|| Error::invalid_data("ring must be an array of coordinate pairs"))?;
-    // A one- or two-point ring has a bounding box but no interior, so
-    // accepting it turns a malformed polygon into a successful empty
-    // extract. Open rings are accepted on purpose: RFC 7946 asks for a
-    // repeated first position, but the point-in-ring and antimeridian tests
-    // close a ring implicitly, and osmium accepts three-position rings too
-    // (its .poly parser closes them). Refusing them would break region
-    // files that have always worked.
+    // Refused here as osmium's parser does; `Polygon::new` repeats the check
+    // with the domain and area refusals, for rings built in code too.
     if points.len() < 3 {
         return Err(Error::invalid_data(
             "polygon ring must contain at least 3 coordinate positions",
@@ -293,6 +248,8 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         let pair = point
             .as_array()
             .ok_or_else(|| Error::invalid_data("coordinate must be a [lon, lat] array"))?;
+        // osmium requires exactly two numbers; a GeoJSON position may carry
+        // an altitude, which is ignored here.
         if pair.len() < 2 {
             return Err(Error::invalid_data(
                 "coordinate array must have at least 2 elements",
@@ -304,90 +261,9 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         let lat = pair[1]
             .as_f64()
             .ok_or_else(|| Error::invalid_data("coordinate lat must be a number"))?;
-        crate::coord_pack::validate_lon("polygon longitude", lon)
-            .map_err(Error::invalid_data_from)?;
-        crate::coord_pack::validate_lat("polygon latitude", lat)
-            .map_err(Error::invalid_data_from)?;
         result.push((lon, lat));
     }
-    // Self-intersections are deliberately not rejected here. osmium extract
-    // also accepts rings without a simplicity check and applies even-odd
-    // ray crossing when selecting points; rejecting crossings would diverge
-    // from that behavior and requires a separate geometry-validation pass.
-    // The signed-area check below still rejects rings whose algebraic area
-    // cancels to zero, including a symmetric bow-tie.
-    // A ring can still collapse to a line or point (fewer than three distinct
-    // positions, or all collinear) and so have no interior to select. Taking
-    // the shoelace sum relative to the first position makes the closing
-    // edge's term zero, so this is the full area whether or not the input
-    // repeats its first position.
-    let origin = result[0];
-    let twice_area = result
-        .windows(2)
-        .map(|edge| {
-            (edge[0].0 - origin.0) * (edge[1].1 - origin.1)
-                - (edge[1].0 - origin.0) * (edge[0].1 - origin.1)
-        })
-        .sum::<f64>();
-    if twice_area == 0.0 {
-        return Err(Error::invalid_data(
-            "polygon ring must enclose a non-zero area",
-        ));
-    }
     Ok(result)
-}
-
-/// Compute the enclosing bounding box from all exterior ring vertices.
-fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
-    let mut min_lon = f64::MAX;
-    let mut min_lat = f64::MAX;
-    let mut max_lon = f64::MIN;
-    let mut max_lat = f64::MIN;
-    let mut found_any = false;
-    let mut crosses_antimeridian = false;
-
-    for poly in polygons {
-        if ring_crosses_antimeridian(&poly.exterior) {
-            crosses_antimeridian = true;
-        }
-        for &(lon, lat) in &poly.exterior {
-            found_any = true;
-            if lon < min_lon {
-                min_lon = lon;
-            }
-            if lat < min_lat {
-                min_lat = lat;
-            }
-            if lon > max_lon {
-                max_lon = lon;
-            }
-            if lat > max_lat {
-                max_lat = lat;
-            }
-        }
-    }
-
-    if !found_any {
-        return Err(Error::invalid_data(
-            "no exterior ring vertices found for bounding box",
-        ));
-    }
-
-    // Region::bbox and blob scheduling accept one ordinary interval. A crossing
-    // polygon needs both longitude lobes; widening is conservative and loses
-    // skip efficiency, not points. Two boxes require a union-aware scheduling
-    // interface, including multi-extract, rather than narrowing this interval.
-    if crosses_antimeridian {
-        min_lon = -180.0;
-        max_lon = 180.0;
-    }
-
-    Ok(Bbox {
-        min_lon,
-        min_lat,
-        max_lon,
-        max_lat,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +514,7 @@ fn parse_extract_geometry(
         let geom = entry
             .get("polygon")
             .ok_or_else(|| Error::invalid_data(format!("extract[{index}] missing 'polygon'")))?;
-        let mut polygons = Vec::new();
+        let mut geometries = Vec::new();
         for geometry in extract_geometries(geom)? {
             let geo_type = geometry
                 .get("type")
@@ -651,10 +527,9 @@ fn parse_extract_geometry(
                     "extract[{index}] polygon missing 'coordinates' field"
                 ))
             })?;
-            polygons.extend(parse_geometry_by_type(geo_type, coords)?);
+            geometries.push(parse_geometry_by_type(geo_type, coords)?);
         }
-        let bbox = bbox_from_polygons(&polygons)?;
-        return Ok(Region::Polygon { polygons, bbox });
+        return Ok(Region::Polygon(Polygon::new(&geometries)?));
     }
 
     // has_polygon_file
@@ -1063,7 +938,7 @@ pub(crate) fn extract_to(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::geo::{point_in_ring, point_in_ring_with_antimeridian};
+    use crate::coord_fmt::from_decimicro;
     use std::io::Write as _;
     use tempfile::TempDir;
 
@@ -1166,190 +1041,83 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // point_in_ring tests
+    // Region::Polygon tests (the rule itself is pinned in polygon.rs)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn point_in_square() {
-        // Unit square: (0,0), (1,0), (1,1), (0,1), (0,0)
-        let square = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)];
-        // Inside
-        assert!(point_in_ring(0.5, 0.5, &square));
-        // Outside
-        assert!(!point_in_ring(2.0, 0.5, &square));
-        assert!(!point_in_ring(0.5, 2.0, &square));
-        assert!(!point_in_ring(-0.5, 0.5, &square));
+    fn polygon_region(exterior: Vec<(f64, f64)>, holes: Vec<Vec<(f64, f64)>>) -> Region {
+        Region::Polygon(Polygon::new(&[vec![PolygonRings { exterior, holes }]]).unwrap())
     }
 
-    #[test]
-    fn point_in_triangle() {
-        // Triangle: (0,0), (4,0), (2,3), (0,0)
-        let triangle = vec![(0.0, 0.0), (4.0, 0.0), (2.0, 3.0), (0.0, 0.0)];
-        // Inside
-        assert!(point_in_ring(2.0, 1.0, &triangle));
-        // Outside
-        assert!(!point_in_ring(0.0, 3.0, &triangle));
-        assert!(!point_in_ring(5.0, 1.0, &triangle));
+    fn square(lon0: f64, lat0: f64, size: f64) -> Vec<(f64, f64)> {
+        vec![
+            (lon0, lat0),
+            (lon0 + size, lat0),
+            (lon0 + size, lat0 + size),
+            (lon0, lat0 + size),
+            (lon0, lat0),
+        ]
     }
-
-    #[test]
-    fn point_in_concave() {
-        // L-shaped polygon (concave):
-        // (0,0), (2,0), (2,1), (1,1), (1,2), (0,2), (0,0)
-        let l_shape = vec![
-            (0.0, 0.0),
-            (2.0, 0.0),
-            (2.0, 1.0),
-            (1.0, 1.0),
-            (1.0, 2.0),
-            (0.0, 2.0),
-            (0.0, 0.0),
-        ];
-        // Inside the bottom part
-        assert!(point_in_ring(1.5, 0.5, &l_shape));
-        // Inside the left part
-        assert!(point_in_ring(0.5, 1.5, &l_shape));
-        // Outside: in the upper-right concavity
-        assert!(!point_in_ring(1.5, 1.5, &l_shape));
-        // Fully outside
-        assert!(!point_in_ring(3.0, 1.0, &l_shape));
-    }
-
-    #[test]
-    fn point_in_ring_degenerate() {
-        // Empty ring
-        assert!(!point_in_ring(0.0, 0.0, &[]));
-        // Two-point ring (not a valid polygon)
-        assert!(!point_in_ring(0.0, 0.0, &[(0.0, 0.0), (1.0, 1.0)]));
-    }
-
-    #[test]
-    fn point_in_ring_antimeridian() {
-        // Rectangle crossing the dateline.
-        let ring = vec![
-            (179.0, 10.0),
-            (-179.0, 10.0),
-            (-179.0, 12.0),
-            (179.0, 12.0),
-            (179.0, 10.0),
-        ];
-        assert!(point_in_ring_with_antimeridian(179.5, 11.0, &ring));
-        assert!(point_in_ring_with_antimeridian(-179.5, 11.0, &ring));
-        assert!(!point_in_ring_with_antimeridian(0.0, 11.0, &ring));
-    }
-
-    // -----------------------------------------------------------------------
-    // Region::Polygon tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn polygon_region_contains() {
-        // Square polygon from (10, 50) to (12, 52) in (lon, lat)
-        let region = Region::Polygon {
-            polygons: vec![PolygonRings {
-                exterior: vec![
-                    (10.0, 50.0),
-                    (12.0, 50.0),
-                    (12.0, 52.0),
-                    (10.0, 52.0),
-                    (10.0, 50.0),
-                ],
-                holes: vec![],
-            }],
-            bbox: Bbox {
-                min_lon: 10.0,
-                min_lat: 50.0,
-                max_lon: 12.0,
-                max_lat: 52.0,
-            },
-        };
-        // Inside: lat=51, lon=11
+        let region = polygon_region(square(10.0, 50.0, 2.0), vec![]);
         assert!(region.contains(51.0, 11.0));
-        // Outside
         assert!(!region.contains(53.0, 11.0));
         assert!(!region.contains(51.0, 13.0));
+        assert!(!region.contains(0.0, 0.0));
+        // The north-east vertex, which an f64 ray cast excluded.
+        assert!(region.contains(52.0, 12.0));
     }
 
     #[test]
     fn polygon_region_hole() {
-        // Square with a hole in the center
-        let region = Region::Polygon {
-            polygons: vec![PolygonRings {
-                exterior: vec![
-                    (0.0, 0.0),
-                    (10.0, 0.0),
-                    (10.0, 10.0),
-                    (0.0, 10.0),
-                    (0.0, 0.0),
-                ],
-                holes: vec![vec![
-                    (3.0, 3.0),
-                    (7.0, 3.0),
-                    (7.0, 7.0),
-                    (3.0, 7.0),
-                    (3.0, 3.0),
-                ]],
-            }],
-            bbox: Bbox {
-                min_lon: 0.0,
-                min_lat: 0.0,
-                max_lon: 10.0,
-                max_lat: 10.0,
-            },
-        };
-        // Inside exterior but outside hole: lat=1, lon=1
+        let region = polygon_region(square(0.0, 0.0, 10.0), vec![square(3.0, 3.0, 4.0)]);
         assert!(region.contains(1.0, 1.0));
-        // Inside hole: lat=5, lon=5
         assert!(!region.contains(5.0, 5.0));
-        // Outside entirely
         assert!(!region.contains(15.0, 5.0));
     }
 
+    /// The f64 entry point and the integer one agree on every node, edges
+    /// and vertices included, because both land a stored decimicrodegree on
+    /// its own column.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     #[test]
-    fn polygon_region_bbox_rejects() {
-        // Point well outside the bbox should be rejected quickly
-        let region = Region::Polygon {
-            polygons: vec![PolygonRings {
-                exterior: vec![
-                    (10.0, 50.0),
-                    (12.0, 50.0),
-                    (12.0, 52.0),
-                    (10.0, 52.0),
-                    (10.0, 50.0),
-                ],
-                holes: vec![],
-            }],
-            bbox: Bbox {
-                min_lon: 10.0,
-                min_lat: 50.0,
-                max_lon: 12.0,
-                max_lat: 52.0,
-            },
-        };
-        // lat=0, lon=0 -- outside bbox
-        assert!(!region.contains(0.0, 0.0));
+    fn polygon_region_f64_and_integer_paths_agree() {
+        let region = polygon_region(square(10.0, 50.0, 2.0), vec![square(10.5, 50.5, 0.5)]);
+        let exact = common::BboxInt::inside_bbox(region.bbox());
+        assert_eq!(
+            (exact.min_lon, exact.min_lat, exact.max_lon, exact.max_lat),
+            (100_000_000, 500_000_000, 120_000_000, 520_000_000)
+        );
+        for lat in (499_999_998..=520_000_002)
+            .step_by(2_500_000)
+            .chain([505_000_000, 510_000_000])
+        {
+            for lon in (99_999_998..=120_000_002)
+                .step_by(2_500_000)
+                .chain([105_000_000, 110_000_000])
+            {
+                assert_eq!(
+                    region.contains(from_decimicro(lat), from_decimicro(lon)),
+                    region.contains_decimicro(&exact, lat, lon),
+                    "({lat},{lon})"
+                );
+            }
+        }
     }
 
     #[test]
     fn polygon_region_antimeridian_contains() {
-        let region = Region::Polygon {
-            polygons: vec![PolygonRings {
-                exterior: vec![
-                    (179.0, 10.0),
-                    (-179.0, 10.0),
-                    (-179.0, 12.0),
-                    (179.0, 12.0),
-                    (179.0, 10.0),
-                ],
-                holes: vec![],
-            }],
-            bbox: Bbox {
-                min_lon: -180.0,
-                min_lat: 10.0,
-                max_lon: 180.0,
-                max_lat: 12.0,
-            },
-        };
+        let region = polygon_region(
+            vec![
+                (179.0, 10.0),
+                (-179.0, 10.0),
+                (-179.0, 12.0),
+                (179.0, 12.0),
+                (179.0, 10.0),
+            ],
+            vec![],
+        );
         assert!(region.contains(11.0, 179.5));
         assert!(region.contains(11.0, -179.5));
         assert!(!region.contains(11.0, 0.0));
@@ -1371,36 +1139,7 @@ mod tests {
     /// [`polygon_mixed_grid_parity`]. Split out to keep that test's body within
     /// the line budget.
     fn mixed_parity_regions() -> Vec<Region> {
-        fn square(lon0: f64, lat0: f64, size: f64) -> Vec<(f64, f64)> {
-            vec![
-                (lon0, lat0),
-                (lon0 + size, lat0),
-                (lon0 + size, lat0 + size),
-                (lon0, lat0 + size),
-                (lon0, lat0),
-            ]
-        }
-        fn poly(exterior: Vec<(f64, f64)>, holes: Vec<Vec<(f64, f64)>>) -> Region {
-            let mut min_lon = f64::MAX;
-            let mut min_lat = f64::MAX;
-            let mut max_lon = f64::MIN;
-            let mut max_lat = f64::MIN;
-            for &(x, y) in &exterior {
-                min_lon = min_lon.min(x);
-                max_lon = max_lon.max(x);
-                min_lat = min_lat.min(y);
-                max_lat = max_lat.max(y);
-            }
-            Region::Polygon {
-                polygons: vec![PolygonRings { exterior, holes }],
-                bbox: Bbox {
-                    min_lon,
-                    min_lat,
-                    max_lon,
-                    max_lat,
-                },
-            }
-        }
+        let poly = polygon_region;
 
         let mut regions: Vec<Region> = Vec::new();
         // 12 bbox regions tiling a longitude band.
@@ -1421,24 +1160,16 @@ mod tests {
         // Polygon with a hole.
         regions.push(poly(square(0.0, 0.0, 10.0), vec![square(3.0, 3.0, 4.0)]));
         // Antimeridian-crossing polygon -> full-width bbox.
-        regions.push(Region::Polygon {
-            polygons: vec![PolygonRings {
-                exterior: vec![
-                    (179.0, 10.0),
-                    (-179.0, 10.0),
-                    (-179.0, 12.0),
-                    (179.0, 12.0),
-                    (179.0, 10.0),
-                ],
-                holes: vec![],
-            }],
-            bbox: Bbox {
-                min_lon: -180.0,
-                min_lat: 10.0,
-                max_lon: 180.0,
-                max_lat: 12.0,
-            },
-        });
+        regions.push(poly(
+            vec![
+                (179.0, 10.0),
+                (-179.0, 10.0),
+                (-179.0, 12.0),
+                (179.0, 12.0),
+                (179.0, 10.0),
+            ],
+            vec![],
+        ));
         // Pole-adjacent polygon.
         regions.push(poly(square(0.0, 85.0, 4.0), vec![]));
         // One more bbox in the southern hemisphere to reach 24.
@@ -1581,12 +1312,17 @@ mod tests {
             assert!(err.to_string().contains("at least 3"), "wrong error: {err}");
         }
 
-        // Implicitly closed: the point-in-ring test supplies the last edge.
+        let polygon = |ring: serde_json::Value| {
+            parse_geojson_text(
+                &serde_json::json!({"type": "Polygon", "coordinates": [ring]}).to_string(),
+            )
+        };
+        // Implicitly closed: the region gets the closing segment.
         let open_ring = serde_json::json!([[12.0, 55.0], [13.0, 55.0], [13.0, 56.0], [12.0, 56.0]]);
-        let ring = parse_ring(&open_ring).expect("open rings are closed implicitly");
-        assert!(point_in_ring(12.5, 55.5, &ring));
+        let region = polygon(open_ring).expect("open rings are closed implicitly");
+        assert!(region.contains(55.5, 12.5));
         let open_triangle = serde_json::json!([[12.0, 55.0], [13.0, 55.0], [12.0, 56.0]]);
-        parse_ring(&open_triangle).expect("an open triangle has an interior");
+        polygon(open_triangle).expect("an open triangle has an interior");
 
         for ring in [
             // Closed but collinear.
@@ -1596,7 +1332,9 @@ mod tests {
             // Three positions, two distinct.
             serde_json::json!([[12.0, 55.0], [13.0, 56.0], [12.0, 55.0]]),
         ] {
-            let err = parse_ring(&ring).expect_err("zero-area rings must be rejected");
+            let err = polygon(ring)
+                .err()
+                .expect("zero-area rings must be rejected");
             assert!(
                 err.to_string().contains("non-zero area"),
                 "wrong error: {err}"

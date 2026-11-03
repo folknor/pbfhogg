@@ -2233,6 +2233,24 @@ over 1 042 815 edges and adds 78 408 relations; the relation classify phase
 that collects the edges stays at 0.94 s. Variant UUIDs are dirty sidecar
 rows (`brokkr sidecar <uuid>`), not `results` rows.
 
+### Polygon membership on osmium's banded integer test (bygg, 2026-11-03, against `c4ed2ad8`)
+
+The polygon predicate moved from an f64 ray cast over every vertex per node
+to osmium's integer test over the segments of the node's latitude band.
+brokkr runs extract and multi-extract with bbox regions only, so these are
+direct runs of the two release binaries, interleaved, wall clock, not stored
+cells; bbox extracts do not reach the changed code. Boundaries exported by
+`osmium export` from the same input:
+
+| Input, region (vertices), strategy | `c4ed2ad8` | variant |
+|------------------------------------|------------|---------|
+| denmark-20260220, Aarhus Kommune (9694), simple, 4 pairs | 1.26 s median (1.26 to 1.28) | 0.35 s median (0.35 to 0.36) |
+| germany-20260224, Berlin (6017), complete, 2 pairs | 5.70 s warm, 11.10 s cold first run | 3.28 s, 3.31 s |
+
+Prepared segments and bands are built once per region; the per-node cost is
+the band's segments instead of every vertex, so the gain grows with the
+polygon's vertex count.
+
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each

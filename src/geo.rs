@@ -64,13 +64,6 @@ impl Bbox {
         }
     }
 
-    /// The raw f64 envelope test, no quantization. Only for prefiltering a
-    /// polygon's continuous f64 geometry, whose own predicate decides.
-    #[cfg(feature = "commands")]
-    pub(crate) fn envelope_contains(&self, lat: f64, lon: f64) -> bool {
-        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
-    }
-
     /// This box with each edge replaced by the decimal its text token
     /// quantizes to (see [`quantize_decimal_text`]), stored as that
     /// decimicrodegree over `1e7`. `None` when a token is not a decimal
@@ -347,8 +340,10 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 ///
 /// Coordinates are `(x, y)` = `(longitude, latitude)` in degrees.
 /// Each crossing toggles membership, so accepted self-intersecting rings use
-/// the even-odd interpretation. This matches osmium extract's polygon test;
-/// this function does not decide whether a ring is geometrically simple.
+/// the even-odd interpretation; this function does not decide whether a ring
+/// is geometrically simple. An f64 test with no vertex or edge rule, for the
+/// geocode index's admin rings. `extract` does not use it: its polygon
+/// regions follow osmium's integer rule (`commands::extract::Polygon`).
 /// Returns `false` for rings with fewer than 3 vertices.
 pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
     let n = ring.len();

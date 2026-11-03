@@ -535,7 +535,10 @@ pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 /// so the drain is not busy for the whole run while the workers keep
 /// producing behind it. The batch bounds what one call holds (its frames,
 /// and a builder per running task), whatever the run's length; 64 keeps a
-/// 32-thread executor busy through a batch.
+/// 32-thread executor busy through a batch. The integration test that
+/// crosses a batch boundary sizes its run at 65 full blocks and one
+/// element; a unit test in `stream_output.rs` fails if this value grows
+/// past what that run crosses, so raising it means growing the run.
 pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: usize = 64;
 
 /// Filter bits per OSC node in the `--locations-on-ways` refresh probe

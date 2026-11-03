@@ -3,7 +3,9 @@
 //! blob) and at end of input. A run longer than one block is encoded and
 //! framed in parallel; its blocks must be cut where a single builder filling
 //! to the element cap would cut them, and written in id order, on the
-//! indexed and the forced unindexed route alike.
+//! indexed and the forced unindexed route alike. The executor takes a long
+//! run in batches of blocks; a run past one batch must still come out
+//! whole, its final partial batch included.
 
 #![allow(clippy::unwrap_used)]
 
@@ -169,4 +171,84 @@ fn create_runs_are_cut_at_the_element_cap_and_written_in_order() {
         crate::common::assert_every_data_blob_indexed(&output);
         crate::common::assert_sorted_file(&output);
     }
+}
+
+/// Full blocks in the run that crosses the batch boundary. The executor
+/// encodes a long run in batches of `APPLY_CHANGES_CREATE_BATCH_BLOCKS`
+/// (64) blocks, so 65 full blocks and a one-element block make a full first
+/// batch and a second, final batch of one full and one partial block. The
+/// constant is private to the crate, so this test cannot read it; raised to
+/// 66 or more it would hold this whole run in one batch and the test would
+/// stop crossing the boundary. A unit test in
+/// `src/commands/apply_changes/stream_output.rs` fails first in that case.
+const BOUNDARY_RUN_FULL_BLOCKS: usize = 65;
+
+#[test]
+fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
+    let dir = crate::common::test_scratch();
+    // Plain XML and uncompressed output: the batching is independent of
+    // both, and gzip and zlib in a debug build would be most of the run.
+    let osc = dir.path().join("diff.osc");
+    let cap = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP.get();
+    let first = 1000_i64;
+    let count = BOUNDARY_RUN_FULL_BLOCKS * cap + 1;
+    let creates = first..first + i64::try_from(count).unwrap();
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<create>\n",
+    );
+    for id in creates.clone() {
+        writeln!(
+            xml,
+            "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>"
+        )
+        .unwrap();
+    }
+    xml.push_str("</create>\n</osmChange>\n");
+    std::fs::write(&osc, xml).unwrap();
+
+    // Every create lies past the one base node blob, so the whole run is
+    // written at the node-to-way transition, as planet's is.
+    let base = dir.path().join("base.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_multi_block_test_pbf(
+        &base,
+        &generate_nodes(50, 1),
+        &generate_ways(10, 1, 2, 1),
+        &[],
+        50,
+    );
+    let opts = pbfhogg::apply_changes::MergeOptions {
+        write: pbfhogg::write::WriteOptions {
+            compression: pbfhogg::writer::Compression::None,
+            ..pbfhogg::write::WriteOptions::default()
+        },
+        locations_on_ways: None,
+        // The automatic sizing gives more than one worker, so the run is
+        // encoded on the executor, in batches.
+        parallelism: pbfhogg::Parallelism::Auto,
+        allow_version_regression: false,
+    };
+    let stats = pbfhogg::apply_changes::merge(
+        &base,
+        &osc,
+        crate::common::out(&output),
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .unwrap();
+
+    let mut expected_blobs = vec![(50, 0, 0)];
+    expected_blobs.extend(std::iter::repeat_n((cap, 0, 0), BOUNDARY_RUN_FULL_BLOCKS));
+    expected_blobs.push((1, 0, 0));
+    expected_blobs.push((0, 10, 0));
+    assert_eq!(elements_per_blob(&output), expected_blobs);
+    let c = read_all_elements_id_only(&output);
+    let mut expected_nodes: Vec<i64> = (1..=50).collect();
+    expected_nodes.extend(creates);
+    assert_eq!(node_ids_id_only(&c), expected_nodes);
+    assert_eq!(way_ids_id_only(&c), (1..=10).collect::<Vec<i64>>());
+    assert_eq!(stats.diff_nodes, count as u64);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
 }

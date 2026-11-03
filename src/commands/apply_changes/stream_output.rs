@@ -17,8 +17,9 @@
 //! A run of one block is encoded on the drain thread. A longer one is
 //! encoded on the invocation's executor, `APPLY_CHANGES_CREATE_BATCH_BLOCKS`
 //! blocks per call, except under an explicit `-j 1`, which runs
-//! sequentially and encodes every block on the drain thread. At planet the OSC's node creates past the last base
-//! node blob are about 300 blocks, written at the node-to-way transition:
+//! sequentially and encodes every block on the drain thread. At planet the
+//! OSC's node creates past the last base node blob are about 300 blocks,
+//! written at the node-to-way transition:
 //! encoded serially that kept the drain busy for a third of a second while
 //! the workers kept producing way output behind it, a backlog of framed
 //! output the allocator then kept as free memory in the workers' arenas for
@@ -300,4 +301,29 @@ pub(super) fn has_gap_creates(
 ) -> bool {
     let (cursor, upserts) = cursors.get(blob_kind, diff);
     cursor < upserts.len() && crate::osm_id::osm_id_cmp(upserts[cursor], min_id).is_lt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tests/apply_changes_create_runs.rs`
+    /// (`a_create_run_past_one_executor_batch_is_written_whole_and_in_order`)
+    /// pins a create run past one executor batch with a run of this many full
+    /// blocks and one element. It cannot read the crate-private batch size, so
+    /// the precondition that its run spans more than one batch is checked
+    /// here, against the expression `emit` batches by.
+    const BOUNDARY_FIXTURE_FULL_BLOCKS: usize = 65;
+
+    #[test]
+    fn the_batch_boundary_fixture_spans_more_than_one_batch() {
+        let cap = DEFAULT_ELEMENT_CAP.get();
+        let run = 0..BOUNDARY_FIXTURE_FULL_BLOCKS * cap + 1;
+        assert!(
+            chunks(run, cap * APPLY_CHANGES_CREATE_BATCH_BLOCKS).count() > 1,
+            "APPLY_CHANGES_CREATE_BATCH_BLOCKS holds the batch-boundary fixture's \
+             whole run in one batch: grow the run in tests/apply_changes_create_runs.rs \
+             and this constant together"
+        );
+    }
 }

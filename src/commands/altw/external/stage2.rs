@@ -683,9 +683,10 @@ pub(super) fn stage2_node_join(
                                         lon: tuple.lon,
                                     };
                                     let bucket = entry.slot_bucket(total_slots, slot_bucket_count);
-                                    let (bucket_start, _bucket_end) =
+                                    // The bucket-local slot fits u32: the layout's
+                                    // widest bucket was checked once, before stage 2.
+                                    let (bucket_start, _) =
                                         slot_bucket_bounds(total_slots, slot_bucket_count, bucket);
-                                    debug_assert!(_bucket_end - bucket_start <= u64::from(u32::MAX));
                                     entry.write_to(bucket_start, &mut entry_buf);
                                     slot_bufs[bucket].extend_from_slice(&entry_buf);
                                     slot_counts[bucket] += 1;

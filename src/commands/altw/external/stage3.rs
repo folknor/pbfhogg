@@ -233,6 +233,13 @@ pub(super) fn stage3_slot_reorder(
                     } else {
                         ((bucket_idx as u64 + 1) * range_size).min(total_slots)
                     };
+                    // `validate_slot_layout` checked before stage 2 that the
+                    // widest bucket's slot count, times `COORD_SLOT_SIZE` (the
+                    // scatter buffer) and times `RESOLVED_ENTRY_SIZE` (at most
+                    // one entry per slot, the bucket file `data_buf` reads), is
+                    // a representable allocation, so the `usize` casts below
+                    // and the local-slot offsets into the scatter buffer cannot
+                    // wrap.
                     let bucket_slots = bucket_end - bucket_start;
 
                     if entry_counts[bucket_idx] == 0 {

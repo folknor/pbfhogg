@@ -155,7 +155,7 @@ if let Some(bytes) = bb.take()? {
 # Ok::<(), std::io::Error>(())
 ```
 
-`BlockBuilder` does not flush by itself. Before each add, check `can_add_node()` / `can_add_way()` / `can_add_relation()`: they return `false` when the block is at its element cap or holds another element type (e.g. switching from nodes to ways), and then you `take()` the block and write it before adding. An add the block cannot take is refused, not encoded: the element is lost, and every later `take()` returns an error, so no output can be completed after the mistake. The same refusal applies to a way whose refs and locations differ in length and a relation member of an unknown type. Always call `take()` after adding all elements to flush the final partial block, and propagate its error.
+`BlockBuilder` does not flush by itself. Before each add, check `can_add_node()` / `can_add_way()` / `can_add_relation()`: they return `false` when the block is at its element cap or holds another element type (e.g. switching from nodes to ways), and then you `take()` the block and write it before adding. An add the block cannot take is refused, not encoded: the element is lost, and every later `take()` returns an error, so no output can be completed after the mistake. The same refusal applies to a way whose refs and locations differ in length and a relation member of an unknown type. Always call `take()` after adding all elements to flush the final partial block, and propagate its error. Dropping a builder is cleanup only: whatever it holds, a refusal included, is discarded without an error or a panic, so a refusal reaches you only through `take()`.
 
 ### Metadata
 

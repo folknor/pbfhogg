@@ -291,6 +291,20 @@
   could miss that street or boundary, and a debug
   build panicked on the valid input. Indexes built before this need a
   rebuild to gain the cell; the format is unchanged.
+- `add-locations-to-ways --index-type external` refuses an input past its
+  way-side encoding limits (exit 2, nothing published, the message naming
+  the limit and the sparse index): more than 2^32 way blobs, or about
+  2^40 way node refs in total (a slot bucket of more than 2^32 refs). Past
+  either, a release build used to wrap the stored position and write
+  coordinates into the wrong ways with no error. The limits sit far above
+  planet (about 88 times its refs), but highly compressible input reaches
+  them in a much smaller file.
+- Dropping a `BlockBuilder` without `take()` no longer panics in a debug
+  build when it was poisoned by a refused element. A relation member of an
+  unknown type followed by an unrelated error (a bad tag string in the same
+  blob, for one) made a debug build of the CLI or of a library consumer
+  panic in place of reporting that error. Dropping a builder is cleanup;
+  a refusal is reported by `take()` / `take_owned()` only.
 
 ## 0.6.0 - 2026-10-30
 

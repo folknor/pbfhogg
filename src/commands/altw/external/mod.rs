@@ -553,7 +553,9 @@ mod id_record_tests {
 // one invocation, not a persistent format that can outlive that option.
 // Keep the 12-byte scratch record: a separate field would grow each encoded
 // entry by 1/3 at 16 bytes, and the slot's high bit is not spare (bucket
-// widths can use the full u32 range). coord_pack's presence bit serves rank
+// widths can use the full u32 range; `validate_slot_layout` refuses a
+// layout whose widest bucket a u32 local slot cannot cover, once per run,
+// so `write_to`'s narrowing cast cannot wrap). coord_pack's presence bit serves rank
 // stores, where absence must remain distinct from Null Island. This scratch
 // stream intentionally maps unwritten orphan slots to (0, 0) placeholders
 // and counts absence in stage 2 independently of coordinate values. The
@@ -569,6 +571,8 @@ pub(super) struct ResolvedEntry {
 
 impl ResolvedEntry {
     fn write_to(&self, bucket_start: u64, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
+        // Lossless: `validate_slot_layout` refused any layout whose widest
+        // bucket holds more than 2^32 slots before stage 2 began.
         #[allow(clippy::cast_possible_truncation)]
         let local_slot_pos = (self.slot_pos - bucket_start) as u32;
         buf[RE_OFF_LOCAL_SLOT_POS..][..RE_W_LOCAL_SLOT_POS]
@@ -661,11 +665,50 @@ pub fn external_join(
 /// Validate before stage 2 writes slot buckets. Each nonempty blob is no
 /// wider than the smallest bucket, so it intersects at most two adjacent
 /// buckets. Empty blobs publish no straddler half, including at total_slots.
+///
+/// The widest bucket (the last, which absorbs the remainder) must also be
+/// encodable: [`ResolvedEntry::write_to`] stores a bucket-local slot as
+/// `u32`, so a bucket of more than 2^32 slots would wrap a local slot into
+/// another way's position with no later check able to tell. With 256
+/// buckets that is about 2^40 way node refs in total, some 88 times planet.
+/// The total is the way pass's real ref count, but highly compressible
+/// refs reach it in a file far smaller than that, so it is an input limit
+/// of this backend, refused like [`BucketLayout::new`]'s. Stage 3 then
+/// sizes one bucket's scatter buffer (`width * COORD_SLOT_SIZE` bytes) and
+/// its entry buffer (at most one `RESOLVED_ENTRY_SIZE` record per slot),
+/// and indexes the scatter buffer by local slot: both sizes are checked
+/// here to be representable allocations on this target, so stage 3's
+/// `usize` arithmetic on them cannot wrap.
 fn validate_slot_layout(starts: &[u64], total: u64, buckets: usize) -> Result<()> {
     if buckets == 0 || starts.first().is_some_and(|&start| start != 0) {
         return Err(crate::Error::internal(
             "external join: invalid slot bucket layout",
         ));
+    }
+    let (last_start, last_end) = slot_bucket_bounds(total, buckets, buckets - 1);
+    let widest = last_end - last_start;
+    if widest > 1u64 << 32 {
+        return Err(crate::Error::invalid_data(format!(
+            "add-locations-to-ways, external index: the input's ways carry {total} node \
+             refs, which split over {buckets} slot buckets put {widest} in the widest, \
+             above the {} a bucket of this backend can encode. The sparse index has no \
+             such limit.",
+            1u64 << 32,
+        )));
+    }
+    let representable = |record: usize| {
+        usize::try_from(widest)
+            .ok()
+            .and_then(|w| w.checked_mul(record))
+            .is_some_and(|bytes| isize::try_from(bytes).is_ok())
+    };
+    if !representable(COORD_SLOT_SIZE) || !representable(RESOLVED_ENTRY_SIZE) {
+        return Err(crate::Error::invalid_data(format!(
+            "add-locations-to-ways, external index: the input's ways carry {total} node \
+             refs, which split over {buckets} slot buckets put {widest} in the widest, \
+             more than one buffer on this platform can hold. The sparse index has no \
+             such limit.",
+        )));
     }
     let width = total / buckets as u64;
     for (i, &start) in starts.iter().enumerate() {
@@ -699,6 +742,46 @@ mod slot_layout_tests {
         assert!(validate_slot_layout(&[0, 0], 0, 256).is_ok());
         assert!(validate_slot_layout(&[], 0, 256).is_ok());
         assert!(validate_slot_layout(&[0], 1, 0).is_err());
+    }
+
+    /// Blob starts every 2^31 slots, well under every bucket width below, so
+    /// only the width check can refuse.
+    #[cfg(target_pointer_width = "64")]
+    fn starts_for(total: u64) -> Vec<u64> {
+        (0..total.div_ceil(1 << 31)).map(|i| i << 31).collect()
+    }
+
+    /// The widest bucket is the last, `total / 256 + total % 256` slots, and
+    /// its bucket-local slots must fit `u32`. The limit is not monotone in
+    /// the total: the remainder can push a smaller total over it.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn widest_slot_bucket_must_fit_a_u32_local_slot() {
+        // Widest 2^32 - 1, and exactly 2^32: both encodable.
+        for total in [(1u64 << 40) - 256, 1 << 40] {
+            assert!(
+                validate_slot_layout(&starts_for(total), total, 256).is_ok(),
+                "{total} slots"
+            );
+        }
+        // Widest 2^32 + 1, from a smaller total than the accepted 2^40.
+        let total = (1u64 << 40) - 254;
+        let err = validate_slot_layout(&starts_for(total), total, 256)
+            .expect_err("a bucket past 2^32 slots");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::InvalidData { .. }),
+            "an input limit, not an internal error: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{total} node refs"))
+                && msg.contains(&((1u64 << 32) + 1).to_string())
+                && msg.contains("sparse index"),
+            "{msg}"
+        );
+        // One bucket: the whole total is the widest bucket.
+        let total = (1u64 << 32) + 1;
+        assert!(validate_slot_layout(&starts_for(total), total, 1).is_err());
     }
 }
 

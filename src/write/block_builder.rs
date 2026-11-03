@@ -146,8 +146,14 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
 /// [`take`](Self::take) should be called to serialize and reset.
 ///
 /// Each block contains only one element type (nodes OR ways OR relations).
-/// Adding a different type when the block is non-empty will panic - the
-/// caller must flush first.
+/// Adding a different type when the block is non-empty, or adding at the
+/// cap, is refused: the element is not encoded and the builder is poisoned,
+/// so every later `take` / `take_owned` fails. Check `can_add_*` and flush
+/// first.
+///
+/// Dropping a builder is cleanup only: what it holds, a refusal included,
+/// is discarded without an error. A refusal reaches the caller only through
+/// finalization, so finalize every builder whose output counts.
 pub struct BlockBuilder {
     string_table: StringTable,
     block_type: Option<BlockType>,
@@ -231,31 +237,17 @@ pub struct BlockBuilder {
     // has already lost the element. Later `add_*` calls are not checked
     // against it (that would cost every element a load and a branch): they
     // may still mutate the doomed block's buffers, but nothing is emitted.
+    //
+    // Dropping a builder is cleanup and checks nothing, poisoned or not.
+    // Finalization is where the poison is enforced; abandonment is legal,
+    // because a caller abandons its builder on every `?` bail-out, and the
+    // builder cannot tell that from a caller that dropped it instead of
+    // finalizing. A drop-time assert was tried: compiled into every debug
+    // build, it turned bad input (a relation member of an unknown type,
+    // poisoning the builder) plus a later unrelated error into a panic that
+    // replaced the caller's error, the reason `PbfWriter`'s `Drop` keeps
+    // its forgot-to-flush check to the crate's unit tests.
     poison: Option<String>,
-
-    // Set once `encode_block` has refused because of `poison`, i.e. the
-    // caller was told. Debug-only bookkeeping for the `Drop` assert: a
-    // poisoned builder dropped without ever reaching `take` / `take_owned`
-    // has lost its element silently.
-    #[cfg(debug_assertions)]
-    poison_surfaced: bool,
-}
-
-#[cfg(debug_assertions)]
-impl Drop for BlockBuilder {
-    fn drop(&mut self) {
-        // Not during unwind: a panic legitimately abandons a builder, and a
-        // second panic would abort. An early error return is not exempt: the
-        // `add_*` methods poison silently, so a poisoned builder dropped on an
-        // unrelated `?` still never told its caller, and the assert says so.
-        if !std::thread::panicking() {
-            debug_assert!(
-                self.poison.is_none() || self.poison_surfaced,
-                "BlockBuilder dropped poisoned without a take: {:?}",
-                self.poison
-            );
-        }
-    }
 }
 
 impl Default for BlockBuilder {
@@ -352,8 +344,6 @@ impl BlockBuilder {
 
             seeded: None,
             poison: None,
-            #[cfg(debug_assertions)]
-            poison_surfaced: false,
         }
     }
 
@@ -866,16 +856,11 @@ impl BlockBuilder {
 
     /// Refuse a raw add over a bad string index: the error goes back to the
     /// caller, and the builder is poisoned with it, so the block in progress,
-    /// which may hold part of the refused element, is never emitted. The
-    /// poison counts as surfaced, since the caller has the error.
+    /// which may hold part of the refused element, is never emitted.
     #[cold]
     #[inline(never)]
     fn refuse_raw_index(&mut self, err: crate::error::Error) -> crate::error::Error {
         self.poison(err.to_string());
-        #[cfg(debug_assertions)]
-        {
-            self.poison_surfaced = true;
-        }
         err
     }
 
@@ -1120,10 +1105,6 @@ impl BlockBuilder {
     /// contents (element type, ID range, count).
     fn encode_block(&mut self) -> Result<Option<BlobIndex>> {
         if let Some(reason) = self.poison.as_deref() {
-            #[cfg(debug_assertions)]
-            {
-                self.poison_surfaced = true;
-            }
             return Err(crate::error::Error::invalid_data(format!(
                 "BlockBuilder refused to encode a block: {reason}"
             )));
@@ -2047,6 +2028,31 @@ mod tests {
             bb.take_owned().is_err(),
             "an unmodelled member type must not slip out through take_owned"
         );
+    }
+
+    /// Dropping a poisoned builder without finalizing it is cleanup, as on
+    /// any `?` bail-out after bad input poisoned it: nothing panics, in a
+    /// debug build either (a drop-time check used to, replacing the
+    /// caller's error).
+    #[test]
+    fn a_poisoned_builder_dropped_without_a_take_is_cleanup() {
+        let members = [MemberData {
+            id: MemberId::Unknown(7, 99),
+            role: "future",
+        }];
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 0, 0, [("k", "v")], None);
+        let mut other = BlockBuilder::new();
+        other.add_relation(499, [("type", "route")], &[], None);
+        other.add_relation(500, [("type", "multipolygon")], &members, None);
+        drop(other);
+        // A builder poisoned while empty, abandoned the same way.
+        let mut empty = BlockBuilder::new();
+        empty.add_relation(501, [("type", "route")], &members, None);
+        assert!(empty.is_empty());
+        drop(empty);
+        // The unrelated builder is untouched by either drop.
+        assert!(bb.take().expect("unpoisoned").is_some());
     }
 
     /// Passing counterpart: `take_owned` on a clean builder still yields a

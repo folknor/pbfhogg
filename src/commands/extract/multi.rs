@@ -205,11 +205,11 @@ pub(super) fn try_extract_multi_single_pass(
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
-    let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
+    // Each node blob with its passthrough state, in one vector, so nothing
+    // pairs a schedule with a parallel table by position.
+    let mut node_blobs: Vec<NodeBlob> = Vec::new();
     let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
     let mut relation_schedule: Vec<ScheduledBlob> = Vec::new();
-    // Per-node-blob passthrough metadata.
-    let mut node_blob_info: Vec<NodeBlobInfo> = Vec::new();
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -245,33 +245,32 @@ pub(super) fn try_extract_multi_single_pass(
                                     .contains(blob_bbox)
                             })
                     });
-                    node_blob_info.push(NodeBlobInfo {
+                    node_blobs.push(NodeBlob {
+                        entry,
                         passthrough: if candidate {
                             Passthrough::Candidate
                         } else {
                             Passthrough::No
                         },
-                        frame_offset: meta.frame_start,
-                        frame_size: meta.frame_size,
                     });
-                    node_schedule.push(entry);
                 }
                 crate::ElementKind::Way => way_schedule.push(entry),
                 crate::ElementKind::Relation => relation_schedule.push(entry),
             }
         } else {
             // No indexdata - include in all schedules (conservative).
-            node_blob_info.push(NodeBlobInfo {
+            node_blobs.push(NodeBlob {
+                entry,
                 passthrough: Passthrough::No,
-                frame_offset: meta.frame_start,
-                frame_size: 0,
             });
-            node_schedule.push(entry);
             way_schedule.push(entry);
             relation_schedule.push(entry);
         }
     }
     host.invocation.marker("MULTI_SCHEDULE_SCAN_END");
+    // The classify pools take a bare schedule; derived, in order, so its
+    // positions are `node_blobs`' positions by construction.
+    let node_schedule: Vec<ScheduledBlob> = node_blobs.iter().map(|blob| blob.entry).collect();
 
     // DO NOT add per-region partial raw passthrough here (decode once,
     // write raw to contained regions, route elements to non-contained
@@ -409,7 +408,7 @@ pub(super) fn try_extract_multi_single_pass(
         // block pool for the rest and a raw pool that copied each candidate
         // into a block; it is a simplification, measured neutral at planet
         // (reference/performance.md, "Payloads validated where they lie").
-        let node_blob_info_ref = &node_blob_info;
+        let node_blobs_ref = &node_blobs;
         crate::scan::classify::parallel_project_phase(
             &shared_file,
             &node_schedule,
@@ -418,8 +417,7 @@ pub(super) fn try_extract_multi_single_pass(
             |position, buffer, (columns, scratch)| {
                 let (crate::read::block::NoProjection, validated) =
                     buffer.project(|_, _| crate::read::block::NoProjection)?;
-                let eligible = if node_blob_info_ref[position].passthrough == Passthrough::Candidate
-                {
+                let eligible = if node_blobs_ref[position].passthrough == Passthrough::Candidate {
                     Some(dense_only_payload(validated.bytes())?)
                 } else {
                     None
@@ -498,7 +496,7 @@ pub(super) fn try_extract_multi_single_pass(
     // classify observed, the rest are decoded like any other blob.
     let mut verified_blobs: u64 = 0;
     let mut demoted_blobs: u64 = 0;
-    for (info, verified) in node_blob_info.iter_mut().zip(&verified_nodes) {
+    for (info, verified) in node_blobs.iter_mut().zip(&verified_nodes) {
         if info.passthrough == Passthrough::Candidate {
             info.passthrough = match *verified {
                 Some(nodes) => {
@@ -518,8 +516,7 @@ pub(super) fn try_extract_multi_single_pass(
     host.invocation.marker("MULTI_NODE_WRITE_START");
     multi_extract_pread_write_nodes(
         &shared_file,
-        &node_schedule,
-        &node_blob_info,
+        &node_blobs,
         n,
         |block, bbs, output, _scratch| {
             let mut counts = vec![0u64; n];
@@ -778,13 +775,13 @@ pub(super) fn try_extract_multi_single_pass(
 // Parallel batch infrastructure
 // ---------------------------------------------------------------------------
 
-/// Per-node-blob passthrough metadata, parallel to the node schedule.
-struct NodeBlobInfo {
+/// One node blob of the node pass: its schedule entry (which also locates
+/// its raw frame for passthrough) and its passthrough state.
+struct NodeBlob {
+    entry: ScheduledBlob,
     /// `Candidate` when the indexdata bbox claims containment in every
     /// region; settled to `Verified` or `No` after node classify.
     passthrough: Passthrough,
-    frame_offset: u64,
-    frame_size: usize,
 }
 
 /// Merge one blob's per-region matching node ids into the region id sets.
@@ -808,8 +805,7 @@ fn merge_region_ids(bbox_node_ids: &mut [IdSet], region_ids: Vec<Vec<i64>>) {
 #[allow(clippy::too_many_arguments)]
 fn multi_extract_pread_write_nodes<F>(
     input: &InputFile,
-    schedule: &[ScheduledBlob],
-    blob_info: &[NodeBlobInfo],
+    blobs: &[NodeBlob],
     n: usize,
     block_fn: F,
     framing: &RegionFraming<'_>,
@@ -831,11 +827,11 @@ where
     // entirely - the consumer writes their raw frame to all N writers
     // between the decoded ones. Other blobs, including any unsettled
     // candidate, go through the parallel decode workers.
-    let len = blob_info.len().min(schedule.len());
-    let decode_at: Vec<usize> = blob_info[..len]
+    let len = blobs.len();
+    let decode_at: Vec<usize> = blobs
         .iter()
         .enumerate()
-        .filter(|(_, info)| !matches!(info.passthrough, Passthrough::Verified { .. }))
+        .filter(|(_, blob)| !matches!(blob.passthrough, Passthrough::Verified { .. }))
         .map(|(position, _)| position)
         .collect();
 
@@ -859,7 +855,7 @@ where
     let decode_at = &decode_at;
     let mut consumer = MultiNodeConsumer {
         interleaved: crate::ordered_pool::Interleaved::new(decode_at, len),
-        blob_info,
+        blobs,
         input,
         frame_buf: Vec::new(),
         writers,
@@ -877,7 +873,7 @@ where
         },
         |_| MultiLocal::new(n, &host.invocation),
         |(), local: &mut MultiLocal, ordinal| {
-            let entry = &schedule[decode_at[ordinal]];
+            let entry = &blobs[decode_at[ordinal]].entry;
             let block = local.decode(input, entry)?;
             local
                 .classify(&block, n, &block_fn, framing)
@@ -1055,7 +1051,7 @@ fn write_regions(
 /// matching note in `common::pread_execute`).
 struct MultiNodeConsumer<'a> {
     interleaved: crate::ordered_pool::Interleaved<'a>,
-    blob_info: &'a [NodeBlobInfo],
+    blobs: &'a [NodeBlob],
     input: &'a InputFile,
     frame_buf: Vec<u8>,
     writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
@@ -1069,17 +1065,18 @@ impl MultiNodeConsumer<'_> {
     fn passthrough(&mut self, position: usize) -> Result<()> {
         use std::os::unix::fs::FileExt as _;
         self.cancel.check()?;
-        let info = &self.blob_info[position];
-        let Passthrough::Verified { nodes } = info.passthrough else {
+        let blob = &self.blobs[position];
+        let Passthrough::Verified { nodes } = blob.passthrough else {
             return Err(crate::error::Error::internal(
                 "multi-extract: a decode blob was scheduled as passthrough",
             ));
         };
-        self.frame_buf.resize(info.frame_size, 0);
+        let frame_start = blob.entry.frame_start();
+        self.frame_buf.resize(blob.entry.frame_size(), 0);
         self.input
             .file()
-            .read_exact_at(&mut self.frame_buf, info.frame_offset)
-            .map_err(|e| self.input.locate_at(info.frame_offset, e.into()))?;
+            .read_exact_at(&mut self.frame_buf, frame_start)
+            .map_err(|e| self.input.locate_at(frame_start, e.into()))?;
         for (writer, stats) in self.writers.iter_mut().zip(self.stats.iter_mut()) {
             writer.write_raw(&self.frame_buf)?;
             stats.nodes_in_bbox += nodes;

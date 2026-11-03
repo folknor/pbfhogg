@@ -242,30 +242,49 @@ fn shard_error(
 }
 
 /// Build the way-blob schedule from the shared blob metadata scan.
+///
+/// A way blob's ordinal travels as the `u32` `blob_idx` of every
+/// [`IdRecord`] its refs emit, so an input with more than 2^32 way blobs is
+/// refused here, before any record is written: a wrapped ordinal would join
+/// one blob's refs to another blob's slots with no later check able to tell.
+/// Empty way blobs make that reachable in a file of some tens of GB, so it
+/// is an input limit of this backend, not an invariant.
 pub(super) fn build_way_schedule(
     blob_meta: &[BlobMeta],
     invocation: &crate::host::Recorder,
-) -> Vec<WayBlobTask> {
+) -> Result<Vec<WayBlobTask>> {
     invocation.marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = crate::counters::Stopwatch::start();
     let mut schedule: Vec<WayBlobTask> = Vec::new();
-    let mut seq: u32 = 0;
     for meta in blob_meta {
         if !matches!(meta.kind, crate::ElementKind::Way) {
             continue;
         }
+        let seq = way_blob_ordinal(schedule.len())?;
         schedule.push(WayBlobTask {
             seq,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
             claim: meta.claim(),
         });
-        seq += 1;
     }
     invocation.counter("s1_way_schedule_blobs", schedule.len());
     invocation.counter("s1_way_schedule_build_ms", t0.elapsed_ms());
     invocation.marker("EXTJOIN_S1_WAY_SCHEDULE_END");
-    schedule
+    Ok(schedule)
+}
+
+/// The `u32` ordinal of the way blob at schedule position `position`, or
+/// the refusal of an input with more way blobs than that can number.
+fn way_blob_ordinal(position: usize) -> Result<u32> {
+    u32::try_from(position).map_err(|_| {
+        Error::invalid_data(format!(
+            "add-locations-to-ways, external index: the input has more than {} way \
+             blobs, more than this backend can number. The sparse index has no such \
+             limit.",
+            1u64 << 32,
+        ))
+    })
 }
 
 /// Pass A: parallel way scan that emits one [`IdRecord`] per ref to
@@ -599,7 +618,7 @@ pub(super) fn stage1_way_pass(
     inject_prepass: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<Stage1Output> {
-    let schedule = build_way_schedule(blob_meta, &host.invocation);
+    let schedule = build_way_schedule(blob_meta, &host.invocation)?;
 
     // Cap num_workers against the file descriptor allowance. Pass A
     // below holds `num_workers * NUM_BUCKETS` id-shard files open
@@ -760,5 +779,25 @@ fn fd_allowance_too_low(allowance: &crate::process::FdAllowance, need: u64) -> S
              every descriptor {limit} allows; close descriptors or raise the limit",
             std::io::Error::from_raw_os_error(errno)
         ),
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod way_ordinal_tests {
+    use super::way_blob_ordinal;
+
+    /// Ordinals 0 to `u32::MAX` number exactly 2^32 way blobs; the next
+    /// blob is an input limit, refused, never a wrapped ordinal.
+    #[test]
+    fn way_blob_ordinals_stop_at_the_u32_range() {
+        assert_eq!(way_blob_ordinal(0).expect("first"), 0);
+        let last = usize::try_from(u32::MAX).expect("64-bit");
+        assert_eq!(way_blob_ordinal(last).expect("last"), u32::MAX);
+        let err = way_blob_ordinal(last + 1).expect_err("one past");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::InvalidData { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("sparse index"), "{err}");
     }
 }

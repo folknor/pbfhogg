@@ -393,6 +393,20 @@ Bounded memory with high scratch-disk demand. See
 [performance.md](performance.md) for measured resource use. Requires sorted
 input with indexdata.
 
+Its scratch records carry fixed-width fields, so the backend has encoding
+limits the sparse index does not, each refused as invalid data naming the
+sparse index, never wrapped: a node `max_id` above 256 buckets of 2^30 ids
+(2^38, refused when the layout is built from indexdata, before the way
+pass); more than 2^32 way blobs (the `u32` blob ordinal of each way-pass
+record, refused while the way schedule is built); and a slot bucket of
+more than 2^32 way node refs (the `u32` bucket-local slot of each resolved
+record, refused after the way pass, when the exact ref count is known and
+before the node join). Slot buckets are `refs / 256` wide with the last
+absorbing the remainder, so the ref limit is about 2^40 in total. The same
+check refuses a slot bucket whose stage-3 buffers (8 bytes per slot for the
+scatter, 12 per resolved record) would not be a representable allocation
+on the target.
+
 Free space is checked once, between the way pass and the node join, on
 Linux: the way pass yields the exact ref count, and the join then refuses
 unless the scratch filesystem holds 23 bytes per ref (12-byte resolved

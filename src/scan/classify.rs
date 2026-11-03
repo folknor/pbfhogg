@@ -209,6 +209,14 @@ impl ScheduledBlob {
         self.frame_start
     }
 
+    /// Length of the blob's whole frame: the 4-byte length prefix, the
+    /// `BlobHeader` and the payload, the span a raw passthrough copies (the
+    /// header walker's `frame_size`).
+    #[inline]
+    pub(crate) fn frame_size(&self) -> usize {
+        4 + usize::from(self.header_len) + self.data_size()
+    }
+
     /// 0-based ordinal of the blob in its file, when the schedule knew it.
     #[inline]
     pub(crate) fn blob_index(&self) -> Option<u64> {

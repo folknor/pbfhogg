@@ -537,43 +537,22 @@ lat/lon-linear segment the sampler walks and `geo.rs` measures distance
 against, so the replacement needs one geometry contract for both sides
 before it is conservative.
 
-### WRK-157: BlockBuilder's poison-on-drop check can panic a debug build
+### WRK-167: altw external stage 3 memory grows with the slot bucket width
 
-From the 2026-11-03 debug-assert audit. The check that a poisoned
-`BlockBuilder` had its poison surfaced before drop (the
-`cfg(debug_assertions)` state and Drop in `src/write/block_builder.rs`) is
-compiled into every debug build, not only tests, unlike the writers'
-forgot-to-flush checks, which are `cfg(test)` for the reason recorded at
-`PbfWriter`'s Drop: Drop cannot tell a forgotten take from a legitimate
-`?` bail-out, and a panic there replaces the caller's real error. Poison is
-input-reachable (a relation member type decoding as unknown, re-encoded
-through `add_relation`; a library caller passing mismatched refs and
-locations), so a debug build of the CLI or of a consumer can panic in Drop
-on bad input plus an unrelated error. Narrow it to `cfg(test)` like the
-writers, or drop it.
-
-### WRK-158: altw external slot bucket width is unchecked against u32
-
-From the 2026-11-03 debug-assert audit. `ResolvedEntry::write_to`
-(`src/commands/altw/external/mod.rs`) stores `slot_pos - bucket_start` as
-u32. `slot_bucket_count` is `total_slots / max_blob_slots` clamped to
-1..=`NUM_BUCKETS`, and the last bucket is up to twice the width;
-`validate_slot_layout` bounds a blob's span against the width but not the
-width against u32. With 256 buckets the width passes u32 at about 5.5e11
-way refs, about 50 times planet: legal input at extreme scale, which in
-release scatters coordinates into the wrong way slots silently. The only
-guard is a per-entry `debug_assert!` in stage 2. Fix: an encoding-limit
-`Err` in `validate_slot_layout`, once per run, in the style of
-`BucketLayout::new`'s node-id refusal, and drop the per-entry assert.
-
-### WRK-159: multi-extract masks a schedule length mismatch with min
-
-From the 2026-11-03 debug-assert audit. `src/commands/extract/multi.rs`
-takes `len = blob_info.len().min(schedule.len())`, which would drop
-trailing schedule blobs silently if the two vectors ever disagreed. They
-are pushed in pairs today, so it cannot happen; under the maintainer's
-rule (a silent wrong answer is worse than a loud failure) it should be a
-once-per-run `assert_eq!` or `Error::internal`.
+Found 2026-11-03 while bounding the slot bucket width against u32. The
+slot bucket count is fixed at 256 for any input past a few blobs, so each
+bucket is about refs / 256 slots wide, and every stage 3 worker holds one
+bucket's scatter buffer (8 bytes per slot) and its whole bucket file (12
+bytes per resolved record) at once: at planet (48.6M slots per bucket,
+`4cd2eddf` counters) about 0.4 GB plus up to 0.6 GB per worker. The
+backend's "bounded memory" is therefore linear in total refs, not
+bounded; at the 2^32 per-bucket encoding cap it is about 80 GB per worker.
+Scaling the slot bucket count with the total would bound both the memory
+and lift the 2^40 ref limit, but the count must stay at or below
+total / max_blob_slots (the two-piece straddler floor) and must keep stage
+2's per-bucket buffers and slot-bucket file count in budget. Not needed
+for any real input today; worth deciding before the backend is sold as
+bounded-memory at any scale.
 
 ### WRK-165: tagdata written before 0.6.0 can omit an empty tag key
 

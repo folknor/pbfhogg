@@ -833,13 +833,18 @@ full file per step: passthrough saves little there.
 - `take_owned()` - returns `OwnedBlock { bytes, index, tagdata, way_members }`, moving `encode_buf` out; the next block reserves the last owned block's length (capped) up front instead of regrowing from empty
 
 A builder is not tied to a blob. The re-encoding commands' ordered-pool
-workers (`cat --clean`, the time-filter snapshot path, repack's and degrade's
-full blocks) and apply-changes' rewrite workers each keep one builder as
-worker-local state for the run (`commands::WorkerBuilder`) and frame every
-block as it fills, straight from the builder's buffer
-(`commands::FramedBlocks`, a `BlockSink`), so no builder is preallocated per
-blob and no encode buffer changes hands. Producers that hand blocks to the
-writer keep `Vec<OwnedBlock>` (the other `BlockSink`).
+workers (`cat --clean`, the time-filter snapshot path, repack's blobs of at
+least the cap and degrade's blobs outside an unsort mode, each encoded
+whole, its remainder as its own block) and apply-changes' rewrite workers
+each keep one builder as worker-local state for the run
+(`commands::WorkerBuilder`) and frame every block as it fills, straight from
+the builder's buffer (`commands::FramedBlocks`, a `BlockSink`), so no
+builder is preallocated per blob and no encode buffer changes hands.
+Producers that hand blocks to the writer keep `Vec<OwnedBlock>` (the other
+`BlockSink`): repack's and degrade's merge-thread builders, for the elements
+that coalesce across input blobs, hand each completed block to
+`PbfWriter::write_primitive_block_owned`, which frames it on the writer's
+executor in sequence order with the raw frames around it.
 
 **PbfWriter** - `src/write/writer.rs`:
 - `FrameScratch` - `body_head` (the Blob body's few bytes ahead of its payload), `header_buf`, `compress_buf` (the compressed payload), lazy-init `Compress`/`zstd::Compressor`

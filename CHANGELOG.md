@@ -300,8 +300,19 @@ state.
   Re-encoding no longer allocates per string or per block, so `cat
   --clean` and `repack` run as fast under such a cap as without it. On
   planet on bygg, `build-geocode-index` takes 177 s, `cat --clean` about
-  154 s, `repack` and `degrade --strip-locations` about 170 s at about
-  1.8 GB peak anon, and `time-filter` about 132 s.
+  154 s, `repack` and `degrade --strip-locations` about 170 s, and
+  `time-filter` about 132 s.
+- `repack` and `degrade` (outside `--unsort` and `--unsort-intra`) encode
+  each input blob on the worker that decoded it, so their merge thread no
+  longer re-encodes every blob's remainder from decoded copies, and their
+  workers no longer walk a blob once just to count it. On planet on bygg
+  `repack` takes about 148 s and `degrade --strip-locations` about 153 s,
+  against about 164 s for both, and peak anon falls from about 1.7 GB to
+  about 0.8 GB.
+  `degrade`'s output is unchanged. `repack` writes the remainder of an input
+  blob holding at least the cap as its own block, where it used to merge it
+  with smaller input blobs that follow; an input whose blobs are all above
+  or all below the cap repacks as before.
 - Commands that decode on a worker pool recycle right-sized decode buffers
   instead of allocating one per blob, which lowers their peak memory.
 - `diff` runs one engine at every `-j`: each input is read once as one

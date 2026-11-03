@@ -367,21 +367,19 @@ fn relation_ids_in_output_order(path: &Path) -> Vec<i64> {
 /// blob's higher-ID full block - producing output that violates the
 /// Sort.Type_then_ID ordering its own header still claims.
 ///
-/// The repro needs relation input blobs LARGER than the target cap so the
-/// worker splits each blob into a direct full block (low IDs) plus a
-/// trailing tail (high IDs) that the central builder must carry across the
-/// input-blob boundary. Fixture: 40 relations, IDs 1..=40, packed 20 per
-/// input blob (2 relation blobs). Cap 12: each input blob yields one full
-/// block of 12 plus a tail of 8.
+/// The repro needs relation input blobs LARGER than the target cap, so each
+/// blob yields a full block (low IDs) plus a remainder (high IDs). Fixture:
+/// 40 relations, IDs 1..=40, packed 20 per input blob (2 relation blobs).
+/// Cap 12: each input blob yields one full block of 12 plus 8.
 ///
 /// Before the fix, blob A's direct full block [1..=12] and blob B's direct
 /// full block [21..=32] were written first, and the coalesced tails
 /// ([13..=20] merged with [33..=36], then [37..=40]) were flushed only at
-/// the end - so ID 13 followed ID 32 in the output stream. After the fix
-/// the drain guard flushes blob A's tail before blob B's full block, so
-/// the output is globally [1..=12], [13..=20], [21..=32], [33..=40] and
-/// strictly increasing. The element multiset is preserved either way, so
-/// this ordering assertion is what pins the bug.
+/// the end - so ID 13 followed ID 32 in the output stream. Each blob's
+/// remainder is now its own block, framed by its worker after the blob's
+/// full blocks, so the output is globally [1..=12], [13..=20], [21..=32],
+/// [33..=40] and strictly increasing. The element multiset is preserved
+/// either way, so this ordering assertion is what pins the bug.
 #[test]
 fn repack_output_is_monotonic_across_coalesced_blob_boundaries() {
     let dir = crate::common::test_scratch();
@@ -473,16 +471,15 @@ fn assert_strictly_increasing(ids: &[i64], kind: &str) {
 
 /// Cross-kind coverage for the ordering fix (companion to the relation-only
 /// `repack_output_is_monotonic_across_coalesced_blob_boundaries`). Nodes
-/// (dense) and ways run through the same two-stream merge path - worker full
-/// blocks written directly, coalesced tails routed through the central
-/// builder - so they were equally exposed to the pre-fix reordering.
+/// (dense) and ways run through the same per-kind phase, so they were
+/// equally exposed to the pre-fix reordering.
 ///
 /// Fixture: 40 nodes and 40 ways, each laid out as two 20-element input
-/// blobs, cap 12. Every input blob splits into a direct full block of 12
-/// (low IDs) plus an 8-element coalescing tail (high IDs), so blob B's
-/// direct full block would land before blob A's tail without the drain
-/// guard - non-monotonic for both kinds. The relations are incidental (one
-/// small blob) and only keep the fixture a well-formed multi-kind PBF.
+/// blobs, cap 12. Every input blob yields a full block of 12 (low IDs) plus
+/// an 8-element remainder (high IDs), and blob A's remainder must precede
+/// blob B's full block - non-monotonic for both kinds otherwise. The
+/// relations are incidental (one small blob) and only keep the fixture a
+/// well-formed multi-kind PBF.
 #[test]
 fn repack_output_is_monotonic_for_nodes_and_ways() {
     let dir = crate::common::test_scratch();
@@ -592,38 +589,23 @@ fn write_pbf_with_relation_blob_sizes(
     writer.flush().expect("flush");
 }
 
-/// Pins the ordering guard firing while the central-builder `pending`
-/// buffer is ALREADY non-empty at guard entry - the path the relation-only
-/// regression test never reaches (there the guard always enters with
-/// `pending` empty and fires solely because `bb` holds the prior blob's
-/// tail).
+/// Pins the ordering guard when the merge thread's builder has already
+/// completed a block before a shrink blob arrives: every block it holds or
+/// has completed carries lower IDs than the shrink blob's frames, so all of
+/// them must reach the writer first.
 ///
 /// Layout: relation input blobs of sizes 5, 5, 5, 15 (30 relations, IDs
-/// 1..=30), cap 12. The three 5-element blobs are all-tail (5 < 12), so
-/// they feed the central builder without producing any direct full block
-/// or firing the guard. Their cumulative 15 relations overflow the cap
-/// once: the builder flushes a completed block (IDs 1..=12) into `pending`
-/// and retains IDs 13..=15. `pending` is now non-empty and stays that way
-/// (well under the FRAME_BATCH=32 drain threshold) when the fourth blob
-/// arrives. That blob (15 relations, IDs 16..=30) carries a direct full
-/// block of 12, so the guard fires with `pending` already holding the
-/// coalesced 1..=12 block - and must drain it (plus the retained 13..=15
-/// tail) before the direct 16..=27 write to stay ordered.
+/// 1..=30), cap 12. The three 5-element blobs are grow blobs (5 < 12), so
+/// they feed the central builder. Their cumulative 15 relations overflow
+/// the cap once: the builder completes a block (IDs 1..=12) and retains
+/// IDs 13..=15. The fourth blob (15 relations, IDs 16..=30) is a shrink
+/// blob its worker frames whole (16..=27 and the remainder 28..=30), so the
+/// guard must write 1..=12 and then flush and write 13..=15 before those
+/// frames to stay ordered.
 ///
-/// Before the fix the direct block 16..=27 was written first and the
-/// buffered low-ID blocks were flushed only at phase end, so ID 16
-/// preceded ID 1 in the output - non-monotonic. After the fix the guard
-/// drains 1..=12 and 13..=15 first, yielding 1..=30 in order.
-///
-/// Note: the guard's `!pending.is_empty()` disjunct here co-occurs with a
-/// non-empty `bb` (IDs 13..=15), so `bb` short-circuits the OR. The strict
-/// `bb`-empty-`pending`-non-empty state is not reachable: the block builder
-/// flushes lazily (only on overflow before an add, or an explicit flush),
-/// so every tail-consume that populates `pending` leaves `bb` holding a
-/// non-empty remainder, and the only thing that empties `bb` mid-stream is
-/// the guard itself, which then drains all of `pending`. The disjunct is
-/// therefore defensive; this test exercises the reachable pending-non-empty
-/// entry, which the existing regression does not.
+/// Before the fix the frame 16..=27 was written first and the buffered
+/// low-ID blocks were flushed only at phase end, so ID 16 preceded ID 1 in
+/// the output - non-monotonic.
 #[test]
 fn repack_output_is_monotonic_with_pending_prepopulated_at_guard() {
     let dir = crate::common::test_scratch();
@@ -652,6 +634,42 @@ fn repack_output_is_monotonic_with_pending_prepopulated_at_guard() {
     let (_, _, rel_ids) = ids_in_output_order(&output);
     assert_eq!(rel_ids.len(), 30, "expected all 30 relations in the output");
     assert_strictly_increasing(&rel_ids, "relation");
+}
+
+/// The packing rule docs/cli/commands.md states: an input blob with at
+/// least `cap` elements leaves as full blocks plus its remainder as its own
+/// block, and only blobs below the cap coalesce, among themselves. At cap
+/// 12, relation blobs of 15, 5, 5 give blocks of 12, 3 and 10 (the 3 does
+/// not merge with the 5s after it), and blobs of 5, 5, 15 give 10, 12, 3.
+#[test]
+fn repack_a_shrink_blobs_remainder_is_its_own_block() {
+    for (sizes, want) in [([15, 5, 5], vec![12, 3, 10]), ([5, 5, 15], vec![10, 12, 3])] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+
+        let nodes = generate_nodes(5, 1);
+        let ways = generate_ways(5, 1, 3, 1);
+        let rels = generate_relations(25, 1, 2, 1);
+        write_pbf_with_relation_blob_sizes(&input, &nodes, &ways, &rels, &sizes);
+
+        run_repack(&input, &output, 12);
+
+        let got: Vec<usize> = elements_per_blob(&output)
+            .into_iter()
+            .map(|(_, _, r)| r)
+            .filter(|&r| r > 0)
+            .collect();
+        assert_eq!(got, want, "relation blocks for input blobs {sizes:?}");
+
+        let (_, _, rel_ids) = ids_in_output_order(&output);
+        assert_eq!(rel_ids.len(), 25, "every relation is written once");
+        assert_strictly_increasing(&rel_ids, "relation");
+        assert_eq!(
+            read_normalized(&input).relations,
+            read_normalized(&output).relations
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -746,13 +764,19 @@ fn way_locations_in_output(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
 }
 
 /// When the input header declares `LocationsOnWays`, repack must re-advertise
-/// the feature AND round-trip every way-ref coordinate exactly. Cap 2 against
-/// 5 ways in one input blob forces the split: the worker frames two full
-/// blocks (4 ways) and ships one way as the trailing merge slice, so both the
-/// per-worker `add_way_with_locations` path and the central-builder
-/// (Owned-way) path carry coordinates.
+/// the feature AND round-trip every way-ref coordinate exactly, on both of
+/// its encode paths. Against 5 ways in one input blob, cap 2 makes it a
+/// shrink blob, which the worker encodes whole (`add_way_with_locations` on
+/// the worker's builder); cap 8 makes it a grow blob, whose ways travel
+/// owned to the merge thread's builder.
 #[test]
 fn repack_preserves_locations_on_ways() {
+    for cap in [2, 8] {
+        repack_preserves_locations_on_ways_at(cap);
+    }
+}
+
+fn repack_preserves_locations_on_ways_at(cap: usize) {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -777,12 +801,11 @@ fn repack_preserves_locations_on_ways() {
         "fixture must declare LocationsOnWays"
     );
 
-    // Cap 2 < 5 ways/blob: worker full blocks (4 ways) plus a 1-way tail.
-    run_repack(&input, &output, 2);
+    run_repack(&input, &output, cap);
 
     assert!(
         read_header(&output).has_locations_on_ways(),
-        "output dropped LocationsOnWays"
+        "output dropped LocationsOnWays at cap {cap}"
     );
 
     let mut got = way_locations_in_output(&output);

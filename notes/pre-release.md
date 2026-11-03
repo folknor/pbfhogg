@@ -189,39 +189,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ---
 
-## Residual memory above the README
-
-### WRK-010: cat --clean at 824-838 MB against 750 MB
-
-Planet `cat --clean version` peaks at 824 and 838 MB (bygg, 2026-11-01,
-the encode-storage change: one builder per worker for the run, one exactly
-sized frame per block, the string table on one byte arena), against
-898-913 MB at `5789830e` and the README's 750 MB. The 750 MB baseline
-(`f2315551`) predates the single ordered pass and ran under the two-arena
-cap. What holds the remaining 75-90 MB is unattributed: the 64-task window
-of owned frames is the obvious candidate, and which phase peaks has not
-been re-read since `5bfa37ab` put it in relations.
-
-### WRK-115: repack and degrade relation phase at 1.8 GB
-
-With glibc's default arenas (the CLI's two-arena cap is gone; see
-reference/performance.md, "The CLI no longer caps malloc arenas") planet
-repack and degrade `--strip-locations` peaked at 1.93 GB in the
-relations phase, against 1.37 and 1.38 GB under the cap. The
-encode-storage change (workers keep one builder, string table on one
-byte arena; reference/performance.md, "Encode storage kept across
-blocks") brought them to 1.79-1.80 and 1.78-1.80 GB; the rest of this
-entry describes the cells before it and has not been re-read since. In repack's
-uncapped cell that phase ran about 4 s at 8 cores with 65 threads, after
-a ways phase peaking at 1.19 GB; pinning `M_MMAP_THRESHOLD` alone gave
-repack 1.70 GB. Repack's ordered pool admits its default window (8 tasks
-per worker, at least 32) and its consumer batches `FRAME_BATCH` blocks;
-which holds the extra half GB, and whether it is retention across the
-threads' arenas or live data, is unmeasured. Nothing in the phase sizes
-against `Resources::memory_available`.
-
----
-
 ## Memory and throughput: structural work
 
 ### WRK-123: Dense-node block body still staged once in the encoder
@@ -273,10 +240,38 @@ its own anonymous mapping. The mechanism is not getid's: any multi-phase
 command that frees a large `Vec` (or retained decode buffers) between
 phases pays it, and the phase order decides by how much. Candidates by
 shape: `check --refs` (node, way, relation phases), tags-filter's closure
-and way-dependency phases, extract's passes. Survey with the
+and way-dependency phases, extract's passes. Seen in repack (and so
+degrade, the same phases): a diagnostic cell at `1f93e674` (sidecar
+`4ca7a7a9`, reference/performance.md "repack and degrade encode each blob
+on its worker") has the node phase's decode buffers in mmapped chunks
+(`hblkhd` 435-489 MB, arena about 216 MB); they are freed when its pools
+end, and the way phase then ran about 0.6 GB live in a 1.14 GB arena (with
+32 idle executor threads started at the node phase's end, which those
+commands no longer start). The way phase is now both commands' planet peak,
+777-800 MB, against `cat --clean`'s 766 MB over the same blobs in one pass,
+so what the mechanism still costs there is small; not re-instrumented after
+the change. Survey with the
 `emit_mallinfo2` counters at phase boundaries (check --refs already emits
 them) before deciding between per-site mappings and a shared remedy; the
 library cannot tune the allocator itself (ADR-0016), the CLI could.
+
+### WRK-172: Idle executor threads between pools cost about 180 MB
+
+At `1f93e674` repack's and degrade's merge thread framed the node phase's
+one remainder on the executor, which started rayon's 32 threads before the
+way phase; the way phase then peaked at 956-962 MB with 65 threads, against
+777-800 MB with 33 once the workers framed it themselves and nothing
+started the executor (reference/performance.md, "repack and degrade encode
+each blob on its worker"). The way phase's work is identical in both, so the
+threads themselves cost it. Not attributed. A guess to test, not a finding:
+glibc hands an exiting thread's arena to the next thread that allocates
+(`get_free_list` in `research/glibc/malloc/arena.c`), so executor threads
+that allocate at start-up take the node workers' arenas, with the free
+memory in them, and the way workers get fresh arenas instead. apply-changes
+starts the same pool mid-run (its node-to-way transition), and its
+diagnostic found under 2 MB in each of those 32 arenas, which a per-arena
+`malloc_info` around the start would square with or refute. Matters to any
+command that first touches the executor between two pools.
 
 ### WRK-170: Worker read buffers keep their largest frame for the phase
 
@@ -608,8 +603,12 @@ to `resize` plus `read_exact`. The same cell covers cat's fd admission
 `cat --clean version` on planet, `a05b3d25` vs `8da26b23` (one ordered pass
 per input instead of three per-kind phases, window 64, not tuned): wall,
 peak anon, stall counters, and whether workers stall behind a slow head
-blob. Then repeat at HEAD, which has the per-kind rows back
-(approximately). Baseline `f2315551`: 333.8 s, 750 MB peak anon.
+blob. Baseline `f2315551`: 333.8 s, 750 MB peak anon (plantasjen). The HEAD
+half is done: `6f9896db` at `1f93e674` on bygg, 146 s and 766 MB, no window
+or send wait and the consumer idle 89 % of the wall, so at HEAD no worker
+stalls behind a slow head (reference/performance.md, "cat --clean's peak
+against the README row"). What is left is the pair across `8da26b23`
+itself.
 
 ### WRK-096: Writer cluster
 

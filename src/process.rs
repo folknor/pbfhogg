@@ -264,9 +264,12 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
 /// memory, and fewer arenas share more of it. The cap bounds the arena
 /// count, not bytes: it once held anon RSS down when the decode pipeline
 /// allocated per-block string tables on workers and freed them on the
-/// consumer (tens of GB at planet; gone, see [`malloc_trim`]). Of the
-/// commands measured without it at planet, only repack and degrade peaked
-/// much higher (1.4 to 1.9 GB).
+/// consumer (tens of GB at planet; gone, see [`malloc_trim`]). When the CLI
+/// stopped calling it, only repack and degrade peaked much higher without
+/// it at planet, and that was mostly live data, not arena memory: decoded
+/// elements queued behind their merge thread, since moved onto the workers
+/// (reference/performance.md, "repack and degrade encode each blob on its
+/// worker").
 ///
 /// The cost is that every thread's allocations above the tcache limit
 /// (about 1 KiB by default) take one of two arena mutexes, a futex lock

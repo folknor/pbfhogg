@@ -253,9 +253,9 @@ enum BlobMeta {
     /// Emit none of the optional fields.
     Bare,
     /// The caller's pre-computed index and payloads, emitted exactly as
-    /// given: an absent tagdata or WayMembers is not recomputed.
+    /// given: an absent index, tagdata or WayMembers is not recomputed.
     Given {
-        index: blob_meta::BlobIndex,
+        index: Option<blob_meta::BlobIndex>,
         tagdata: Option<Vec<u8>>,
         way_members: Option<Vec<u8>>,
     },
@@ -286,9 +286,9 @@ impl BlobMeta {
                 tagdata,
                 way_members,
             } => {
-                let indexdata = index.serialize();
+                let indexdata = index.as_ref().map(blob_meta::BlobIndex::serialize);
                 frame(
-                    Some(indexdata.as_slice()),
+                    indexdata.as_ref().map(<[u8; 42]>::as_slice),
                     tagdata.as_deref(),
                     way_members.as_deref(),
                 )
@@ -1048,6 +1048,23 @@ impl<W: Write> PbfWriter<W> {
     /// recomputed.
     #[hotpath::measure]
     pub(crate) fn write_primitive_block_owned(&mut self, block: OwnedBlock) -> Result<()> {
+        self.write_owned_block(block, true)
+    }
+
+    /// [`write_primitive_block_owned`](Self::write_primitive_block_owned)
+    /// without the indexdata field, as
+    /// [`write_primitive_block_no_indexdata`](Self::write_primitive_block_no_indexdata)
+    /// is to `write_primitive_block`; the block's tagdata and WayMembers are
+    /// still emitted as given (clear them on the block to omit them).
+    #[hotpath::measure]
+    pub(crate) fn write_primitive_block_owned_no_indexdata(
+        &mut self,
+        block: OwnedBlock,
+    ) -> Result<()> {
+        self.write_owned_block(block, false)
+    }
+
+    fn write_owned_block(&mut self, block: OwnedBlock, keep_indexdata: bool) -> Result<()> {
         let OwnedBlock {
             bytes,
             index,
@@ -1055,7 +1072,7 @@ impl<W: Write> PbfWriter<W> {
             way_members,
         } = block;
         let meta = BlobMeta::Given {
-            index,
+            index: keep_indexdata.then_some(index),
             tagdata,
             way_members,
         };
@@ -1065,9 +1082,9 @@ impl<W: Write> PbfWriter<W> {
         self.poison_on_error(result)
     }
 
-    /// The one per-block dispatch behind the three `write_primitive_block*`
-    /// entry points, which differ only in where the block's index fields
-    /// come from ([`BlobMeta`]) and whether the bytes arrive owned.
+    /// The one per-block dispatch behind the `write_primitive_block*` entry
+    /// points, which differ only in where the block's index fields come from
+    /// ([`BlobMeta`]) and whether the bytes arrive owned.
     ///
     /// Pipelined: reserve a slot (the dispatch permit bounds in-flight
     /// framing work; see `PIPELINE_DISPATCH_PERMITS` for the planet-scale

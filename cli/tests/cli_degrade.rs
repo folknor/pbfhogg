@@ -1818,8 +1818,8 @@ fn degrade_strip_tagdata_and_strip_indexdata_compose() {
 
 /// `--unsort --strip-tagdata` composes on the decode path: the elements are
 /// re-encoded (unsorted) *and* every output blob is emitted without tagdata.
-/// This exercises the `frame_and_write_batch` tagdata=None path that the
-/// merge thread uses under either unsort mode.
+/// This exercises the merge thread's central blocks, written through the
+/// writer with tagdata cleared, under either unsort mode.
 #[test]
 fn degrade_unsort_and_strip_tagdata_compose() {
     let dir = crate::common::test_scratch();

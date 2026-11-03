@@ -670,15 +670,8 @@ pub(crate) const RENUMBER_RELATIONS_WORKERS_CAP: usize = 6;
 pub(crate) const RENUMBER_PREALLOC_IDS_PER_BYTE: u64 = 64;
 
 // ---------------------------------------------------------------------------
-// Re-encoding (repack, degrade)
+// Degrade
 // ---------------------------------------------------------------------------
-
-/// Batch size for the parallel-framing fan-out on the merge thread. The
-/// merge thread accumulates `OwnedBlock`s in seq order as the central
-/// builder flushes; once a batch is full it is framed in parallel via
-/// rayon and the framed bytes are written in seq order. Shared by repack and
-/// degrade.
-pub(crate) const FRAME_BATCH: usize = 32;
 
 /// How far a `--corrupt-indexdata` index overstates the blob it describes.
 /// Large enough that no honest count could coincide with it.

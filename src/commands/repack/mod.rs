@@ -7,36 +7,46 @@
 //! produce them.
 //!
 //! Implementation: parallel three-phase scan (nodes, ways, relations).
-//! Each worker decodes one input blob, filters to the current kind, and
-//! splits its matching elements at the per-input-blob `M % cap` boundary:
+//! Each worker decodes one input blob and filters it to the current kind.
+//! What happens to its `M` matching elements depends on `M` alone:
 //!
-//! - The first `M - (M % cap)` elements (a multiple of `cap`) are
-//!   re-encoded through a per-worker `BlockBuilder` and shipped to the
-//!   merge thread as already-framed blob bytes. This is the parallel
-//!   path that recovers v1's shrink throughput.
-//! - The remaining `M % cap` elements (the trailing partial) are shipped
-//!   as decoded `Owned*` data to the merge thread.
+//! - `M >= cap` (a shrink blob): the worker re-encodes every one through
+//!   its own long-lived `BlockBuilder` and frames each block as it fills:
+//!   `M / cap` full blocks, then the `M % cap` remainder as its own block.
+//!   It ships only frames, so nothing of the blob's elements outlives the
+//!   worker.
+//! - `M < cap` (a grow blob, or none at all): the worker ships the elements
+//!   as decoded `Owned*` data, because they always go into the merge
+//!   thread's builder.
 //!
-//! The merge thread runs a single long-lived `BlockBuilder` per kind,
-//! configured with the requested cap, and consumes payloads in seq order
-//! from the ordered classify pool. Per input blob, when that blob carries direct
-//! full blocks it first drains the central stream (flush the builder,
-//! write all pending) so the earlier lower-ID tails precede this blob's
-//! higher-ID full blocks, then writes the worker's full framed blocks
-//! directly, then feeds the trailing `Owned*` slice into the central
-//! builder; mid-stream flushes are framed in parallel (`rayon::par_iter`
-//! over `FRAME_BATCH`-sized batches) and written serially. The drain
-//! guard keeps the two output streams globally `Sort.Type_then_ID`
-//! ordered; on a pure grow (empty `full_framed`) it never fires, so the
-//! central builder still coalesces across input-blob boundaries.
+//! The merge thread runs a single `BlockBuilder` per kind, configured with
+//! the requested cap, and consumes results in schedule order from the
+//! ordered classify pool. Grow blobs coalesce in it across input-blob
+//! boundaries, so a cap larger than the input blobs fires correctly. Before
+//! it writes a shrink blob's frames it flushes that builder, so the lower
+//! IDs it holds precede the frames' higher ones and the output keeps
+//! `Sort.Type_then_ID`. Every block the merge thread's builder completes is
+//! handed to the pipelined writer, which frames it on its executor in
+//! sequence order with the raw frames around it.
 //!
-//! Both shrink (planet's ~228 k/blob -> 8 k/blob) and grow (Geofabrik
-//! 8 k/blob -> 64 k/blob) work because the central builder spans
-//! input-blob boundaries on the trailing path. The
-//! `repack_input_blobs_coalesced` counter tracks how often a non-empty
-//! trailing payload extends a non-empty central builder. The
-//! "never fired" warning fires only when the cap exceeds every kind's
-//! total element count (every kind collapses to a single output blob).
+//! So a shrink blob's remainder never coalesces with what follows it: the
+//! output's blocks for that blob depend on that blob alone. Repacking the
+//! output again at the same cap can therefore still merge such a remainder
+//! with a following grow blob's elements; one pass does not promise the
+//! tightest packing.
+//!
+//! The shrink rule keeps the merge thread off the critical path where the
+//! input blobs are larger than the cap. It used to re-encode every
+//! remainder itself from owned elements: at planet, relation blobs hold
+//! about 31k relations each, the merge thread then ran the relation phase
+//! at about 8 cores, and the results queued behind it held about 0.7 GB of
+//! owned remainders at the phase's start (`reference/performance.md`,
+//! "repack and degrade encode each blob on its worker").
+//!
+//! The `repack_input_blobs_coalesced` counter tracks how often a non-empty
+//! grow payload extends a non-empty central builder. The "never fired"
+//! warning fires only when the cap exceeds every kind's total element count
+//! (every kind collapses to a single output blob).
 
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -51,10 +61,8 @@ use crate::owned::{
 };
 use crate::read::input::InputSource;
 use crate::write::WriteOptions;
-use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
+use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader};
-
-use crate::tunables::FRAME_BATCH;
 
 /// Per-run statistics from a repack operation.
 pub struct RepackStats {
@@ -75,8 +83,8 @@ impl RepackStats {
     }
 }
 
-/// Trailing-partial payload: 0 to `cap-1` elements that didn't fill a
-/// full output block in the worker. One variant populated per phase.
+/// A grow blob's elements: 0 to `cap-1` of them, for the merge thread's
+/// builder. One variant populated per phase.
 enum KindPayload {
     Nodes(Vec<OwnedNode>),
     Ways(Vec<OwnedWay>),
@@ -94,11 +102,15 @@ impl KindPayload {
     }
 }
 
-/// One worker's output for one input blob: framed full blocks plus the
-/// trailing partial.
-struct WorkerOutput {
-    full_framed: Vec<Vec<u8>>,
-    tail: KindPayload,
+/// One worker's output for one input blob.
+enum WorkerOutput {
+    /// A shrink blob (at least `cap` matching elements), encoded whole by
+    /// its worker: `elements / cap` blocks of `cap` elements, then the
+    /// remainder as one block when `elements % cap != 0`.
+    Framed { frames: Vec<Vec<u8>>, elements: u64 },
+    /// A grow blob (fewer than `cap` matching elements, possibly none), for
+    /// the merge thread's builder.
+    Owned(KindPayload),
 }
 
 /// Re-encode `input` to `output` with a per-blob element cap of
@@ -179,7 +191,7 @@ pub(crate) fn repack_to(
     // Unlike tags-filter / extract, repack round-trips way payloads with
     // their inline coordinates, so an input declaring LocationsOnWays keeps
     // it: the way phase threads the coordinates through both the worker
-    // full-block path and the trailing Owned* merge path. An input without
+    // encode path and the merge thread's owned path. An input without
     // LocationsOnWays carries no coordinates and the output is the plain
     // shape (no implicit conversion). The prepass fields are not rewritten,
     // so their declarations go, with the shared warning.
@@ -233,6 +245,7 @@ pub(crate) fn repack_to(
     let mut elements_written: u64 = 0;
     let mut total_coalesces: u64 = 0;
     let mut total_worker_full_blobs: u64 = 0;
+    let mut total_worker_tail_blobs: u64 = 0;
     let mut total_central_blobs: u64 = 0;
     let mut any_cap_fired: bool = false;
 
@@ -254,6 +267,7 @@ pub(crate) fn repack_to(
     elements_written += node_stats.elements;
     total_coalesces += node_stats.coalesces;
     total_worker_full_blobs += node_stats.worker_full_blobs;
+    total_worker_tail_blobs += node_stats.worker_tail_blobs;
     total_central_blobs += node_stats.central_blobs;
     any_cap_fired |= node_stats.cap_fired;
 
@@ -275,6 +289,7 @@ pub(crate) fn repack_to(
     elements_written += way_stats.elements;
     total_coalesces += way_stats.coalesces;
     total_worker_full_blobs += way_stats.worker_full_blobs;
+    total_worker_tail_blobs += way_stats.worker_tail_blobs;
     total_central_blobs += way_stats.central_blobs;
     any_cap_fired |= way_stats.cap_fired;
 
@@ -296,6 +311,7 @@ pub(crate) fn repack_to(
     elements_written += rel_stats.elements;
     total_coalesces += rel_stats.coalesces;
     total_worker_full_blobs += rel_stats.worker_full_blobs;
+    total_worker_tail_blobs += rel_stats.worker_tail_blobs;
     total_central_blobs += rel_stats.central_blobs;
     any_cap_fired |= rel_stats.cap_fired;
 
@@ -311,6 +327,8 @@ pub(crate) fn repack_to(
         .counter("repack_input_blobs_coalesced", total_coalesces);
     host.invocation
         .counter("repack_worker_full_blobs", total_worker_full_blobs);
+    host.invocation
+        .counter("repack_worker_tail_blobs", total_worker_tail_blobs);
     host.invocation
         .counter("repack_central_blobs", total_central_blobs);
     host.invocation.counter("repack_cap_fired", any_cap_fired);
@@ -343,25 +361,27 @@ pub(crate) fn repack_to(
 struct PhaseStats {
     blobs: u64,
     elements: u64,
-    /// Count of input blobs whose trailing payload extended a non-empty
-    /// central builder. 0 on shrinks with exact division; otherwise grows
-    /// with the proportion of input blobs that don't divide cleanly.
+    /// Count of grow blobs whose elements extended a non-empty central
+    /// builder: 0 on a pure shrink, about one per grow blob on a pure grow.
     coalesces: u64,
-    /// Output blobs framed in workers (full-block path).
+    /// Blocks of `cap` elements framed in workers (shrink blobs).
     worker_full_blobs: u64,
-    /// Output blobs framed via the merge-thread central builder (mid-stream
-    /// flushes from cap fires + the final residual flush).
+    /// A shrink blob's remainder, framed in its worker as its own block.
+    worker_tail_blobs: u64,
+    /// Blocks of the merge thread's central builder (grow blobs): its cap
+    /// fires, its flushes before a shrink blob's frames, and its final
+    /// residual flush. The three counts sum to `blobs`.
     central_blobs: u64,
     /// True iff this kind produced more than one output blob, i.e. the
-    /// cap actually shaped the output (worker emitted full blocks or the
-    /// central builder flushed mid-stream). Used by the global warning.
+    /// cap actually shaped the output. Used by the global warning.
     cap_fired: bool,
 }
 
 /// Sidecar counter names for one kind's phase, in emission order: blobs,
-/// elements, coalesces, worker_full_blobs, central_blobs, cap_fired. Spelled
-/// out literally so each name can be grepped verbatim.
-fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
+/// elements, coalesces, worker_full_blobs, central_blobs, cap_fired,
+/// worker_tail_blobs. Spelled out literally so each name can be grepped
+/// verbatim.
+fn phase_counter_names(kind: ElementKind) -> [&'static str; 7] {
     match kind {
         ElementKind::Node => [
             "repack_nodes_blobs",
@@ -370,6 +390,7 @@ fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
             "repack_nodes_worker_full_blobs",
             "repack_nodes_central_blobs",
             "repack_nodes_cap_fired",
+            "repack_nodes_worker_tail_blobs",
         ],
         ElementKind::Way => [
             "repack_ways_blobs",
@@ -378,6 +399,7 @@ fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
             "repack_ways_worker_full_blobs",
             "repack_ways_central_blobs",
             "repack_ways_cap_fired",
+            "repack_ways_worker_tail_blobs",
         ],
         ElementKind::Relation => [
             "repack_relations_blobs",
@@ -386,25 +408,35 @@ fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
             "repack_relations_worker_full_blobs",
             "repack_relations_central_blobs",
             "repack_relations_cap_fired",
+            "repack_relations_worker_tail_blobs",
         ],
     }
 }
 
 /// Emit per-kind sidecar counters for one `run_kind_phase` result.
 fn emit_phase_counters(kind: ElementKind, s: &PhaseStats, invocation: &crate::host::Recorder) {
-    let [blobs, elements, coalesces, worker_full, central, cap_fired] = phase_counter_names(kind);
+    let [
+        blobs,
+        elements,
+        coalesces,
+        worker_full,
+        central,
+        cap_fired,
+        worker_tail,
+    ] = phase_counter_names(kind);
     invocation.counter(blobs, s.blobs);
     invocation.counter(elements, s.elements);
     invocation.counter(coalesces, s.coalesces);
     invocation.counter(worker_full, s.worker_full_blobs);
     invocation.counter(central, s.central_blobs);
     invocation.counter(cap_fired, s.cap_fired);
+    invocation.counter(worker_tail, s.worker_tail_blobs);
 }
 
-/// Run one per-kind phase: pread workers decode + split (full blocks
-/// framed in parallel; trailing partial owned-and-shipped); the merge
-/// thread writes full blocks directly and runs a single long-lived
-/// `BlockBuilder` for cross-input-blob coalescing on the trailing slices.
+/// Run one per-kind phase: pread workers decode each blob and encode and
+/// frame a shrink blob whole, or ship a grow blob's elements owned; the
+/// merge thread writes the frames as they are and coalesces the grow blobs
+/// in one `BlockBuilder` (see the module doc).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
@@ -418,14 +450,13 @@ fn run_kind_phase(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     host: &crate::host::Entered<'_>,
 ) -> Result<PhaseStats> {
-    let elements_per_blob = cap.get();
-
     if schedule.is_empty() {
         return Ok(PhaseStats {
             blobs: 0,
             elements: 0,
             coalesces: 0,
             worker_full_blobs: 0,
+            worker_tail_blobs: 0,
             central_blobs: 0,
             cap_fired: false,
         });
@@ -440,11 +471,11 @@ fn run_kind_phase(
     // single CLI integer request an unbounded allocation.
     let mut bb = BlockBuilder::with_element_cap_prealloc(cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
-    let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
-    let mut blobs: u64 = 0;
+    let cap_u64 = cap.get() as u64;
     let mut elements: u64 = 0;
     let mut coalesces: u64 = 0;
     let mut worker_full_blobs: u64 = 0;
+    let mut worker_tail_blobs: u64 = 0;
     let mut central_blobs: u64 = 0;
 
     // Results arrive in schedule order through the ordered pool, whose window
@@ -477,117 +508,89 @@ fn run_kind_phase(
             )
         },
         |_position, item| {
-            let WorkerOutput { full_framed, tail } = item;
-            let full_count = full_framed.len() as u64 * elements_per_blob as u64;
-            let tail_n = tail.len();
-
-            // Ordering guard (restores Sort.Type_then_ID monotonicity
-            // across the two output streams). This input blob's full
-            // blocks carry IDs strictly above every tail accumulated so
-            // far: the source is type-then-ID sorted, and the worker
-            // splits the low `M - M%cap` IDs into `full_framed` and the
-            // high `M%cap` IDs into `tail`, so blob N's full blocks
-            // outrank blob N-1's tail. The central stream (`bb` +
-            // `pending`) holds those earlier lower-ID tails but is
-            // otherwise flushed only in FRAME_BATCH-sized batches - a
-            // delayed batch would land AFTER these direct writes and
-            // emit lower IDs after higher ones. So before any direct
-            // write, drain the central stream: flush `bb`, then write
-            // everything `pending` holds. This leaves pure-grow
-            // coalescing untouched - grows produce empty `full_framed`,
-            // so the guard never fires and the central builder still
-            // coalesces trailing slices across input-blob boundaries.
-            // In the shrink/mixed case it splits each accumulated tail
-            // into its own (possibly under-cap) block, which is the
-            // correct trade: coalescing there was buying little and was
-            // the source of the reordering.
-            if !full_framed.is_empty() && (!bb.is_empty() || !pending.is_empty()) {
-                flush_local(&mut bb, &mut output)?;
-                central_blobs += output.len() as u64;
-                pending.append(&mut output);
-                if !pending.is_empty() {
-                    let batch = std::mem::take(&mut pending);
-                    blobs += frame_and_write_batch(batch, compression, writer, &host.executor)?;
-                }
-            }
-
-            // Write the worker's already-framed full blocks directly.
-            for framed in full_framed {
-                writer.write_raw_owned(framed)?;
-                blobs += 1;
-                worker_full_blobs += 1;
-            }
-
-            // Coalesce check: the trailing slice extends a non-empty
-            // central builder iff it's non-empty and the BB carries
-            // residual elements from a prior input blob's tail.
-            if tail_n > 0 && !bb.is_empty() {
-                coalesces += 1;
-            }
-
-            match tail {
-                KindPayload::Nodes(nodes) => {
-                    for node in &nodes {
-                        write_single_node_local(node, &mut bb, &mut output)?;
+            match item {
+                WorkerOutput::Framed {
+                    frames,
+                    elements: n,
+                } => {
+                    // Ordering guard: this shrink blob's IDs are above every
+                    // ID the central builder holds (the input is type-then-ID
+                    // sorted and those came from earlier blobs), so the
+                    // builder is flushed and its blocks handed to the writer
+                    // before these frames. Raw frames and writer-framed
+                    // blocks take their sequence numbers in submission order,
+                    // so the output is ordered as submitted.
+                    if !bb.is_empty() {
+                        flush_local(&mut bb, &mut output)?;
+                        central_blobs += write_central(&mut output, writer)?;
                     }
-                }
-                KindPayload::Ways(ways) => {
-                    for way in &ways {
-                        write_single_way_local(way, &mut bb, &mut output)?;
+                    worker_full_blobs += n / cap_u64;
+                    worker_tail_blobs += u64::from(n % cap_u64 != 0);
+                    for frame in frames {
+                        writer.write_raw_owned(frame)?;
                     }
+                    elements += n;
                 }
-                KindPayload::Relations(rels) => {
-                    for rel in &rels {
-                        write_single_relation_local(rel, &mut bb, &mut output)?;
+                WorkerOutput::Owned(tail) => {
+                    let tail_n = tail.len();
+                    if tail_n > 0 && !bb.is_empty() {
+                        coalesces += 1;
                     }
+                    match tail {
+                        KindPayload::Nodes(nodes) => {
+                            for node in &nodes {
+                                write_single_node_local(node, &mut bb, &mut output)?;
+                            }
+                        }
+                        KindPayload::Ways(ways) => {
+                            for way in &ways {
+                                write_single_way_local(way, &mut bb, &mut output)?;
+                            }
+                        }
+                        KindPayload::Relations(rels) => {
+                            for rel in &rels {
+                                write_single_relation_local(rel, &mut bb, &mut output)?;
+                            }
+                        }
+                    }
+                    // Blocks the builder completed at its cap.
+                    central_blobs += write_central(&mut output, writer)?;
+                    elements += tail_n;
                 }
             }
-            // Anything in `output` came from a mid-stream cap fire on
-            // the central builder; track for the warning logic, then
-            // accumulate into `pending` for batched parallel framing.
-            central_blobs += output.len() as u64;
-            pending.append(&mut output);
-            while pending.len() >= FRAME_BATCH {
-                let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
-                blobs += frame_and_write_batch(batch, compression, writer, &host.executor)?;
-            }
-            elements += full_count + tail_n;
             Ok(())
         },
         host,
     )?;
 
-    // Final flush: emit the residual block (if any) for this kind. Any
-    // blocks `output` holds at this point are residuals, not mid-stream
-    // flushes, so they don't count toward `central_blobs`.
+    // Final flush: the residual block (if any) for this kind.
     flush_local(&mut bb, &mut output)?;
-    let residual = output.len() as u64;
-    pending.append(&mut output);
-    if !pending.is_empty() {
-        let final_batch = std::mem::take(&mut pending);
-        let written = frame_and_write_batch(final_batch, compression, writer, &host.executor)?;
-        blobs += written;
-    }
+    central_blobs += write_central(&mut output, writer)?;
 
-    // Cap fired iff this kind produced more than one output blob. The
-    // residual final-flush adds at most one block; everything else
-    // (worker full blobs + central mid-stream flushes) reflects the cap
-    // actually shaping the output.
-    let cap_fired = (worker_full_blobs + central_blobs + residual) > 1;
-
-    // Roll the residual into central_blobs for the sidecar accounting:
-    // the merge thread framed and wrote it via the same `frame_and_write_batch`
-    // path as the mid-stream flushes.
-    let central_blobs_total = central_blobs + residual;
-
+    let blobs = worker_full_blobs + worker_tail_blobs + central_blobs;
     Ok(PhaseStats {
         blobs,
         elements,
         coalesces,
         worker_full_blobs,
-        central_blobs: central_blobs_total,
-        cap_fired,
+        worker_tail_blobs,
+        central_blobs,
+        cap_fired: blobs > 1,
     })
+}
+
+/// Hand every block in `output` to the pipelined writer, which frames it on
+/// its executor (with its index and tagdata) and writes it in submission
+/// order; returns how many there were.
+fn write_central(
+    output: &mut Vec<OwnedBlock>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+) -> Result<u64> {
+    let n = output.len() as u64;
+    for block in output.drain(..) {
+        writer.write_primitive_block_owned(block)?;
+    }
+    Ok(n)
 }
 
 /// Encode one way into the per-worker full-block `BlockBuilder`, reusing the
@@ -628,11 +631,11 @@ struct WorkerScratch {
     locations: Vec<(i32, i32)>,
 }
 
-/// One worker's body: count matching elements, frame the leading
-/// `M - M%cap` elements as full blocks via the worker's `BlockBuilder`
-/// (each framed into `framed` as it fills), and ship the trailing `M%cap`
-/// elements as `Owned*` data for the merge thread to coalesce across
-/// input-blob boundaries.
+/// One worker's body: count the blob's elements of `kind` (`M`). With
+/// `M >= cap` re-encode every one through the worker's `BlockBuilder`, each
+/// block framed into `framed` as it fills, so the blob leaves as `M / cap`
+/// full blocks and its `M % cap` remainder as its own block. With `M < cap`
+/// own them for the merge thread's builder.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_split_blob(
@@ -653,85 +656,31 @@ fn worker_split_blob(
     // is dropped silently. An unindexed blob (`--force`) is replicated into
     // every kind's phase with no claim stamped, so a no-match there is correct
     // and is not refused. See reference/pipeline.md "Blob Filtering".
-    let total = match kind {
-        ElementKind::Node => block
-            .elements()
-            .filter(|e| matches!(e, Element::DenseNode(_) | Element::Node(_)))
-            .count(),
-        ElementKind::Way => block
-            .elements()
-            .filter(|e| matches!(e, Element::Way(_)))
-            .count(),
-        ElementKind::Relation => block
-            .elements()
-            .filter(|e| matches!(e, Element::Relation(_)))
-            .count(),
-    };
-    let tail_size = total % cap;
-    let full_count = total - tail_size;
-
-    let bb = scratch.builder.task()?;
-    let refs_buf = &mut scratch.refs;
-    let locations_buf = &mut scratch.locations;
-    let mut tail: KindPayload = match kind {
-        ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
-        ElementKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
-        ElementKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
-    };
-
-    let mut idx: usize = 0;
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-    for element in block.elements() {
-        let is_match = matches!(
-            (&element, kind),
+    let is_match = |element: &Element<'_>| {
+        matches!(
+            (element, kind),
             (Element::DenseNode(_) | Element::Node(_), ElementKind::Node)
                 | (Element::Way(_), ElementKind::Way)
                 | (Element::Relation(_), ElementKind::Relation)
-        );
-        if !is_match {
-            continue;
-        }
+        )
+    };
+    // A block holding no other kind (every indexed blob, by the refusal
+    // above) yields exactly its validated element count of this kind, so
+    // only an unindexed blob pays a counting walk.
+    let total = match usize::try_from(block.element_count()) {
+        Ok(n) if block.kinds().foreign_to(kind).is_none() => n,
+        _ => block.elements().filter(|e| is_match(e)).count(),
+    };
 
-        if idx < full_count {
-            // Full-block path: re-encode through the worker's builder; a
-            // block `ensure_*` flushes is framed into `framed` on the spot.
-            match (&element, kind) {
-                (Element::DenseNode(dn), ElementKind::Node) => {
-                    ensure_node_capacity_local(bb, &mut framed)?;
-                    let meta = dense_node_metadata(dn)?;
-                    bb.add_node(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        dn.tags(),
-                        meta.as_ref(),
-                    );
-                }
-                (Element::Node(n), ElementKind::Node) => {
-                    ensure_node_capacity_local(bb, &mut framed)?;
-                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        n.tags(),
-                        meta.as_ref(),
-                    );
-                }
-                (Element::Way(w), ElementKind::Way) => {
-                    ensure_way_capacity_local(bb, &mut framed)?;
-                    encode_way_full_block(bb, w, refs_buf, locations_buf, preserve_locations)?;
-                }
-                (Element::Relation(r), ElementKind::Relation) => {
-                    ensure_relation_capacity_local(bb, &mut framed)?;
-                    relation_members_into(r, &mut members_buf)?;
-                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
-                }
-                _ => {}
-            }
-        } else {
-            // Tail path: own and ship to the merge thread.
+    if total < cap {
+        // A grow blob (or no match at all): its elements always go into the
+        // merge thread's builder, so they leave owned.
+        let mut tail: KindPayload = match kind {
+            ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(total)),
+            ElementKind::Way => KindPayload::Ways(Vec::with_capacity(total)),
+            ElementKind::Relation => KindPayload::Relations(Vec::with_capacity(total)),
+        };
+        for element in block.elements() {
             match (&element, &mut tail) {
                 (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)?),
                 (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)?),
@@ -744,66 +693,62 @@ fn worker_split_blob(
                 _ => {}
             }
         }
-        idx += 1;
+        return Ok(WorkerOutput::Owned(tail));
     }
 
-    // Force-flush the final full block (if any). After processing
-    // exactly `full_count` matching elements and `full_count` is a
-    // multiple of `cap`, the BB holds the last cap elements unflushed.
+    // A shrink blob: every element through the worker's builder, which
+    // flushes at the cap (a block `ensure_*` flushes is framed into `framed`
+    // on the spot); the final flush frames the remainder as its own block.
+    let bb = scratch.builder.task()?;
+    let refs_buf = &mut scratch.refs;
+    let locations_buf = &mut scratch.locations;
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    for element in block.elements() {
+        match (&element, kind) {
+            (Element::DenseNode(dn), ElementKind::Node) => {
+                ensure_node_capacity_local(bb, &mut framed)?;
+                let meta = dense_node_metadata(dn)?;
+                bb.add_node(
+                    dn.id(),
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    dn.tags(),
+                    meta.as_ref(),
+                );
+            }
+            (Element::Node(n), ElementKind::Node) => {
+                ensure_node_capacity_local(bb, &mut framed)?;
+                let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
+                bb.add_node(
+                    n.id(),
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    n.tags(),
+                    meta.as_ref(),
+                );
+            }
+            (Element::Way(w), ElementKind::Way) => {
+                ensure_way_capacity_local(bb, &mut framed)?;
+                encode_way_full_block(bb, w, refs_buf, locations_buf, preserve_locations)?;
+            }
+            (Element::Relation(r), ElementKind::Relation) => {
+                ensure_relation_capacity_local(bb, &mut framed)?;
+                relation_members_into(r, &mut members_buf)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+            }
+            _ => {}
+        }
+    }
     flush_local(bb, &mut framed)?;
     crate::commands::release_scratch(&mut scratch.refs);
     crate::commands::release_scratch(&mut scratch.locations);
-    let full_framed = framed.frames.into_iter().map(|(_, frame)| frame).collect();
+    let frames: Vec<Vec<u8>> = framed.frames.into_iter().map(|(_, frame)| frame).collect();
 
-    Ok(WorkerOutput { full_framed, tail })
-}
-
-/// Frame `batch` in parallel via rayon, then write the framed bytes in
-/// seq order. Used by the merge thread to keep central-builder framing
-/// off the serial critical path.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn frame_and_write_batch(
-    batch: Vec<OwnedBlock>,
-    compression: Compression,
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    executor: &crate::host::Executor,
-) -> Result<u64> {
-    use rayon::prelude::*;
-
-    let invocation = writer.cancel_token().permit();
-    let metrics = &invocation.metrics().writer;
-    let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
-        batch
-            .into_par_iter()
-            .map(
-                |OwnedBlock {
-                     bytes: block_bytes,
-                     index,
-                     tagdata,
-                     way_members,
-                 }|
-                 -> Result<Vec<u8>> {
-                    let indexdata = index.serialize();
-                    frame_blob_pipelined(
-                        &block_bytes,
-                        &compression,
-                        Some(indexdata.as_slice()),
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                        metrics,
-                    )
-                },
-            )
-            .collect()
-    });
-
-    let mut written: u64 = 0;
-    for r in framed {
-        let bytes = r?;
-        writer.write_raw_owned(bytes)?;
-        written += 1;
-    }
-    Ok(written)
+    Ok(WorkerOutput::Framed {
+        frames,
+        elements: total as u64,
+    })
 }
 
 #[cfg(test)]
@@ -824,6 +769,7 @@ mod counter_name_tests {
                 "worker_full_blobs",
                 "central_blobs",
                 "cap_fired",
+                "worker_tail_blobs",
             ]
             .map(|c| format!("repack_{word}_{c}"));
             assert_eq!(phase_counter_names(kind).map(String::from), want);

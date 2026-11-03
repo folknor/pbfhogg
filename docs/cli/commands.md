@@ -1268,7 +1268,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-Growing (e.g. europe 8 k -> 64 k) coalesces elements across input-blob boundaries, so caps larger than the input blob size fire correctly. On a coalescing shrink the output blob count is not the general `ceil(elements / cap)`: each input blob whose element count is not a multiple of the cap emits its tail as its own possibly-under-cap block (the deliberate trade that keeps output ID-monotonic across coalesced boundaries). When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips exactly; the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
+Input blobs with fewer elements of a kind than the cap coalesce across input-blob boundaries (growing, e.g. europe 8 k -> 64 k), so caps larger than the input blob size fire correctly. An input blob with at least the cap's worth is encoded on its own: full blocks of the cap, then the rest as its own possibly-under-cap block, which never coalesces with the blobs after it. So on a shrink the output blob count is not the general `ceil(elements / cap)`, and repacking the output again at the same cap can merge such a remainder with the small blobs that follow it. When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips exactly; the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
 
 ### degrade
 

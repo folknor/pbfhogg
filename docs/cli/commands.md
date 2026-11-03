@@ -948,7 +948,9 @@ or element-kind byte the reader does not recognise is reported as a violation
 even though every *reader* collapses it to "no index" and decodes the blob.
 The safe reading is right for a reader and wrong for a verifier: a file that
 claims something it cannot back up is not a file that claims nothing.
-Malformed tagdata is reported the same way, and so is a well-formed tagdata
+Malformed tagdata is reported the same way - including a key list that is
+out of order, repeats a key, or is followed by stray bytes, which readers
+also treat as no tagdata - and so is a well-formed tagdata
 attached to a blob this crate refuses to index at all - a group mixing element
 kinds, where any key set is necessarily incomplete because the scanner sees
 only the first element field, and `tags-filter` would skip the blob on the

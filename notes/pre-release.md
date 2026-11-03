@@ -123,8 +123,8 @@ trust, and nothing amends or supersedes it. Rule on how the two reconcile
 per-element path, `debug_assert!` only where it would cost per element);
 an amended or superseding ADR follows.
 
-The 2026-11-03 audit of every site (see "Invariant checks" below, and
-WRK-154 to WRK-159) found almost no release cost: the only per-element
+The 2026-11-03 audit of every site (see "Invariant checks" below, and the
+input-reachable findings it filed beside them) found almost no release cost: the only per-element
 checks are the iterator ends (WRK-161) and apply-changes' raw-rewrite
 string checks, which turned out to be input checks living only in debug
 builds. Those are now release refusals, at noise cost on a planet A/B once
@@ -519,26 +519,6 @@ ordered failure that runs `abandon`) was rejected because `abandon` would
 still wait on earlier tasks parked on the same router. Not decided whether
 anything beyond the documentation is wanted.
 
-### WRK-154: unsorted stored tagdata gives a silently wrong tags-filter answer
-
-Found by the 2026-11-03 debug-assert audit, not reproduced.
-`TagIndex::deserialize` (`src/blob_meta/tag_index.rs`) reads the key list
-from `BlobHeader.tagdata` without checking order, but `has_any_key` uses
-`binary_search` and `has_any_prefix` uses `partition_point`. A stored index
-with the right key set in the wrong order makes
-`BlobFilter::wants_tag_index` say no for a key that is present, and
-`tags-filter` / `tags-count` skip the blob. ADR-0013 believes tagdata
-values; this is a format violation, not a lie about the payload. Also:
-`carried_tags_hold` in `src/commands/blob_merge.rs` sorts carried keys
-before comparing, so cat and merge pass such an index through unrepaired;
-and `check --index` (`diff_tagdata`) runs `binary_search` over the unsorted
-keys, so it flags the file as `TagKeysMissing` rather than
-`MalformedTagdata`. Fix: one compare against the previous key in the loop
-`deserialize` already runs, returning `None` (the existing decode-this-blob
-collapse) or a malformed-tagdata refusal on failure; check `--index`'s
-reporting follows. The scan-side `debug_assert!` in `from_sorted_keys`
-becomes structural (the constructor sorts and dedups itself) and goes.
-
 ### WRK-155: geocode segment cover may miss an endpoint cell at lon -180
 
 Reasoned by the 2026-11-03 debug-assert audit, not run. `cover_segment`
@@ -600,6 +580,22 @@ are pushed in pairs today, so it cannot happen; under the maintainer's
 rule (a silent wrong answer is worse than a loud failure) it should be a
 once-per-run `assert_eq!` or `Error::internal`.
 
+### WRK-165: tagdata written before 0.6.0 can omit an empty tag key
+
+Found 2026-11-03 running `check --index` over the planet bench file
+(`planet-20260223-with-indexdata`, written by an older pbfhogg): every one
+of its 50,816 blobs carries tagdata, all well-formed, and exactly one
+(blob 32633, offset 61377444639) fails: "tagdata omits 1 key(s) the blob
+carries (e.g. "")". The builder used to drop an explicit empty tag key
+from tagdata; `dd37f62e` (2026-10-22, in 0.6.0) keeps it, and the
+CHANGELOG has no entry for that fix. Consequence: on files pbfhogg wrote
+before 0.6.0, a `tags-filter` expression naming the empty key can skip a
+blob holding a match, silently. Decide whether 0.6.0's notes (or the
+indexdata guide) should say so and point at `check --index` and
+`cat --reindex` / `sort --distrust-metadata` as the repair, and whether
+the brokkr planet dataset should be reindexed so `check --index` passes on
+it.
+
 ---
 
 ## Invariant checks (from the 2026-11-03 debug-assert audit)
@@ -607,7 +603,7 @@ once-per-run `assert_eq!` or `Error::internal`.
 Three read-only audits classified every `debug_assert!` and
 `cfg(debug_assertions)` site in production code (about 50) by invariant,
 reachability from input, release cost and disposition. The input-reachable
-and defect findings still open are WRK-154 to WRK-159 above. These entries carry the
+and defect findings still open are entries of their own above. These entries carry the
 rest and assume WRK-146 rules for release assertions by default; if it
 rules otherwise, revisit them. The audit reports themselves were transient.
 

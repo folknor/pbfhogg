@@ -273,6 +273,13 @@
   index used to be copied into the output, where it could name an unrelated
   string the diff added to the same block, and a tag key there panicked the
   run.
+- Blob tagdata whose key list is out of order, repeats a key, or carries
+  bytes after the last key is now treated as no tagdata, so the blob is
+  decoded. `tags-filter`, `inspect tags` and filtered reads used to believe
+  an out-of-order list and could skip a blob holding matches, with no
+  error. `check --index` reports such tagdata as malformed (it used to
+  report an out-of-order list as omitting a key it lists), and
+  `sort --distrust-metadata` replaces it rather than copying it through.
 - `extract` complete-ways and `--smart` on a sorted input with a bbox
   dropped every node stored as a plain (non-dense) Node message, and with
   it every way and relation that node would have matched. They are now

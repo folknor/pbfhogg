@@ -213,6 +213,52 @@ fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
     );
 }
 
+/// Stored tagdata is a strictly ascending key list, and the skip test
+/// binary-searches it. A stored index naming the right keys out of order
+/// used to be believed as parsed, so the search missed a present key and
+/// `tags-filter` skipped a blob holding a match. Out-of-order bytes are now
+/// unreadable tagdata, which every reader treats as absent and decodes.
+#[test]
+fn an_out_of_order_stored_tag_index_is_not_believed() {
+    let dir = crate::common::test_scratch();
+    let pristine = dir.path().join("pristine.osm.pbf");
+    crate::common::write_indexed_pbf(
+        &pristine,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("amenity", "bench"), ("highway", "bus_stop")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let pbf = std::fs::read(&pristine).expect("read fixture");
+    // Version 1, two keys, `highway` before `amenity`: the right set in the
+    // wrong order. A two-element binary search for `highway` probes
+    // `amenity`, goes right, and reports it absent.
+    let mut tagdata = vec![1_u8, 2, 0];
+    for key in [b"highway".as_slice(), b"amenity".as_slice()] {
+        tagdata.extend_from_slice(&u16::try_from(key.len()).unwrap().to_le_bytes());
+        tagdata.extend_from_slice(key);
+    }
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    std::fs::write(
+        &unsorted,
+        crate::common::adversarial::replace_blob_header_tagdata(&pbf, 1, &tagdata),
+    )
+    .expect("write fixture");
+
+    let out = dir.path().join("out.osm.pbf");
+    let stderr = run_filter(&unsorted, &out, &["n/highway=bus_stop"], false);
+    assert_eq!(
+        node_ids(&read_all_elements(&out)),
+        vec![1],
+        "an out-of-order tag index must not hide a match; stderr was:\n{stderr}"
+    );
+}
+
 /// `--distrust-metadata` has to hold on the *reference-expansion* scans, not
 /// only on the pass that finds direct matches.
 ///

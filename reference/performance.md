@@ -1876,6 +1876,24 @@ the `Info` user; its walls and rewrite CPU are inside HEAD's spread. The
 `--locations-on-ways` path, which copies ways through the same checks, was
 not measured.
 
+### tags-filter checks stored tagdata is canonical (bygg, 2026-11-03, against `ebe69342`)
+
+The change: `TagIndex::deserialize`, which runs once per blob header on a
+tag-filtered read, refuses a key not greater than the one before it (one
+slice compare per key in the loop that already copies each key), a key
+count the bytes cannot hold, and bytes after the last key.
+
+Planet (`planet-20260223-with-indexdata`), the default `w/highway=primary`
+expression, which skips most blobs on their tagdata, `--bench 1`, both arms
+built in the main tree, no trim of its own. Run order variant, HEAD.
+
+| arm | wall (s) |
+|---|---|
+| `ebe69342` (`53d5f705`) | 77.7 |
+| variant (`--force`, sidecar `24f24eb9`) | 77.2 |
+
+Neutral: the variant is inside a single cell's noise.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

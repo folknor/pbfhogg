@@ -1583,6 +1583,74 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
     );
 }
 
+/// A carried tag index naming the blob's keys out of order is not a key set
+/// any reader can use (they binary-search it, and refuse it as unreadable),
+/// so `--distrust-metadata` replaces it with the canonical one rather than
+/// copying it through because the keys match as a set.
+#[test]
+fn sort_distrust_metadata_replaces_out_of_order_tagdata() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    crate::common::write_test_pbf_sorted(
+        &honest,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("amenity", "bench"), ("highway", "bus_stop")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let encode = |keys: [&str; 2]| {
+        let mut out = vec![1_u8, 2, 0];
+        for key in keys {
+            out.extend_from_slice(&u16::try_from(key.len()).expect("len").to_le_bytes());
+            out.extend_from_slice(key.as_bytes());
+        }
+        out
+    };
+    let canonical = encode(["amenity", "highway"]);
+    assert_eq!(
+        crate::common::adversarial::blob_header_tagdata(&pbf, 1).as_deref(),
+        Some(canonical.as_slice()),
+        "the fixture's own tagdata is the canonical encoding"
+    );
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    std::fs::write(
+        &unsorted,
+        crate::common::adversarial::replace_blob_header_tagdata(
+            &pbf,
+            1,
+            &encode(["highway", "amenity"]),
+        ),
+    )
+    .expect("write fixture");
+
+    let repaired = dir.path().join("repaired.osm.pbf");
+    CliInvoker::new()
+        .arg("sort")
+        .arg("--distrust-metadata")
+        .arg(&unsorted)
+        .arg("-o")
+        .arg(&repaired)
+        .assert_success()
+        .assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
+    let out = std::fs::read(&repaired).expect("read output");
+    assert_eq!(
+        crate::common::adversarial::blob_header_tagdata(&out, 1).as_deref(),
+        Some(canonical.as_slice()),
+        "the regenerated tagdata is present and canonical"
+    );
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&repaired)
+        .assert_success();
+}
+
 /// `--distrust-metadata` reads no indexdata, so an unindexed input needs no
 /// `--force`.
 #[test]

@@ -17,12 +17,19 @@ const TAG_INDEX_MAX_KEYS: usize = u16::MAX as usize;
 /// Largest single key length the wire format can represent (`key_len` is u16 LE).
 const TAG_INDEX_MAX_KEY_LEN: usize = u16::MAX as usize;
 
-/// Encode a sorted key set into the tag index wire format.
+/// Encode a key set, given in strictly ascending byte order, into the tag
+/// index wire format.
 ///
 /// Format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) +
-/// key bytes].
+/// key bytes], keys strictly ascending and nothing after the last one. That
+/// is the one encoding [`TagIndex::deserialize`] accepts: lookups
+/// binary-search the key list, so a list in any other order would make a
+/// present key look absent.
 ///
-/// Returns `None` when the key set cannot be represented faithfully - more
+/// Returns `None` when the keys are not strictly ascending (a caller bug;
+/// emitting nothing keeps the output correct, where emitting the list as
+/// given would be unreadable at best), and when the key set cannot be
+/// represented faithfully - more
 /// than [`TAG_INDEX_MAX_KEYS`] keys, or any key longer than
 /// [`TAG_INDEX_MAX_KEY_LEN`] bytes. Both bounds used to be silent `as u16`
 /// truncations at the producer, which is the worst possible failure mode for
@@ -50,10 +57,12 @@ where
     #[allow(clippy::cast_possible_truncation)]
     buf.extend_from_slice(&(count as u16).to_le_bytes());
     let mut written = 0_usize;
+    let mut prev: Option<&[u8]> = None;
     for key in keys {
-        if key.len() > TAG_INDEX_MAX_KEY_LEN {
+        if key.len() > TAG_INDEX_MAX_KEY_LEN || prev.is_some_and(|p| p >= key) {
             return None;
         }
+        prev = Some(key);
         #[allow(clippy::cast_possible_truncation)]
         buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
         buf.extend_from_slice(key);
@@ -88,7 +97,16 @@ impl TagIndex {
 
     /// Deserialize from tag index bytes (BlobHeader field 4).
     ///
-    /// Returns `None` if the data is invalid or has an unrecognized version.
+    /// Accepts only the encoding [`encode_tag_index`] writes: keys strictly
+    /// ascending, and the last key ending exactly at the end of `data`.
+    /// Returns `None` for anything else - an unrecognized version, a
+    /// truncated or over-long record list, a key not greater than the one
+    /// before it - which every reader treats as no tagdata and decodes the
+    /// blob. `has_any_key` and `has_any_prefix` binary-search the list, so an
+    /// out-of-order list naming the right keys used to make a present key
+    /// look absent and `tags-filter` skip a blob holding matches; a count
+    /// short of the records present (an old unchecked `as u16` writer's
+    /// wrap) parsed as a smaller set with the same effect.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {
             return None;
@@ -97,8 +115,13 @@ impl TagIndex {
             return None;
         }
         let key_count = u16::from_le_bytes(super::le_at(data, 1)?) as usize;
+        // Every record holds at least its two-byte length, so this also
+        // bounds the allocation below by the bytes actually present.
+        if key_count > (data.len() - 3) / 2 {
+            return None;
+        }
         let mut pos = 3;
-        let mut keys = Vec::with_capacity(key_count);
+        let mut keys: Vec<Box<[u8]>> = Vec::with_capacity(key_count);
         for _ in 0..key_count {
             if pos + 2 > data.len() {
                 return None;
@@ -108,19 +131,26 @@ impl TagIndex {
             if pos + key_len > data.len() {
                 return None;
             }
-            keys.push(data[pos..pos + key_len].into());
+            let key = &data[pos..pos + key_len];
+            if keys.last().is_some_and(|prev| &**prev >= key) {
+                return None;
+            }
+            keys.push(key.into());
             pos += key_len;
+        }
+        if pos != data.len() {
+            return None;
         }
         Some(TagIndex { keys })
     }
 
-    /// Build from a key set the caller has already sorted and deduplicated.
-    /// The scanner in `scan.rs` is the only producer.
-    pub(super) fn from_sorted_keys(keys: Vec<Box<[u8]>>) -> Self {
-        debug_assert!(
-            keys.windows(2).all(|w| w[0] < w[1]),
-            "keys must be sorted and unique"
-        );
+    /// Build from the tag keys a block carries, in any order and with
+    /// repeats (distinct string table slots can name equal strings). The
+    /// index holds each key once, ascending. The scanner in `scan.rs` is the
+    /// only producer.
+    pub(super) fn from_keys(mut keys: Vec<Box<[u8]>>) -> Self {
+        keys.sort_unstable();
+        keys.dedup();
         TagIndex { keys }
     }
 
@@ -213,6 +243,76 @@ mod tests {
         assert!(TagIndex::deserialize(&[]).is_none());
     }
 
+    /// Wire bytes for `keys` exactly as listed, count first, then `trailing`.
+    fn raw_index(count: u16, keys: &[&[u8]], trailing: &[u8]) -> Vec<u8> {
+        let mut out = vec![TAG_INDEX_VERSION];
+        out.extend_from_slice(&count.to_le_bytes());
+        for key in keys {
+            out.extend_from_slice(&u16::try_from(key.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(key);
+        }
+        out.extend_from_slice(trailing);
+        out
+    }
+
+    #[test]
+    fn deserialize_accepts_only_the_canonical_encoding() {
+        // The canonical list, and its edges: the bare three-byte empty index
+        // and an explicit empty key, which sorts first.
+        let canonical = raw_index(2, &[b"amenity", b"highway"], &[]);
+        let ti = TagIndex::deserialize(&canonical).expect("canonical encoding");
+        assert!(ti.has_any_key(&[b"highway"[..].into()]));
+        assert!(TagIndex::deserialize(&raw_index(0, &[], &[])).is_some());
+        let with_empty = raw_index(2, &[b"", b"name"], &[]);
+        assert_eq!(
+            TagIndex::deserialize(&with_empty)
+                .expect("an empty key is a key")
+                .keys()
+                .len(),
+            2
+        );
+
+        // The right set out of order: a binary search for `highway` over
+        // [highway, amenity] probes `amenity`, goes right and misses.
+        assert!(TagIndex::deserialize(&raw_index(2, &[b"highway", b"amenity"], &[])).is_none());
+        // A repeated key: one set, two encodings.
+        assert!(
+            TagIndex::deserialize(&raw_index(3, &[b"amenity", b"amenity", b"highway"], &[]))
+                .is_none()
+        );
+        // Bytes after the last record, and a count short of the records
+        // present (an `as u16` count wrap): both used to parse as a smaller
+        // set, skipping blobs holding the uncounted keys.
+        assert!(TagIndex::deserialize(&raw_index(2, &[b"amenity", b"highway"], &[0])).is_none());
+        assert!(TagIndex::deserialize(&raw_index(1, &[b"amenity", b"highway"], &[])).is_none());
+        // A count the bytes cannot hold is refused before allocating for it.
+        assert!(TagIndex::deserialize(&raw_index(u16::MAX, &[b"a"], &[])).is_none());
+    }
+
+    #[test]
+    fn encode_refuses_keys_out_of_order_or_repeated() {
+        let ascending: [&[u8]; 2] = [b"amenity", b"highway"];
+        assert!(encode_tag_index(ascending.into_iter()).is_some());
+        let descending: [&[u8]; 2] = [b"highway", b"amenity"];
+        assert!(encode_tag_index(descending.into_iter()).is_none());
+        let repeated: [&[u8]; 2] = [b"amenity", b"amenity"];
+        assert!(encode_tag_index(repeated.into_iter()).is_none());
+    }
+
+    #[test]
+    fn from_keys_orders_and_deduplicates() {
+        let ti = TagIndex::from_keys(vec![
+            b"name"[..].into(),
+            b"amenity"[..].into(),
+            b"name"[..].into(),
+            b""[..].into(),
+        ]);
+        let keys: Vec<&[u8]> = ti.keys().iter().map(AsRef::as_ref).collect();
+        assert_eq!(keys, [b"".as_slice(), b"amenity", b"name"]);
+        let bytes = ti.serialize().expect("encodable");
+        assert_eq!(TagIndex::deserialize(&bytes).unwrap().keys(), ti.keys());
+    }
+
     // --- Encoder bounds -------------------------------------------------
 
     #[test]
@@ -241,9 +341,11 @@ mod tests {
         // 65536 keys wraps `key_count as u16` to 0. That is the dangerous
         // half: the result still parses, as an index with no keys, so
         // `tags_filter` skips the blob entirely and drops every match in it.
-        let keys: Vec<Vec<u8>> = (0..=TAG_INDEX_MAX_KEYS)
+        // Sorted by bytes, not by number: the encoder takes keys ascending.
+        let mut keys: Vec<Vec<u8>> = (0..=TAG_INDEX_MAX_KEYS)
             .map(|i| i.to_string().into_bytes())
             .collect();
+        keys.sort_unstable();
         assert!(
             encode_tag_index(keys.iter().map(std::vec::Vec::as_slice)).is_none(),
             "a key count the count field cannot express must produce no index"

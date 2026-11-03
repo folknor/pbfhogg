@@ -741,6 +741,75 @@ fn duplicate_tagdata_is_reported_while_empty_and_single_claims_pass() {
     }
 }
 
+/// Stored tagdata is one canonical encoding: keys strictly ascending, nothing
+/// after the last key. Readers binary-search the key list, so an out-of-order
+/// list naming the right set made `tags-filter` miss a present key; this
+/// verifier, which searched the same list, reported the file as omitting a
+/// key it lists. Every non-canonical shape is now unreadable tagdata, reported
+/// as such, and the canonical encoding of the same set passes.
+#[test]
+fn non_canonical_tagdata_is_reported_as_unreadable() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("tagged.osm.pbf");
+    write_indexed_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![("amenity", "bench"), ("highway", "bus_stop")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let pbf = std::fs::read(&input).expect("read fixture");
+    let encode = |keys: &[&str], trailing: &[u8]| {
+        let mut out = vec![1_u8];
+        out.extend_from_slice(&u16::try_from(keys.len()).expect("count").to_le_bytes());
+        for key in keys {
+            out.extend_from_slice(&u16::try_from(key.len()).expect("len").to_le_bytes());
+            out.extend_from_slice(key.as_bytes());
+        }
+        out.extend_from_slice(trailing);
+        out
+    };
+    for (name, tagdata, malformed) in [
+        ("canonical", encode(&["amenity", "highway"], &[]), false),
+        ("unsorted", encode(&["highway", "amenity"], &[]), true),
+        (
+            "repeated",
+            encode(&["amenity", "amenity", "highway"], &[]),
+            true,
+        ),
+        ("trailing", encode(&["amenity", "highway"], &[0]), true),
+    ] {
+        let path = dir.path().join(format!("{name}.osm.pbf"));
+        std::fs::write(
+            &path,
+            crate::common::adversarial::replace_blob_header_tagdata(&pbf, 1, &tagdata),
+        )
+        .expect("write fixture");
+        let out = check_index(&path);
+        let stdout = out.stdout_str();
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(malformed)),
+            "{name}: stdout:\n{stdout}\nstderr:\n{}",
+            out.stderr_str(),
+        );
+        assert_eq!(
+            stdout.contains("tagdata is present but is not a valid tag index"),
+            malformed,
+            "{name}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("tagdata omits"),
+            "{name}: a key list naming every key is never reported as omitting one: {stdout}"
+        );
+    }
+}
+
 // Full checks retain the production bitset floors, so keep these allocations
 // out of the concurrent fast-contract sweep.
 mod serial {

@@ -369,17 +369,14 @@ impl<'a> Walk<'a> {
         if self.groups == 0 || self.unsupported_group {
             return None;
         }
-        // Distinct sids can name equal strings, so dedup after sorting.
-        let mut keys: Vec<Box<[u8]>> = self
-            .key_seen
-            .iter()
-            .zip(&self.strings)
-            .filter(|(seen, _)| **seen)
-            .map(|(_, &s)| s.into())
-            .collect();
-        keys.sort();
-        keys.dedup();
-        Some(TagIndex::from_sorted_keys(keys))
+        Some(TagIndex::from_keys(
+            self.key_seen
+                .iter()
+                .zip(&self.strings)
+                .filter(|(seen, _)| **seen)
+                .map(|(_, &s)| s.into())
+                .collect(),
+        ))
     }
 
     /// Walk one `DenseNodes` message: IDs, coordinates, and `keys_vals`.

@@ -114,9 +114,12 @@ answer.
 
 A blob that carries no `indexdata` or no `tagdata` makes no claim. Readers
 also treat sidecar bytes they cannot parse (unrecognised length, version or
-kind byte, an inverted range, a repeated field) as absent and decode the
+kind byte, an inverted range, a repeated field, tagdata whose keys are not
+strictly ascending or that runs past its last key) as absent and decode the
 blob; a verifier must not, and `check --index` reports them (ADR-0013,
-consequence 3).
+consequence 3). Tagdata has one accepted encoding because the skip test
+binary-searches its key list: a list naming the right keys out of order
+would make a present key look absent.
 
 ## Range, count and order claims refused at decode
 

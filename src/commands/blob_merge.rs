@@ -451,7 +451,10 @@ fn claim_holds(claim: &BlobIndex, scanned: &BlobIndex) -> bool {
 /// Whether a blob's carried tagdata, compared as a key set, is the set the
 /// scan found (`scanned`, serialized). Absent carried tagdata claims nothing
 /// and holds; carried bytes that do not parse, or a scanned set too large to
-/// encode, cannot match.
+/// encode, cannot match. Parsing accepts only the canonical encoding (keys
+/// strictly ascending), so a carried index naming the right keys out of
+/// order or repeated does not hold and is replaced: every reader would treat
+/// it as no tagdata.
 fn carried_tags_hold(carried: Option<&[u8]>, scanned: Option<&[u8]>) -> bool {
     let Some(carried) = carried else {
         return true;
@@ -462,12 +465,7 @@ fn carried_tags_hold(carried: Option<&[u8]>, scanned: Option<&[u8]>) -> bool {
     ) else {
         return false;
     };
-    let mut keys: Vec<&[u8]> = carried.keys().iter().map(AsRef::as_ref).collect();
-    keys.sort_unstable();
-    keys.dedup();
-    keys.iter()
-        .copied()
-        .eq(scanned.keys().iter().map(AsRef::as_ref))
+    carried.keys() == scanned.keys()
 }
 
 /// The serialized tag key set of a block one index describes.

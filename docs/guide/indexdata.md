@@ -28,7 +28,7 @@ This enables O(1) blob classification. For example, `apply-changes` determines w
 
 ### Tagdata (BlobHeader field 4)
 
-A variable-length blob containing the set of unique tag key strings present in the blob. Wire format: version byte (`0x01`) + key count (`u16` LE) + repeated `[key_len (u16 LE) + key_bytes]`.
+A variable-length blob containing the set of unique tag key strings present in the blob. Wire format: version byte (`0x01`) + key count (`u16` LE) + repeated `[key_len (u16 LE) + key_bytes]`. The keys are strictly ascending by byte value (so each appears once) and the last one ends the field. That is the only encoding readers accept: tagdata out of order, with a repeated key, or with bytes after the last key is treated as absent and the blob is decoded, and `check --index` reports it as malformed.
 
 This enables `tags-filter`, `inspect tags` and filtered reads to skip decompression of blobs that provably lack required tag keys. For example, `tags-filter highway=primary` skips all blobs without a `highway` key.
 

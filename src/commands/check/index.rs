@@ -463,6 +463,9 @@ fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexVi
         out.push(IndexViolationKind::TagdataOnUnindexableBlob);
         return;
     };
+    // Both key lists are strictly ascending, so binary search is sound:
+    // `deserialize` refuses stored tagdata in any other order (reported
+    // above as malformed, not as a missing key) and the scanner sorts.
     let stored_keys = stored.keys();
     let observed_keys = observed.keys();
 

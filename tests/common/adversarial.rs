@@ -148,6 +148,32 @@ pub fn mutate_blob_header_indexdata(
     )
 }
 
+/// A copy of `pbf` whose frame `blob_idx` carries `tagdata` as its
+/// BlobHeader field 4 (one occurrence), type, indexdata, datasize and payload
+/// unchanged. For forging stored tag indexes the writer never produces.
+pub fn replace_blob_header_tagdata(pbf: &[u8], blob_idx: usize, tagdata: &[u8]) -> Vec<u8> {
+    let blobs = locate_blobs(pbf);
+    let target = *blobs.get(blob_idx).expect("blob_idx out of range");
+    let header = &pbf[target.header_start..target.header_end];
+    let blob_type = read_bytes_field(header, 1).expect("BlobHeader.type missing");
+    let datasize = parse_datasize(header).expect("BlobHeader.datasize missing");
+    let indexdata = locate_indexdata(header).map(|(s, e)| header[s..e].to_vec());
+    let new_header = build_blob_header(&blob_type, indexdata.as_deref(), datasize, Some(tagdata));
+    splice_frame(
+        pbf,
+        target,
+        &new_header,
+        &pbf[target.blob_start..target.blob_end],
+    )
+}
+
+/// The BlobHeader field 4 (tagdata) bytes of frame `blob_idx`; `None` when
+/// the frame does not exist or carries no tagdata.
+pub fn blob_header_tagdata(pbf: &[u8], blob_idx: usize) -> Option<Vec<u8>> {
+    let target = *locate_blobs(pbf).get(blob_idx)?;
+    read_bytes_field(&pbf[target.header_start..target.header_end], 4)
+}
+
 /// A copy of `pbf` whose frame `blob_idx` claims the ID range
 /// `min_id..=max_id` (and, with `count`, that element count) in its
 /// indexdata, everything else in the claim and the frame unchanged. For

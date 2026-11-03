@@ -225,18 +225,31 @@ fn an_id_check_flag_under_locations_names_its_selector() {
     assert!(!stderr.contains("omit --refs"), "{stderr}");
 }
 
-/// A build without `linux-direct-io` refuses the flag before any check runs.
+/// The location check reads through buffered unaligned preads, so alone it
+/// refuses `--direct-io` as ineffective, before the input is read; beside
+/// `--index`, which reads it, the flag is taken. A build without
+/// `linux-direct-io` refuses the flag while parsing.
 #[cfg(feature = "linux-direct-io")]
 #[test]
-fn direct_io_is_reported_as_having_no_effect() {
+fn direct_io_is_refused_where_only_the_location_check_runs() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("honest.osm.pbf");
     write_low(&path, true, &NODES, &honest_ways());
     let out = check(&path, &["--direct-io"]);
+    assert_eq!(out.status.code(), Some(EXIT_USAGE), "{}", out.stderr_str());
+    assert!(
+        out.stderr_str().contains("add --ids or --index"),
+        "{}",
+        out.stderr_str()
+    );
+
+    let out = check(&path, &["--index", "--direct-io"]);
+    if out.is_o_direct_unsupported() {
+        return;
+    }
     assert!(out.status.success(), "{}", out.stderr_str());
     assert!(
-        out.stderr_str()
-            .contains("--direct-io has no effect on --locations"),
+        !out.stderr_str().contains("--direct-io"),
         "{}",
         out.stderr_str()
     );

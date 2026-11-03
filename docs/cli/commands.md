@@ -846,7 +846,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `--direct-io` | Use O_DIRECT to bypass page cache where the check supports it: the ID check's front read and `--index`. It has no effect on `--refs` and `--locations`, whose parallel readers pread unaligned blob ranges, and each says so on stderr when it runs |
+| `--direct-io` | Use O_DIRECT to bypass page cache where the check supports it: the ID check's front read and `--index`. `--refs` and `--locations` read buffered, through parallel unaligned blob preads; beside the ID or index check (the default pair included) they read that way without saying so, and without either it the flag is refused |
 
 With the global [`-q, --quiet`](#quiet) `check` prints no report: the exit
 code is the answer. `--json`, `--show-ids` and `--max-errors`, which only
@@ -857,8 +857,9 @@ shape the report, are refused with it.
 check and are rejected under `--ids` alone; `--agreement` is rejected
 without `--locations`. An explicit `--max-errors` is rejected under
 `--refs` alone without `--show-ids`, where no selected check retains
-details; the default is not. Violations exit `1`, not `2` - see
-[Exit codes](#exit-codes).
+details; the default is not. `--direct-io` is rejected under `--refs`,
+`--locations` or the two together, where no selected check reads it.
+Violations exit `1`, not `2` - see [Exit codes](#exit-codes).
 
 **A false kind claim stops the check (exit 1).** `--refs`, `--ids` and
 `--locations` read each blob in the pass of the kind its indexdata claims
@@ -2014,9 +2015,9 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | inspect tags | Yes | - | Yes | - | Read-only |
 | inspect --nodes | Yes | - | Yes | - | Read-only |
 | check --ids | Yes | - | Partly | - | Read-only; `--direct-io` covers only the front read (header and first blob header); the blob reads are parallel unaligned preads without it |
-| check --refs | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored, with a note (parallel unaligned preads) |
+| check --refs | Yes | - | No | - | Read-only; parallel unaligned preads. `--direct-io` is refused unless `--ids` or `--index` (or the default pair) is selected too |
 | check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
-| check --locations | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored, with a note (parallel unaligned preads) |
+| check --locations | Yes | - | No | - | Read-only; parallel unaligned preads. `--direct-io` is refused unless `--ids` or `--index` is selected too |
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path; with `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |
 | sort | Yes | Yes | Yes (R+W) | Yes | With `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |

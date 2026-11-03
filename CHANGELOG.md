@@ -23,6 +23,11 @@
   alone without `--show-ids`, where the ref check retains no details and
   no other check is selected, instead of accepting it unused. The default
   is not affected, and every other selection still takes the flag.
+- `check` refuses `--direct-io` (exit `64`) under `--refs`, `--locations`
+  or the two together, which read buffered, instead of running and
+  printing that the flag had no effect. Any selection with the ID or
+  index check, the default pair included, still takes it, and no longer
+  prints a note about the ref or location check's buffered reads.
 - `degrade --block-cap`, a hidden test flag, is now the supported
   `--elements-per-blob`, the name `repack` gives the same per-blob element
   cap, and is documented. `--block-cap` is no longer accepted. A blob too

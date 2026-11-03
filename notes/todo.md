@@ -158,7 +158,9 @@ together so the surface changes once.
   `-j 1` streams and honours it),
   `getid::parse_ids_from_pbf`, tags-filter's `collect_relation_member_closure`
   and `collect_way_node_dependencies` (both scans pread through the walker's
-  buffered descriptor), and `check_refs` (`let _ = direct_io;`).
+  buffered descriptor), and `check --refs` / `check --locations` (both
+  parallel unaligned preads; the CLI refuses the flag where neither the
+  ID nor the index check is selected, and beside them it reaches only those).
   Extract's pread passes open buffered regardless (a comment explains
   alignment), multi-extract's single-pass path writes through
   `PbfWriter::new(BufWriter)` regardless, `export` has no I/O flag, and
@@ -183,11 +185,9 @@ together so the surface changes once.
   Two consequences are visible to a user. The "I/O capability matrix" in
   `docs/cli/commands.md` marks most of these commands "Yes (R+W)" or
   "Yes" and has no row for `digest`: it describes the flag's presence, not
-  its reach. And in a build without the `linux-direct-io` feature, whether
-  `--direct-io` is refused ("requires the linux-direct-io feature")
-  depends on whether the command happens to open a reader with the flag
-  set: `check --ids --direct-io` is refused, `check --refs --direct-io`
-  runs and ignores it. Even an honoured open can be silently buffered:
+  its reach. (A build without the `linux-direct-io` feature already refuses
+  `--direct-io` while parsing on every command, through `DirectIoArg`'s
+  value parser.) Even an honoured open can be silently buffered:
   `statx(STATX_DIOALIGN)` reports zero alignment where the filesystem
   falls back to buffered I/O (ext4 `data=journal`, inline-data or verity
   files; f2fs files whose writes are forced buffered), and
@@ -203,8 +203,7 @@ together so the surface changes once.
   one shares a single aligned scratch buffer. For the surface, a per-command reach table in the CLI (read
   passes honoured, write honoured) that generates both the capability
   matrix and the `--direct-io` help text; refuse the flag where it reaches
-  nothing (`check --refs`, under the existing no-op-flag rule);
-  parse-time refusal in every no-feature build; one `Note:` per run when
+  nothing (done for `check`, under the existing no-op-flag rule); one `Note:` per run when
   statx reports zero alignment. Enforce with one contract test per command
   that a no-feature build refuses `--direct-io` before opening any input,
   and a unit test of the table against the capability matrix.

@@ -904,6 +904,7 @@ fn validate_check(
         full,
         type_filter,
         json,
+        io,
         ..
     } = command
     else {
@@ -982,6 +983,22 @@ fn validate_check(
             "--max-errors caps the violation details a check retains, and the ref check \
              retains them only under --show-ids: add --show-ids, add --ids, --index or \
              --locations, or omit --max-errors",
+        );
+    }
+    // O_DIRECT reaches the ID check's front read (a pinned input included)
+    // and the index check's reader. The ref and location checks read
+    // through parallel unaligned preads, buffered, so with neither of the
+    // other two selected the flag reaches nothing. A selection that holds
+    // either takes it and gives it to the checks that read it, with no note
+    // about the rest, as --max-errors does: the per-check reach is in the
+    // check flag table and the capability matrix. The plain bool has no
+    // default, so its value is its presence; a build without the feature
+    // refused it while parsing.
+    if io.direct_io && !run_ids && !*index {
+        return refuse(
+            "--direct-io applies only to the ID check's front read and --index; --refs \
+             and --locations use buffered parallel unaligned preads: add --ids or \
+             --index, or omit --direct-io",
         );
     }
     Ok(())
@@ -3678,6 +3695,8 @@ fn run_check(
         .to_string_lossy();
     // One --max-errors and one --direct-io go to every selected check, each
     // of which retains its own details: there is no shared detail budget.
+    // The ref and location checks ignore --direct-io; `validate_check`
+    // refused it where no selected check reads it.
 
     // With two or more checks selected (a bare `check` is ids then refs) the
     // run is several library calls on one input, each opening it afresh, so
@@ -3706,15 +3725,6 @@ fn run_check(
     // leave that figure far below what the run can use. The report order
     // below is unchanged.
     let locations_report = if run_locations {
-        if direct_io {
-            host::cli_note(
-                "cli.check_locations_direct_io",
-                format_args!(
-                    "--direct-io has no effect on --locations, whose parallel \
-                     readers pread unaligned blob ranges"
-                ),
-            );
-        }
         let opts = pbfhogg::check::locations::CheckLocationsOptions {
             max_errors,
             direct_io,
@@ -3762,15 +3772,6 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
-        if direct_io {
-            host::cli_note(
-                "cli.check_refs_direct_io",
-                format_args!(
-                    "--direct-io has no effect on --refs, whose parallel \
-                     readers pread unaligned blob ranges"
-                ),
-            );
-        }
         // Without --show-ids refs retains no details, so --max-errors (still
         // read by the other checks a run may select) does not reach it.
         let opts = pbfhogg::check::refs::CheckRefsOptions {

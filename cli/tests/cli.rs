@@ -163,13 +163,15 @@ fn cli_check() {
     );
 }
 
-/// `--refs` reads nothing with O_DIRECT, so `--direct-io` is accepted, has
-/// no effect, and says so; it used to be ignored silently. `--refs` alone
-/// opens nothing with O_DIRECT, so this runs on any filesystem. A build
-/// without `linux-direct-io` refuses the flag before any check runs.
+/// The default pair takes `--direct-io`: the ID check opens its front read
+/// with O_DIRECT, the ref check reads buffered, and nothing is said about
+/// the ref check's share, as for `--max-errors`. A filesystem that refuses
+/// O_DIRECT answers exit 3 and the test skips. A build without
+/// `linux-direct-io` refuses the flag while parsing; where no selected
+/// check reads it the refusal is in the flag contract's tables.
 #[cfg(feature = "linux-direct-io")]
 #[test]
-fn cli_check_refs_reports_direct_io_as_having_no_effect() {
+fn cli_check_default_pair_takes_direct_io_without_a_note() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_minimal_pbf(&input);
@@ -177,21 +179,11 @@ fn cli_check_refs_reports_direct_io_as_having_no_effect() {
     let result = CliInvoker::new()
         .arg("check")
         .arg(&input)
-        .args(["--refs", "--direct-io"])
+        .arg("--direct-io")
         .run();
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(result.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("--direct-io has no effect on --refs"),
-        "{stderr}"
-    );
-
-    // Without the flag there is nothing to say.
-    let result = CliInvoker::new()
-        .arg("check")
-        .arg(&input)
-        .arg("--refs")
-        .run();
+    if result.is_o_direct_unsupported() {
+        return;
+    }
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "{stderr}");
     assert!(!stderr.contains("--direct-io"), "{stderr}");

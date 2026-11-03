@@ -103,7 +103,8 @@ struct RelBlobResult {
 #[derive(Debug, Clone, Copy)]
 pub struct CheckRefsOptions {
     /// Accepted and has no effect: the check reads only through the schedule
-    /// walk and the parallel readers' unaligned blob preads.
+    /// walk and the parallel readers' unaligned blob preads. Kept as the
+    /// place O_DIRECT reaches once those reads take it.
     pub direct_io: bool,
     /// Also check relation member references.
     pub check_relations: bool,
@@ -758,8 +759,10 @@ fn check_refs_inner(
     };
     // `opts.direct_io` is accepted and has no effect: every read here
     // is the schedule walk or a `parallel_project_phase` pread of an
-    // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
-    // when the flag is given.
+    // unaligned blob range, neither of which takes O_DIRECT. The field stays
+    // as plumbing for when those reads honour it. The CLI refuses
+    // `--direct-io` where no selected check reads it, and beside the ID or
+    // index check passes it here unread.
 
     host.invocation.marker("CHECKREFS_SCAN_START");
 

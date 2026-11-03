@@ -100,7 +100,7 @@ pub struct CheckLocationsOptions {
     /// module docs for what it bounds in flight.
     pub max_errors: usize,
     /// Accepted and has no effect: the parallel readers pread unaligned blob
-    /// ranges.
+    /// ranges. Kept as the place O_DIRECT reaches once those reads take it.
     pub direct_io: bool,
     /// Also require the inline coordinates of every node the file does not
     /// contain to agree across all references to it. See the module docs for

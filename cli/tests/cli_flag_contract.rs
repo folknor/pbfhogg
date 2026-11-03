@@ -411,6 +411,20 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["check", "IN", "-q", "--refs", "--max-errors", "5"],
         "cannot be used with",
     ),
+    // The ref and location checks read buffered, so with neither the ID nor
+    // the index check selected --direct-io reaches nothing. Every build
+    // names the flag (one without the feature refuses it while parsing);
+    // the selection's own refusal is pinned by
+    // `check_takes_direct_io_wherever_a_selected_check_reads_it`.
+    (&["check", "IN", "--refs", "--direct-io"], "--direct-io"),
+    (
+        &["check", "IN", "--locations", "--direct-io"],
+        "--direct-io",
+    ),
+    (
+        &["check", "IN", "--refs", "--locations", "--direct-io"],
+        "--direct-io",
+    ),
     (
         &[
             "tags-filter",
@@ -1016,6 +1030,57 @@ fn check_takes_max_errors_wherever_a_selected_check_reads_it() {
     for words in cases {
         let out = run(&argv(dir.path(), words));
         reached_input(&out).unwrap_or_else(|why| panic!("[{}] {why}", words.join(" ")));
+    }
+}
+
+/// `check --direct-io` is taken wherever the ID or index check is selected,
+/// the default pair included, and refused, by the selection and before any
+/// input, where only the ref and location checks run. A build without the
+/// feature refuses every row while parsing.
+#[test]
+fn check_takes_direct_io_wherever_a_selected_check_reads_it() {
+    let dir = crate::common::test_scratch();
+    let compiled = pbfhogg::write::OutputBackend::Direct.is_compiled();
+    let refused: &[&[&str]] = &[
+        &["check", "IN", "--refs", "--direct-io"],
+        &["check", "IN", "--locations", "--direct-io"],
+        &["check", "IN", "--refs", "--locations", "--direct-io"],
+        &[
+            "check",
+            "IN",
+            "--refs",
+            "--check-relations",
+            "--show-ids",
+            "--direct-io",
+        ],
+        &["check", "IN", "--locations", "--agreement", "--direct-io"],
+    ];
+    for words in refused {
+        let out = run(&argv(dir.path(), words));
+        let expect = if compiled {
+            "add --ids or --index"
+        } else {
+            "feature"
+        };
+        refused_before_input(&out, expect)
+            .unwrap_or_else(|why| panic!("[{}] {why}", words.join(" ")));
+    }
+    let taken: &[&[&str]] = &[
+        &["check", "IN", "--direct-io"],
+        &["check", "IN", "--ids", "--direct-io"],
+        &["check", "IN", "--index", "--direct-io"],
+        &["check", "IN", "--refs", "--ids", "--direct-io"],
+        &["check", "IN", "--refs", "--index", "--direct-io"],
+        &["check", "IN", "--locations", "--index", "--direct-io"],
+    ];
+    for words in taken {
+        let out = run(&argv(dir.path(), words));
+        let verdict = if compiled {
+            reached_input(&out)
+        } else {
+            refused_before_input(&out, "feature")
+        };
+        verdict.unwrap_or_else(|why| panic!("[{}] {why}", words.join(" ")));
     }
 }
 

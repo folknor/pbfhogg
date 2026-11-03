@@ -429,23 +429,6 @@ No test runs the overlap sweep at planet blob density (about 228k elements
 per blob); nothing guards sweep memory. Resource tests should assert bounded
 admission and progress, never a host's RSS.
 
-### WRK-148: check accepts --direct-io where no selected check reads it
-
-`check --refs --direct-io` and `check --locations --direct-io` (either
-alone, or the two together) are accepted, and each check prints a `Note:`
-that `--direct-io` has no effect on it (`run_check` in `cli/src/lib.rs`;
-the check table in `docs/cli/commands.md` documents the Note). The command
-line alone makes the flag ineffective there, which the Flag rules section
-of the same document says is refused (exit 64) and "never warned about or
-ignored", so the two passages contradict each other. Either refuse it in
-`validate_check` when no ID or index check is selected (the rule `--max-errors`
-now follows), or state the exception in Flag rules with its reason. Check
-first what brokkr passes: a `--direct-io` variant of `check-refs` or
-`check-locations` would turn into a usage error under a refusal, and
-brokkr#88's rule refuses an axis flag only where no pbfhogg revision gives
-it effect. The library parameters stay either way (ignored `direct_io`
-parameters are not removed as dead).
-
 ### WRK-149: extract polygon membership is not osmium's integer rule
 
 Bbox extract membership now matches osmium element for element (DEVIATIONS.md

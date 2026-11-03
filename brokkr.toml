@@ -491,6 +491,12 @@ xxhash = "2688aefbe9710c1fe6b748140b550481"
 [plantasjen.datasets.north-america]
 origin = "Geofabrik"
 
+# Mislabelled: despite the name and seq below, this file is Geofabrik's
+# north-america at replication seq 4700 (header seq 4700, newest element
+# 2026-02-15T21:20:39Z, matching the header timestamp), so osc.4710 does
+# not chain from it; diffs 4701-4709 are missing. Left as is: nothing
+# current applies that OSC to this base. Fix the pairing before trusting
+# an apply-changes or diff result on north-america as a real daily update.
 [plantasjen.datasets.north-america.pbf.indexed]
 file = "north-america-seq4710-with-indexdata.osm.pbf"
 xxhash = "851e6804bcdd713df0bec7510396bf7a"
@@ -1022,6 +1028,7 @@ origin = "Geofabrik"
 getid_ids = ["n4", "n13568274997", "w379", "w1479042478", "r638", "r20223454"]
 getparents_ids = ["n362288", "n362304", "w4592300"]
 
+# Mislabelled: see the same comment on plantasjen's north-america entry.
 [bygg.datasets.north-america.pbf.indexed]
 file = "north-america-seq4710-with-indexdata.osm.pbf"
 xxhash = "851e6804bcdd713df0bec7510396bf7a"

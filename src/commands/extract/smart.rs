@@ -119,7 +119,8 @@ enum UnsortedPhase {
 
 /// Collect pass 1 ID sets with strategy-specific relation handling.
 ///
-/// Reads all elements via sequential BlobReader + DecompressPool, collecting:
+/// On a sorted file, three parallel classify phases; on an unsorted one,
+/// three sequential `BlobReader` sweeps. Collects:
 /// - `bbox_node_ids`: nodes within the bounding box
 /// - `matched_way_ids`: ways referencing at least one bbox node
 /// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
@@ -150,7 +151,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // conservative one, for blob selection only.
     let exact_bbox = BboxInt::inside_bbox(region.bbox());
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
+    // Read only for the header's sort flag, which picks the branch below.
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader.leading_header()?;
@@ -160,6 +161,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     if !is_sorted {
         drop(blob_reader);
+        let (mut st_scratch, mut gr_scratch) = (Vec::new(), Vec::new());
         // One sweep per element kind, for the same reason the simple
         // strategy's unsorted fallback does it: matching a way needs
         // `bbox_node_ids` already complete, and matching a relation needs
@@ -188,7 +190,16 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     continue;
                 }
                 blob.decompress_into(&mut decompress_buf)?;
-                let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+                // The block takes the decode buffer and drops before the
+                // next blob, unpooled by the rule in read/decompress.rs
+                // ("Take loops"); the parse scratch is reused.
+                let block = PrimitiveBlock::from_vec_with_scratch(
+                    std::mem::take(&mut decompress_buf),
+                    &mut st_scratch,
+                    &mut gr_scratch,
+                )?;
+                crate::commands::release_scratch(&mut st_scratch);
+                crate::commands::release_scratch(&mut gr_scratch);
                 super::common::refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
                 for element in block.elements_skip_metadata() {
                     match (phase, &element) {

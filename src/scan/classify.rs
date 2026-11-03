@@ -1341,8 +1341,15 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
         || (Vec::<u8>::new(), worker_init()),
         |local: &mut (Vec<u8>, S), position, raw: &[u8]| {
             let (decompress_buf, state) = local;
-            crate::blob::decompress_blob_raw(raw, decompress_buf)?;
-            classify(position, decompress_buf, state)
+            // The worker's plain decode buffer follows the decode pool's
+            // retention limit, checked once the blob is done with it, so an
+            // outlier blob does not pin its size in the worker for the rest
+            // of the phase (read/decompress.rs, "Retention policy"). A pool
+            // would add nothing here: the caller only borrows the bytes.
+            let result = crate::blob::decompress_blob_raw(raw, decompress_buf)
+                .and_then(|()| classify(position, decompress_buf, state));
+            crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
+            result
         },
         |seq, r| {
             merge(seq, r);

@@ -9,7 +9,9 @@ use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
 use crate::{BlockType, Element, PrimitiveBlock};
 
-use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header};
+use super::super::{
+    HeaderOverrides, Result, drain_batch_results, flush_local, release_scratch, writer_from_header,
+};
 use crate::idset::IdSet;
 
 use super::common::{
@@ -176,7 +178,11 @@ fn extract_simple_two_pass(
     // cost two extra reads of an input that is already on the slow path, and
     // they decide from what the sweep actually saw rather than from where
     // the producer happened to put the blob.
+    // Each block takes the decode buffer and drops before the next blob; the
+    // buffer is not pooled, by the rule in read/decompress.rs ("Take
+    // loops"). The parse scratch is reused.
     let mut decompress_buf: Vec<u8> = Vec::new();
+    let (mut st_scratch, mut gr_scratch) = (Vec::new(), Vec::new());
     for phase in [
         ClassifyPhase::Nodes,
         ClassifyPhase::Ways,
@@ -201,7 +207,13 @@ fn extract_simple_two_pass(
                 continue;
             }
             blob.decompress_into(&mut decompress_buf)?;
-            let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+            let block = PrimitiveBlock::from_vec_with_scratch(
+                std::mem::take(&mut decompress_buf),
+                &mut st_scratch,
+                &mut gr_scratch,
+            )?;
+            release_scratch(&mut st_scratch);
+            release_scratch(&mut gr_scratch);
             refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
             classify_block_simple(
                 &block,
@@ -241,7 +253,9 @@ fn extract_simple_two_pass(
         matched_relation_ids: &matched_relation_ids,
     };
 
-    let mut decompress_buf: Vec<u8> = Vec::new();
+    // The batch's blocks are its working set, each owning the buffer it
+    // decoded into; the batch's clear frees them (read/decompress.rs, "Take
+    // loops").
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(EXTRACT_SIMPLE_BATCH_SIZE);
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -249,7 +263,13 @@ fn extract_simple_two_pass(
             continue;
         }
         blob.decompress_into(&mut decompress_buf)?;
-        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+        let block = PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf),
+            &mut st_scratch,
+            &mut gr_scratch,
+        )?;
+        release_scratch(&mut st_scratch);
+        release_scratch(&mut gr_scratch);
         batch.push(block);
         if batch.len() >= EXTRACT_SIMPLE_BATCH_SIZE {
             process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;

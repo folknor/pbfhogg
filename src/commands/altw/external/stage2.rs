@@ -473,6 +473,7 @@ pub(super) fn stage2_node_join(
                         let resolved_before_bucket = local_resolved;
                         let mut bucket_blobs_read: u64 = 0;
                         let mut bucket_straddlers: u64 = 0;
+                        let mut node_decompress_peak = node_decompress_buf.capacity();
 
                         for blob in &mapping_ref[lo_blob..hi_blob] {
                             host.invocation.check()?;
@@ -726,6 +727,15 @@ pub(super) fn stage2_node_join(
                             t_walk.record_ms(&c.node_walk_ms);
                             t_walk.record_ns(&c.node_walk_ns);
                             bucket_blobs_read += 1;
+                            // The node decode buffer follows the decode
+                            // pool's limit after each blob; the bucket's peak
+                            // sample below reads what it held at most.
+                            node_decompress_peak =
+                                node_decompress_peak.max(node_decompress_buf.capacity());
+                            crate::blob::release_decode_outlier(
+                                &mut node_decompress_buf,
+                                &host.invocation,
+                            );
                         }
 
                         // Count every absent record, including IDs in gaps
@@ -745,7 +755,7 @@ pub(super) fn stage2_node_join(
                                 + (loader.records.capacity() * std::mem::size_of::<IdRecord>())
                                     as u64
                                 + node_read_buf.capacity() as u64
-                                + node_decompress_buf.capacity() as u64
+                                + node_decompress_peak as u64
                                 + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>())
                                     as u64
                                 + (node_group_starts.capacity()

@@ -161,7 +161,12 @@ fn load_ref_count_sidecar_in(
 /// One stage 4 decode worker's thread-local buffers, reused across blobs.
 struct S4Local {
     read_buf: Vec<u8>,
+    /// A way blob decodes into it and reframes from it in place; a non-way
+    /// blob moves it into its block, which drops before the task returns.
     decompress_buf: Vec<u8>,
+    /// Block-parse scratch for the non-way blocks.
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
     bb: BlockBuilder,
     output_blocks: Vec<OwnedBlock>,
     way_reframe_scratch: WayReframeScratch,
@@ -538,6 +543,8 @@ pub(super) fn stage4_assembly(
             let local = S4Local {
                 read_buf: Vec::new(),
                 decompress_buf: Vec::new(),
+                st_scratch: Vec::new(),
+                gr_scratch: Vec::new(),
                 bb: BlockBuilder::new(),
                 output_blocks: Vec::new(),
                 way_reframe_scratch: WayReframeScratch::new(),
@@ -577,6 +584,8 @@ pub(super) fn stage4_assembly(
             let S4Local {
                 read_buf,
                 decompress_buf,
+                st_scratch,
+                gr_scratch,
                 bb,
                 output_blocks,
                 way_reframe_scratch,
@@ -695,11 +704,18 @@ pub(super) fn stage4_assembly(
 
                     // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
                     // `decompress_buf` is already an owned, unshared Vec, so
-                    // parse it in place with `from_vec`; the old
+                    // parse it in place; the old
                     // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
                     // Bytes only to copy it straight back out via `to_vec()`.
-                    let block = PrimitiveBlock::from_vec(std::mem::take(decompress_buf))
-                        .map_err(at_frame)?;
+                    // The buffer moves into the block and is not pooled: the
+                    // next blob allocates afresh, a cost inside noise
+                    // (read/decompress.rs, "Take loops").
+                    let block = PrimitiveBlock::from_vec_with_scratch(
+                        std::mem::take(decompress_buf),
+                        st_scratch,
+                        gr_scratch,
+                    )
+                    .map_err(at_frame)?;
                     // A way or relation under the node claim would be
                     // re-encoded among the nodes with no coordinate source
                     // and outside the member scan: refused, as the sparse
@@ -741,11 +757,6 @@ pub(super) fn stage4_assembly(
                     c.assemble_ms.fetch_add(elapsed, Relaxed);
                     c.nonway_assemble_ms.fetch_add(elapsed, Relaxed);
                     c.nonway_blobs_processed.fetch_add(1, Relaxed);
-
-                    if decompress_buf.capacity() == 0 {
-                        *decompress_buf = Vec::new();
-                    }
-
                     c.blobs.fetch_add(1, Relaxed);
 
                     Ok((std::mem::take(output_blocks), block_stats))
@@ -758,6 +769,10 @@ pub(super) fn stage4_assembly(
                     + reframe_output.capacity() as u64;
                 record_max(&c.max_worker_buf_bytes, worker_bytes);
             }
+            // After the sample above, so the peak still sees the outlier.
+            crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
+            crate::commands::release_scratch(st_scratch);
+            crate::commands::release_scratch(gr_scratch);
 
             guard.disarm();
             // The pool times the send (`s4_send_ms`), opens the

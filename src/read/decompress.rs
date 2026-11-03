@@ -38,6 +38,27 @@ thread_local! {
 // (`DECOMPRESS_EXPANSION_GUESS`) applies only to a blob that declares no
 // `raw_size`. Exact growth is not amortized: a run of steadily larger blobs
 // regrows the buffer each time, which planet data does not do.
+//
+// Retention policy: every decode buffer kept from one blob to the next
+// follows `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`, a pooled one through
+// `DecompressPool::put`, a worker's plain one through
+// `release_decode_outlier`, both counted in the same oversize-drop counter.
+//
+// Take loops: a sequential loop that decompresses into a loop-local buffer
+// and moves it into the block (`PrimitiveBlock::from_vec_with_scratch(take(..))`)
+// keeps no decode buffer between blobs, so it has nothing to retain; what it
+// pays instead is one exact-sized allocation per blob and, when the inline
+// tables are appended, possibly a moving realloc. That is deliberately not
+// pooled. On planet (bygg, `d7d4f967`) the whole table append took 3.79 core-s
+// over 107,701 blocks on an unpooled path against 1,113 core-s of
+// decompression and construction there, and 0.55 core-s over 50,816 blocks on
+// a pooled one (`WireBlock::inline_tables`), two different workloads, so a
+// small absolute cost rather than a measured pooling delta. Altw external
+// stage 4, the busiest such loop on a measured command, builds about 33,000
+// blocks this way at planet, each assembled in about 19 ms (bygg,
+// `8ccb3a2e5`). A pool would add idle retention to save a part of that
+// small cost. The block-parse scratch is the part worth reusing, and those
+// loops keep it.
 
 /// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
 ///
@@ -97,8 +118,7 @@ impl DecompressPool {
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
         let metrics = &self.permit.metrics().decompress;
-        if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
-            metrics.record_oversize_drop(capacity);
+        if rejects_oversize(capacity, metrics) {
             return;
         }
         buf.clear();
@@ -121,6 +141,39 @@ impl DecompressPool {
             }
         };
         drop(rejected);
+    }
+}
+
+/// The decode buffers' per-buffer retention limit, one predicate for both
+/// kinds of holder: `true`, with the rejection counted as an oversize drop,
+/// when `capacity` exceeds `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`.
+fn rejects_oversize(
+    capacity: usize,
+    metrics: &crate::read::pipeline_metrics::DecompressPoolMetrics,
+) -> bool {
+    if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
+        metrics.record_oversize_drop(capacity);
+        return true;
+    }
+    false
+}
+
+/// Apply the decode pool's per-buffer limit to a decode buffer a worker
+/// keeps across blobs outside any pool: call it once per task, after the last read of the
+/// decoded bytes and after any capacity sampling. A buffer one blob grew past
+/// `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY` is freed and counted as a
+/// `pipeline_decompress_pool_oversize_drops`, as the pool would drop it, so
+/// an outlier is not kept for the rest of the phase; a smaller one is kept
+/// for the next blob.
+///
+/// This bounds what a worker holds after an outlier, not while it decodes
+/// one: a worker decoding a blob at the size cap holds that much either way.
+/// Releasing costs the next blob one fresh allocation sized exactly from its
+/// declared `raw_size` (see "Sizing policy" above), which is small next to
+/// decoding the blob.
+pub(crate) fn release_decode_outlier(buf: &mut Vec<u8>, invocation: &crate::host::Recorder) {
+    if rejects_oversize(buf.capacity(), &invocation.metrics().decompress) {
+        *buf = Vec::new();
     }
 }
 
@@ -688,6 +741,33 @@ mod tests {
         assert_eq!(ours.oversize_drops.load(Relaxed), 1);
         assert!(ours.oversize_drop_capacity_bytes.load(Relaxed) > 0);
         assert_eq!(other.metrics().decompress.oversize_drops.load(Relaxed), 0);
+    }
+
+    /// A worker-kept decode buffer follows the pool's per-buffer limit: one
+    /// past it is freed and counted as the pool counts its own drops, one at
+    /// the limit is kept.
+    #[test]
+    fn a_kept_decode_buffer_follows_the_pool_limit() {
+        use crate::tunables::DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
+        use std::sync::atomic::Ordering::Relaxed;
+        let call = crate::host::Call::detached();
+
+        let mut kept = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY);
+        let capacity = kept.capacity();
+        kept.extend_from_slice(b"last blob");
+        super::release_decode_outlier(&mut kept, &call);
+        assert_eq!(kept.capacity(), capacity);
+
+        let mut outlier: Vec<u8> = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1);
+        super::release_decode_outlier(&mut outlier, &call);
+        assert_eq!(outlier.capacity(), 0);
+
+        let metrics = &call.metrics().decompress;
+        assert_eq!(metrics.oversize_drops.load(Relaxed), 1);
+        assert!(
+            metrics.oversize_drop_capacity_bytes.load(Relaxed)
+                > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY as u64
+        );
     }
 
     /// Build a `WireBlob` whose *decompressed* payload is exactly `payload`.

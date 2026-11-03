@@ -294,31 +294,20 @@ and way-dependency phases, extract's passes. Survey with the
 them) before deciding between per-site mappings and a shared remedy; the
 library cannot tune the allocator itself (ADR-0016), the CLI could.
 
-### WRK-125: Sequential decode loops hand their only buffer to each block
+### WRK-170: Worker read buffers keep their largest frame for the phase
 
-The unsorted single-pass extract paths (`src/commands/extract/simple.rs`,
-two sites, and `src/commands/extract/smart.rs`) and ALTW external stage 4
-(`src/commands/altw/external/stage4.rs`) build each block with
-`PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))` and no
-pool, so the loop's reusable buffer leaves with every block and the next
-blob decompresses into a fresh allocation that grows to size. One
-allocation, regrowth and free per blob on those paths. A
-`DecompressPool` (as the unordered pools use) would return the buffer
-when the block drops. Unmeasured; establish the per-blob cost at planet
-before changing it, since the stage 4 path may sit under the noise floor.
-
-### WRK-126: Raw-scan pool buffers escape the decode retention policy
-
-`parallel_scan_blobs_raw` (`src/scan/classify.rs`) gives each worker a
-plain `Vec<u8>` decompress buffer, not a `DecompressPool` buffer, so the
-retention limits the block and projection pools apply
-(`DECOMPRESS_POOL_MAX_RETAINED_CAPACITY` and its siblings in
-`src/tunables.rs`) do not reach it: each worker keeps the
-capacity of the largest blob it has decompressed for the life of the
-phase. Bounded by the blob size limit per worker, so a worst case of
-workers times the largest blob on a hostile file. Decide whether the raw
-pool should take a pool buffer (it hands the caller `&[u8]` either way)
-or whether its phases are short enough that retention does not matter.
+Every worker-kept decode buffer now follows the decode pool's per-buffer
+limit (`release_decode_outlier`), but the compressed-frame read buffers
+beside them follow none: `run_unordered_per_blob`'s `read_buf` (every
+unordered pool, raw scan included), `ClassifyLocal::read_buf`, the altw
+external stage 1, 2 and 4 read buffers, altw passthrough's and geocode
+pass 1.5's. Each keeps the largest frame its worker read for the phase,
+up to the 32 MiB frame cap per worker on a hostile file. apply-changes'
+base-read buffer is the precedent (`ReadBuf::release_outlier`, the 4 MiB
+scratch limit, measured neutral at planet although LocationsOnWays way
+frames exceed it). Deciding the limit (4 MiB scratch or the 16 MiB decode
+line) changes behaviour on LocationsOnWays input for `check --locations`,
+so it is measured there.
 
 ### WRK-027: Membership track for set-dominated peaks
 

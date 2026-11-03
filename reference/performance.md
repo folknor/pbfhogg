@@ -1378,6 +1378,34 @@ average about 146 KB at `f2b8beed` (`627883d77`, bygg;
 `writer_payload_raw_bytes` over `writer_payload_raw_items`), not the
 1.8 MB input blobs.
 
+### Worker-kept decode buffers follow the pool limit (bygg, 2026-11-03, against `d4c97d42`)
+
+Every plain decode buffer a worker keeps across blobs outside a pool (the
+raw scan behind `check --locations`, altw sparse and sorted
+`extract --simple`; altw external stages 1, 2 and 4; altw passthrough's
+way path; geocode pass 1.5; apply-changes' refresh-scan buffer) now takes
+the decode pool's per-buffer limit once per blob through
+`release_decode_outlier`, counted in
+`pipeline_decompress_pool_oversize_drops`. The sequential take loops
+(altw external stage 4's non-way blobs, the unsorted extract sweeps) keep
+handing their buffer to the block unpooled and now reuse their parse
+scratch.
+
+On planet the limit never fires: zero oversize drops in both variant cells
+below, as for the pooled paths. Variant cells are unstored `--force` cells
+on `d4c97d42` plus the change, `--bench 1`.
+
+| command | baseline | wall before | wall after | notes |
+|---|---|---:|---:|---|
+| `check --locations` (`altw-keep-untagged`) | `c17025ee` (`7feb4370`; same-commit cells 203.9-208.1 s) | 206.7 s | 201.8 s | every partition phase -1 % to -8 % |
+| `add-locations-to-ways --index-type external` | `a12a2f7d` (`8ccb3a2e`; same-commit cells 317.0-353.5 s) | 317.0 s | 322.1 s | stage 4 127.1 s to 122.6 s, `s4_nonway_assemble_ms` 623,354 to 607,361; stage 1 32.4 s to 36.2 s |
+
+The altw stage 1 delta is run history, not the change: the variant
+followed a `check --locations` cell over a different 147 GB file, and the
+untouched phases before and beside it moved with it (blob metadata scan
+5.2 s to 7.9 s, relation scan 9.9 s to 11.6 s, disk read in the segment
+after pass A starts 11,373 MB to 13,517 MB). Stage 1's code change is one capacity compare per blob.
+
 ### apply-changes frames each block as it completes (bygg, 2026-10-30)
 
 A planet input blob holds about 200k elements and is rewritten into about

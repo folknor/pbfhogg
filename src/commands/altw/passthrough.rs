@@ -463,7 +463,7 @@ pub(super) fn write_output_passthrough(
         |_| WorkerScratch::new(&host.invocation),
         |(), scratch: &mut WorkerScratch, ordinal| {
             let desc = &schedule[decode_at.position(ordinal)];
-            decode_one(
+            let result = decode_one(
                 desc,
                 &shared_file,
                 node_index,
@@ -484,7 +484,11 @@ pub(super) fn write_output_passthrough(
                     Some(desc.blob_index),
                     Some(crate::ByteOffset(desc.frame_offset)),
                 ))
-            })
+            });
+            // The way path's plain decode buffer follows the pool's limit,
+            // as the non-way path's pooled one does.
+            crate::blob::release_decode_outlier(&mut scratch.decompress_buf, &host.invocation);
+            result
         },
         &mut consumer,
     )?;

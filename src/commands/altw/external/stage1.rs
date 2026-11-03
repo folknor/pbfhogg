@@ -531,6 +531,7 @@ pub(super) fn stage1_pass_a(
 
                 Ok((blob_node_ids.len() as u64, per_way_rcs, first_way))
             })();
+            crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
             result
         },
         &mut consumer,

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use super::decompress::decompress_parsed_blob_into;
 pub(crate) use super::decompress::{
     DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
-    decompress_wire_blob_into, pool_get, pool_wrap, raw_blob_payload,
+    decompress_wire_blob_into, pool_get, pool_wrap, raw_blob_payload, release_decode_outlier,
 };
 
 // Blob-level wire-format parsers live in the sibling `blob_wire` module.

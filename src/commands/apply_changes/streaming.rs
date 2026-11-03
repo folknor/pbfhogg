@@ -479,7 +479,7 @@ fn worker_loop(
                     .map_err(|e| blob_err(&desc, source, e))?;
             }
         }
-        scratch.between_tasks(counters)?;
+        scratch.between_tasks(counters, cancel)?;
     }
 
     Ok(())
@@ -534,7 +534,11 @@ impl WorkerScratch {
     /// late node on a base that lies about its order flushes into a slot
     /// after the merge; the drain's order guard refuses it, so those
     /// coordinates are never needed.)
-    fn between_tasks(&mut self, counters: &WorkerCounters) -> Result<()> {
+    fn between_tasks(
+        &mut self,
+        counters: &WorkerCounters,
+        invocation: &crate::host::Recorder,
+    ) -> Result<()> {
         use crate::commands::release_scratch;
 
         if !self.local_coords.is_empty() {
@@ -557,9 +561,7 @@ impl WorkerScratch {
         // buffer; one a refresh scan kept without a parse is checked here
         // against the same limit, and the next candidate refetches from the
         // pool.
-        if self.decompress_buf.capacity() > crate::tunables::DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
-            self.decompress_buf = Vec::new();
-        }
+        crate::blob::release_decode_outlier(&mut self.decompress_buf, invocation);
         release_scratch(&mut self.st_scratch);
         release_scratch(&mut self.gr_scratch);
         release_scratch(&mut self.node_groups_scratch);
@@ -1380,15 +1382,22 @@ mod tests {
             Default::default(),
         );
 
-        scratch.between_tasks(&counters).expect("between tasks");
+        let call = crate::host::Call::detached();
+        scratch
+            .between_tasks(&counters, &call)
+            .expect("between tasks");
         assert_eq!(scratch.st_scratch.capacity(), 0);
         assert!(scratch.gr_scratch.capacity() >= 16);
         assert_eq!(scratch.decompress_buf.capacity(), 0);
         assert_eq!(scratch.local_coords.capacity(), 0);
         assert!(load(&counters.scratch_peak_bytes) > 2 * MAX_RETAINED_SCRATCH_CAPACITY as u64);
+        // Counted as the decode pool counts the buffers it drops.
+        assert_eq!(load(&call.metrics().decompress.oversize_drops), 1);
 
         scratch.decompress_buf = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY);
-        scratch.between_tasks(&counters).expect("between tasks");
+        scratch
+            .between_tasks(&counters, &call)
+            .expect("between tasks");
         assert_eq!(
             scratch.decompress_buf.capacity(),
             DECOMPRESS_POOL_MAX_RETAINED_CAPACITY
@@ -1402,6 +1411,10 @@ mod tests {
         let counters = WorkerCounters::new();
         let mut scratch = WorkerScratch::default();
         scratch.local_coords.insert(7, (1, 2));
-        assert!(scratch.between_tasks(&counters).is_err());
+        assert!(
+            scratch
+                .between_tasks(&counters, &crate::host::Call::detached())
+                .is_err()
+        );
     }
 }

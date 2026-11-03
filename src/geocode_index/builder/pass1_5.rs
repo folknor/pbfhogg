@@ -306,6 +306,7 @@ pub(super) fn run_pass1_5(
                             );
                             Ok(())
                         })();
+                        crate::blob::release_decode_outlier(&mut decompress_buf, &host.invocation);
 
                         if let Err(e) = result {
                             store_first_err(first_err_ref, input.locate_blob(entry, e));

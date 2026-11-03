@@ -62,7 +62,12 @@ sizing: the decode helpers size a buffer from the blob's declared
 `pool_get(pool, 0)` and adds no capacity guess of its own; a guess past
 the per-buffer cap makes every buffer a drop (what happened at planet
 before the decode buffers were right-sized). The cap bounds idle
-storage per pool, not checked-out buffers or process RSS.
+storage per pool, not checked-out buffers or process RSS. A worker that
+keeps a plain decode buffer outside a pool (the raw scan, the pread
+stages) applies the same per-buffer cap once per task through
+`release_decode_outlier`, counted with the pool's own oversize drops; a
+sequential loop that moves its buffer into each block keeps none and is
+not pooled (the "Take loops" note in `src/read/decompress.rs`).
 
 **Thread oversubscription is a known architectural concern** but
 sequential conversion is *not* the answer. Measured evidence: a

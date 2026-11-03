@@ -139,7 +139,9 @@ crate::counters::counter_set! {
     /// Decompression-pool drop counters: invocation totals across every pool
     /// the invocation ran (classify workers, command-specific readers, altw
     /// passthrough), not only the pipelined reader, so no per-pipeline path
-    /// emits them. Their only way out is [`emit_decompress_pool_counters`],
+    /// emits them. The oversize pair also counts the plain decode buffers
+    /// workers keep outside a pool, which follow the same per-buffer limit
+    /// through `release_decode_outlier`. Their only way out is [`emit_decompress_pool_counters`],
     /// which only the end-of-invocation emitter calls; the generated emitter
     /// is private to this module. A pool records into the invocation it was
     /// built for, also when a block it handed out is dropped after the call.

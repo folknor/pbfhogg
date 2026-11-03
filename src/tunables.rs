@@ -232,6 +232,10 @@ pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 /// dropped every planet buffer (see `reference/performance.md`, "Decode
 /// buffers sized from the blob and recycled"). One retained outlier per
 /// worker is the cost: up to this much per pread worker.
+///
+/// The same limit binds the plain decode buffers workers keep across blobs
+/// outside a pool, checked once per task by `blob::release_decode_outlier`, so no
+/// kept decode buffer holds more than this between blobs.
 pub(crate) const DECOMPRESS_POOL_MAX_RETAINED_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Maximum idle capacity (bytes, the sum of buffer capacities) one

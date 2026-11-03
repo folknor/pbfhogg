@@ -240,22 +240,6 @@ noise floor; what is left is one copy of the node body per block on every
 node-writing command, whose wall cost is not measured and likely sits
 under the 2-3 % floor.
 
-### WRK-127: apply-changes' parallel create runs build a fresh builder per block
-
-`CreateEncoder::emit` (`src/commands/apply_changes/stream_output.rs`)
-encodes a run longer than one block with `par_chunks(cap)` on the
-executor and makes a `BlockBuilder::new()` per chunk, so up to
-`APPLY_CHANGES_CREATE_BATCH_BLOCKS` fresh builders per batch, each
-preallocating its dense vectors for the element cap: the per-block
-fresh-builder shape the re-encoding commands' workers left. At planet it
-is about 300 blocks at the node-to-way transition, so the cost is bounded
-and one-time; whether it shows in the transition's live burst is not
-measured (the attribution diagnostic of 2026-11-03 counted these builders
-only at the end of each chunk, so their share of the transition, where the
-run's peak anon is set, is the one owner it left unmeasured). A builder
-per executor thread (thread-local, or `map_init`)
-would follow the worker rule, if the measurement says it matters.
-
 ### WRK-022: Byte-budgeted fused task engine
 
 One execution model for decode, transform, encode and frame under one byte
@@ -438,6 +422,20 @@ indexdata guide) should say so and point at `check --index` and
 `cat --reindex` / `sort --distrust-metadata` as the repair, and whether
 the brokkr planet dataset should be reindexed so `check --index` passes on
 it.
+
+### WRK-171: no test crosses apply-changes' create-run batch boundary
+
+`CreateEncoder::emit` (`src/commands/apply_changes/stream_output.rs`)
+encodes a create run of more than one block on the executor in batches of
+`APPLY_CHANGES_CREATE_BATCH_BLOCKS` (64) blocks. The one test of create
+runs, `tests/apply_changes_create_runs.rs`, reaches three blocks per run,
+and tunables take no test override, so the second and later batches run
+only on planet (the node-to-way transition there is five batches). The
+missing contract: a create run crossing the batch boundary yields
+complete, ordered output, its final partial batch included. A fixture of
+65 full blocks of node creates past the last base node blob plus a partial
+block (520,001+ creates) exercises it; check the test's run time against
+the tier it lands in.
 
 ---
 

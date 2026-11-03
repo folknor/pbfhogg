@@ -1904,6 +1904,51 @@ the `Info` user; its walls and rewrite CPU are inside HEAD's spread. The
 `--locations-on-ways` path, which copies ways through the same checks, was
 not measured.
 
+### apply-changes' create-run builders are made per block (bygg, 2026-11-03, against `cf73c10f`)
+
+The question: a create run longer than one block is encoded on the
+executor with a fresh `BlockBuilder` per block (about 309 blocks in five
+batches at the planet node-to-way transition), where the re-encoding
+workers keep one builder for the run. Does building one per block cost
+wall or memory?
+
+Both arms carry a `MERGE_TRANSITION_CREATES_START`/`_END` marker pair
+around the creates written at each type transition (landed with this
+entry; earlier cells have no transition marker). Arm A is `cf73c10f`
+plus the markers. Arm B adds an invocation-owned pool to `CreateEncoder`
+(`Mutex<Vec<BlockBuilder>>`: a task takes a builder or makes one, and
+returns it once its block is framed), so no more builders exist than tasks
+ran at once and each is reused across blocks, batches and transitions.
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1 --force`, both arms built in the main tree, no trim of
+its own. Run order A B B A A B B A A B; the last B cell queued behind
+another project's brokkr command. The span is the node-to-way transition's
+`MERGE_TRANSITION_CREATES` pair.
+
+| arm | sidecars | walls (s) | peak anon (MB) | transition span (ms) |
+|---|---|---|---|---|
+| A, a builder per block | `0e3f915f`, `64550e04`, `41e140e0`, `1883d680`, `f95cbd01` | 100.2, 94.7, 98.5, 93.8, 97.3 | 1,983, 1,972, 1,882, 1,873, 1,869 | 33, 34, 16, 22, 15 |
+| B, pooled builders | `74bd551c`, `e585ee57`, `8d601702`, `068a40b4`, `b5ca7fc0` | 95.0, 99.9, 96.1, 99.2, 95.0 | 1,902, 1,878, 1,884, 1,896, 1,906 | 44, 28, 45, 40, 27 |
+
+Medians: wall 97.3 against 96.1 s, peak anon 1,882 against 1,896 MB, span
+22 against 40 ms. The pool shows no wall or sampled-peak benefit. Its
+spans were longer in four of five adjacent pairs; that is an observed
+direction, not an established regression, and at tens of milliseconds a
+run it would not matter either way. The per-block builders stay.
+
+Limits of this record. The sidecar samples every 100 ms, so it cannot
+reliably resolve an instantaneous peak inside a 15-45 ms span: the builders'
+share of the transition's live burst is still not attributed, only shown
+not to move the run's sampled peak (set after the way-to-relation
+transition, at the end of the run, in every cell). The first two A cells show a second step of
+about 85 MB in anon about 0.8 s after the transition, which no other cell
+shows; run history is the likelier cause, but an occasional allocator
+effect of the per-block frees is not excluded by ten cells. `map_init`
+and per-task groups of contiguous blocks were not tested. A thread-local
+builder was not tested because it is ruled out on other grounds: the
+executor's threads belong to the caller and outlive the invocation.
+
 ### tags-filter checks stored tagdata is canonical (bygg, 2026-11-03, against `ebe69342`)
 
 The change: `TagIndex::deserialize`, which runs once per blob header on a

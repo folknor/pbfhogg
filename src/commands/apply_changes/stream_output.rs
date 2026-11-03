@@ -100,6 +100,17 @@ impl<'a> CreateEncoder<'a> {
                         blocks
                             .into_par_iter()
                             .map(|chunk| {
+                                // A builder per block, not the worker rule's
+                                // builder kept for the run: an invocation-owned
+                                // pool of builders, tested at planet, showed no
+                                // wall or sampled-peak benefit and usually
+                                // lengthened the transition (reference/
+                                // performance.md, "apply-changes' create-run
+                                // builders are made per block"). A thread-local
+                                // is ruled out on its own grounds: the
+                                // executor's threads belong to the caller and
+                                // outlive the invocation, and the builders
+                                // would stay on them.
                                 let mut bb = BlockBuilder::new();
                                 encode_and_frame(
                                     &mut bb,

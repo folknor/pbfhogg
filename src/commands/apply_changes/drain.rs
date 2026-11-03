@@ -636,6 +636,9 @@ fn handle_type_transition(
     }
 
     let loc = loc_mode(state.loc.as_ref());
+    writer
+        .cancel_token()
+        .marker("MERGE_TRANSITION_CREATES_START");
     let emitted = flush_remaining_upserts(
         prev,
         item_kind,
@@ -646,6 +649,7 @@ fn handle_type_transition(
         stats,
         loc,
     )?;
+    writer.cancel_token().marker("MERGE_TRANSITION_CREATES_END");
     counters
         .transition_creates_emitted
         .fetch_add(emitted, Ordering::Relaxed);

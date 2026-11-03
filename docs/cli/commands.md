@@ -35,7 +35,7 @@ the command accepts.
 - **Dropped:** every `Note:`, every progress line, the command's closing
   summary (single- or multi-line, `apply-changes`' block, each region's line
   of `extract --config` and its opening `Multi-extract:` line, `inspect tags`'
-  `N distinct key/value pairs counted, ...` line), and the developer lines
+  `K key rows and P key/value rows counted, ...` line), and the developer lines
   some backends print (`[altw external] ...`, the geocode builder's hotpath
   counters).
 - **Kept:** every `Warning:` and the final `Error:` line, which explain the
@@ -755,7 +755,8 @@ every form.
 
 #### inspect tags
 
-Count tag key=value frequencies (subcommand of `inspect`).
+Count tag keys, or key=value pairs for expressions with `=` (subcommand of
+`inspect`).
 
 ```
 pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
@@ -763,8 +764,8 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `--min-count <N>` | Only show tags with at least this many occurrences [default: 1] |
-| `-M, --max-count <N>` | Only show tags with at most this many occurrences |
+| `--min-count <N>` | Only show rows with at least this many occurrences [default: 1] |
+| `-M, --max-count <N>` | Only show rows with at most this many occurrences |
 | `--sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc. `count` and `name` are accepted as aliases for `count-desc` and `name-asc`. (`-s` used to be its short; `-s` now refuses here, naming `--sort`.) |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Count one element type: exactly one of node, way, or relation (a list is refused) |
@@ -772,19 +773,42 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)). Only with `--type` or expressions that together leave some element type out: any other run schedules every blob whether or not it is indexed, does not refuse unindexed input, and refuses `--force` as ineffective |
 
-Each output row on stdout is three tab-separated fields: the count, then the
-key and the value, each a double-quoted literal escaped as in
-[`diff -v`](#diff) (a valid JSON string), for example
-`120`, TAB, `"highway"`, TAB, `"primary"`. A tab or newline inside a key or value prints
-escaped, so splitting a row on tabs always yields three fields and each
-quoted field JSON-decodes to the original text.
+What is counted follows `osmium tags-count`. With no expression, every key
+is counted: one row per key, with the number of its occurrences, whatever
+their values. An expression without `=` (`highway`, `addr:*`) counts the keys
+it matches the same way. An expression with `=` (`highway=*`,
+`highway=primary`, `highway!=primary`) counts the key=value pairs it
+matches, one row per pair. A tag matched by both kinds of expression is
+counted in its key row and in its pair row (`highway highway=*` prints the
+`highway` total beside its breakdown by value). `-e` expressions join the
+positional ones in one list, and every key is counted only when that list is
+empty; osmium also counts every key when `-e` is given with no positional
+expression (see DEVIATIONS.md).
 
-After the rows, one summary line on stderr gives two figures:
-`D distinct key/value pairs counted, K passed the count thresholds`. `D` is
-every distinct pair the run selected (after `--type` and the expressions),
-before `--min-count` and `--max-count`; `K` is how many of them those
-thresholds kept, which is the number of rows printed. Neither counts
-occurrences or distinct keys. `-q` drops the line (see [Quiet](#quiet)).
+Each output row on stdout is tab-separated: the count, then the key, then for
+a pair row the value, each text field a double-quoted literal escaped as in
+[`diff -v`](#diff) (a valid JSON string). A key row is two fields, for
+example `120`, TAB, `"highway"`; a pair row is three, for example `80`, TAB,
+`"highway"`, TAB, `"primary"`. A pair whose value is the empty string is a
+three-field row ending in `""`, a different row from its key's. A tab or
+newline inside a key or value prints escaped, so splitting a row on tabs
+always yields two or three fields and each quoted field JSON-decodes to the
+original text.
+
+`--min-count` and `--max-count` apply to every row, key and pair alike.
+`--sort count-desc` and `count-asc` break ties by name ascending; the name
+orders compare the key, then the value, a key row before its own pair rows
+in `name-asc` (after them in `name-desc`), which is osmium's order for every
+key without a NUL byte.
+
+After the rows, one summary line on stderr gives three figures:
+`K key rows and P key/value rows counted, R passed the count thresholds`.
+`K` and `P` are the distinct key rows and pair rows the run selected (after
+`--type` and the expressions), before `--min-count` and `--max-count`; `R` is
+how many rows of both kinds those thresholds kept, which is the number of
+rows printed. None counts occurrences, and `K` is 0 for a run whose
+expressions all carry `=`, whatever keys its pairs have. `-q` drops the line
+(see [Quiet](#quiet)).
 
 `inspect tags` expressions use the same syntax as `tags-filter`, including
 element-type prefixes. For example, `w/highway=primary` counts that match only
@@ -792,24 +816,27 @@ on ways; `--type` adds an overall element-type restriction.
 
 Expressions select individual tags for counting. If a way has both
 `highway=primary` and `name=Main Street`, the expression `w/highway` counts
-only its highway tag. In `tags-filter` the same expression selects the whole
-way; export also selects whole elements and accepts an omitted expression
-filter as unrestricted.
+only its highway tag, in the `highway` key row. In `tags-filter` the same
+expression selects the whole way; export also selects whole elements and
+accepts an omitted expression filter as unrestricted.
 
-Counts are exact. Memory grows with the number of distinct selected key/value
-pairs and their string bytes, with no fixed byte cap or spill to disk. One
-table, split into shards that the workers fill concurrently, stores each
-distinct pair's value bytes and counter, and each distinct key's bytes once
-per shard holding a pair of it, plus hash-table capacity overhead. The blob
-schedule, decoded blobs and each worker's per-blob scratch add transient
-storage; input blobs are not limited to the writer's default element count.
-Every distinct pair stays in the table until the scan ends, whatever
-`--min-count` or `--max-count` say; only the rows those thresholds keep are
-then copied out, shard by shard, to be sorted and printed. Consequently count
-thresholds do not bound memory, even when few rows are printed. Restrict
-element types and tag expressions to reduce the selected cardinality; neither
-a higher minimum count nor fewer workers bounds the table. No approximate
-counts or silent truncation are used.
+Counts are exact. Memory grows with the number of distinct selected rows
+(keys and key/value pairs) and their string bytes, with no fixed byte cap or
+spill to disk. One table, split into shards that the workers fill
+concurrently, stores each distinct pair's value bytes and counter, each key
+row's counter, and each distinct key's bytes once per shard holding a pair or
+the row of it, plus hash-table capacity overhead. A run that counts only keys
+(no expression, or none with `=`) holds no pairs, so it stays small; one with
+`*=*` holds every distinct pair of the file. The blob schedule, decoded blobs
+and each worker's per-blob scratch add transient storage; input blobs are
+not limited to the writer's default element count. Every distinct row stays
+in the table until the scan ends, whatever `--min-count` or `--max-count`
+say; only the rows those thresholds keep are then copied out, shard by
+shard, to be sorted and printed. Consequently count thresholds do not bound
+memory, even when few rows are printed. Restrict element types and tag
+expressions to reduce the selected cardinality; neither a higher minimum
+count nor fewer workers bounds the table. No approximate counts or silent
+truncation are used.
 
 ### check
 

@@ -142,14 +142,18 @@ flag: `tags-count -s` is `--sort`, `tags-filter -i` / `-t` are
 is `--config`, `cat -c` is `--clean`, and `fileinfo -e` (`inspect`) is
 `--extended`.
 
-The rows differ: pbfhogg always counts key=value pairs, while osmium counts
-the key alone when the expression has no value matcher, and lists keys when
-there is no expression at all. So `osmium tags-count input.pbf highway`
-prints one `highway` row and `pbfhogg inspect tags input.pbf highway` prints
-one row per `highway` value; sum them for osmium's count.
+The rows are osmium's: with no expression, or for an expression without `=`
+(`highway`), each key is counted alone and printed as `count`, TAB, `"key"`;
+an expression with `=` (`highway=*`, `highway=primary`) counts key=value pairs,
+printed with the value as a third field. The text is quoted differently:
+osmium doubles a quote inside a key or value, pbfhogg writes a JSON string
+literal (backslash escapes). With `-e FILE` and no positional expression,
+osmium also counts every key; pbfhogg counts only what the file names. Both
+differences are recorded in DEVIATIONS.md, "tags-filter and inspect tags:
+expression-syntax edge cases".
 
 pbfhogg also accepts the tags-filter type-prefix syntax in these expressions.
-For example, `w/highway` counts the `highway` pairs on ways. Osmium's
+For example, `w/highway` counts the `highway` key on ways. Osmium's
 `tags-count` treats that full string as a tag matcher; use `-t way` there to
 restrict the element kind.
 

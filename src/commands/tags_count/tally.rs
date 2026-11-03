@@ -6,24 +6,29 @@
 //! arrays lie; nothing is read from them until the blob has been accepted
 //! (validation, string table UTF-8, kind claim), so a refused blob counts
 //! nothing. The accepted arrays are then read once, as string table index
-//! pairs counted per (kind, key index, value index): no string is resolved
-//! per tag, no dense node's ID or coordinates are decoded. Each distinct
-//! triple is resolved, judged against the expressions and hashed once per
-//! blob, and only then merged by text, so duplicate string table entries
-//! fold into one pair.
+//! pairs counted per (kind, key index, value index), or per (kind, key
+//! index) when the run counts no pair: no string is resolved per tag, no
+//! dense node's ID or coordinates are decoded. Each distinct entry is
+//! resolved and judged against the [`Selection`] once per blob: a pair the
+//! pair expressions admit is hashed for its pair row, and a key the key
+//! expressions admit adds its count to the blob's tally of that key, across
+//! kinds and values. Only then is anything merged by text, so duplicate
+//! string table entries fold into one row.
 //!
 //! Which tags count is the element walk's rule, the one `TagIter` and
 //! `DenseTagIter` apply: an element's tags are its pairs up to the first one
 //! whose key or value index lies past the string table (CORRECTNESS.md, "Tag
-//! iterators end early on an out-of-range string index"). A plain element
-//! stops there; a dense node stops counting but its pairs are still read up
-//! to its terminator so the next node starts where it should. Index 0 is
-//! looked up like any other index, and a dense `0` is a terminator only in
-//! key position.
+//! iterators end early on an out-of-range string index"). Counting a key
+//! alone still reads and checks its value index. A plain element stops
+//! there; a dense node stops counting but its pairs are still read up to its
+//! terminator so the next node starts where it should. Index 0 is looked up
+//! like any other index, and a dense `0` is a terminator only in key
+//! position.
 
 use rustc_hash::FxHashMap;
 
-use super::table::{CountTable, pair_hash};
+use super::Selection;
+use super::table::{CountTable, key_hash, pair_hash};
 use crate::ElementKind;
 use crate::error::{Error, Result};
 use crate::owned::TypeFilter;
@@ -33,7 +38,6 @@ use crate::read::wire::{
     Cursor, PackedUint32Iter, WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation,
     WireWay,
 };
-use crate::tag_expr::Expression;
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, TAGS_COUNT_ROTATION_STEP as ROTATION_STEP};
 
 /// Where one selected element's, or one dense group's, tags lie.
@@ -107,20 +111,27 @@ impl GroupProjection for TagRuns<'_> {
     }
 }
 
-/// One distinct selected pair of a blob, waiting to be merged: its shard,
-/// hash, string table indices and count.
+/// One distinct selected row of a blob, waiting to be merged: its shard,
+/// hash, string table indices (no value index for a key row) and count.
 struct Pending {
     shard: usize,
     hash: u64,
     key: u32,
-    value: u32,
+    value: Option<u32>,
     count: u64,
 }
 
 /// A worker's tally scratch, reused across its blobs.
 pub(super) struct BlobTally {
     runs: Vec<TagRun>,
+    /// Occurrences per (kind, key index, value index), when the run counts
+    /// pairs.
     pairs: FxHashMap<(ElementKind, u32, u32), u64>,
+    /// Occurrences per (kind, key index), when it counts no pair.
+    keys: FxHashMap<(ElementKind, u32), u64>,
+    /// The selected key-row occurrences per key index, across kinds and
+    /// values.
+    key_rows: FxHashMap<u32, u64>,
     pending: Vec<Pending>,
     /// Where the next blob starts walking the shards. Seeded per worker and
     /// stepped per blob, so workers do not all queue on the same shard.
@@ -133,109 +144,106 @@ impl BlobTally {
         BlobTally {
             runs: Vec::new(),
             pairs: FxHashMap::default(),
+            keys: FxHashMap::default(),
+            key_rows: FxHashMap::default(),
             pending: Vec::new(),
             rotation: seed.wrapping_mul(ROTATION_STEP),
         }
     }
 
-    /// Count one blob's selected tags into `table`. `expressions`, when
-    /// given, select individual tags: a tag counts when any expression whose
-    /// type prefix admits the element's kind matches it.
+    /// Count one blob's selected tags into `table`, as `selection` says: a
+    /// tag counts in its key row when a key expression whose type prefix
+    /// admits the element's kind matches it, and in its pair row when a pair
+    /// expression does, each independently.
     pub(super) fn add_blob(
         &mut self,
         buffer: BlockBuffer<'_>,
         admits: TypeFilter,
-        expressions: Option<&[Expression]>,
+        selection: &Selection,
         table: &CountTable,
         cancel: &crate::host::Recorder,
     ) -> Result<()> {
         let (TagRuns { .. }, accepted) =
             buffer.project(|_, _| TagRuns::new(admits, &mut self.runs))?;
-        self.count_pairs(&accepted)?;
-        self.select(&accepted, expressions)?;
+        self.count(&accepted, selection.counts_pairs())?;
+        self.select(&accepted, selection)?;
         self.merge(&accepted, table, cancel)?;
         self.release_outliers();
         Ok(())
     }
 
-    /// The accepted blob's tag occurrences, per (kind, key index, value
-    /// index), by the element walk's rule (module docs).
-    fn count_pairs(&mut self, accepted: &ValidatedBlock<'_>) -> Result<()> {
-        let BlobTally { runs, pairs, .. } = self;
+    /// The accepted blob's tag occurrences by the element walk's rule
+    /// (module docs): per (kind, key index, value index) when `by_pair`,
+    /// else per (kind, key index).
+    fn count(&mut self, accepted: &ValidatedBlock<'_>, by_pair: bool) -> Result<()> {
+        let BlobTally {
+            runs, pairs, keys, ..
+        } = self;
         pairs.clear();
-        let bytes = accepted.bytes();
-        let strings = accepted.string_count();
-        let resolves = |index: u64| {
-            u32::try_from(index)
-                .ok()
-                .filter(|&i| (i as usize) < strings)
-        };
-        for &run in runs.iter() {
-            match run {
-                TagRun::Plain { kind, keys, vals } => {
-                    let keys = PackedUint32Iter::new(keys.in_blob(bytes)?);
-                    let vals = PackedUint32Iter::new(vals.in_blob(bytes)?);
-                    for (k, v) in keys.zip(vals) {
-                        let (Some(k), Some(v)) = (resolves(k.into()), resolves(v.into())) else {
-                            break;
-                        };
-                        *pairs.entry((kind, k, v)).or_insert(0) += 1;
-                    }
-                }
-                TagRun::Dense(span) => {
-                    let mut cursor = Cursor::new(span.in_blob(bytes)?);
-                    // Whether the current node's tags are still counting.
-                    let mut live = true;
-                    while !cursor.is_empty() {
-                        let key = cursor.read_varint()?;
-                        if key == 0 {
-                            live = true;
-                            continue;
-                        }
-                        let value = cursor.read_varint()?;
-                        if !live {
-                            continue;
-                        }
-                        match (resolves(key), resolves(value)) {
-                            (Some(k), Some(v)) => {
-                                *pairs.entry((ElementKind::Node, k, v)).or_insert(0) += 1;
-                            }
-                            _ => live = false,
-                        }
-                    }
-                }
-            }
+        keys.clear();
+        if by_pair {
+            walk_tags(runs, accepted, |kind, k, v| {
+                *pairs.entry((kind, k, v)).or_insert(0) += 1;
+            })
+        } else {
+            walk_tags(runs, accepted, |kind, k, _| {
+                *keys.entry((kind, k)).or_insert(0) += 1;
+            })
         }
-        Ok(())
     }
 
-    /// The distinct triples the expressions select, each resolved and hashed
-    /// once, sorted by shard.
-    fn select(
-        &mut self,
-        accepted: &ValidatedBlock<'_>,
-        expressions: Option<&[Expression]>,
-    ) -> Result<()> {
-        let BlobTally { pairs, pending, .. } = self;
+    /// The distinct rows the selection admits, each resolved and hashed once,
+    /// sorted by shard: every admitted pair, then every key the key
+    /// expressions admitted on any kind with any value, with its occurrences
+    /// added up.
+    fn select(&mut self, accepted: &ValidatedBlock<'_>, selection: &Selection) -> Result<()> {
+        let BlobTally {
+            pairs,
+            keys,
+            key_rows,
+            pending,
+            ..
+        } = self;
         pending.clear();
+        key_rows.clear();
         for (&(kind, key, value), &count) in pairs.iter() {
             let (k, v) = strings(accepted, key, value)?;
-            if expressions.is_none_or(|e| super::matches_expression(e, k, v, kind)) {
+            if selection.admits_pair(kind, k, v) {
                 let hash = pair_hash(k.as_bytes(), v.as_bytes());
                 pending.push(Pending {
                     shard: CountTable::shard_of(hash),
                     hash,
                     key,
-                    value,
+                    value: Some(value),
                     count,
                 });
             }
+            if selection.admits_key(kind, k) {
+                *key_rows.entry(key).or_insert(0) += count;
+            }
+        }
+        for (&(kind, key), &count) in keys.iter() {
+            if selection.admits_key(kind, string(accepted, key)?) {
+                *key_rows.entry(key).or_insert(0) += count;
+            }
+        }
+        // Two indices holding the same text stay two entries here; the
+        // shard adds both to the one row, by bytes.
+        for (&key, &count) in key_rows.iter() {
+            let hash = key_hash(string(accepted, key)?.as_bytes());
+            pending.push(Pending {
+                shard: CountTable::shard_of(hash),
+                hash,
+                key,
+                value: None,
+                count,
+            });
         }
         pending.sort_unstable_by_key(|p| p.shard);
         Ok(())
     }
 
-    /// Merge the pending pairs into `table`, one shard locked at a time,
+    /// Merge the pending rows into `table`, one shard locked at a time,
     /// starting at this blob's rotation and wrapping. Cancellation is
     /// checked before each shard.
     fn merge(
@@ -257,8 +265,13 @@ impl BlobTally {
                 held = Some((p.shard, table.lock(p.shard)?));
             }
             if let Some((_, shard)) = held.as_mut() {
-                let (k, v) = strings(accepted, p.key, p.value)?;
-                shard.add(p.hash, k, v, p.count)?;
+                match p.value {
+                    Some(value) => {
+                        let (k, v) = strings(accepted, p.key, value)?;
+                        shard.add(p.hash, k, v, p.count)?;
+                    }
+                    None => shard.add_key(p.hash, string(accepted, p.key)?, p.count)?,
+                }
             }
         }
         Ok(())
@@ -281,10 +294,76 @@ impl BlobTally {
         ) {
             self.pairs = FxHashMap::default();
         }
+        if over(self.keys.capacity(), size_of::<((ElementKind, u32), u64)>()) {
+            self.keys = FxHashMap::default();
+        }
+        if over(self.key_rows.capacity(), size_of::<(u32, u64)>()) {
+            self.key_rows = FxHashMap::default();
+        }
         if over(self.pending.capacity(), size_of::<Pending>()) {
             self.pending = Vec::new();
         }
     }
+}
+
+/// Call `f(kind, key index, value index)` for every tag the element walk
+/// counts on the recorded runs (module docs).
+fn walk_tags(
+    runs: &[TagRun],
+    accepted: &ValidatedBlock<'_>,
+    mut f: impl FnMut(ElementKind, u32, u32),
+) -> Result<()> {
+    let bytes = accepted.bytes();
+    let strings = accepted.string_count();
+    let resolves = |index: u64| {
+        u32::try_from(index)
+            .ok()
+            .filter(|&i| (i as usize) < strings)
+    };
+    for &run in runs {
+        match run {
+            TagRun::Plain { kind, keys, vals } => {
+                let keys = PackedUint32Iter::new(keys.in_blob(bytes)?);
+                let vals = PackedUint32Iter::new(vals.in_blob(bytes)?);
+                for (k, v) in keys.zip(vals) {
+                    let (Some(k), Some(v)) = (resolves(k.into()), resolves(v.into())) else {
+                        break;
+                    };
+                    f(kind, k, v);
+                }
+            }
+            TagRun::Dense(span) => {
+                let mut cursor = Cursor::new(span.in_blob(bytes)?);
+                // Whether the current node's tags are still counting.
+                let mut live = true;
+                while !cursor.is_empty() {
+                    let key = cursor.read_varint()?;
+                    if key == 0 {
+                        live = true;
+                        continue;
+                    }
+                    let value = cursor.read_varint()?;
+                    if !live {
+                        continue;
+                    }
+                    match (resolves(key), resolves(value)) {
+                        (Some(k), Some(v)) => f(ElementKind::Node, k, v),
+                        _ => live = false,
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn past_the_table() -> Error {
+    Error::internal("inspect tags: a counted string index lies past its string table")
+}
+
+/// The string of an index already found in the table.
+fn string<'b>(accepted: &'b ValidatedBlock<'_>, index: u32) -> Result<&'b str> {
+    accepted.string(index as usize).ok_or_else(past_the_table)
 }
 
 /// The key and value strings of an index pair already found in the table.
@@ -293,15 +372,7 @@ fn strings<'b>(
     key: u32,
     value: u32,
 ) -> Result<(&'b str, &'b str)> {
-    match (
-        accepted.string(key as usize),
-        accepted.string(value as usize),
-    ) {
-        (Some(k), Some(v)) => Ok((k, v)),
-        _ => Err(Error::internal(
-            "inspect tags: a counted string index lies past its string table",
-        )),
-    }
+    Ok((string(accepted, key)?, string(accepted, value)?))
 }
 
 #[cfg(test)]
@@ -309,24 +380,38 @@ fn strings<'b>(
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::super::Selection;
     use super::{BlobTally, CountTable};
     use crate::owned::TypeFilter;
     use crate::read::wire_fixtures::{
         Group, block, deltas, dense, field_bytes, field_varint, mutations, packed, plain_node,
         projection_fixtures, relation,
     };
-    use crate::tag_expr::{Expression, parse_expressions};
+    use crate::tag_expr::{Expression, parse_expressions, tag_matches};
     use crate::{Element, ElementKind};
 
-    type Counts = BTreeMap<(String, String), u64>;
+    /// Rows by (key, value), `None` for a key row.
+    type Counts = BTreeMap<(String, Option<String>), u64>;
 
-    /// The element walk's counts: every tag `tags()` yields on an element
-    /// `admits` selects and the expressions select.
+    fn rows(rows: Vec<super::super::TagCount>) -> Counts {
+        rows.into_iter()
+            .map(|r| ((r.key, r.value), r.count))
+            .collect()
+    }
+
+    /// The element walk's counts, by osmium's rule written out on its own:
+    /// every tag `tags()` yields on an element `admits` selects counts in its
+    /// key row when no expression is given or an expression without `=`
+    /// matches it, and in its pair row when an expression with `=` matches
+    /// it, the two judged independently.
     fn walked(
         block: &crate::PrimitiveBlock,
         admits: TypeFilter,
         expressions: Option<&[Expression]>,
     ) -> Counts {
+        let matches = |e: &Expression, kind: ElementKind, k: &str, v: &str| {
+            e.type_filter.admits(kind) && tag_matches(&e.matcher, k, v)
+        };
         let mut counts = Counts::new();
         for element in block.elements_skip_metadata() {
             let (kind, tags): (ElementKind, Vec<(&str, &str)>) = match &element {
@@ -339,8 +424,21 @@ mod tests {
                 continue;
             }
             for (k, v) in tags {
-                if expressions.is_none_or(|e| super::super::matches_expression(e, k, v, kind)) {
-                    *counts.entry((k.to_owned(), v.to_owned())).or_insert(0) += 1;
+                let key_row = expressions.is_none_or(|es| {
+                    es.iter()
+                        .any(|e| e.matcher.value.is_none() && matches(e, kind, k, v))
+                });
+                let pair_row = expressions.is_some_and(|es| {
+                    es.iter()
+                        .any(|e| e.matcher.value.is_some() && matches(e, kind, k, v))
+                });
+                if key_row {
+                    *counts.entry((k.to_owned(), None)).or_insert(0) += 1;
+                }
+                if pair_row {
+                    *counts
+                        .entry((k.to_owned(), Some(v.to_owned())))
+                        .or_insert(0) += 1;
                 }
             }
         }
@@ -411,13 +509,15 @@ mod tests {
     /// counts are the element walk's.
     #[test]
     fn tally_refuses_as_construction_and_counts_as_the_element_walk() {
-        let expressions = parse_expressions(&[
-            "n/k".to_owned(),
-            "w/highway=x".to_owned(),
-            "type".to_owned(),
-            "k=e".to_owned(),
-        ])
-        .unwrap();
+        let parse = |texts: &[&str]| {
+            parse_expressions(&texts.iter().map(|&t| t.to_owned()).collect::<Vec<_>>()).unwrap()
+        };
+        // Key and pair expressions with type prefixes; overlapping routes
+        // with a repeated key expression, a tag both routes count, and a
+        // value-only pair matcher; pairs alone.
+        let mixed = parse(&["n/k", "w/highway=x", "type", "k=e"]);
+        let overlapping = parse(&["k", "k=*", "*=v", "k", "w/e"]);
+        let pairs = parse(&["*=*"]);
         let only = |kind| {
             let mut filter = TypeFilter::none();
             match kind {
@@ -427,12 +527,15 @@ mod tests {
             }
             filter
         };
-        let selections: [(TypeFilter, Option<&[Expression]>); 5] = [
+        let selections: [(TypeFilter, Option<&[Expression]>); 8] = [
             (TypeFilter::all(), None),
             (only(ElementKind::Node), None),
             (only(ElementKind::Way), None),
-            (only(ElementKind::Relation), Some(&expressions)),
-            (TypeFilter::all(), Some(&expressions)),
+            (only(ElementKind::Relation), Some(&mixed)),
+            (TypeFilter::all(), Some(&mixed)),
+            (TypeFilter::all(), Some(&overlapping)),
+            (only(ElementKind::Way), Some(&overlapping)),
+            (TypeFilter::all(), Some(&pairs)),
         ];
         let host = crate::host::Host::entered_for_tests();
         let mut fixtures = projection_fixtures();
@@ -458,19 +561,20 @@ mod tests {
                         &mut gr,
                         None,
                     );
+                    let selection = Selection::new(exprs);
                     let counted = tally
-                        .add_blob(buffer, admits, exprs, &table, &host.invocation)
+                        .add_blob(buffer, admits, &selection, &table, &host.invocation)
                         .and_then(|()| table.into_counts(|_| true, &host.invocation));
                     match (&oracle, counted) {
                         (Err(a), Err(b)) => {
                             assert_eq!(a.to_string(), b.to_string(), "{what}, {how}, {n}");
                         }
-                        (Ok(block), Ok((rows, _))) => {
-                            let got: Counts = rows
-                                .into_iter()
-                                .map(|r| ((r.key, r.value), r.count))
-                                .collect();
-                            assert_eq!(got, walked(block, admits, exprs), "{what}, {how}, {n}");
+                        (Ok(block), Ok((got, _))) => {
+                            assert_eq!(
+                                rows(got),
+                                walked(block, admits, exprs),
+                                "{what}, {how}, {n}"
+                            );
                         }
                         (oracle, counted) => panic!(
                             "{what}, {how}, {n}: construction accepted {}, the tally {}",
@@ -489,26 +593,34 @@ mod tests {
     fn tag_rules_on_a_known_block() {
         let host = crate::host::Host::entered_for_tests();
         let (_, bytes) = tag_fixtures().swap_remove(0);
-        let table = CountTable::new();
-        let (mut st, mut gr) = (Vec::new(), Vec::new());
-        let buffer = crate::read::block::BlockBuffer::new(bytes, None, &mut st, &mut gr, None);
-        BlobTally::new(0)
-            .add_blob(buffer, TypeFilter::all(), None, &table, &host.invocation)
-            .unwrap();
-        let got: Counts = table
-            .into_counts(|_| true, &host.invocation)
-            .unwrap()
-            .0
-            .into_iter()
-            .map(|r| ((r.key, r.value), r.count))
-            .collect();
-        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let count = |texts: &[&str]| {
+            let parsed =
+                parse_expressions(&texts.iter().map(|&t| t.to_owned()).collect::<Vec<_>>())
+                    .unwrap();
+            let table = CountTable::new();
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            let buffer =
+                crate::read::block::BlockBuffer::new(bytes.clone(), None, &mut st, &mut gr, None);
+            BlobTally::new(0)
+                .add_blob(
+                    buffer,
+                    TypeFilter::all(),
+                    &Selection::new(Some(&parsed)),
+                    &table,
+                    &host.invocation,
+                )
+                .unwrap();
+            rows(table.into_counts(|_| true, &host.invocation).unwrap().0)
+        };
+        let key = |k: &str| (k.to_owned(), None);
+        let pair = |k: &str, v: &str| (k.to_owned(), Some(v.to_owned()));
         // Plain node 1: k=v twice (indices 1 and 3), ""=e, then an index past
-        // the table ends its tags. Plain node 2 ends at once. Dense: node 3
-        // k=v then ends, node 4 k="" (value index 0), node 5 none, node 6
-        // (unterminated) k=v twice. Way: k=v twice, then ends. Relation: e=v
-        // and k="".
-        let expected: Counts = [
+        // the table ends its tags. Plain node 2 ends at once, its key "v" not
+        // counted either: the pair's value index is past the table. Dense:
+        // node 3 k=v then ends, node 4 k="" (value index 0), node 5 none,
+        // node 6 (unterminated) k=v twice. Way: k=v twice, then ends.
+        // Relation: e=v and k="".
+        let pairs: Counts = [
             (pair("k", "v"), 2 + 1 + 2 + 2),
             (pair("", "e"), 1),
             (pair("k", ""), 1 + 1),
@@ -516,40 +628,81 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(got, expected);
+        assert_eq!(count(&["*=*"]), pairs);
+        let keys: Counts = [(key("k"), 7 + 2), (key(""), 1), (key("e"), 1)]
+            .into_iter()
+            .collect();
+        // No expression and a bare `*` both count every key.
+        assert_eq!(count(&[]), keys);
+        assert_eq!(count(&["*"]), keys);
+        // A tag both routes select counts in both rows; the repeated key
+        // expression counts once.
+        let both: Counts = [(key("k"), 9), (pair("k", "v"), 7)].into_iter().collect();
+        assert_eq!(count(&["k", "k=v", "k"]), both);
     }
 
-    /// Pairs spread over many shards merge to the same totals from any
-    /// rotation, and a pair seen in two blobs adds up.
+    /// Rows spread over many shards merge to the same totals from any
+    /// rotation, and a row seen in two blobs adds up: 600 pairs of one key,
+    /// and 600 keys.
     #[test]
     fn counts_add_across_blobs_and_shards() {
         let host = crate::host::Host::entered_for_tests();
         let words: Vec<String> = (0..600).map(|i| format!("w{i}")).collect();
         let mut strings: Vec<&str> = vec![""];
         strings.extend(words.iter().map(String::as_str));
-        let tags: Vec<(u64, u64)> = (1..=600).map(|i| (1, i)).collect();
-        let bytes = block(
-            &strings,
-            &[Group {
-                nodes: vec![plain_node(1, 0, 0, &tags, None)],
-                ..Group::default()
-            }],
+        let run = |tags: &[(u64, u64)], selection: &Selection| {
+            let bytes = block(
+                &strings,
+                &[Group {
+                    nodes: vec![plain_node(1, 0, 0, tags, None)],
+                    ..Group::default()
+                }],
+            );
+            let table = CountTable::new();
+            for seed in [0, 5] {
+                let (mut st, mut gr) = (Vec::new(), Vec::new());
+                let buffer = crate::read::block::BlockBuffer::new(
+                    bytes.clone(),
+                    None,
+                    &mut st,
+                    &mut gr,
+                    None,
+                );
+                BlobTally::new(seed)
+                    .add_blob(
+                        buffer,
+                        TypeFilter::all(),
+                        selection,
+                        &table,
+                        &host.invocation,
+                    )
+                    .unwrap();
+            }
+            table.into_counts(|_| true, &host.invocation).unwrap()
+        };
+
+        let star = parse_expressions(&["*=*".to_owned()]).unwrap();
+        let one_key: Vec<(u64, u64)> = (1..=600).map(|i| (1, i)).collect();
+        let (got, stats) = run(&one_key, &Selection::new(Some(&star)));
+        assert_eq!(got.len(), 600);
+        assert_eq!(
+            (stats.key_rows, stats.pair_rows, stats.retained_rows),
+            (0, 600, 600)
         );
-        let table = CountTable::new();
-        for seed in [0, 5] {
-            let (mut st, mut gr) = (Vec::new(), Vec::new());
-            let buffer =
-                crate::read::block::BlockBuffer::new(bytes.clone(), None, &mut st, &mut gr, None);
-            BlobTally::new(seed)
-                .add_blob(buffer, TypeFilter::all(), None, &table, &host.invocation)
-                .unwrap();
-        }
-        let (rows, stats) = table.into_counts(|_| true, &host.invocation).unwrap();
-        assert_eq!(rows.len(), 600);
-        assert_eq!((stats.distinct_pairs, stats.retained_pairs), (600, 600));
-        assert!(rows.iter().all(|r| r.key == "w0" && r.count == 2));
-        let values: std::collections::BTreeSet<&str> =
-            rows.iter().map(|r| r.value.as_str()).collect();
+        assert!(got.iter().all(|r| r.key == "w0" && r.count == 2));
+        let values: std::collections::BTreeSet<Option<&str>> =
+            got.iter().map(|r| r.value.as_deref()).collect();
         assert_eq!(values.len(), 600);
+        assert!(!values.contains(&None));
+
+        let many_keys: Vec<(u64, u64)> = (1..=600).map(|i| (i, 0)).collect();
+        let (got, stats) = run(&many_keys, &Selection::new(None));
+        assert_eq!(
+            (stats.key_rows, stats.pair_rows, stats.retained_rows),
+            (600, 0, 600)
+        );
+        assert!(got.iter().all(|r| r.value.is_none() && r.count == 2));
+        let keys: std::collections::BTreeSet<&str> = got.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys.len(), 600);
     }
 }

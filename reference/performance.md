@@ -3490,6 +3490,45 @@ key's bytes with every pair in one doubling vector per shard: 14.0 GB peak,
 of which 1.86 GB was repeated key bytes and 2.7 GB the vectors' unfilled
 reserve, at the same wall.
 
+The figures above are a bare run counting every key=value pair, which is
+what a bare `inspect tags` did until the change below; that workload is now
+`inspect tags '*=*'`.
+
+## inspect tags counts keys as osmium does (bygg, 2026-11-03, against `719ccf92`)
+
+A bare `inspect tags` and an expression without `=` now count keys, one row
+per key, as `osmium tags-count` does; an expression with `=` counts pairs.
+brokkr's `inspect --tags` cells pass no expression, so the same brokkr
+argv measures pair counting on cells up to `719ccf92` and key counting after
+it. Planet `planet-20260223-with-indexdata`, default `-j`, both arms built in
+the main tree.
+
+Bare run (brokkr `inspect --tags --bench 1`, `--min-count 999999999`):
+
+| Arm | Wall | Peak anon | Distinct rows |
+|---|---:|---:|---:|
+| HEAD, pairs (stored `97bd775a`) | 41.35 s | 10.26 GB | 187.4 M pairs |
+| Change, keys (`--force`, unstored) | 29.97 s | 0.40 GB | 107,879 keys |
+
+The key run tallies each blob per (kind, key index) instead of per (kind,
+key index, value index) and holds 3.3 MB of table: its scan took 23.0 s at
+21.7 cores against HEAD's 33.6 s at 22.3. The HEAD cell's scan read part of
+the planet from disk (326 K major faults), so its wall is above the 36 s the
+same code measured on 2026-11-02; the pair figures below are the matched
+comparison.
+
+Pair counting (HEAD bare against the change's `'*=*'`, the same 187.4 M
+pairs; `brokkr run --release`, wall from `brokkr history`, order change,
+HEAD, HEAD, change): HEAD 36.5 s and 36.5 s, change 36.9 s and 37.7 s. The
+2 % median difference is inside the noise band; the change adds one
+expression test per distinct pair per blob (`*=*`) and a wider pending
+entry.
+
+A bare run with the default `--min-count 1` now builds about 108 K rows at
+planet instead of 187 M, so the row build and serial sort that were never
+measured for the pair default are no longer a bare run's concern; `'*=*'`
+with the default thresholds still builds every pair as a row.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

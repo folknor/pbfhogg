@@ -752,26 +752,39 @@ deviate deliberately.
 `inspect tags` and `tags-count` deliberately reuse the full tags-filter
 expression parser, including its `n/`, `w/` and `r/` element-type prefixes.
 Thus `w/highway` counts only `highway` tags on ways, subject to any additional
-`--type` filter. Osmium's `tags-count` `add_matcher` sends the entire expression
-to its tag matcher and has no type-prefix syntax; there, `w/highway` is treated
-as a tag-key pattern. Use `--type way` for the equivalent kind restriction in
-osmium. The pbfhogg parser is shared from `src/tag_expr.rs` by
-`src/commands/tags_count/mod.rs`; the behavior is described in the CLI
-reference.
+`--type` filter. Osmium's `tags-count` `add_matcher` hands the entire
+expression to `get_tag_matcher` and has no type-prefix syntax; there,
+`w/highway` is treated as a tag-key pattern. Use `--type way` for the
+equivalent kind restriction in osmium. The pbfhogg parser is shared from
+`src/tag_expr.rs` by `src/commands/tags_count/mod.rs`; the behavior is
+described in the CLI reference.
 
-**`inspect tags` always counts key=value pairs.** Osmium's `tags-count`
-keeps two filters (`research/osmium-tool/src/command_tags_count.cpp`):
-`add_matcher` sends an expression with a value matcher to the tag filter,
-which counts key=value pairs, and a key-only expression to the key filter,
-which counts the key alone; with no expression at all it sets the key
-filter to match everything, so a bare `osmium tags-count` lists keys, not
-pairs. pbfhogg counts the key=value pairs the expression selects in every
-case, so a bare `inspect tags` lists every pair and `inspect tags highway`
-lists each `highway=*` value with its count where osmium prints one
-`highway` row. Each pbfhogg row is three tab-separated fields (count, key,
-value, the text fields quoted and escaped as the CLI reference describes),
-so osmium's key-only rows have no equivalent output here; summing a key's
-rows gives osmium's count.
+`inspect tags` otherwise counts what osmium's `tags-count` counts, by its two
+filters (`research/osmium-tool/src/command_tags_count.cpp`): no expression and
+an expression without `=` count keys, an expression with `=` (`key=*`
+included) counts key=value pairs, and a tag both select counts in both rows.
+The rows differ from osmium's in three places:
+
+- **Quoting.** Osmium wraps the key and value in double quotes and doubles
+  any quote inside, escaping nothing else, so a tab or newline in the text
+  breaks its row framing. pbfhogg writes each as a JSON string literal
+  (backslash escapes, the CLI reference has the rules), so a row always
+  splits on tabs into two or three fields. The counts and the row order are
+  osmium's; a byte comparison of the two outputs differs only on text holding
+  a quote, a backslash or a control character.
+- **`-e` with no positional expression.** Osmium decides "no expression" from
+  the positional arguments alone, before it reads the `-e` file, so
+  `osmium tags-count in.pbf -e file` counts every key and the file's
+  expressions on top. pbfhogg treats the file's expressions and the
+  positional ones as one list and counts every key only when that list is
+  empty (an empty or comments-only file with no positional expression
+  included), so `-e file` alone counts what the file names, as the same
+  expressions typed on the command line would.
+- **Keys holding a NUL byte.** Osmium names a key row `key` and a pair row
+  `key` NUL `value` and sorts by those strings; pbfhogg sorts by key, then
+  value, a key row first. The two orders agree for every key without a NUL
+  byte (osmium cannot hold one, as its strings are NUL-terminated); with one,
+  osmium's rows are ambiguous and pbfhogg's are not.
 
 **An empty key is an error, not an empty-string match.** `get_string_matcher`
 returns `equal{""}` for an empty key, so osmium accepts `=value` and matches

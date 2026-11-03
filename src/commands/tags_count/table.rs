@@ -1,16 +1,23 @@
-//! The run's tag counts: one table of distinct (key, value) pairs split into
-//! shards by pair hash, each behind its own mutex, so every decode worker
-//! merges its own blob's counts and no single thread serialises the merge.
+//! The run's tag counts: one table of distinct rows, key rows and (key,
+//! value) pair rows, split into shards by row hash, each behind its own
+//! mutex, so every decode worker merges its own blob's counts and no single
+//! thread serialises the merge.
 //!
 //! A shard stores its strings in a [`ChunkArena`] (fixed-size byte chunks,
 //! so growth never copies and never reserves double) and each distinct pair
 //! as one fixed-size [`Entry`] in a `hashbrown::HashTable`: no allocation per
 //! pair, no `String` header per value, nothing to free per pair when the run
 //! ends. Keys are interned per shard: a key's bytes are stored once in each
-//! shard holding a pair of it, and an entry names its key by slot. The slot is
-//! only a storage reference; pairs are hashed and compared by their bytes, so
-//! equal keys in different shards (with unrelated slots) and equal strings at
-//! different string table indices count as one text.
+//! shard holding a pair of it or its key row, and an entry names its key by
+//! slot. The slot is only a storage reference; rows are hashed and compared
+//! by their bytes, so equal keys in different shards (with unrelated slots)
+//! and equal strings at different string table indices count as one text.
+//!
+//! A key row is the count beside its key's slot, in the one shard its
+//! [`key_hash`] selects. Interning a key for a pair stores it with a zero
+//! count, which is no row; only [`Shard::add_key`] makes the count nonzero,
+//! so a key row lives in exactly one shard while its key may be interned in
+//! many.
 
 use std::hash::BuildHasher as _;
 use std::sync::{Mutex, MutexGuard};
@@ -30,8 +37,9 @@ pub(super) fn pair_hash(key: &[u8], value: &[u8]) -> u64 {
     FxBuildHasher.hash_one((key, value))
 }
 
-/// The hash of a key alone, for a shard's key index.
-fn key_hash(key: &[u8]) -> u64 {
+/// The hash of a key alone, for a shard's key index and for the shard of a
+/// key row.
+pub(super) fn key_hash(key: &[u8]) -> u64 {
     FxBuildHasher.hash_one(key)
 }
 
@@ -119,6 +127,9 @@ pub(super) struct Shard {
     arena: ChunkArena,
     /// Every interned key's place, by slot.
     keys: Vec<Place>,
+    /// The key row's count, by slot, beside `keys`: zero for a key interned
+    /// only for its pairs, which is no row.
+    key_counts: Vec<u64>,
     /// Slots of `keys`, keyed by the bytes they address.
     key_index: HashTable<u32>,
     entries: HashTable<Entry>,
@@ -129,12 +140,13 @@ impl Shard {
         self.arena.get(self.keys[slot as usize])
     }
 
-    /// The slot of `key`, interning it on first sight.
-    fn intern(&mut self, key: &[u8]) -> Result<u32> {
-        let hash = key_hash(key);
+    /// The slot of `key`, whose [`key_hash`] is `hash`, interning it with a
+    /// zero row count on first sight.
+    fn intern(&mut self, hash: u64, key: &[u8]) -> Result<u32> {
         let Shard {
             arena,
             keys,
+            key_counts,
             key_index,
             ..
         } = self;
@@ -143,9 +155,19 @@ impl Shard {
         }
         let slot = u32::try_from(keys.len()).map_err(|_| too_long())?;
         keys.push(arena.push(key)?);
+        key_counts.push(0);
         let (arena, keys) = (&*arena, &*keys);
         key_index.insert_unique(hash, slot, |&s| key_hash(arena.get(keys[s as usize])));
         Ok(slot)
+    }
+
+    /// Add `count` to the key row of `key`, whose [`key_hash`] is `hash`.
+    /// The caller has chosen this shard by that hash, so the row lives
+    /// nowhere else.
+    pub(super) fn add_key(&mut self, hash: u64, key: &str, count: u64) -> Result<()> {
+        let slot = self.intern(hash, key.as_bytes())?;
+        self.key_counts[slot as usize] += count;
+        Ok(())
     }
 
     /// Add `count` to the pair (`key`, `value`), whose [`pair_hash`] is
@@ -172,7 +194,7 @@ impl Shard {
         // Key slot and value bytes exist before the entry does, so a rehash
         // on growth can resolve every entry, this one included.
         let entry = Entry {
-            key: self.intern(key)?,
+            key: self.intern(key_hash(key), key)?,
             value: self.arena.push(value)?,
             count,
         };
@@ -217,7 +239,8 @@ impl CountTable {
         self.shards.len()
     }
 
-    /// The shard of a pair with hash `hash`: the top bits of a multiplicative
+    /// The shard of a row with hash `hash` (a pair's [`pair_hash`], a key
+    /// row's [`key_hash`]): the top bits of a multiplicative
     /// mix of the whole hash (the 64-bit golden-ratio constant, odd and with
     /// its bits spread). A plain slice of `hash` would pin, within each shard,
     /// the bits hashbrown reads for the bucket index (low) or the control
@@ -240,14 +263,16 @@ impl CountTable {
             .map_err(|_| poisoned())
     }
 
-    /// Every pair whose count `keep` admits, as owned rows, unsorted, with
-    /// the run's figures: every distinct pair the table holds and how many
-    /// `keep` admitted. A pair lives in exactly one shard (shards split by
-    /// pair hash, pairs compare by bytes), so the sum of the shards' entries
-    /// is the exact distinct count. Retained rows are counted before the
-    /// result is reserved, so a threshold that keeps few rows reserves few;
-    /// each shard is freed once read, so the rows never coexist with the
-    /// whole table. Cancellation is checked per shard.
+    /// Every row whose count `keep` admits, as owned rows, unsorted, with
+    /// the run's figures: every distinct key row and pair row the table
+    /// holds and how many `keep` admitted. A row lives in exactly one shard
+    /// (shards split by row hash, rows compare by bytes), so the sum over the
+    /// shards is the exact distinct count. A key slot with a zero count is
+    /// storage for pairs, never a row, whatever `keep` says of zero.
+    /// Retained rows are counted before the result is reserved, so a
+    /// threshold that keeps few rows reserves few; each shard is freed once
+    /// read, so the rows never coexist with the whole table. Cancellation is
+    /// checked per shard.
     pub(super) fn into_counts(
         self,
         keep: impl Fn(u64) -> bool,
@@ -259,12 +284,14 @@ impl CountTable {
             .map(|shard| shard.into_inner().map_err(|_| poisoned()))
             .collect::<Result<Vec<Shard>>>()?;
         // What the table holds at its peak, for attributing the run's memory:
-        // distinct pairs and interned keys (one per shard holding the key),
-        // arena bytes stored and reserved, and the two hash tables' own
-        // allocations.
+        // distinct pairs and key rows, interned keys (one per shard holding
+        // the key), arena bytes stored and reserved, and the hash tables' and
+        // slot vectors' own allocations.
         let sum = |f: fn(&Shard) -> usize| shards.iter().map(f).sum::<usize>();
-        let distinct_pairs = sum(|s| s.entries.len());
-        cancel.counter("tags_count_distinct_pairs", distinct_pairs);
+        let pair_rows = sum(|s| s.entries.len());
+        let key_rows = sum(|s| s.key_counts.iter().filter(|&&c| c > 0).count());
+        cancel.counter("tags_count_distinct_pairs", pair_rows);
+        cancel.counter("tags_count_distinct_keys", key_rows);
         cancel.counter("tags_count_interned_keys", sum(|s| s.keys.len()));
         cancel.counter("tags_count_arena_len_bytes", sum(|s| s.arena.len()));
         cancel.counter("tags_count_arena_bytes", sum(|s| s.arena.capacity()));
@@ -274,12 +301,20 @@ impl CountTable {
                 s.entries.allocation_size()
                     + s.key_index.allocation_size()
                     + s.keys.capacity() * size_of::<Place>()
+                    + s.key_counts.capacity() * size_of::<u64>()
             }),
         );
+        // A key row is a nonzero slot count; a zero one is pair storage.
+        let key_row_kept = |count: u64| count > 0 && keep(count);
         let mut retained = 0_usize;
         for shard in &shards {
             cancel.check()?;
-            retained += shard.entries.iter().filter(|e| keep(e.count)).count();
+            retained += shard.entries.iter().filter(|e| keep(e.count)).count()
+                + shard
+                    .key_counts
+                    .iter()
+                    .filter(|&&c| key_row_kept(c))
+                    .count();
         }
         let text = |bytes: &[u8]| -> Result<String> {
             std::str::from_utf8(bytes)
@@ -289,17 +324,27 @@ impl CountTable {
         let mut rows = Vec::with_capacity(retained);
         for shard in shards {
             cancel.check()?;
+            for (&place, &count) in shard.keys.iter().zip(&shard.key_counts) {
+                if key_row_kept(count) {
+                    rows.push(TagCount {
+                        key: text(shard.arena.get(place))?,
+                        value: None,
+                        count,
+                    });
+                }
+            }
             for &entry in shard.entries.iter().filter(|e| keep(e.count)) {
                 rows.push(TagCount {
                     key: text(shard.key(entry.key))?,
-                    value: text(shard.arena.get(entry.value))?,
+                    value: Some(text(shard.arena.get(entry.value))?),
                     count: entry.count,
                 });
             }
         }
         let stats = TagCountStats {
-            distinct_pairs: distinct_pairs as u64,
-            retained_pairs: retained as u64,
+            key_rows: key_rows as u64,
+            pair_rows: pair_rows as u64,
+            retained_rows: retained as u64,
         };
         Ok((rows, stats))
     }
@@ -308,7 +353,7 @@ impl CountTable {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ChunkArena, Shard, pair_hash};
+    use super::{ChunkArena, CountTable, Shard, key_hash, pair_hash};
     use crate::tunables::TAGS_COUNT_ARENA_CHUNK_BYTES;
 
     /// An outsized string gets a chunk of its own and the current chunk
@@ -360,5 +405,69 @@ mod tests {
         shard.add(pair_hash(b"ab", b"c"), "ab", "c", 1).unwrap();
         shard.add(pair_hash(b"a", b"bc"), "a", "bc", 1).unwrap();
         assert_eq!(shard.entries.len(), pairs.len() + 2);
+        // Every key interned for pairs only carries no row.
+        assert_eq!(shard.keys.len(), shard.key_counts.len());
+        assert!(shard.key_counts.iter().all(|&c| c == 0));
+    }
+
+    /// A key row is the count beside its interned key: adding to a key a
+    /// pair already interned reuses the slot, and pairs never move it.
+    #[test]
+    fn key_rows_share_the_slot_their_pairs_intern() {
+        let mut shard = Shard::default();
+        shard.add(pair_hash(b"k", b"v"), "k", "v", 4).unwrap();
+        shard.add_key(key_hash(b"k"), "k", 2).unwrap();
+        shard.add_key(key_hash(b"k"), "k", 3).unwrap();
+        shard.add_key(key_hash(b"j"), "j", 1).unwrap();
+        shard.add(pair_hash(b"j", b""), "j", "", 7).unwrap();
+        assert_eq!(shard.keys.len(), 2);
+        assert_eq!(shard.key_counts, vec![5, 1]);
+        assert_eq!(shard.entries.len(), 2);
+    }
+
+    /// The drain emits key rows as `None` and pairs as `Some`, an empty
+    /// value as `Some("")`, and never a zero-count slot, even when the
+    /// threshold admits zero.
+    #[test]
+    fn drain_tells_key_rows_from_pairs_and_skips_storage_slots() {
+        let host = crate::host::Host::entered_for_tests();
+        let table = CountTable::new();
+        let pair = |k: &str, v: &str, n| {
+            let hash = pair_hash(k.as_bytes(), v.as_bytes());
+            table
+                .lock(CountTable::shard_of(hash))
+                .unwrap()
+                .add(hash, k, v, n)
+                .unwrap();
+        };
+        pair("a", "x", 2);
+        pair("a", "", 1);
+        pair("b", "y", 1);
+        let hash = key_hash(b"a");
+        table
+            .lock(CountTable::shard_of(hash))
+            .unwrap()
+            .add_key(hash, "a", 3)
+            .unwrap();
+        let (rows, stats) = table.into_counts(|_| true, &host.invocation).unwrap();
+        let mut got: Vec<_> = rows
+            .into_iter()
+            .map(|r| (r.key, r.value, r.count))
+            .collect();
+        got.sort();
+        let row = |k: &str, v: Option<&str>, n| (k.to_owned(), v.map(str::to_owned), n);
+        assert_eq!(
+            got,
+            vec![
+                row("a", None, 3),
+                row("a", Some(""), 1),
+                row("a", Some("x"), 2),
+                row("b", Some("y"), 1),
+            ]
+        );
+        assert_eq!(
+            (stats.key_rows, stats.pair_rows, stats.retained_rows),
+            (1, 3, 4)
+        );
     }
 }

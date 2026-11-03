@@ -326,7 +326,7 @@ fn quiet_inspect_indexed_refuses_json() {
 
 /// A report on stdout is the command's output, not a summary: `-q` leaves it
 /// byte-identical and silences only stderr (`inspect tags`' closing summary
-/// of distinct pairs counted included).
+/// of the rows counted included).
 #[test]
 fn a_quiet_run_leaves_a_stdout_report_alone() {
     let fx = Fx::new();
@@ -342,9 +342,7 @@ fn a_quiet_run_leaves_a_stdout_report_alone() {
         assert!(!plain.stdout.is_empty(), "{words:?} printed no report");
         if words[1] == "tags" {
             assert!(
-                plain
-                    .stderr_str()
-                    .contains("distinct key/value pairs counted"),
+                plain.stderr_str().contains("key/value rows counted"),
                 "{words:?} without -q must print its summary; stderr:\n{}",
                 plain.stderr_str()
             );

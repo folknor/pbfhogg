@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+This release makes pbfhogg safe to embed as a library and strict about its
+input. Commands refuse files they would otherwise answer wrongly about,
+outputs are never left partial, and the library no longer touches process
+state.
+
 ### Breaking
 
 **CLI**
@@ -19,6 +24,15 @@
   expressions name every element type (`highway`): it no longer refuses
   unindexed input there, and refuses `--force`. A script passing `--force`
   to such a command line drops it.
+- `inspect tags` counts what `osmium tags-count` counts. With no expression,
+  or for an expression without `=` (`highway`), it counts keys: one row per
+  key, two fields (`120`, TAB, `"highway"`), its occurrences whatever their
+  values. An expression with `=` (`highway=*`, `highway=primary`) counts
+  key=value pairs in three-field rows as before, and a tag matched both ways
+  counts in both rows. A plain `inspect tags` used to list every pair and
+  `inspect tags highway` every `highway` value: pass `'*=*'` and
+  `'highway=*'` for those. A bare planet run now takes 30 s and 0.4 GB peak
+  memory instead of 36 to 41 s and 10.3 GB.
 - `check` refuses an explicit `--max-errors` (exit `64`) under `--refs`
   alone without `--show-ids`, where the ref check retains no details and
   no other check is selected, instead of accepting it unused. The default
@@ -104,10 +118,13 @@
 - `tags_filter::osc::tags_filter_osc` takes a `Parallelism` after the
   expressions: `Fixed(n)` runs the filtering workers on a pool of `n`
   threads built for the call, `Auto` on `Host::executor` as before.
-- `tags_count::tags_count` returns `TagCounts { rows, stats }` instead of
-  the bare rows: `stats` is a `TagCountStats` with `distinct_pairs` (every
-  selected pair, before the count thresholds), `retained_pairs` (those the
-  thresholds kept) and `write_summary`.
+- `tags_count::tags_count` counts keys or pairs as `inspect tags` does,
+  and returns `TagCounts { rows, stats }` instead of the bare rows.
+  `TagCount::value` is an `Option<String>`: `None` for a key row,
+  `Some("")` for a pair with the empty value. `stats` is a `TagCountStats`
+  with `key_rows` and `pair_rows` (the distinct rows of each kind selected,
+  before the count thresholds), `retained_rows` (those the thresholds kept)
+  and `write_summary`.
 - Settings that mean something in one mode only now live inside that
   mode, so a combination that used to be refused or ignored at run time
   cannot be written:
@@ -171,11 +188,11 @@
   indexdata; proceeding without its optimizations`.
 - `getid --add-referenced` skips way blobs when no way ID is requested; it
   decoded every way blob before.
-- `inspect tags` ends with `D distinct key/value pairs counted, K passed
-  the count thresholds` on stderr in place of `N distinct tag values`,
-  whose number was the rows printed, not distinct values: with
-  `--min-count` or `--max-count` narrowing the rows, the distinct-pair
-  count was not shown at all.
+- `inspect tags` ends with `K key rows and P key/value rows counted, R
+  passed the count thresholds` on stderr in place of `N distinct tag
+  values`, whose number was the rows printed, not distinct values: with
+  `--min-count` or `--max-count` narrowing the rows, the distinct count was
+  not shown at all.
 - The CLI no longer caps glibc at two malloc arenas or pins
   `M_MMAP_THRESHOLD`. The cap made every worker's larger allocations
   queue on two locks. On planet, `build-geocode-index` went from 320 s to
@@ -207,9 +224,10 @@
   26 s to 22.4 s, with the same refusals and slightly lower peak memory.
 - `inspect tags` counts on every worker thread instead of merging every
   blob's counts on one, and keeps its strings in compact shared storage
-  instead of one allocation per value. On planet it went from 99 s and
-  17.6 GB peak memory to 36 s and 10.8 GB, with the same output and the
-  same refusals. The count thresholds still apply only after the whole
+  instead of one allocation per value. On planet, counting every pair
+  (what a plain run did, now `'*=*'`) went from 99 s and 17.6 GB peak
+  memory to 36 s and 10.8 GB, with the same output and the same refusals.
+  The count thresholds still apply only after the whole
   file is counted, so they do not bound memory.
 - `check --ids` and `check --refs` read a wholly unindexed input once,
   not once per element kind, with the same reports. `check --refs` reads
@@ -305,12 +323,6 @@
   blob, for one) made a debug build of the CLI or of a library consumer
   panic in place of reporting that error. Dropping a builder is cleanup;
   a refusal is reported by `take()` / `take_owned()` only.
-
-## 0.6.0 - 2026-10-30
-
-0.6.0 makes pbfhogg safe to embed as a library and strict about its input.
-Commands refuse files they would otherwise answer wrongly about, outputs are
-never left partial, and the library no longer touches process state.
 
 ### Breaking
 

@@ -61,36 +61,49 @@ impl Route {
     };
 }
 
-/// `(key, value, count)`, sorted by name.
-type Counts = Vec<(String, String, u64)>;
+/// `(key, value, count)`, sorted by name; `None` is a key row.
+type Counts = Vec<(String, Option<String>, u64)>;
+
+/// One fixture's three tags: `(key, value)` on the first 50 nodes, on the
+/// last 50, and on the ways.
+type Tags = [(&'static str, &'static str); 3];
 
 /// Nodes 1..=100, 25 per blob: the first half `amenity=cafe`, the second
 /// `shop=bakery`; five ways `highway=primary`.
+const INPUT: Tags = [
+    ("amenity", "cafe"),
+    ("shop", "bakery"),
+    ("highway", "primary"),
+];
+
+/// The same layout with other keys and values: a run that read any blob of
+/// it would count different rows on every route that counts any, key rows
+/// included. `craft` stays absent from both.
+const REPLACEMENT: Tags = [
+    ("leisure", "pub"),
+    ("office", "butcher"),
+    ("railway", "rail"),
+];
+
 fn write_input(path: &Path, route: Route) {
-    write_fixture(path, route.unindexed, ("cafe", "bakery", "primary"));
+    write_fixture(path, route.unindexed, INPUT);
 }
 
-/// The same layout with other values: a run that read any of it would
-/// count different pairs.
 fn write_replacement(path: &Path) {
-    write_fixture(path, false, ("pub", "butcher", "residential"));
+    write_fixture(path, false, REPLACEMENT);
 }
 
-fn write_fixture(path: &Path, unindexed: bool, values: (&'static str, &'static str, &'static str)) {
-    let (amenity, shop, highway) = values;
+fn write_fixture(path: &Path, unindexed: bool, tags: Tags) {
+    let [first, second, way] = tags;
     let mut nodes = generate_nodes(100, 1);
     for (i, node) in nodes.iter_mut().enumerate() {
-        node.tags = if i < 50 {
-            vec![("amenity", amenity)]
-        } else {
-            vec![("shop", shop)]
-        };
+        node.tags = if i < 50 { vec![first] } else { vec![second] };
     }
     let ways: Vec<TestWay> = (0..5_i64)
         .map(|k| TestWay {
             id: 1_000 + k,
             refs: vec![k + 1, k + 2, k + 3],
-            tags: vec![("highway", highway)],
+            tags: vec![way],
             meta: None,
         })
         .collect();
@@ -136,19 +149,44 @@ fn run<'a>(
         .collect())
 }
 
-/// What the unreplaced run of `route` counts, from the fixture's
+/// What a run of `route` counts on a fixture with `tags`, from its
 /// construction.
+fn counted(route: Route, tags: Tags) -> Counts {
+    let [first, second, way] = tags;
+    let key = |(k, _): (&str, &str), n: u64| (k.to_string(), None, n);
+    let pair = |(k, v): (&str, &str), n: u64| (k.to_string(), Some(v.to_string()), n);
+    let mut counts = match route.filter {
+        Filter::None => vec![key(first, 50), key(second, 50), key(way, 5)],
+        Filter::Ways => vec![key(way, 5)],
+        // `amenity=*`, which only the input carries.
+        Filter::Amenity if first.0 == "amenity" => vec![pair(first, 50)],
+        Filter::Amenity | Filter::Absent => Vec::new(),
+    };
+    counts.sort();
+    counts
+}
+
+/// What the unreplaced run of `route` counts.
 fn expected(route: Route) -> Counts {
-    let pair = |k: &str, v: &str, n: u64| (k.to_string(), v.to_string(), n);
-    match route.filter {
-        Filter::None => vec![
-            pair("amenity", "cafe", 50),
-            pair("highway", "primary", 5),
-            pair("shop", "bakery", 50),
-        ],
-        Filter::Ways => vec![pair("highway", "primary", 5)],
-        Filter::Amenity => vec![pair("amenity", "cafe", 50)],
-        Filter::Absent => Vec::new(),
+    counted(route, INPUT)
+}
+
+/// The fixtures are told apart by every route that counts anything: a run
+/// that read the replacement could not pass for one that read the input.
+#[test]
+fn the_replacement_counts_differently_on_every_counting_route() {
+    let dir = crate::common::test_scratch();
+    let replacement = dir.path().join("replacement.osm.pbf");
+    write_replacement(&replacement);
+    let host = crate::common::test_host();
+    for filter in [Filter::None, Filter::Ways, Filter::Amenity] {
+        let route = Route {
+            filter,
+            ..Route::PLAIN
+        };
+        let got = run(route, &replacement, &host).expect("count the replacement");
+        assert_eq!(got, counted(route, REPLACEMENT), "{filter:?}");
+        assert_ne!(got, expected(route), "{filter:?}");
     }
 }
 
@@ -310,7 +348,7 @@ fn a_forced_unindexed_input_reads_only_the_pinned_input() {
 fn an_unindexed_input_is_refused_only_where_indexdata_would_skip_blobs() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
-    write_fixture(&input, true, ("cafe", "bakery", "primary"));
+    write_fixture(&input, true, INPUT);
     let host = crate::common::test_host();
     for filter in [Filter::None, Filter::Amenity, Filter::Absent] {
         let route = Route {

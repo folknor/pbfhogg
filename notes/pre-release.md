@@ -25,7 +25,7 @@ The planet regressions found by the RAM pass below are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
 (apply-changes). The release itself still needs WRK-001, WRK-003 to WRK-005 and the
-maintainer's rulings in WRK-137 and WRK-146.
+maintainer's ruling in WRK-146.
 
 ---
 
@@ -83,31 +83,6 @@ actually gives, not an assumption:
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
   should give `check-index = "violations"`. Confirm each with one run first;
   brokkr#71 notes `--unsort` breaks ID order only on large enough inputs.
-
-### WRK-137: inspect tags adopts osmium's key-only rows
-
-Ruled by the maintainer 2026-11-03: adopt osmium's rule. No expression and
-a bare-key expression count keys (key-only rows); `key=*` and `key=value`
-count key=value pairs, so the value breakdown stays reachable. Ready to
-work: the row shape, the per-key tally or fold, the CHANGELOG entry and
-the three doc passages below. Background as it was written: osmium's `tags-count`
-(`research/osmium-tool/src/command_tags_count.cpp`) counts the key alone
-when an expression has no value matcher (`add_matcher` routes it to
-`m_keys_filter`), and with no expression at all it sets
-`m_keys_filter = osmium::TagsFilter{true}` and lists keys. pbfhogg's
-`inspect tags` always counts key=value pairs, three tab-separated fields
-per row: `inspect tags highway` prints one row per `highway` value where
-osmium prints one `highway` row.
-
-The docs now describe today's behaviour as a deliberate deviation
-(DEVIATIONS.md "inspect tags always counts key=value pairs", both
-osmium-parity pages), written 2026-11-02 without a ruling. Either confirm
-it, and this entry goes, or adopt osmium's key-only rows: a CLI output
-change (key-only rows need their own row shape, a two-field row or an
-empty value), a CHANGELOG entry, and those three doc passages rewritten.
-The counting engine (the sharded table landed in `befcab8e`) counts per
-key=value text; key-only rows would need a per-key tally beside it or a
-fold of each key's rows at output.
 
 ### WRK-146: Maintainer ruling on ADR-0005 and release-mode invariant panics
 
@@ -340,30 +315,6 @@ pass (`research/osmium-tool/src/command_getid.cpp`,
 narrower behaviour, but DEVIATIONS.md has no entry. Decide: implement the
 relation closure (a relation pass on the projection pools, then the way
 pass over the closed set) or record the deviation.
-
-### WRK-131: inspect tags with its default thresholds at planet is unmeasured
-
-WRK-137 was ruled for osmium's key-only rows (2026-11-03), so a bare run
-will list keys: delete this entry when WRK-137 lands. Low value on its own: a
-bare planet run prints about 187 M rows, gigabytes of text no realistic
-caller wants, and the 10.8 GB counting table is the same at any
-threshold, so only the row build and serial sort are unmeasured. If
-WRK-137 adopts osmium's key-only rows, a bare run lists keys and this
-entry goes; if it confirms key=value rows, decide then whether the
-default is worth a measurement.
-
-Every brokkr `inspect --tags` cell passes `--min-count 999999999`, so no
-measured run builds output rows. With the default `--min-count 1` every
-distinct pair becomes a row: at planet 187.4 M `TagCount`s (counter
-`tags_count_distinct_pairs`), each owning a key and a value `String`
-(`table::CountTable::into_counts` in `src/commands/tags_count/`), then one
-single-threaded `sort_by` over them and the formatter. The rows plus the
-table still held for the shards not yet drained may exceed a 30 GB host;
-the sort alone is a long serial tail. Measure a default-threshold planet
-run first (it needs a brokkr cell that does not pass `--min-count`). If it
-does not fit, the shape is to sort and print from the shards without
-owning the strings, which the public `Vec<TagCount>` return type rules
-out: a streaming or borrowed-row API.
 
 ### WRK-125: Sequential decode loops hand their only buffer to each block
 
@@ -709,6 +660,18 @@ per-chunk accounting across `Raw` / `RawChunks` (allocated
 capacity, not length), `CopyRange` (no bytes) and error slots, added on push
 and subtracted on pop in `deliver_in_order`; it is per blob on every
 pipelined writer, so it needs its own matched A/B.
+
+### WRK-168: The guide's inspect tags speedup row compares different counts
+
+`docs/guide/performance.md`, "CLI command benchmarks" (Denmark, commit
+`6fc1283`), lists `inspect tags --type way` at 0.4 s against osmium's
+0.59 s, a 1.5x speedup. At that commit a bare `inspect tags` counted every
+key=value pair while a bare `osmium tags-count` counts keys, so the row
+timed two different workloads. Since `inspect tags` counts keys as osmium
+does (found 2026-11-03 while landing that change), the two now count the
+same rows. Re-measure the row on equal workloads (bare against bare, or
+`'*=*'` against `'*=*'`) or drop it; the table's other rows share its
+commit and were not checked for the same issue.
 
 ---
 

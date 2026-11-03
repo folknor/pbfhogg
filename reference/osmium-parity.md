@@ -165,10 +165,13 @@ per-command shorts are long-only here and refuse naming the long flag:
 `--add-self`, `renumber -s` is `--start-id`, `extract -c` is `--config`,
 `cat -c` is `--clean`, and `fileinfo -e` (pbfhogg `inspect`) is `--extended`.
 
-The rows differ too: pbfhogg always counts key=value pairs, where osmium
-counts the key alone for an expression without a value matcher and lists
-keys when given no expression (DEVIATIONS.md, "inspect tags always counts
-key=value pairs").
+The rows are osmium's: no expression and an expression without `=` count
+keys, an expression with `=` counts key=value pairs, a tag both select counts
+in both rows, and the counts, thresholds and row order match. What differs is
+the quoting of the text (JSON string literals, where osmium doubles quotes),
+`-e FILE` with no positional expression (osmium adds every key; pbfhogg counts
+only the file's expressions), and the order of keys holding a NUL byte
+(DEVIATIONS.md, "tags-filter and inspect tags: expression-syntax edge cases").
 
 ### tags-filter-osc is now `tags-filter --input-kind osc`
 

@@ -42,8 +42,9 @@ Used by:
 
 `inspect tags` uses pread workers through `parallel_project_accumulate`,
 reading each blob through a projection on the block validator; every worker
-merges its blob's counts into one count table sharded by pair hash, a mutex
-per shard, so no single thread merges.
+merges its blob's counts into one count table sharded by row hash (a key
+row's key, a pair row's key and value), a mutex per shard, so no single
+thread merges.
 
 ### Ordered pread pool
 

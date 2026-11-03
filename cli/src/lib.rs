@@ -2385,14 +2385,14 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InspectCommand {
-    /// Count tag key=value frequencies
+    /// Count tag keys, or key=value pairs for expressions with =
     Tags {
         /// Input PBF file
         file: PathBuf,
-        /// Only show tags with at least this many occurrences
+        /// Only show rows with at least this many occurrences
         #[arg(long, default_value = "1")]
         min_count: u64,
-        /// Only show tags with at most this many occurrences
+        /// Only show rows with at most this many occurrences
         #[arg(short = 'M', long)]
         max_count: Option<u64>,
         /// Sort order: count-desc (default), count-asc, name-asc, name-desc
@@ -2401,7 +2401,7 @@ enum InspectCommand {
         /// Read tag expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
         expressions_file: Option<PathBuf>,
-        /// Tag filter expressions (e.g. "highway", "amenity", "w/building=yes")
+        /// Tag expressions: a key counts that key ("highway"), key=value or key=* counts pairs ("highway=*", "w/building=yes")
         expressions: Vec<String>,
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type", value_parser = parse_single_type)]
@@ -2541,7 +2541,10 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
 }
 
 /// Combine CLI positional expressions with expressions read from a file.
-/// CLI expressions come first, then file expressions (additive, matching osmium).
+/// CLI expressions come first, then file expressions (additive, matching
+/// osmium). One difference: osmium `tags-count` counts every key when no
+/// positional expression is given even if `-e` supplies some; `inspect tags`
+/// counts every key only when the combined list is empty (DEVIATIONS.md).
 fn combine_expressions(
     file: Option<&std::path::Path>,
     cli_args: &[String],
@@ -4043,14 +4046,18 @@ fn run_tags_count(
     let mut out = output::buffered();
     for entry in &results.rows {
         // Tab-separated, the key and value as JSON-compatible literals: a tab
-        // or newline in the text cannot break field or row framing.
-        writeln!(
-            out,
-            "{}\t{}\t{}",
-            entry.count,
-            Quoted(&entry.key),
-            Quoted(&entry.value)
-        )?;
+        // or newline in the text cannot break field or row framing. A key
+        // row has no value field, as in osmium.
+        match &entry.value {
+            Some(value) => writeln!(
+                out,
+                "{}\t{}\t{}",
+                entry.count,
+                Quoted(&entry.key),
+                Quoted(value)
+            )?,
+            None => writeln!(out, "{}\t{}", entry.count, Quoted(&entry.key))?,
+        }
     }
     out.flush()?;
 

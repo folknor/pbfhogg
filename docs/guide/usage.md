@@ -14,10 +14,11 @@ Check if a PBF has blob-level indexdata (exit code 0 = indexed, 1 = not):
 pbfhogg inspect --indexed denmark.osm.pbf
 ```
 
-Count tag key=value frequencies:
+Count tag keys, then the values of one key:
 
 ```sh
 pbfhogg inspect tags denmark.osm.pbf
+pbfhogg inspect tags denmark.osm.pbf 'highway=*'
 ```
 
 For extended analysis (timestamp range, data bbox, metadata coverage):

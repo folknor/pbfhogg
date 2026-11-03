@@ -91,8 +91,10 @@ Blobs it copies unchanged are not decoded and not checked.
 arrays through a projection on the block validator
 (`src/commands/tags_count/tally.rs`) and counts each element's tags by the
 same rule, up to the first pair whose key or value index lies past the
-table. Its unit tests hold its counts to the element walk's on every
-fixture and mutation, so the two cannot drift apart silently.
+table, for key rows (which still check the value index) as for pair rows.
+Its unit tests hold its counts to the element walk's on every fixture and
+mutation, under key, pair and mixed selections, so the two cannot drift
+apart silently.
 
 `validate_block` (`src/read/block.rs`) does not close the gap: it is a
 structural pass that checks array framing and parallel-array lengths without

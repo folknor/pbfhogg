@@ -1,4 +1,6 @@
-//! Count tag frequencies in a PBF file. Equivalent to `osmium tags-count`.
+//! Count tag frequencies in a PBF file. Equivalent to `osmium tags-count`:
+//! an expression without `=` (and a run with no expression at all) counts
+//! keys, one row per key; an expression with `=` counts key=value pairs.
 
 mod table;
 mod tally;
@@ -7,47 +9,108 @@ use super::require_indexdata;
 use crate::ElementKind;
 use crate::owned::TypeFilter;
 use crate::read::input::InputSource;
-use crate::tag_expr::{Expression, parse_expressions, tag_matches};
+use crate::tag_expr::{Expression, StringMatcher, TagMatcher, parse_expressions, tag_matches};
 
 use super::Result;
 
-/// A single tag count entry: key, value, count.
+/// One row of a [`tags_count`] run: a key with its count, or a key=value
+/// pair with its count.
 pub struct TagCount {
     pub key: String,
-    pub value: String,
+    /// `None` for a key row (an occurrence of the key with any value), the
+    /// value for a pair row. `Some("")` is a pair whose value is the empty
+    /// string, a different row from the key row.
+    pub value: Option<String>,
     pub count: u64,
 }
 
 /// What [`tags_count`] returns: the rows, sorted, and what the run counted.
 pub struct TagCounts {
-    /// The pairs that passed the count thresholds, in the requested order.
+    /// The rows that passed the count thresholds, in the requested order.
     pub rows: Vec<TagCount>,
     /// Figures of the completed run. They are fixed when the run ends, so
     /// they still hold after a caller drains or edits `rows`.
     pub stats: TagCountStats,
 }
 
-/// What one [`tags_count`] run counted.
+/// What one [`tags_count`] run counted. Each figure counts distinct rows the
+/// run selected (after the type filter and the expressions), not
+/// occurrences.
 pub struct TagCountStats {
-    /// Distinct key/value pairs the run selected and saw (after the type
-    /// filter and the expressions, before `min_count` and `max_count`): not
-    /// occurrences and not distinct keys.
-    pub distinct_pairs: u64,
-    /// Of `distinct_pairs`, how many passed `min_count` and `max_count`,
-    /// which is how many rows the run returned.
-    pub retained_pairs: u64,
+    /// Key rows, before `min_count` and `max_count`. A run whose
+    /// expressions all carry `=` counts none, whatever keys its pairs have.
+    pub key_rows: u64,
+    /// Key=value rows, before `min_count` and `max_count`.
+    pub pair_rows: u64,
+    /// Of both kinds together, how many passed `min_count` and
+    /// `max_count`, which is how many rows the run returned.
+    pub retained_rows: u64,
 }
 
 impl TagCountStats {
-    /// The closing summary line: both figures, always, in one shape. It
+    /// The closing summary line: all three figures, always, in one shape. It
     /// carries no `=`: a harness scraping `key=value` lines from stderr
     /// would otherwise read it as a metric.
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             w,
-            "{} distinct key/value pairs counted, {} passed the count thresholds",
-            self.distinct_pairs, self.retained_pairs,
+            "{} key rows and {} key/value rows counted, {} passed the count thresholds",
+            self.key_rows, self.pair_rows, self.retained_rows,
         )
+    }
+}
+
+/// Which tags a run counts, and as what: osmium's two filters. An
+/// expression without a value matcher (no `=`) selects keys, one with a
+/// value matcher (`=`, `!=`, including `key=*`) selects pairs, and a tag
+/// both select is counted in both rows. With no expression at all every key
+/// is counted, as osmium's `TagsFilter{true}`; that is the expression `*`,
+/// which is what a typed `*` parses to as well. Built only by
+/// [`Selection::new`], so the partition cannot be written inconsistently.
+pub(super) struct Selection {
+    keys: Vec<Expression>,
+    pairs: Vec<Expression>,
+}
+
+impl Selection {
+    /// The selection of a run's parsed expressions, `None` for none.
+    fn new(expressions: Option<&[Expression]>) -> Self {
+        let Some(expressions) = expressions.filter(|e| !e.is_empty()) else {
+            return Selection {
+                keys: vec![Expression {
+                    type_filter: TypeFilter::all(),
+                    matcher: TagMatcher {
+                        key: StringMatcher::Always,
+                        value: None,
+                        invert: false,
+                    },
+                }],
+                pairs: Vec::new(),
+            };
+        };
+        let (pairs, keys) = expressions
+            .iter()
+            .cloned()
+            .partition(|e| e.matcher.value.is_some());
+        Selection { keys, pairs }
+    }
+
+    /// Whether any pair is counted; without one, a blob is tallied per key.
+    pub(super) fn counts_pairs(&self) -> bool {
+        !self.pairs.is_empty()
+    }
+
+    /// Whether an occurrence of `key` on an element of `kind` counts in the
+    /// key's row.
+    pub(super) fn admits_key(&self, kind: ElementKind, key: &str) -> bool {
+        // A key expression has no value matcher, so the value is not read.
+        matches_expression(&self.keys, key, "", kind)
+    }
+
+    /// Whether the tag `key`=`value` on an element of `kind` counts in the
+    /// pair's row.
+    pub(super) fn admits_pair(&self, kind: ElementKind, key: &str, value: &str) -> bool {
+        matches_expression(&self.pairs, key, value, kind)
     }
 }
 
@@ -121,9 +184,11 @@ pub enum TagCountSort {
     CountDesc,
     /// Count ascending (least frequent first).
     CountAsc,
-    /// Key name ascending, then value ascending.
+    /// Key name ascending, then value ascending, a key row before the
+    /// key's pair rows.
     NameAsc,
-    /// Key name descending, then value descending.
+    /// Key name descending, then value descending, a key row after the
+    /// key's pair rows.
     NameDesc,
 }
 
@@ -141,32 +206,37 @@ pub struct TagCountOptions<'a> {
     pub parallelism: crate::host::Parallelism,
 }
 
-/// Count tag key=value frequencies in a PBF file.
+/// Count tag frequencies in a PBF file, by osmium `tags-count`'s rule: with
+/// no expression, every key is counted (one row per key); an expression
+/// without `=` counts the keys it matches; an expression with `=` (including
+/// `key=*`) counts the key=value pairs it matches. A tag matched both ways is
+/// counted in its key row and in its pair row. Expressions use the
+/// `tags-filter` syntax, `n/`, `w/` and `r/` type prefixes included.
 ///
 /// If `type_filter` is set, only count tags on elements of those types.
-/// Results are sorted by count descending,
-/// then by key, then by value. Entries below `min_count` are excluded. The
-/// returned [`TagCountStats`] says how many distinct pairs were counted and
-/// how many of them the thresholds kept.
-///
-/// If `expressions` is non-empty, only tags matching at least one
-/// expression are counted (same syntax as `tags-filter`).
+/// Results are sorted by count descending, then by key, then by value, a key
+/// row before the key's pair rows. Rows of either kind below `min_count` or
+/// above `max_count` are excluded. The returned [`TagCountStats`] says how
+/// many distinct rows of each kind were counted and how many the thresholds
+/// kept.
 ///
 /// Parallel workers via `parallel_project_accumulate`: each worker reads a
 /// blob through a validator projection (`tally`), counts its tags by string
-/// table index, and merges the blob's distinct pairs into one table shared by
-/// every worker, sharded by pair hash with a mutex per shard (`table`). No
+/// table index, and merges the blob's distinct rows into one table shared by
+/// every worker, sharded by row hash with a mutex per shard (`table`). No
 /// per-blob map crosses a channel and no single thread does the merging: a
 /// lone consumer merging per-blob maps was the whole wall at planet, with the
 /// workers parked behind it. Per-worker whole-file maps are not kept either
 /// (that shape held roughly the global cardinality once per worker).
-/// Transient per-worker storage is one blob's distinct index pairs.
+/// Transient per-worker storage is one blob's distinct index pairs (or keys,
+/// when no pair is counted).
 ///
 /// The table is not bounded independently of input: for D distinct selected
 /// key/value pairs whose value bytes total S, and K distinct keys of total
 /// length L, it needs O(D + S) for the pairs plus at most O(K + L) per shard
-/// for the keys (a key is interned once in each shard holding a pair of
-/// it), plus hash-table capacity overhead. `min_count` and `max_count` filter only after the
+/// for the keys (a key is interned once in each shard holding a pair or the
+/// row of it), plus hash-table capacity overhead. A run counting keys only
+/// holds no pairs. `min_count` and `max_count` filter only after the
 /// exact totals are known; neither limits the table. Early eviction can lose
 /// a later threshold crossing, and a sketch would change the exact-count
 /// contract. Use type/expression restrictions to reduce cardinality, rather
@@ -216,6 +286,7 @@ fn tags_count_inner(
     let pin = input.pin(host)?;
 
     let plan = Plan::new(opts.type_filter, expressions.as_deref());
+    let selection = Selection::new(expressions.as_deref());
 
     // Indexdata is demanded only where the run skips blobs on it. With no
     // single-kind filter and no kind-restricting expression the schedule
@@ -267,15 +338,7 @@ fn tags_count_inner(
         &schedule,
         thread_override,
         || tally::BlobTally::new(seeds.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-        |buffer, tally| {
-            tally.add_blob(
-                buffer,
-                plan.tf,
-                expressions.as_deref(),
-                &table,
-                &host.invocation,
-            )
-        },
+        |buffer, tally| tally.add_blob(buffer, plan.tf, &selection, &table, &host.invocation),
         drop,
         host,
     )?;
@@ -286,6 +349,10 @@ fn tags_count_inner(
         &host.invocation,
     )?;
 
+    // Names compare as (key, value) with a key row's `None` first, osmium's
+    // order (it compares `key` against `key NUL value`) for every key without
+    // a NUL byte. Rows are unique by name, so the name orders need no count
+    // tie-break; it is kept only to make the order total on its face.
     results.sort_by(|a, b| match opts.sort {
         TagCountSort::CountDesc => b
             .count

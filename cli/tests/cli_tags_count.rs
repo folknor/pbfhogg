@@ -86,7 +86,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     // above is two empty vectors agreeing.
     assert_eq!(
         with_index,
-        vec![("amenity".to_string(), "cafe".to_string(), 20)],
+        vec![("amenity".to_string(), Some("cafe".to_string()), 20)],
         "20 of the 60 nodes carry amenity=cafe"
     );
 
@@ -129,10 +129,11 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     );
 }
 
-/// The closing summary on stderr names both figures: every distinct pair
-/// counted, and how many passed `--min-count`, which are the rows on stdout.
+/// The closing summary on stderr names all three figures: the distinct key
+/// rows and key/value rows counted, and how many passed `--min-count`, which
+/// are the rows on stdout. A bare run counts keys; a key row is two fields.
 #[test]
-fn summary_counts_distinct_pairs_and_the_rows_that_passed() {
+fn summary_counts_distinct_rows_and_the_rows_that_passed() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("summary.osm.pbf");
     let mut nodes = generate_nodes(5, 1);
@@ -145,23 +146,36 @@ fn summary_counts_distinct_pairs_and_the_rows_that_passed() {
     }
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
-    let out = CliInvoker::new()
-        .arg("inspect")
-        .arg("tags")
-        .arg(&input)
-        .arg("--min-count")
-        .arg("3")
-        .assert_success();
-    assert_eq!(out.stdout_str(), "3\t\"amenity\"\t\"cafe\"\n");
+    let run = |extra: &[&str]| {
+        CliInvoker::new()
+            .arg("inspect")
+            .arg("tags")
+            .arg(&input)
+            .arg("--min-count")
+            .arg("3")
+            .args(extra)
+            .assert_success()
+    };
+    let out = run(&[]);
+    assert_eq!(out.stdout_str(), "3\t\"amenity\"\n");
     assert_eq!(
         out.stderr_str(),
-        "2 distinct key/value pairs counted, 1 passed the count thresholds\n"
+        "2 key rows and 0 key/value rows counted, 1 passed the count thresholds\n"
+    );
+    let out = run(&["amenity", "*=*"]);
+    assert_eq!(
+        out.stdout_str(),
+        "3\t\"amenity\"\n3\t\"amenity\"\t\"cafe\"\n"
+    );
+    assert_eq!(
+        out.stderr_str(),
+        "1 key rows and 2 key/value rows counted, 2 passed the count thresholds\n"
     );
 }
 
-/// Each `inspect tags` row is three tab-separated fields, the key and value
-/// as JSON-compatible literals: a tab or newline in the text stays inside
-/// its field and row.
+/// An `inspect tags` row's key and value are JSON-compatible literals: a tab
+/// or newline in the text stays inside its field and row. A pair row is
+/// three tab-separated fields, a key row two.
 #[test]
 fn rows_quote_and_escape_key_and_value() {
     let dir = crate::common::test_scratch();
@@ -171,11 +185,15 @@ fn rows_quote_and_escape_key_and_value() {
     nodes[1].tags = vec![("a\tb", "x\ny\"\\")];
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
-    let stdout = CliInvoker::new()
-        .arg("inspect")
-        .arg("tags")
-        .arg(&input)
-        .assert_success()
-        .stdout_str();
-    assert_eq!(stdout, "2\t\"a\\tb\"\t\"x\\ny\\\"\\\\\"\n");
+    let stdout = |extra: &[&str]| {
+        CliInvoker::new()
+            .arg("inspect")
+            .arg("tags")
+            .arg(&input)
+            .args(extra)
+            .assert_success()
+            .stdout_str()
+    };
+    assert_eq!(stdout(&["*=*"]), "2\t\"a\\tb\"\t\"x\\ny\\\"\\\\\"\n");
+    assert_eq!(stdout(&[]), "2\t\"a\\tb\"\n");
 }

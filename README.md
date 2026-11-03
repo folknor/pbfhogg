@@ -146,7 +146,7 @@ writer.flush()?;
 ```
 pbfhogg inspect <file>                    File inspection (blocks, ordering, counts)
 pbfhogg inspect --indexed <file>          Check if PBF has indexdata (exit code 0/1)
-pbfhogg inspect tags <file>               Tag key=value frequencies
+pbfhogg inspect tags <file>               Tag key frequencies (key=value with an expression)
 pbfhogg check <file> --ids                Validate ID uniqueness and ordering
 pbfhogg check <file> --refs               Validate referential integrity
 pbfhogg check <file> --locations          Validate inline way locations against node records

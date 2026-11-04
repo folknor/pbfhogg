@@ -1,8 +1,14 @@
 //! Interned string pool used by the builder.
+//!
+//! The pool is `strings.bin` as published: entries in the format's
+//! length-prefixed encoding (`format::read_pool_string`), so every value,
+//! one holding a NUL included, reads back whole from its offset.
 
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHasher};
+
+use super::super::format;
 
 pub(super) struct StringPool {
     overflowed: bool,
@@ -13,11 +19,6 @@ pub(super) struct StringPool {
     // Hash collisions are exceptional. Store extra offsets only for those
     // hashes and compare the bytes before reusing an offset.
     collisions: FxHashMap<u32, Vec<u32>>,
-    // Offsets of strings holding an interior NUL. The pool is NUL-terminated,
-    // so reading one back yields only its prefix; `read_whole` refuses them
-    // for a caller that must not act on a prefix. OSM XML cannot carry a NUL,
-    // so this is normally empty.
-    truncated: FxHashSet<u32>,
 }
 
 impl StringPool {
@@ -27,10 +28,9 @@ impl StringPool {
             data: Vec::new(),
             index: FxHashMap::default(),
             collisions: FxHashMap::default(),
-            truncated: FxHashSet::default(),
         };
-        // Offset 0 = empty string
-        pool.data.push(0);
+        // Offset 0 = empty string: the length-zero entry.
+        format::push_pool_string(&mut pool.data, "", 0);
         pool
     }
 
@@ -49,7 +49,7 @@ impl StringPool {
         }
         // Latch failure so merge callbacks can drain their bounded channels
         // without publishing a wrapped offset or allocating further strings.
-        let Some(offset) = pool_offset(self.data.len(), s.len()) else {
+        let Some((offset, len)) = pool_offset(self.data.len(), s.len()) else {
             self.overflowed = true;
             return 0;
         };
@@ -64,18 +64,8 @@ impl StringPool {
         } else {
             self.index.insert(hash, offset);
         }
-        if s.as_bytes().contains(&0) {
-            self.truncated.insert(offset);
-        }
-        self.data.extend_from_slice(s.as_bytes());
-        self.data.push(0);
+        format::push_pool_string(&mut self.data, s, len);
         offset
-    }
-
-    /// The string interned at `offset`, or None when it holds an interior
-    /// NUL and so reads back from the pool as a prefix of itself.
-    pub(super) fn read_whole(&self, offset: u32) -> Option<&str> {
-        (!self.truncated.contains(&offset)).then(|| read_string_from_pool(self, offset))
     }
 
     fn find_with_hash(&self, s: &str, hash: u64) -> Option<u32> {
@@ -90,18 +80,12 @@ impl StringPool {
             .find(|&offset| self.matches_at(offset, s))
     }
 
-    // Compare exactly `s.len()` bytes plus the terminator rather than scanning
-    // for the first NUL: no per-candidate scan, and a string with an interior
-    // NUL still deduplicates against its own earlier copy, as the previous
-    // owned-String keys did.
+    // The entry carries its own length, so equality is of whole values:
+    // interned offsets stay equal exactly when the strings are, which the
+    // interpolation resolver relies on. Raw bytes are compared; every entry
+    // was written from a `&str`, so no UTF-8 decode is needed per probe.
     fn matches_at(&self, offset: u32, s: &str) -> bool {
-        let Ok(start) = usize::try_from(offset) else {
-            return false;
-        };
-        let Some(end) = start.checked_add(s.len()) else {
-            return false;
-        };
-        self.data.get(start..end) == Some(s.as_bytes()) && self.data.get(end) == Some(&0)
+        format::pool_entry_bytes(&self.data, offset) == Some(s.as_bytes())
     }
 
     #[cfg(feature = "hotpath")]
@@ -119,31 +103,53 @@ impl StringPool {
     }
 }
 
-fn pool_offset(current: usize, string_len: usize) -> Option<u32> {
-    let end = current.checked_add(string_len)?.checked_add(1)?;
+/// The offset and `u32` length of a `string_len`-byte entry appended at
+/// `current`, or None when the entry's offset or its last byte would not be
+/// addressable by a `u32`.
+fn pool_offset(current: usize, string_len: usize) -> Option<(u32, u32)> {
+    let len = u32::try_from(string_len).ok()?;
+    let end = current
+        .checked_add(format::pool_prefix_len(len))?
+        .checked_add(string_len)?;
     u32::try_from(end).ok()?;
-    u32::try_from(current).ok()
+    Some((u32::try_from(current).ok()?, len))
 }
 
-/// Read a null-terminated string from the pool by offset.
+/// Read a string from the pool by offset.
 #[expect(
     clippy::expect_used,
-    reason = "offsets come from this pool's own inserts of &str values, each NUL-terminated, so the read is valid UTF-8 up to a NUL"
+    reason = "offsets come from this pool's own inserts of &str values, each a whole length-prefixed UTF-8 entry"
 )]
 pub(super) fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
-    super::super::format::read_nul_string(&pool.data, offset)
-        .expect("StringPool only contains NUL-terminated UTF-8 strings")
+    format::read_pool_string(&pool.data, offset)
+        .expect("StringPool only contains length-prefixed UTF-8 strings")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pool_offset;
+    use super::{StringPool, pool_offset, read_string_from_pool};
 
     #[test]
-    fn pool_limit_includes_terminator() {
+    fn pool_limit_includes_the_length_prefix() {
         let limit = u32::MAX as usize;
-        assert_eq!(pool_offset(limit - 2, 1), Some(u32::MAX - 2));
+        // A one-byte string takes a one-byte prefix: two bytes in all.
+        assert_eq!(pool_offset(limit - 2, 1), Some((u32::MAX - 2, 1)));
         assert_eq!(pool_offset(limit - 1, 1), None);
+        // A 128-byte string takes a two-byte prefix.
+        assert_eq!(pool_offset(limit - 130, 128), Some((u32::MAX - 130, 128)));
+        assert_eq!(pool_offset(limit - 129, 128), None);
         assert_eq!(pool_offset(usize::MAX, 1), None);
+    }
+
+    #[test]
+    fn a_value_holding_a_nul_interns_and_reads_back_whole() {
+        let mut pool = StringPool::new();
+        let whole = pool.intern("10\0a");
+        let prefix = pool.intern("10");
+        assert_ne!(whole, prefix, "distinct values get distinct offsets");
+        assert_eq!(pool.intern("10\0a"), whole, "a repeat deduplicates");
+        assert_eq!(read_string_from_pool(&pool, whole), "10\0a");
+        assert_eq!(read_string_from_pool(&pool, prefix), "10");
+        assert_eq!(read_string_from_pool(&pool, 0), "");
     }
 }

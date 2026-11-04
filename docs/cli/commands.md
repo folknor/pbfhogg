@@ -1937,7 +1937,9 @@ whose roles do not describe outer or inner rings are ignored (an empty role
 counts as outer). The PBF replication sequence is stored as a u32 in the
 geocode header. A missing value is stored as zero, and a present value outside
 the u32 range fails the build rather than being wrapped to a different source
-version.
+version. Names, house numbers, streets, postcodes and country codes are
+stored and answered whole, bytes and all: a PBF tag value holding a NUL byte
+is not cut at it.
 
 A way segment is the line straight in latitude and longitude between its two
 nodes, taken the shorter way around in longitude: the line a query measures

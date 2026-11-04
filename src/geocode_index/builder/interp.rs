@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use super::pass2::SlimInterpWay;
-use super::strings::StringPool;
+use super::strings::{StringPool, read_string_from_pool};
 
 use super::super::format::*;
 
@@ -218,9 +218,9 @@ fn endpoint_house_number(
             Some(_) => return None,
         }
     }
-    // A string with an interior NUL reads back as a prefix (`10\0a` as
-    // `10`), which the strict parse would then accept.
-    parse_house_number(strings.read_whole(housenumber?)?)
+    // The pool stores values whole, so `10\0a` reads back as itself and the
+    // strict parse refuses it.
+    parse_house_number(read_string_from_pool(strings, housenumber?))
 }
 
 #[cfg(test)]

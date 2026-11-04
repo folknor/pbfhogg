@@ -946,6 +946,52 @@ fn synthetic_build_query_matches_low_level_api() {
     assert!(far.admin.is_empty(), "far-away query must not invent admin");
 }
 
+/// PBF strings are length-delimited and may hold a NUL byte. The index stores
+/// every value whole, so an answer is the tag value itself, not the prefix
+/// before its first NUL.
+#[test]
+fn tag_values_holding_a_nul_are_answered_whole() {
+    let node = |id, lat, lon, tags| TestNode {
+        id,
+        lat,
+        lon,
+        tags,
+        meta: None,
+    };
+    let nodes = [
+        node(1, 557_000_000, 125_000_000, vec![]),
+        node(2, 557_000_000, 125_010_000, vec![]),
+        node(
+            3,
+            557_000_500,
+            125_005_000,
+            vec![
+                ("addr:housenumber", "10\0a"),
+                ("addr:street", "Main\0Street"),
+                ("addr:postcode", "12\x0034"),
+            ],
+        ),
+    ];
+    let ways = [TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![("highway", "residential"), ("name", "Main\0Street")],
+        meta: None,
+    }];
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &ways);
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let result = reader.query(55.70005, 12.5005).expect("valid query");
+    let addr = result.address.as_ref().expect("the address is indexed");
+    assert_eq!(addr.house_number, "10\0a");
+    assert_eq!(addr.street, "Main\0Street");
+    assert_eq!(addr.postcode, Some("12\x0034"));
+    let street = result.street.as_ref().expect("the street is indexed");
+    assert_eq!(street.name, "Main\0Street");
+}
+
 #[test]
 fn null_island_street_vertex_is_not_treated_as_absent() {
     let dir = crate::common::test_scratch();

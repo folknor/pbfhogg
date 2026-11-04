@@ -279,7 +279,8 @@ impl Reader {
     /// header-counted record-file lengths, every cell's entry-list span, each
     /// geometry span, and every string offset referenced by a way, address
     /// point, or polygon.
-    /// The string checks read through each referenced string's terminator.
+    /// The string checks read each referenced string's length prefix and
+    /// bytes.
     /// This touches file-backed mmap pages and can fault them into memory.
     /// Coordinate payloads and individual cell-entry references are not
     /// scanned; the latter are bounds-checked when queries use them. The
@@ -453,6 +454,11 @@ impl Reader {
             &self.coarse_interp_entries,
         )?;
         self.validate_admin_tree()?;
+        // Offset 0 is the empty string of every absent optional field, so the
+        // pool's length-zero sentinel is checked even when no record names a
+        // string at all.
+        validate_string_offset(0, &self.strings, "empty-string sentinel")
+            .map_err(|e| e.context(format::FILE_STRINGS))?;
         self.validate_way_geometry()?;
         Ok(())
     }
@@ -488,8 +494,11 @@ impl Reader {
     ///
     /// String-pool offsets (`name_offset`, `housenumber_offset`,
     /// `street_offset`, `postcode_offset`, `country_code_offset`) are validated
-    /// here as well. `read_nul_string` independently returns `None` for an
-    /// invalid offset, missing terminator, or invalid UTF-8.
+    /// here as well: each must frame a whole length-prefixed UTF-8 entry
+    /// inside `strings.bin` (`format::read_pool_string`). That proves the
+    /// offset decodes, not that it is the start of an entry the builder
+    /// wrote; an offset pointing at another valid entry is undetectable
+    /// either way.
     fn validate_way_geometry(&self) -> Result<()> {
         for (index, way) in self.street_ways.table().iter().enumerate() {
             (|| -> Result<()> {
@@ -1828,7 +1837,7 @@ impl Reader {
         // Rechecking here cannot make arbitrary in-place edits safe: truncation
         // can SIGBUS while reading the mmap, before an error can be returned.
         // External writers must likewise replace files instead of mutating them.
-        format::read_nul_string(&self.strings, offset)
+        format::read_pool_string(&self.strings, offset)
             .expect("Reader::open validated every referenced string")
     }
 
@@ -2025,14 +2034,14 @@ fn validate_span<T: Record>(
 }
 
 /// Validate a string-pool offset. Offset 0 is the "no string" sentinel that
-/// [`format::read_nul_string`] already treats as empty.
+/// [`format::read_pool_string`] reads as empty.
 fn validate_string_offset(offset: u32, strings: &[u8], kind: &str) -> Result<()> {
-    format::read_nul_string(strings, offset)
+    format::read_pool_string(strings, offset)
         .map(|_| ())
         .ok_or_else(|| {
             corrupt(format!(
                 "invalid geocode index: {kind} string at offset {offset} is out of bounds, \
-             unterminated, or invalid UTF-8"
+                 badly framed, or invalid UTF-8"
             ))
         })
 }
@@ -2249,22 +2258,23 @@ mod tests {
     fn string_validation_rejects_every_corruption_class() {
         // Offset 0 is the format's genuine empty string, used by every absent
         // optional field (a missing postcode, say). `StringPool::new` always
-        // writes the sentinel NUL, so even an index carrying no names at all
-        // has a one-byte pool - validation must accept it, or such an index
-        // would be unopenable.
+        // writes the length-zero sentinel, so even an index carrying no names
+        // at all has a one-byte pool - validation must accept it, or such an
+        // index would be unopenable.
         assert!(validate_string_offset(0, b"\0", "test").is_ok());
         // A zero-length pool is a different thing: no builder emits one, so a
         // truncated strings.bin is corruption and is rejected rather than
         // silently reading as empty.
         assert!(validate_string_offset(0, b"", "test").is_err());
         for (offset, pool) in [
-            (1, b"\0\xff\0" as &[u8]),
-            (1, b"\0unterminated"),
+            (1, b"\0\x01\xff" as &[u8]),
+            (1, b"\0\x09short"),
+            (1, b"\0\x80\x00"),
             (99, b"\0"),
         ] {
             let error = validate_string_offset(offset, pool, "test")
                 .expect_err("corrupt string must be rejected");
-            assert!(error.to_string().contains("unterminated, or invalid UTF-8"));
+            assert!(error.to_string().contains("badly framed, or invalid UTF-8"));
         }
     }
 }

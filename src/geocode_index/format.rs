@@ -18,9 +18,11 @@ use crate::coord_fmt::e7_to_deg;
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 
 /// Current format version. Version 3 widens `AdminCell.entries_offset` and
-/// `AdminPolygon.vertex_offset` from u32 to u64. Readers deliberately reject
-/// older versions: existing indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 3;
+/// `AdminPolygon.vertex_offset` from u32 to u64; version 4 stores
+/// `strings.bin` entries length-prefixed instead of NUL-terminated (see
+/// [`read_pool_string`]). Readers deliberately reject other versions:
+/// existing indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -758,22 +760,79 @@ pub fn parse_polygon_rings(
 }
 
 // ---------------------------------------------------------------------------
-// Null-terminated string reading
+// String pool (`strings.bin`)
 // ---------------------------------------------------------------------------
+//
+// Every entry is a canonical unsigned LEB128 byte length followed by that many
+// bytes of UTF-8, with no terminator, so any tag value round-trips: PBF
+// strings are length-delimited and may hold a NUL, which a NUL-terminated pool
+// would publish as its prefix. A record's string field is the byte offset of
+// an entry's length prefix. Offset 0 always holds the single byte 0, the
+// length-zero entry: the empty string every absent optional field names.
 
-/// Read a null-terminated UTF-8 string from a byte slice at the given offset.
-///
-/// Offset 0 is the format's genuine empty string. Invalid offsets, missing NUL
-/// terminators, and invalid UTF-8 return `None` so corruption cannot collapse
-/// to the same value.
-pub fn read_nul_string(data: &[u8], offset: u32) -> Option<&str> {
-    if offset == 0 {
-        return data.first().is_some_and(|byte| *byte == 0).then_some("");
+/// Bytes of the canonical LEB128 prefix for a string of `len` bytes.
+#[cfg(feature = "commands")]
+pub(crate) const fn pool_prefix_len(len: u32) -> usize {
+    match len {
+        0..0x80 => 1,
+        0x80..0x4000 => 2,
+        0x4000..0x20_0000 => 3,
+        0x20_0000..0x1000_0000 => 4,
+        _ => 5,
     }
-    let start = offset as usize;
-    let remaining = data.get(start..)?;
-    let end = remaining.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&remaining[..end]).ok()
+}
+
+/// Append one entry (canonical LEB128 length, then the bytes) to `pool`.
+/// `len` is `s.len()`, which the caller has bounded to `u32`.
+#[cfg(feature = "commands")]
+pub(crate) fn push_pool_string(pool: &mut Vec<u8>, s: &str, len: u32) {
+    let mut rest = len;
+    while rest >= 0x80 {
+        #[allow(clippy::cast_possible_truncation)]
+        pool.push((rest as u8 & 0x7F) | 0x80);
+        rest >>= 7;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    pool.push(rest as u8);
+    pool.extend_from_slice(s.as_bytes());
+}
+
+/// Read the pool entry at `offset`.
+///
+/// Returns `None` for an offset past the pool, a length prefix that is
+/// truncated, overlong (not canonical) or above `u32`, an entry running past
+/// the pool, or bytes that are not UTF-8, so corruption cannot collapse to
+/// the same value as a real string. Offset 0 reads as `""` only when the pool
+/// begins with its length-zero sentinel.
+pub fn read_pool_string(data: &[u8], offset: u32) -> Option<&str> {
+    std::str::from_utf8(pool_entry_bytes(data, offset)?).ok()
+}
+
+/// The bytes of the pool entry at `offset`, framing checked as in
+/// [`read_pool_string`] but not decoded as UTF-8.
+pub(crate) fn pool_entry_bytes(data: &[u8], offset: u32) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let mut len: u32 = 0;
+    let mut pos = start;
+    for shift in (0..35).step_by(7) {
+        let byte = *data.get(pos)?;
+        pos += 1;
+        let bits = u32::from(byte & 0x7F);
+        // The fifth byte carries only the top four bits of a u32.
+        if shift == 28 && bits > 0x0F {
+            return None;
+        }
+        len |= bits << shift;
+        if byte & 0x80 == 0 {
+            // A continuation that adds a zero top byte is overlong.
+            if shift > 0 && byte == 0 {
+                return None;
+            }
+            let end = pos.checked_add(usize::try_from(len).ok()?)?;
+            return data.get(pos..end);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,18 +1416,70 @@ mod tests {
     }
 
     #[test]
-    fn nul_string_distinguishes_empty_from_corruption() {
-        let pool = b"\0valid\0bad\xff\0unterminated";
-        assert_eq!(read_nul_string(pool, 0), Some(""));
-        assert_eq!(read_nul_string(pool, 1), Some("valid"));
-        assert_eq!(read_nul_string(pool, 7), None, "invalid UTF-8");
-        assert_eq!(read_nul_string(pool, 12), None, "missing NUL");
-        assert_eq!(read_nul_string(pool, 99), None, "out-of-bounds offset");
+    fn pool_string_distinguishes_empty_from_corruption() {
+        let pool = b"\x00\x05valid\x03b\xffd\x0atruncated";
+        assert_eq!(read_pool_string(pool, 0), Some(""));
+        assert_eq!(read_pool_string(pool, 1), Some("valid"));
+        assert_eq!(read_pool_string(pool, 7), None, "invalid UTF-8");
+        assert_eq!(read_pool_string(pool, 11), None, "entry past the pool");
+        assert_eq!(read_pool_string(pool, 99), None, "out-of-bounds offset");
         assert_eq!(
-            read_nul_string(b"not-empty", 0),
+            read_pool_string(b"not-empty", 0),
             None,
-            "offset zero needs NUL"
+            "offset zero needs the length-zero sentinel"
         );
+        assert_eq!(read_pool_string(b"\x80\x00", 0), None, "overlong prefix");
+        assert_eq!(read_pool_string(b"\x80", 0), None, "truncated prefix");
+        assert_eq!(
+            read_pool_string(b"\xff\xff\xff\xff\x1f", 0),
+            None,
+            "prefix above u32"
+        );
+    }
+
+    /// The pool is length-delimited, so a value holding a NUL reads back
+    /// whole rather than as the prefix before it.
+    #[cfg(feature = "commands")]
+    #[test]
+    fn pool_string_round_trips_every_value() {
+        let long_a = "a".repeat(0x7F);
+        let long_b = "b".repeat(0x80);
+        let long_c = "c".repeat(0x4000);
+        let values = ["10\0a", "\0", "Main Street", &long_a, &long_b, &long_c];
+        let mut pool = vec![0u8];
+        let mut offsets = Vec::new();
+        for value in values {
+            let len = u32::try_from(value.len()).expect("test length");
+            let before = pool.len();
+            offsets.push(u32::try_from(before).expect("test offset"));
+            push_pool_string(&mut pool, value, len);
+            assert_eq!(
+                pool.len() - before,
+                pool_prefix_len(len) + value.len(),
+                "prefix width for {} bytes",
+                value.len()
+            );
+        }
+        for (value, offset) in values.iter().zip(offsets) {
+            assert_eq!(read_pool_string(&pool, offset), Some(*value));
+        }
+        for (len, width) in [
+            (0, 1),
+            (0x7F, 1),
+            (0x80, 2),
+            (0x3FFF, 2),
+            (0x4000, 3),
+            (0x1F_FFFF, 3),
+            (0x20_0000, 4),
+            (0x0FFF_FFFF, 4),
+            (0x1000_0000, 5),
+            (u32::MAX, 5),
+        ] {
+            assert_eq!(pool_prefix_len(len), width, "{len:#x}");
+            let mut prefix = Vec::new();
+            push_pool_string(&mut prefix, "", len);
+            assert_eq!(prefix.len(), width, "encoded width of {len:#x}");
+        }
     }
 
     #[test]

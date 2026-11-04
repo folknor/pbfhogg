@@ -137,7 +137,7 @@ state.
   keeping an old ID that may name another element.
 - `removeid` and `sort` summaries count only the elements they decoded.
 - `cat --clean` writes elements in input order and no longer needs indexdata.
-- `build-geocode-index` writes index format version 3 (rebuild existing
+- `build-geocode-index` writes index format version 4 (rebuild existing
   indexes), splits `--force` into `--overwrite` and `--allow-unindexed`, and
   caps `--admin-level` at 10 and `--street-level` / `--coarse-level` at 19.
   `--search-radius` and `--coarse-search-radius` are capped at a fixed
@@ -527,6 +527,10 @@ state.
   ways resolve (Germany 7 of 78 at any level). Queries on existing indexes
   also refuse an `even` or `odd` range whose ends have the wrong parity,
   which stepped past the end; rebuild for the rest.
+- `build-geocode-index` stores names, house numbers, streets, postcodes and
+  country codes whole. A PBF tag value holding a NUL byte used to be answered
+  as the part before the NUL (`10\0a` as `10`); the index string pool is now
+  length-prefixed, which is why the format version is 4.
 - Concurrent library runs no longer share scratch.
 - io_uring writers opened one after another no longer fail with ENOMEM.
 

@@ -227,3 +227,8 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   whose addresses disagree or whose number is not a positive integer, a
   wrong-parity `even`/`odd` range and an unsupported mode leave the way
   unresolved. No cell level or distance takes part. No format change.
+- [ADR-0025](0025-geocode-strings-are-stored-whole.md) - Geocode index
+  strings are length-prefixed (canonical LEB128, no terminator), so every
+  tag value, one holding a NUL included, is stored and answered whole;
+  format version 4. Open validates that each referenced offset frames a
+  whole entry, not that it is an entry start.

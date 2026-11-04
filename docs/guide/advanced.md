@@ -142,7 +142,12 @@ reader's flat approximation: latitude and longitude differences in radians,
 longitude scaled by the cosine of the query's latitude and taken the short
 way around, times the Earth's mean radius.
 
-The on-disk format is version 3. Readers reject older versions outright with a
-message naming `build-geocode-index` as the remedy, so an index built by an
-earlier release must be rebuilt rather than migrated - the index is a directory
-of regenerable derived files, not a document.
+The on-disk format carries a version number. Readers reject any version but
+their own outright with a message naming `build-geocode-index` as the remedy,
+so an index built by an earlier release must be rebuilt rather than migrated -
+the index is a directory of regenerable derived files, not a document.
+
+Every string an answer carries (names, house numbers, streets, postcodes,
+country codes) is the tag value whole: a value holding a NUL byte, which PBF
+allows, is not cut at it. A caller passing one to a C API or into XML has to
+handle that byte itself.

@@ -3103,6 +3103,20 @@ Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
 interpolation ways with `addr:interpolation` + `addr:street`; how many
 resolve is under "Interpolation ends from their own nodes" below.
 
+### Length-prefixed string pool (bygg, 2026-11-04, against `47f5a973`)
+
+`strings.bin` entries carry a LEB128 length instead of a NUL terminator
+(ADR-0025): interning writes the prefix and deduplicates on the decoded
+length and bytes, the reader decodes the prefix instead of scanning for
+the NUL, and open checks the pool's sentinel once. Planet, `--bench 1`,
+two pairs: A stored `08eed2c8` (at `3c5b8d3a`, geocode code identical) then
+B uncommitted 175.5 s (A 172.4 s); A `b1b8b1bb` (clean `47f5a973`) 174.1 s then B
+uncommitted 173.7 s. A's mean 173.3 s, B's 174.6 s (+0.8 %), noise. The
+first pair's +3.1 s sits in Pass 1, a relation scan at 0.5 cores that read
+87 GB against the stored cell's 77 GB, not in a phase that interns or
+reads strings; Pass 2b, where most interning runs, moved +0.8 s and +0.4 s
+(3 % and 1 %). Peak RSS unchanged (13.3 GB in all four cells).
+
 ### Interpolation ends from their own nodes (bygg, 2026-11-03)
 
 The endpoint resolver takes each end's number from the same-street

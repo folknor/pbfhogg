@@ -408,18 +408,6 @@ convention allows are not indexed:
 Decide whether either is wanted before 0.6.0; both change which ways and
 numbers an index holds.
 
-### WRK-176: geocode strings with an interior NUL are published as their prefix
-
-Found 2026-11-03 in review of the interpolation resolver. The builder's
-string pool (`src/geocode_index/builder/strings.rs`) and the index's
-`strings.bin` are NUL-terminated, while PBF tags may hold a NUL (UTF-8
-allows it; only OSM XML cannot carry one). A street name or house number
-`10\0a` is interned under its own offset but every reader of that offset,
-the query answers included, sees `10`. The interpolation resolver refuses
-such a string (`StringPool::read_whole`); nothing else does. Decide
-whether the builder should refuse or skip a tag value holding a NUL, or
-whether the format should carry lengths; the latter is a format bump.
-
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 
 Found 2026-11-03 running `check --index` over the planet bench file

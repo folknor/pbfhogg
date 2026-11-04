@@ -91,7 +91,9 @@ failure order are the full schedule's. `commands::blob_merge` (sort,
 so it is not one result per task; it runs on the engine's streamed entry
 point, `run_ordered_streams`. There each task has its own channel (an
 overlap run's `OVERLAP_RUN_CHANNEL_DEPTH` chunks of frames the sweep
-compressed itself, each at most `OVERLAP_RUN_CHUNK_BYTES`), and the consumer
+compressed itself, each at most `OVERLAP_RUN_CHUNK_BYTES`; a frame larger
+than that is cut into pieces of at most a chunk, since the writer takes a
+chunk as bytes in order), and the consumer
 dispatches: it issues a task by making its channel and queueing the sender
 on a FIFO job queue, at most a window of tasks ahead of the one it is
 reading, so no gate is involved. Its result send and receive waits go to

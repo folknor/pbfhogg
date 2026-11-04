@@ -979,6 +979,18 @@ suite; the rest still carry their older commit in the Notes column.
 > 208.1 s, signs mixed, write loop +1 % in `--compare`, peak anon about
 > 1.0 GB on both: the bookkeeping costs nothing measurable.
 
+> **Large frames sent in chunk-sized pieces (2026-11-04, bygg, `8a2c8ad2`
+> plus the change that frames an over-chunk frame straight into pieces of
+> at most `OVERLAP_RUN_CHUNK_BYTES`, measured uncommitted with `--force`).**
+> `cat --dedupe` planet with itself, one `--bench 1` cell each: HEAD
+> `2202ef70` 201.5 s, variant `c57ba39b` (dirty sidecar) 206.3 s. The
+> write loop, the only phase the change touches, is 1 % faster in the
+> variant (198.9 s against 200.7 s); the wall difference is pass 1, which
+> read 654 MB from disk in the variant against 19 MB (a cold header walk,
+> code the change does not touch). Planet zlib output has no frame above a
+> chunk, so every frame is one piece and the counters are identical
+> (63,466 chunks, largest 2,097,145 bytes): no cost on normal input.
+
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
 > (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day.

@@ -319,12 +319,6 @@ merge, or an osmium-style per-source stream merge with globally
 byte-bounded prefetch inside oversized components. Only `sort` of
 adversarially unsorted input reaches this.
 
-### WRK-031: Budget for oversized frames in the overlap sweep
-
-The per-run chunk bound is `window x depth x max(OVERLAP_RUN_CHUNK_BYTES,
-largest frame)`. A frame near the 32 MiB format limit (`--compression none`
-on a huge block) travels alone and is not otherwise budgeted.
-
 ### WRK-032: Dedupe pass 2 buffered under --direct-io --io-uring
 
 Pass 2 (sort and `cat --dedupe`) now reads `O_DIRECT` under `--direct-io`

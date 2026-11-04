@@ -31,8 +31,8 @@ pub use crate::write::compression::{Compression, ParseCompressionError};
 // Blob framing / encoding helpers live in the sibling `framing` module.
 use super::framing::{FrameScratch, PIPELINE_SCRATCH, frame_blob_into, frame_in_scratch};
 pub(crate) use super::framing::{
-    frame_blob, frame_blob_pipelined, reframe_raw_with_index, strip_blob_header_fields,
-    strip_header_block_fields,
+    frame_blob, frame_blob_pipelined, frame_blob_pipelined_pieces, reframe_raw_with_index,
+    strip_blob_header_fields, strip_header_block_fields,
 };
 
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer

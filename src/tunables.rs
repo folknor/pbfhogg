@@ -699,7 +699,8 @@ pub(crate) const OVERLAP_RUN_WINDOW_PER_WORKER: usize = 2;
 pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
 
 /// Allocation capacity of framed blobs a sweep packs into one chunk before
-/// sending it; a frame larger than this travels alone. Sized so a typical
+/// sending it; a frame larger than this is framed into pieces of at most
+/// this size, so no chunk exceeds it. Sized so a typical
 /// run (two dense planet blobs merged, about 2 MB compressed) completes in a
 /// chunk or two without parking behind the write loop, which is what lets
 /// later runs proceed while the head drains; the planet self-merge's

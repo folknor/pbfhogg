@@ -143,6 +143,69 @@ pub(crate) fn frame_blob_pipelined(
     })
 }
 
+/// [`frame_blob_pipelined`], with the frame's bytes appended to `pieces` as
+/// consecutive buffers of exactly `piece` bytes each, the last one possibly
+/// shorter (a frame of at most `piece` bytes is one buffer, as
+/// [`frame_blob_pipelined`] returns it). Concatenated in order they are the
+/// frame.
+///
+/// For a producer whose transport bounds what it holds by buffer size: no
+/// buffer it receives exceeds `piece`, whatever the block. The parts are
+/// copied out of the scratch once, as [`frame_blob_into`] copies them into
+/// one buffer, so splitting costs no second copy; `pieces` is the caller's,
+/// so a reused one with room for the pieces costs no allocation of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frame_blob_pipelined_pieces(
+    uncompressed: &[u8],
+    compression: &Compression,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
+    metrics: &WriterMetrics,
+    piece: std::num::NonZeroUsize,
+    pieces: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+        let framed = frame_in_scratch(
+            "OSMData",
+            uncompressed,
+            compression,
+            indexdata,
+            tagdata,
+            way_members,
+            scratch,
+            metrics,
+        )?;
+        let t_assemble = crate::counters::Stopwatch::start();
+        split_into_pieces(&framed.parts(), framed.len(), piece.get(), pieces);
+        t_assemble.record_ns(&metrics.frame_ns);
+        scratch.trim_oversize_retained_buffers(metrics);
+        Ok(())
+    })
+}
+
+/// Copy `parts` (`total` bytes together) into exactly sized buffers of
+/// `piece` bytes, the last one possibly shorter, appended to `out`.
+fn split_into_pieces(parts: &[&[u8]], total: usize, piece: usize, out: &mut Vec<Vec<u8>>) {
+    let mut left = total;
+    let mut target = left.min(piece);
+    let mut current: Vec<u8> = Vec::with_capacity(target);
+    for part in parts {
+        let mut rest: &[u8] = part;
+        while !rest.is_empty() {
+            let n = (target - current.len()).min(rest.len());
+            current.extend_from_slice(&rest[..n]);
+            rest = &rest[n..];
+            if current.len() == target {
+                left -= target;
+                out.push(std::mem::take(&mut current));
+                target = left.min(piece);
+                current = Vec::with_capacity(target);
+            }
+        }
+    }
+}
+
 /// Compress and frame a blob using reusable scratch buffers, returning the
 /// whole frame `[4-byte BE header_len][BlobHeader][Blob]` as one exactly
 /// sized `Vec<u8>`, ready for any backend to write as it stands.
@@ -1097,6 +1160,65 @@ mod tests {
             scratch.compress_buf.capacity() <= MAX_RETAINED_SCRATCH_CAPACITY,
             "an outlier compression buffer is not retained"
         );
+    }
+
+    /// Pieces are exactly sized, `piece` bytes each but the last, and spell
+    /// the parts in order, wherever a piece boundary falls (inside a part, on
+    /// a part boundary, across several short parts).
+    #[test]
+    fn split_pieces_spell_the_parts_and_none_exceeds_the_size() {
+        let parts: [&[u8]; 4] = [&[1, 2, 3, 4], &[5], &[6, 7], &[8, 9, 10, 11, 12, 13]];
+        let whole = parts.concat();
+        for piece in 1..=whole.len() + 2 {
+            let mut out = vec![vec![0xee]];
+            split_into_pieces(&parts, whole.len(), piece, &mut out);
+            assert_eq!(out.remove(0), vec![0xee], "appended, not replaced");
+            assert_eq!(out.concat(), whole, "piece size {piece}");
+            assert_eq!(out.len(), whole.len().div_ceil(piece), "piece size {piece}");
+            for (i, p) in out.iter().enumerate() {
+                assert_eq!(p.capacity(), p.len(), "piece size {piece}: exactly sized");
+                if i + 1 < out.len() {
+                    assert_eq!(p.len(), piece, "piece size {piece}: only the last is short");
+                }
+            }
+        }
+    }
+
+    /// The pieces of a frame are its bytes: the same as the one-buffer
+    /// framing, one buffer when the frame fits a piece.
+    #[test]
+    fn framed_pieces_concatenate_to_the_frame() {
+        let payload: Vec<u8> = (0..10_000u32)
+            .map(|i| u8::try_from(i % 251).expect("below 256"))
+            .collect();
+        for compression in [Compression::None, Compression::Zstd(1)] {
+            let whole = frame_blob_pipelined(
+                &payload,
+                &compression,
+                None,
+                None,
+                None,
+                &WriterMetrics::new(),
+            )
+            .expect("frame");
+            for piece in [1_000, whole.len(), whole.len() + 1] {
+                let mut pieces = Vec::new();
+                frame_blob_pipelined_pieces(
+                    &payload,
+                    &compression,
+                    None,
+                    None,
+                    None,
+                    &WriterMetrics::new(),
+                    std::num::NonZeroUsize::new(piece).expect("non-zero"),
+                    &mut pieces,
+                )
+                .expect("frame in pieces");
+                assert_eq!(pieces.concat(), whole, "{compression:?}, piece {piece}");
+                assert!(pieces.iter().all(|p| p.capacity() <= piece));
+                assert_eq!(pieces.len(), whole.len().div_ceil(piece));
+            }
+        }
     }
 
     #[test]

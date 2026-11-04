@@ -994,14 +994,13 @@ impl RunResources {
 /// [`OVERLAP_RUN_CHANNEL_DEPTH`] messages, while this thread writes the
 /// entries in order, a run's chunks as they arrive. At most `window` runs
 /// ([`OVERLAP_RUN_WINDOW_PER_WORKER`] per worker) are issued ahead of the
-/// one being written. Memory: at most `window x depth` chunks buffered (a
-/// frame larger than a chunk travels alone) plus one chunk being built per
-/// worker, beside each active sweep's open cursors (see `sweep.rs`: decoded
-/// blocks of its live overlap, sparse tails demoted past
+/// one being written. Memory: at most `window x depth` chunks buffered, each
+/// within the chunk budget (a frame larger than a chunk is sent in pieces),
+/// plus, per worker, the chunk being built and the unsent part of the
+/// output it is shipping, beside each active sweep's open cursors (see
+/// `sweep.rs`: decoded blocks of its live overlap, sparse tails demoted past
 /// [`SWEEP_PINNED_BYTES`]; up to `min(window, workers)` sweeps at once).
 ///
-/// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
-/// [`SWEEP_PINNED_BYTES`]: crate::tunables::SWEEP_PINNED_BYTES
 /// Progress, shutdown and the failure order are the pool's; the first error
 /// met in run order is returned, unless a worker panicked, which the join
 /// re-raises. Its stall counters (`ordered_pool_*_wait_ns`) are this pass's:
@@ -1010,8 +1009,10 @@ impl RunResources {
 /// What the sweeps held (`overlap_run_*`, see `sweep.rs`) is emitted once
 /// the pool has finished, and only when there were runs.
 ///
+/// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
 /// [`OVERLAP_RUN_CHANNEL_DEPTH`]: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH
 /// [`OVERLAP_RUN_WINDOW_PER_WORKER`]: crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER
+/// [`SWEEP_PINNED_BYTES`]: crate::tunables::SWEEP_PINNED_BYTES
 #[hotpath::measure]
 pub(crate) fn write_plan(
     plan: &Plan,

@@ -66,12 +66,20 @@
 //!
 //! Output: every block the builder fills is framed (compressed) here, on the
 //! sweep's worker, and frames are packed into chunks of at most
-//! [`OVERLAP_RUN_CHUNK_BYTES`] of capacity (a single larger frame travels
-//! alone), sent through the run's channel of
-//! [`OVERLAP_RUN_CHANNEL_DEPTH`] messages. A run therefore holds at most
-//! that many chunks queued plus the one it is building, whatever its size.
-//! Filled blocks are shipped after every ID group, so completed output waits
-//! on the sweep's side for one group at most.
+//! [`OVERLAP_RUN_CHUNK_BYTES`] of capacity, sent through the run's channel
+//! of [`OVERLAP_RUN_CHANNEL_DEPTH`] messages. A frame larger than a chunk
+//! (a block of large elements under `Compression::None`, or of
+//! incompressible ones, up to the 32 MiB format limit) is framed straight
+//! into pieces of at most a chunk, packed like whole frames: the write loop
+//! takes a chunk as bytes in order and no frame boundary is read after
+//! framing. So every chunk is within the budget whatever the block, and a
+//! run holds at most `depth` chunks queued plus the one it is building,
+//! whatever its size. A sweep blocked on its full channel while sending a
+//! large frame's pieces still holds the pieces not yet sent and the group's
+//! filled blocks not yet framed: worker-local, one frame and one group at
+//! most, and only on the workers sweeping, never per issued run. Filled
+//! blocks are shipped after every ID group, so completed output
+//! waits on the sweep's side for one group at most.
 //!
 //! # Resource counters
 //!
@@ -80,11 +88,13 @@
 //! `overlap_run_pinned_high_water_bytes` (the largest charge any run reached,
 //! taken as each cursor opens, before any demotion it triggers),
 //! `overlap_run_demoted_cursors`, `overlap_run_chunks` (chunks sent),
-//! `overlap_run_chunk_high_water_bytes` (the largest summed frame capacity
-//! of a chunk sent, the final partial one included) and
+//! `overlap_run_chunk_high_water_bytes` (the largest summed capacity of the
+//! frames and frame pieces of a chunk sent, the final partial one included)
+//! and
 //! `overlap_run_staged_high_water_bytes` (the largest completed output held
 //! on the sweep's side before shipping: payload lengths of the filled blocks
-//! plus the frame capacities of the chunk being packed, at each ship). They
+//! plus the capacities of the chunk being packed, sampled as each ship
+//! begins, so it leaves out the pieces of the frame being packed). They
 //! are what the resource tests in `tests/merge_pbf.rs` assert, in place of a
 //! host's resident memory.
 //!
@@ -108,10 +118,12 @@ use crate::owned::{
 };
 use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
-use crate::writer::{Compression, frame_blob_pipelined};
+use crate::writer::{Compression, frame_blob_pipelined_pieces};
 use crate::{Element, ElementKind, PrimitiveBlock};
 
-/// One run's chunk of framed output blobs, written in order.
+/// One run's chunk of framed output, written in order: whole frames, or the
+/// pieces of one larger than a chunk. Its buffers are bytes in order, not
+/// one frame each.
 pub(super) type Chunk = Vec<Vec<u8>>;
 
 /// One overlap run's sweep, on its worker.
@@ -411,6 +423,8 @@ struct Output<'s> {
     filled: Vec<OwnedBlock>,
     chunk: Chunk,
     chunk_bytes: usize,
+    /// The frame being packed, in pieces (reused, so it grows only when a frame needs more pieces than any before).
+    pieces: Vec<Vec<u8>>,
     refs: Vec<i64>,
     compression: &'s Compression,
     metrics: &'s WriterMetrics,
@@ -474,23 +488,35 @@ impl Output<'_> {
     }
 
     /// Frame every filled block into the chunk, sending full chunks.
+    ///
+    /// A frame larger than a chunk arrives in pieces of at most a chunk
+    /// each, packed like whole frames, so no chunk sent exceeds
+    /// [`OVERLAP_RUN_CHUNK_BYTES`] of capacity whatever the block: the
+    /// writer takes a chunk as bytes in order and never reads a frame
+    /// boundary.
+    ///
+    /// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
     fn ship(&mut self, emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>) -> Result<()> {
         let filled: usize = self.filled.iter().map(|b| b.bytes.len()).sum();
         self.staged_high_water = self
             .staged_high_water
             .max(filled.saturating_add(self.chunk_bytes));
+        let limit = crate::tunables::OVERLAP_RUN_CHUNK_BYTES;
         for block in std::mem::take(&mut self.filled) {
-            let frame = frame_owned(block, self.compression, self.metrics)?;
-            let cap = frame.capacity();
-            let limit = crate::tunables::OVERLAP_RUN_CHUNK_BYTES;
-            if self.chunk_bytes > 0 && self.chunk_bytes + cap > limit {
-                self.send(emitter)?;
+            frame_owned(block, self.compression, self.metrics, &mut self.pieces)?;
+            let mut pieces = std::mem::take(&mut self.pieces);
+            for piece in pieces.drain(..) {
+                let cap = piece.capacity();
+                if self.chunk_bytes > 0 && self.chunk_bytes + cap > limit {
+                    self.send(emitter)?;
+                }
+                self.chunk.push(piece);
+                self.chunk_bytes += cap;
+                if self.chunk_bytes >= limit {
+                    self.send(emitter)?;
+                }
             }
-            self.chunk.push(frame);
-            self.chunk_bytes += cap;
-            if self.chunk_bytes >= limit {
-                self.send(emitter)?;
-            }
+            self.pieces = pieces;
         }
         Ok(())
     }
@@ -507,26 +533,38 @@ impl Output<'_> {
     }
 }
 
-/// Frame one encoded block to complete wire bytes, on this thread.
+/// Frame one encoded block to complete wire bytes, on this thread, appended
+/// to `pieces` in buffers of at most [`OVERLAP_RUN_CHUNK_BYTES`] (one buffer
+/// unless the frame is larger).
+///
+/// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
 fn frame_owned(
     owned: OwnedBlock,
     compression: &Compression,
     metrics: &WriterMetrics,
-) -> Result<Vec<u8>> {
+    pieces: &mut Vec<Vec<u8>>,
+) -> Result<()> {
     let OwnedBlock {
         bytes,
         index,
         tagdata,
         way_members,
     } = owned;
+    const PIECE: std::num::NonZeroUsize =
+        match std::num::NonZeroUsize::new(crate::tunables::OVERLAP_RUN_CHUNK_BYTES) {
+            Some(piece) => piece,
+            None => panic!("OVERLAP_RUN_CHUNK_BYTES must be non-zero"),
+        };
     let indexdata = index.serialize();
-    frame_blob_pipelined(
+    frame_blob_pipelined_pieces(
         &bytes,
         compression,
         Some(indexdata.as_slice()),
         tagdata.as_deref(),
         way_members.as_deref(),
         metrics,
+        PIECE,
+        pieces,
     )
 }
 
@@ -605,6 +643,7 @@ impl Sweep<'_, '_> {
             filled: Vec::new(),
             chunk: Vec::new(),
             chunk_bytes: 0,
+            pieces: Vec::new(),
             refs: Vec::new(),
             compression: self.compression,
             metrics: self.metrics,
@@ -971,7 +1010,8 @@ mod tests {
         assert!(drain(&mut descending).is_err());
     }
 
-    /// The resource tests in `tests/merge_pbf.rs` (the planet-density ones)
+    /// The resource tests in `tests/merge_pbf.rs` (the planet-density and
+    /// large-frame ones)
     /// size their fixtures against these values, which they cannot read: a
     /// change here must resize them.
     #[test]
@@ -979,7 +1019,7 @@ mod tests {
         assert_eq!(
             crate::tunables::OVERLAP_RUN_CHUNK_BYTES,
             2 << 20,
-            "resize CHUNK_BYTES and the self-merge fixture in tests/merge_pbf.rs"
+            "resize CHUNK_BYTES and the self-merge and large-frame fixtures in tests/merge_pbf.rs"
         );
         assert_eq!(
             crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,

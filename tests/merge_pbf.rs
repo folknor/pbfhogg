@@ -1270,6 +1270,52 @@ fn a_planet_density_self_merge_streams_its_run_in_bounded_chunks() {
     assert_eq!(counters.get("overlap_run_demoted_cursors"), 0);
 }
 
+/// Output frames larger than a chunk: long tag values, written uncompressed,
+/// make every output block a few chunks' worth. Such a frame is sent in
+/// pieces within the chunk budget, never as one message of its own size,
+/// and the pieces rejoin into the same valid file.
+#[test]
+fn output_frames_larger_than_a_chunk_travel_in_budget_sized_pieces() {
+    const NODES: i64 = 16_000;
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let ids: Vec<i64> = (1..=NODES).collect();
+    let value = |id: i64| format!("{id:0600}");
+    write_node_blobs(&a, true, std::slice::from_ref(&ids), value);
+    write_node_blobs(&b, true, std::slice::from_ref(&ids), value);
+
+    let (host, counters) = recording_host(4);
+    let stats = merge_pbf(
+        &[a.as_path(), b.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+    let n = u64::try_from(NODES).expect("count");
+    assert_eq!(stats.nodes, n);
+    assert_eq!(stats.duplicates_removed, n);
+    let expected: Vec<(i64, String)> = ids.iter().map(|&id| (id, value(id))).collect();
+    assert!(
+        nodes_with_value(&output) == expected,
+        "the merge is not the input's nodes in order"
+    );
+
+    let largest = largest_frame(&output);
+    assert!(
+        largest > 2 * CHUNK_BYTES,
+        "fixture: the largest output frame, {largest} bytes, spans under two chunks"
+    );
+    let chunk_high = counters.get("overlap_run_chunk_high_water_bytes");
+    assert!(
+        chunk_high <= CHUNK_BYTES,
+        "a chunk of {chunk_high} bytes exceeds the chunk budget"
+    );
+}
+
 /// Sparse tails: one input whose blobs each hold a dense run of IDs plus one
 /// ID far past every other blob's, so all of them chain into one overlap run
 /// and each cursor is down to its tail when the next blob opens. Long tag

@@ -295,7 +295,6 @@ fn write_merge(
 
     let sources = blob_merge::open_sources(
         inputs,
-        &plan,
         opts.direct_reads,
         opts.backend.supports_copy_range(),
     )?;
@@ -500,22 +499,7 @@ mod tests {
         );
 
         let merged = |merge, opts: &WriteOptions, name: &str| {
-            let path = dir.path().join(name);
-            let output = crate::output::Output::new(
-                path.clone(),
-                crate::output::Overwrite::Refuse,
-                &crate::host::Diagnostics::discard(),
-            )
-            .expect("output");
-            let output = output.bind(&host.invocation).expect("open");
-            let stats = write_merge(merge, &output, opts, &HeaderOverrides::default(), &host)
-                .expect("pass 2");
-            output.publish().expect("publish");
-            (
-                (stats.nodes, stats.ways, stats.relations),
-                (stats.blobs_rewritten, stats.duplicates_removed),
-                std::fs::read(&path).expect("read merged"),
-            )
+            merged_output(dir.path(), &host, merge, opts, name).expect("pass 2")
         };
         let direct_pass2 = WriteOptions {
             backend: crate::write::OutputBackend::Direct,
@@ -525,6 +509,103 @@ mod tests {
             merged(direct, &direct_pass2, "direct.osm.pbf"),
             merged(buffered, &WriteOptions::default(), "buffered.osm.pbf")
         );
+    }
+
+    /// What a merge wrote: its counts and the output's bytes.
+    #[cfg(feature = "linux-direct-io")]
+    type Merged = ((u64, u64, u64), (u64, u64), Vec<u8>);
+
+    /// Run pass 2 of `merge` into `dir/name` under `opts`.
+    #[cfg(feature = "linux-direct-io")]
+    fn merged_output(
+        dir: &std::path::Path,
+        host: &crate::host::Entered<'static>,
+        merge: MergePlan,
+        opts: &WriteOptions,
+        name: &str,
+    ) -> crate::Result<Merged> {
+        let path = dir.join(name);
+        let output = crate::output::Output::new(
+            path.clone(),
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )?;
+        let output = output.bind(&host.invocation)?;
+        let stats = write_merge(merge, &output, opts, &HeaderOverrides::default(), host)?;
+        output.publish()?;
+        Ok((
+            (stats.nodes, stats.ways, stats.relations),
+            (stats.blobs_rewritten, stats.duplicates_removed),
+            std::fs::read(&path)?,
+        ))
+    }
+
+    /// `--direct-io` beside an output that splices: pass 2's sources open
+    /// direct and the passthrough frames the plan copies are read through
+    /// aligned spans (the buffered and parallel sinks' userspace copy,
+    /// io_uring's read into its buffers), writing what the buffered run
+    /// writes.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn direct_sources_copy_through_a_splicing_output() {
+        let dir = crate::path_guard::tests::scratch();
+        if !crate::test_support::direct_reads_supported(dir.path(), "the whole test") {
+            return;
+        }
+        let (a, b) = fixtures(dir.path());
+        let host = crate::host::Host::entered_for_tests();
+        let sources: [InputSource<'_>; 2] = [(&a).into(), (&b).into()];
+        let buffered = plan_merge(&sources, &WriteOptions::default(), &host).expect("pass 1");
+        assert!(
+            buffered
+                .plan
+                .entries
+                .iter()
+                .zip(&buffered.plan.rewrite)
+                .any(|(e, &rewrite)| !rewrite && buffered.plan.frames[e.frame].reindex.is_none()),
+            "the plan copies a frame through"
+        );
+        let expected = merged_output(
+            dir.path(),
+            &host,
+            buffered,
+            &WriteOptions::default(),
+            "buffered.osm.pbf",
+        )
+        .expect("buffered pass 2");
+        #[cfg_attr(not(feature = "linux-io-uring"), allow(unused_mut))]
+        let mut splicing = vec![
+            crate::write::OutputBackend::Buffered,
+            crate::write::OutputBackend::Parallel,
+        ];
+        #[cfg(feature = "linux-io-uring")]
+        splicing.push(crate::write::OutputBackend::Uring);
+        for backend in splicing {
+            assert!(backend.supports_copy_range());
+            let spliced = WriteOptions {
+                backend,
+                direct_reads: true,
+                ..WriteOptions::default()
+            };
+            let merge = plan_merge(&sources, &spliced, &host).expect("direct pass 1");
+            let name = format!("{backend:?}.osm.pbf");
+            match merged_output(dir.path(), &host, merge, &spliced, &name) {
+                Ok(copied) => assert_eq!(copied, expected, "{backend:?}"),
+                // Only a typed io_uring setup refusal skips.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        crate::ErrorKind::PlatformUnsupported {
+                            feature: "io-uring",
+                            ..
+                        }
+                    ) =>
+                {
+                    crate::test_support::skip(format!("the io_uring pass 2: {e}"));
+                }
+                Err(e) => panic!("{backend:?} pass 2: {e:?}"),
+            }
+        }
     }
 
     /// The untouched plan merges: the two shared nodes are deduped.
@@ -568,8 +649,7 @@ mod tests {
 
         for direct in pass2_transports(dir.path()) {
             let sources =
-                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, false)
-                    .expect("open inputs");
+                blob_merge::open_sources(merge.inputs.clone(), direct, false).expect("open inputs");
             assert_eq!(sources.direct(), direct);
             let mut buf = blob_merge::FrameBuf::default();
             let call = crate::host::Call::detached();
@@ -621,16 +701,15 @@ mod tests {
         drop(file);
 
         for direct in pass2_transports(dir.path()) {
+            // The transport is the request's, whether or not the output
+            // splices the frames this plan copies through.
+            for splice in [false, true] {
+                let opened = blob_merge::open_sources(merge.inputs.clone(), direct, splice)
+                    .expect("open inputs");
+                assert_eq!(opened.direct(), direct, "splice {splice}");
+            }
             let sources =
-                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, false)
-                    .expect("open inputs");
-            assert_eq!(sources.direct(), direct);
-            // This plan copies a frame through, so an output that splices
-            // keeps the buffered descriptor the copy needs.
-            let splicing =
-                blob_merge::open_sources(merge.inputs.clone(), &merge.plan, direct, true)
-                    .expect("open inputs");
-            assert!(!splicing.direct(), "a direct source would meet a splice");
+                blob_merge::open_sources(merge.inputs.clone(), direct, false).expect("open inputs");
             let mut buf = blob_merge::FrameBuf::default();
             let err = match buf.read(&sources[entry.source], entry) {
                 Ok(_) => panic!("a missing frame must fail pass 2"),

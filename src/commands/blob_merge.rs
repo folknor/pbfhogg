@@ -593,15 +593,6 @@ impl Plan {
     pub(crate) fn blobs_total(&self) -> u64 {
         self.frames.len() as u64 + self.omitted
     }
-
-    /// Whether some entry is copied through unchanged, the one kind of
-    /// entry pass 2 splices when the output can (see `passthrough_until`).
-    pub(crate) fn has_copyable_passthrough(&self) -> bool {
-        self.entries
-            .iter()
-            .zip(&self.rewrite)
-            .any(|(entry, &rewrite)| !rewrite && self.frames[entry.frame].reindex.is_none())
-    }
 }
 
 /// Order the entries by (kind, first key), find the overlap runs and fold
@@ -808,33 +799,29 @@ fn overlap_components(entries: &[BlobEntry]) -> Vec<(usize, usize)> {
 /// `cat --dedupe` asks the host for. The walk's descriptions are closed by
 /// now; these are fresh ones.
 ///
-/// `direct_reads` (`--direct-io`) opens them `O_DIRECT` unless pass 2 will
-/// splice: `splice` is whether the output can (`supports_copy_range`), and
-/// it will exactly when some entry is a copied passthrough
-/// ([`Plan::has_copyable_passthrough`]). A splice copies from the source
-/// descriptor at unaligned frame offsets, which an `O_DIRECT` descriptor
-/// cannot serve, and a second descriptor per argument beside it would change
-/// what the run asks the host for. So a direct run that splices (an
-/// `--io-uring` output with frames to copy through, or a library caller
-/// pairing direct reads with a splicing backend) reads pass 2 buffered;
-/// every other direct run reads it direct, one descriptor per argument
-/// either way. The choice and the copy permission are made here together,
-/// so a direct source never reaches the copy path.
+/// `direct_reads` (`--direct-io`) opens them `O_DIRECT`, whatever the
+/// output: the transport is the input's ([`InputFile::direct_align`]), and
+/// every reader of a pass-2 source honours it. The sweeps and the owned
+/// passthrough read through [`FrameBuf`]; a passthrough the output copies
+/// (`splice`, the backend's `supports_copy_range`) goes through
+/// `crate::write::copy_range`, which reads a direct input in aligned spans
+/// and never hands it to `copy_file_range`. So a splicing output (`--io-uring`,
+/// whose copy is a positioned read into its registered buffers) costs no
+/// second descriptor and no buffered read, and the run holds one descriptor
+/// per argument either way.
 pub(crate) fn open_sources(
     inputs: Vec<PinnedInput>,
-    plan: &Plan,
     direct_reads: bool,
     splice: bool,
 ) -> Result<Sources> {
-    let copies = splice && plan.has_copyable_passthrough();
-    let direct = direct_reads && !copies && cfg!(feature = "linux-direct-io");
+    let direct = direct_reads && cfg!(feature = "linux-direct-io");
     let mut files = Vec::with_capacity(inputs.len());
     for pin in inputs {
         files.push(Source::open(&pin, direct)?);
     }
     Ok(Sources {
         files,
-        use_copy_range: splice && !direct,
+        use_copy_range: splice,
     })
 }
 
@@ -849,7 +836,7 @@ impl Sources {
     /// Whether pass 2 reads its inputs `O_DIRECT`.
     #[cfg(test)]
     pub(crate) fn direct(&self) -> bool {
-        self.files.iter().any(|f| f.align.is_some())
+        self.files.iter().any(|f| f.input.direct_align().is_some())
     }
 }
 
@@ -860,31 +847,23 @@ impl std::ops::Index<usize> for Sources {
     }
 }
 
-/// One pass-2 input: the open file, and its direct I/O alignment when it was
-/// opened `O_DIRECT`.
+/// One pass-2 input, opened buffered or `O_DIRECT` (the transport rides on
+/// the [`InputFile`]).
 pub(crate) struct Source {
     input: InputFile,
-    #[cfg_attr(
-        not(feature = "linux-direct-io"),
-        allow(dead_code, reason = "always None without direct reads")
-    )]
-    align: Option<usize>,
 }
 
 impl Source {
     fn open(pin: &PinnedInput, direct: bool) -> Result<Self> {
         #[cfg(feature = "linux-direct-io")]
         if direct {
-            let (file, align) = pin.open_direct()?;
             return Ok(Self {
-                input: InputFile::from_parts(std::sync::Arc::new(file), pin.path().into()),
-                align: Some(align),
+                input: InputFile::direct(pin)?,
             });
         }
         let _ = direct;
         Ok(Self {
             input: InputFile::open(pin)?,
-            align: None,
         })
     }
 
@@ -915,7 +894,7 @@ impl FrameBuf {
         #[allow(clippy::cast_possible_truncation)]
         let len = frame.frame_len as usize;
         #[cfg(feature = "linux-direct-io")]
-        if let Some(align) = source.align {
+        if let Some(align) = source.input.direct_align() {
             use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
             use std::os::unix::fs::FileExt as _;
             let scratch = match &mut self.scratch {

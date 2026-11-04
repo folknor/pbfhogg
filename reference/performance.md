@@ -4407,6 +4407,29 @@ loop) and pass 1; the gap sits in the CPU-bound write loop and the later
 HEAD direct-io cell `ef8f68ee` ran that same buffered pass 2 in 251.7 s,
 so it is drift between cells, not the change, and is not claimed.
 
+`sort --direct-io --io-uring` with direct pass-2 copies (bygg, planet,
+sorted input, 2026-11-04, change on top of `bc075247`). The copied-through
+frames are now read `O_DIRECT` in aligned chunks into the uring writer's
+buffers instead of through a second, buffered descriptor. Three
+interleaved `--bench 1` pairs, HEAD stored, change `--force`: HEAD
+`b9d61181` 45.0 s then change 53.6 s; HEAD `8ed88f79` 57.2 s then change
+58.5 s; change 60.6 s then HEAD `fb083b98` 57.1 s. The first pair is the
+first cell after a long rest and does not compare. The other two put the
+change 2-6 % behind, a sign held across both orders. Pass 1 matches
+(6.86 s each) and both write loops read 87.6 GB from the device, so the gap
+is the read pattern of the write loop, not more bytes: synchronous direct
+chunks get no kernel readahead. Inside the noise band for a single pair,
+and the transport is the one `--direct-io` asks for.
+
+`sort --io-uring` against the buffered default (bygg, planet, sorted
+input, `bc075247`, 2026-11-04), interleaved stored `--bench 1` cells:
+buffered `d18ccf43` 52.1 s, uring `4b51c917` 47.5 s, uring `ac69de9f`
+55.8 s, buffered `15393169` 51.5 s. A tie on the median (51.7 s against
+51.8 s), with the uring arm's spread wider. Sorted planet is a pure copy of
+about 87 GB, and both write loops read it from the device at about
+1.8 GB/s with well under one core busy (0.4 buffered, 0.1 uring), so the
+drive bounds both arms and the write backend cannot move the wall.
+
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.

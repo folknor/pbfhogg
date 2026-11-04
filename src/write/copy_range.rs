@@ -38,6 +38,24 @@
 //! is no kernel to have checked the pair first. Off Linux is not built or
 //! tested by any sweep here.
 //!
+//! A direct input (an [`InputFile`] opened `O_DIRECT`, which pass 2 of
+//! `sort` and `cat --dedupe` opens under `--direct-io`) is never handed to
+//! `copy_file_range`: the kernel would splice it through `O_DIRECT` reads
+//! at the frames' unaligned offsets, which the filesystem refuses. Both
+//! loops read it instead through [`read_aligned_in`] into a
+//! [`DirectScratch`] the caller keeps, one chunk at a time, each chunk
+//! ending `IO_BUF_BYTES` past the aligned offset it starts at, so the
+//! chunks of one range do not overlap and only the range's edges read
+//! padding. A chunk is read whole before any of it goes to the sink, and
+//! drained through as many reservations as the sink hands out: the sink's
+//! boundaries are the output's and never decide where an input read
+//! starts. [`copy_range`] takes a direct input straight to the userspace
+//! copy, under the same [`bounce_safe`] guard the kernel's refusal path
+//! takes, and does not count it as a fallback: the copy is the transport
+//! the caller asked for, not a refusal. A failed chunk read is located at
+//! the chunk's first byte, which is a byte of the requested range (not
+//! necessarily a frame start, never alignment padding).
+//!
 //! The shared rules, owned here so no second loop can drift from them:
 //!
 //! - **`EINTR` is retried, immediately, everywhere** ([`retry_eintr`]): a
@@ -50,7 +68,11 @@
 //!   an indexed range means the input is shorter than its index says.
 //! - **Cancellation is checked before every call**: a coalesced passthrough
 //!   run can span the whole input (sort of an already-sorted planet is one
-//!   range), so this is where a cancelled run stops splicing.
+//!   range), so this is where a cancelled run stops splicing. On a direct
+//!   input it is checked before each chunk read and each reservation; the
+//!   short-transfer and `EINTR` retries inside one chunk's aligned read
+//!   ([`read_aligned_in`]) are not interrupted, so a cancelled direct copy
+//!   stops within one chunk.
 //! - **Lengths convert with [`len_to_usize`]**, saturating. The kernel and
 //!   every sink cap the per-call size anyway, so a saturated request is only
 //!   ever a smaller first call. The kernel copy asks for the whole remaining
@@ -77,7 +99,32 @@ use std::os::unix::fs::FileExt as _;
 use std::os::unix::io::{AsRawFd as _, RawFd};
 
 use crate::error::{Error, Location, Result};
+#[cfg(feature = "linux-direct-io")]
+use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
 use crate::read::input::InputFile;
+
+/// The aligned scratch a direct input's range reads go through (see the
+/// module docs), kept by whoever runs the reads: the io_uring writer thread
+/// across its copies, one per copy for the buffered and `pwrite` sinks,
+/// whose pool threads copy concurrently. Remade when an input's alignment
+/// differs from the one it was made for. Its allocation is one chunk's
+/// aligned span, at most `IO_BUF_BYTES` plus one alignment block, far under
+/// the read buffers' retention line, so it needs no release.
+#[derive(Default)]
+pub(crate) struct DirectScratch {
+    #[cfg(feature = "linux-direct-io")]
+    scratch: Option<AlignedScratch>,
+}
+
+#[cfg(feature = "linux-direct-io")]
+impl DirectScratch {
+    fn for_align(&mut self, align: usize) -> &mut AlignedScratch {
+        match &mut self.scratch {
+            Some(s) if s.align() == align => s,
+            slot => slot.insert(AlignedScratch::new(align)),
+        }
+    }
+}
 
 /// Where [`copy_range`] writes.
 #[derive(Clone, Copy, Debug)]
@@ -309,6 +356,15 @@ pub(crate) fn copy_range(
 ) -> Result<()> {
     let in_fd = input.file().as_raw_fd();
     let out_fd = out.file().as_raw_fd();
+    // A direct input goes to the userspace copy without asking the kernel,
+    // under the guard the kernel's refusal path takes (see the module docs).
+    #[cfg(feature = "linux-direct-io")]
+    if input.direct_align().is_some() {
+        if !bounce_safe(in_fd, out_fd, offset, out.offset(), len) {
+            return Err(unsafe_pair(input, offset, len));
+        }
+        return copy_range_fallback(input, out, offset, len, cancel);
+    }
     copy_range_with(input, out, offset, len, cancel, |off_in, off_out, chunk| {
         let off_out = off_out.map_or(std::ptr::null_mut(), std::ptr::from_mut);
         // The crate's one `copy_file_range`: std has no wrapper for it.
@@ -335,17 +391,24 @@ pub(crate) fn copy_range(
     let in_fd = input.file().as_raw_fd();
     let out_fd = out.file().as_raw_fd();
     if !bounce_safe(in_fd, out_fd, offset, out.offset(), len) {
-        return Err(copy_error(
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot establish that a userspace range copy is safe for this pair of files",
-            ),
-            input,
-            offset,
-            offset.saturating_add(len),
-        ));
+        return Err(unsafe_pair(input, offset, len));
     }
     copy_range_fallback(input, out, offset, len, cancel)
+}
+
+/// The refusal of a userspace copy [`bounce_safe`] could not clear.
+#[cfg(any(not(target_os = "linux"), feature = "linux-direct-io"))]
+#[cold]
+fn unsafe_pair(input: &InputFile, offset: u64, len: u64) -> Error {
+    copy_error(
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot establish that a userspace range copy is safe for this pair of files",
+        ),
+        input,
+        offset,
+        offset.saturating_add(len),
+    )
 }
 
 /// The [`copy_range`] loop over one `copy_file_range` attempt,
@@ -440,13 +503,22 @@ pub(crate) trait ReadSink {
 /// input ending early, located in the input at that offset. The sink decides
 /// what happens to the bytes and when (the io_uring writer submits only full
 /// buffers; nothing here flushes a partial one).
+///
+/// A direct input is read in aligned chunks through `scratch` (see the
+/// module docs); a buffered one never touches it.
 pub(crate) fn read_range(
     input: &InputFile,
     mut offset: u64,
     mut len: u64,
     cancel: &crate::host::Recorder,
     sink: &mut impl ReadSink,
+    scratch: &mut DirectScratch,
 ) -> Result<()> {
+    #[cfg(feature = "linux-direct-io")]
+    if let Some(align) = input.direct_align() {
+        return read_range_direct(input, align, offset, len, cancel, sink, scratch);
+    }
+    let _ = scratch;
     let file = input.file();
     while len > 0 {
         cancel.check()?;
@@ -473,6 +545,66 @@ pub(crate) fn read_range(
         sink.filled(n)?;
         offset += n as u64;
         len -= n as u64;
+    }
+    Ok(())
+}
+
+/// [`read_range`] over a direct input of alignment `align`: whole aligned
+/// chunks, each drained into the sink's reservations (see the module docs).
+#[cfg(feature = "linux-direct-io")]
+fn read_range_direct(
+    input: &InputFile,
+    align: usize,
+    mut offset: u64,
+    len: u64,
+    cancel: &crate::host::Recorder,
+    sink: &mut impl ReadSink,
+    scratch: &mut DirectScratch,
+) -> Result<()> {
+    let overflow = |offset| {
+        read_error(
+            io::Error::new(io::ErrorKind::InvalidInput, "direct copy range overflows"),
+            input,
+            offset,
+        )
+    };
+    let end = offset.checked_add(len).ok_or_else(|| overflow(offset))?;
+    let align64 = u64::try_from(align).map_err(|_| overflow(offset))?;
+    let chunk64 = u64::try_from(crate::write::IO_BUF_BYTES).map_err(|_| overflow(offset))?;
+    let scratch = scratch.for_align(align);
+    let file = input.file();
+    while offset < end {
+        cancel.check()?;
+        // `align` is a power of two (`AlignedScratch::new` refuses anything
+        // else), so the mask rounds down to the aligned offset the chunk's
+        // read starts at.
+        let aligned = offset & !(align64 - 1);
+        let chunk_end = aligned.checked_add(chunk64).map_or(end, |b| b.min(end));
+        if chunk_end <= offset {
+            return Err(Error::internal(
+                "direct copy chunk ends before it starts (alignment above the I/O buffer)",
+            ));
+        }
+        // At most one I/O buffer, so it fits a usize.
+        let chunk_len = usize::try_from(chunk_end - offset).map_err(|_| overflow(offset))?;
+        let bytes = read_aligned_in(chunk_len, offset, scratch, |dst, at| file.read_at(dst, at))
+            .map_err(|err| read_error(err, input, offset))?;
+        let mut done = 0;
+        while done < bytes.len() {
+            cancel.check()?;
+            let want = bytes.len() - done;
+            let dst = sink.space(want)?;
+            if dst.is_empty() || dst.len() > want {
+                return Err(Error::internal(
+                    "range read sink reserved an empty or oversized buffer",
+                ));
+            }
+            let n = dst.len();
+            dst.copy_from_slice(&bytes[done..done + n]);
+            sink.filled(n)?;
+            done += n;
+        }
+        offset = chunk_end;
     }
     Ok(())
 }
@@ -521,7 +653,14 @@ fn copy_range_fallback(
         buf: vec![0u8; crate::write::IO_BUF_BYTES],
         out,
     };
-    read_range(input, offset, len, cancel, &mut sink)
+    read_range(
+        input,
+        offset,
+        len,
+        cancel,
+        &mut sink,
+        &mut DirectScratch::default(),
+    )
 }
 
 /// A failed read of `input` at `offset` during a range copy.
@@ -808,8 +947,155 @@ mod tests {
             buf: Vec::new(),
             got: Vec::new(),
         };
-        read_range(&input, 10, 900, &crate::host::Call::detached(), &mut sink).unwrap();
+        read_range(
+            &input,
+            10,
+            900,
+            &crate::host::Call::detached(),
+            &mut sink,
+            &mut DirectScratch::default(),
+        )
+        .unwrap();
         assert_eq!(sink.got, bytes[10..910]);
+    }
+
+    /// The patterned input of [`patterned_input`], opened `O_DIRECT`, or
+    /// `None` (announced as a skip) where the scratch filesystem refuses it.
+    #[cfg(feature = "linux-direct-io")]
+    fn direct_patterned_input(dir: &Path, len: usize) -> Option<(InputFile, Vec<u8>)> {
+        if !crate::test_support::direct_reads_supported(dir, "the whole test") {
+            return None;
+        }
+        let (_, bytes) = patterned_input(dir, len);
+        let input = InputFile::direct_for_tests(&dir.join("in.bin")).unwrap();
+        assert!(input.direct_align().is_some());
+        Some((input, bytes))
+    }
+
+    /// A direct input is read in whole aligned chunks that the sink drains
+    /// through reservations of any size: a range from an unaligned offset,
+    /// over several chunks, to an unaligned end of file arrives exactly.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_direct_range_reads_across_chunks_into_any_reservations() {
+        let dir = crate::path_guard::tests::scratch();
+        let len = 3 * crate::write::IO_BUF_BYTES + 1_234;
+        let Some((input, bytes)) = direct_patterned_input(dir.path(), len) else {
+            return;
+        };
+        let mut scratch = DirectScratch::default();
+        for (offset, sizes) in [
+            (777_usize, vec![1, 7, 300, 4_096, 65_536]),
+            (0, vec![]),
+            (4_096, vec![crate::write::IO_BUF_BYTES - 1]),
+        ] {
+            let mut sink = Scripted {
+                sizes: VecDeque::from(sizes),
+                buf: Vec::new(),
+                got: Vec::new(),
+            };
+            read_range(
+                &input,
+                offset as u64,
+                (len - offset) as u64,
+                &crate::host::Call::detached(),
+                &mut sink,
+                &mut scratch,
+            )
+            .unwrap();
+            assert_eq!(sink.got, bytes[offset..], "offset {offset}");
+        }
+        // A range past the end fails at the input, located inside the range.
+        let mut sink = Scripted {
+            sizes: VecDeque::new(),
+            buf: Vec::new(),
+            got: Vec::new(),
+        };
+        let err = read_range(
+            &input,
+            100,
+            len as u64,
+            &crate::host::Call::detached(),
+            &mut sink,
+            &mut scratch,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "{err}"
+        );
+        let at = err.byte_offset().unwrap().0;
+        assert!((100..len as u64).contains(&at), "located at {at}");
+    }
+
+    /// A direct range keeps the reservation refusal of the buffered loop.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_direct_range_refuses_an_empty_or_oversized_reservation() {
+        let dir = crate::path_guard::tests::scratch();
+        let Some((input, _)) = direct_patterned_input(dir.path(), 100) else {
+            return;
+        };
+        for size in [0, 51] {
+            let mut sink = Scripted {
+                sizes: VecDeque::from([size]),
+                buf: Vec::new(),
+                got: Vec::new(),
+            };
+            let err = read_range(
+                &input,
+                0,
+                50,
+                &crate::host::Call::detached(),
+                &mut sink,
+                &mut DirectScratch::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err.kind(), ErrorKind::Internal { .. }),
+                "size {size}: {err}"
+            );
+            assert!(sink.got.is_empty(), "size {size}: nothing may be passed on");
+        }
+    }
+
+    /// A direct input is copied in userspace without asking the kernel, and
+    /// not counted as a refused copy; the pair guard still refuses a copy
+    /// into the input itself.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_direct_input_copies_in_userspace_under_the_guard() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = crate::path_guard::tests::scratch();
+        let len = 2 * crate::write::IO_BUF_BYTES + 99;
+        let Some((input, bytes)) = direct_patterned_input(dir.path(), len) else {
+            return;
+        };
+        let out_path = dir.path().join("out.bin");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let invocation = crate::host::Call::detached();
+        copy_range(
+            &input,
+            CopyOut::At(&out, 5),
+            33,
+            (len - 33) as u64,
+            &invocation,
+        )
+        .unwrap();
+        let written = std::fs::read(&out_path).unwrap();
+        assert_eq!(&written[5..], &bytes[33..]);
+        let metrics = &invocation.metrics().writer;
+        assert_eq!(metrics.copy_range_fallback_ranges.load(Relaxed), 0);
+
+        let same = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("in.bin"))
+            .unwrap();
+        let err = copy_range(&input, CopyOut::At(&same, 0), 10, 10, &invocation).unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "{err}"
+        );
     }
 
     #[test]
@@ -822,8 +1108,15 @@ mod tests {
                 buf: Vec::new(),
                 got: Vec::new(),
             };
-            let err =
-                read_range(&input, 0, 50, &crate::host::Call::detached(), &mut sink).unwrap_err();
+            let err = read_range(
+                &input,
+                0,
+                50,
+                &crate::host::Call::detached(),
+                &mut sink,
+                &mut DirectScratch::default(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err.kind(), ErrorKind::Internal { .. }),
                 "size {size}: {err}"

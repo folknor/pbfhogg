@@ -308,19 +308,6 @@ merge, or an osmium-style per-source stream merge with globally
 byte-bounded prefetch inside oversized components. Only `sort` of
 adversarially unsorted input reaches this.
 
-### WRK-032: Dedupe pass 2 buffered under --direct-io --io-uring
-
-Pass 2 (sort and `cat --dedupe`) now reads `O_DIRECT` under `--direct-io`
-unless the output splices and the plan copies some frame through
-(`blob_merge::open_sources`). That case - `--direct-io --io-uring` with any
-passthrough - still reads the sweep buffered. Closing it needs a second,
-direct descriptor per argument for the sweep beside the buffered one the
-splice uses, which changes the descriptor grant (`CAT_EXTRA_FDS`, the
-`FdPool` doc, the open-count tests in `tests/fault_cat_input.rs` and
-`tests/fd_pool.rs`); or a per-source choice (direct only for inputs with
-no copied frame). Belongs with the deferred `--direct-io` reach redesign in
-`notes/todo.md`.
-
 ### WRK-178: Same-ID groups in the overlap sweep are unbounded
 
 The sweep gathers every copy of one ID from every cursor before writing any
@@ -743,7 +730,17 @@ What a session picking this up needs that is not written elsewhere:
   #64, #67, #68, #69 and #70 are answered. Stored short-run rows from before
   brokkr `a8605c879` carry up to ~100 ms of wall error.
 - **io_uring on bygg** needs memlock raised for the session (the deferred
-  io_uring item in `notes/todo.md`); the writer tests skip otherwise.
+  io_uring item in `notes/todo.md`); the writer tests skip and
+  `--io-uring` refuses at preflight otherwise (RLIMIT_MEMLOCK is 8 MB).
+  A `!` shell's `$PPID` is the `claude` process, so the user runs
+  `! sudo prlimit --pid $PPID --memlock=unlimited:unlimited`; shells and
+  brokkr runs started afterwards inherit it (`! ulimit -l` confirms).
+- **Running the binary directly:** only `./target/release/pbfhogg` (with
+  the `./`) is allowlisted. brokkr deletes its bench output after a run, so
+  comparing two outputs byte for byte needs direct runs into
+  `data/bench-tmp/`; `xxhsum` is not installed and `diff` is broken in
+  the tool shell, `git diff --no-index --stat A B` works (no output means
+  identical).
 - **Filing in brokkr's bz from here:** the Bash hook rejects a command that
   names brokkr together with a redirect, a pipe or backticks, so pass the
   body with `-b '...'` in single quotes and no backticks.

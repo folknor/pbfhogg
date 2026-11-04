@@ -579,10 +579,18 @@ pub(crate) fn pin_sources(
 
 /// An open input and the path it was opened from, so a failure reading it
 /// can name the file. Cloning shares both.
+///
+/// Inside the crate an input can also be opened `O_DIRECT`
+/// ([`InputFile::direct`]); it then carries the file's direct I/O alignment,
+/// and every reader that takes an `InputFile` by this type (pass 2's frame
+/// reads, the range copies in `crate::write::copy_range`) reads it in
+/// aligned spans. The constructor's one caller hands it only to those.
 #[derive(Clone, Debug)]
 pub struct InputFile {
     file: Arc<File>,
     path: Arc<Path>,
+    /// The direct I/O alignment when the file was opened `O_DIRECT`.
+    direct_align: Option<usize>,
 }
 
 impl InputFile {
@@ -596,12 +604,50 @@ impl InputFile {
         Ok(Self {
             file: Arc::new(source.open()?),
             path: Arc::from(source.path()),
+            direct_align: None,
         })
     }
 
-    /// An input already opened from `path`.
+    /// An input already opened from `path`, read buffered.
     pub fn from_parts(file: Arc<File>, path: Arc<Path>) -> Self {
-        Self { file, path }
+        Self {
+            file,
+            path,
+            direct_align: None,
+        }
+    }
+
+    /// `pin` opened `O_DIRECT`, carrying the alignment its reads keep.
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn direct(pin: &PinnedInput) -> Result<Self> {
+        let (file, align) = pin.open_direct()?;
+        Ok(Self {
+            file: Arc::new(file),
+            path: Arc::from(pin.path()),
+            direct_align: Some(align),
+        })
+    }
+
+    /// `path` opened `O_DIRECT` without a pin, for the range-copy tests.
+    #[cfg(all(test, feature = "linux-direct-io"))]
+    pub(crate) fn direct_for_tests(path: &Path) -> Result<Self> {
+        let (file, align) = crate::direct_io::open_for_read(path)?;
+        Ok(Self {
+            file: Arc::new(file),
+            path: Arc::from(path),
+            direct_align: Some(align),
+        })
+    }
+
+    /// The direct I/O alignment when the file was opened `O_DIRECT`, `None`
+    /// for a buffered input.
+    #[must_use]
+    #[cfg_attr(
+        not(any(feature = "linux-direct-io", test)),
+        allow(dead_code, reason = "always None without direct reads")
+    )]
+    pub(crate) fn direct_align(&self) -> Option<usize> {
+        self.direct_align
     }
 
     /// The open file.

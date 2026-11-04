@@ -502,10 +502,14 @@ impl Drop for UringState {
 ///
 /// The read lands directly in the registered buffer at `current_len`, so
 /// there is no user-space bounce buffer and no extra copy beyond what the
-/// kernel's read path already performs. A short read is progress: the input
-/// fd is an ordinary buffered one (no O_DIRECT alignment on the destination,
-/// length or offset), and the alignment the O_DIRECT output needs is kept by
-/// submitting full buffers only.
+/// kernel's read path already performs. A short read is progress: a buffered
+/// input needs no O_DIRECT alignment on the destination, length or offset,
+/// and the alignment the O_DIRECT output needs is kept by submitting full
+/// buffers only. A direct input (pass 2 of `sort` / `cat --dedupe` under
+/// `--direct-io`) cannot be read into an arbitrary buffer position, so
+/// `read_range` reads it in aligned chunks into the sink's own scratch and
+/// copies each chunk into these reservations: one memcpy per byte more than
+/// the buffered route, and no page-cache fill.
 ///
 /// `read_range` enforces the reservation protocol; `space` and `filled`
 /// still bounds-check against the buffer with checked arithmetic, because
@@ -745,6 +749,7 @@ fn uring_init_and_run(
         &mut UringSink {
             state: &mut state,
             cancel,
+            direct: super::copy_range::DirectScratch::default(),
         },
         expected,
         metrics,
@@ -762,6 +767,9 @@ fn uring_init_and_run(
 struct UringSink<'a> {
     state: &'a mut UringState,
     cancel: &'a crate::host::Recorder,
+    /// The aligned scratch a `CopyRange` from a direct input reads through,
+    /// kept across copies on this thread.
+    direct: super::copy_range::DirectScratch,
 }
 
 impl UringSink<'_> {
@@ -792,7 +800,14 @@ impl OutputSink for UringSink<'_> {
         len: u64,
     ) -> Result<()> {
         self.fault_point();
-        super::copy_range::read_range(&in_file, offset, len, self.cancel, self.state)?;
+        super::copy_range::read_range(
+            &in_file,
+            offset,
+            len,
+            self.cancel,
+            self.state,
+            &mut self.direct,
+        )?;
         // The Arc keeps the input open across the read loop.
         drop(in_file);
         Ok(())

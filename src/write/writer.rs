@@ -1523,7 +1523,10 @@ impl PbfWriter<FileWriter> {
     /// thread and returns immediately, so the input has to stay open until
     /// the splice actually runs. Passing a bare `RawFd` could not express
     /// that - see [`OutputChunk::CopyRange`](crate::write::pipeline::OutputChunk).
-    /// The path names the input when the read or splice fails.
+    /// The path names the input when the read or splice fails. An input the
+    /// crate opened `O_DIRECT` (pass 2 of `sort` and `cat --dedupe` under
+    /// `--direct-io`) is not spliced: every backend reads it in aligned
+    /// chunks (`crate::write::copy_range`).
     /// `offset` and `len` describe the framed blob's position in the input file.
     ///
     /// Callers must not use this when the output writer is O_DIRECT - use

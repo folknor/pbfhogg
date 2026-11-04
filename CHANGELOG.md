@@ -355,10 +355,10 @@ state.
   of buffering it: planet merged with itself takes about 216 s and 1.1 GB
   peak anon on bygg.
 - `cat --dedupe --direct-io` and `sort --direct-io` read their second pass
-  `O_DIRECT` too, so the run no longer fills the page cache. With
-  `--io-uring` as well, the second pass stays buffered whenever a blob is
-  copied through unchanged. Merging a file with itself is slower this way
-  (every blob is read from the device twice).
+  `O_DIRECT` too, so the run no longer fills the page cache, with
+  `--io-uring` as well: a blob copied through unchanged is read `O_DIRECT`
+  into the io_uring writer's buffers. Merging a file with itself is slower
+  this way (every blob is read from the device twice).
 - Multi-region `extract --config` with `--simple` on sorted input
   compresses every region's output in parallel instead of on one thread:
   a 5-region planet extract takes about 128 s on bygg, with unchanged

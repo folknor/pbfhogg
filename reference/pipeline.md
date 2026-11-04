@@ -266,15 +266,16 @@ shares (`src/commands/blob_merge.rs`).
 
 Under `--direct-io` both passes read `O_DIRECT`: pass 1 through
 `HeaderWalker::open_direct`, pass 2 through one direct descriptor per
-argument, each reading thread holding its own aligned scratch. The one
-exception is a run whose output splices (`--io-uring`, or a library
-backend that supports copy-range) and whose plan copies at least one frame
-through: the splice copies from the source descriptor at unaligned
-offsets, so that run's pass 2 reads buffered rather than holding a second
-descriptor per argument (`open_sources` makes the choice and the copy
-permission together). A self-merge reads every frame twice, which a
-buffered pass 2 serves the second time from the page cache and a direct
-one reads again from the device.
+argument, each reading thread holding its own aligned scratch. That holds
+whatever the output: the transport rides on the opened input
+(`InputFile::direct_align`), and a frame the output copies through
+(`--io-uring`, whose copy is a positioned read into its registered
+buffers, or a library backend that supports copy-range) is read by
+`src/write/copy_range.rs` in aligned chunks of `IO_BUF_BYTES` and copied
+into the output, never handed to `copy_file_range`. So a splicing run
+holds no second descriptor and reads nothing buffered. A self-merge reads
+every frame twice, which a buffered pass 2 serves the second time from the
+page cache and a direct one reads again from the device.
 
 ### export
 

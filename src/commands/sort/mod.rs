@@ -318,8 +318,7 @@ pub(crate) fn sort_to<'a>(
     let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
     host.invocation.marker("SORT_WRITER_SETUP_END");
 
-    let sources =
-        blob_merge::open_sources(vec![pin], &plan, direct_io, backend.supports_copy_range())?;
+    let sources = blob_merge::open_sources(vec![pin], direct_io, backend.supports_copy_range())?;
     host.invocation
         .counter("sort_overlap_runs", plan.runs.len());
 

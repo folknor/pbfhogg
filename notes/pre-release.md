@@ -437,26 +437,6 @@ indexdata guide) should say so and point at `check --index` and
 the brokkr planet dataset should be reindexed so `check --index` passes on
 it.
 
-### WRK-177: no test fails a block inside apply-changes' parallel create run
-
-`CreateEncoder::emit` (`src/commands/apply_changes/stream_output.rs`)
-promises that the first failure in output order is the one returned, with
-every block before it submitted to the writer and none after it. No test
-fails a block on the executor arm, in the first batch or a later one. A
-failed merge publishes nothing (`merge` returns before
-`output_pbf.publish()`, and the staging `Target` is removed on drop), so the
-prefix discipline is an internal writer-submission contract, not
-caller-visible output. What a test can pin from outside: with distinct
-encoding failures in several blocks of one batch (and of a later batch),
-the earliest failing block's error is returned whatever order the tasks
-finish in, and no output is published. Isolate competing block failures
-from cancellation, producer and writer failures, which have their own
-precedence. The reachable block failure is a way create whose node is
-missing under `--locations-on-ways` (`loc.for_way`); a way run past one
-batch is 512,001+ way creates, so the cost against the tier needs
-checking, or the failure comes from a test hook at `encode_and_frame`.
-Found 2026-11-03 while adding the batch-boundary success test.
-
 ---
 
 ## Documentation and comment corrections

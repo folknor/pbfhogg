@@ -2055,6 +2055,22 @@ and per-task groups of contiguous blocks were not tested. A thread-local
 builder was not tested because it is ruled out on other grounds: the
 executor's threads belong to the caller and outlive the invocation.
 
+### apply-changes' create-run loop lifted into a function its tests drive (bygg, 2026-11-04, against `3c5b8d3a`)
+
+`CreateEncoder::emit`'s batching and ordered-write loop moved, unchanged,
+into `write_run` (`src/commands/apply_changes/stream_output.rs`), which
+takes the block encoder and the frame writer as closures so unit tests can
+fail chosen blocks and record what is written. The closures are
+monomorphized; no change was expected, and one cell checks that.
+
+Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
+zstd:1`, `--bench 1`. Baseline is the stored cell at `3c5b8d3a`
+(`ed178984`: wall 96.4 s, peak anon 1,999 MB, transition spans 11.3 and
+33.8 ms); the change, uncommitted on `43373aa0` with `--force` (sidecar
+`7eab1838`): wall 93.9 s, peak anon 1,995 MB, transition spans 18.1 and
+21.1 ms. Within noise on every figure; the phase split matches phase for
+phase.
+
 ### tags-filter checks stored tagdata is canonical (bygg, 2026-11-03, against `ebe69342`)
 
 The change: `TagIndex::deserialize`, which runs once per blob header on a

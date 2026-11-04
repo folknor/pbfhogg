@@ -255,7 +255,13 @@ pub fn malloc_trim() -> i32 {
 /// fresh per blob); 4 MiB was wall-neutral where measured and saved 5 to
 /// 30 %, but raised cat `--clean`'s peak by 12 %. No value was a uniform
 /// win, so the CLI sets none (reference/performance.md, "glibc's sliding
-/// mmap threshold across commands", which holds every cell).
+/// mmap threshold across commands", which holds every cell). Do not
+/// re-measure a fixed threshold until the per-blob allocate-and-free of
+/// blob-scale buffers is gone (the blob reader's compressed frames first);
+/// before that the result above stands. Any CLI default that does land must
+/// step aside when the user has set their own allocator policy (any
+/// `MALLOC_*` variable or a `glibc.malloc.*` entry in `GLIBC_TUNABLES`),
+/// since a `mallopt` call would silently override it.
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.

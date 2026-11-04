@@ -17,8 +17,10 @@
 //! workload-dependent ratio loss, in exchange for compressing chunks in
 //! parallel.
 //!
-//! The only in-crate consumer is `diff --format osc` assembly, whose
-//! compression was a serial tail before this writer existed.
+//! The only in-crate consumer is `diff --format osc` assembly of an
+//! `.osc.gz` from the unindexed element stream, whose compression was a
+//! serial tail before this writer existed. The indexed path deflates its
+//! members on the unit workers through [`compress_one`] instead.
 //!
 //! ## Failure
 //!
@@ -169,6 +171,24 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         // chunk and one chunk waiting for admission. Queue capacities alone do
         // not bound `pending`: writer_loop drains completed chunks out of the
         // compressed queue while an earlier sequence is still running.
+        //
+        // What that costs in memory. With W workers, chunk capacity R and
+        // compressed capacity at most C per chunk, raw chunks are bounded by
+        // the queues, not the permits: 2W queued, W in workers, plus the
+        // producer's two, so 3W+2. A seq is raw until its worker finishes,
+        // then compressed; an active worker holds both forms at once (`raw`
+        // lives through `compress_job`). Payload capacity is therefore at
+        // most 2R + max(3W(R+C), W(R+5C)): about 9W+4 MiB at R = 2 MiB and
+        // C = 1 MiB (the initial capacity `compress_one` reserves), 292 MiB
+        // at W = 32. C is an assumption, not a guarantee: high-entropy tag
+        // values or Vec growth can exceed it. Encoder state, stacks and
+        // allocator retention are outside the bound. It scales with host
+        // threads, not `-j`, because the one caller sizes W from host
+        // parallelism; a fixed budget would need a cap on concurrent jobs,
+        // which trades assembly wall for memory. The envelope is reached
+        // only under backpressure (slow output, a straggling early chunk, a
+        // producer outrunning the pool); reference/performance.md
+        // "Unindexed `.osc.gz` assembly" records an ordinary run far below it.
         //
         // The permits are what make this a bound on seq *distance*, which is
         // what the reorder buffer's window measures: a permit is taken before

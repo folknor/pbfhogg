@@ -3482,6 +3482,32 @@ error. Walker phase ~15 s (pread-only via `HeaderWalker` with
 germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
 14.7, WAY 12.9, REL 14.5 out of 16 (86-92 %).
 
+### Unindexed `.osc.gz` assembly (bygg, 2026-11-04, at `80e0b8f0`)
+
+The one path that still assembles through `ParallelGzipWriter`: an
+`.osc.gz` from inputs without indexdata, so the comparison is the
+sequential element stream and the gzip pool runs on every host thread
+(32 here) after it. `diff-snapshots --dataset germany --from base --to
+20260420 --variant raw --format osc --bench 1`, `217680f2`, 104.3 s:
+
+| Span | Duration | Peak anon | Avg cores |
+|---|---:|---:|---:|
+| node, way, relation scan | 103.8 s | 14 MB | 1.0 |
+| assembly (`DERIVECHANGES_WRITE`) | 0.36 s | 71 MB | 12.5 |
+
+About 1.8 GB of fragment XML in, 362 MB written. The pool never waited
+for a sequence permit (`writer_parallel_gzip_reorder_blocked` 0,
+reorder high water 9 slots), and its 12.5 cores of 32 put the limit on
+the fragment copy feeding it, so this run used little of the writer's
+envelope (about 292 MiB of payload capacity at 32 workers; the bound
+and what it assumes are at `ParallelGzipWriter::new`). That envelope
+is reached only under backpressure (slow output, a straggling early
+chunk, a pool slower than its producer) and grows with host threads.
+The assembly is nonetheless this command's peak: the scan's readers
+and decode pool are dropped before it, so it does not stack on the
+scan's working set. 0.36 s is three 100 ms samples, so 71 MB is a
+sampled peak, not the instantaneous one.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

@@ -334,12 +334,6 @@ distinct versions costs about k squared over two comparisons. Only
 adversarial input (`sort` of many copies of one ID) or a history file with
 an object of very many versions reaches either. Unmeasured.
 
-### WRK-037: ParallelGzipWriter window size
-
-At 32 workers the window admits up to 160 sequences x 2 MiB, about 320 MiB
-of raw payload. Bounded, but not small; matters if anything reuses its
-sizing.
-
 ---
 
 

@@ -405,7 +405,9 @@ pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 /// Bounded channel depth for both raw-in and compressed-out queues.
 /// Sized at `2 * worker_count` so a full queue on either side
 /// backpressures the producer thread naturally without starving the
-/// pool.
+/// pool. Together with [`DEFAULT_CHUNK_SIZE`] it sets the writer's memory
+/// envelope, which grows with the worker count; `ParallelGzipWriter::new`
+/// states the bound.
 pub(crate) const QUEUE_SLOTS_PER_WORKER: usize = 2;
 
 /// How long the parallel gzip writer parks on its reorder-permit channel

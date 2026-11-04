@@ -3533,6 +3533,158 @@ peak to 445 MB. The store now lives in its own anonymous mapping
 (`EdgeStore`), grown by remapping and unmapped after the closure, so it
 never passes through `free`: wall and peak are within noise of the base.
 
+## glibc's sliding mmap threshold across commands (bygg, 2026-11-04, at `3c5b8d3a`)
+
+Question: does glibc's dynamic mmap threshold leave freed memory resident in
+later work, which command pays it and how much, and does a fixed threshold
+set at process start buy the memory back without wall cost. Answer: every
+multi-phase command surveyed pays it, by 4 to 41 % of peak anon, and none of
+the three fixed thresholds measured is a uniform win, so the CLI still sets
+no allocator policy. Do not re-run this survey; the cells are below.
+
+Mechanism (`research/glibc/malloc/malloc.c`, `__libc_free` and `sysmalloc`):
+freeing an mmapped chunk of at most 32 MiB whose size exceeds the current
+threshold raises the threshold to that chunk size and the trim threshold to
+twice it. Some such free happens early in every command (a pool's decode
+buffers at a phase end, any blob-scale buffer), and from then on blob-scale
+buffers below the raised threshold come from the per-thread arenas, whose
+freed interior memory stays resident (only `malloc_trim` releases interior
+pages). `mallinfo2` shows it directly: check `--refs` after its way phase
+holds a 148.5 MB arena with 0.2 MB in use (4.8 MB with the threshold
+fixed); extract `--complete` ends with a 5.16 GB arena, 1.36 GB of it free,
+its 4 MiB `IdSet` chunks arena-backed (`hblks` 3), against a 149 MB arena
+and 1,025 mapped chunks with the threshold fixed. Fixing the threshold also
+freezes the trim threshold, so a fixed-threshold cell mixes both effects.
+
+Method: the arms differ only in `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=N`
+(glibc applies it through `do_set_mmap_threshold`, which disables the
+sliding threshold exactly as `process::set_mmap_threshold` would; passed to
+the child through `scripts/envrun.sh`). The default arm is the binary as
+shipped. One binary, `--bench 1`, 32 threads, glibc 2.43, THP `always`,
+`planet-20260223-with-indexdata`; brokkr records no `GLIBC_TUNABLES`, so
+every fixed-threshold cell is an unstored `--force` cell, and so are the
+later default cells interleaved with them. Peak anon is the sidecar's
+`anon` max; the peak phase is the sidecar segment that holds it, named by
+the marker that begins it. extract cells use `--bbox=-25,34,45,72`,
+apply-changes OSC 4913 with `--compression zstd:1`.
+
+### The survey: default against a threshold fixed at 128 KiB
+
+128 KiB is glibc's starting value, so this arm is the process as if no free
+had ever raised the threshold.
+
+| command | arm | UUID | wall | peak anon | peak phase |
+|---|---|---|---:|---:|---|
+| `check --refs` | default | `7592610c` | 31.5 s | 2,183 MB | ways |
+| `check --refs` | 128 KiB | `5a19bf9d` (unstored) | 31.4 s | 1,983 MB | ways |
+| `tags-filter w/highway=primary` | default | `707198dd` | 75.6 s | 2,554 MB | pass 2 |
+| `tags-filter w/highway=primary` | 128 KiB | `03b5f0b7` (unstored) | 76.0 s | 2,276 MB | pass 2 |
+| `tags-filter r/route=bus` (runs the relation closure) | default | `4e5ca3bf` | 60.8 s | 2,592 MB | pass 2 |
+| `tags-filter r/route=bus` | 128 KiB | `cdb0f07f` (unstored) | 54.1 s | 2,285 MB | pass 2 |
+| `extract --simple` | default | `b0d3cb39` | 110.2 s | 3,127 MB | relation write |
+| `extract --simple` | 128 KiB | `843a874f` (unstored) | 112.0 s | 2,549 MB | way write |
+| `extract --complete` | default | `3ad0761a` | 119.8 s | 4,896 MB | `PREAD_WRITE_EXECUTE` |
+| `extract --complete` | 128 KiB | `f3ed59b3` (unstored) | 124.2 s | 4,274 MB | `PREAD_WRITE_EXECUTE` |
+| `extract --smart` | default | `12ebfc9c` | 133.6 s | 7,779 MB | pass 1 relation classify |
+| `extract --smart` | 128 KiB | `53375530` (unstored) | 135.3 s | 7,442 MB | pass 1 relation classify |
+| `repack` | default | `723e4963` | 148.3 s | 783 MB | ways |
+| `repack` | 128 KiB | `b0024e40` (unstored) | 151.2 s | 559 MB | nodes |
+| `degrade --strip-locations` | default | `7f7d260e` | 154.3 s | 778 MB | ways |
+| `degrade --strip-locations` | 128 KiB | `70c3224b` (unstored) | 154.4 s | 552 MB | nodes |
+| `cat --clean version` | default | `55c10efb` | 146.7 s | 776 MB | relations |
+| `cat --clean version` | 128 KiB | `ff567413` (unstored) | 150.7 s | 690 MB | relations |
+| `time-filter` | default | `bb2517a3` | 125.5 s | 668 MB | main scan |
+| `time-filter` | 128 KiB | `bb5d2dbb` (unstored) | 126.7 s | 611 MB | main scan |
+| `apply-changes` | default | `ed178984` | 96.4 s | 1,999 MB | after the way-to-relation transition |
+| `apply-changes` | 128 KiB | `dba29045` (unstored) | 99.6 s | 1,471 MB | way phase |
+| `check --ids --full` | default | `3dd9be05` | 29.2 s | 2,292 MB | ways |
+| `check --ids --full` | 128 KiB | `6e479d57` (unstored) | 29.8 s | 2,126 MB | ways |
+| `renumber` | default | `cd477c21` | 131.3 s | 3,271 MB | stage 2d |
+| `renumber` | 128 KiB | `d62ada6b` (unstored) | 135.4 s | 2,307 MB | stage 2d |
+| `getid --add-referenced` | default | `b0db023a` | 39.0 s | 461 MB | pass 2 |
+| `getid --add-referenced` | 128 KiB | `62a4c1df` (unstored) | 41.2 s | 272 MB | ways read |
+| `build-geocode-index` | default | `08eed2c8` | 172.4 s | 13,309 MB | pass 2b |
+| `build-geocode-index` | 128 KiB | `76c97efb` (unstored) | 176.9 s | 12,874 MB | pass 2b |
+
+The r/route=bus pinned wall is not the change: its pass-2 schedule walk
+ran from page cache (57 ms against 6.5 s); its work phases are equal.
+
+Per command, what the sliding threshold costs (the 128 KiB arm's saving):
+
+- Affected, in the phase after the first pool ends: check `--refs` -9 %
+  (way phase), check `--ids --full` -7 %, repack -29 % and degrade -29 % (the
+  way phase, their peak, falls below the node phase), tags-filter two-pass
+  -11 % and with the relation closure -12 % (way-dependency and pass 2),
+  extract `--simple` -18 %, `--complete` -13 %, `--smart` -4 % at the run
+  peak and -21 % in its write phase, renumber -29 % (stage 2d), getid
+  `--add-referenced` -41 % (after the edge store already left the arenas),
+  apply-changes -26 %.
+- Affected inside one phase: time-filter -9 % and cat `--clean` -11 %. The
+  effect is not only between phases: any early free raises the threshold
+  for the rest of the run.
+- Barely affected: build-geocode-index -3 %; its peak is the builder's own
+  stores, not blob-scale buffers.
+- Not affected by construction, not measured: commands that hold no
+  blob-scale buffers across a pool (plain `inspect`, `cat` passthrough, `cat
+  --type`, `sort` on sorted input, `merge-changes`, plain `getid`), whose
+  planet peaks are small next to every row above.
+
+What it costs in wall: 1 to 5 % on the commands that allocate blob-scale
+buffers per blob, through mapping, faulting and unmapping each one. extract
+`--complete` way classify 16.7 to 19.4 s (minor faults 0.68 M to 10.6 M)
+and write 76.4 to 79.3 s (0.19 M to 14.4 M), apply-changes streaming 61.7
+to 64.7 s, getid pass 2 25.1 to 26.4 s, cat `--clean` +2.7 %, renumber
++3.1 %. check `--refs`, tags-filter, degrade and time-filter are within
+noise.
+
+### Higher fixed thresholds: 1 MiB and 4 MiB
+
+Interleaved cells, all unstored, in run order (default, then the fixed
+arm, or the reverse after the `fstrim`).
+
+| command | arm | UUIDs | walls | peak anon |
+|---|---|---|---|---|
+| `getid --add-referenced` | default | `d2a31f1e`, `0bb8cec6`, `5d2fcb80`, `cd3167f1`, `0c110f7f` | 39.8, 41.0, 41.0, 41.0, 41.0 s | 411, 441, 442, 425, 417 MB |
+| `getid --add-referenced` | 1 MiB | `b9f84be1`, `9d9ff652`, `7b0a2d89`, `eb501852` | 40.8, 41.8, 41.6, 41.9 s | 263, 278, 279, 261 MB |
+| `getid --add-referenced` | 4 MiB | `25fdc5e1`, `0285b427`, `bc09f777` | 40.3, 40.6, 41.1 s | 373, 368, 373 MB |
+| `extract --complete` | default | `bd8e67ab`, `0857e34d`, `e4333b70` | 120.4, 119.8, 119.7 s | 4,880, 4,894, 4,878 MB |
+| `extract --complete` | 1 MiB | `477613f2`, `c55f7329`, `71e15b3f` | 121.4, 120.6, 120.9 s | 4,549, 4,509, 4,537 MB |
+| `extract --complete` | 4 MiB | `a0a0f0d2`, `dc314727`, `3d8e733a` | 121.2, 121.3, 121.0 s | 4,660, 4,608, 4,611 MB |
+| `apply-changes` | default | `134f91d8`, `3ff91a4f`, then after `fstrim` `e44bdbee`, `8e1629d1`, `a7211d20` | 95.4, 99.6, 102.7, 97.0, 100.5 s | 1,899, 1,938, 1,901, 1,869, 1,903 MB |
+| `apply-changes` | 1 MiB | `ff41305a` | 95.7 s | 1,579 MB |
+| `apply-changes` | 4 MiB | `2b90f120`, `974babea`, `07c0709d`, then after `fstrim` `a4071c51`, `594adc58`, `298c3b62` | 92.3, 104.7, 102.5, 92.5, 97.8, 99.1 s | 1,777, 1,834, 1,686, 1,737, 1,872, 1,689 MB |
+| `renumber` | default | `5aa13b41`, `48a247a7` | 136.3, 136.3 s | 3,308, 3,250 MB |
+| `renumber` | 1 MiB | `10aca9cd` | 137.4 s | 2,506 MB |
+| `renumber` | 4 MiB | `0b726f57`, `f1ee10e1`, `5b4d01cc` | 127.6, 136.4, 138.6 s | 2,364, 2,322, 2,294 MB |
+| `cat --clean version` | default | `54121254`, `bf32566e` | 150.4, 150.3 s | 770, 779 MB |
+| `cat --clean version` | 4 MiB | `493a355c`, `1bb2d473` | 149.3, 149.6 s | 865, 864 MB |
+
+- 1 MiB keeps most of the saving, but getid pass 2 runs about 4 % slower
+  (26.3 to 28.2 s against 25.1 to 25.4 s; 21 M minor faults against 0.2 M).
+  The sequential blob reader allocates each compressed frame, about 1.8 MB
+  at planet, fresh per blob (`BlobReader::next_frame`, `src/read/blob.rs`),
+  so a threshold under the frame size maps and unmaps every frame.
+- 4 MiB is wall-neutral where measured (apply-changes medians 98.5 against
+  98.3 s over six cells each, getid, renumber, extract `--complete` +1.2 %)
+  and keeps a smaller saving (getid -15 %, apply-changes -9 %, renumber
+  -30 %, extract `--complete` -5 %), but raises cat `--clean`'s peak by
+  about 90 MB (12 %). A threshold fixed at 4 MiB from process start routes
+  every allocation below it through the arenas, where the default would
+  have mapped those above the value it slid to; that is a plausible reading
+  of the cat regression, not an attributed one.
+- No fixed value predicts a win everywhere: the request sizes of the
+  churned buffers (frames, encode and frame output) and of the
+  residue-forming ones overlap, and an explicit trim threshold governs only
+  the arena top, not the interior holes.
+
+Gaps, stated so they are not mistaken for absences: the 1 MiB and 4 MiB
+arms ran only on the commands above (not check `--refs`, tags-filter,
+extract `--simple`/`--smart`, repack, degrade, time-filter, check `--ids
+--full`, the geocode builder); `multi-extract`, `inspect --tags`, `diff`,
+`cat --dedupe`, add-locations-to-ways and check `--locations` were not
+measured at any fixed value. Where the extract `--complete` way-classify
+and write phases allocate what they free per blob is not attributed.
+
 ## check --ids and getparents read through projections (bygg, 2026-11-01)
 
 Both commands validate each blob through a `GroupProjection` on the block

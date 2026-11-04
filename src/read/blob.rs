@@ -838,6 +838,12 @@ impl<R: Read + Send> BlobReader<R> {
         // no reallocation. It is not free of zero-fill: a reader that
         // implements only `read` (`FileReader` does) gets std's default
         // `read_buf`, which zero-fills the spare capacity before each read.
+        // One fresh allocation per blob, so under a glibc mmap threshold
+        // below the frame size every frame is mapped and unmapped: at
+        // planet a 1 MiB threshold cost getid's second pass about 4 %
+        // (reference/performance.md, "glibc's sliding mmap threshold across
+        // commands"). Recycling frames would have to follow the frame's last
+        // `Bytes` slice, which a raw payload carries past decompression.
         let frame_len = header.payload_offset() + header.data_size;
         let mut blob_data = Vec::with_capacity(header.data_size);
         if let Err(err) = self.frames.read_payload(&mut blob_data) {

@@ -195,8 +195,11 @@ mod proc_metric_tests {
     }
 }
 
-/// Ask glibc to return free chunks above the trim threshold to the OS
-/// (`malloc_trim(0)`). Returns 1 if memory was released, 0 otherwise.
+/// Ask glibc to return free memory to the OS (`malloc_trim(0)`): every
+/// whole page inside a free chunk, in every arena, is released with
+/// `MADV_DONTNEED` whatever the trim threshold (which governs only the
+/// automatic trimming of an arena's top). Returns 1 if memory was released,
+/// 0 otherwise.
 ///
 /// Use at a phase boundary when glibc holds eligible freed heap chunks as
 /// anonymous RSS and returning them to the OS is useful. A former pipelined
@@ -204,8 +207,8 @@ mod proc_metric_tests {
 /// and freed them on the consumer; glibc retained those pages and this reached
 /// 25+ GB anon at scale. The current reader stores entries inline in its pooled
 /// decompression buffer, removing that specific cross-thread retention path.
-/// Calling `malloc_trim(0)` sweeps all arenas for free chunks above the trim
-/// threshold.
+/// It cannot lower a peak already reached inside a phase, and memory it
+/// releases faults back in when reused.
 ///
 /// Cost: a few ms per call at planet scale (one pass over the
 /// free-list). Cheap enough to fire per snapshot batch (~140
@@ -240,7 +243,19 @@ pub fn malloc_trim() -> i32 {
 /// mapping, faulting and unmapping. The per-blob mapping a high pin avoids
 /// was costly only under a two-arena cap ([`cap_malloc_arenas`]): with
 /// glibc's default arenas, time-filter and repack at planet ran the same
-/// wall with or without a 32 MiB pin, so the CLI sets none.
+/// wall with or without a 32 MiB pin.
+///
+/// The sliding threshold itself costs memory: it rises at the first free of
+/// a blob-scale mapped buffer, after which such buffers come from the arenas
+/// and their freed interior memory stays resident. At planet a pin at
+/// 128 KiB cut every multi-phase command's peak anon by 4 to 41 % but cost
+/// 1 to 5 % wall in the commands that allocate a blob-scale buffer per blob
+/// (each one mapped, faulted and unmapped); 1 MiB kept most of the saving
+/// but cost getid about 4 % (each ~1.8 MB compressed frame is allocated
+/// fresh per blob); 4 MiB was wall-neutral where measured and saved 5 to
+/// 30 %, but raised cat `--clean`'s peak by 12 %. No value was a uniform
+/// win, so the CLI sets none (reference/performance.md, "glibc's sliding
+/// mmap threshold across commands", which holds every cell).
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.

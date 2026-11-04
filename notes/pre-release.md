@@ -228,32 +228,31 @@ ledger does not bound pages glibc retains. apply-changes now bounds outstanding 
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-169: A large free between phases leaves later phases arena-resident
+### WRK-169: glibc's sliding mmap threshold keeps freed buffers resident
 
-Found landing getid's relation closure (reference/performance.md, "getid
---add-referenced follows relation members"): freeing a 17-33 MB `Vec`
-between two pread pools raised glibc's dynamic mmap threshold, so every
-later decompress buffer came from the malloc arenas and stayed resident
-once freed, +170-190 MB peak anon at planet with nothing live
-(`mallinfo2`: 541 MB arena, 0.2 MB in use). getid now keeps that store in
-its own anonymous mapping. The mechanism is not getid's: any multi-phase
-command that frees a large `Vec` (or retained decode buffers) between
-phases pays it, and the phase order decides by how much. Candidates by
-shape: `check --refs` (node, way, relation phases), tags-filter's closure
-and way-dependency phases, extract's passes. Seen in repack (and so
-degrade, the same phases): a diagnostic cell at `1f93e674` (sidecar
-`4ca7a7a9`, reference/performance.md "repack and degrade encode each blob
-on its worker") has the node phase's decode buffers in mmapped chunks
-(`hblkhd` 435-489 MB, arena about 216 MB); they are freed when its pools
-end, and the way phase then ran about 0.6 GB live in a 1.14 GB arena (with
-32 idle executor threads started at the node phase's end, which those
-commands no longer start). The way phase is now both commands' planet peak,
-777-800 MB, against `cat --clean`'s 766 MB over the same blobs in one pass,
-so what the mechanism still costs there is small; not re-instrumented after
-the change. Survey with the
-`emit_mallinfo2` counters at phase boundaries (check --refs already emits
-them) before deciding between per-site mappings and a shared remedy; the
-library cannot tune the allocator itself (ADR-0016), the CLI could.
+Surveyed at planet: reference/performance.md, "glibc's sliding mmap
+threshold across commands" holds every cell, per-command verdicts and the
+gaps. Every multi-phase command pays it, and not only between phases: the
+first free of any blob-scale mapped buffer raises the threshold for the
+rest of the run. A CLI-wide fixed threshold was measured at 128 KiB, 1 MiB
+and 4 MiB and none passes both the wall guard and the no-memory-regression
+bar on every command, so nothing landed and the CLI still sets no policy.
+Two things remain:
+
+- Decision for the user: whether to accept one of the measured trades (the
+  section lists what each value costs and saves) or keep the current
+  default.
+- Structural route, to make a low threshold stop costing wall: remove the
+  per-blob allocate-and-free of blob-scale buffers. One site is
+  demonstrated: `BlobReader::next_frame` allocates every compressed frame
+  fresh (the 1 MiB arm's getid cost); recycling has to follow the frame's
+  last `Bytes` slice, which raw payloads carry past decompression
+  (`PooledBuffer` in `src/read/decompress.rs` is the ownership precedent).
+  The other churn sites, in extract `--complete`'s way classify and write
+  phases (minor faults up twentyfold under a 128 KiB threshold), are not
+  attributed. Removing a site removes one source of the wall cost; it does
+  not by itself promise a low threshold becomes free. Bounded pooled storage
+  retains idle memory, so it has to be weighed against the saving.
 
 ### WRK-172: Idle executor threads between pools cost about 180 MB
 
@@ -871,8 +870,9 @@ What a session picking this up needs that is not written elsewhere:
   blob, because a query hits few blobs.
 - **glibc realloc** (`research/glibc/malloc/malloc.c`): an mmapped chunk
   grows by `mremap`; an arena chunk grows in place or moves. Freeing an
-  mmapped chunk raises the process-wide `mmap_threshold` to its size (32 MiB
-  cap) and `trim_threshold` to twice that, which is why buffers that stop
+  mmapped chunk raises the process-wide `mmap_threshold` to its chunk size
+  (chunks up to 32 MiB; a larger free leaves it alone) and `trim_threshold`
+  to twice that, which is why buffers that stop
   being freed can push later allocations onto mmap (time-filter paid 29 s of
   kernel time for it before `5bfa37ab` pinned the threshold, but only under
   the two-arena cap). Read the source rather than reasoning from memory.
@@ -882,7 +882,13 @@ What a session picking this up needs that is not written elsewhere:
   under it. Every measured re-encoding command paid 10 to 82 % more planet
   wall for it, apply-changes 20x; the memory it was added for had already
   gone with the decode-side string tables.
-  The CLI sets no allocator policy; measure before adding any.
+  The CLI sets no allocator policy; fixed mmap thresholds were measured
+  across commands at planet (reference/performance.md, "glibc's sliding
+  mmap threshold across commands") and none was a uniform win.
+- **brokkr does not see glibc tunables** (2026-11-04): a
+  `GLIBC_TUNABLES` arm is invisible to `results.db` (not captured, so not
+  greppable), and `--force` on a clean tree stores the cell as if it were
+  the default. Run such arms with the tree dirty so they stay unstored.
 - **Per-blob decode buffers at planet** (`5bfa37ab`): the old 4x-compressed
   reservation plus the table append put every buffer over the pool's cap,
   and glibc kept the freed memory resident. Raising the cap alone made it

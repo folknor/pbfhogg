@@ -1476,6 +1476,16 @@ pub enum PageCachePolicy {
 ///
 /// `Ambient` uses whatever pool the calling thread is in, or rayon's global
 /// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
+/// Under `Ambient` off any pool the library starts rayon's global pool at its
+/// first job, if nothing has yet. When a pool starts is a memory question
+/// under glibc: a thread takes its malloc arena at its first allocation, an
+/// arena whose threads have all exited before a new one, and every rayon
+/// worker allocates as it starts. A pool started during a call just after one
+/// of the call's worker sets ended takes those workers' arenas with the free
+/// memory in them, which it strands if it then idles and reuses if it then
+/// works; a pool started before the call never gets them, and the next worker
+/// set does. Neither order suits every command (reference/performance.md,
+/// "Idle executor threads take exited workers' arenas").
 /// `Pool` confines the work to the caller's pool. A caller can check where a
 /// writer's framing ran: the invocation counter
 /// `writer_payload_framed_on_executor_items` counts the framed payloads whose

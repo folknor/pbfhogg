@@ -316,6 +316,12 @@ state.
   blob holding at least the cap as its own block, where it used to merge it
   with smaller input blobs that follow; an input whose blobs are all above
   or all below the cap repacks as before.
+- `repack` of an input already written at the cap (any extract at the
+  default 8000 elements per blob) peaks lower: each phase's last, short
+  block no longer starts the framing thread pool just after the phase's
+  workers exit, where its idle threads kept those workers' freed memory.
+  A planet written at 8000 per blob peaks at about 0.59 GB against 0.62 to
+  0.69 GB on bygg, at the same speed. Output is unchanged.
 - Commands that decode on a worker pool recycle right-sized decode buffers
   instead of allocating one per blob, which lowers their peak memory.
 - `diff` runs one engine at every `-j`: each input is read once as one

@@ -265,6 +265,8 @@ writer.flush()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Under `Ambient` off any pool, rayon's global pool starts at the first framing job unless something started it earlier. Under glibc, when a pool starts decides which memory its threads reuse: each thread takes its malloc arena at its first allocation, preferring one left by threads that have exited, and rayon workers allocate as they start. A pool started just after another set of worker threads ended takes those threads' arenas and the free memory in them, which stays resident while the pool idles; a pool built before the work starts never takes them. Neither order is better for every workload.
+
 Three things follow from handing the writer a pool:
 
 - Thread-local framing and decompression scratch persists on whichever pool's threads ran it, for as long as those threads live. Release every owner of the pool, including its writers, to let its workers exit and free that scratch; dropping a pool does not join its workers.

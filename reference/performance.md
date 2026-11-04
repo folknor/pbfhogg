@@ -1731,8 +1731,85 @@ builds (its blobs hold exact multiples of the cap, so neither has a
 remainder there). In the HEAD cells the merge thread framed the node
 phase's one remainder (its last blob's) through the executor, which started
 its 32 threads before the way phase (65 threads at peak there, against 33
-in the change cells, which start none at planet). Why those idle threads
-cost about 180 MB of peak was not attributed.
+in the change cells, which start none at planet). Those idle threads held
+the node workers' freed arena memory; see the next section.
+
+### Idle executor threads take exited workers' arenas (bygg, 2026-11-04, against `a82e23bc`)
+
+**Mechanism.** glibc gives a thread its malloc arena at the thread's first
+allocation, and `arena_get2` takes an arena off `free_list` (arenas whose
+every thread has exited, pushed by `__malloc_arena_thread_freeres`) before
+it creates one (`research/glibc/malloc/arena.c`). Every rayon worker
+allocates as it starts (rayon-core 1.13: `main_loop`, `WorkerThread::from`,
+`JobFifo::new`, a crossbeam `Injector` block, before the worker reports
+itself started). So the CLI's executor, rayon's global pool started at its
+first job, takes whichever arenas a just-ended worker pool left, free
+memory and all, if its first job comes after that pool ended.
+
+**Attribution** (uncommitted diagnostic: repack dumped per-arena
+`malloc_info` at the node phase's end, after an `executor.spawn` of an
+empty job there, and at the way phase's midpoint; planet
+`planet-20260223-with-indexdata`, `--bench 1`, sidecar sessions `7dc1d843`
+and `ec9d7037`):
+
+- At the node phase's end 30 node-worker arenas held 316 MB, 314 MB of it
+  free.
+- Lazy start (the CLI as it is): at the way midpoint those 30 arenas were
+  unchanged to the byte, held by the 32 idle executor threads, and 30 new
+  arenas had grown to 21-36 MB each for the way workers: 1,130 MB held in
+  65 arenas. Way phase peak anon 1,055 MB, relation phase 974 MB, wall
+  147.7 s.
+- The CLI building the global pool before dispatch (`build_global`, which
+  waits until every worker has started): the 32 executor arenas stayed at
+  0.13 MB each, the way workers took the 30 node arenas (about 11 to 26 MB
+  each) and no arena was created: 787 MB held. Way peak anon 758 MB,
+  relations 689 MB, wall 147.3 s.
+
+That is the 180 MB of the section above, measured there at `1f93e674`.
+
+**Starting the pool early is no general cure.** The same early start
+measured on planet `build-geocode-index` (interleaved, `a82e23bc` from
+brokkr's worktree `410c8832`, `87ea7677`, against unstored sessions
+`7b56aa31`, `32ba68ea`): walls 173.8 and 171.1 s against 171.7 and
+173.2 s, peak anon 13,299 and 13,302 MB against 13,309 and 13,323 MB, but
+every phase from `GEOCODE_PASS2_ADMIN_ASSEMBLY` (the builder's first
+executor job, after its pass 2 scan pools ended) to the end peaked 320 to
+420 MB higher in RSS, p50 anon 4.67 and 4.78 GB against 5.07 and 5.18 GB.
+There the lazily started executor inherits the pass 2 workers' arenas and
+does the heavy parallel work in them; started early it grows its own while
+those sit unused. Which order wins depends on whether the pool that starts
+after a worker set ends then works or idles, so the CLI keeps the lazy
+start and the `Executor` rustdoc states the consequence for library
+callers.
+
+**The change**: what the executor was started for at repack's phase
+boundaries was one block, the phase's residual after its pool ended. On an
+input whose blobs hold exactly the cap, the last input blob of each kind is
+below it, so its elements go to the merge thread's builder and its final
+flush was the executor's first job. The merge thread now frames that
+residual itself and writes it raw. Output is byte-identical
+(`denmark-20260220-seq4704-with-indexdata`, at the default cap and at
+20000). degrade has no such block outside its unsort modes. Under those
+every element goes through the merge thread's builder, which usually starts
+the executor during the first phase; an input whose first phase completes
+no block before the final flush still starts it after the pool ends. Not
+changed: degrade's unsort modes produce adversarial test inputs.
+
+Planet written at 8000 elements per blob (`--snapshot 8k`), `--bench 1`,
+`a82e23bc` from brokkr's worktree (stored) against the change (unstored
+sessions), run order HEAD, change, change, HEAD:
+
+| arm | walls (s) | peak threads, way phase | way phase peak anon (MB) | peak anon (MB) |
+|---|---|---|---|---|
+| `a82e23bc` (`7d437f6d`, `41ab9a1c`) | 255.4, 256.8 | 65 | 583, 496 | 687, 619 |
+| change (`7ac2425b`, `40ef3705`) | 260.0, 255.7 | 33 | 479, 458 | 580, 593 |
+
+The node, way and relation phases run the same time in all four (88.3 to
+89.0, 51.4 to 51.8 and 1.33 to 1.36 s); the 4.4 s wall difference in the
+first pair is the schedule scan (114 against 118 s), which the change does
+not touch. Germany (`germany-20260224-seq4704-with-indexdata`), one cell
+each, the lazy trigger at HEAD (`17a4601d`) against an early-started pool
+(session `ecf95439`): way phase peak anon 224 against 206 MB.
 
 ### apply-changes' memory step at the node-to-way transition (bygg, 2026-11-02, against `2cd85f7e`)
 

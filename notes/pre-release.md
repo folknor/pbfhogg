@@ -254,23 +254,27 @@ Two things remain:
   not by itself promise a low threshold becomes free. Bounded pooled storage
   retains idle memory, so it has to be weighed against the saving.
 
-### WRK-172: Idle executor threads between pools cost about 180 MB
+### WRK-172: Other commands whose executor starts idle after a worker set
 
-At `1f93e674` repack's and degrade's merge thread framed the node phase's
-one remainder on the executor, which started rayon's 32 threads before the
-way phase; the way phase then peaked at 956-962 MB with 65 threads, against
-777-800 MB with 33 once the workers framed it themselves and nothing
-started the executor (reference/performance.md, "repack and degrade encode
-each blob on its worker"). The way phase's work is identical in both, so the
-threads themselves cost it. Not attributed. A guess to test, not a finding:
-glibc hands an exiting thread's arena to the next thread that allocates
-(`get_free_list` in `research/glibc/malloc/arena.c`), so executor threads
-that allocate at start-up take the node workers' arenas, with the free
-memory in them, and the way workers get fresh arenas instead. apply-changes
-starts the same pool mid-run (its node-to-way transition), and its
-diagnostic found under 2 MB in each of those 32 arenas, which a per-arena
-`malloc_info` around the start would square with or refute. Matters to any
-command that first touches the executor between two pools.
+Attributed and fixed for repack (reference/performance.md, "Idle executor
+threads take exited workers' arenas"): a lazily started executor whose
+first job comes just after a worker set ended takes that set's arenas with
+their free memory, and strands it if it then idles. Starting the pool
+early is rejected as a CLI policy (it cost the geocode builder 320-420 MB
+through pass 2 and 3, where the executor works after a set ends), so each
+remaining case is fixed where it arises, by not handing the executor a lone
+job at a phase boundary. Not surveyed: where the other executor users take
+their first job - the pipelined writer in every other command that hands it
+blocks to frame, extract simple's par-iterators, merge-changes and the OSC
+tags-filter. A command shows it as `peak_threads` rising by the executor's
+count right after a phase's pool ends while the next phase's work runs on
+its own workers. degrade has central blocks only under its unsort modes;
+those usually start the executor during the first phase, but a phase whose
+held elements never reach a block until the final flush starts it after the
+pool ends, as repack did (left: an adversarial-input generator). The
+geocode builder and apply-changes (its workers persist across the start;
+its diagnostic's under-2 MB executor arenas are the fresh-arena case) are
+covered.
 
 ### WRK-027: Membership track for set-dominated peaks
 

@@ -25,9 +25,12 @@
 //! boundaries, so a cap larger than the input blobs fires correctly. Before
 //! it writes a shrink blob's frames it flushes that builder, so the lower
 //! IDs it holds precede the frames' higher ones and the output keeps
-//! `Sort.Type_then_ID`. Every block the merge thread's builder completes is
-//! handed to the pipelined writer, which frames it on its executor in
-//! sequence order with the raw frames around it.
+//! `Sort.Type_then_ID`. Every block the merge thread's builder completes
+//! while the phase's pool runs is handed to the pipelined writer, which
+//! frames it on its executor in sequence order with the raw frames around
+//! it. The phase's last block, its builder's residual after the pool has
+//! ended, the merge thread frames itself and writes raw (see
+//! `run_kind_phase`).
 //!
 //! So a shrink blob's remainder never coalesces with what follows it: the
 //! output's blocks for that blob depend on that blob alone. Repacking the
@@ -563,9 +566,30 @@ fn run_kind_phase(
         host,
     )?;
 
-    // Final flush: the residual block (if any) for this kind.
-    flush_local(&mut bb, &mut output)?;
-    central_blobs += write_central(&mut output, writer)?;
+    // Final flush: the residual block (if any) for this kind, framed here on
+    // the merge thread and written raw, not handed to the writer's executor.
+    // The pool has ended, and on an input whose blobs hold exactly the cap
+    // (any extract written at the default cap) this one block - the last
+    // input blob's below-cap remainder - is the phase's only central block.
+    // Handed to the executor it is the executor's first job: under the CLI's
+    // lazily started global pool, its threads start now, each takes at its
+    // first allocation one of the arenas glibc kept from the pool's exited
+    // workers, with their free memory, and idles on it while the next
+    // phase's workers grow fresh arenas. Planet repack with its executor
+    // started here peaked about 300 MB higher in its way phase
+    // (reference/performance.md, "Idle executor threads take exited
+    // workers' arenas"). One block gains nothing from parallel framing.
+    // Starting the executor early instead is no general cure: a pool that
+    // does real work after a phase (the geocode builder's) loses the reuse.
+    // The closure drains `output` after every result, so nothing precedes
+    // the residual.
+    let mut residual =
+        crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer);
+    flush_local(&mut bb, &mut residual)?;
+    for (_, frame) in residual.frames {
+        writer.write_raw_owned(frame)?;
+        central_blobs += 1;
+    }
 
     let blobs = worker_full_blobs + worker_tail_blobs + central_blobs;
     Ok(PhaseStats {
@@ -581,7 +605,8 @@ fn run_kind_phase(
 
 /// Hand every block in `output` to the pipelined writer, which frames it on
 /// its executor (with its index and tagdata) and writes it in submission
-/// order; returns how many there were.
+/// order; returns how many there were. Used while the phase's pool runs; the
+/// phase's residual is framed on the merge thread instead.
 fn write_central(
     output: &mut Vec<OwnedBlock>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,

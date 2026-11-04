@@ -373,7 +373,8 @@ pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 /// folding them together would either throttle framing behind a slow head
 /// or admit as many queued input blocks as the window allows.
 ///
-/// It counts items, not bytes. The value is headroom above what planet runs
+/// It counts items, not bytes; the bytes its reorder-buffer leg held at peak
+/// are `writer_reorder_bytes_high_water`. The value is headroom above what planet runs
 /// were seen to need - a reorder span in the low hundreds behind a slow
 /// head, plus the dispatch permits and the channel - so that ordinary input
 /// does not wait on it; it is not a guarantee that no input ever does.

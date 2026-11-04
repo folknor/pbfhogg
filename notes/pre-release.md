@@ -419,16 +419,6 @@ it.
 
 ## Documentation and comment corrections
 
-### WRK-063: Resident bytes in the writer reorder buffer
-
-`writer_reorder_high_water` (seq span) and `writer_reorder_filled_high_water`
-(occupied slots) are documented and recorded, but no counter gives the bytes
-held there, so memory attribution from them stays inferred. A byte peak needs
-per-chunk accounting across `Raw` / `RawChunks` (allocated
-capacity, not length), `CopyRange` (no bytes) and error slots, added on push
-and subtracted on pop in `deliver_in_order`; it is per blob on every
-pipelined writer, so it needs its own matched A/B.
-
 ### WRK-168: The guide's inspect tags speedup row compares different counts
 
 `docs/guide/performance.md`, "CLI command benchmarks" (Denmark, commit

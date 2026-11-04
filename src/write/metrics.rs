@@ -24,7 +24,8 @@ crate::counters::counter_set! {
         /// included, sampled after each push (so fully ordered output reads
         /// one). Not filled slots and not resident frames: a span of 200
         /// can hold a single early arrival. Residency is
-        /// `writer_reorder_filled_high_water`; the name keeps its original
+        /// `writer_reorder_filled_high_water` in slots and
+        /// `writer_reorder_bytes_high_water` in bytes; the name keeps its original
         /// meaning so stored runs compare like with like.
         pub reorder_high_water => "writer_reorder_high_water",
         /// Peak occupied result slots in that reorder buffer, sampled at the
@@ -34,6 +35,19 @@ crate::counters::counter_set! {
         /// buffers. The two peaks can occur at different moments, so their
         /// difference is not the peak number of holes.
         pub reorder_filled_high_water => "writer_reorder_filled_high_water",
+        /// Peak owned output-buffer capacity held in those occupied slots,
+        /// in bytes, sampled at the same point (so fully ordered output reads
+        /// one item's buffers). Capacity, not length: a `Raw` buffer's
+        /// capacity, a `RawChunks`'s buffers plus its outer vector; a
+        /// `CopyRange` and a framing error count zero. Not counted: the
+        /// input file a `CopyRange` keeps open, an error's own allocation,
+        /// the buffer's slot storage, allocator overhead, items still in the
+        /// channel ahead of the buffer, and bytes past the handoff. Across an
+        /// invocation it is the largest single writer's peak, not the sum of
+        /// concurrent writers' buffers; the span, filled and byte peaks can
+        /// come from different writers and moments, so their ratio is not a
+        /// mean frame size.
+        pub reorder_bytes_high_water => "writer_reorder_bytes_high_water",
         /// Time blocked waiting for a sequence permit in `ParallelGzipWriter`.
         pub parallel_gzip_reorder_wait_ns => "writer_parallel_gzip_reorder_wait_ns",
         /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
@@ -255,11 +269,13 @@ impl WriterMetrics {
         self.bytes_written.fetch_add(len, Relaxed);
     }
 
-    /// Record both reorder levels after a push: `span` is
-    /// `ReorderBuffer::pending_len`, `filled` is `ReorderBuffer::filled_len`.
-    pub fn record_reorder_high_water(&self, span: usize, filled: usize) {
+    /// Record the three reorder levels after a push: `span` is
+    /// `ReorderBuffer::pending_len`, `filled` is `ReorderBuffer::filled_len`,
+    /// `bytes` the output-buffer capacity its occupied slots hold.
+    pub fn record_reorder_high_water(&self, span: usize, filled: usize, bytes: u64) {
         crate::counters::record_max(&self.reorder_high_water, span as u64);
         crate::counters::record_max(&self.reorder_filled_high_water, filled as u64);
+        crate::counters::record_max(&self.reorder_bytes_high_water, bytes);
     }
 
     /// Emit the counters, at most once per invocation.

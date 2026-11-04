@@ -4220,6 +4220,31 @@ the low hundreds, about 25 MB of 146 KB raw items on apply-changes and
 about 270 MB of 1.3 MB frames on altw external) sit below the window. It
 replaces the unbounded worst case behind a slow head with backpressure.
 
+### Reorder buffer bytes (bygg, 2026-11-04)
+
+`writer_reorder_bytes_high_water` reports the peak output-buffer capacity
+held in the pipelined writer's occupied reorder slots, sampled with the
+span and filled peaks (definition in `src/write/metrics.rs`). Planet,
+interleaved `--bench 1` after `fstrim`. Baseline cells are `184fe3d6`;
+variant cells are that commit plus the uncommitted counter, run with
+`--force`, so they have no UUID.
+
+| Command | Cell | Wall | Reorder span / filled | Reorder bytes |
+|---|---|---:|---:|---:|
+| cat --clean | variant | 144.6 s | 1 / 1 | 2.1 MB |
+| | `612ed3eb` base | 145.9 s | | |
+| altw external | variant | 327.7 s | 231 / 231 | 466 MB |
+| | `467a50a9` base | 343.8 s | | |
+
+The variant is not slower in either pair; the altw delta sits in stage 1's
+relation scan, before the writer receives anything, so it is drive and
+cache state, not the counter. The byte peak is about 2.0 MB per slot,
+above the 1.3 MB mean frame, so the earlier slots-times-mean estimate of
+about 270 MB undercounted what altw external holds there. cat --clean and
+apply-changes now send pre-framed raw items in order from the producer
+(`writer_payload_framed_items` 0), so their reorder buffer holds one item
+at a time and the counter reads the largest single item.
+
 ## Apply-changes sequence window (bygg, 2026-10-31)
 
 The apply-changes scanner admits each blob seq against a window

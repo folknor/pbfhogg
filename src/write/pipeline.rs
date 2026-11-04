@@ -51,6 +51,32 @@ pub(crate) enum OutputChunk {
     },
 }
 
+impl OutputChunk {
+    /// Owned output-buffer capacity this chunk holds, in bytes: what
+    /// `writer_reorder_bytes_high_water` counts per occupied slot. Capacity,
+    /// not length, because a caller-supplied raw buffer can carry spare
+    /// capacity that is just as resident; a `RawChunks` adds its outer vector
+    /// of buffer descriptors. A `CopyRange` holds no output buffer.
+    fn buffer_capacity(&self) -> u64 {
+        match self {
+            Self::Raw(bytes) => bytes.capacity() as u64,
+            Self::RawChunks(chunks) => {
+                let outer = (chunks.capacity() as u64) * (size_of::<Vec<u8>>() as u64);
+                chunks
+                    .iter()
+                    .fold(outer, |sum, chunk| sum + chunk.capacity() as u64)
+            }
+            Self::CopyRange { .. } => 0,
+        }
+    }
+}
+
+/// [`OutputChunk::buffer_capacity`] of one reorder-buffer entry; a framing
+/// error holds no output buffer.
+fn slot_buffer_capacity(entry: &Result<OutputChunk>) -> u64 {
+    entry.as_ref().map_or(0, OutputChunk::buffer_capacity)
+}
+
 /// A chunk with its sequence number, ready for the writer thread.
 ///
 /// `data` is `Result<OutputChunk>` because framing runs on rayon workers
@@ -731,7 +757,7 @@ pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch, metrics: 
 /// workers are propagated in order via `Result<OutputChunk>`. For pipeline
 /// items, every backend records `writer_recv_wait_ns`,
 /// `writer_reorder_high_water`, `writer_reorder_filled_high_water`,
-/// `writer_handoff_ns` (around [`hand_off`]
+/// `writer_reorder_bytes_high_water`, `writer_handoff_ns` (around [`hand_off`]
 /// only; the sink's [`after_drain`](OutputSink::after_drain) is outside it)
 /// and `writer_bytes_written` here; the header frame and the synchronous
 /// writer account for themselves at their own sites.
@@ -763,6 +789,10 @@ pub(super) fn deliver_in_order<S: OutputSink>(
 ) -> Result<()> {
     let mut pending: ReorderBuffer<Result<OutputChunk>> =
         ReorderBuffer::with_max_window(WRITE_AHEAD, PIPELINE_DELIVERY_WINDOW);
+    // Sum of `slot_buffer_capacity` over the occupied slots: added on push,
+    // subtracted on pop, and nothing mutates an entry in between, so it is
+    // exact. Local to this loop; an early return abandons it with the buffer.
+    let mut pending_bytes: u64 = 0;
 
     loop {
         let t_recv = crate::counters::Stopwatch::start();
@@ -771,11 +801,18 @@ pub(super) fn deliver_in_order<S: OutputSink>(
             Err(_) => break,
         };
         metrics.record_recv_wait(t_recv);
+        let item_bytes = slot_buffer_capacity(&item.data);
         pending.push(item.seq, item.data);
-        metrics.record_reorder_high_water(pending.pending_len(), pending.filled_len());
+        pending_bytes += item_bytes;
+        metrics.record_reorder_high_water(
+            pending.pending_len(),
+            pending.filled_len(),
+            pending_bytes,
+        );
 
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
+            pending_bytes -= slot_buffer_capacity(&result);
             let chunk = result?;
             metrics.time_handoff(|| hand_off(sink, chunk, metrics))?;
             inbox.window.send(()).ok();
@@ -959,6 +996,50 @@ mod tests {
         result.unwrap();
         assert_eq!(metrics.reorder_high_water.load(Relaxed), 4);
         assert_eq!(metrics.reorder_filled_high_water.load(Relaxed), 2);
+        // Each fixture frame is `vec![seq]`, one byte of capacity.
+        assert_eq!(metrics.reorder_bytes_high_water.load(Relaxed), 2);
+    }
+
+    /// `writer_reorder_bytes_high_water` counts owned buffer capacity per
+    /// occupied slot: spare capacity counts, a `RawChunks` adds its outer
+    /// vector, and a framing error holds nothing. Popping subtracts exactly
+    /// what the push added, so a later peak is not inflated by delivered
+    /// items, and the error pop ends the loop with the error.
+    #[test]
+    fn reorder_bytes_count_capacity_per_occupied_slot() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);
+        let send = |seq, data| tx.send(PipelineItem { seq, data }).unwrap();
+        let spare = Vec::with_capacity(1000);
+        let mut outer = Vec::with_capacity(4);
+        outer.push(Vec::with_capacity(300));
+        outer.push(Vec::with_capacity(200));
+        let outer_bytes = 4 * size_of::<Vec<u8>>() as u64;
+
+        // Seqs 1 and 2 wait behind seq 0: 1000 + chunks, peak with seq 0's
+        // 10 on top, all three then delivered.
+        send(1, Ok(OutputChunk::Raw(spare)));
+        send(2, Ok(OutputChunk::RawChunks(outer)));
+        send(0, Ok(OutputChunk::Raw(Vec::with_capacity(10))));
+        // An error slot behind seq 3 adds nothing; seq 3 alone is far below
+        // the earlier peak, and the error is what the loop returns.
+        send(4, Err(crate::error::Error::internal("framing failed")));
+        send(3, Ok(OutputChunk::Raw(Vec::with_capacity(7))));
+        drop(tx);
+
+        let mut sink = RecordingSink {
+            written: Vec::new(),
+            after_drains: 0,
+        };
+        let result = deliver_in_order(&Inbox::detached(rx), &mut sink, &SeqTotal::new(), &metrics);
+        let err = result.expect_err("seq 4 is a framing error");
+        assert!(err.to_string().contains("framing failed"), "{err}");
+        assert_eq!(
+            metrics.reorder_bytes_high_water.load(Relaxed),
+            1000 + 300 + 200 + outer_bytes + 10
+        );
     }
 
     /// The between-items hook runs once per received item and never before

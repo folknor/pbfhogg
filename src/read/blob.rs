@@ -334,6 +334,12 @@ impl Blob {
 
     /// Decompress into a buffer from `pool`, which the caller hands back
     /// (through `pool_wrap`) when done with it.
+    ///
+    /// Measured: every pipelined block decode decompresses here, and nothing
+    /// below it carries a measure point, so without this one a `--hotpath`
+    /// profile folds decompression into `run_pipeline`. The span covers the
+    /// pool checkout and size checks as well as the codec.
+    #[hotpath::measure]
     pub(crate) fn decompress_pooled(&self, pool: &Arc<DecompressPool>) -> Result<Vec<u8>> {
         let mut buf = pool_get(Some(pool), self.blob.estimated_capacity());
         decompress_parsed_blob_into(&self.blob, &mut buf)?;

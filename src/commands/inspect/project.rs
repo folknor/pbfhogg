@@ -27,6 +27,10 @@ use super::types::{BlockKind, ScanState, TypeIdRange, UserNames, classify_block,
 /// collectors the flags name, validating it through the inspect projection
 /// (`BlockBuffer::project`, which also applies the buffer's kind-claim
 /// refusal); returns the state with the block's kind and element count.
+///
+/// Measured once per data blob, so a `--hotpath` profile of the full-decode
+/// inspect splits validation plus projection from decompression.
+#[hotpath::measure]
 pub(super) fn scan_block_buffer(
     buffer: BlockBuffer<'_>,
     show_id_ranges: bool,

@@ -456,13 +456,6 @@ commit and were not checked for the same issue.
 
 ## Tooling
 
-### WRK-071: inspect rows stored under other command names
-
-`brokkr results --command inspect` misses the denmark `fileinfo --extended`
-row `e4f4508c` (`23862d1`), stored under command `fileinfo`. The hotpath
-rows stored as `inspect` are tags-count runs, so no profile of the
-full-decode path exists.
-
 ### WRK-072: Allowlist gaps met during measurement
 
 `sudo fstrim -av` (AGENTS.md asks for it before a matched suite) and

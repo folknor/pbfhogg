@@ -74,6 +74,21 @@ usually small.
   `678478d`, so its ~7 GB churn - led by `parse_and_inline_with_scratch`
   1.7 GB, `parallel_scan_blobs_raw` and `parallel_classify_phase` 1.6 GB
   each - is real; older alloc profiles do not compare.
+- **A row's `command` is the brokkr subcommand that ran, not the pbfhogg
+  one; `cli_args` is.** The 20 `inspect` hotpath rows of 2026-02-28 to
+  2026-03-07 are tags counting (brokkr's `inspect` drove `pbfhogg
+  tags-count`, later `inspect tags`), and the 2026-03-01 extended-metadata
+  scan `e4f4508c` is stored under `fileinfo`, the subcommand `inspect`
+  replaced. Select by argv (`--grep extended`, `--grep tags`), not by
+  `--command`. The first hotpath profile of the full-decode inspect
+  (`inspect --extended`) postdates them: from the change that measures
+  `Blob::decompress_pooled` and the projection scan `scan_block_buffer`
+  per blob, it splits decompression from validation plus projection, where
+  before both folded into `run_pipeline` (denmark, `a9eb4708` plus that
+  change, bygg, unstored: 7,396 blobs, `scan_block_buffer` 1.82 core-s,
+  `decompress_pooled` 1.54 core-s, in a 0.19 s wall). `decompress_pooled`
+  serves every pipelined block decode and includes the pool checkout and
+  size checks, so its share is an upper bound on codec cost.
 - **`writer_write_ns` is retired (2026-10-26); it never meant one thing.**
   On the buffered, `O_DIRECT` and io_uring backends it was writer-thread
   wall inside the backend write; on the `pwrite` pool (the default for

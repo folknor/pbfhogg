@@ -254,9 +254,13 @@ shares (`src/commands/blob_merge.rs`).
    `OVERLAP_RUN_WINDOW_PER_WORKER` runs per worker, so the output buffered
    is bounded whatever the input. A sweep's open cursors are not: they pin
    the decoded blocks of whatever overlaps the current position, which one
-   blob spanning a kind's whole ID range makes the whole kind; past
-   `SWEEP_PINNED_BYTES` mostly consumed cursors are demoted to owned tails,
-   and bounding a dense overlap would take an external merge.
+   blob spanning a kind's whole ID range makes the whole kind, and a cursor
+   over an internally unsorted blob also holds one view per element, which
+   at planet density outweighs the block. Both are charged against
+   `SWEEP_PINNED_BYTES`; past it mostly consumed cursors are demoted to owned
+   tails, and bounding a dense overlap would take an external merge. What
+   the sweeps held is reported in the `overlap_run_*` counters
+   (`src/commands/blob_merge/sweep.rs`, "Resource counters").
 
 Under `--direct-io` both passes read `O_DIRECT`: pass 1 through
 `HeaderWalker::open_direct`, pass 2 through one direct descriptor per

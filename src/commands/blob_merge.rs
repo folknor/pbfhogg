@@ -931,11 +931,52 @@ pub(crate) struct WriteCounts {
     pub(crate) copy_range_coalesced: u64,
 }
 
-/// What one overlap run emitted.
+/// What one overlap run emitted, and what it held while it ran (the
+/// resource figures of `sweep.rs`'s module docs).
 #[derive(Debug, Default)]
 struct RunCounts {
     elements: u64,
     duplicates: u64,
+    pinned_high_water: usize,
+    demoted: u64,
+    chunks: u64,
+    chunk_high_water: usize,
+    staged_high_water: usize,
+}
+
+/// The resource figures of every run, folded as the write loop finishes
+/// each: maxima of the high-water marks, sums of the counts.
+#[derive(Default)]
+struct RunResources {
+    pinned_high_water: usize,
+    demoted: u64,
+    chunks: u64,
+    chunk_high_water: usize,
+    staged_high_water: usize,
+}
+
+impl RunResources {
+    fn fold(&mut self, run: &RunCounts) {
+        self.pinned_high_water = self.pinned_high_water.max(run.pinned_high_water);
+        self.demoted += run.demoted;
+        self.chunks += run.chunks;
+        self.chunk_high_water = self.chunk_high_water.max(run.chunk_high_water);
+        self.staged_high_water = self.staged_high_water.max(run.staged_high_water);
+    }
+
+    fn emit(&self, invocation: &crate::host::Recorder) {
+        invocation.counter(
+            "overlap_run_pinned_high_water_bytes",
+            self.pinned_high_water,
+        );
+        invocation.counter("overlap_run_demoted_cursors", self.demoted);
+        invocation.counter("overlap_run_chunks", self.chunks);
+        invocation.counter("overlap_run_chunk_high_water_bytes", self.chunk_high_water);
+        invocation.counter(
+            "overlap_run_staged_high_water_bytes",
+            self.staged_high_water,
+        );
+    }
 }
 
 /// Pass 2: write the plan in order to `writer`.
@@ -966,6 +1007,8 @@ struct RunCounts {
 /// re-raises. Its stall counters (`ordered_pool_*_wait_ns`) are this pass's:
 /// the write loop waiting on a sweep is `ordered_pool_result_recv_wait_ns`,
 /// a sweep blocked behind the write loop `ordered_pool_result_send_wait_ns`.
+/// What the sweeps held (`overlap_run_*`, see `sweep.rs`) is emitted once
+/// the pool has finished, and only when there were runs.
 ///
 /// [`OVERLAP_RUN_CHANNEL_DEPTH`]: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH
 /// [`OVERLAP_RUN_WINDOW_PER_WORKER`]: crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER
@@ -995,6 +1038,7 @@ pub(crate) fn write_plan(
         copy: CopyRun::default(),
         frame_buf: FrameBuf::default(),
         cursor: 0,
+        resources: RunResources::default(),
     };
     if !plan.runs.is_empty() {
         let metrics = &writer_invocation.metrics().writer;
@@ -1035,6 +1079,7 @@ pub(crate) fn write_plan(
             },
             &mut out,
         )?;
+        out.resources.emit(&host.invocation);
     }
     out.passthrough_until(plan.entries.len())?;
     let PlanWriter {
@@ -1063,6 +1108,8 @@ struct PlanWriter<'a> {
     frame_buf: FrameBuf,
     /// The next plan entry to write.
     cursor: usize,
+    /// The runs' resource figures, folded as each run finishes.
+    resources: RunResources,
 }
 
 impl PlanWriter<'_> {
@@ -1126,6 +1173,7 @@ impl crate::ordered_pool::StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter
             ElementKind::Relation => self.counts.relations += emitted.elements,
         }
         self.counts.duplicates_removed += emitted.duplicates;
+        self.resources.fold(&emitted);
         self.cursor = run.end;
         Ok(())
     }

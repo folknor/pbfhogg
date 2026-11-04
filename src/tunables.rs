@@ -702,14 +702,24 @@ pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
 /// sending it; a frame larger than this travels alone. Sized so a typical
 /// run (two dense planet blobs merged, about 2 MB compressed) completes in a
 /// chunk or two without parking behind the write loop, which is what lets
-/// later runs proceed while the head drains; not otherwise measured.
+/// later runs proceed while the head drains; the planet self-merge's
+/// `overlap_run_chunks` bears that out (reference/performance.md). The wall
+/// effect of other sizes is not measured.
 pub(crate) const OVERLAP_RUN_CHUNK_BYTES: usize = 2 << 20;
 
-/// Decoded block bytes one overlap sweep may pin before it demotes mostly
-/// consumed cursors (less than an eighth of their elements left) to owned
-/// tails, releasing their blocks. Two dense planet blobs pin about 20 MB, so
-/// ordinary runs never demote; a run with many sparse tails stops pinning
-/// whole blocks for a few elements each. Not measured.
+/// Bytes one overlap sweep's open cursors may be charged for (decoded block
+/// payloads, and the view vectors of sorted-views cursors) before it
+/// demotes mostly consumed cursors (less than an eighth of their elements
+/// left) to owned tails, releasing their blocks. On planet merged with
+/// itself the largest run charge, two dense twin blobs, is about a fifth of
+/// this (`overlap_run_pinned_high_water_bytes`, reference/performance.md),
+/// so ordinary runs never demote; a run with many sparse tails stops
+/// pinning whole blocks for a few elements each.
+///
+/// This value, [`OVERLAP_RUN_CHUNK_BYTES`] and [`OVERLAP_RUN_CHANNEL_DEPTH`]
+/// size the resource tests in `tests/merge_pbf.rs`, which cannot read them;
+/// a unit test in `blob_merge/sweep.rs` fails when one changes, so changing
+/// one means resizing those fixtures.
 pub(crate) const SWEEP_PINNED_BYTES: usize = 64 << 20;
 
 /// Heap removals (emitted elements and dropped duplicates alike) an overlap

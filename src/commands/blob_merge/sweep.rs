@@ -39,14 +39,26 @@
 //!
 //! # Memory
 //!
-//! A cursor pins its decoded block while it has elements left. A block that
+//! A cursor pins its decoded block while it has elements left. Its charge
+//! against the run's budget is the block's protobuf payload length plus, for
+//! a sorted-views cursor, the allocated capacity of its view vector (one
+//! [`Element`] per element of the block, which at planet density is several
+//! times the payload). A block that
 //! is mostly consumed but keeps a sparse tail far ahead (a layout `sort`
 //! accepts) would pin the whole block for a handful of elements, so when the
-//! run's pinned bytes pass [`SWEEP_PINNED_BYTES`] the sweep demotes every
+//! run's charged bytes pass [`SWEEP_PINNED_BYTES`] the sweep demotes every
 //! cursor with less than an eighth of its elements left: the rest of the
-//! block is validated, copied into owned elements and the block released.
-//! The scan is amortized (at most once per half budget of growth). A dense
-//! giant component still holds its live overlap, as any in-memory merge must.
+//! block is validated, copied into owned elements and the block (and any
+//! views) released. The scan is amortized (at most once per half budget of
+//! growth). A dense giant component still holds its live overlap, as any
+//! in-memory merge must.
+//!
+//! The charge is an accounting of what cursors hold, not an allocation
+//! census. It leaves out a decoded block's inline string and group entries
+//! appended past its payload, the stable sort's scratch while a sorted-views
+//! cursor opens, the owned tails demotion leaves, the group being emitted
+//! (whose elements keep their block alive after the cursor has released it)
+//! and one cursor slot per opened entry.
 //!
 //! Each borrowed element carries an [`Rc`] of the block it borrows from, so a
 //! block lives exactly as long as the cursor reading it or any element taken
@@ -58,6 +70,23 @@
 //! alone), sent through the run's channel of
 //! [`OVERLAP_RUN_CHANNEL_DEPTH`] messages. A run therefore holds at most
 //! that many chunks queued plus the one it is building, whatever its size.
+//! Filled blocks are shipped after every ID group, so completed output waits
+//! on the sweep's side for one group at most.
+//!
+//! # Resource counters
+//!
+//! Each run reports what it held ([`RunCounts`]), and `write_plan` emits the
+//! figures over every run once its pool has finished:
+//! `overlap_run_pinned_high_water_bytes` (the largest charge any run reached,
+//! taken as each cursor opens, before any demotion it triggers),
+//! `overlap_run_demoted_cursors`, `overlap_run_chunks` (chunks sent),
+//! `overlap_run_chunk_high_water_bytes` (the largest summed frame capacity
+//! of a chunk sent, the final partial one included) and
+//! `overlap_run_staged_high_water_bytes` (the largest completed output held
+//! on the sweep's side before shipping: payload lengths of the filled blocks
+//! plus the frame capacities of the chunk being packed, at each ship). They
+//! are what the resource tests in `tests/merge_pbf.rs` assert, in place of a
+//! host's resident memory.
 //!
 //! [`SWEEP_PINNED_BYTES`]: crate::tunables::SWEEP_PINNED_BYTES
 //! [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
@@ -266,7 +295,8 @@ struct Cursor {
     /// Elements of the kind pulled so far, and the block's total.
     pulled: u64,
     total: u64,
-    /// Decoded bytes this cursor pins (0 once released).
+    /// Bytes this cursor is charged for holding: its block's payload, plus
+    /// a sorted feed's view vector (0 once released; see the module docs).
     pinned: usize,
 }
 
@@ -384,6 +414,10 @@ struct Output<'s> {
     refs: Vec<i64>,
     compression: &'s Compression,
     metrics: &'s WriterMetrics,
+    /// What the run reports (see the module docs, "Resource counters").
+    chunks: u64,
+    chunk_high_water: usize,
+    staged_high_water: usize,
 }
 
 impl Output<'_> {
@@ -441,6 +475,10 @@ impl Output<'_> {
 
     /// Frame every filled block into the chunk, sending full chunks.
     fn ship(&mut self, emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>) -> Result<()> {
+        let filled: usize = self.filled.iter().map(|b| b.bytes.len()).sum();
+        self.staged_high_water = self
+            .staged_high_water
+            .max(filled.saturating_add(self.chunk_bytes));
         for block in std::mem::take(&mut self.filled) {
             let frame = frame_owned(block, self.compression, self.metrics)?;
             let cap = frame.capacity();
@@ -458,11 +496,13 @@ impl Output<'_> {
     }
 
     fn send(&mut self, emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>) -> Result<()> {
-        self.chunk_bytes = 0;
+        let bytes = std::mem::take(&mut self.chunk_bytes);
         let chunk = std::mem::take(&mut self.chunk);
         if chunk.is_empty() {
             return Ok(());
         }
+        self.chunks += 1;
+        self.chunk_high_water = self.chunk_high_water.max(bytes);
         emitter.send(chunk)
     }
 }
@@ -527,6 +567,9 @@ struct Merge {
     next_scan: usize,
     group: Vec<Member>,
     visits: usize,
+    /// What the run reports (see the module docs, "Resource counters").
+    pinned_high_water: usize,
+    demoted: u64,
 }
 
 impl Sweep<'_, '_> {
@@ -565,6 +608,9 @@ impl Sweep<'_, '_> {
             refs: Vec::new(),
             compression: self.compression,
             metrics: self.metrics,
+            chunks: 0,
+            chunk_high_water: 0,
+            staged_high_water: 0,
         };
         let mut merge = Merge {
             cursors: Vec::with_capacity(self.entries.len()),
@@ -573,6 +619,8 @@ impl Sweep<'_, '_> {
             next_scan: crate::tunables::SWEEP_PINNED_BYTES,
             group: Vec::new(),
             visits: 0,
+            pinned_high_water: 0,
+            demoted: 0,
         };
         for entry in self.entries {
             self.checkpoint()?;
@@ -594,6 +642,7 @@ impl Sweep<'_, '_> {
                 .map_err(|e| self.locate(frame.source, frame.file_offset, e))?;
             let slot = merge.cursors.len();
             merge.pinned += cursor.pinned;
+            merge.pinned_high_water = merge.pinned_high_water.max(merge.pinned);
             if let Some(head) = &cursor.head {
                 merge.heap.push(Reverse((osm_id_key(head.id()), slot)));
                 merge.cursors.push(Some(cursor));
@@ -609,6 +658,11 @@ impl Sweep<'_, '_> {
         crate::commands::flush_local(&mut out.bb, &mut out.filled)?;
         out.ship(self.emitter)?;
         out.send(self.emitter)?;
+        counts.pinned_high_water = merge.pinned_high_water;
+        counts.demoted = merge.demoted;
+        counts.chunks = out.chunks;
+        counts.chunk_high_water = out.chunk_high_water;
+        counts.staged_high_water = out.staged_high_water;
         Ok(counts)
     }
 
@@ -645,19 +699,32 @@ impl Cursor {
         sorted_views: bool,
         (source, offset): (usize, u64),
     ) -> Result<Cursor> {
-        let pinned = block.decompressed_size();
+        let mut pinned = block.decompressed_size();
         let block = Rc::new(block);
         let (feed, total) = if sorted_views {
-            let mut views: Vec<Element<'static>> = block
-                .elements()
-                .filter(|e| of_kind(e, kind))
-                // SAFETY: the views live in this cursor's feed, declared
-                // before `owner`, which holds the block; each view taken
-                // out carries its own clone of the `Rc`.
-                .map(|e| unsafe { erase_elem(e) })
-                .collect();
+            // Sized up front from the block's own count (every kind, so a
+            // restructured block over-reserves by its other kinds), so the
+            // vector is allocated once and its capacity is what it holds.
+            let mut views: Vec<Element<'static>> =
+                Vec::with_capacity(usize::try_from(block.element_count()).unwrap_or(0));
+            views.extend(
+                block
+                    .elements()
+                    .filter(|e| of_kind(e, kind))
+                    // SAFETY: the views live in this cursor's feed, declared
+                    // before `owner`, which holds the block; each view taken
+                    // out carries its own clone of the `Rc`.
+                    .map(|e| unsafe { erase_elem(e) }),
+            );
             views.sort_by(|a, b| osm_id_cmp(element_id(a), element_id(b)));
             let total = views.len() as u64;
+            // The vector stays allocated until the feed ends or is demoted,
+            // however far its iterator has advanced.
+            pinned = pinned.saturating_add(
+                views
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Element<'static>>()),
+            );
             (Feed::Sorted(views.into_iter()), total)
         } else {
             // SAFETY: as above, for the iterator.
@@ -782,6 +849,7 @@ impl Sweep<'_, '_> {
                     .demote()
                     .map_err(|e| self.locate(source, offset, e))?;
                 merge.pinned -= pinned;
+                merge.demoted += 1;
             }
         }
         let budget = crate::tunables::SWEEP_PINNED_BYTES;
@@ -901,6 +969,44 @@ mod tests {
         )
         .expect("open");
         assert!(drain(&mut descending).is_err());
+    }
+
+    /// The resource tests in `tests/merge_pbf.rs` (the planet-density ones)
+    /// size their fixtures against these values, which they cannot read: a
+    /// change here must resize them.
+    #[test]
+    fn the_resource_tests_are_sized_against_these_constants() {
+        assert_eq!(
+            crate::tunables::OVERLAP_RUN_CHUNK_BYTES,
+            2 << 20,
+            "resize CHUNK_BYTES and the self-merge fixture in tests/merge_pbf.rs"
+        );
+        assert_eq!(
+            crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
+            4,
+            "resize CHANNEL_DEPTH and the self-merge fixture in tests/merge_pbf.rs"
+        );
+        assert_eq!(
+            crate::tunables::SWEEP_PINNED_BYTES,
+            64 << 20,
+            "resize PINNED_BYTES and the sparse-tail fixture in tests/merge_pbf.rs"
+        );
+    }
+
+    /// A sorted-views cursor is charged for its view vector as well as its
+    /// block, and releases both when it ends.
+    #[test]
+    fn a_sorted_cursor_is_charged_for_its_views() {
+        let ids: Vec<i64> = (1..=100).rev().collect();
+        let block = node_block(&ids);
+        let payload = block.decompressed_size();
+        let mut cursor = Cursor::open(block, ElementKind::Node, None, true, (0, 0)).expect("open");
+        assert_eq!(
+            cursor.pinned,
+            payload + 100 * std::mem::size_of::<Element<'static>>()
+        );
+        drain(&mut cursor).expect("drain");
+        assert_eq!(cursor.pinned, 0, "released once exhausted");
     }
 
     /// Sorted views reorder an internally unsorted block, keeping the

@@ -338,11 +338,18 @@ splice uses, which changes the descriptor grant (`CAT_EXTRA_FDS`, the
 no copied frame). Belongs with the deferred `--direct-io` reach redesign in
 `notes/todo.md`.
 
-### WRK-033: A sweep test at planet blob density
+### WRK-178: Same-ID groups in the overlap sweep are unbounded
 
-No test runs the overlap sweep at planet blob density (about 228k elements
-per blob); nothing guards sweep memory. Resource tests should assert bounded
-admission and progress, never a host's RSS.
+The sweep gathers every copy of one ID from every cursor before writing any
+(`emit_group` in `src/commands/blob_merge/sweep.rs`). A group's members keep
+their blocks alive past the cursor's release and are not charged against
+`SWEEP_PINNED_BYTES`, and a group large enough fills several output blocks
+before `ship` runs, so `overlap_run_staged_high_water_bytes` is bounded by
+one block only for groups of ordinary size. Under dedupe, `insert` finds
+the kept copy of a version by a linear scan of the group, so a group of k
+distinct versions costs about k squared over two comparisons. Only
+adversarial input (`sort` of many copies of one ID) or a history file with
+an object of very many versions reaches either. Unmeasured.
 
 ### WRK-037: ParallelGzipWriter window size
 

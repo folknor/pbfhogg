@@ -929,8 +929,9 @@ fn a_frame_truncated_between_passes_is_located() {
 const RUNS: i64 = 8;
 /// Blobs per run, their IDs interleaved so every blob of a run overlaps.
 const BLOBS_PER_RUN: i64 = 6;
-/// Nodes per blob: a run re-encodes into more blocks than one run's channel
-/// holds, so a worker running ahead parks on it.
+/// Nodes per blob: a run re-encodes into several output blocks. Without tags
+/// or metadata they compress to one chunk, so no run here fills its channel;
+/// the planet-density tests below are the ones whose runs do.
 const NODES_PER_BLOB: i64 = 6_000;
 
 /// A file claiming `Sort.Type_then_ID` whose node blobs nevertheless
@@ -973,11 +974,10 @@ fn host_with_cores(cores: usize) -> pbfhogg::host::Host {
 
 /// The sweeps run on worker threads but the output is written in run order:
 /// one worker and many write the same bytes, each run being one overlap
-/// component, with more blocks per run than its channel holds and (on one
-/// worker) more runs than the admission window. The two inputs hold the same
-/// IDs and versions at different coordinates, so which of each duplicate
-/// pair survives shows in the bytes: the heap gives no input-order
-/// guarantee, but the worker count must not change its choice.
+/// component re-encoded into several blocks, with (on one worker) more runs
+/// than the admission window. The two inputs hold the same IDs and versions
+/// at different coordinates, so which of each duplicate pair survives shows
+/// in the bytes: the earliest input's copy, whatever the worker count.
 #[test]
 fn overlap_runs_write_the_same_bytes_on_one_worker_and_many() {
     let dir = crate::common::test_scratch();
@@ -1060,5 +1060,316 @@ fn a_failed_overlap_run_ends_the_pipeline_with_its_own_error() {
         Some(pbfhogg::ByteOffset(frame)),
         "{}",
         err.report()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What an overlap sweep holds, at planet blob density
+// ---------------------------------------------------------------------------
+//
+// These assert the sweep's own resource counters (`overlap_run_*`, see
+// `src/commands/blob_merge/sweep.rs`), never the host's resident memory.
+
+/// The sweep constants these tests are sized against
+/// (`OVERLAP_RUN_CHUNK_BYTES`, `OVERLAP_RUN_CHANNEL_DEPTH`,
+/// `SWEEP_PINNED_BYTES`). They are crate-private, so a unit test beside the
+/// sweep fails if one changes without these.
+const CHUNK_BYTES: u64 = 2 << 20;
+const CHANNEL_DEPTH: u64 = 4;
+const PINNED_BYTES: u64 = 64 << 20;
+
+/// Planet's elements per blob (reference/blob-density.md).
+const PLANET_BLOB_ELEMENTS: i64 = 228_000;
+
+/// Records every counter the run emits.
+#[derive(Default)]
+struct Counters(std::sync::Mutex<Vec<(String, i64)>>);
+
+impl pbfhogg::debug::InstrumentSink for Counters {
+    fn marker(&self, _name: &str) {}
+    fn counter(&self, name: &str, value: i64) {
+        self.0.lock().expect("sink").push((name.to_owned(), value));
+    }
+}
+
+impl Counters {
+    /// The value of the one emission of `name`.
+    fn get(&self, name: &str) -> u64 {
+        let all = self.0.lock().expect("sink");
+        let mut values = all.iter().filter(|(n, _)| n == name).map(|(_, v)| *v);
+        let value = values
+            .next()
+            .unwrap_or_else(|| panic!("no counter named {name}"));
+        assert!(values.next().is_none(), "{name} emitted more than once");
+        u64::try_from(value).expect("non-negative counter")
+    }
+}
+
+/// A host of `cores` cores whose invocation records every counter.
+fn recording_host(cores: usize) -> (pbfhogg::host::Host, std::sync::Arc<Counters>) {
+    let counters = std::sync::Arc::new(Counters::default());
+    let mut host = host_with_cores(cores);
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        std::sync::Arc::clone(&counters) as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    (host, counters)
+}
+
+/// Uncompressed output: a frame is its payload, so these debug-build tests
+/// spend their time in the sweep, not in zlib.
+fn uncompressed_opts() -> WriteOptions {
+    WriteOptions {
+        compression: pbfhogg::writer::Compression::None,
+        ..default_opts()
+    }
+}
+
+/// Write one uncompressed node blob per entry of `blobs`, each node tagged
+/// `v=value(id)`, under a header claiming `Sort.Type_then_ID` when `sorted`.
+/// Returns each blob's payload length: what the sweep charges for holding
+/// its decoded block.
+fn write_node_blobs(
+    path: &std::path::Path,
+    sorted: bool,
+    blobs: &[Vec<i64>],
+    value: impl Fn(i64) -> String,
+) -> Vec<u64> {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    let file = std::fs::File::create(path).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+    let header = if sorted {
+        HeaderBuilder::new().sorted()
+    } else {
+        HeaderBuilder::new()
+    };
+    writer
+        .write_header(&header.build().expect("header"))
+        .expect("write header");
+    let mut payloads = Vec::new();
+    for ids in blobs {
+        // One block per entry, however large: the element cap is the
+        // entry's own length.
+        let cap = std::num::NonZeroUsize::new(ids.len()).expect("non-empty blob");
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap, 8_000);
+        for &id in ids {
+            let v = value(id);
+            bb.add_node(id, 0, 0, [("v", v.as_str())], None);
+        }
+        let bytes = bb.take().expect("encode").expect("non-empty block");
+        payloads.push(u64::try_from(bytes.len()).expect("length"));
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush fixture");
+    payloads
+}
+
+/// Every node of `path` in file order: (id, its `v` tag).
+fn nodes_with_value(path: &std::path::Path) -> Vec<(i64, String)> {
+    read_all_elements(path)
+        .nodes
+        .into_iter()
+        .map(|(id, tags)| {
+            let v = tags
+                .into_iter()
+                .find(|(k, _)| k == "v")
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("node {id} lost its tag"));
+            (id, v)
+        })
+        .collect()
+}
+
+/// The length of the largest frame of `path`, prefix and header included.
+fn largest_frame(path: &std::path::Path) -> u64 {
+    let len = std::fs::metadata(path).expect("stat output").len();
+    let starts: Vec<u64> = frames(path).into_iter().map(|(start, _)| start).collect();
+    starts
+        .iter()
+        .zip(starts.iter().skip(1).chain([&len]))
+        .map(|(start, end)| end - start)
+        .max()
+        .expect("a frame")
+}
+
+/// Planet merged with itself, at planet density: two inputs, each one node
+/// blob of planet's elements per blob, the same nodes in both. They are one
+/// overlap run whose two cursors open before any element is emitted, so the
+/// run holds both blocks for its whole length (a dense overlap is not
+/// demoted), while its output, about thirty blocks, streams out in more
+/// chunks than the run's channel holds. Every chunk stays within the chunk
+/// budget, and completed output waits on the sweep's side for one ID group
+/// at most: shipping only at the end of the run, or keeping filled blocks
+/// across groups, would hold the whole run there.
+///
+/// One run is swept by one worker, whatever the host; the worker-count
+/// comparison is `overlap_runs_write_the_same_bytes_on_one_worker_and_many`.
+#[test]
+fn a_planet_density_self_merge_streams_its_run_in_bounded_chunks() {
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let ids: Vec<i64> = (1..=PLANET_BLOB_ELEMENTS).collect();
+    let value = |id: i64| format!("{id:040}");
+    let payload_a = write_node_blobs(&a, true, std::slice::from_ref(&ids), value);
+    let payload_b = write_node_blobs(&b, true, std::slice::from_ref(&ids), value);
+
+    let (host, counters) = recording_host(4);
+    let stats = merge_pbf(
+        &[a.as_path(), b.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+    let n = u64::try_from(PLANET_BLOB_ELEMENTS).expect("count");
+    assert_eq!(stats.nodes, n);
+    assert_eq!(stats.duplicates_removed, n);
+    assert_eq!(stats.blobs_rewritten, 2);
+    let expected: Vec<(i64, String)> = ids.iter().map(|&id| (id, value(id))).collect();
+    assert!(
+        nodes_with_value(&output) == expected,
+        "the merge is not the input's nodes in order"
+    );
+
+    // Every frame is far below a chunk, so none travels alone and every
+    // chunk is a packed one; and the run's output is more than its channel
+    // holds in budget-sized chunks.
+    let largest = largest_frame(&output);
+    assert!(
+        largest * 2 < CHUNK_BYTES,
+        "fixture: an output frame of {largest} bytes is near a chunk"
+    );
+    let output_len = std::fs::metadata(&output).expect("stat output").len();
+    assert!(
+        output_len > (CHANNEL_DEPTH + 1) * CHUNK_BYTES,
+        "fixture: {output_len} bytes of output fit the run's channel"
+    );
+    let chunk_high = counters.get("overlap_run_chunk_high_water_bytes");
+    assert!(
+        chunk_high <= CHUNK_BYTES,
+        "a chunk of {chunk_high} bytes exceeds the chunk budget"
+    );
+    let chunks = counters.get("overlap_run_chunks");
+    assert!(
+        chunks > CHANNEL_DEPTH,
+        "the run's output went out in {chunks} chunks"
+    );
+    let staged = counters.get("overlap_run_staged_high_water_bytes");
+    assert!(
+        staged <= CHUNK_BYTES + largest,
+        "{staged} bytes of completed output were held before shipping"
+    );
+    assert_eq!(
+        counters.get("overlap_run_pinned_high_water_bytes"),
+        payload_a[0] + payload_b[0],
+        "the run's charge is both blocks"
+    );
+    assert_eq!(counters.get("overlap_run_demoted_cursors"), 0);
+}
+
+/// Sparse tails: one input whose blobs each hold a dense run of IDs plus one
+/// ID far past every other blob's, so all of them chain into one overlap run
+/// and each cursor is down to its tail when the next blob opens. Long tag
+/// values make each block a few MiB, so keeping every mostly consumed block
+/// would pin well past the sweep's budget; demotion keeps the charge within
+/// one block of it.
+#[test]
+fn sparse_tails_are_demoted_within_the_pinned_budget() {
+    const BLOBS: i64 = 12;
+    const DENSE: i64 = 8_000;
+    const TAIL: i64 = 1 << 40;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("tails.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let blobs: Vec<Vec<i64>> = (0..BLOBS)
+        .map(|blob| {
+            let base = 1 + blob * DENSE;
+            (base..base + DENSE).chain([TAIL + blob]).collect()
+        })
+        .collect();
+    let payloads = write_node_blobs(&input, true, &blobs, |id| format!("{id:0>1000}"));
+    let largest = *payloads.iter().max().expect("a blob");
+    // The bound's preconditions: each block is under half the budget, so a
+    // scan that demotes every older cursor leaves only the newest pinned and
+    // the next threshold is the budget again; and the blocks together exceed
+    // the bound, so a run that never demoted would break it.
+    assert!(
+        largest < PINNED_BYTES / 2,
+        "fixture: a {largest}-byte block"
+    );
+    assert!(
+        payloads.iter().sum::<u64>() > PINNED_BYTES + largest,
+        "fixture: the blocks fit the budget without demotion"
+    );
+
+    let (host, counters) = recording_host(4);
+    let stats = merge_pbf(
+        &[input.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+    let expected: Vec<i64> = (1..=BLOBS * DENSE).chain(TAIL..TAIL + BLOBS).collect();
+    assert_eq!(stats.nodes, u64::try_from(expected.len()).expect("count"));
+    assert_eq!(stats.duplicates_removed, 0);
+    assert_eq!(node_ids(&read_all_elements(&output)), expected);
+
+    assert!(
+        counters.get("overlap_run_demoted_cursors") > 0,
+        "no cursor was demoted"
+    );
+    let pinned = counters.get("overlap_run_pinned_high_water_bytes");
+    assert!(
+        pinned <= PINNED_BYTES + largest,
+        "the run's charge reached {pinned} bytes"
+    );
+}
+
+/// An internally unsorted blob is merged through views sorted by ID, one
+/// `Element` per element, which at planet density outweigh the decoded block
+/// itself; the run's charge counts them.
+#[test]
+fn sorted_views_are_charged_to_the_run() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("shuffled.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    // A fixed permutation of 1..=N (7919 is prime and does not divide N),
+    // so the blob descends; no header claim, so `sort` scans it and finds
+    // it out of order.
+    let n = PLANET_BLOB_ELEMENTS;
+    let ids: Vec<i64> = (0..n).map(|i| (i * 7_919) % n + 1).collect();
+    let payload = write_node_blobs(&input, false, std::slice::from_ref(&ids), |id| {
+        id.to_string()
+    })[0];
+    let views =
+        u64::try_from(ids.len() * std::mem::size_of::<pbfhogg::Element<'static>>()).expect("size");
+    assert!(
+        payload < views,
+        "fixture: the {payload}-byte block outweighs its views"
+    );
+
+    let (host, counters) = recording_host(4);
+    let stats = pbfhogg::commands::sort::sort(
+        input.as_path(),
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("sort: {}", e.report()));
+    assert_eq!(stats.nodes, u64::try_from(n).expect("count"));
+    assert!(
+        node_ids(&read_all_elements(&output)).into_iter().eq(1..=n),
+        "the sort is not 1..=N"
+    );
+    let pinned = counters.get("overlap_run_pinned_high_water_bytes");
+    assert!(
+        pinned >= payload + views,
+        "the run's charge of {pinned} bytes leaves out its sorted views"
     );
 }

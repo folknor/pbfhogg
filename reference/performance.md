@@ -941,9 +941,9 @@ suite; the rest still carry their older commit in the Notes column.
 > callout used to say. Since that run, `cat --dedupe` shares `sort`'s
 > engine (`src/commands/blob_merge.rs`): pass 1 is the `HeaderWalker`
 > walk, passthrough is coalesced `copy_file_range`, and each overlap
-> group is swept on a worker thread with bounded streaming. **Unmeasured** -
-> the 133-minute row predates all three and needs a fresh cell. A fresh
-> cell has more to read than that row: `MERGEPBF_*` now nests
+> group is swept on a worker thread with bounded streaming. The 133-minute
+> row predates all three; the callouts below hold the cells measured since.
+> A cell now has more to read than that row: `MERGEPBF_*` now nests
 > `MERGEPBF_PASS1_*`, `MERGEPBF_PASS2_*`, `MERGEPBF_WRITE_LOOP_*` and
 > `MERGEPBF_FLUSH_*`, the `cat_dedupe_*` counters give the plan's and the
 > write's blob, run and duplicate counts, and `--stalls` attributes pass 2:
@@ -964,6 +964,20 @@ suite; the rest still carry their older commit in the Notes column.
 > result send wait 0, result recv wait 303 s (the write loop now waits on
 > the sweeps). 10.4x faster and 5.2x less peak anon. Same plan on both
 > (50,816 two-blob runs, 0 passthrough). No fstrim before the variant cell.
+
+> **What the planet self-merge sweeps hold (2026-11-04, bygg, `fda05956`
+> plus the change that added the `overlap_run_*` counters, measured
+> uncommitted with `--force`).** The counters (`src/commands/blob_merge/sweep.rs`,
+> "Resource counters") on `cat --dedupe` planet with itself, cell
+> `10f5ec37` (dirty sidecar): largest run charge
+> `overlap_run_pinned_high_water_bytes` **12.5 MB** (two twin blobs, about a
+> fifth of `SWEEP_PINNED_BYTES`), `overlap_run_demoted_cursors` 0,
+> `overlap_run_chunks` 63,466 over 50,816 runs, largest chunk 2,097,145
+> bytes (the 2 MiB budget), largest completed output held before shipping
+> 3.9 MB. Matched pair after `fstrim`, interleaved `--bench 1`: HEAD
+> `8827bc7f` 207.9 s and `78832185` 205.6 s against the variant 206.6 s and
+> 208.1 s, signs mixed, write loop +1 % in `--compare`, peak anon about
+> 1.0 GB on both: the bookkeeping costs nothing measurable.
 
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**

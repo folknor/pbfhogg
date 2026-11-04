@@ -195,7 +195,6 @@ fn try_index_only_scan(
     let file_size = walker.file_size();
     let mut saw_header = false;
     let mut header_meta = HeaderMeta::default();
-    let mut data_buf: Vec<u8> = Vec::new();
 
     let mut accum = BlockAccum::new(show_blocks);
     let mut block_number = 0u64;
@@ -210,11 +209,13 @@ fn try_index_only_scan(
         }
         match header.blob_type {
             BlobKind::OsmHeader => {
-                walker
+                // Read once, into a buffer that does not outlive the header.
+                let mut data_buf = crate::read::read_buf::ReadBuf::default();
+                let data = walker
                     .pread_data(header.data_offset, header.data_size, &mut data_buf)
                     .map_err(|e| walker.locate_meta(&header, e))?;
-                let block = decode_blob_to_headerblock(&data_buf)
-                    .map_err(|e| walker.locate_meta(&header, e))?;
+                let block =
+                    decode_blob_to_headerblock(data).map_err(|e| walker.locate_meta(&header, e))?;
                 header_meta = extract_header_metadata(&block);
                 saw_header = true;
                 // Only once the header has decoded, so the note never

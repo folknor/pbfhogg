@@ -348,15 +348,42 @@ impl AlignedScratch {
         self.align
     }
 
-    /// The first `len` bytes, growing the allocation to hold them.
+    /// The bytes its allocation holds (the aligned span of the largest read
+    /// since it was last released, alignment padding included).
+    pub(crate) fn held(&self) -> usize {
+        self.alloc.map_or(0, |(_, layout)| layout.size())
+    }
+
+    /// Free the allocation if it holds more than
+    /// `READ_BUF_MAX_RETAINED_CAPACITY`, the read buffers' retention line
+    /// (`crate::read::read_buf`), counted as a read-buffer release. The held
+    /// size is the aligned span, padding included. Call once a read's bytes
+    /// are done with.
+    pub(crate) fn release_outlier(&mut self, invocation: &crate::host::Recorder) {
+        let held = self.held();
+        if held > crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY {
+            self.free();
+            invocation
+                .metrics()
+                .decompress
+                .record_read_buf_release(held);
+        }
+    }
+
+    fn free(&mut self) {
+        if let Some((ptr, layout)) = self.alloc.take() {
+            // Safety: allocated with this layout by `alloc_aligned_zeroed`.
+            unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+
+    /// The first `len` bytes, growing the allocation to hold them. A growth
+    /// frees the old allocation before making the new one, so the two are
+    /// never held at once (the read overwrites what it needs).
     fn slice_mut(&mut self, len: usize) -> io::Result<&mut [u8]> {
-        let held = self.alloc.map_or(0, |(_, layout)| layout.size());
-        if held < len {
-            let (ptr, layout) = crate::direct_io::alloc_aligned_zeroed(len, self.align)?;
-            if let Some((old, old_layout)) = self.alloc.replace((ptr, layout)) {
-                // Safety: allocated with this layout by `alloc_aligned_zeroed`.
-                unsafe { alloc::dealloc(old.as_ptr(), old_layout) };
-            }
+        if self.held() < len {
+            self.free();
+            self.alloc = Some(crate::direct_io::alloc_aligned_zeroed(len, self.align)?);
         }
         match self.alloc {
             // Safety: the allocation holds at least `len` zeroed (so
@@ -370,10 +397,7 @@ impl AlignedScratch {
 
 impl Drop for AlignedScratch {
     fn drop(&mut self) {
-        if let Some((ptr, layout)) = self.alloc.take() {
-            // Safety: allocated with this layout by `alloc_aligned_zeroed`.
-            unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
-        }
+        self.free();
     }
 }
 
@@ -467,26 +491,34 @@ pub(crate) struct DirectPositional {
     file: File,
     /// Owns the file's direct I/O alignment too.
     scratch: RefCell<AlignedScratch>,
+    /// The invocation the scratch's releases count into.
+    permit: crate::host::Permit,
 }
 
 impl DirectPositional {
     /// `file`, opened `O_DIRECT` by `crate::direct_io` with the alignment
-    /// `align` it reported.
-    pub(crate) fn new(file: File, align: usize) -> Self {
+    /// `align` it reported, read for `invocation`.
+    pub(crate) fn new(file: File, align: usize, invocation: &crate::host::Recorder) -> Self {
         Self {
             file,
             scratch: RefCell::new(AlignedScratch::new(align)),
+            permit: invocation.permit(),
         }
     }
 
     /// Fill `buf` exactly with the bytes at `offset`; `UnexpectedEof` when
-    /// the file ends first.
+    /// the file ends first. The bytes are copied out of the aligned scratch,
+    /// so the scratch follows the read buffers' retention limit after every
+    /// read, failed ones included: a large payload read does not pin its
+    /// span here for the rest of the walk.
     pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         let mut scratch = self.scratch.borrow_mut();
-        read_aligned(buf, offset, &mut scratch, |dst, at| {
+        let read = read_aligned(buf, offset, &mut scratch, |dst, at| {
             self.file.read_at(dst, at)
-        })
+        });
+        scratch.release_outlier(&self.permit);
+        read
     }
 }
 
@@ -641,7 +673,8 @@ mod tests {
             }
             Err(e) => panic!("{e}"),
         };
-        let reader = DirectPositional::new(file, align);
+        let call = crate::host::Call::detached();
+        let reader = DirectPositional::new(file, align, &call);
         for (offset, want) in [(0, 1), (5, 4000), (4095, 2), (100, bytes.len() - 100)] {
             let mut out = vec![0_u8; want];
             reader.read_exact_at(&mut out, offset as u64).unwrap();

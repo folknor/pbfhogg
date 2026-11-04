@@ -28,8 +28,6 @@
 //! drops exact duplicates; their markers, counters and diagnostic keys stay
 //! in the command modules.
 
-use std::os::unix::fs::FileExt as _;
-
 use crate::Element;
 use crate::ElementKind;
 use crate::blob::{
@@ -193,12 +191,13 @@ pub(crate) fn index_inputs(
     let mut walk = Walk {
         policy,
         host,
+        invocation: &host.invocation,
         indexed: Indexed {
             frames: Vec::new(),
             entries: Vec::new(),
             omitted: 0,
         },
-        data_buf: Vec::new(),
+        data_buf: crate::read::read_buf::ReadBuf::default(),
         decompress_buf: Vec::new(),
         noted_unclaimed: false,
     };
@@ -220,8 +219,12 @@ pub(crate) fn index_inputs(
 struct Walk<'a> {
     policy: &'a IndexPolicy,
     host: &'a crate::host::Host,
+    /// The command's admission, which the buffers' releases count into.
+    invocation: &'a crate::host::Recorder,
     indexed: Indexed,
-    data_buf: Vec<u8>,
+    /// Kept across blobs and inputs; both follow their retention limits once
+    /// per blob (`data_blob`, `header`).
+    data_buf: crate::read::read_buf::ReadBuf,
     decompress_buf: Vec<u8>,
     noted_unclaimed: bool,
 }
@@ -277,10 +280,12 @@ impl Walk<'_> {
         meta: &BlobHeaderMeta,
     ) -> Result<crate::HeaderBlock> {
         let located = |e| walker.locate_meta(meta, e);
-        walker
+        let data = walker
             .pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)
             .map_err(located)?;
-        let hdr = decode_blob_to_headerblock(&self.data_buf).map_err(located)?;
+        let hdr = decode_blob_to_headerblock(data).map_err(located);
+        self.data_buf.release_outlier(self.invocation);
+        let hdr = hdr?;
         if let Some(reason) = self.policy.require_sorted {
             let path = walker.path();
             crate::commands::require_sorted(
@@ -304,7 +309,7 @@ impl Walk<'_> {
         claims_sorted: bool,
     ) -> Result<()> {
         let frame = self.indexed.frames.len();
-        let mut new_frame = Frame {
+        let new_frame = Frame {
             source,
             file_offset: meta.frame_start,
             frame_len: meta.frame_size as u64,
@@ -345,9 +350,30 @@ impl Walk<'_> {
         // key set is checked against them. Otherwise an indexed blob is
         // copied whole unless its claim turns out false, which rescans the
         // buffer below.
-        let scanned = self
-            .scan_payload(walker, meta, claimed.is_none() || distrust)
-            .map_err(located)?;
+        let scanned = self.scan_payload(walker, meta, claimed.is_none() || distrust);
+        // The compressed bytes are done with; the decoded ones stay until
+        // the reindex below has read them.
+        self.data_buf.release_outlier(self.invocation);
+        let scanned = scanned.map_err(located);
+        let result = scanned
+            .and_then(|scanned| self.record(walker, frame, new_frame, meta, claimed, scanned));
+        crate::blob::release_decode_outlier(&mut self.decompress_buf, self.invocation);
+        result
+    }
+
+    /// Push the frame and entries `scanned` describes, or count the blob
+    /// omitted.
+    fn record<P: Positional>(
+        &mut self,
+        walker: &HeaderWalker<P>,
+        frame: usize,
+        mut new_frame: Frame,
+        meta: &BlobHeaderMeta,
+        claimed: Option<BlobIndex>,
+        scanned: Scanned,
+    ) -> Result<()> {
+        let distrust = self.policy.distrust_metadata;
+        let located = |e| walker.locate_meta(meta, e);
         match scanned {
             Scanned::Block {
                 index,
@@ -410,8 +436,8 @@ impl Walk<'_> {
         meta: &BlobHeaderMeta,
         with_tags: bool,
     ) -> Result<Scanned> {
-        walker.pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)?;
-        decompress_blob_data_into(&self.data_buf, &mut self.decompress_buf)?;
+        let data = walker.pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)?;
+        decompress_blob_data_into(data, &mut self.decompress_buf)?;
         let (index, tags) = if with_tags {
             try_scan_block_ids_and_tags(&self.decompress_buf)?
         } else {
@@ -871,10 +897,12 @@ impl Source {
 
 /// A frame read buffer, one per thread that reads frames: a plain buffer
 /// for buffered sources and an aligned scratch for direct ones (remade when
-/// a source's alignment differs from the one it was made for).
+/// a source's alignment differs from the one it was made for). Both follow
+/// the read buffers' retention limit through [`FrameBuf::release_outlier`],
+/// called once a frame's bytes are done with.
 #[derive(Default)]
 pub(crate) struct FrameBuf {
-    buf: Vec<u8>,
+    buf: crate::read::read_buf::ReadBuf,
     #[cfg(feature = "linux-direct-io")]
     scratch: Option<crate::read::direct_reader::AlignedScratch>,
 }
@@ -900,14 +928,19 @@ impl FrameBuf {
             })
             .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)));
         }
-        self.buf.clear();
-        self.buf.resize(len, 0);
-        source
-            .input
-            .file()
-            .read_exact_at(&mut self.buf, frame.file_offset)
-            .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))?;
-        Ok(&self.buf)
+        self.buf
+            .read_exact_at(&**source.input.file(), frame.file_offset, len)
+            .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))
+    }
+
+    /// Apply the read buffers' retention limit (`crate::read::read_buf`) to
+    /// whichever buffer the last frame went through.
+    pub(crate) fn release_outlier(&mut self, invocation: &crate::host::Recorder) {
+        self.buf.release_outlier(invocation);
+        #[cfg(feature = "linux-direct-io")]
+        if let Some(scratch) = &mut self.scratch {
+            scratch.release_outlier(invocation);
+        }
     }
 }
 
@@ -1238,6 +1271,19 @@ fn write_passthrough(
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut FrameBuf,
 ) -> Result<()> {
+    let written = write_frame(frame, reindex, source, writer, frame_buf);
+    frame_buf.release_outlier(writer.cancel_token());
+    written
+}
+
+/// [`write_passthrough`]'s read and write, before the release.
+fn write_frame(
+    frame: &Frame,
+    reindex: Option<&Reindex>,
+    source: &Source,
+    writer: &mut PbfWriter<FileWriter>,
+    frame_buf: &mut FrameBuf,
+) -> Result<()> {
     let frame_bytes = frame_buf.read(source, frame)?;
     match reindex {
         None => writer.write_raw(frame_bytes)?,
@@ -1276,14 +1322,22 @@ fn count_passthrough(entry: &BlobEntry, counts: &mut WriteCounts) {
 
 /// Re-read and decode an overlap-run entry's frame, a read or decode
 /// failure located at its input and frame offset.
+///
+/// The block owns its decoded bytes, so `buf` follows its retention limit
+/// before this returns.
 pub(crate) fn read_block(
     source: &Source,
     frame: &Frame,
     buf: &mut FrameBuf,
+    invocation: &crate::host::Recorder,
 ) -> Result<crate::PrimitiveBlock> {
-    frame_parts(buf.read(source, frame)?)
-        .and_then(|(_, blob)| decode_blob_to_primitiveblock(blob))
-        .map_err(|e| source.locate_at(frame.file_offset, e))
+    let block = buf.read(source, frame).and_then(|bytes| {
+        frame_parts(bytes)
+            .and_then(|(_, blob)| decode_blob_to_primitiveblock(blob))
+            .map_err(|e| source.locate_at(frame.file_offset, e))
+    });
+    buf.release_outlier(invocation);
+    block
 }
 
 /// The BlobHeader and Blob bytes of a complete frame,

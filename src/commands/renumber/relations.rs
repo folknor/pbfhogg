@@ -60,7 +60,7 @@ pub(super) fn relation_r1_collect_ids(
     for task in relation_schedule {
         // Once per relation blob, before it is read.
         cancel.check()?;
-        (|| -> Result<()> {
+        let blob = (|| -> Result<()> {
             buffers
                 .load(shared_file, task, &counters)
                 .map_err(|e| e.context("R1"))?;
@@ -108,8 +108,9 @@ pub(super) fn relation_r1_collect_ids(
             t.record_ns(&counters.reframe_ns);
             counters.bump_blobs();
             Ok(())
-        })()
-        .map_err(|e| task.locate(source, e))?;
+        })();
+        buffers.release_outliers(cancel);
+        blob.map_err(|e| task.locate(source, e))?;
     }
 
     counters.emit(Phase::R1, cancel);
@@ -124,6 +125,12 @@ struct R2dWorker {
     buffers: BlobBuffers,
     scratch: Scratch,
     reframe_buf: Vec<u8>,
+}
+
+impl super::RewriteWorker for R2dWorker {
+    fn buffers(&mut self) -> &mut BlobBuffers {
+        &mut self.buffers
+    }
 }
 
 /// What R2d produced besides the output blobs.

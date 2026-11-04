@@ -4,7 +4,6 @@
 //! relation blobs rather than walking every blob. It decompresses each
 //! selected blob via `decompress_blob_raw`.
 
-use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,7 +33,7 @@ pub(super) fn collect_relation_member_ids_indexed(
 
     let mut node_ids = want_nodes.then(IdSet::new);
     let mut way_ids = want_ways.then(IdSet::new);
-    let mut read_buf: Vec<u8> = Vec::new();
+    let mut read_buf = crate::read::read_buf::ReadBuf::default();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -47,7 +46,6 @@ pub(super) fn collect_relation_member_ids_indexed(
         // Once per relation blob: this scan runs beside stage 1 on a thread
         // of its own, and the join waits for it.
         cancel.check()?;
-        read_buf.resize(meta.data_size, 0);
         let locate = |e: crate::Error| {
             e.locate(crate::error::Location::new(
                 Some(&source),
@@ -55,10 +53,14 @@ pub(super) fn collect_relation_member_ids_indexed(
                 Some(crate::ByteOffset(meta.frame_offset)),
             ))
         };
-        file.read_exact_at(&mut read_buf, meta.data_offset)
+        let raw = read_buf
+            .read_exact_at(&*file, meta.data_offset, meta.data_size)
             .map_err(|e| locate(crate::Error::from(e).context("relation scan pread")))?;
-        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+        crate::blob::decompress_blob_raw(raw, &mut decompress_buf)
             .map_err(|e| locate(e.context("relation scan decompress")))?;
+        // Done with the compressed bytes; the read buffer follows its
+        // retention limit (read/read_buf.rs).
+        read_buf.release_outlier(cancel);
         let block = PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf),
             &mut st_scratch,

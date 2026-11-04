@@ -15,6 +15,7 @@ pub mod input;
 pub(crate) mod pipeline;
 pub(crate) mod pipeline_metrics;
 pub(crate) mod project_ids;
+pub(crate) mod read_buf;
 pub mod reader;
 pub(crate) mod region_grid;
 pub(crate) mod wire;
@@ -23,15 +24,15 @@ pub(crate) mod wire_schema;
 #[cfg(test)]
 pub(crate) mod wire_fixtures;
 
-/// Emit `invocation`'s `pipeline_decompress_pool_*` sidecar counters, at
-/// most once per invocation.
+/// Emit `invocation`'s `pipeline_decompress_pool_*` and
+/// `pipeline_read_buf_*` sidecar counters, at most once per invocation.
 ///
 /// The read-side twin of [`crate::write::emit_writer_counters`]: call it once,
 /// on the way out, after every thread of the invocation has joined - the CLI
 /// does so on its single exit path, success or failure. The totals cover
-/// every decompression pool of the invocation (classify workers,
-/// command-specific readers, altw passthrough), not only the pipelined
-/// reader, which is why no per-pipeline path emits them. Counter names and
+/// every decompression pool and every worker read buffer of the invocation
+/// (classify workers, command-specific readers, altw passthrough), not only
+/// the pipelined reader, which is why no per-pipeline path emits them. Counter names and
 /// FIFO framing are unchanged. Inert without a sink on the invocation, and
 /// under a sealed one.
 pub fn emit_read_counters(invocation: &crate::host::Invocation) {

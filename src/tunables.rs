@@ -465,6 +465,33 @@ const _: () = assert!(
 /// lowers the peak only as far as the allocator returns or reuses it.
 pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
 
+/// The largest read-buffer allocation a holder keeps from one frame to the
+/// next (`crate::read::read_buf`): every buffer that holds a compressed blob
+/// payload or a whole input frame across blobs, and the aligned scratch of
+/// the direct reads beneath them. An allocation grown past it by one frame
+/// is freed once that frame is done with, counted in
+/// `pipeline_read_buf_releases`.
+///
+/// It sits at the decode buffers' line, `DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`,
+/// as a policy choice, not a size relationship: a read allocation holds the
+/// serialized Blob (sometimes the whole frame with its BlobHeader, or an
+/// aligned span with its padding), so it can exceed its decoded size and be
+/// released where its decode buffer is kept. On planet it never fires
+/// (largest data frame 3.7 MB indexed, 9.6 MB under LocationsOnWays). It
+/// bounds each kept allocation, not a worker: one holding both a plain buffer
+/// and an aligned scratch, or a direct walk's caller buffer beside its
+/// reader's scratch, keeps up to this much in each.
+///
+/// The scratch limit was measured in its place and costs time: on
+/// `check --locations` over the LocationsOnWays planet a 4 MiB line freed
+/// and regrew a buffer on most way-blob reads (90,972 releases) and ran
+/// 214.4 and 222.9 s against 197.4 to 204.2 s, with no lower run peak; this
+/// line ran 204.4 s with no release (bygg, `22a5f24a`,
+/// `reference/performance.md`, "Worker read buffers follow a retention
+/// limit"). apply-changes keeps the stricter scratch limit on its base-read
+/// buffer, measured neutral there (`MAX_RETAINED_SCRATCH_CAPACITY`).
+pub(crate) const READ_BUF_MAX_RETAINED_CAPACITY: usize = DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
+
 /// Zlib worst-case output bound reserved up front: input + input >> this
 /// shift (~0.1%) + [`ZLIB_RESERVE_SLACK`] header/trailer bytes.
 pub(crate) const ZLIB_RESERVE_SHIFT: u32 = 10;

@@ -355,8 +355,6 @@ pub(super) fn stage2_node_join(
     )
     .min(ALTW_STAGE2_WORKERS_CAP);
 
-    use std::os::unix::fs::FileExt as _;
-
     // A hand-built claim-counter pool, deliberately not on
     // `crate::ordered_pool`: it has no consumer and no order to keep.
     // Workers claim id buckets with one `fetch_add`, each holding its own
@@ -387,7 +385,7 @@ pub(super) fn stage2_node_join(
                 use std::sync::atomic::Ordering::Relaxed;
 
                 let mut loader = LoaderScratch::new();
-                let mut node_read_buf: Vec<u8> = Vec::new();
+                let mut node_read_buf = crate::read::read_buf::ReadBuf::default();
                 let mut node_decompress_buf: Vec<u8> = Vec::new();
                 let mut node_tuples: Vec<NodeTuple> = Vec::new();
                 let mut node_group_starts: Vec<(usize, usize)> = Vec::new();
@@ -474,6 +472,7 @@ pub(super) fn stage2_node_join(
                         let mut bucket_blobs_read: u64 = 0;
                         let mut bucket_straddlers: u64 = 0;
                         let mut node_decompress_peak = node_decompress_buf.capacity();
+                        let mut node_read_peak = node_read_buf.capacity();
 
                         for blob in &mapping_ref[lo_blob..hi_blob] {
                             host.invocation.check()?;
@@ -490,12 +489,11 @@ pub(super) fn stage2_node_join(
 
                             // pread + decompress + extract.
                             let t_pr = crate::counters::Stopwatch::start();
-                            node_read_buf.resize(blob.data_size, 0);
                             // Input failures are located with the input and
                             // the blob's payload offset (cold).
                             let in_input = |e: Error| input_pbf.locate_at(blob.data_offset, e);
-                            pbf_file
-                                .read_exact_at(&mut node_read_buf, blob.data_offset)
+                            let raw = node_read_buf
+                                .read_exact_at(&*pbf_file, blob.data_offset, blob.data_size)
                                 .map_err(|e| {
                                     in_input(Error::from(e).context("stage2 node pread"))
                                 })?;
@@ -504,11 +502,8 @@ pub(super) fn stage2_node_join(
                             c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
 
                             let t_dc = crate::counters::Stopwatch::start();
-                            crate::blob::decompress_blob_raw(
-                                &node_read_buf,
-                                &mut node_decompress_buf,
-                            )
-                            .map_err(|e| in_input(e.context("stage2 node decompress")))?;
+                            crate::blob::decompress_blob_raw(raw, &mut node_decompress_buf)
+                                .map_err(|e| in_input(e.context("stage2 node decompress")))?;
                             t_dc.record_ms(&c.node_decompress_ms);
                             t_dc.record_ns(&c.node_decompress_ns);
 
@@ -727,9 +722,11 @@ pub(super) fn stage2_node_join(
                             t_walk.record_ms(&c.node_walk_ms);
                             t_walk.record_ns(&c.node_walk_ns);
                             bucket_blobs_read += 1;
-                            // The node decode buffer follows the decode
-                            // pool's limit after each blob; the bucket's peak
-                            // sample below reads what it held at most.
+                            // The node read and decode buffers follow their
+                            // retention limits after each blob; the bucket's
+                            // peak sample below reads what each held at most.
+                            node_read_peak = node_read_peak.max(node_read_buf.capacity());
+                            node_read_buf.release_outlier(&host.invocation);
                             node_decompress_peak =
                                 node_decompress_peak.max(node_decompress_buf.capacity());
                             crate::blob::release_decode_outlier(
@@ -754,7 +751,7 @@ pub(super) fn stage2_node_join(
                             let worker_bytes = loader.data_buf.capacity() as u64
                                 + (loader.records.capacity() * std::mem::size_of::<IdRecord>())
                                     as u64
-                                + node_read_buf.capacity() as u64
+                                + node_read_peak as u64
                                 + node_decompress_peak as u64
                                 + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>())
                                     as u64

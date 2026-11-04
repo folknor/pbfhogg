@@ -6,7 +6,6 @@
 //! page cache working set from ~83 GB (all 10.4B nodes) to ~16 GB (~2B
 //! referenced). Same pattern as ALTW pass 0.
 
-use std::os::unix::fs::FileExt as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -242,7 +241,7 @@ pub(super) fn run_pass1_5(
             for _ in 0..decode_threads {
                 let file = std::sync::Arc::clone(shared_file);
                 scope.spawn(move || {
-                    let mut read_buf: Vec<u8> = Vec::new();
+                    let mut read_buf = crate::read::read_buf::ReadBuf::default();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
@@ -268,10 +267,13 @@ pub(super) fn run_pass1_5(
                             // first-error slot like any blob failure (this
                             // pool has no consumer, and no sequence to keep).
                             host.invocation.check()?;
-                            read_buf.resize(entry.data_size(), 0);
-                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
+                            let raw = read_buf.read_exact_at(
+                                &*file,
+                                entry.data_offset(),
+                                entry.data_size(),
+                            )?;
                             decompress_buf.clear();
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                            crate::blob::decompress_blob_raw(raw, &mut decompress_buf)?;
                             let kinds = crate::scan::way::scan_way_geocode_tagged_refs(
                                 &decompress_buf,
                                 literals_ref,
@@ -306,6 +308,7 @@ pub(super) fn run_pass1_5(
                             );
                             Ok(())
                         })();
+                        read_buf.release_outlier(&host.invocation);
                         crate::blob::release_decode_outlier(&mut decompress_buf, &host.invocation);
 
                         if let Err(e) = result {

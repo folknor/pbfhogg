@@ -408,7 +408,9 @@ impl HeaderWalker<crate::read::direct_reader::DirectPositional> {
                       shape for the buffered walker, whose Arc does cross threads"
         )]
         let file = Arc::new(crate::read::direct_reader::DirectPositional::new(
-            file, align,
+            file,
+            align,
+            &host.invocation,
         ));
         Ok(Self::over(file, file_size, path, host))
     }
@@ -557,10 +559,16 @@ impl<P: Positional> HeaderWalker<P> {
         Ok(Some(meta))
     }
 
-    /// `pread` a blob's data payload into `buf`. Resizes `buf` to `size`.
-    pub(crate) fn pread_data(&self, offset: u64, size: usize, buf: &mut Vec<u8>) -> Result<()> {
-        buf.resize(size, 0);
-        Ok(self.file.pread_exact(buf, offset)?)
+    /// `pread` `size` bytes at `offset` (a payload or a whole frame) into
+    /// `buf` and return them. A caller keeping `buf` across blobs applies its
+    /// retention limit (`ReadBuf::release_outlier`) once it is done with them.
+    pub(crate) fn pread_data<'b>(
+        &self,
+        offset: u64,
+        size: usize,
+        buf: &'b mut crate::read::read_buf::ReadBuf,
+    ) -> Result<&'b [u8]> {
+        Ok(buf.read_exact_at(&*self.file, offset, size)?)
     }
 }
 
@@ -688,7 +696,10 @@ pub(crate) mod tests {
             .accepting_partial_index();
         assert_eq!(direct_opens(), before + 1);
         assert_eq!(direct.file_size(), buffered.file_size());
-        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut a, mut b) = (
+            crate::read::read_buf::ReadBuf::default(),
+            crate::read::read_buf::ReadBuf::default(),
+        );
         let mut frames = 0;
         while let Some(want) = buffered.next_header().expect("buffered walk") {
             let got = direct.next_header().expect("direct walk").expect("a frame");
@@ -723,10 +734,10 @@ pub(crate) mod tests {
                     &want.tagdata
                 )
             );
-            buffered
+            let a = buffered
                 .pread_data(want.data_offset, want.data_size, &mut a)
                 .expect("buffered payload");
-            direct
+            let b = direct
                 .pread_data(got.data_offset, got.data_size, &mut b)
                 .expect("direct payload");
             assert_eq!(a, b, "payload of frame {frames}");

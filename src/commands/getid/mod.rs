@@ -732,8 +732,8 @@ fn filter_by_id_walker(
     // the header index (~140 MB at planet) plus a handful of matching
     // blob bodies.
     let mut walker = HeaderWalker::open(input, host)?;
-    let mut data_buf: Vec<u8> = Vec::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
+    let mut data_buf = crate::read::read_buf::ReadBuf::default();
+    let mut frame_buf = crate::read::read_buf::ReadBuf::default();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -767,10 +767,11 @@ fn filter_by_id_walker(
         match meta.blob_type {
             // The walker refuses a second OSMHeader, so this is the only one.
             BlobKind::OsmHeader => {
-                walker
+                let data = walker
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
-                let header = decode_blob_to_headerblock(&data_buf).map_err(locate)?;
+                let header = decode_blob_to_headerblock(data).map_err(locate)?;
+                data_buf.release_outlier(&host.invocation);
                 let built = super::output_header::build_one(&header, &facts, overrides, host)?;
                 declared = built.declared;
                 let header_bytes = built.bytes;
@@ -815,7 +816,7 @@ fn filter_by_id_walker(
                         // something this command observed. It goes in its own
                         // counter rather than into `*_written`.
                         stats.passthrough_claimed += idx.count;
-                        w.write_raw_owned(std::mem::take(&mut frame_buf))?;
+                        w.write_raw_owned(frame_buf.take())?;
                         blobs_passthrough += 1;
                         continue;
                     }
@@ -823,12 +824,15 @@ fn filter_by_id_walker(
                 // Blob might contain matching IDs, or the blob carries no
                 // indexdata and we must decode to check. Pread the data
                 // and run the per-element filter.
-                walker
+                let data = walker
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)
-                    .map_err(locate)?;
+                let decoded = crate::blob::decompress_blob_data_into(data, &mut decompress_buf);
+                // Done with the compressed bytes; the read buffer follows its
+                // retention limit (read/read_buf.rs).
+                data_buf.release_outlier(&host.invocation);
+                decoded.map_err(locate)?;
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.

@@ -253,7 +253,7 @@ impl StageCounters {
 /// A worker's read and decompress buffers.
 #[derive(Default)]
 struct BlobBuffers {
-    raw: Vec<u8>,
+    raw: crate::read::read_buf::ReadBuf,
     decompressed: Vec<u8>,
 }
 
@@ -269,20 +269,34 @@ impl BlobBuffers {
         task: &BlobTask,
         counters: &StageCounters,
     ) -> crate::Result<()> {
-        use std::os::unix::fs::FileExt as _;
         let t = crate::counters::Stopwatch::start();
-        self.raw.resize(task.data_size, 0);
-        file.read_exact_at(&mut self.raw, task.data_offset)
+        let raw = self
+            .raw
+            .read_exact_at(file, task.data_offset, task.data_size)
             .map_err(|e| {
                 Error::from(e).context(format!("pread failed at offset {}", task.data_offset))
             })?;
         t.record_ns(&counters.pread_ns);
 
         let t = crate::counters::Stopwatch::start();
-        crate::blob::decompress_blob_raw(&self.raw, &mut self.decompressed)?;
+        crate::blob::decompress_blob_raw(raw, &mut self.decompressed)?;
         t.record_ns(&counters.decompress_ns);
         Ok(())
     }
+
+    /// Apply the retention limits once a blob is done with both buffers: the
+    /// read buffer's (read/read_buf.rs) and the decode pool's for the decode
+    /// buffer (read/decompress.rs, "Retention policy").
+    fn release_outliers(&mut self, invocation: &crate::host::Recorder) {
+        self.raw.release_outlier(invocation);
+        crate::blob::release_decode_outlier(&mut self.decompressed, invocation);
+    }
+}
+
+/// A rewrite worker's state, whose blob buffers the rewrite pool releases
+/// after every blob.
+trait RewriteWorker {
+    fn buffers(&mut self) -> &mut BlobBuffers;
 }
 
 /// Per-blob base new IDs for a positionally numbered kind: blob `i` starts

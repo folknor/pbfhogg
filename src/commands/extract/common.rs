@@ -302,8 +302,6 @@ where
         + Send
         + Sync,
 {
-    use std::os::unix::fs::FileExt as _;
-
     if schedule.is_empty() {
         return Ok(());
     }
@@ -359,7 +357,7 @@ where
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| PreadLocal {
-            read_buf: Vec::new(),
+            read_buf: crate::read::read_buf::ReadBuf::default(),
             bb: BlockBuilder::new(),
             output_blocks: Vec::new(),
             pool: crate::blob::DecompressPool::new(&host.invocation),
@@ -369,11 +367,12 @@ where
         |(), local: &mut PreadLocal, ordinal| {
             let d = &schedule[decode_at.position(ordinal)];
             // Workers: pread -> decompress -> PrimitiveBlock -> extract -> OwnedBlocks.
-            (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
-                local.read_buf.resize(d.size, 0);
-                shared_file.read_exact_at(&mut local.read_buf, d.offset)?;
+            let result = (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
+                let raw = local
+                    .read_buf
+                    .read_exact_at(&*shared_file, d.offset, d.size)?;
                 let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
-                crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
+                crate::blob::decompress_blob_raw(raw, &mut buf)?;
                 let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                     buf,
                     &local.pool,
@@ -392,7 +391,10 @@ where
                     None,
                     Some(crate::ByteOffset(d.frame_offset)),
                 ))
-            })
+            });
+            // The read buffer follows its retention limit (read/read_buf.rs).
+            local.read_buf.release_outlier(&host.invocation);
+            result
         },
         &mut consumer,
     )?;
@@ -404,7 +406,7 @@ where
 
 /// One `pread_execute` worker's thread-local state.
 struct PreadLocal {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     bb: BlockBuilder,
     output_blocks: Vec<OwnedBlock>,
     pool: std::sync::Arc<crate::blob::DecompressPool>,

@@ -67,7 +67,13 @@ keeps a plain decode buffer outside a pool (the raw scan, the pread
 stages) applies the same per-buffer cap once per task through
 `release_decode_outlier`, counted with the pool's own oversize drops; a
 sequential loop that moves its buffer into each block keeps none and is
-not pooled (the "Take loops" note in `src/read/decompress.rs`).
+not pooled (the "Take loops" note in `src/read/decompress.rs`). The
+compressed-frame read buffers beside them (every pread worker, the
+header-walk consumers, the overlap sweeps, the direct reads' aligned
+scratch) are `ReadBuf` (`src/read/read_buf.rs`): exact growth, and a
+release past `READ_BUF_MAX_RETAINED_CAPACITY` once per blob, counted in
+`pipeline_read_buf_releases`; apply-changes holds its base-read buffer to
+the stricter scratch limit.
 
 **Thread oversubscription is a known architectural concern** but
 sequential conversion is *not* the answer. Measured evidence: a

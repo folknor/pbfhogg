@@ -86,7 +86,7 @@ pub(super) fn run_rewrite_stage<S, W>(
     work: W,
 ) -> Result<StageTotals>
 where
-    S: Send,
+    S: Send + super::RewriteWorker,
     W: Fn(&mut S, usize) -> crate::Result<Rewritten> + Sync,
 {
     let mut order = StrictOrder::new(kind);
@@ -108,7 +108,14 @@ where
             },
         },
         |_| (),
-        |state, (), idx| work(state, idx),
+        |state, (), idx| {
+            // Nothing a result carries borrows the blob buffers, so they
+            // follow their retention limits as soon as the work returns,
+            // on success and failure alike.
+            let result = work(state, idx);
+            state.buffers().release_outliers(&cancel);
+            result
+        },
         &mut ConsumeFn(|_, item: Rewritten| {
             order.admit(item.span).map_err(|e| {
                 e.locate(crate::error::Location::new(

@@ -23,6 +23,12 @@ struct Pass1Worker {
     overflow: Vec<i64>,
 }
 
+impl super::RewriteWorker for Pass1Worker {
+    fn buffers(&mut self) -> &mut BlobBuffers {
+        &mut self.buffers
+    }
+}
+
 /// What pass 1 produced besides the output blobs.
 pub(super) struct Pass1Result {
     pub(super) nodes_written: u64,

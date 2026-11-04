@@ -572,7 +572,8 @@ mod tests {
                     .expect("open inputs");
             assert_eq!(sources.direct(), direct);
             let mut buf = blob_merge::FrameBuf::default();
-            let err = match blob_merge::read_block(&sources[entry.source], entry, &mut buf) {
+            let call = crate::host::Call::detached();
+            let err = match blob_merge::read_block(&sources[entry.source], entry, &mut buf, &call) {
                 Ok(_) => panic!("a corrupt blob must fail pass 2"),
                 Err(err) => err,
             };

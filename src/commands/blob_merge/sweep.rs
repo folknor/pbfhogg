@@ -708,7 +708,7 @@ impl Sweep<'_, '_> {
     /// Read and decode one entry's frame and open a cursor on it.
     fn open(&self, entry: &BlobEntry, frame: &Frame, frame_buf: &mut FrameBuf) -> Result<Cursor> {
         let source = &self.sources[frame.source];
-        let block = read_block(source, frame, frame_buf)?;
+        let block = read_block(source, frame, frame_buf, self.cancel)?;
         // A believed header claim routed this blob to this kind's sweep and
         // placed it in the run, so it is held to the claim (see the module
         // docs). A scanned entry's index came from the payload; a

@@ -160,7 +160,7 @@ fn load_ref_count_sidecar_in(
 
 /// One stage 4 decode worker's thread-local buffers, reused across blobs.
 struct S4Local {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     /// A way blob decodes into it and reframes from it in place; a non-way
     /// blob moves it into its block, which drops before the task returns.
     decompress_buf: Vec<u8>,
@@ -193,7 +193,6 @@ struct S4Consumer<'a> {
     schedule: &'a [BlobDescriptor],
     file: &'a std::fs::File,
     input: &'a Path,
-    frame_read_buf: Vec<u8>,
     writer: &'a mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
     total_stats: Stats,
     bytes_written: u64,
@@ -214,9 +213,11 @@ impl S4Consumer<'_> {
         let desc = &self.schedule[position];
         let (frame_offset, frame_size) = (desc.frame_offset, desc.frame_size);
         let t_pread = crate::counters::Stopwatch::start();
-        self.frame_read_buf.resize(frame_size, 0);
+        // The frame is handed to the writer whole, so it is read into a
+        // buffer of its own and the consumer keeps none between blobs.
+        let mut frame = vec![0_u8; frame_size];
         self.file
-            .read_exact_at(&mut self.frame_read_buf, frame_offset)
+            .read_exact_at(&mut frame, frame_offset)
             .map_err(|e| {
                 Error::from(e).locate(crate::error::Location::at_offset(self.input, frame_offset))
             })?;
@@ -226,10 +227,7 @@ impl S4Consumer<'_> {
         let t_w = crate::counters::Stopwatch::start();
         self.bytes_written += frame_size as u64;
         self.write_calls += 1;
-        self.writer.write_raw_owned(std::mem::replace(
-            &mut self.frame_read_buf,
-            Vec::with_capacity(frame_size),
-        ))?;
+        self.writer.write_raw_owned(frame)?;
         self.write_ms += t_w.elapsed_ms();
 
         self.passthrough_blobs += 1;
@@ -331,7 +329,6 @@ pub(super) fn stage4_assembly(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<Stats> {
-    use std::os::unix::fs::FileExt;
     let WriteOptions {
         compression,
         backend,
@@ -501,7 +498,6 @@ pub(super) fn stage4_assembly(
         schedule,
         file: &shared_file,
         input,
-        frame_read_buf: Vec::new(),
         writer: &mut writer,
         total_stats: Stats::default(),
         bytes_written: 0,
@@ -541,7 +537,7 @@ pub(super) fn stage4_assembly(
         |_| {
             let guard = AbortOnDrop::new(coord_payloads_reader, "stage 4 worker");
             let local = S4Local {
-                read_buf: Vec::new(),
+                read_buf: crate::read::read_buf::ReadBuf::default(),
                 decompress_buf: Vec::new(),
                 st_scratch: Vec::new(),
                 gr_scratch: Vec::new(),
@@ -617,15 +613,15 @@ pub(super) fn stage4_assembly(
                     }
 
                     let t0 = crate::counters::Stopwatch::start();
-                    read_buf.resize(desc.data_size, 0);
-                    file.read_exact_at(read_buf, desc.data_offset)
+                    let raw = read_buf
+                        .read_exact_at(&**file, desc.data_offset, desc.data_size)
                         .map_err(|e| at_frame(Error::from(e)))?;
                     t0.record_ms(&c.pread_ms);
                     c.bytes_read.fetch_add(desc.data_size as u64, Relaxed);
                     c.pread_calls.fetch_add(1, Relaxed);
 
                     let t1 = crate::counters::Stopwatch::start();
-                    crate::blob::decompress_blob_raw(read_buf, decompress_buf).map_err(at_frame)?;
+                    crate::blob::decompress_blob_raw(raw, decompress_buf).map_err(at_frame)?;
                     t1.record_ms(&c.decompress_ms);
 
                     let t2 = crate::counters::Stopwatch::start();
@@ -770,6 +766,7 @@ pub(super) fn stage4_assembly(
                 record_max(&c.max_worker_buf_bytes, worker_bytes);
             }
             // After the sample above, so the peak still sees the outlier.
+            read_buf.release_outlier(&host.invocation);
             crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
             crate::commands::release_scratch(st_scratch);
             crate::commands::release_scratch(gr_scratch);

@@ -1056,8 +1056,6 @@ fn run_unordered_per_blob<L, R: Send>(
     host: &crate::host::Entered<'_>,
     metrics: &UnorderedPoolMetrics,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
-
     let mut willneed = WillneedPrefetch::new(schedule, &host.invocation);
     host.invocation.check()?;
     if schedule.is_empty() {
@@ -1099,18 +1097,22 @@ fn run_unordered_per_blob<L, R: Send>(
             let work_ref = &work;
             let local_ref = &local;
             scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
+                let mut read_buf = crate::read::read_buf::ReadBuf::default();
                 let mut state = local_ref();
 
                 while let Some(position) = next_position(&rx, metrics) {
                     let entry = &schedule[position];
 
                     let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(entry.data_size(), 0);
-                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                        work_ref(&mut state, position, &read_buf)
+                        let raw = read_buf.read_exact_at(
+                            &*file,
+                            entry.data_offset(),
+                            entry.data_size(),
+                        )?;
+                        work_ref(&mut state, position, raw)
                     })()
                     .map_err(|e| input.locate_blob(entry, e));
+                    read_buf.release_outlier(&host.invocation);
                     if crate::counters::send_recording_wait(
                         &tx,
                         (position, r),
@@ -1158,7 +1160,7 @@ impl Drop for EmitOnDrop<'_> {
 /// One ordered-classify worker's thread-local state: its read buffer,
 /// decompress pool and block-parse scratch, beside the caller's state.
 struct ClassifyLocal<S> {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     pool: std::sync::Arc<crate::blob::DecompressPool>,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
@@ -1257,8 +1259,6 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
     merge: impl FnMut(usize, R) -> Result<()>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
-
     let decode_threads = resolve_thread_count(threads, &*host.resources);
     let window = window.unwrap_or_else(|| crate::ordered_pool::default_window(decode_threads));
     let file = input.file();
@@ -1272,7 +1272,7 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| ClassifyLocal {
-            read_buf: Vec::new(),
+            read_buf: crate::read::read_buf::ReadBuf::default(),
             pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
@@ -1280,11 +1280,14 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
         },
         |(), local: &mut ClassifyLocal<S>, position| {
             let entry = &schedule[position];
-            (|| {
-                local.read_buf.resize(entry.data_size(), 0);
-                file.read_exact_at(&mut local.read_buf, entry.data_offset())?;
+            let result = (|| {
+                let raw = local.read_buf.read_exact_at(
+                    &**file,
+                    entry.data_offset(),
+                    entry.data_size(),
+                )?;
                 let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
-                crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
+                crate::blob::decompress_blob_raw(raw, &mut buf)?;
                 let buffer = entry.buffer(
                     buf,
                     &local.pool,
@@ -1293,7 +1296,11 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
                 );
                 project(buffer, &mut local.state)
             })()
-            .map_err(|e| input.locate_blob(entry, e))
+            .map_err(|e| input.locate_blob(entry, e));
+            // The read buffer follows the read-buffer retention limit once
+            // the blob is done with it (read/read_buf.rs).
+            local.read_buf.release_outlier(&host.invocation);
+            result
         },
         &mut ClassifyConsumer {
             merge,
@@ -1496,8 +1503,6 @@ fn run_accumulate_decoded<S: Send>(
     mut merge: impl FnMut(S),
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
-
     let mut willneed = WillneedPrefetch::new(schedule, &host.invocation);
     host.invocation.check()?;
     if schedule.is_empty() {
@@ -1549,7 +1554,7 @@ fn run_accumulate_decoded<S: Send>(
             let work_ref = &work;
             let worker_init_ref = &worker_init;
             scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
+                let mut read_buf = crate::read::read_buf::ReadBuf::default();
                 let worker_pool = crate::blob::DecompressPool::new(cancel);
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1573,16 +1578,21 @@ fn run_accumulate_decoded<S: Send>(
                         };
                         let entry = &schedule[position];
 
-                        (|| -> crate::error::Result<()> {
-                            read_buf.resize(entry.data_size(), 0);
-                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
+                        let blob = (|| -> crate::error::Result<()> {
+                            let raw = read_buf.read_exact_at(
+                                &*file,
+                                entry.data_offset(),
+                                entry.data_size(),
+                            )?;
                             let mut buf = crate::blob::pool_get(Some(&worker_pool), 0);
-                            crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                            crate::blob::decompress_blob_raw(raw, &mut buf)?;
                             let buffer =
                                 entry.buffer(buf, &worker_pool, &mut st_scratch, &mut gr_scratch);
                             work_ref(buffer, &mut state)
                         })()
-                        .map_err(|e| input.locate_blob(entry, e))?;
+                        .map_err(|e| input.locate_blob(entry, e));
+                        read_buf.release_outlier(cancel);
+                        blob?;
                     }
                 })();
 

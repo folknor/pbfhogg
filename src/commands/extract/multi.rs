@@ -853,7 +853,7 @@ where
         interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         blobs,
         input,
-        frame_buf: Vec::new(),
+        frame_buf: crate::read::read_buf::ReadBuf::default(),
         writers,
         stats,
         cancel: &host.invocation,
@@ -870,7 +870,7 @@ where
         |_| MultiLocal::new(n, &host.invocation),
         |(), local: &mut MultiLocal, ordinal| {
             let entry = &blobs[decode_at.position(ordinal)].entry;
-            let block = local.decode(input, entry)?;
+            let block = local.decode(input, entry, &host.invocation)?;
             local
                 .classify(&block, n, &block_fn, framing)
                 .map_err(|e| input.locate_blob(entry, e))
@@ -886,7 +886,7 @@ where
 /// One multi-extract worker's thread-local state: per-region builders and
 /// output, plus the decode scratch.
 struct MultiLocal {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     bbs: Vec<BlockBuilder>,
     output: Vec<Vec<OwnedBlock>>,
     pool: std::sync::Arc<crate::blob::DecompressPool>,
@@ -898,7 +898,7 @@ struct MultiLocal {
 impl MultiLocal {
     fn new(n: usize, invocation: &crate::host::Recorder) -> Self {
         Self {
-            read_buf: Vec::new(),
+            read_buf: crate::read::read_buf::ReadBuf::default(),
             bbs: (0..n).map(|_| BlockBuilder::new()).collect(),
             output: (0..n).map(|_| Vec::new()).collect(),
             pool: crate::blob::DecompressPool::new(invocation),
@@ -909,15 +909,22 @@ impl MultiLocal {
     }
 
     /// pread, decompress and parse `entry`, located with the input on failure.
-    fn decode(&mut self, input: &InputFile, entry: &ScheduledBlob) -> Result<PrimitiveBlock> {
-        use std::os::unix::fs::FileExt as _;
-        (|| {
-            self.read_buf.resize(entry.data_size(), 0);
-            input
-                .file()
-                .read_exact_at(&mut self.read_buf, entry.data_offset())?;
+    /// The read buffer follows its retention limit once the blob is
+    /// decompressed (read/read_buf.rs).
+    fn decode(
+        &mut self,
+        input: &InputFile,
+        entry: &ScheduledBlob,
+        invocation: &crate::host::Recorder,
+    ) -> Result<PrimitiveBlock> {
+        let block = (|| {
+            let raw = self.read_buf.read_exact_at(
+                &**input.file(),
+                entry.data_offset(),
+                entry.data_size(),
+            )?;
             let mut buf = crate::blob::pool_get(Some(&self.pool), 0);
-            crate::blob::decompress_blob_raw(&self.read_buf, &mut buf)?;
+            crate::blob::decompress_blob_raw(raw, &mut buf)?;
             PrimitiveBlock::from_vec_pooled_with_scratch(
                 buf,
                 &self.pool,
@@ -925,7 +932,9 @@ impl MultiLocal {
                 &mut self.gr_scratch,
             )
         })()
-        .map_err(|e| input.locate_blob(entry, e))
+        .map_err(|e| input.locate_blob(entry, e));
+        self.read_buf.release_outlier(invocation);
+        block
     }
 
     /// Classify `block` against the N regions and take each region's blocks.
@@ -1049,7 +1058,7 @@ struct MultiNodeConsumer<'a> {
     interleaved: crate::ordered_pool::Interleaved<'a>,
     blobs: &'a [NodeBlob],
     input: &'a InputFile,
-    frame_buf: Vec<u8>,
+    frame_buf: crate::read::read_buf::ReadBuf,
     writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &'a mut [ExtractStats],
     cancel: &'a crate::host::Recorder,
@@ -1059,7 +1068,6 @@ impl MultiNodeConsumer<'_> {
     /// Copy the verified raw frame at schedule position `position` to all N
     /// writers.
     fn passthrough(&mut self, position: usize) -> Result<()> {
-        use std::os::unix::fs::FileExt as _;
         self.cancel.check()?;
         let blob = &self.blobs[position];
         let Passthrough::Verified { nodes } = blob.passthrough else {
@@ -1068,15 +1076,17 @@ impl MultiNodeConsumer<'_> {
             ));
         };
         let frame_start = blob.entry.frame_start();
-        self.frame_buf.resize(blob.entry.frame_size(), 0);
-        self.input
-            .file()
-            .read_exact_at(&mut self.frame_buf, frame_start)
+        let frame = self
+            .frame_buf
+            .read_exact_at(&**self.input.file(), frame_start, blob.entry.frame_size())
             .map_err(|e| self.input.locate_at(frame_start, e.into()))?;
         for (writer, stats) in self.writers.iter_mut().zip(self.stats.iter_mut()) {
-            writer.write_raw(&self.frame_buf)?;
+            writer.write_raw(frame)?;
             stats.nodes_in_bbox += nodes;
         }
+        // Every region has its copy; the frame buffer follows its retention
+        // limit (read/read_buf.rs).
+        self.frame_buf.release_outlier(self.cancel);
         Ok(())
     }
 }

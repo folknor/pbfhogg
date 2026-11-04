@@ -272,21 +272,6 @@ diagnostic found under 2 MB in each of those 32 arenas, which a per-arena
 `malloc_info` around the start would square with or refute. Matters to any
 command that first touches the executor between two pools.
 
-### WRK-170: Worker read buffers keep their largest frame for the phase
-
-Every worker-kept decode buffer now follows the decode pool's per-buffer
-limit (`release_decode_outlier`), but the compressed-frame read buffers
-beside them follow none: `run_unordered_per_blob`'s `read_buf` (every
-unordered pool, raw scan included), `ClassifyLocal::read_buf`, the altw
-external stage 1, 2 and 4 read buffers, altw passthrough's and geocode
-pass 1.5's. Each keeps the largest frame its worker read for the phase,
-up to the 32 MiB frame cap per worker on a hostile file. apply-changes'
-base-read buffer is the precedent (`ReadBuf::release_outlier`, the 4 MiB
-scratch limit, measured neutral at planet although LocationsOnWays way
-frames exceed it). Deciding the limit (4 MiB scratch or the 16 MiB decode
-line) changes behaviour on LocationsOnWays input for `check --locations`,
-so it is measured there.
-
 ### WRK-027: Membership track for set-dominated peaks
 
 The rows dominated by ID sets (extract, multi-extract, tags-filter two-pass,

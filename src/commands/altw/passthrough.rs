@@ -180,7 +180,7 @@ fn build_schedule(
 
 /// Per-worker scratch reused across decode descriptors.
 struct WorkerScratch {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     decompress_buf: Vec<u8>,
     bb: BlockBuilder,
     refs_buf: Vec<i64>,
@@ -199,7 +199,7 @@ struct WorkerScratch {
 impl WorkerScratch {
     fn new(invocation: &crate::host::Recorder) -> Self {
         Self {
-            read_buf: Vec::new(),
+            read_buf: crate::read::read_buf::ReadBuf::default(),
             decompress_buf: Vec::new(),
             bb: BlockBuilder::new(),
             refs_buf: Vec::new(),
@@ -233,8 +233,9 @@ fn decode_one(
     counters: &Pass2Counters,
 ) -> crate::Result<(Vec<OwnedBlock>, Stats)> {
     let t_pread = crate::counters::Stopwatch::start();
-    scratch.read_buf.resize(desc.data_size, 0);
-    file.read_exact_at(&mut scratch.read_buf, desc.data_offset)
+    scratch
+        .read_buf
+        .read_exact_at(&**file, desc.data_offset, desc.data_size)
         .map_err(|e| crate::error::Error::from(e).context("pass 2 pread"))?;
     t_pread.record_ns(&counters.pread_ns);
     counters
@@ -244,7 +245,7 @@ fn decode_one(
 
     if desc.is_way_blob {
         let t_dc = crate::counters::Stopwatch::start();
-        decompress_blob_raw(&scratch.read_buf, &mut scratch.decompress_buf)?;
+        decompress_blob_raw(scratch.read_buf.bytes(), &mut scratch.decompress_buf)?;
         t_dc.record_ns(&counters.decompress_ns);
         let t_reframe = crate::counters::Stopwatch::start();
         let stats = reframe_way_blob_with_locations(
@@ -307,7 +308,7 @@ fn decode_one(
     // `decompress_blob_raw` - the same wire-level path the way branch above uses.
     let t_dc = crate::counters::Stopwatch::start();
     let mut decompressed = crate::blob::pool_get(Some(&scratch.pool), 0);
-    decompress_blob_raw(&scratch.read_buf, &mut decompressed)?;
+    decompress_blob_raw(scratch.read_buf.bytes(), &mut decompressed)?;
     t_dc.record_ns(&counters.decompress_ns);
     let t_nonway = crate::counters::Stopwatch::start();
     let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -433,7 +434,6 @@ pub(super) fn write_output_passthrough(
         interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         schedule,
         file: &shared_file,
-        frame_read_buf: Vec::new(),
         writer: &mut writer,
         total_stats: Stats::default(),
         write_ns: 0,
@@ -486,7 +486,9 @@ pub(super) fn write_output_passthrough(
                 ))
             });
             // The way path's plain decode buffer follows the pool's limit,
-            // as the non-way path's pooled one does.
+            // as the non-way path's pooled one does; the read buffer follows
+            // its own (read/read_buf.rs).
+            scratch.read_buf.release_outlier(&host.invocation);
             crate::blob::release_decode_outlier(&mut scratch.decompress_buf, &host.invocation);
             result
         },
@@ -533,7 +535,6 @@ struct Pass2Consumer<'a> {
     interleaved: crate::ordered_pool::Interleaved<'a>,
     schedule: &'a [BlobDescriptor],
     file: &'a std::fs::File,
-    frame_read_buf: Vec<u8>,
     writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
     total_stats: Stats,
     write_ns: u64,
@@ -552,17 +553,15 @@ impl Pass2Consumer<'_> {
         let desc = &self.schedule[position];
         let frame_size = desc.frame_size;
         let t_pt = crate::counters::Stopwatch::start();
-        self.frame_read_buf.resize(frame_size, 0);
-        self.file
-            .read_exact_at(&mut self.frame_read_buf, desc.frame_offset)?;
+        // The frame is handed to the writer whole, so it is read into a
+        // buffer of its own and the consumer keeps none between blobs.
+        let mut frame = vec![0_u8; frame_size];
+        self.file.read_exact_at(&mut frame, desc.frame_offset)?;
         self.pt_pread_ns += t_pt.elapsed_ns();
         self.pt_bytes += frame_size as u64;
         self.pt_blobs += 1;
         let t_write = crate::counters::Stopwatch::start();
-        self.writer.write_raw_owned(std::mem::replace(
-            &mut self.frame_read_buf,
-            Vec::with_capacity(frame_size),
-        ))?;
+        self.writer.write_raw_owned(frame)?;
         self.write_ns += t_write.elapsed_ns();
         self.total_stats.blobs_passthrough += 1;
         match desc.kind {

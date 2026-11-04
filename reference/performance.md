@@ -1448,6 +1448,38 @@ untouched phases before and beside it moved with it (blob metadata scan
 5.2 s to 7.9 s, relation scan 9.9 s to 11.6 s, disk read in the segment
 after pass A starts 11,373 MB to 13,517 MB). Stage 1's code change is one capacity compare per blob.
 
+### Worker read buffers follow a retention limit (bygg, 2026-11-04, against `22a5f24a`)
+
+Every buffer that keeps a compressed blob payload or a whole frame across
+blobs is now `crate::read::read_buf::ReadBuf`: exact growth (the old
+`resize` doubled, so a buffer kept up to nearly twice its largest frame)
+and a release past `READ_BUF_MAX_RETAINED_CAPACITY` once per blob, counted
+in `pipeline_read_buf_releases`. The direct reads' aligned scratch follows
+the same line. Two lines were measured on `check --locations` over
+`planet-20260223-altw-keep-untagged` (way frames median 4.5 MB, max
+9.6 MB), `--bench 1`, run order HEAD, HEAD, 4 MiB, 16 MiB, 4 MiB, HEAD
+(HEAD cells stored, variant cells `--force`):
+
+| arm | walls (s) | max phase anon (GB) | releases |
+|---|---|---|---|
+| `22a5f24a` (`d030ae1a`, `b91bc0b6`, `9cb69c5a`) | 197.4, 203.2, 204.2 | 17.65, 18.14, 17.96 | - |
+| 4 MiB, the scratch limit (sidecars `eea69fb4`, `28ac76b5`) | 214.4, 222.9 | 17.98, 18.10 | 90,972 |
+| 16 MiB, landed (sidecar `48fea30c`) | 204.4 | 17.99 | 0 |
+
+The 4 MiB line freed and regrew a way-frame buffer on most way reads (452 GB
+of released capacity over the six partitions); partitions 2 to 5 ran 2 to
+4 % slower in both of its cells, partition 1 17 and 39 %, and the run peak
+did not fall. The 16 MiB line runs phase for phase as HEAD and never fires
+on planet. apply-changes keeps its own 4 MiB line on the base-read buffer
+(see "apply-changes' worker scratch follows the release rule" below).
+
+`add-locations-to-ways --index-type external` on the indexed planet
+(largest frame 3.7 MB, zero releases), variant then HEAD: 325.5 s
+(`7a756d41`) against 356.4 s (`c0b11c81`). Stage 2 159.2 against 158.9 s,
+stage 4 123.8 against 121.7 s; the wall gap is the HEAD cell's stage 1 pass
+A at 67.9 s against 33.9 s here and 32 to 36 s in earlier records, run
+history rather than the change.
+
 ### apply-changes frames each block as it completes (bygg, 2026-10-30)
 
 A planet input blob holds about 200k elements and is rewritten into about

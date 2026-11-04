@@ -103,7 +103,7 @@ struct Stage1Shard<'a> {
 
 /// One pass A worker's thread-local decode buffers.
 struct Stage1Local {
-    read_buf: Vec<u8>,
+    read_buf: crate::read::read_buf::ReadBuf,
     decompress_buf: Vec<u8>,
     refs_buf: Vec<i64>,
     group_starts: Vec<(usize, usize)>,
@@ -309,8 +309,6 @@ pub(super) fn stage1_pass_a(
     inject_prepass: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(u64, Vec<u64>)> {
-    use std::os::unix::fs::FileExt as _;
-
     let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
     let input = input.path();
 
@@ -363,7 +361,7 @@ pub(super) fn stage1_pass_a(
             waits: crate::ordered_pool::Waits::default(),
         },
         |_| Stage1Local {
-            read_buf: Vec::new(),
+            read_buf: crate::read::read_buf::ReadBuf::default(),
             decompress_buf: Vec::new(),
             refs_buf: Vec::new(),
             group_starts: Vec::new(),
@@ -394,8 +392,8 @@ pub(super) fn stage1_pass_a(
 
             let result: crate::Result<(u64, Vec<u32>, Option<i64>)> = (|| {
                 let t0 = crate::counters::Stopwatch::start();
-                read_buf.resize(task.data_size, 0);
-                file.read_exact_at(read_buf, task.data_offset)
+                let raw = read_buf
+                    .read_exact_at(&**file, task.data_offset, task.data_size)
                     .map_err(|e| in_input(Error::from(e).context("pass A pread")))?;
                 t0.record_ms(&counters_ref.pread_ms);
                 counters_ref
@@ -404,7 +402,7 @@ pub(super) fn stage1_pass_a(
                 counters_ref.pread_calls.fetch_add(1, Relaxed);
 
                 let t1 = crate::counters::Stopwatch::start();
-                crate::blob::decompress_blob_raw(read_buf, decompress_buf)
+                crate::blob::decompress_blob_raw(raw, decompress_buf)
                     .map_err(|e| in_input(e.context("pass A decompress")))?;
                 t1.record_ms(&counters_ref.decompress_ms);
 
@@ -531,6 +529,7 @@ pub(super) fn stage1_pass_a(
 
                 Ok((blob_node_ids.len() as u64, per_way_rcs, first_way))
             })();
+            read_buf.release_outlier(&host.invocation);
             crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
             result
         },

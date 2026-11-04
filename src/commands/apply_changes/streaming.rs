@@ -56,7 +56,6 @@
 //! scanner and the surviving workers. Per-blob errors carry the blob's
 //! seq and frame offset.
 
-use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
@@ -240,9 +239,6 @@ crate::counters::counter_set! {
         /// held, or none was held (first read, after an owned passthrough
         /// took it, or after a release).
         pub read_buf_allocs => "merge_streaming_read_buf_allocs",
-        /// Read buffers dropped between blobs for exceeding
-        /// `MAX_RETAINED_SCRATCH_CAPACITY`.
-        pub read_buf_releases => "merge_streaming_read_buf_releases",
         /// The largest capacity each worker's other kept scratch held at the
         /// end of a blob, before the retention limit is applied (group
         /// scratch, node-group scratch, refresh scratch and the coordinate
@@ -504,7 +500,7 @@ fn worker_loop(
 /// buffer takes the common limit rather than one of its own.
 #[derive(Default)]
 struct WorkerScratch {
-    read: ReadBuf,
+    read: BaseRead,
     /// Owned here only between a decompress and the parse that moves it into
     /// its block (whose drop returns it to the decode pool), or after a
     /// refresh scan that passed its blob through without a parse; empty
@@ -556,7 +552,13 @@ impl WorkerScratch {
             self.scratch_peak = kept;
         }
 
-        self.read.release_outlier(counters);
+        // The stricter scratch limit, not the read buffers' default line:
+        // measured at planet under `-l` as wall-neutral with a lower peak
+        // (see `MAX_RETAINED_SCRATCH_CAPACITY` in `tunables.rs`). Counted
+        // with every read buffer's, in `pipeline_read_buf_releases`.
+        self.read
+            .buf
+            .release_past(crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY, invocation);
         // The decode pool applies its limit when a parsed block returns the
         // buffer; one a refresh scan kept without a parse is checked here
         // against the same limit, and the next candidate refetches from the
@@ -583,23 +585,19 @@ impl WorkerScratch {
     }
 }
 
-/// The worker's base-read buffer.
-///
-/// It grows exactly to the frame it is about to read, never doubling, and a
-/// growth is a fresh allocation rather than a reallocation: the read
-/// overwrites every byte, so there is nothing to copy, and a growth costs one
-/// allocation and a zero fill of the frame, the same order as the read itself,
-/// even over a run of steadily larger frames. A read within the capacity
-/// zero fills only the part beyond the previous frame's length.
+/// The worker's base-read buffer: the crate's worker read buffer
+/// (`crate::read::read_buf`, exact growth), held to the scratch limit rather
+/// than the read buffers' default line (`WorkerScratch::between_tasks`), with
+/// this command's allocation and peak counters around it.
 #[derive(Default)]
-struct ReadBuf {
-    buf: Vec<u8>,
+struct BaseRead {
+    buf: crate::read::read_buf::ReadBuf,
     /// The largest capacity held, the share already added to
     /// `read_buf_peak_bytes`.
     peak: usize,
 }
 
-impl ReadBuf {
+impl BaseRead {
     /// Size the buffer to `len` and pread `len` bytes at `offset`, counted in
     /// `blob_reads`.
     fn read_at(
@@ -610,13 +608,11 @@ impl ReadBuf {
         counters: &WorkerCounters,
     ) -> Result<()> {
         counters.blob_reads.fetch_add(1, Ordering::Relaxed);
-        if len > self.buf.capacity() {
-            // Free the old buffer before allocating its replacement, so the
-            // two are never held at once.
-            drop(std::mem::take(&mut self.buf));
-            self.buf = Vec::with_capacity(len);
+        let before = self.buf.capacity();
+        let read = self.buf.read_exact_at(file, offset, len).map(|_| ());
+        let capacity = self.buf.capacity();
+        if capacity != before {
             counters.read_buf_allocs.fetch_add(1, Ordering::Relaxed);
-            let capacity = self.buf.capacity();
             if capacity > self.peak {
                 counters
                     .read_buf_peak_bytes
@@ -624,17 +620,7 @@ impl ReadBuf {
                 self.peak = capacity;
             }
         }
-        self.buf.resize(len, 0);
-        Ok(file.read_exact_at(&mut self.buf, offset)?)
-    }
-
-    /// Drop the buffer if a frame grew it past the retention limit. A
-    /// retained buffer keeps its contents and length.
-    fn release_outlier(&mut self, counters: &WorkerCounters) {
-        if self.buf.capacity() > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY {
-            self.buf = Vec::new();
-            counters.read_buf_releases.fetch_add(1, Ordering::Relaxed);
-        }
+        Ok(read?)
     }
 }
 
@@ -723,7 +709,7 @@ fn handle_candidate(
         read.read_at(file, desc.frame_start, desc.frame_len, counters)?;
         desc.blob_offset
             .checked_add(desc.data_size)
-            .filter(|&end| end <= read.buf.len())
+            .filter(|&end| end <= read.buf.bytes().len())
             .map(|end| desc.blob_offset..end)
             .ok_or_else(|| Error::internal("streaming: blob body outside its frame"))?
     } else {
@@ -737,7 +723,7 @@ fn handle_candidate(
         // The last parsed block took the buffer; fetch it back.
         *decompress_buf = crate::blob::pool_get(Some(decode_pool), 0);
     }
-    decompress_blob_raw(&read_buf[body.clone()], decompress_buf)?;
+    decompress_blob_raw(&read_buf.bytes()[body.clone()], decompress_buf)?;
     t_decompress.record_ns(&counters.decompress_ns);
 
     // The blob's indexdata claim, `None` for an unindexed blob. Every
@@ -981,7 +967,7 @@ fn handle_candidate(
             // the output header allows: it declares no way enrichment
             // (`Ways::Reencoded` in `build_header_bytes`).
             let frame_bytes = reframe_raw_with_index(
-                &read_buf[body],
+                &read_buf.bytes()[body],
                 &index.serialize(),
                 tagdata.as_deref(),
                 metrics,
@@ -1146,7 +1132,7 @@ fn handle_owned_passthrough(
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
-    read: &mut ReadBuf,
+    read: &mut BaseRead,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     read.read_at(file, desc.frame_start, desc.frame_len, counters)?;
@@ -1167,7 +1153,7 @@ fn pass_through_indexed(
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
-    read_buf: &mut Vec<u8>,
+    read_buf: &mut crate::read::read_buf::ReadBuf,
     route: Route<()>,
     observed_first: Option<i64>,
 ) -> Result<()> {
@@ -1182,7 +1168,7 @@ fn pass_through_indexed(
             "streaming: owned passthrough of a blob without indexdata",
         ));
     };
-    if read_buf.len() != desc.frame_len {
+    if read_buf.bytes().len() != desc.frame_len {
         return Err(Error::internal(
             "streaming: owned passthrough without its whole frame read",
         ));
@@ -1194,7 +1180,8 @@ fn pass_through_indexed(
         drain_tx,
         DrainItem::OwnedBytes {
             seq: desc.seq,
-            frame_bytes: std::mem::take(read_buf),
+            // Moved on whole, not released: the drain holds it now.
+            frame_bytes: read_buf.take(),
             kind: desc.kind,
             id_range,
             observed_first,
@@ -1297,6 +1284,7 @@ fn blob_err(desc: &BlobDescriptor, source: &Arc<Path>, e: Error) -> Error {
 mod tests {
     use super::*;
     use crate::tunables::{DECOMPRESS_POOL_MAX_RETAINED_CAPACITY, MAX_RETAINED_SCRATCH_CAPACITY};
+    use std::os::unix::fs::FileExt as _;
 
     fn input(len: usize) -> (tempfile::TempDir, std::fs::File) {
         let dir = crate::path_guard::tests::scratch();
@@ -1321,7 +1309,7 @@ mod tests {
     fn read_buffer_grows_exactly_and_only_on_a_larger_frame() {
         let (_dir, file) = input(10_000);
         let counters = WorkerCounters::new();
-        let mut read = ReadBuf::default();
+        let mut read = BaseRead::default();
 
         read.read_at(&file, 0, 3_000, &counters).expect("read");
         read.read_at(&file, 100, 3_001, &counters).expect("read");
@@ -1336,34 +1324,12 @@ mod tests {
             grown,
             "a smaller frame reuses the buffer"
         );
-        assert_eq!(read.buf.len(), 1_000);
         let expected: Vec<u8> = (7..1_007).map(byte).collect();
-        assert_eq!(read.buf, expected);
+        assert_eq!(read.buf.bytes(), expected);
 
         assert_eq!(load(&counters.blob_reads), 3);
         assert_eq!(load(&counters.read_buf_allocs), 2);
         assert_eq!(load(&counters.read_buf_peak_bytes), grown as u64);
-        read.release_outlier(&counters);
-        assert_eq!(read.buf.len(), 1_000, "a retained buffer keeps its length");
-        assert_eq!(load(&counters.read_buf_releases), 0);
-    }
-
-    /// A read buffer past the retention limit is dropped between blobs; a
-    /// smaller one is kept.
-    #[test]
-    fn read_buffer_past_its_limit_is_released() {
-        let counters = WorkerCounters::new();
-        let mut read = ReadBuf {
-            buf: Vec::with_capacity(MAX_RETAINED_SCRATCH_CAPACITY / 2),
-            peak: 0,
-        };
-        read.release_outlier(&counters);
-        assert_ne!(read.buf.capacity(), 0);
-
-        read.buf = Vec::with_capacity(MAX_RETAINED_SCRATCH_CAPACITY + 1);
-        read.release_outlier(&counters);
-        assert_eq!(read.buf.capacity(), 0);
-        assert_eq!(load(&counters.read_buf_releases), 1);
     }
 
     /// Between blobs the small scratch past the scratch limit, and a kept
@@ -1402,6 +1368,42 @@ mod tests {
             scratch.decompress_buf.capacity(),
             DECOMPRESS_POOL_MAX_RETAINED_CAPACITY
         );
+    }
+
+    /// The base-read buffer is held to the scratch limit, stricter than the
+    /// read buffers' default line: a frame between the two is released
+    /// between blobs and counted with every read buffer's release, one at
+    /// the scratch limit is kept.
+    #[test]
+    fn between_tasks_holds_the_read_buffer_to_the_scratch_limit() {
+        use crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY;
+        let frame = MAX_RETAINED_SCRATCH_CAPACITY + 1;
+        assert!(frame <= READ_BUF_MAX_RETAINED_CAPACITY);
+        let (_dir, file) = input(frame);
+        let counters = WorkerCounters::new();
+        let call = crate::host::Call::detached();
+        let mut scratch = WorkerScratch::default();
+
+        scratch
+            .read
+            .read_at(&file, 0, MAX_RETAINED_SCRATCH_CAPACITY, &counters)
+            .expect("read");
+        scratch
+            .between_tasks(&counters, &call)
+            .expect("between tasks");
+        assert_eq!(scratch.read.buf.capacity(), MAX_RETAINED_SCRATCH_CAPACITY);
+
+        scratch
+            .read
+            .read_at(&file, 0, frame, &counters)
+            .expect("read");
+        scratch
+            .between_tasks(&counters, &call)
+            .expect("between tasks");
+        assert_eq!(scratch.read.buf.capacity(), 0);
+        let metrics = &call.metrics().decompress;
+        assert_eq!(load(&metrics.read_buf_releases), 1);
+        assert_eq!(load(&metrics.read_buf_release_capacity_bytes), frame as u64);
     }
 
     /// Coordinates still in the accumulator after a blob's handler returned

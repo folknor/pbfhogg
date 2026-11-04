@@ -227,7 +227,6 @@ fn getparents_walker(
 
     host.invocation.marker("GETPARENTS_SCHEDULE_START");
     let mut walker = HeaderWalker::open(input, host)?;
-    let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
     let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
     let mut blobs_skipped: u64 = 0;
@@ -235,12 +234,13 @@ fn getparents_walker(
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
             BlobKind::OsmHeader if header_block.is_none() => {
-                walker
+                // Read once, into a buffer that does not outlive the header.
+                let mut header_buf = crate::read::read_buf::ReadBuf::default();
+                let data = walker
                     .pread_data(meta.data_offset, meta.data_size, &mut header_buf)
                     .map_err(|e| walker.locate_meta(&meta, e))?;
                 header_block = Some(
-                    decode_blob_to_headerblock(&header_buf)
-                        .map_err(|e| walker.locate_meta(&meta, e))?,
+                    decode_blob_to_headerblock(data).map_err(|e| walker.locate_meta(&meta, e))?,
                 );
             }
             BlobKind::OsmData => {

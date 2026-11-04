@@ -19,6 +19,12 @@ struct Stage2dWorker<'a> {
     reframe_buf: Vec<u8>,
 }
 
+impl super::RewriteWorker for Stage2dWorker<'_> {
+    fn buffers(&mut self) -> &mut BlobBuffers {
+        &mut self.buffers
+    }
+}
+
 /// What stage 2d produced besides the output blobs.
 pub(super) struct Stage2dResult {
     pub(super) ways_written: u64,

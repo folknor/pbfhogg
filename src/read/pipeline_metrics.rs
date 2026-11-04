@@ -141,7 +141,9 @@ crate::counters::counter_set! {
     /// passthrough), not only the pipelined reader, so no per-pipeline path
     /// emits them. The oversize pair also counts the plain decode buffers
     /// workers keep outside a pool, which follow the same per-buffer limit
-    /// through `release_decode_outlier`. Their only way out is [`emit_decompress_pool_counters`],
+    /// through `release_decode_outlier`. The read-buffer pair counts the
+    /// compressed-frame read buffers' releases (`crate::read::read_buf`),
+    /// invocation totals in the same way. Their only way out is [`emit_decompress_pool_counters`],
     /// which only the end-of-invocation emitter calls; the generated emitter
     /// is private to this module. A pool records into the invocation it was
     /// built for, also when a block it handed out is dropped after the call.
@@ -159,6 +161,11 @@ crate::counters::counter_set! {
         poisoned_drops => "pipeline_decompress_pool_poisoned_drops",
         /// Sum of capacities of buffers dropped after the pool mutex was poisoned.
         poisoned_drop_capacity_bytes => "pipeline_decompress_pool_poisoned_drop_capacity_bytes",
+        /// Worker read buffers freed because one frame grew them past their
+        /// retention limit (`crate::read::read_buf`).
+        pub(crate) read_buf_releases => "pipeline_read_buf_releases",
+        /// Sum of the capacities of those read buffers.
+        pub(crate) read_buf_release_capacity_bytes => "pipeline_read_buf_release_capacity_bytes",
     }
 }
 
@@ -181,6 +188,15 @@ impl DecompressPoolMetrics {
 
     pub fn record_full_drop(&self, capacity: usize) {
         Self::record_drop(&self.full_drops, &self.full_drop_capacity_bytes, capacity);
+    }
+
+    /// Record a worker read buffer freed past its retention limit.
+    pub fn record_read_buf_release(&self, capacity: usize) {
+        Self::record_drop(
+            &self.read_buf_releases,
+            &self.read_buf_release_capacity_bytes,
+            capacity,
+        );
     }
 
     pub fn record_poisoned_drop(&self, capacity: usize) {

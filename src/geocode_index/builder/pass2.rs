@@ -48,6 +48,9 @@ use super::super::format::*;
 /// Slim interpolation metadata kept in memory during the build.
 /// Node coordinates are written directly to interp_nodes.bin; this struct
 /// keeps the source way ID, file offset, count, and endpoint metadata.
+/// Pass 2 pushes one per source way; the resolver replaces a resolved way
+/// with one record per section between its address nodes, whose node spans
+/// share the split node (see `interp.rs`).
 ///
 /// Interpolation endpoints must have positive house numbers. Endpoint matching
 /// rejects zero; serialized zero marks unresolved ways, so a real
@@ -64,6 +67,8 @@ pub(super) struct SlimInterpWay {
     /// `even` and `odd`), which is never resolved.
     pub(super) interpolation: Option<InterpolationType>,
     pub(super) node_count: u16,
+    /// Every node ref of the source way resolved to a coordinate.
+    pub(super) complete: bool,
     pub(super) start_number: u32,
     pub(super) end_number: u32,
 }
@@ -207,6 +212,10 @@ struct PendingInterp {
     way_id: i64,
     street: Box<str>,
     interpolation: Option<InterpolationType>,
+    /// Every node ref resolved to a coordinate. A shortened way would join
+    /// its surviving nodes across the gap and could put an interior address
+    /// where an end was, so the resolver refuses an incomplete way.
+    complete: bool,
     coords: Vec<(i32, i32)>,
 }
 
@@ -354,8 +363,12 @@ fn classify_way_into(
             }
             state.interps.push(PendingInterp {
                 way_id,
+                // An interpolation way tagged by the OSM convention carries
+                // no street; the empty string interns to offset 0, and the
+                // resolver takes the street from the end nodes' addresses.
                 street: addr_st.unwrap_or("").into(),
                 interpolation,
+                complete: missing_node_ref_count == 0,
                 coords,
             });
         }
@@ -682,6 +695,7 @@ pub(super) fn run_pass2(
                         street_offset,
                         interpolation: pi.interpolation,
                         node_count: nc,
+                        complete: pi.complete,
                         // Zero marks endpoints that were not resolved.
                         start_number: 0,
                         end_number: 0,

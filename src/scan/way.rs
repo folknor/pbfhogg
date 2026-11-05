@@ -33,6 +33,14 @@ use crate::tunables::GEOCODE_EXCLUDED_HIGHWAYS;
 impl WayGeocodeFlags {
     /// Both passes supply presence bits; only the representation-specific
     /// highway exclusion lookup differs (string bytes versus table indices).
+    ///
+    /// An interpolation way needs only `addr:interpolation`: OSM puts the
+    /// street and numbers on its end nodes, and the way "doesn't take
+    /// addr:street=*" (wiki, Addresses, Interpolation), so requiring the
+    /// street on the way would drop exactly the conforming ways. A way that
+    /// also carries `addr:housenumber` is an addressed object, not a range
+    /// (Nominatim excludes it the same way), and is classified as a building
+    /// address when it qualifies as one.
     #[allow(clippy::fn_params_excessive_bools)]
     pub(crate) fn classify(
         highway: bool,
@@ -46,7 +54,7 @@ impl WayGeocodeFlags {
         Self {
             is_street: highway && name && !excluded,
             is_building_addr: building && housenumber && street,
-            is_interp: interpolation && street,
+            is_interp: interpolation && !housenumber,
         }
     }
 }

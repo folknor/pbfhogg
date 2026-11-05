@@ -1173,6 +1173,11 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **glibc's mmap threshold, per command.** A CLI-wide fixed threshold
+  was ruled out at planet; a per-command choice, the measurements it still
+  needs across dataset sizes and hosts, and the structural route (recycling
+  blob-scale buffers) are in `notes/mmap-threshold.md`.
+
 - [ ] **A cold schedule header walk costs ~6 s at planet (found
   2026-10-30).** Cells that run without the headers in page cache spend
   about 6 s per schedule walk (getparents, check `--ids`, time-filter, cat,

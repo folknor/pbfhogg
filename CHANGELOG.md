@@ -538,6 +538,16 @@ state.
   ways resolve (Germany 7 of 78 at any level). Queries on existing indexes
   also refuse an `even` or `odd` range whose ends have the wrong parity,
   which stepped past the end; rebuild for the rest.
+- `build-geocode-index` reads interpolation ways as OSM tags them: a way
+  needs only `addr:interpolation` and takes its street from the addresses on
+  its end nodes when it has no `addr:street` (it used to be dropped, which
+  was most of them). An address node inside the way splits it into separate
+  ranges (10, 20, 40 is 10-20 and 20-40, not 10-40), so the index's
+  interpolation count is now ranges, not ways. A way that also carries
+  `addr:housenumber` is no longer interpolation, and one with equal numbers
+  at both ends (a closed outline with one address), a node missing from the
+  input, or a zero or oversized interior number never answers. Rebuild
+  existing indexes to gain this.
 - `build-geocode-index` stores names, house numbers, streets, postcodes and
   country codes whole. A PBF tag value holding a NUL byte used to be answered
   as the part before the NUL (`10\0a` as `10`); the index string pool is now

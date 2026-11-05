@@ -231,32 +231,6 @@ ledger does not bound pages glibc retains. apply-changes now bounds outstanding 
 peaks of 300-410); a byte budget here would replace that window, not sit
 beside it.
 
-### WRK-169: glibc's sliding mmap threshold keeps freed buffers resident
-
-Surveyed at planet: reference/performance.md, "glibc's sliding mmap
-threshold across commands" holds every cell, per-command verdicts and the
-gaps. Every multi-phase command pays it, and not only between phases: the
-first free of any blob-scale mapped buffer raises the threshold for the
-rest of the run. A CLI-wide fixed threshold was measured at 128 KiB, 1 MiB
-and 4 MiB and none passes both the wall guard and the no-memory-regression
-bar on every command, so nothing landed and the CLI still sets no policy.
-Two things remain:
-
-- Decision for the user: whether to accept one of the measured trades (the
-  section lists what each value costs and saves) or keep the current
-  default.
-- Structural route, to make a low threshold stop costing wall: remove the
-  per-blob allocate-and-free of blob-scale buffers. One site is
-  demonstrated: `BlobReader::next_frame` allocates every compressed frame
-  fresh (the 1 MiB arm's getid cost); recycling has to follow the frame's
-  last `Bytes` slice, which raw payloads carry past decompression
-  (`PooledBuffer` in `src/read/decompress.rs` is the ownership precedent).
-  The other churn sites, in extract `--complete`'s way classify and write
-  phases (minor faults up twentyfold under a 128 KiB threshold), are not
-  attributed. Removing a site removes one source of the wall cost; it does
-  not by itself promise a low threshold becomes free. Bounded pooled storage
-  retains idle memory, so it has to be weighed against the saving.
-
 ### WRK-172: Other commands whose executor starts idle after a worker set
 
 Attributed and fixed for repack (reference/performance.md, "Idle executor
@@ -279,37 +253,86 @@ geocode builder and apply-changes (its workers persist across the start;
 its diagnostic's under-2 MB executor arenas are the fresh-arena case) are
 covered.
 
-### WRK-027: Membership track for set-dominated peaks
+### WRK-180: check --ids --full proves duplicates absent from monotonicity
 
-The rows dominated by ID sets (extract, multi-extract, tags-filter two-pass,
-check `--ids --full`, the apply-changes overlay): fewer coexisting sets,
-release each set after its last dependent phase, a shared region-membership
-representation for overlapping multi-extract regions, partitioned or
-spillable dependency state where a hard ceiling matters. "Swap `IdSet` for a
-compressed bitmap" is too shallow, since `IdSet` already has sparse and
-dense chunks. Bolder for check `--ids --full`: on input proven strictly
-sorted, strict monotonicity already rules out duplicates, so the dense sets
-can go, with a fallback for unsorted input.
+The default mode of `src/commands/check/verify_ids.rs` already proves
+strict per-kind monotonicity from the data, in `osm_id_cmp` order
+(`KindJudge::push` within a blob, `merge_kind` across blobs in file
+order). A strictly increasing sequence holds no duplicate, so for a kind
+with no monotonicity violation `--full`'s pre-allocated `IdSet` (the node
+set about 1.6 GB at planet) can only confirm zero. Run the default pass
+first; a kind with violations gets a second pass with its set. No header
+or indexdata claim is believed. Planet on bygg: `--full` 2.37 GB and 37 s
+against 566 MB and 31 s default. Open for the maintainer: today `--full`
+reports every negative ID as `IdOutOfRange` and exits 1; on the proof
+path a monotonic file with negative IDs (JOSM staging IDs) is proven
+duplicate-free and would exit 0. A behaviour change, so a CHANGELOG line.
+On unsorted input peak is unchanged and wall gains one read.
 
-### WRK-029: Collapse byte-equal twin frames in dedupe
+### WRK-181: Shared region membership for multi-extract
 
-For entries with equal kind, range and frame length across inputs, verify
-payload byte equality and collapse to one representative (and recognise the
-same file passed twice by identity); the representative plans as a lone
-entry and is copied through. Makes a self-merge a copy and keeps way
-enrichments a rewrite drops. Deliberately not done in `13ec0927`: it is
-benchmark-shaped, since two different snapshots share no frames. Semantics:
-internal duplicates inside a passed-through twin survive, as they already do
-in any lone blob.
+`src/commands/extract/multi.rs` builds three `IdSet`s per region
+(`bbox_node_ids`, `matched_way_ids`, `matched_relation_ids`, a `Vec` of n
+each), so five regions hold fifteen sets, and where regions overlap most
+of their members are the same IDs held several times. Planet on bygg, 5
+regions inside `-10,35,32,72`: `--simple` peak anon 9.90 GB (`eded8718`),
+`--smart` 6.9 GB (`d4d8d0dc`), against a single `extract --simple` of a
+larger box at 3.09 GB. Idea: one structure answering "which regions hold
+this ID" (an ID set plus a small per-ID region mask, or per-chunk masks
+inside `IdSet`'s dense chunks) in place of n sets per kind. The trade is
+a mask lookup per element in every phase that tests membership against
+the memory saved, and the saving depends on how much the regions overlap,
+so the bench's five regions (tiled inside one box) may overstate or
+understate it. "Swap `IdSet` for a compressed bitmap" is too shallow:
+`IdSet` already has sparse and dense chunks. Not designed. First step: read multi.rs for how each
+region's sets are filled and tested, and count per-region set bytes at
+planet (an `IdSet` size counter or the sidecar), which says how much of
+the 9.9 GB the sets are at all. Measuring needs planet pairs; europe with
+`--regions 5` may show the shape cheaper.
 
-### WRK-030: Hard memory bound for giant dense overlap components
+### WRK-182: extract set lifetimes
 
-A dense overlap component still pins the decoded blocks of its live overlap;
-sparse tails are demoted to owned elements past `SWEEP_PINNED_BYTES`, dense
-ones cannot be. A hard bound needs bounded sorted runs plus an external
-merge, or an osmium-style per-source stream merge with globally
-byte-bounded prefetch inside oversized components. Only `sort` of
-adversarially unsorted input reaches this.
+Each strategy builds four `IdSet`s: `bbox_node_ids`, `matched_way_ids`,
+`matched_relation_ids` and `all_way_node_ids` (`src/commands/extract/
+simple.rs`, `complete.rs`, `smart.rs`, shared code in `common.rs`;
+simple.rs builds them in two places, its two code paths). Planet on bygg
+(`-25,34,45,72`): `--simple` 3.09 GB, `--complete` 4.87 GB, `--smart`
+8.2 GB peak anon. The peak phases (reference/performance.md, "glibc's
+sliding mmap threshold across commands", default arm at `3c5b8d3a`):
+simple in the relation write, complete in `PREAD_WRITE_EXECUTE`, smart in
+pass 1 relation classify. Question: which sets are still alive in the
+peak phase without being read there, and can each be dropped after its
+last reader (a set that only classified ways, still held through the
+write, for example)? Part of what those peaks are is glibc's retained
+arena memory, not live data (the same section: `--complete` ends with a
+5.16 GB arena, 1.36 GB free), so a set dropped late may show less saving
+than its size. "Swap `IdSet` for a compressed bitmap" is too shallow:
+`IdSet` already has sparse and dense chunks. Unaudited. The audit is code reading, the tests cover
+output, and each fix that results needs one matched planet pair per
+strategy it touches.
+
+### WRK-183: tags-filter two-pass set lifetimes
+
+`src/commands/tags_filter/mod.rs` holds seven `IdSet`s in two-pass mode:
+`matched_node_ids`, `direct_way_ids`, `included_way_ids`,
+`direct_relation_ids`, `included_relation_ids`, `way_dep_node_ids` and
+`relation_dep_node_ids`. Planet on bygg: `w/highway=primary` 2.57 GB
+peak anon (`b8491cfd`), `r/route=bus` with the relation closure 2.59 GB
+(`4e5ca3bf`), both peaking in pass 2 (reference/performance.md, "glibc's sliding
+mmap threshold across commands", default arm at `3c5b8d3a`). Question:
+which sets are still alive in pass 2 without being read there, whether
+the direct and included sets of a kind need to coexist, and whether each
+dependency set can be dropped once the pass that consumes it ends, rather
+than at command end. Part of what the peak is is glibc's retained arena
+memory, not live data (the same section measured tags-filter two-pass 11
+to 12 % lower with the mmap threshold pinned at 128 KiB), so a set
+dropped late may show less saving than its size. "Swap `IdSet` for a
+compressed bitmap" is too shallow: `IdSet` already has sparse and dense
+chunks. `tags-filter -R` (one pass, 659 MB) builds none of these sets and
+is out of scope; `-i` (7.49 GB peak, `9bf96ab2`) was not looked at for
+this. Unaudited. The audit is code reading, the existing tests cover
+output, and each fix that results needs one matched planet pair, with and
+without the relation closure.
 
 ### WRK-178: Same-ID groups in the overlap sweep are unbounded
 
@@ -329,58 +352,21 @@ an object of very many versions reaches either. Unmeasured.
 
 ## Correctness
 
-### WRK-052: Same-way fallback for unresolved refs in apply-changes -l
+### WRK-184: geocode addresses ignore `addr:place`, and stepped interpolation is unread
 
-On a base without its untagged nodes, an OSC-modified way that keeps a ref
-from its old version could take that ref's coordinate from the old version's
-inline value, which sits in the blob the worker is already rewriting. That
-would resolve many of the refs that make `-l` fail on such a base (about
-2.8M on a europe daily diff), but not refs a way newly adds, and it carries
-forward any coordinate an earlier run left stale. It needs its own
-resolution and accounting (the global `loc_missing` would still count those
-IDs). Not decided whether it is wanted at all, given the docs require
-`--keep-untagged-nodes`. Background: the stale inline coordinates defect is
-fixed (`81f3fbe4`), with `check --locations` (`669a31e6`) as its oracle.
+Found 2026-11-05 while landing the OSM-shaped interpolation reading
+(ADR-0026). Address points (nodes and building ways, Pass 2) require
+`addr:street` and never read `addr:place`, which OSM uses instead of a
+street for addresses that belong to a place (Nominatim maps `addr:place`
+and `addr:substreet` to its `place` field, `lib-lua/themes/nominatim/presets.lua`).
+So such addresses are absent from the index, and an interpolation way
+between them has no street to take. Deciding it means choosing what a
+query answers in the street field for a place address; interpolation then
+follows the address points with no change of its own.
 
-### WRK-053: Ordered pool internal panic lingers behind parked waits
-
-Residual of the altw stage 4 worker-panic fix (`64e478f8`). Stage 4 workers
-and their setup hold an `AbortOnDrop` guard, so a panic in caller-supplied
-worker code aborts the coord-payload router at once. A panic inside the
-ordered pool's own machinery (admission, the result send) is outside those
-guards: the gate closes, but a worker parked in `wait_ready` for a way blob
-slot stays until stage 3 publishes it or observes cancellation. That would
-be a pool bug, not caller code; the Panics section of `src/ordered_pool.rs`
-states the general behaviour. The pool-level alternative (a task panic as an
-ordered failure that runs `abandon`) was rejected because `abandon` would
-still wait on earlier tasks parked on the same router. Not decided whether
-anything beyond the documentation is wanted.
-
-### WRK-175: the geocoder reads interpolation ways in a narrower shape than OSM's
-
-Found 2026-11-03 while replacing the endpoint resolver with the
-address-on-the-end-node rule (ADR-0024). Two shapes the OSM addresses
-convention allows are not indexed:
-
-- The way classifier (`WayGeocodeFlags::classify` in `src/scan/way.rs`,
-  `is_interp: interpolation && street`) keeps an interpolation way only
-  when `addr:street` is on the way itself. The convention puts the full
-  address on the end nodes and leaves the way's `addr:street` optional, so
-  a way tagged that way is dropped at Pass 1.5 and Pass 2, silently. The
-  fix shape: classify on `addr:interpolation` alone, take the street from
-  the end nodes' addresses when both agree, and refuse a contradiction
-  with an explicit way street. The coordinate lookup in
-  `src/geocode_index/builder/interp.rs` is already street-agnostic. Germany
-  (`germany-20260224-seq4704`) has 78 ways with `addr:street` on the way;
-  how many carry only `addr:interpolation` is not measured.
-- Only the first and last node are read. A way with address nodes in its
-  interior (10 at the start, 20 in the middle, 40 at the end) is
-  interpolated 10..40 linearly over its whole length, so numbers between
-  the interior address and an end can be wrong; the convention splits the
-  range at every interior address node.
-
-Decide whether either is wanted before 0.6.0; both change which ways and
-numbers an index holds.
+`addr:interpolation` numeric steps (`1` to `9`, a few hundred planet ways)
+stay unresolved: `InterpWay` has no step value, so supporting them is a
+format change (Nominatim steps them).
 
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 
@@ -417,9 +403,10 @@ file took about 9 minutes. Unprofiled; the phase split is the first step.
 key=value pair while a bare `osmium tags-count` counts keys, so the row
 timed two different workloads. Since `inspect tags` counts keys as osmium
 does (found 2026-11-03 while landing that change), the two now count the
-same rows. Re-measure the row on equal workloads (bare against bare, or
-`'*=*'` against `'*=*'`) or drop it; the table's other rows share its
-commit and were not checked for the same issue.
+same rows. Decided 2026-11-05: re-measure the whole table at HEAD on
+denmark, each row against osmium on equal workloads (bare against bare),
+as part of the release docs pass; the other rows share the old commit and
+were never checked for the same mismatch.
 
 ---
 
@@ -432,6 +419,8 @@ denmark indexed cells put digest at 503 ms on `d2d8836a` against 701 ms on
 `4157567d`, about 39 % slower, after the digest `v2` change (`16154b0d`).
 The ticket suggests a `--form content` run to separate drift from code.
 The recorded "no cost" claim for v2 needs re-checking against that.
+Decided 2026-11-05: run it later as matched interleaved pairs, on denmark
+and on larger datasets.
 
 ---
 

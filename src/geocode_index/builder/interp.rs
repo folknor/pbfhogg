@@ -1,19 +1,43 @@
-//! Interpolation endpoint resolution (mmap-based).
+//! Interpolation way resolution (mmap-based).
 //!
-//! An interpolation way's start and end numbers are the house numbers of the
-//! address points at its two end nodes. OSM tags an interpolation way between
-//! two address nodes, so its end nodes are themselves the address points: the
-//! address of an end is the one whose stored coordinate equals the end node's,
-//! not the nearest one. Nothing here depends on a cell level or a distance.
+//! OSM draws an interpolation way between address nodes: its end nodes, and
+//! any node inside it, can be address points themselves. The address of a
+//! node is the one whose stored coordinate equals the node's, not the nearest
+//! one. Nothing here depends on a cell level or a distance.
 //!
-//! An endpoint resolves only when the same-street address points at its
-//! coordinate all carry one house-number string, and that string is a
-//! positive decimal number. A way resolves only when both ends do, its
-//! `addr:interpolation` is `all`, `even` or `odd`, and an `even` or `odd` way
-//! has both ends of that parity. Anything else leaves both numbers at the
-//! zero sentinel (see CORRECTNESS.md), so the way never answers a query: a
-//! borrowed, ambiguous or truncated number would be a silent wrong answer.
-//! ADR-0024 records the rule and the nearest-address search it replaced.
+//! **The street.** A way that carries `addr:street` keeps it, and only
+//! addresses on that street count. A way without one (the OSM convention:
+//! the street is on the end nodes, and the way "doesn't take addr:street=*")
+//! takes the one street that the addresses at its first node and at its last
+//! node have in common; none, or more than one, refuses the way. The street
+//! is chosen before any house number is looked at, so an unusable number on
+//! one street cannot decide between two.
+//!
+//! **The numbers.** At every node, the addresses on the way's street either
+//! are absent, or all carry one house-number string. That string is an
+//! anchor when it is a positive decimal number fitting a u32. An interior
+//! node with one non-numeric string (`12b`) is passed over, as the wiki
+//! allows; any other non-anchor (disagreeing strings, `10` beside `10a` or
+//! `010`, an all-digit `0` or an overflow, a non-numeric end) refuses the
+//! way. Both ends must be anchors.
+//!
+//! **The sections.** Consecutive anchors bound a section, and each section
+//! becomes its own record over the shared node span (the split node is the
+//! last node of one record and the first of the next, in place in
+//! `interp_nodes.bin`). A section with equal numbers at both anchors
+//! establishes no range and refuses the way; one whose `even` or `odd`
+//! anchors have the other parity refuses it too. A section whose anchors are
+//! adjacent numbers (10 to 12 even, 10 to 11 all) has no number between them
+//! and is dropped, without refusing the rest of the way.
+//!
+//! A way is resolved whole or not at all: a refused way is kept as one
+//! record over all its nodes with both numbers at the zero sentinel (see
+//! CORRECTNESS.md), so it never answers a query - a borrowed, ambiguous or
+//! truncated number would be a silent wrong answer. So is a way with an
+//! unsupported `addr:interpolation` mode or with a node ref Pass 2 could not
+//! resolve, whose shortened node list could put an interior address where
+//! an end was. ADR-0024 records the end-node rule and the nearest-address
+//! search it replaced; ADR-0026 the street inference and the sections.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -25,7 +49,7 @@ use super::super::format::*;
 
 /// A coordinate as an exact lookup key, longitude folded by
 /// [`crate::geo::normalize_longitude_e7`]: +180 and -180 degrees are one
-/// meridian, so an end node and an address point either side of that
+/// meridian, so a way node and an address point either side of that
 /// spelling are still at the same place.
 type CoordKey = (i32, i64);
 
@@ -36,15 +60,15 @@ fn coord_key(lat_e7: i32, lon_e7: i32) -> CoordKey {
     )
 }
 
-/// The address points that sit exactly on some interpolation end node,
-/// sorted by `(coordinate, address index)`. Built from the end-node
+/// The address points that sit exactly on some interpolation way node,
+/// sorted by `(coordinate, address index)`. Built from the way-node
 /// coordinates first, so it holds only matched points, never the whole
 /// address table.
-struct EndpointAddrs {
+struct NodeAddrs {
     rows: Vec<(CoordKey, u32)>,
 }
 
-impl EndpointAddrs {
+impl NodeAddrs {
     /// The address-point indices whose coordinate equals `key`.
     fn at(&self, key: CoordKey) -> impl Iterator<Item = u32> + '_ {
         let first = self.rows.partition_point(|&(k, _)| k < key);
@@ -55,44 +79,35 @@ impl EndpointAddrs {
     }
 }
 
-/// The first and last node of a way that has at least two.
-fn way_ends(
-    way: &SlimInterpWay,
-    interp_nodes: Table<'_, NodeCoord>,
-) -> Option<(CoordKey, CoordKey)> {
-    // Not just a bounds guard: a one-node way would resolve both ends to
-    // the same point.
-    if way.node_count < 2 {
+/// The node coordinates of a way the resolver may resolve: a supported
+/// mode, every node ref resolved, and at least two nodes (a one-node way
+/// would resolve both ends to the same point).
+fn way_nodes(way: &SlimInterpWay, interp_nodes: Table<'_, NodeCoord>) -> Option<Vec<CoordKey>> {
+    if way.interpolation.is_none() || !way.complete || way.node_count < 2 {
         return None;
     }
     let nodes = interp_nodes
         .span_at(way.node_file_offset, u64::from(way.node_count))
         .ok()?;
-    let start = nodes.get(0)?;
-    let end = nodes.get(usize::from(way.node_count) - 1)?;
-    Some((
-        coord_key(start.lat_e7, start.lon_e7),
-        coord_key(end.lat_e7, end.lon_e7),
-    ))
+    (0..usize::from(way.node_count))
+        .map(|i| nodes.get(i).map(|n| coord_key(n.lat_e7, n.lon_e7)))
+        .collect()
 }
 
-fn build_endpoint_addrs(
+fn build_node_addrs(
     interp_ways: &[SlimInterpWay],
     addr_points: Table<'_, AddrPoint>,
     interp_nodes: Table<'_, NodeCoord>,
     executor: &crate::host::Executor,
-) -> EndpointAddrs {
-    let mut ends: FxHashSet<CoordKey> = FxHashSet::default();
+) -> NodeAddrs {
+    let mut keys: FxHashSet<CoordKey> = FxHashSet::default();
     for way in interp_ways {
-        if way.interpolation.is_some()
-            && let Some((start, end)) = way_ends(way, interp_nodes)
-        {
-            ends.insert(start);
-            ends.insert(end);
+        if let Some(nodes) = way_nodes(way, interp_nodes) {
+            keys.extend(nodes);
         }
     }
-    if ends.is_empty() {
-        return EndpointAddrs { rows: Vec::new() };
+    if keys.is_empty() {
+        return NodeAddrs { rows: Vec::new() };
     }
     #[expect(
         clippy::expect_used,
@@ -104,7 +119,7 @@ fn build_endpoint_addrs(
             .filter_map(|index| {
                 let point = addr_points.get(index)?;
                 let key = coord_key(point.lat_e7, point.lon_e7);
-                ends.contains(&key).then(|| {
+                keys.contains(&key).then(|| {
                     (
                         key,
                         u32::try_from(index).expect("address count checked during Pass 2"),
@@ -114,7 +129,7 @@ fn build_endpoint_addrs(
             .collect()
     });
     rows.sort_unstable();
-    EndpointAddrs { rows }
+    NodeAddrs { rows }
 }
 
 /// Parse a house number that is entirely a positive decimal number. `42A`,
@@ -126,82 +141,200 @@ fn parse_house_number(s: &str) -> Option<u32> {
     s.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-/// Resolve start/end house numbers for interpolation ways from the address
-/// points at their end nodes (see the module documentation for the rule).
-/// Reads address points from mmap'd addr_points.bin. Returns the number of
-/// ways resolved.
+/// The interpolation records to write, and what happened to the source ways.
+pub(super) struct Resolution {
+    /// One record per section of a resolved way, one zero-sentinel record
+    /// per refused way, in source-way order.
+    pub(super) records: Vec<SlimInterpWay>,
+    /// Source ways resolved, including those whose every section was
+    /// adjacent numbers and so emitted no record. Resolved means the street
+    /// and numbers resolved; the reader still refuses a section too short
+    /// to measure.
+    pub(super) resolved_ways: u64,
+    /// Source ways refused.
+    pub(super) unresolved_ways: u64,
+    /// A sample of refused source way IDs.
+    pub(super) unresolved_ids: Vec<i64>,
+}
+
+/// Resolve every interpolation way from the address points on its nodes
+/// (see the module documentation for the rule). Reads address points from
+/// mmap'd addr_points.bin.
 #[hotpath::measure]
-pub(super) fn resolve_interpolation_endpoints_mmap(
-    interp_ways: &mut [SlimInterpWay],
+pub(super) fn resolve_interpolation_ways_mmap(
+    interp_ways: Vec<SlimInterpWay>,
     addr_points: Table<'_, AddrPoint>,
     interp_nodes: Table<'_, NodeCoord>,
     strings: &StringPool,
     executor: &crate::host::Executor,
     invocation: &crate::host::Recorder,
-) -> u32 {
-    if interp_ways.is_empty() || addr_points.is_empty() {
-        return 0;
-    }
-
+) -> Resolution {
     invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
-    let addrs = build_endpoint_addrs(interp_ways, addr_points, interp_nodes, executor);
+    let addrs = if addr_points.is_empty() {
+        NodeAddrs { rows: Vec::new() }
+    } else {
+        build_node_addrs(&interp_ways, addr_points, interp_nodes, executor)
+    };
     invocation.marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
     invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
-    let resolved = executor.install(|| {
+    let outcomes: Vec<Option<Resolved>> = executor.install(|| {
         interp_ways
-            .par_iter_mut()
+            .par_iter()
             .map(|way| resolve_one_way(way, interp_nodes, addr_points, strings, &addrs))
-            .sum()
+            .collect()
     });
     invocation.marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
-    resolved
+
+    let mut resolution = Resolution {
+        records: Vec::with_capacity(interp_ways.len()),
+        resolved_ways: 0,
+        unresolved_ways: 0,
+        unresolved_ids: Vec::new(),
+    };
+    for (way, outcome) in interp_ways.into_iter().zip(outcomes) {
+        let Some(resolved) = outcome else {
+            resolution.unresolved_ways += 1;
+            super::sample_id(&mut resolution.unresolved_ids, way.way_id);
+            resolution.records.push(way);
+            continue;
+        };
+        resolution.resolved_ways += 1;
+        for section in resolved.sections {
+            resolution.records.push(SlimInterpWay {
+                way_id: way.way_id,
+                node_file_offset: way.node_file_offset
+                    + u64::from(section.first) * NodeCoord::SIZE as u64,
+                street_offset: resolved.street_offset,
+                interpolation: way.interpolation,
+                node_count: section.last - section.first + 1,
+                complete: true,
+                start_number: section.start,
+                end_number: section.end,
+            });
+        }
+    }
+    resolution
 }
 
+/// A resolved way: its street and the sections that have numbers to infer.
+struct Resolved {
+    street_offset: u32,
+    sections: Vec<Section>,
+}
+
+/// Nodes `first..=last` of the source way, numbered `start` to `end`.
+struct Section {
+    first: u16,
+    last: u16,
+    start: u32,
+    end: u32,
+}
+
+/// What the addresses on the way's street say at one node.
+enum NodeNumber {
+    /// No address on the street here.
+    Absent,
+    /// One non-numeric string at an interior node, which the wiki allows
+    /// and interpolation passes over.
+    PassedOver,
+    Anchor(u32),
+    /// Anything that makes the node unusable as an end or as a gap.
+    Refused,
+}
+
+/// Resolve one source way, or `None` to refuse it.
 fn resolve_one_way(
-    way: &mut SlimInterpWay,
+    way: &SlimInterpWay,
     interp_nodes: Table<'_, NodeCoord>,
     addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
-    addrs: &EndpointAddrs,
-) -> u32 {
-    let Some(interpolation) = way.interpolation else {
-        return 0;
+    addrs: &NodeAddrs,
+) -> Option<Resolved> {
+    let interpolation = way.interpolation?;
+    let nodes = way_nodes(way, interp_nodes)?;
+    let (&first, &last) = (nodes.first()?, nodes.last()?);
+    let street_offset = if way.street_offset != 0 {
+        way.street_offset
+    } else {
+        common_end_street(first, last, addr_points, addrs)?
     };
-    let Some((start, end)) = way_ends(way, interp_nodes) else {
-        return 0;
+
+    let step = match interpolation {
+        InterpolationType::All => 1,
+        InterpolationType::Even | InterpolationType::Odd => 2,
     };
-    let number = |key| endpoint_house_number(key, way.street_offset, addr_points, strings, addrs);
-    let (Some(start), Some(end)) = (number(start), number(end)) else {
-        // Leave the zero sentinel when either endpoint does not resolve.
-        return 0;
-    };
-    // OSM requires an even or odd way's ends to follow its declared rule.
-    if !interpolation.steps(start, end) {
-        return 0;
+    let last_index = nodes.len() - 1;
+    let mut sections = Vec::new();
+    let mut previous: Option<(u16, u32)> = None;
+    for (index, &key) in nodes.iter().enumerate() {
+        let is_end = index == 0 || index == last_index;
+        let number = match node_number(key, street_offset, addr_points, strings, addrs) {
+            NodeNumber::Anchor(number) => number,
+            NodeNumber::Absent | NodeNumber::PassedOver if !is_end => continue,
+            NodeNumber::Absent | NodeNumber::PassedOver | NodeNumber::Refused => return None,
+        };
+        // Pass 2 refuses a way of more than u16::MAX nodes.
+        let index = u16::try_from(index).ok()?;
+        if let Some((first, start)) = previous {
+            // Equal numbers establish no range; OSM requires an even or
+            // odd way's anchors to follow its declared rule.
+            if start == number || !interpolation.steps(start, number) {
+                return None;
+            }
+            if start.abs_diff(number) > step {
+                sections.push(Section {
+                    first,
+                    last: index,
+                    start,
+                    end: number,
+                });
+            }
+        }
+        previous = Some((index, number));
     }
-    way.start_number = start;
-    way.end_number = end;
-    1
+    Some(Resolved {
+        street_offset,
+        sections,
+    })
 }
 
-/// The house number of the address at an interpolation end node: the one
-/// house-number string every same-street address point at exactly `key`
-/// carries, parsed strictly. None when there is no such point, when they
-/// disagree (`10` beside `20`, or beside `10a`), or when the string is not a
-/// positive decimal number. Disagreement is judged on the strings before any
+/// The one non-empty street that the addresses at both end nodes share, or
+/// `None` when they share none or more than one.
+fn common_end_street(
+    first: CoordKey,
+    last: CoordKey,
+    addr_points: Table<'_, AddrPoint>,
+    addrs: &NodeAddrs,
+) -> Option<u32> {
+    let streets_at = |key| {
+        let mut streets: Vec<u32> = addrs
+            .at(key)
+            .filter_map(|index| addr_points.get(index as usize))
+            .map(|point| point.street_offset)
+            .filter(|&offset| offset != 0)
+            .collect();
+        streets.sort_unstable();
+        streets.dedup();
+        streets
+    };
+    let at_last = streets_at(last);
+    let mut common = streets_at(first)
+        .into_iter()
+        .filter(|street| at_last.binary_search(street).is_ok());
+    let street = common.next()?;
+    common.next().is_none().then_some(street)
+}
+
+/// The house number the addresses on `street_offset` at exactly `key`
+/// give that node. Disagreement is judged on the strings before any
 /// parsing, so a refused spelling cannot hide a conflict.
-fn endpoint_house_number(
+fn node_number(
     key: CoordKey,
     street_offset: u32,
     addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
-    addrs: &EndpointAddrs,
-) -> Option<u32> {
-    // Offset 0 is the empty string: a way without a street name has no
-    // street for its ends to agree with.
-    if street_offset == 0 {
-        return None;
-    }
+    addrs: &NodeAddrs,
+) -> NodeNumber {
     let mut housenumber: Option<u32> = None;
     for index in addrs.at(key) {
         let Some(point) = addr_points.get(index as usize) else {
@@ -215,12 +348,24 @@ fn endpoint_house_number(
         match housenumber {
             None => housenumber = Some(point.housenumber_offset),
             Some(offset) if offset == point.housenumber_offset => {}
-            Some(_) => return None,
+            Some(_) => return NodeNumber::Refused,
         }
     }
+    let Some(offset) = housenumber else {
+        return NodeNumber::Absent;
+    };
     // The pool stores values whole, so `10\0a` reads back as itself and the
     // strict parse refuses it.
-    parse_house_number(read_string_from_pool(strings, housenumber?))
+    let s = read_string_from_pool(strings, offset);
+    if let Some(number) = parse_house_number(s) {
+        NodeNumber::Anchor(number)
+    } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        // `0` or a number past u32: a real number the index cannot hold,
+        // not a non-integer to step over.
+        NodeNumber::Refused
+    } else {
+        NodeNumber::PassedOver
+    }
 }
 
 #[cfg(test)]
@@ -259,7 +404,23 @@ mod tests {
             self.addr_bytes.extend_from_slice(&point.to_bytes());
         }
 
+        /// A way carrying `addr:street` STREET.
         fn way(&mut self, nodes: &[(i32, i32)], interpolation: Option<InterpolationType>) {
+            self.way_on(nodes, interpolation, STREET, true);
+        }
+
+        /// A way tagged by the OSM convention: no street on the way.
+        fn bare_way(&mut self, nodes: &[(i32, i32)], interpolation: Option<InterpolationType>) {
+            self.way_on(nodes, interpolation, "", true);
+        }
+
+        fn way_on(
+            &mut self,
+            nodes: &[(i32, i32)],
+            interpolation: Option<InterpolationType>,
+            street: &str,
+            complete: bool,
+        ) {
             let node_file_offset = self.node_bytes.len() as u64;
             for &(lat_e7, lon_e7) in nodes {
                 self.node_bytes
@@ -268,26 +429,33 @@ mod tests {
             self.ways.push(SlimInterpWay {
                 way_id: i64::try_from(self.ways.len()).expect("test way count") + 1,
                 node_file_offset,
-                street_offset: self.strings.intern(STREET),
+                street_offset: self.strings.intern(street),
                 interpolation,
                 node_count: u16::try_from(nodes.len()).expect("test way"),
+                complete,
                 start_number: 0,
                 end_number: 0,
             });
         }
 
-        /// Resolve every way; return each way's `(start, end)` numbers.
-        fn resolve(mut self) -> Vec<(u32, u32)> {
+        fn run(self) -> (Resolution, StringPool) {
             let host = crate::host::Host::entered_for_tests();
-            resolve_interpolation_endpoints_mmap(
-                &mut self.ways,
+            let resolution = resolve_interpolation_ways_mmap(
+                self.ways,
                 Table::new(&self.addr_bytes),
                 Table::new(&self.node_bytes),
                 &self.strings,
                 &host.executor,
                 &host.invocation,
             );
-            self.ways
+            (resolution, self.strings)
+        }
+
+        /// Resolve every way; return each record's `(start, end)` numbers.
+        fn resolve(self) -> Vec<(u32, u32)> {
+            self.run()
+                .0
+                .records
                 .iter()
                 .map(|way| (way.start_number, way.end_number))
                 .collect()
@@ -296,16 +464,14 @@ mod tests {
 
     const A: (i32, i32) = (557_000_000, 125_000_000);
     const B: (i32, i32) = (557_000_000, 125_060_000);
+    const M: (i32, i32) = (557_000_000, 125_030_000);
 
     #[test]
     fn ends_take_the_numbers_of_the_addresses_at_them() {
         let mut fx = Fixture::new();
         fx.address(A, "10", STREET);
         fx.address(B, "30", STREET);
-        fx.way(
-            &[A, (557_000_000, 125_030_000), B],
-            Some(InterpolationType::Even),
-        );
+        fx.way(&[A, M, B], Some(InterpolationType::Even));
         fx.way(&[B, A], Some(InterpolationType::All));
         assert_eq!(fx.resolve(), vec![(10, 30), (30, 10)]);
     }
@@ -335,7 +501,7 @@ mod tests {
 
     #[test]
     fn coincident_addresses_that_disagree_refuse_the_end() {
-        for other in ["20", "10a"] {
+        for other in ["20", "10a", "010"] {
             let mut fx = Fixture::new();
             fx.address(A, "10", STREET);
             fx.address(A, other, STREET);
@@ -420,5 +586,139 @@ mod tests {
         for bad in ["", "0", "00", "42A", "4294967296", "-1", "+1"] {
             assert_eq!(parse_house_number(bad), None, "{bad:?}");
         }
+    }
+
+    /// The OSM convention: the street is on the end nodes, not the way.
+    #[test]
+    fn a_way_without_a_street_takes_the_street_its_ends_share() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(A, "1", "Corner Street");
+        fx.address(B, "30", STREET);
+        fx.bare_way(&[A, M, B], Some(InterpolationType::Even));
+        let (resolution, strings) = fx.run();
+        assert_eq!(resolution.resolved_ways, 1);
+        let record = &resolution.records[0];
+        assert_eq!((record.start_number, record.end_number), (10, 30));
+        assert_eq!(
+            read_string_from_pool(&strings, record.street_offset),
+            STREET
+        );
+    }
+
+    /// The street is chosen before the numbers: two shared streets refuse
+    /// even when only one of them carries usable numbers.
+    #[test]
+    fn ends_sharing_no_street_or_two_refuse_a_way_without_one() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(B, "30", "Other Street");
+        fx.bare_way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(A, "9a", "Other Street");
+        fx.address(B, "30", STREET);
+        fx.address(B, "9b", "Other Street");
+        fx.bare_way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    /// 10 at the start, 20 in the middle, 40 at the end is two ranges, not
+    /// one 10..40 spread over the whole length.
+    #[test]
+    fn an_interior_address_splits_the_way() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(M, "20", STREET);
+        fx.address(B, "40", STREET);
+        fx.bare_way(
+            &[A, (557_000_000, 125_010_000), M, B],
+            Some(InterpolationType::Even),
+        );
+        let (resolution, _) = fx.run();
+        let records: Vec<_> = resolution
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.start_number,
+                    r.end_number,
+                    r.node_count,
+                    r.node_file_offset,
+                )
+            })
+            .collect();
+        let size = NodeCoord::SIZE as u64;
+        assert_eq!(records, vec![(10, 20, 3, 0), (20, 40, 2, 2 * size)]);
+        assert_eq!(resolution.resolved_ways, 1);
+    }
+
+    #[test]
+    fn a_non_integer_interior_address_is_passed_over() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(M, "12b", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, M, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(10, 30)]);
+    }
+
+    #[test]
+    fn an_unusable_interior_address_refuses_the_whole_way() {
+        for (first, second) in [("20", "22"), ("0", "0"), ("99999999999", "99999999999")] {
+            let mut fx = Fixture::new();
+            fx.address(A, "10", STREET);
+            fx.address(M, first, STREET);
+            fx.address(M, second, STREET);
+            fx.address(B, "40", STREET);
+            fx.way(&[A, M, B], Some(InterpolationType::Even));
+            let (resolution, _) = fx.run();
+            assert_eq!(resolution.unresolved_ways, 1, "{first}/{second}");
+            let records: Vec<_> = resolution
+                .records
+                .iter()
+                .map(|r| (r.start_number, r.end_number, r.node_count))
+                .collect();
+            assert_eq!(records, vec![(0, 0, 3)], "{first}/{second}");
+        }
+    }
+
+    /// A closed outline with one address at its closing node answered that
+    /// one number along its whole perimeter.
+    #[test]
+    fn equal_numbers_establish_no_range() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.way(&[A, M, B, A], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn a_section_with_no_number_between_its_anchors_is_dropped() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(M, "12", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, M, B], Some(InterpolationType::Even));
+        fx.way(&[A, M], Some(InterpolationType::Even));
+        let (resolution, _) = fx.run();
+        assert_eq!(resolution.resolved_ways, 2);
+        let records: Vec<_> = resolution
+            .records
+            .iter()
+            .map(|r| (r.start_number, r.end_number))
+            .collect();
+        assert_eq!(records, vec![(12, 30)]);
+    }
+
+    #[test]
+    fn a_way_with_an_unresolved_node_ref_is_refused() {
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(B, "30", STREET);
+        fx.way_on(&[A, B], Some(InterpolationType::Even), STREET, false);
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
     }
 }

@@ -88,6 +88,9 @@ pub struct Candidates<'a> {
 #[derive(Debug)]
 pub struct InterpolationCandidate<'a> {
     pub street: &'a str,
+    /// Index of the interpolation record in `interp_ways.bin`. A record is
+    /// one section of an OSM way between two of its address nodes, so this
+    /// is not an OSM way identity: one way can own several records.
     pub way_index: u32,
     pub segment_index: u16,
     pub snap_lat_e7: i32,

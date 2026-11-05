@@ -2422,6 +2422,63 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     assert_eq!(cand_interp.house_number, 20);
 }
 
+/// The OSM convention: the way carries only `addr:interpolation`, the street
+/// and numbers sit on its address nodes, and an interior address node splits
+/// the range. 10 at the start, 50 after two thirds of the length, 60 at the
+/// end: the middle of the first section is 30, where one range over the whole
+/// way would say 26.
+#[test]
+fn a_streetless_interpolation_way_takes_its_street_and_sections_from_its_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    let node = |id, lon, hn| TestNode {
+        id,
+        lat: 557_000_000,
+        lon,
+        tags: vec![("addr:housenumber", hn), ("addr:street", "Interp Street")],
+        meta: None,
+    };
+    write_test_pbf_sorted(
+        &input,
+        &[
+            node(100, 125_000_000, "10"),
+            node(101, 125_040_000, "50"),
+            node(102, 125_060_000, "60"),
+        ],
+        &[TestWay {
+            id: 200,
+            refs: vec![100, 101, 102],
+            tags: vec![("addr:interpolation", "even")],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let stats = build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            coarse_search_radius_m: 1.0,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build should succeed");
+    assert_eq!(stats.interp_ways, 2, "one record per section");
+
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let result = reader.query(55.7000, 12.5020).expect("valid query");
+    let interp = result
+        .interpolation
+        .as_ref()
+        .expect("query should resolve the interpolation");
+    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.house_number, 30);
+}
+
 /// Builders before the parity check could write an `even` range with an odd
 /// end (the old resolver borrowed the nearest same-street number). Stepping
 /// by two from the start then runs past the end: `even` 10..13 answers 14

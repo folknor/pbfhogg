@@ -369,7 +369,10 @@ record! {
 }
 
 record! {
-    /// `interp_ways.bin`.
+    /// `interp_ways.bin`. One record per section of an interpolation way
+    /// between two of its address nodes (or one per unresolved way), so
+    /// the node spans of a way's sections share their split node and may
+    /// overlap in `interp_nodes.bin`.
     #[derive(Debug, Clone, Copy)]
     pub struct InterpWay {
         /// Byte offset into interp_nodes.bin (u64 for consistency).

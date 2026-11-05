@@ -1949,16 +1949,26 @@ admin polygon under every cell, at the street, coarse and admin levels, that
 such a line passes through (an index built by pbfhogg 0.5.0 or earlier can
 lack a cell the line only clips near its corner; rebuild to gain them).
 
-An interpolation way (`addr:interpolation` with `addr:street` on the way)
-takes its start and end numbers from the address points on its first and
-last node: an address with the way's street whose coordinate equals the
-node's. No nearby address stands in for a missing one, and the cell levels
-play no part. The way is kept but never answers a query when either end
-has no such address, the addresses at an end carry different house numbers,
-an end's number is not a plain positive integer (`57a`, `18-20` and `0` are
-refused), an `even` or `odd` way's ends do not both have that parity, or
-`addr:interpolation` is anything but `all`, `even` or `odd`. The build
-warns with the count and a sample of way IDs.
+An interpolation way is a way with `addr:interpolation` and no
+`addr:housenumber` (a way with both is an addressed object, indexed as a
+building address when it is one). Its numbers come from the address points
+on its own nodes: an address whose coordinate equals the node's. No nearby
+address stands in for a missing one, and the cell levels play no part. Its
+street is its `addr:street` when it has one; otherwise, as OSM tags it, the
+one street that the addresses at its first and last node share. Only
+addresses on that street count. Both end nodes must carry a number, and an
+interior node with a number splits the way: each stretch between two
+address nodes is its own range (10, 20 and 40 along a way are 10-20 and
+20-40, not 10-40), and a stretch with no number between its ends (10 to 12
+on an `even` way) is dropped. An interior node with a non-numeric number
+(`12b`) is passed over. The way is kept but never answers a query when its
+ends share no single street, an end has no address on it, the addresses at
+a node carry different house numbers, an end's number is not a plain
+positive integer (`57a`, `18-20` and `0` are refused) or an interior number
+is `0` or too large, two consecutive numbers are equal or an `even` or `odd`
+way's numbers do not all have that parity, a node of the way is missing
+from the input, or `addr:interpolation` is anything but `all`, `even` or
+`odd`. The build warns with the count and a sample of way IDs.
 
 #### S2 level bounds
 

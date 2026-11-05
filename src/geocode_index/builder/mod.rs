@@ -165,6 +165,9 @@ pub enum SmokeOutcome {
 pub struct BuildStats {
     pub addr_points: u64,
     pub street_ways: u64,
+    /// Interpolation records in the index: one per section between the
+    /// address nodes of a resolved way, one per unresolved way. A resolved
+    /// way whose every section has no number to infer has none.
     pub interp_ways: u64,
     pub admin_polygons: u64,
     /// Relations that produced no polygon because their boundary geometry was
@@ -516,7 +519,7 @@ fn build_generation(
     let pass2::Pass2Output {
         addr_point_count,
         street_way_count,
-        mut interp_ways,
+        interp_ways,
         way_geom,
         street_ways,
         street_nodes,
@@ -631,44 +634,42 @@ fn build_generation(
     // -----------------------------------------------------------------------
     host.invocation.marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
     strings.validate()?;
-    checked_count(interp_ways.len(), "interpolation ways")?;
-    let resolved = interp::resolve_interpolation_endpoints_mmap(
-        &mut interp_ways,
+    let source_interp_ways = interp_ways.len();
+    let interp::Resolution {
+        records: interp_ways,
+        resolved_ways,
+        unresolved_ways,
+        unresolved_ids,
+    } = interp::resolve_interpolation_ways_mmap(
+        interp_ways,
         addr_points.table(),
         interp_nodes.table(),
         &strings,
         &host.executor,
         &host.invocation,
     );
-    let mut unresolved_interpolation_count = 0_u64;
-    let mut unresolved_interpolation_ids = Vec::new();
-    for way in &interp_ways {
-        if way.start_number == 0 || way.end_number == 0 {
-            unresolved_interpolation_count = unresolved_interpolation_count.saturating_add(1);
-            sample_id(&mut unresolved_interpolation_ids, way.way_id);
-        }
-    }
-    host.invocation.counter(
-        "geocode_unresolved_interpolation_ways",
-        unresolved_interpolation_count,
-    );
-    if unresolved_interpolation_count > 0 {
+    // Resolution splits a way into one record per section, so the record
+    // count is checked again before anything indexes records by u32.
+    checked_count(interp_ways.len(), "interpolation records")?;
+    host.invocation
+        .counter("geocode_unresolved_interpolation_ways", unresolved_ways);
+    if unresolved_ways > 0 {
         crate::host::diag!(
             host.diagnostics,
             Warning,
             "geocode.pass2.interp_unresolved",
-            "{unresolved_interpolation_count} interpolation ways are unresolved (an end with \
-             no same-street address on its node, coincident addresses that disagree, a \
-             number that is not a positive decimal, ends of the wrong parity, or an \
-             unsupported addr:interpolation value); way IDs (sample): \
-             {unresolved_interpolation_ids:?}"
+            "{unresolved_ways} interpolation ways are unresolved (no single street at both \
+             ends, a node with no same-street address at an end, coincident addresses that \
+             disagree, a number that is not a positive decimal, equal numbers or the wrong \
+             parity between address nodes, a missing node, or an unsupported \
+             addr:interpolation value); way IDs (sample): {unresolved_ids:?}"
         );
     }
     crate::host::diag!(
         host.diagnostics,
         Progress,
         "geocode.pass2.interp_resolved",
-        "  {resolved}/{} interpolation ways resolved",
+        "  {resolved_ways}/{source_interp_ways} interpolation ways resolved, {} records",
         interp_ways.len()
     );
     host.invocation.marker("GEOCODE_PASS2_INTERP_RESOLVE_END");

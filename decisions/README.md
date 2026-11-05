@@ -232,3 +232,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   tag value, one holding a NUL included, is stored and answered whole;
   format version 4. Open validates that each referenced offset frames a
   whole entry, not that it is an entry start.
+- [ADR-0026](0026-interpolation-ways-are-read-as-osm-tags-them.md) - A
+  geocode interpolation way needs only `addr:interpolation` (not with
+  `addr:housenumber`); a way without `addr:street` takes the one street its
+  end addresses share. Interior address nodes split it into one record per
+  section; equal or wrong-parity numbers refuse the way, adjacent ones drop
+  the section. No format change.

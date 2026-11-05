@@ -1,7 +1,8 @@
 # ADR-0024: An interpolation end takes the address on its node
 
 Date: 2026-11-03
-Status: Accepted
+Status: Accepted; extended by ADR-0026 (a way without `addr:street` takes
+its street from its end addresses, and interior address nodes split it)
 
 ## Decision
 

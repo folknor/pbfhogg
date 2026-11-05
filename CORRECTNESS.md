@@ -289,15 +289,17 @@ and the second added one - see `DEVIATIONS.md`.
 **Context:** `SlimInterpWay` (the in-memory staging struct that flushes to
 `interp_ways.bin` as `InterpWay`) stores resolved interpolation house
 numbers in `start_number: u32, end_number: u32`. The resolver
-(`resolve_interpolation_endpoints_mmap` in `src/geocode_index/builder/interp.rs`)
-runs after Pass 2 and takes each end's number from the addr points with
-the way's street name at exactly the end node's coordinate (ADR-0024).
-Endpoint matching rejects house number 0;
+(`resolve_interpolation_ways_mmap` in `src/geocode_index/builder/interp.rs`)
+runs after Pass 2 and takes each node's number from the addr points on
+the way's street at exactly that node's coordinate (ADR-0024), splitting
+the way into one record per section between address nodes.
+Matching rejects house number 0;
 only positive matched numbers overwrite `start_number` and `end_number`.
-If either endpoint fails to match, both fields stay at their initial `0`,
-as they do for every other way the resolver refuses (disagreeing
-coincident numbers, a number that is not a positive decimal, wrong parity,
-an unsupported `addr:interpolation` mode).
+If any part of the way fails, it stays one record with both fields at
+their initial `0` (an end with no match, disagreeing coincident numbers,
+a number that is not a positive decimal, equal or wrong-parity numbers,
+no single street, a missing node, an unsupported `addr:interpolation`
+mode).
 
 **Impact:** A 0 at either end means unresolved, so the way yields no
 interpolated number

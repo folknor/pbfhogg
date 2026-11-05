@@ -3249,9 +3249,27 @@ PrimitiveBlock cross-thread retention. The 19 GB peak RSS is the DenseMmapIndex
 mmap (file-backed, fits in RAM at Japan scale). At Europe/planet scale this
 mmap would thrash (same as dense ALTW).
 
-Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
-interpolation ways with `addr:interpolation` + `addr:street`; how many
-resolve is under "Interpolation ends from their own nodes" below.
+Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany's
+interpolation counts are under "Interpolation ways as OSM tags them" below.
+
+### Interpolation ways as OSM tags them (plantasjen, 2026-11-05, against `f4838f76`)
+
+Interpolation ways no longer need `addr:street` on the way, and interior
+address nodes split a way into one record per section (ADR-0026).
+
+Germany (`germany-20260224-seq4704`), variant uncommitted: 2,536
+interpolation ways classified (78 before: only those with the street on
+the way), 2,228 resolved (7 before), 308 unresolved, 2,724 records. Wall
+19.9 s.
+
+Planet (`planet-20260223-reindexed`), one matched `--bench 1` pair:
+baseline `70e9c975` at `f4838f76` 299.4 s, variant (uncommitted, dirty
+sidecar `954f1ba5`) 295.2 s - no wall difference. Interpolation phases:
+`GEOCODE_INTERP_RESOLVE_INDEX` 0.86 to 2.03 s (the coordinate table now
+covers every node of every way), endpoint and section resolution 0 to
+0.11 s, `GEOCODE_PASS3_STAGEA_INTERP` 0.02 to 0.61 s: about 2 s more work,
+below the run-to-run band. Unresolved ways 34,049 to 302,181 (the classified
+set grew far more; the resolved count is not exported as a counter).
 
 ### Length-prefixed string pool (bygg, 2026-11-04, against `47f5a973`)
 

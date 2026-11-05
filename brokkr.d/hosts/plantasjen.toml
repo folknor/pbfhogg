@@ -195,8 +195,8 @@ download_date = "2026-03-07"
 # PBF repl timestamp is 2026-02-23 01:00 UTC (1h past the boundary) - filename date matches cutoff.
 
 [plantasjen.datasets.planet.pbf.indexed]
-file = "planet-20260223-with-indexdata.osm.pbf"
-xxhash = "3ce64c662db10ed2c551ad2737144df1"
+file = "planet-20260223-reindexed.osm.pbf"
+xxhash = "e7f431ab422a0ccdb75d270528ac3e2e"
 seq = 4912
 
 [plantasjen.datasets.planet.pbf.altw]

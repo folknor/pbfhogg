@@ -69,7 +69,9 @@ actually gives, not an assumption:
 
 - Planet `pbf.indexed`: `check-refs = "clean"` (`0accad98`, exit 0) and
   `check-ids = "clean"` (`4edab6b2`, and `f6ba05d4` for `--full`), both
-  post-split cells at `627883d7`. `check-index` never ran on it.
+  post-split cells at `627883d7`. `check-index = "clean"` on plantasjen's
+  reindexed planet (`e7f431ab...`, 2026-11-05); bygg's is still the old
+  file until its own reindex.
 - Denmark, germany, europe and the other regional extracts: every stored
   check cell predates the exit-code split (`854f9465`), so exit 1 there is
   ambiguous. A Geofabrik cut may carry relation members outside the region,
@@ -78,7 +80,8 @@ actually gives, not an assumption:
 - `diff` per OSC: a primary diffed against itself with its next OSC applied
   should be `differs` (denmark 4705, planet 4913, and so on).
 - `expect.diff-snapshots`: planet base against `20260411`
-  (`3ce64c66...` + `7facb638...`) is two different planets, `differs`.
+  (`3ce64c66...` on bygg, `e7f431ab...` on plantasjen, + `7facb638...`) is
+  two different planets, `differs`.
 - Deliberately broken snapshots: `unsorted` / `test-unsorted`
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
   should give `check-index = "violations"`. Confirm each with one run first;
@@ -389,10 +392,18 @@ carries (e.g. "")". The builder used to drop an explicit empty tag key
 from tagdata; `dd37f62e` (2026-10-22, after v0.5.0, unreleased) keeps it,
 and the CHANGELOG has no entry for that fix. Consequence: on files written
 by pbfhogg v0.5.0 or earlier, a `tags-filter` expression naming the empty
-key can skip a blob holding a match, silently. The CHANGELOG now says so
-and names the repair. Left: whether the indexdata guide should say it too,
-and whether the brokkr planet dataset should be reindexed so
-`check --index` passes on it.
+key can skip a blob holding a match, silently. The CHANGELOG says so and
+names the repair. Plantasjen's planet is reindexed
+(`planet-20260223-reindexed.osm.pbf`, `check --index` OK). Left, filed in
+bz: bygg's planet, and `check --index` over every other indexed dataset
+file on both hosts, reindexing any that fail.
+
+### WRK-179: check --index takes 11 minutes at planet
+
+`brokkr check-index --dataset planet` on plantasjen at `779b263e`: 652 s
+(unstored, dirty tree), against about 30 s for `check-ids` and
+`check-refs` on the same host. The plain `cat --reindex` that wrote the
+file took about 9 minutes. Unprofiled; the phase split is the first step.
 
 ---
 

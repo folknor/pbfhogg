@@ -1,0 +1,561 @@
+# AGENTS.md's document-folder rule, enforced rather than trusted: nothing
+# durable (reference/, docs/, code comments) may cite notes/, and durable
+# docs must not point at files that no longer exist. Reads tracked files
+# only, so data/ and research/ never count. pre-clippy: text only, no build.
+[[script_check]]
+name = "doc-links"
+command = "python3 scripts/check_doc_links.py"
+expect = "document conventions ok"
+match = "last-line"
+stage = "pre-clippy"
+
+# glibc-only allocator calls live in src/debug.rs and src/process.rs, behind
+# `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
+# A call gated on `target_os = "linux"` alone also compiles for musl, where
+# these symbols do not exist, and nothing here builds against musl - so the
+# one way to keep musl building is to keep calls in gated debug/process wrappers.
+# Matches the `libc::` path, so callers of the wrappers (`crate::debug`'s
+# `emit_mallinfo2`; `crate::process`'s `cap_malloc_arenas`, `malloc_trim` and
+# `set_mmap_threshold`) stay legal, and `region = "code"` lets comments
+# discuss the calls by name.
+[[textlint]]
+name = "glibc-allocator-calls-live-in-debug"
+pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "benches/**/*.rs"]
+exclude = ["src/debug.rs", "src/process.rs"]
+region = "code"
+message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"
+
+# Stdout discipline. `print!`/`println!` panic when stdout's reader goes away,
+# so `pbfhogg inspect x.pbf | head` used to die with exit 101. The CLI writes
+# through cli/src/output.rs, whose writer turns EPIPE into a silent exit 0;
+# the library never owns its host's stdout and renders into a caller-supplied
+# `io::Write` instead. Rule two matches the bare identifier, not the call, so
+# `use std::io::stdout as out;` cannot rename its way past it.
+# `region = "code"` keeps doc examples, comments and
+# clap help strings out of scope. `eprintln!` stays legal.
+# tests/common is mounted by path into pbfhogg (where `commands` is on by
+# default) and into pbfhogg-cli (where `commands` is a no-op feature, off in
+# the `all` and `musl` sweeps). A gate on either feature in a shared helper
+# would silently drop CLI tests out of those sweeps. Comment lines are exempt
+# so the explanation can name the features.
+[[textlint]]
+name = "no-library-feature-gates-in-tests-common"
+pattern = 'feature\s*=\s*"(?:commands|geocode-reader)"'
+paths = ["tests/common/**/*.rs"]
+except = ['^\s*//']
+message = "tests/common is shared with pbfhogg-cli, where `commands` means something else; gate the mod line in tests/all.rs instead, never a shared helper"
+
+# Fault injection is per-run: every hook's state lives in the fault plan the
+# run's token carries (src/test_hooks.rs), so an armed fault cannot reach a
+# sibling test in a shared harness. A `static` there, or a `test_hooks`
+# module anywhere else, would bring back process-global hooks and the
+# one-process-per-test machinery they needed.
+[[textlint]]
+name = "no-static-fault-hook-state"
+pattern = '^\s*(?:pub(?:\([^)]*\))?\s+)?static\s'
+paths = ["src/test_hooks.rs"]
+region = "code"
+message = "fault-hook state lives in FaultPlan, carried by the run's Invocation token; a static would fire in every concurrent test of the process"
+
+[[textlint]]
+name = "fault-hooks-only-in-test-hooks"
+pattern = '\bmod\s+\w*test_hooks\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/lib.rs"]
+region = "code"
+message = "fault hooks go in pbfhogg::test_hooks (src/test_hooks.rs) as FaultPlan fields, not in a module of their own"
+
+[[textlint]]
+name = "no-print-macro"
+pattern = '\b(?:print|println)!\s*[\(\[\{]'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+region = "code"
+message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
+
+[[textlint]]
+name = "no-stdout-handle"
+pattern = '\bstdout\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["cli/src/output.rs", "harness/src/describe_out.rs"]
+region = "code"
+message = "only cli/src/output.rs (and the harness's describe writer, harness/src/describe_out.rs) acquires stdout; use output::buffered, or have the library take an io::Write"
+
+# Header feature spellings live in `read/block.rs` feature constants. Test
+# sources intentionally spell them when building or checking literal fixtures.
+# The renumber wire rewriter also uses `DenseNodes` as a protobuf field label.
+[[textlint]]
+name = "header-features-via-feature-constants"
+pattern = '"(?:OsmSchema-V0\.6|DenseNodes|Sort\.Type_then_ID|LocationsOnWays|HistoricalInformation|pbfhogg\.WayMembers-v1|pbfhogg\.SharedNodePins-v1)"'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/read/block.rs"]
+except = [
+    '2 => "DenseNodes",',
+    'repeated_message_field_error\("PrimitiveGroup", "DenseNodes"\)',
+    '(?:unpacked_field_error|repeated_field_error)\("DenseNodes",',
+]
+region = "string"
+message = "Use the Feature constants from read/block.rs for PBF header feature names"
+
+# Read-side data the crate has already validated (a constructed block, the
+# OSC overlay's arena) is consumed with a panic on a broken invariant, never
+# a fallback: an empty tag, a default Info or a dropped element is the silent
+# wrong answer validation exists to prevent (`validated` in read/block.rs,
+# `arena_invariant_broken` in osc/interner.rs). Input that can genuinely be
+# bad is refused with an error. A Result-to-Option `.ok()` in these paths is
+# therefore either a swallow or a deliberate "absent" answer, and the second
+# carries `// ok-deliberate: <reason>` on the same line; the except regex
+# insists on a non-empty reason. Text checks, not proof: the swallow
+# spellings `if let Ok`, `.is_err()` then `return None`, `.flatten()` and
+# `unwrap_or_default` are common in legitimate optional-field handling and
+# are left to review, as is an `.unwrap_or(` whose `""` rustfmt leaves on
+# the next line.
+[[textlint]]
+name = "read-side-ok-is-deliberate"
+pattern = '\.ok\(\)'
+paths = ["src/read/**/*.rs", "src/blob_meta/**/*.rs", "src/osc/**/*.rs", "src/owned.rs"]
+except = ['//\s*ok-deliberate:\s*\S']
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/block.rs",
+    "src/read/dense.rs",
+    "src/read/elements.rs",
+    "src/osc/compact.rs",
+    "src/osc/interner.rs",
+    "src/osc/write.rs",
+    "src/owned.rs",
+]
+message = "A .ok() on validated read-side data swallows a broken invariant; panic through the module's invariant helper, return the error, or mark a deliberate absent answer with // ok-deliberate: <reason>"
+
+# The exact spelling the OSC arena used to turn a bad intern id or bad UTF-8
+# into an empty tag key, role, value or user name. Matched on the raw line
+# (`region = "code"` would blank the literal), so comment lines are exempt.
+[[textlint]]
+name = "read-side-no-empty-string-fallback"
+pattern = '\.unwrap_or\(""\)'
+paths = ["src/read/**/*.rs", "src/blob_meta/**/*.rs", "src/osc/**/*.rs", "src/owned.rs"]
+except = ['^\s*//', '//\s*ok-deliberate:\s*\S']
+test_code = "skip"
+message = "An empty-string fallback on read-side data writes a silent wrong tag, role or user; panic on the broken invariant or return the error"
+
+[[textlint]]
+name = "no-process-mutation"
+pattern = '\blibc::(?:mallopt|setrlimit|prlimit|prlimit64)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/process.rs"]
+region = "code"
+message = "Process mutations belong to the caller's explicit process toolbox"
+
+# docs/cli/commands.md "Names pbfhogg leaves behind" promises that the
+# CLI starts no other process and never closes, replaces or changes the flags
+# of a descriptor it inherited: a caller hands pbfhogg a descriptor holding a
+# lease lock and removes the run's private directories once no process holds
+# it. A helper process, or a closed or replaced inherited descriptor, would let
+# the caller reclaim a directory something still uses. These are tripwires,
+# not proof: an aliased or wrapped import, or a dependency that starts a
+# process, escapes them.
+[[textlint]]
+name = "no-child-process-or-descriptor-reset"
+pattern = '\bprocess::(?:Command|Child|Stdio|CommandExt)\b|\buse\s+std::process::\{[^}]*\b(?:Command|CommandExt|Child)\b|\blibc::(?:fork|vfork|exec\w*|posix_spawn\w*|daemon|clone3?|close|close_range|closefrom|dup|dup2|dup3|ioctl)\b|\b(?:F_SETFD|FD_CLOEXEC|FIONBIO)\b|\bfrom_raw_fd\b'
+# The library harness inherits brokkr's lease descriptor just as the CLI
+# does, so it is held to the same promise.
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+region = "code"
+message = "The CLI promises it starts no other process and leaves inherited descriptors alone (docs/cli/commands.md, Names pbfhogg leaves behind); the library harness keeps the same promise"
+
+# The same promise covers file-status flags. The one F_SETFL clears O_NONBLOCK
+# on a descriptor src/read/input.rs opened itself.
+[[textlint]]
+name = "no-file-status-flag-change"
+pattern = '\bF_SETFL\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["src/read/input.rs"]
+region = "code"
+message = "Only src/read/input.rs changes file-status flags, on descriptors it opened; inherited descriptors keep theirs"
+
+# hotpath's hotpath-cpu feature spawns a detached profiler process, which would
+# break the no-helper-process promise above. A manifest text match cannot see
+# the feature switched on by unification from another dependency, so the check
+# reads the resolved graph with every workspace feature on (cargo metadata)
+# and also fails on any hotpath version or source other than the audited one.
+# pre-test: clippy has brought the lock up to date with the manifests by then.
+[[script_check]]
+name = "no-hotpath-cpu"
+command = "python3 scripts/check_hotpath_cpu.py"
+expect = "hotpath-cpu absent"
+match = "last-line"
+stage = "pre-test"
+
+# statvfs in altw (sparse preallocation, external scratch precheck) guards
+# scratch writes and sizes no host resource.
+[[textlint]]
+name = "no-host-probe"
+pattern = 'available_parallelism|/proc/meminfo'
+paths = ["src/**/*.rs"]
+exclude = ["src/host.rs"]
+region = "code"
+message = "Host probes must use Resources at the original program point"
+
+# Direct I/O must keep the alignment the file's device and filesystem
+# require, which `src/direct_io.rs` discovers at open (statx) and hands the
+# backend with the file. An `O_DIRECT` open anywhere else would skip that and
+# assume an alignment. Matching the identifier, not one call spelling,
+# also catches a flags variable built elsewhere.
+[[textlint]]
+name = "o-direct-opens-through-direct-io"
+pattern = '\bO_DIRECT\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/direct_io.rs"]
+region = "code"
+message = "O_DIRECT files open through crate::direct_io (create_for_write, open_for_read), which also returns the alignment their I/O must keep"
+
+[[textlint]]
+name = "no-env-read"
+pattern = '\benv::(?:var|var_os|vars|vars_os)\b'
+paths = ["src/**/*.rs"]
+region = "code"
+message = "Environment access belongs to the caller"
+
+# The CLI's command interval markers are reserved for it: brokkr reads exactly
+# one CLI_COMMAND_START/CLI_COMMAND_END pair per CLI process as the command's
+# span, so no library phase and no other CLI site may spell either name.
+# `cli/src/host.rs` defines them and `CommandInterval` is their one emitter.
+[[textlint]]
+name = "cli-command-interval-names-reserved"
+pattern = 'CLI_COMMAND_(?:START|END)'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["cli/src/host.rs"]
+region = "string"
+message = "CLI_COMMAND_START and CLI_COMMAND_END are the CLI's reserved command-interval markers; only host::CommandInterval emits them"
+
+[[textlint]]
+name = "no-public-reader-in-commands"
+pattern = '\b(?:BlobReader|ElementReader)::(?:open|from_path|from_path_direct|from_path_with_eviction)\b'
+paths = ["src/commands/**/*.rs", "src/geocode_index/builder/**/*.rs", "src/scan/**/*.rs", "src/osc/**/*.rs"]
+region = "code"
+message = "Command readers must inherit the caller's host"
+
+# Input page-cache eviction is the caller's policy (ADR-0016), and the
+# `host.page-cache-keep.v1` library capability rests on two facts: nothing
+# arms input eviction under `PageCachePolicy::Keep`, and every input eviction
+# counts into `fadvise_input_evictions`. The types carry the counting
+# (`crate::fadvise`: only `evict_input` drops an arbitrary file's pages, and
+# it always counts; scratch eviction takes a `scratch::ScratchFile` and counts
+# apart, as `fadvise_scratch_evictions`). These
+# rules confine the entry points outside their owners: the reader opt-in
+# that arms eviction (bare identifiers, so method, path and function-value
+# spellings all match) to the read path that applies the host policy, the
+# reader's eviction step to the reader, and the counted eviction to that
+# step. What the owners do with them is checked in review and by the
+# harness's page-cache-keep scenario, not here.
+[[textlint]]
+name = "input-eviction-armed-only-by-the-reader"
+pattern = '\b(?:evict_page_cache|from_path_with_eviction)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/read/blob.rs", "src/read/reader.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/pipeline.rs", "src/read/header_walker.rs", "src/commands/mod.rs"]
+message = "input page-cache eviction is armed only by BlobReader and ElementReader, from the host's PageCachePolicy or a public caller's opt-in; library code inherits the caller's policy"
+
+[[textlint]]
+name = "input-eviction-step-only-in-the-reader"
+pattern = '\bevict_consumed_prefix\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/read/file_reader.rs", "src/read/blob.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/pipeline.rs", "src/read/header_walker.rs"]
+message = "FileReader::evict_consumed_prefix runs only from BlobReader's armed eviction step"
+
+[[textlint]]
+name = "counted-input-eviction-only-from-the-reader"
+pattern = '\bevict_input\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/fadvise.rs", "src/read/file_reader.rs"]
+region = "code"
+test_code = "skip"
+must_scan = ["src/read/blob.rs", "src/read/pipeline.rs", "src/read/header_walker.rs"]
+message = "fadvise::evict_input is called only by FileReader::evict_consumed_prefix, the reader's eviction under the caller's policy"
+
+# The library's shared rayon tasks run on the caller's `host::Executor`, never
+# on whatever pool happens to be ambient. Par-iterators cannot be matched by
+# text; each one is wrapped in `executor.install` and checked in review.
+# Dedicated per-call worker sets (a library-built rayon pool, std thread
+# scopes) are a separate category this rule does not see; the `Executor`
+# rustdoc lists what runs where. rayon's pool constructors are disallowed in
+# clippy.toml instead, so every library-built pool is a joined
+# `crate::joined_pool::JoinedPool`.
+[[textlint]]
+name = "no-ambient-rayon"
+pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global'
+paths = ["src/**/*.rs"]
+exclude = ["src/host.rs"]
+region = "code"
+message = "Library rayon tasks must go through the caller's host::Executor, not an ambient pool"
+
+[[textlint]]
+name = "no-eprint-macro"
+pattern = '\beprint(?:ln)?!'
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["cli/src/output.rs"]
+region = "code"
+message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr; the library harness writes nothing to stderr at all"
+
+# Test scratch comes from one implementation, tests/common/scratch.rs:
+# random directories under the gitignored data/test-scratch/, removed when
+# the guard drops. Unit tests under src/ reach it as
+# `path_guard::tests::scratch()`, integration tests as
+# `common::test_scratch()`, and the CLI crate's unit tests as
+# `test_scratch::scratch()` (cli/src/test_scratch.rs, same body). Fixed names
+# in the system temp dir let concurrent check sweeps delete each other's
+# fixtures.
+# The `_in` forms (`tempfile_in`, `tempdir_in`, `TempDir::new_in`) stay legal
+# so a test can place a file inside its guard's directory.
+[[textlint]]
+name = "unit-test-scratch-via-path-guard"
+pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir|tempfile|NamedTempFile|Builder)\b|\bTempDir::new\b'
+paths = ["src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs", "harness/tests/**/*.rs"]
+region = "code"
+message = "Test scratch must come from the shared scratch helper (path_guard::tests::scratch(), common::test_scratch(), or the CLI's or the harness's test_scratch::scratch()), never the system temp dir or a fixed name"
+
+# Error propagation (reference/pipeline.md, "Error propagation and
+# provenance"). A typed error keeps its kind and
+# its cause as it travels; text is only ever produced for the final rendering
+# (`Error::report`) and for a caught panic's payload. Every rule below keeps
+# `src/error.rs`, which owns the constructors and the io carrier, out of scope.
+# The library crate only: the CLI's `Box<dyn Error>` is its program boundary.
+[[textlint]]
+name = "no-io-error-other"
+pattern = '\bio::Error::other\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "io::Error::other flattens a typed error into an opaque Other; use a pbfhogg::Error constructor (Error::internal and friends) or keep the original io::Error"
+
+[[textlint]]
+name = "no-io-error-new-other"
+pattern = '\bErrorKind::Other\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "io::ErrorKind::Other discards what failed; pick the real io kind, or a pbfhogg::Error constructor"
+
+[[textlint]]
+name = "no-io-error-restringing"
+pattern = '\bio::Error::new\(\s*\w+\.kind\(\)\s*,\s*(?:\w+\.to_string\(\)|format!)'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Rebuilding an io::Error from its own kind and text loses its OS error and its source; add context with Error::context instead"
+
+[[textlint]]
+name = "no-map-err-to-string"
+pattern = '\.map_err\(\|\w+\|\s*\w+\.to_string\(\)\)'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "map_err to a String flattens the error's kind and cause; propagate the typed error and add context with Error::context"
+
+[[textlint]]
+name = "no-string-error-result"
+pattern = '\bResult<(?:[^;{<>,]|<(?:[^<>]|<[^<>]*>)*>)*,\s*String>'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "A String error carries no kind and no cause; return pbfhogg::Result"
+
+[[textlint]]
+name = "no-box-dyn-error"
+pattern = 'Box<dyn (?:std::error::)?Error'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Box<dyn Error> erases the error's kind; return pbfhogg::Result"
+
+# Only error.rs builds an ErrorKind; everything else uses the constructors
+# (`Error::invalid_data`, `Error::internal`, `new_blob_error`, ...), so a new
+# classification is one reviewed place.
+[[textlint]]
+name = "no-error-kind-construction"
+pattern = '\bnew_error\(\s*(?:crate::error::)?ErrorKind::'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Build errors with the constructors in error.rs, not new_error(ErrorKind::..)"
+
+# A rough check: an error constructor whose text interpolates another error
+# flattens the cause into the message. Pass the cause as the typed source
+# (`invalid_data_with`, `internal_with`) or add context to the typed error.
+# Catches the single-line shape only. The interpolation sits inside a string
+# literal, which `region = "code"` blanks out, so this rule scans the whole
+# file (no region).
+[[textlint]]
+name = "no-error-interpolated-into-message"
+pattern = '\b(?:invalid_argument|invalid_data|internal)\(\s*format!\(.*\{(?:e|err|error|source)(?::[^}]*)?\}'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+message = "Do not interpolate an error into a new error's message; keep it as the typed source or add context to it"
+
+# Writer counter funnel. `sync_all_ns` / `sync_all_calls` are a pair and
+# `recv_wait_ns` is fed by one funnel; `WriterMetrics::sync_recorded` (the
+# crate's one output fsync, which records through a private
+# `record_sync_all`) and `record_recv_wait` in write/metrics.rs are the only
+# places that may move them. A backend that hand-rolled `sync_all_ns.fetch_add` left
+# `writer_sync_all_calls` reading zero for two of three backends, which no
+# test of the funnel can see. The names are forbidden outright in production
+# code (a rustfmt-wrapped `metrics\n.sync_all_ns\n.fetch_add` always lands
+# the field name on some line); tests may still read the counters.
+# src/output.rs is excused: `PublishSpan` takes read-only snapshots of the
+# pair to report the syncs a publication did, and never writes them. The
+# scan covers every library file, so a new writer file cannot escape it.
+[[textlint]]
+name = "writer-paired-counters-only-through-the-funnel"
+pattern = '\b(?:sync_all_ns|sync_all_calls|recv_wait_ns)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/write/metrics.rs", "src/output.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are moved only by WriterMetrics::sync_recorded and record_recv_wait in write/metrics.rs, so the paired counters cannot drift apart"
+
+# One ordered-delivery loop. Every pipelined PBF backend runs
+# `pipeline::deliver_in_order` and supplies only an `OutputSink`; the loop's
+# primitives (popping the reorder buffer, the recv-wait and high-water
+# records, the completeness check) appear nowhere else under src/write/, so a
+# backend cannot grow a private copy of the loop whose counters drift from
+# the others (decisions/0014-output-backends-stay-separate.md, amendment).
+# metrics.rs defines the records. parallel_gzip.rs is excluded because the
+# OSC gzip writer reorders with `ReorderBuffer` (so it calls `pop_ready`) but
+# is not a PBF backend: it carries flush barriers and failed-chunk
+# placeholders instead of `OutputChunk`s, must keep draining after a failure
+# so every barrier is answered (the shared loop returns on its first error),
+# and keeps its own `parallel_gzip_*` counters. The next rule keeps the PBF
+# loop's records and completeness check out of it.
+[[textlint]]
+name = "writer-loop-primitives-only-in-the-shared-loop"
+pattern = '\b(?:pop_ready|check_stream_complete|record_recv_wait|record_reorder_high_water)\b'
+paths = ["src/write/**/*.rs"]
+exclude = ["src/write/pipeline.rs", "src/write/metrics.rs", "src/write/parallel_gzip.rs"]
+region = "code"
+must_scan = [
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/writer.rs",
+]
+message = "the receive, reorder and completeness loop is pipeline::deliver_in_order; a backend implements OutputSink instead of looping itself"
+
+[[textlint]]
+name = "gzip-writer-uses-no-pbf-loop-records"
+pattern = '\b(?:check_stream_complete|record_recv_wait|record_reorder_high_water|SeqTotal)\b'
+paths = ["src/write/parallel_gzip.rs"]
+region = "code"
+must_scan = ["src/write/parallel_gzip.rs"]
+message = "the OSC gzip writer keeps its own parallel_gzip_* counters and proves completeness in finish against its own sent count; the PBF loop's records would change what the PBF writer counters mean"
+
+# Writer counter emission. The writer set is an invocation total, so emitting
+# it from a per-writer path (`PbfWriter::flush` once did) publishes N sidecar
+# samples of one total that a reader takes for N per-writer numbers, and the
+# `emit_once` latch then turns the real end-of-invocation call into a no-op.
+# Only the end-of-invocation hook (`pbfhogg::write::emit_writer_counters`,
+# called once from the CLI's exit path) may emit. `emit` is private to
+# write/metrics.rs, so `emit_once(invocation)` is the one spelling to
+# cover, inline (`metrics.writer.emit_once(..)`) or rustfmt-wrapped (a line
+# beginning with `.emit_once(`); the pattern matches both. host.rs is
+# excluded for `Diagnostics::emit_once`, a different method. Owners are
+# write/metrics.rs (defines emit and emit_once), write/mod.rs (the hook) and
+# cli/src/lib.rs (the exit path that calls it).
+[[textlint]]
+name = "writer-counters-emitted-only-from-the-exit-hook"
+pattern = '\.\s*emit_once\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/write/metrics.rs", "src/write/mod.rs", "src/host.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "writer counters are an invocation total; emit them only from the end-of-invocation hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
+
+# The hook spelling: a backend calling `emit_writer_counters()` (qualified or
+# imported) re-creates per-writer emission by the other route. Only the
+# CLI's exit path and the library harness's runner (once per call, after it
+# returns) call it; write/mod.rs defines it.
+[[textlint]]
+name = "writer-counter-hook-called-only-from-the-cli-exit-path"
+pattern = '\bemit_writer_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["src/write/mod.rs", "cli/src/lib.rs", "harness/src/runner.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "emit_writer_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
+
+# Read-side twin of the writer exit-hook rules. The pool-drop counters are
+# invocation totals, so only the one end-of-invocation hook may emit them; a
+# per-pipeline emission would publish N samples of a total, and the latch
+# would turn the exit call into a no-op after the first. The per-pool emitter
+# is called only by the hook (read/mod.rs); the hook only by the CLI exit path
+# and the library harness's runner.
+[[textlint]]
+name = "read-pool-counters-emitted-only-from-the-exit-hook"
+pattern = '\bemit_decompress_pool_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/read/mod.rs", "src/read/pipeline_metrics.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/pipeline.rs",
+    "src/read/reader.rs",
+    "src/read/blob.rs",
+    "src/read/decompress.rs",
+    "src/scan/classify.rs",
+]
+message = "pool-drop counters are an invocation total; only pbfhogg::read::emit_read_counters (read/mod.rs) emits them"
+
+[[textlint]]
+name = "read-counter-hook-called-only-from-the-cli-exit-path"
+pattern = '\bemit_read_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "harness/src/**/*.rs"]
+exclude = ["src/read/mod.rs", "cli/src/lib.rs", "harness/src/runner.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/pipeline.rs",
+    "src/read/reader.rs",
+    "src/read/blob.rs",
+    "src/read/decompress.rs",
+    "src/scan/classify.rs",
+]
+message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
+
+# Presence of the CLI exit-path hook calls, the function-scoped probe_lock
+# open flags, no `as i64` cast inside a `.counter(` call's arguments (which
+# rustfmt wraps across lines), and no static under a test-hooks gate anywhere
+# in src/ (the gate is on the line above): none fits a one-line forbid rule.
+[[script_check]]
+name = "source-invariants"
+command = "python3 scripts/check_source_invariants.py"
+expect = "source invariants ok"
+match = "last-line"
+stage = "pre-clippy"

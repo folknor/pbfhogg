@@ -458,6 +458,11 @@ state.
   an out-of-order list and could skip a blob holding matches, with no
   error. `check --index` reports such tagdata as malformed, and
   `sort --distrust-metadata` replaces it.
+- Blob tagdata now lists an explicit empty tag key; earlier versions dropped
+  it, so on files they wrote a `tags-filter` or `inspect tags` expression
+  naming the empty key could skip a blob holding a match, with no error.
+  `check --index` finds such blobs, and `cat --reindex` or
+  `sort --distrust-metadata` repairs the file.
 - Commands that decode a blob refuse one whose indexdata is false instead of
   answering from the claim.
 - Blob indexdata and tagdata are generated exactly or not at all.

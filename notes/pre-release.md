@@ -33,8 +33,8 @@ WRK-005.
 
 ### WRK-001: Version bump and CHANGELOG date
 
-CHANGELOG.md's section is headed `## 0.6.0 - 2026-10-30`; set the real date
-when it ships. Both `Cargo.toml`s still say 0.5.0, and no tag after `v0.5.0`
+CHANGELOG.md's section is headed `## Unreleased`; retitle it
+`## 0.6.0 - <date>` when it ships. Both `Cargo.toml`s still say 0.5.0, and no tag after `v0.5.0`
 exists. The 0.6.0 section was rewritten to net change against v0.5.0, one
 line per entry; keep it that terse.
 
@@ -389,12 +389,10 @@ carries (e.g. "")". The builder used to drop an explicit empty tag key
 from tagdata; `dd37f62e` (2026-10-22, after v0.5.0, unreleased) keeps it,
 and the CHANGELOG has no entry for that fix. Consequence: on files written
 by pbfhogg v0.5.0 or earlier, a `tags-filter` expression naming the empty
-key can skip a
-blob holding a match, silently. Decide whether 0.6.0's notes (or the
-indexdata guide) should say so and point at `check --index` and
-`cat --reindex` / `sort --distrust-metadata` as the repair, and whether
-the brokkr planet dataset should be reindexed so `check --index` passes on
-it.
+key can skip a blob holding a match, silently. The CHANGELOG now says so
+and names the repair. Left: whether the indexdata guide should say it too,
+and whether the brokkr planet dataset should be reindexed so
+`check --index` passes on it.
 
 ---
 
@@ -415,15 +413,6 @@ commit and were not checked for the same issue.
 ---
 
 ## Tooling
-
-### WRK-072: Allowlist gaps met during measurement
-
-`sudo fstrim -av` (AGENTS.md asks for it before a matched suite) and
-`taskset` (to run bygg at a README-like worker count) are not allowlisted,
-so implementers skipped both. On 2026-10-31 `! sudo fstrim -av` ran on
-bygg without a password prompt, though cached sudo credentials may explain
-that; if not, an exact `Bash(sudo fstrim -av)` allowlist entry is all
-agents would need. The maintainer's call.
 
 ### WRK-073: Digest v2 cost
 
@@ -744,6 +733,8 @@ What a session picking this up needs that is not written elsewhere:
 - **Filing in brokkr's bz from here:** the Bash hook rejects a command that
   names brokkr together with a redirect, a pipe or backticks, so pass the
   body with `-b '...'` in single quotes and no backticks.
+- **`sudo fstrim -av`** runs without a password, but after heavy scratch
+  churn it can take over 2 minutes; give it a long Bash timeout.
 - **Never `brokkr verify` above germany** (AGENTS.md). `brokkr verify` has no
   `inspect` or `merge-changes` subcommand.
 - **Do not `git stash` with a dirty `.brokkr/results.db`:** a stash dropped a

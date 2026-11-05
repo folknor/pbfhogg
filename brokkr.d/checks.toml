@@ -1,0 +1,219 @@
+# brokkr check + test sweeps. Each [[check]] entry is one (clippy +
+# test) pass with its own feature shape. Profiles in [test.profiles]
+# reference these by name and layer libtest filters on top.
+#
+#  - "all"      = test-hooks (fault injection, `pbfhogg::test_hooks`; the
+#                 fault tests run here with every other test) +
+#                 linux-direct-io + linux-io-uring. Mirrors what --all-features used to
+#                 pull in MINUS hotpath (#[hotpath::measure] turns into
+#                 runtime measurement that emits a banner to stdout at
+#                 process exit, contaminating stdout-output commands
+#                 like `pbfhogg diff` under integration tests; hotpath
+#                 stays opt-in via `brokkr <cmd> --hotpath`) and MINUS
+#                 `commands` because pbfhogg's `default = ["commands"]`
+#                 already enables it whenever no_default_features is
+#                 false, and pbfhogg-cli always pulls it in via its lib
+#                 dep.
+#  - "consumer" = no-default-features view; what a downstream library
+#                 user builds with `default-features = false, features =
+#                 ["commands"]`. Catches lints in always-compiled code
+#                 that proc-macros silently mask (e.g. #[hotpath::measure]
+#                 swallowing function bodies). Also tests pbfhogg-cli
+#                 built without linux-direct-io / linux-io-uring, so the
+#                 cli_sort.rs feature_missing tests (gated on
+#                 `cfg(not(feature = "linux-..."))`) fire in this sweep
+#                 against a CLI that doesn't support the flag; for
+#                 pbfhogg-cli this shape is its default build (default =
+#                 [], and its `commands` feature is a no-op that exists
+#                 purely so brokkr can apply `--features commands` to
+#                 both crates).
+#
+# The sweeps that test the CLI select the CLI and the library harness
+# too. Every test that drives the `pbfhogg` binary lives in pbfhogg-cli
+# (cli/tests/all.rs), and every test that drives the harness in
+# pbfhogg-harness (harness/tests/all.rs), where cargo builds the binary
+# with that test build's features and hands its path as
+# CARGO_BIN_EXE_<name> - so there is no build_packages pre-build and no
+# binary from another sweep to pick up. Every package declares test-hooks,
+# linux-direct-io, linux-io-uring and commands under the same names, so
+# one feature list serves all three. A sweep that must keep the library
+# alone (minimal, geocode-reader) leaves the other two out: their lib dep
+# would turn `commands` back on.
+
+[[check]]
+name = "all"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+# `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
+# binaries executed directly, budget = tests in flight, defaulting to the L3
+# cache domain (the right default for a compute-bound suite). Until 2026-09-02
+# every profile here ran libtest's serial default, so this is the first
+# parallelism the suite has seen; the per-test 20s watchdog is kept. Two-run
+# ritual to judge it: the first run weights by test count (always the slow
+# one), and `claims 1-1` on the second means the budget needs raising (see
+# brokkr man config parallel). Since the test fold (autotests = false) the
+# sweep's binaries are each package's lib unit tests and `all` binary, and
+# the process_nofile target; the fan-out therefore parallelizes mostly
+# inside the two `all` binaries, and shared scratch between concurrent
+# cli_* modules is the class to suspect first if a test flakes.
+parallel = {}
+
+[[check]]
+name = "consumer"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+no_default_features = true
+features = ["commands"]
+parallel = {}
+
+# "minimal" = the configuration the crate advertises but never built.
+# `consumer` sets no_default_features and then re-enables `commands`, so
+# until this entry existed no sweep ever compiled pbfhogg without it and
+# `default-features = false` was an untested claim.
+#
+# No pbfhogg-cli, deliberately. pbfhogg-cli pins its lib dep as
+# `default-features = false, features = ["commands"]`, so the moment the
+# CLI joins the build cargo's feature unification turns `commands` back
+# on and the sweep silently stops testing what it is named for. This
+# sweep must stay scoped to the library package alone.
+#
+# Integration tests that reach into the feature-gated modules
+# (`check`, `export`, `extract`, `inspect::json`, `geocode_index`) carry
+# a `#[cfg(feature = "commands")]` on their `mod` line in tests/all.rs so
+# they drop out here and still run in full under `all` and `consumer`.
+#
+# Named explicitly rather than left to the workspace's default selection,
+# so a change to the workspace's default members cannot widen it.
+[[check]]
+name = "minimal"
+packages = ["pbfhogg"]
+no_default_features = true
+features = []
+parallel = {}
+
+# Library-only geocode reader configuration, without the builder or CLI.
+[[check]]
+name = "geocode-reader"
+packages = ["pbfhogg"]
+no_default_features = true
+features = ["geocode-reader"]
+parallel = {}
+
+# The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
+# on target_env = "gnu"; this sweep builds, lints and runs the suite against
+# musl so an ungated call fails here rather than in a downstream musl build.
+# x86_64 musl binaries run natively on the glibc host.
+[[check]]
+name = "musl"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+target = "x86_64-unknown-linux-musl"
+parallel = {}
+
+# Doctests live in cargo's `--doc` pseudo-target, which a `parallel` sweep
+# cannot carry, and `[test] doctests` is off by default - so until this entry
+# existed no doctest in the library ever ran, and a broken example in a doc
+# comment was invisible. Workspace-shaped (no `packages`) on purpose: a gate
+# needs at least one doctest carrier that spans the whole workspace. Run
+# through the gate profile only, to keep tier1 fast.
+# pbfhogg-cli's library target is the program, not an API, and sets
+# `doctest = false`, and pbfhogg-harness has no library target at all, so
+# both are excluded rather than the lane being package-scoped.
+[[check]]
+name = "doctests"
+doc_only = true
+test_exclude_packages = ["pbfhogg-cli", "pbfhogg-harness"]
+
+[test]
+debug = true
+default_package = "pbfhogg"
+default_profile = "tier1"
+gate_profile = "gate"
+
+# Tier 1 - fast contracts. brokkr check's inner-loop signal during
+# refactor. Skips the tier2/tier3/serial submodules; runs everything
+# else across every listed sweep, the O_DIRECT and io_uring tests
+# included (they exist only in the `all` sweep, which builds both
+# features, and skip on a typed platform refusal). `minimal` contributes
+# mostly a compile + clippy gate: the commands-gated test files cfg
+# themselves out there.
+[test.profiles.tier1]
+description = "Fast edit loop used by brokkr check (tier 1)"
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
+skip = ["tier2::", "tier3::", "serial::"]
+include_ignored = false
+
+# Tier 3 - full in-project correctness gate (pre-merge). include_ignored
+# picks up fast ignored tests that #[ignore] keeps out of tier 1.
+# Tests slower than brokkr check's fixed 20 s per-test kill are skipped here BY NAME
+# and must be run individually via `brokkr test <name> --timeout <secs>`
+# (add `-p pbfhogg-cli` when the test is a CLI one, as
+# sort_cross_validate_osmium is); without the skip the profile could
+# never pass, by construction.
+#
+# WARNING, and it has bitten once (2026-08-20): these entries are SUBSTRING
+# matches, not exact test names. Every fast synthetic test whose name merely
+# CONTAINS one of them is silently excluded from this gate too - it still
+# passes under tier1, so nothing goes red and nothing announces the loss.
+# Two short real-data test names were swallowing four synthetic
+# geocode tests that way. Before adding a short name here, grep the suite for
+# it; before naming a new test, check it does not contain an entry below.
+[test.profiles.full]
+description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
+sweeps = ["all"]
+skip = [
+    "sort_cross_validate_osmium",
+]
+include_ignored = true
+
+# Tests requiring --test-threads=1. Fault tests are not a serial case
+# (their hooks are per-run, see `pbfhogg::test_hooks`); this profile is
+# reserved for any future serial-only test.
+# Note the entries now carry `parallel` (2026-09-02): if a serial:: test
+# ever materializes, give this profile a parallel-free twin of `all`
+# (same build shape, clippy dedupes) rather than running it through the
+# fan-out - the nautilus config is the worked example of that split.
+[test.profiles.serial]
+description = "Serial tests requiring --test-threads=1"
+sweeps = ["all"]
+only = ["serial::"]
+include_ignored = true
+test_threads = 1
+
+# Tier 2 command-slice precedent. cli/tests/cli_sort.rs is already split into
+# root (tier 1) + mod backends (also tier 1); once it grows a mod tier2 (many-blob
+# boundary fixtures, scratch-leak sweeps), this profile picks them up.
+# Add similar entries for other commands as their tier-2 matrices
+# land - per testing.md, there is no generic tier2 profile.
+#
+# The sweeps are named rather than inherited from tier1: cli_sort lives in
+# pbfhogg-cli, so the root-only sweeps (minimal, geocode-reader) hold no
+# cli_sort test. Verified with `brokkr check --profile sort` and the tier1
+# sweep list at a time it held a root-only sweep ahead of these: the run
+# stopped there with "cargo test: zero tests ran", and the sweeps after it
+# never ran. These three are every
+# shape the CLI tests run in.
+[test.profiles.sort]
+description = "Tier 2: expanded sort command tests"
+extends = "tier1"
+sweeps = ["all", "consumer", "musl"]
+tests = ["all"]
+only = ["cli_sort::"]
+skip = ["serial::"]
+
+# `brokkr check --gate`: every sweep with no filters, plus doctests, plus the
+# coverage audit. Under `certifies = "complete"` every (build shape, test)
+# pair must run, be `#[ignore]`d at the source, or be justified by a
+# `[[quarantine]]` entry - otherwise the check fails as orphaned. That is the
+# failure the substring skips in `full` caused silently (see its comment):
+# a test that stops running cannot go unnoticed here.
+[test.profiles.gate-tests]
+description = "Every sweep, unfiltered"
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
+
+[test.profiles.doc-twin]
+description = "The doc-only carrier"
+sweeps = ["doctests"]
+
+[test.profiles.gate]
+description = "Every sweep unfiltered, doctests, and the coverage audit"
+lanes = ["gate-tests", "doc-twin"]
+certifies = "complete"

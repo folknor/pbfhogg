@@ -1,0 +1,23 @@
+[dm6]
+data = "data"
+scratch = "data/bench-tmp"
+target = "target"
+
+[dm6.drives]
+source = "nvme"
+data = "nvme"
+scratch = "nvme"
+target = "nvme"
+
+[dm6.datasets.denmark]
+origin = "Geofabrik"
+
+[dm6.datasets.denmark.pbf.raw]
+file = "denmark-20260415.osm.pbf"
+xxhash = "fba07e0f57475a22b49348ed6584a2df"
+seq = 4757
+
+[dm6.datasets.denmark.pbf.indexed]
+file = "denmark-20260415-with-indexdata.osm.pbf"
+xxhash = "e2d812be0ec0d57ba1e351c50b50e269"
+seq = 4757

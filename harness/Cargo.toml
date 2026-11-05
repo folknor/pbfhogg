@@ -46,7 +46,7 @@ test-hooks = ["pbfhogg/test-hooks"]
 [dependencies]
 pbfhogg = { version = "0.5", path = "..", default-features = false, features = ["commands"] }
 serde_json.workspace = true
-hotpath = "0.30.0"
+hotpath = "0.31.0"
 # Only to read the ambient executor's effective size for the call context.
 rayon = "1.12.0"
 # getrlimit and setrlimit for the harness's own descriptor policy.

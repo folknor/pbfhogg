@@ -322,6 +322,13 @@ state.
   workers exit, where its idle threads kept those workers' freed memory.
   A planet written at 8000 per blob peaks at about 0.59 GB against 0.62 to
   0.69 GB on bygg, at the same speed. Output is unchanged.
+- `extract` (simple on sorted input, complete and smart) compresses each
+  output block on the worker that built it instead of on a second, framing
+  thread pool, which simple extract started just after its node classify
+  workers exited and then left idle through each later classify phase. A
+  planet simple extract of Europe's bbox on plantasjen peaks at about
+  2.4 GB of anon against 2.85 GB, with half the threads, at the same
+  speed. Output is unchanged.
 - Commands that decode on a worker pool recycle right-sized decode buffers
   instead of allocating one per blob, which lowers their peak memory.
 - `diff` runs one engine at every `-j`: each input is read once as one

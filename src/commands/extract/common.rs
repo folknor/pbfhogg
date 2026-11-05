@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::cat::CleanAttrs;
 use crate::read::input::PinnedInput;
 use crate::read::wire::{Cursor, WIRE_LEN};
@@ -10,8 +10,8 @@ use crate::writer::PbfWriter;
 use crate::{BlobFilter, Element, MemberId, PrimitiveBlock};
 
 use super::super::{
-    Result, ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
-    flush_local,
+    BlockSink, FramedBlocks, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local,
 };
 pub(super) use crate::commands::spatial::BboxInt;
 use crate::idset::IdSet;
@@ -287,6 +287,18 @@ pub(super) fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractSta
 }
 
 /// Execute a pread-from-workers write pass on a pre-built schedule.
+///
+/// Each worker frames its blocks as they complete (`FramedBlocks`) and the
+/// consumer writes the frames raw, so no extract write pass hands the
+/// writer's executor a job. That is deliberate. A pool started lazily by its
+/// first job takes the malloc arenas a just-ended worker set left, free
+/// memory and all, and strands them if it then idles while the next phase
+/// runs on its own workers (`reference/performance.md`, "Idle executor
+/// threads take exited workers' arenas"). Simple extract alternates classify
+/// pools with these write pools, and a node write whose blobs are mostly
+/// verified raw copies would start the executor for a handful of rebuilt
+/// blocks and then leave it idle through the way classify. Framing on the
+/// workers keeps the executor out of every phase boundary here.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_execute<F>(
@@ -298,7 +310,7 @@ pub(super) fn pread_execute<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -337,6 +349,8 @@ where
         !matches!(d.passthrough, Passthrough::Verified { .. })
     });
     let decode_at = &decode_at;
+    let compression = writer.compression();
+    let metrics = &host.invocation.metrics().writer;
     let mut consumer = PreadConsumer {
         interleaved: crate::ordered_pool::Interleaved::new(decode_at),
         schedule,
@@ -359,15 +373,14 @@ where
         |_| PreadLocal {
             read_buf: crate::read::read_buf::ReadBuf::default(),
             bb: BlockBuilder::new(),
-            output_blocks: Vec::new(),
             pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
         },
         |(), local: &mut PreadLocal, ordinal| {
             let d = &schedule[decode_at.position(ordinal)];
-            // Workers: pread -> decompress -> PrimitiveBlock -> extract -> OwnedBlocks.
-            let result = (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
+            // Workers: pread -> decompress -> PrimitiveBlock -> extract -> framed blocks.
+            let result = (|| -> crate::error::Result<(Vec<Vec<u8>>, ExtractStats)> {
                 let raw = local
                     .read_buf
                     .read_exact_at(&*shared_file, d.offset, d.size)?;
@@ -379,10 +392,11 @@ where
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
                 )?;
-                local.output_blocks.clear();
-                let block_stats = block_fn(&block, &mut local.bb, &mut local.output_blocks)?;
-                flush_local(&mut local.bb, &mut local.output_blocks)?;
-                Ok((std::mem::take(&mut local.output_blocks), block_stats))
+                let mut output = FramedBlocks::new(compression, metrics);
+                let block_stats = block_fn(&block, &mut local.bb, &mut output)?;
+                flush_local(&mut local.bb, &mut output)?;
+                let frames = output.frames.into_iter().map(|(_, frame)| frame).collect();
+                Ok((frames, block_stats))
             })()
             // Cold: only a failure builds the location.
             .map_err(|e| {
@@ -408,13 +422,12 @@ where
 struct PreadLocal {
     read_buf: crate::read::read_buf::ReadBuf,
     bb: BlockBuilder,
-    output_blocks: Vec<OwnedBlock>,
     pool: std::sync::Arc<crate::blob::DecompressPool>,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
 }
 
-/// `pread_execute`'s consumer: worker `OwnedBlock`s and passthrough raw
+/// `pread_execute`'s consumer: the workers' framed blocks and passthrough raw
 /// frames, merged in schedule order.
 ///
 /// A raw frame keeps the input's BlobHeader, indexdata and tagdata
@@ -455,7 +468,7 @@ impl PreadConsumer<'_> {
     }
 }
 
-impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, ExtractStats)> for PreadConsumer<'_> {
+impl crate::ordered_pool::OrderedConsumer<(Vec<Vec<u8>>, ExtractStats)> for PreadConsumer<'_> {
     fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
         for position in self.interleaved.before(ordinal) {
             self.passthrough(position)?;
@@ -466,11 +479,11 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, ExtractStats)> for P
     fn consume(
         &mut self,
         _ordinal: usize,
-        (blocks, block_stats): (Vec<OwnedBlock>, ExtractStats),
+        (frames, block_stats): (Vec<Vec<u8>>, ExtractStats),
     ) -> crate::Result<()> {
         merge_extract_stats(self.stats, &block_stats);
-        for block in blocks {
-            self.writer.write_primitive_block_owned(block)?;
+        for frame in frames {
+            self.writer.write_raw_owned(frame)?;
         }
         Ok(())
     }
@@ -488,7 +501,7 @@ pub(super) fn pread_write_pass<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -519,7 +532,7 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -562,13 +575,13 @@ use crate::owned::{dense_node_metadata, element_metadata, relation_members_into}
 /// non-indexed blob. For indexed PBFs the filter is a no-op (each blob is
 /// homogeneous by type, pre-routed to its phase).
 #[hotpath::measure]
-pub(super) fn extract_block_pass2(
+pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
     phase_kind: Option<crate::ElementKind>,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut O,
 ) -> crate::Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,

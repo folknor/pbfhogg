@@ -1,6 +1,6 @@
 //! Smart extraction strategy (three passes) + shared Pass 1 ID collection used by complete-ways.
 
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::cat::CleanAttrs;
 use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
@@ -726,12 +726,12 @@ use crate::owned::{dense_node_metadata, element_metadata, relation_members_into}
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
 #[hotpath::measure]
-fn extract_block_pass3(
+fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
     block: &PrimitiveBlock,
     ids: &ExtractPass3IdSets<'_>,
     clean: &CleanAttrs,
     bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
+    output: &mut O,
 ) -> crate::Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,

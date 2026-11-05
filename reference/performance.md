@@ -1811,6 +1811,43 @@ not touch. Germany (`germany-20260224-seq4704-with-indexdata`), one cell
 each, the lazy trigger at HEAD (`17a4601d`) against an early-started pool
 (session `ecf95439`): way phase peak anon 224 against 206 MB.
 
+**The other executor users** (surveyed 2026-11-05 at `d919ab21`). Where
+the executor's first job falls after a worker set ends:
+
+- Its whole run or final pass, working throughout: `cat` (passthrough and
+  `--type`, no worker set before), `time-filter` history, `getid`,
+  `getparents`, two-pass `tags-filter`, `add-locations-to-ways` (every
+  index type's output pass), `renumber` (every stage frames every block
+  on it), unsorted simple extract (no worker set before its batches).
+  `merge-changes` and the OSC `tags-filter` run their whole body inside
+  it. `sort`, `cat --clean` and `time-filter` snapshot hand it nothing.
+- Between worker sets, then idle: extract's pread write pools, which simple
+  extract on sorted input alternates with its classify pools (node
+  classify, node write, way classify, way write, relation classify,
+  relation write). The executor started at the node write, after the node
+  classify workers exited, and sat idle through each later classify phase.
+  A node write whose blobs are mostly verified raw copies would start it
+  for a few rebuilt blocks, the repack shape.
+
+**The change**: `pread_execute` (simple's three write phases and the
+complete and smart write passes) frames each block on its worker through
+`FramedBlocks` and writes the frames raw, so extract's pread passes hand
+the executor no job. Planet (`planet-20260223-reindexed`), `--strategy
+simple --bbox=-25,34,45,72`, `--bench 1`, plantasjen, order HEAD, change,
+HEAD:
+
+| arm | walls (s) | peak threads, write / classify phases | peak anon (MB) |
+|---|---|---|---|
+| `d919ab21` (`bb82cdd8`, `4a447ac3`) | 223, 224 | 49 / 50 | 2,842, 2,855 |
+| change (unstored session) | 226 | 25 / 26 | 2,400 |
+
+Every phase runs the same time in both (node write 100.5 to 102.1 s, way
+write 56.6 to 58.2 s); average cores in the write phases fall from about
+23 to 21.5, the framing pool's threads that ran beside the workers. Output
+passes `brokkr verify extract` on denmark; the frames carry the same
+indexdata, tagdata and compression as the writer's (the builder's blocks
+carry no WayMembers). degrade's unsort modes are left as above.
+
 ### apply-changes' memory step at the node-to-way transition (bygg, 2026-11-02, against `2cd85f7e`)
 
 Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression

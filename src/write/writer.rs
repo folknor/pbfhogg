@@ -1064,6 +1064,13 @@ impl<W: Write> PbfWriter<W> {
         self.write_owned_block(block, false)
     }
 
+    /// The compression this writer frames blocks with, for a caller that
+    /// frames on its own workers and hands the frames to
+    /// [`write_raw_owned`](Self::write_raw_owned).
+    pub(crate) fn compression(&self) -> Compression {
+        self.compression
+    }
+
     fn write_owned_block(&mut self, block: OwnedBlock, keep_indexdata: bool) -> Result<()> {
         let OwnedBlock {
             bytes,

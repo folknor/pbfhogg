@@ -1652,6 +1652,35 @@ behind a slow head, which this run never had. The peak is the workers' own
 working sets: decode, read and encode buffers and frames of the blob in
 hand.
 
+### Dense-node direct encoding, refused (plantasjen, 2026-11-05, against `9ebcfa97`)
+
+`BlockBuilder` stages each dense packed field in a scratch buffer, the
+DenseInfo submessage in `elem_scratch` and the DenseNodes body in
+`group_buf`, then copies the body once into the encode buffer. The variant
+measured every packed body first (a varint-width pass over each dense
+vector, checked sums), reserved the whole block once (string table plus
+group) and wrote every field straight into the encode buffer. A unit test
+against the staged path and a germany `cat --clean version` byte compare
+(62,461 blobs, `cmp` clean) showed identical output.
+
+Planet `cat --clean version`, `--bench 1`, interleaved H V V H, after
+`fstrim`. H is stored (`41ca4be3`, `f9b8146d`); V ran `--force`, sidecars
+`046eceb9` and `095013e5`.
+
+| Cell | Wall | `CAT_NODES` | `CAT_WAYS` |
+|---|---|---|---|
+| H `41ca4be3` | 296.4 s | 179.2 s | 107.1 s |
+| V `046eceb9` | 311.0 s | 190.4 s | 109.6 s |
+| V `095013e5` | 312.2 s | 192.0 s | 109.3 s |
+| H `f9b8146d` | 304.4 s | 183.7 s | 110.1 s |
+
+The node phase, the only one the change touches, is 5-6 % slower in both
+pairs; the way phase is flat. Node-phase peak RSS fell 25-40 MB, inside the
+noise floor. About 180 us per 8000-node block across the workers: computing
+a width per value costs more than bulk-copying bytes that are already
+encoded. Not adopted; the staging stays. Untried shapes: accumulating packed
+lengths as values are added, and reserving prefix space then compacting.
+
 ### repack and degrade encode each blob on its worker (bygg, 2026-11-03, against `1f93e674`)
 
 **Attribution** (uncommitted diagnostic on `1f93e674`, sidecar session

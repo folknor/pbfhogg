@@ -194,22 +194,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Memory and throughput: structural work
 
-### WRK-123: Dense-node block body still staged once in the encoder
-
-`BlockBuilder::encode_dense_nodes_group` encodes the DenseNodes message
-into `group_buf` and copies it once into `encode_buf` behind both length
-prefixes (the copy through `elem_scratch` that wrapped it as a
-PrimitiveGroup is gone). Writing the body straight into `encode_buf` needs
-the packed fields' lengths before they are written, so either a length
-pass over the dense vectors or a reserve-and-shift of each field; each
-packed field is still staged through `elem_scratch` too. At planet the
-node phase's `group_buf` is about 0.6 MB per worker (17-22 MB summed over
-apply-changes' 30 workers, reference/performance.md "apply-changes'
-retained encode storage, attributed"), so the memory left is under the
-noise floor; what is left is one copy of the node body per block on every
-node-writing command, whose wall cost is not measured and likely sits
-under the 2-3 % floor.
-
 ### WRK-022: Byte-budgeted fused task engine
 
 One execution model for decode, transform, encode and frame under one byte

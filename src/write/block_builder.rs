@@ -201,10 +201,14 @@ pub struct BlockBuilder {
     last_dense_uid: i32,
     last_dense_user_sid: i32,
 
-    // Wire-format accumulators for ways and relations
-    group_buf: Vec<u8>,      // per-block: all serialized way/relation messages
-    elem_scratch: Vec<u8>,   // per-element body (cleared each add_way/add_relation call)
-    packed_scratch: Vec<u8>, // per-field packed content (refs in location path)
+    // Wire-format accumulators. Ways and relations: `group_buf` holds the
+    // block's serialized messages, `elem_scratch` one element's body. Dense
+    // nodes: `group_buf` stages the DenseNodes body, `elem_scratch` one
+    // packed field or the DenseInfo body, `packed_scratch` one DenseInfo
+    // packed field (see `encode_dense_nodes_group` for why they stay).
+    group_buf: Vec<u8>,
+    elem_scratch: Vec<u8>,
+    packed_scratch: Vec<u8>, // per-field packed content (refs in location path, DenseInfo)
     packed_vals_scratch: Vec<u8>, // tag values packed encoding (dual-buffer single-pass)
     packed_lat_scratch: Vec<u8>, // way location lat encoding (single-pass)
     packed_lon_scratch: Vec<u8>, // way location lon encoding (single-pass)
@@ -1295,10 +1299,25 @@ impl BlockBuilder {
         Ok(Some(used))
     }
 
-    /// Encode DenseNodes directly to wire format into `encode_buf`.
+    /// Encode DenseNodes to wire format and append it to `encode_buf`.
     ///
     /// Encodes PrimitiveGroup (field 2 of PrimitiveBlock) containing
-    /// DenseNodes (field 2 of PrimitiveGroup) with all packed fields.
+    /// DenseNodes (field 2 of PrimitiveGroup) with all packed fields. Each
+    /// packed field is staged in a scratch buffer to learn its length, the
+    /// DenseInfo submessage in `elem_scratch`, and the DenseNodes body in
+    /// `group_buf`, which is copied once into `encode_buf` behind both
+    /// prefixes.
+    ///
+    /// The staging is deliberate. Writing everything straight into
+    /// `encode_buf` behind lengths measured first (a varint-width pass over
+    /// every dense vector, then one direct write) was built on 2026-11-05,
+    /// verified byte-identical, and measured slower: on planet `cat --clean`
+    /// (host plantasjen, against `9ebcfa97`) the node phase took 5-6 %
+    /// longer in both interleaved pairs while peak RSS fell only 25-40 MB.
+    /// Computing a width per value costs more than bulk-copying the
+    /// already-encoded bytes. Shapes not tried: accumulating packed lengths
+    /// as values are added, and reserving prefix space then compacting. See
+    /// reference/performance.md "Dense-node direct encoding, refused".
     ///
     /// DenseNodes fields:
     ///   id (sint64 packed, field 1), denseinfo (submessage, field 5),

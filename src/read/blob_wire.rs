@@ -70,7 +70,9 @@ impl WireBlobHeader {
     ///
     /// When `parse_indexdata` is `false`, field 2 (indexdata) is skipped instead
     /// of copied. Hot read paths that never call `Blob::index()` (e.g.
-    /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy.
+    /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy,
+    /// unless the walk is armed against a partially indexed input, which
+    /// passes `true` here for its own observation and drops the result.
     ///
     /// The retention flags decide copy versus skip and nothing else: a
     /// field with the wrong wire type is handled the same way whether or

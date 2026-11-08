@@ -225,13 +225,6 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-083: The partial-index guard
-
-`brokkr read --dataset planet`, `84f50b31^` vs `84f50b31`. An armed frame now
-parses indexdata (a 42-byte copy and a deserialize) on reads that skipped it
-(the pipelined reader without a blob filter, `par_map_reduce`) and compares
-once per data frame everywhere.
-
 ### WRK-084: Ordered pools
 
 `56a50e0d` added windows where there were none (`default_window`, 8 per

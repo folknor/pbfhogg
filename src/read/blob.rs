@@ -618,7 +618,16 @@ impl<R: Read + Send> BlobReader<R> {
     ///
     /// When enabled (default), `WireBlobHeader::parse` copies the 42-byte
     /// indexdata per blob. Disable on hot paths that never call `Blob::index()`
-    /// to skip the per-blob copy.
+    /// to skip the per-blob copy. This decides retention for the caller
+    /// only: a reader armed against a partially indexed input
+    /// (`Frames::refuse_partial_index`, every command input) still parses
+    /// and deserializes each data frame's indexdata for the guard, then
+    /// drops it. That is fixed per-frame work, a stack copy and a scalar
+    /// check with no allocation, element walk or I/O. By source estimate,
+    /// not measurement, it is milliseconds on planet's 51k frames and tens
+    /// of milliseconds on a europe walk of about 522k; no planet benchmark
+    /// resolves it, and `bench-read` cannot see it at all, since it opens
+    /// through the unarmed public constructors.
     pub(crate) fn set_parse_indexdata(&mut self, enable: bool) {
         self.frames.fields.indexdata = enable;
     }

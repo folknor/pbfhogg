@@ -563,7 +563,9 @@ impl<R: Read + Send> ElementReader<R> {
         // indexdata parsing; using the optional metadata filter here would make
         // results depend on indexdata presence and correctness.
         // par_map_reduce never inspects blob.index(); skip the per-blob
-        // indexdata copy in the frame pump.
+        // indexdata copy in the frame pump. On a reader armed against a
+        // partially indexed input the guard still parses it per frame
+        // (see `BlobReader::set_parse_indexdata`).
         this.blob_iter.set_parse_indexdata(false);
 
         // Reserve one thread for the frame pump (this thread); the rest decode.

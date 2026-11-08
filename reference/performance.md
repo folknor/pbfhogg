@@ -2378,6 +2378,28 @@ planet, not that their cost is under any figure. The verdict is for the
 pair; the checked functions are unchanged since, but the code around them
 is not, so it is not re-claimed for later trees without a cell there.
 
+### The partial-index guard, not measured by `brokkr read` (bygg, 2026-11-08, at `71c0a4d3`)
+
+`84f50b31` armed every command-input frame walk against a partially
+indexed file: an armed walk parses the 42-byte indexdata, deserializes it
+and observes it once per completed data frame, including on readers whose
+caller asked not to keep it. The proposed screen, `brokkr read --dataset
+planet` at `84f50b31^` against `84f50b31`, was not run because it cannot
+see the guard: `bench-read` opens every mode through the public library
+constructors (`ElementReader::open_with` and `BlobReader::open_with` at
+HEAD, `from_path_with_eviction` at `84f50b31`), which never arm the walk,
+so both arms run with no guard. `par_map_reduce` has no armed caller.
+
+On the armed command paths the added work is fixed per frame: a stack
+copy and a scalar `BlobIndex::deserialize`, with no allocation, element
+walk, payload read or seek. These figures are a source estimate, not a
+measurement. At 100 ns a frame, a planet walk of 50,816 frames costs about
+5 ms and a europe walk of 522,168 frames about 52 ms. At 1 us a frame the
+same walks cost about 51 ms and 522 ms. Either way the cost sits far below
+the noise floor of a minutes-long planet run. Inputs packed more densely
+than europe, and short header-only walks, have a different denominator,
+so this is not a claim of insignificance everywhere.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

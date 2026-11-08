@@ -351,7 +351,11 @@ pub(super) fn stage1_pass_a(
     };
 
     // The ordered pool writes the two sidecars in blob order; cancellation
-    // is checked on its consumer.
+    // is checked on its consumer. The window buys no memory here (results
+    // are small), but it is not dropped for an unbounded run: in the
+    // planet runs recorded in reference/performance.md its admission wait
+    // is zero, so workers do not
+    // park behind a slow head, and it stays the bound if one ever stalls.
     let pool_result = crate::ordered_pool::run_ordered(
         schedule.len(),
         &mut shards,

@@ -50,7 +50,8 @@
 //!   wait). A failing run calls [`OrderedConsumer::abandon`] before it joins,
 //!   so a consumer whose workers can park on such a wait can release it.
 //! - **Cancellation** is checked on the calling thread only: before each wait
-//!   for a result, on each arrival, before each consumed item, after the
+//!   for a result, on each arrival, before each consumed item and each
+//!   `before_item`, after the
 //!   channel closes, and on an empty run. Workers never check it, so an
 //!   admitted task is never abandoned while the consumer could still wait
 //!   for it.
@@ -220,22 +221,39 @@ pub(crate) fn default_window(workers: usize) -> NonZeroUsize {
 /// The admission gate: how many results the consumer has finished with, and
 /// whether claiming has stopped or the run is closed.
 ///
-/// Every wait predicate lives under the one mutex and every transition
-/// notifies all waiters, so a waiter cannot miss the change that would
-/// release it. `stopped` mirrors "claims stopped or closed" for the
-/// lock-free check a worker makes before claiming; it is only a fast exit,
-/// never the wait predicate. A worker can pass that check and claim just
-/// after another sets it; the claim still goes through [`OrderedGate::admit`],
-/// which judges it under the lock, so the race is harmless.
+/// `consumed` is an atomic the consumer advances without the lock, once per
+/// consumed result. It takes the mutex and notifies only when a worker is
+/// registered as parked: std's futex condvar issues a wake syscall on every
+/// `notify_all`, waiters or not, and the window rarely binds, so an
+/// unconditional notify was a syscall per consumed result for nothing.
+///
+/// No wakeup is lost. A worker that may sleep registers in `parked` under
+/// the mutex, then reads `consumed`, then waits (which releases the mutex
+/// atomically); the consumer stores `consumed`, then reads `parked`. Both
+/// sides use `SeqCst`, so in their single total order either the worker's
+/// read sees the new `consumed` (it does not sleep) or the consumer's read
+/// sees the registration, takes the mutex - which it can only get once the
+/// worker is inside `wait` or has left the loop - and notifies.
+///
+/// The flag transitions (`stop_claims`, `close`) are rare and keep the
+/// locked notify. `stopped` mirrors "claims stopped or closed" for the
+/// lock-free checks: the one before claiming, and the admission fast path,
+/// which admits only while it is clear, so the precedence `closed`, then
+/// eligible, then `stop_claims` is judged under the lock whenever a flag is
+/// set. A worker can pass a lock-free check just after another sets a flag;
+/// that admission linearizes before the flag, so the race is harmless.
 struct OrderedGate {
     state: Mutex<GateState>,
     cv: Condvar,
     stopped: AtomicBool,
+    /// Tasks below this have been consumed.
+    consumed: AtomicUsize,
+    /// Workers inside the locked admission loop, who may be asleep on `cv`.
+    /// Changed only under the mutex.
+    parked: AtomicUsize,
 }
 
 struct GateState {
-    /// Tasks below this have been consumed.
-    consumed: usize,
     /// A worker failed: no new claims, but an already-claimed task inside
     /// the window is still worked (eligibility wins), so every task below
     /// the failing one is delivered.
@@ -249,17 +267,18 @@ impl OrderedGate {
     fn new() -> Self {
         Self {
             state: Mutex::new(GateState {
-                consumed: 0,
                 stop_claims: false,
                 closed: false,
             }),
             cv: Condvar::new(),
             stopped: AtomicBool::new(false),
+            consumed: AtomicUsize::new(0),
+            parked: AtomicUsize::new(0),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, GateState> {
-        // Two counters and two flags, all still meaningful after a panic
+        // Two flags, both still meaningful after a panic
         // elsewhere; the panic itself surfaces at the join.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -286,8 +305,21 @@ impl OrderedGate {
 
     /// The consumer has finished with every task below `consumed`.
     fn advance(&self, consumed: usize) {
-        self.lock().consumed = consumed;
-        self.cv.notify_all();
+        self.consumed.store(consumed, Ordering::SeqCst);
+        if self.parked.load(Ordering::SeqCst) > 0 {
+            // Taking the lock orders this notify after any registered worker
+            // has entered `wait` (or left the loop); see the type docs.
+            drop(self.lock());
+            self.cv.notify_all();
+        }
+    }
+
+    fn eligible(&self, position: usize, window: NonZeroUsize) -> bool {
+        position
+            < self
+                .consumed
+                .load(Ordering::SeqCst)
+                .saturating_add(window.get())
     }
 
     /// Block until task `position` is inside the window (`true`), or until
@@ -303,13 +335,20 @@ impl OrderedGate {
         window: NonZeroUsize,
         metrics: Option<&OrderedPoolMetrics>,
     ) -> bool {
+        // Lock-free fast path: no flag set and already inside the window.
+        if !self.is_stopped() && self.eligible(position, window) {
+            return true;
+        }
         let mut state = self.lock();
+        // Registered for the whole loop, under the mutex, so `advance` sees
+        // every worker that may sleep.
+        self.parked.fetch_add(1, Ordering::SeqCst);
         let mut parked: Option<crate::counters::Stopwatch> = None;
         let admitted = loop {
             if state.closed {
                 break false;
             }
-            if position < state.consumed.saturating_add(window.get()) {
+            if self.eligible(position, window) {
                 break true;
             }
             if state.stop_claims {
@@ -323,6 +362,7 @@ impl OrderedGate {
             }
             state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
         };
+        self.parked.fetch_sub(1, Ordering::SeqCst);
         drop(state);
         if let (Some(parked), Some(m)) = (parked, metrics) {
             parked.record_ns(&m.window_wait_ns);
@@ -404,10 +444,13 @@ pub(crate) struct Waits<'a> {
 /// The calling thread's side of an ordered run: one object, so the hooks can
 /// all reach the same writer and state.
 pub(crate) trait OrderedConsumer<T> {
-    /// Before task `task`'s result is unwrapped. Runs even when that result is
-    /// an error, so output that belongs before the task (a passthrough frame
-    /// between two decoded blobs) is written - and can fail - in its true
-    /// position.
+    /// Before task `task`'s result is waited for: once, as soon as task
+    /// `task - 1` has been consumed and its credit published (task 0's once
+    /// the workers are running), whether or not `task`'s result has arrived.
+    /// So it runs even when that result is an error, and output that belongs
+    /// before the task (a passthrough frame between two decoded blobs) is
+    /// written - and can fail - in its true position, overlapping the
+    /// workers' production of `task`. It must not depend on `task`'s result.
     fn before_item(&mut self, task: usize) -> crate::Result<()> {
         let _ = task;
         Ok(())
@@ -792,6 +835,12 @@ fn deliver<T, C: OrderedConsumer<T>>(
     // buffer's `next_seq`, which moves when an item is popped, before it is
     // consumed.
     let mut consumed = 0_usize;
+    // `before_item(k)` runs as soon as task `k - 1` is consumed (task 0's once
+    // the workers are running), before the wait for task `k`'s result, so a
+    // passthrough interval is copied while its next decode is produced
+    // (altw stage 4's node prefix while way blob 0 waits on stage 3).
+    cancel.check()?;
+    consumer.before_item(0)?;
     loop {
         cancel.check()?;
         let timed = waits
@@ -815,11 +864,14 @@ fn deliver<T, C: OrderedConsumer<T>>(
         reorder.push(task, result);
         while let Some(result) = reorder.pop_ready() {
             cancel.check()?;
-            consumer.before_item(consumed)?;
             consumer.consume(consumed, result?)?;
             consumed += 1;
             consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
             gate.advance(consumed);
+            if consumed < n_tasks {
+                cancel.check()?;
+                consumer.before_item(consumed)?;
+            }
         }
     }
     cancel.check()?;
@@ -1549,6 +1601,84 @@ mod tests {
             .unwrap_err()
         });
         assert_eq!(err.to_string(), "passthrough before 10 failed");
+    }
+
+    /// `before_item(k)` runs before task `k`'s result is waited for: here
+    /// every task's work waits until its own `before_item` has run, which
+    /// would deadlock if the hook ran only once the result had arrived.
+    #[test]
+    fn before_item_runs_before_its_result_is_awaited() {
+        struct Consumer<'a>(&'a AtomicUsize);
+        impl OrderedConsumer<usize> for Consumer<'_> {
+            fn before_item(&mut self, task: usize) -> crate::Result<()> {
+                assert_eq!(self.0.load(Ordering::SeqCst), task);
+                self.0.store(task + 1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn consume(&mut self, _: usize, _: usize) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+        within_deadline(|| {
+            let prepared = AtomicUsize::new(0);
+            run_with(
+                200,
+                4,
+                &crate::host::Call::detached(),
+                |i| {
+                    while prepared.load(Ordering::SeqCst) <= i {
+                        std::thread::yield_now();
+                    }
+                    Ok(i)
+                },
+                &mut Consumer(&prepared),
+            )
+            .unwrap();
+            assert_eq!(prepared.load(Ordering::SeqCst), 200);
+        });
+    }
+
+    /// An eager `before_item` failure while the task's worker is parked on a
+    /// wait outside the pool (altw stage 4's router readiness): the run
+    /// reaches `abandon`, which releases the wait, and returns that error.
+    #[test]
+    fn an_eager_before_item_failure_abandons_a_worker_on_an_outside_wait() {
+        struct Consumer<'a>(&'a AtomicBool);
+        impl OrderedConsumer<usize> for Consumer<'_> {
+            fn before_item(&mut self, task: usize) -> crate::Result<()> {
+                if task == 3 {
+                    return Err(Error::internal("passthrough before 3 failed"));
+                }
+                Ok(())
+            }
+            fn consume(&mut self, _: usize, _: usize) -> crate::Result<()> {
+                Ok(())
+            }
+            fn abandon(&mut self, _: &Error) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let err = within_deadline(|| {
+            let released = AtomicBool::new(false);
+            let err = run_with(
+                50,
+                4,
+                &crate::host::Call::detached(),
+                |i| {
+                    if i == 3 {
+                        while !released.load(Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    Ok(i)
+                },
+                &mut Consumer(&released),
+            )
+            .unwrap_err();
+            assert!(released.load(Ordering::SeqCst));
+            err
+        });
+        assert_eq!(err.to_string(), "passthrough before 3 failed");
     }
 
     /// One slow task while the others race ahead: the window bounds how far

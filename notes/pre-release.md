@@ -227,25 +227,20 @@ question.
 
 ### WRK-084: Ordered pools
 
-`56a50e0d` added windows where there were none (`default_window`, 8 per
-worker, floor 32, never tuned), claim workers instead of a dispatcher,
-`WILLNEED` advice moved from the dispatcher to the consumer (one
-`posix_fadvise` per consumed item on the serial writer thread, further
-ahead than before; it can enter reclaim at planet scale), failures in
-schedule order, passthrough prefixes copied between decode results. Risks
-named: `OrderedGate::advance` takes the mutex and `notify_all`s on every
-consumed item (a wake syscall even with no waiters, about 1 us per blob; a
-thundering herd when the window is full, stage 4's steady state); stage 1
-workers parking behind a slow head for no memory gain; with
-`--keep-untagged-nodes`, stage 4 copying the node prefix only after the
-first way result. Pair `60e1b691` against `c2409c45` (the shape that ships;
-`56a50e0d` itself carries the window-deep channel `c2409c45` removed) and
-bisect inside if it moves. Phase split first, in this order: altw external
-on planet at zlib:6 (stage 1 and stage 4 walls, peak anon, `s4_*`);
-`extract --strategy smart` on planet with the Europe bbox; `multi-extract
---regions 5` on Japan and Europe (its region writer gained `WILLNEED` here,
-measured a win on europe only, ruled kept); `repack` on europe or planet;
-tags-filter two-pass and getparents on planet; time-filter on planet.
+Residue. The gate now notifies only parked workers and passthrough runs
+ahead of its decode result (reference/performance.md, "Ordered pool:
+notify only parked workers"); the window measured as never binding, so
+stage 1 parking is not a cost. The `60e1b691` against `c2409c45`
+attribution is superseded: the callers were reshaped since (`7e7ede73`,
+`9ebcfa97`, `44c62853`), so HEAD is the shape to measure. Left:
+
+- `WILLNEED` on the consumer thread (one `posix_fadvise` per consumed
+  item on the serial writer, further ahead than the old dispatcher; it can
+  enter reclaim at planet scale) is unmeasured against any alternative
+  placement. Shares the footprint of WRK-085 and WRK-098.
+- Claim workers against a dispatcher: no cell isolates it.
+- altw external stage 4 under `--keep-untagged-nodes`, the case the eager
+  passthrough targets, is unmeasured: brokkr cannot forward the flag.
 
 ### WRK-085: extract simple on the unordered driver
 

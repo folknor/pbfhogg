@@ -2683,6 +2683,47 @@ This does not show that 30 workers are free when the drive is slow, only
 that capping did not pay. Decoupling file count and buffer RAM from the
 worker count is the open alternative.
 
+### Ordered pool: notify only parked workers, passthrough ahead of its result (bygg, 2026-11-08, against `141bb4c4`)
+
+Two changes in `src/ordered_pool.rs`. The admission gate's `consumed` is an
+atomic: `advance` stores it and takes the mutex and `notify_all`s only when
+a worker is registered as parked, where it used to lock and notify on every
+consumed result (std's futex condvar makes a wake syscall even with no
+waiter). And `before_item(k)` runs once task `k - 1` is consumed, before
+the wait for `k`'s result, so a passthrough interval (altw stage 4's node
+prefix under `--keep-untagged-nodes`, extract's verified node blobs) is
+copied while its next decode is produced.
+
+Context from stored cells at post-`c2409c45` commits on bygg (altw
+external `13668dda`, `467a50a9`; tags-filter `b8491cfd`; time-filter
+`bb2517a3`; getparents `dd453b3f`; repack `723e4963`; multi-extract
+`21d32a8f`; extract smart `05bbc210`): `ordered_pool_window_wait_ns` is 0
+in every one. The window never bound in those runs, so stage 1 workers
+never parked behind a slow head and the herd on a full window did not
+occur; altw stage 4 is consumer-bound on result send.
+
+Planet reindexed input, `--bench 1`, variant uncommitted (`--force`,
+unstored), baseline clean `141bb4c4`. Seconds:
+
+| Cell | Arm | UUID | Wall | Pass A | Stage 2 | Stage 4 |
+|---|---|---|---:|---:|---:|---:|
+| altw external 1 | variant | `1e24412d` | 364.2 | 37.0 | 177.9 | 140.7 |
+| altw external 1 | baseline | `ce032961` | 379.4 | 59.2 | 172.3 | 140.2 |
+| altw external 2 | baseline | `eb94af17` | 415.3 | 83.3 | 180.2 | 144.1 |
+| altw external 2 | variant | sidecar `dirty` at 21:30 | 400.1 | 63.7 | 183.9 | 144.9 |
+| tags-filter w/highway=primary 1 | variant | `16739974` | 52.9 | | | |
+| tags-filter 1 | baseline | `9406cf2a` | 52.6 | | | |
+| tags-filter 2 | baseline | `4c79e049` | 57.8 | | | |
+| tags-filter 2 | variant | `2ab0cbf4` | 52.5 | | | |
+
+Stage 4 is flat (140.7/144.9 against 140.2/144.1 s); the altw wall gap is
+pass A, which swings with run history ("altw external pass A swings with
+run history" above), not with this change. Peak anon 10.22 against 10.26
+GB. tags-filter is flat apart from one slow baseline cell. Verdict: no
+measurable cost or gain on the default paths. The `--keep-untagged-nodes`
+stage 4 prefix, the case the eager passthrough targets, is not measured:
+brokkr's `add-locations-to-ways` cannot forward that flag.
+
 ## Renumber (external mode)
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces

@@ -5008,6 +5008,23 @@ about 87 GB, and both write loops read it from the device at about
 1.8 GB/s with well under one core busy (0.4 buffered, 0.1 uring), so the
 drive bounds both arms and the write backend cannot move the wall.
 
+`sort` across the blob-merge engine move, `dd312160` (old) against
+`79d2e923` (new) (bygg, planet sorted reindexed input, kernel 7.2.14,
+2026-11-08, both arms `--commit` worktrees, buffered, no fstrim: it was
+refused in the session). Sequence after a discarded warm-up cell
+`ee055efc` (new, 51.8 s, pass 2 44.9 s): old `4f654ece` 75.3 s, new
+`b9f304ca` 88.4 s, new `e51b3f6a` 80.2 s, old `fdc99aeb` 78.8 s. Pass 1
+(cold header walk) is 6.06-6.08 s in all four. Pass 2 is all of
+`writer_write_ns`: old 69.2 / 72.7 s, new 82.3 / 74.2 s, so new minus old is
++13.1 s and +1.5 s in the two adjacent pairs. Counters match on both arms:
+50816 blobs, 0 overlap runs, 0 rewritten, one copy-range item of
+92010514684 bytes coalescing 50815 frames, 0 userspace-fallback ranges.
+Both engines submit the same bulk copy through the same copy loop; the
+timing is inconclusive, because every cell after the warm-up ran 50-80 %
+slower than it under untrimmed back-to-back 92 GB writes, and the two pair
+deltas differ ninefold. Not re-measure-worthy without a trimmed suite and a
+reason in the code to expect a pass-2 difference.
+
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.

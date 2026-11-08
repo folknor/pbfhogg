@@ -257,11 +257,6 @@ coalesce (check `cat_dedupe_blobs_passthrough` and
 three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
 second input.
 
-### WRK-087: sort on planet across the engine move
-
-`sort --dataset planet`, `79d2e923^` vs `79d2e923`. Expected unchanged: no
-runs, no threads, one coalesced copy.
-
 ### WRK-088: sort on the Denmark unsorted snapshot
 
 `79d2e923^` vs `79d2e923` on snapshot `unsorted` (or `test-unsorted`, the

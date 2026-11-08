@@ -170,6 +170,13 @@ enum PlanMsg {
 /// Merge both pinned inputs over `phases`, at up to `jobs` workers, into
 /// `consumer`. Returns the merge's shadow counters summed over every unit.
 /// A phase whose kind neither input holds is skipped, markers included.
+///
+/// `prints_every_element` says the command's output holds a line for every
+/// element, common ones included (a text diff without `-c`). The planner
+/// then counts every frame's claimed elements toward the element cut, not
+/// only single-sided frames', which limits a unit's run-ahead text to about
+/// its channel (an oversized frame or verbose details can still pass it); see
+/// [`DIFF_UNIT_LONE_ELEMENTS`]. It steers scheduling only, never the bytes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run<C: UnitConsumer>(
     old: &PinnedInput,
@@ -178,6 +185,7 @@ pub(super) fn run<C: UnitConsumer>(
     jobs: usize,
     direct_io: bool,
     skip_equal_blobs: bool,
+    prints_every_element: bool,
     make_sink: &(dyn Fn(usize) -> C::Sink + Sync),
     consumer: &mut C,
     host: &crate::host::Entered<'_>,
@@ -195,7 +203,11 @@ pub(super) fn run<C: UnitConsumer>(
         let (tx, rx) = std::sync::mpsc::sync_channel::<PlanMsg>(DIFF_UNIT_QUEUE_DEPTH);
         let planner = scope.spawn(move || {
             let mut cursors = [old_cursor, new_cursor];
-            let msg = match plan(&mut cursors, &kinds, target, &tx, invocation) {
+            let cut = UnitCut {
+                target,
+                prints_every_element,
+            };
+            let msg = match plan(&mut cursors, &kinds, cut, &tx, invocation) {
                 Ok(()) => PlanMsg::Done,
                 Err(e) => PlanMsg::Failed(e),
             };
@@ -488,12 +500,20 @@ impl<C: UnitConsumer>
 // The planner
 // ---------------------------------------------------------------------------
 
+/// When the planner closes a unit: the frame-byte target, and whether every
+/// taken frame's claimed elements count toward the element cut.
+#[derive(Clone, Copy)]
+struct UnitCut {
+    target: usize,
+    prints_every_element: bool,
+}
+
 /// Cut every phase's kind into units and send them, then walk the rest of
 /// both inputs so a defect past the last selected kind is still refused.
 fn plan(
     cursors: &mut [BlobCursor; 2],
     kinds: &[ElementKind],
-    target: usize,
+    cut: UnitCut,
     tx: &std::sync::mpsc::SyncSender<PlanMsg>,
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
@@ -505,7 +525,7 @@ fn plan(
         if !old_has && !new_has {
             continue;
         }
-        if !plan_kind(cursors, kind, target, tx, cancel)? {
+        if !plan_kind(cursors, kind, cut, tx, cancel)? {
             return Ok(());
         }
     }
@@ -518,10 +538,11 @@ fn plan(
 fn plan_kind(
     cursors: &mut [BlobCursor; 2],
     kind: ElementKind,
-    target: usize,
+    cut: UnitCut,
     tx: &std::sync::mpsc::SyncSender<PlanMsg>,
     cancel: &crate::host::Recorder,
 ) -> Result<bool> {
+    let target = cut.target;
     let mut start: Option<OsmIdKey> = None;
     let mut carry: [Vec<Frame>; 2] = [Vec::new(), Vec::new()];
     loop {
@@ -531,8 +552,12 @@ fn plan_kind(
         // start before `start`, so they never bound the cut).
         let mut max_first: Option<OsmIdKey> = None;
         // Per side, the largest claimed last key in the unit (carry
-        // included), and the claimed elements of the frames taken here that
-        // no frame of the other side can share a key with.
+        // included), and the claimed elements of the frames taken here whose
+        // every element becomes output: those no frame of the other side
+        // can share a key with or, when common elements print too, every
+        // frame taken here. Both sides are summed, an upper bound on the
+        // lines (an equal pair is one line). Carried frames never count, or
+        // one long carried blob would request a cut after every small frame.
         let mut max_last: [Option<OsmIdKey>; 2] =
             [0, 1].map(|s| sides[s].iter().map(|f| f.desc.last_key()).max());
         let mut lone: u64 = 0;
@@ -567,8 +592,9 @@ fn plan_kind(
             // is rarely lone, which only delays a cut.
             let other = 1 - side;
             let (first, last) = (frame.desc.first_key(), frame.desc.last_key());
-            if peeks[other].is_none_or(|d| d.first_key() > last)
-                && max_last[other].is_none_or(|m| m < first)
+            if cut.prints_every_element
+                || (peeks[other].is_none_or(|d| d.first_key() > last)
+                    && max_last[other].is_none_or(|m| m < first))
             {
                 lone = lone.saturating_add(frame.desc.index.count);
             }

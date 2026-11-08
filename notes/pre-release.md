@@ -257,20 +257,18 @@ coalesce (check `cat_dedupe_blobs_passthrough` and
 three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
 second input.
 
-### WRK-091: diff-snapshots across the block-pair engine
+### WRK-188: diff -v details can still outrun a text unit's channel
 
-Planet `diff-snapshots --from base --to 20260411`, text and osc,
-`2c12a955^` vs `2c12a955`, expected unchanged. Recorded sequential planet
-figures, which cannot be re-measured: text 2134 s (`a9d430f2`), osc
-2225.6 s, peak anon about 28-41 MB per phase; header walk about 15 s cold.
-
-An observed, unbisected slowdown worth checking first: `pbfhogg diff` of the Denmark
-indexed file against its own `cat --dedupe` self-merge (equal elements,
-different framing) took 1.29 s at `79d2e923` (an ancestor of `2c12a955`)
-and 8.22 s at `4e0eaa50`, both `--commit` worktree builds on bygg, input
-warm, one run each (`dedupe-self --check yes` cells `89f2ce1e` and
-`f6d7708e`, the diff child). Each arm diffed its own merge output, so a
-matched pair on the same two files comes first; then bisect.
+A text diff's units are cut by claimed elements (single-sided frames, or
+every frame without `-c`), which bounds compact lines but not `-v`
+details: files with identical framing and many modified elements carrying
+long tag changes (`diff -c -v`) can make a unit's text tens of MB against
+the four 1 MiB chunks it may queue, so later units park and the head
+formats alone. Also an oversized frame (far past 131k elements) can do it
+with compact lines. Derive's per-unit spill to scratch would cover both
+but costs the text diff's no-scratch contract; a cut by an estimate of
+detail bytes would not. Unmeasured; no input of that shape exists in the
+datasets.
 
 ### WRK-093: Unindexed sequential diff
 
@@ -337,7 +335,8 @@ CPU. Neither is an established remedy.
 
 About eight commands hand the `HeaderWalker`'s `FADV_RANDOM` descriptor to
 their pread workers (classify, tags-filter, extract smart and multi,
-getparents, geocode pass 1.5, diff's shard walk, altw sparse passthrough),
+getparents, geocode pass 1.5, altw sparse passthrough; diff's shard walk
+went with `587bfc12`),
 while altw external and apply-changes keep separate descriptors on an
 argument (`a3f1a1bc`) never measured. The split may track access pattern
 (selective readers with `FADV_RANDOM` plus `WILLNEED` against stage 4

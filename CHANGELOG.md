@@ -376,6 +376,11 @@ state.
   `--direct-io` applies at every `-j`, and inputs holding negative IDs run in
   parallel too. A planet text diff of a base against itself with one daily
   diff applied takes 284 s on bygg, at 1.8 GB peak anon.
+- A text `diff` without `-c` of two files holding mostly the same elements
+  no longer prints its common lines on one core: Denmark against its own
+  `cat --dedupe` output takes 0.65 s on bygg, against 8.2 s with the work
+  units as first landed and 1.3 s with the sharded engine before them.
+  Output is unchanged.
 - `diff --format osc` to a `.osc.gz` from indexed inputs deflates on every
   worker and keeps its scratch compressed (about the output's size rather
   than several times it), and no stretch of large changes (a planet's new

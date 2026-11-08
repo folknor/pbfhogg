@@ -118,7 +118,8 @@ fn the_answer_does_not_depend_on_the_cuts() {
 
 /// A unit whose text passes the output chunk size hands it over in several
 /// chunks: the text is still whole and in order. Every node moves, so each
-/// prints a line, and the default target keeps all of them in one unit.
+/// prints a line and its coordinate change; the element cut makes two units
+/// of the default target, each well past one chunk.
 #[test]
 fn a_unit_output_larger_than_a_chunk_arrives_whole() {
     let dir = crate::common::test_scratch();
@@ -175,6 +176,74 @@ fn a_single_sided_stretch_cuts_by_elements_with_the_same_answer() {
             "jobs {jobs}, unit {unit_bytes}"
         );
     }
+}
+
+/// Equal elements in different framing, printed without `-c`: every element
+/// is a common line, so the planner cuts by every frame's elements, not only
+/// single-sided ones. The text is the same at every worker count and byte
+/// target, and holds one common line per element.
+#[test]
+fn common_lines_cut_by_elements_with_the_same_answer() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("common-old.osm.pbf");
+    let new = dir.path().join("common-new.osm.pbf");
+    let count = 300_000;
+    write_multi_block_test_pbf(&old, &generate_nodes(count, 1), &[], &[], 8_000);
+    write_multi_block_test_pbf(&new, &generate_nodes(count, 1), &[], &[], 6_000);
+    let reference = diff_text(&old, &new, 1, 0, false);
+    assert!(
+        reference.ends_with(&format!(
+            "DiffStats {{ common: {count}, created: 0, modified: 0, deleted: 0 }}"
+        )),
+        "{}",
+        &reference[reference.len().saturating_sub(200)..]
+    );
+    // One line per element, then the counts.
+    assert_eq!(reference.lines().count(), count + 1);
+    for (jobs, unit_bytes) in [(3, 0), (3, 1), (8, 0)] {
+        assert_eq!(
+            diff_text(&old, &new, jobs, unit_bytes, false),
+            reference,
+            "jobs {jobs}, unit {unit_bytes}"
+        );
+    }
+    // The cut itself: 600,000 claimed elements make several units when
+    // common lines print, one under `-c`, which prints none.
+    let plain = node_units(&old, &new, false);
+    assert!(plain >= 4, "printing common lines: {plain} node units");
+    assert_eq!(node_units(&old, &new, true), 1, "under -c");
+}
+
+/// Records every counter a run emits.
+#[derive(Default)]
+struct Counters(std::sync::Mutex<Vec<(String, i64)>>);
+impl pbfhogg::debug::InstrumentSink for Counters {
+    fn marker(&self, _name: &str) {}
+    fn counter(&self, name: &str, value: i64) {
+        self.0.lock().unwrap().push((name.to_owned(), value));
+    }
+}
+
+/// The node units a text diff at 3 workers and the default target ran.
+fn node_units(old: &Path, new: &Path, suppress_common: bool) -> i64 {
+    let counters = std::sync::Arc::new(Counters::default());
+    let mut host = crate::common::test_host();
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        std::sync::Arc::clone(&counters) as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    let options = DiffOptions {
+        suppress_common,
+        verbose: false,
+        type_filter: None,
+        parallelism: pbfhogg::Parallelism::from_jobs(3),
+    };
+    diff(old, new, &mut std::io::sink(), &options, false, &host).unwrap();
+    let counters = counters.0.lock().unwrap();
+    counters
+        .iter()
+        .find(|(name, _)| name == "diffpar_node_units")
+        .map(|&(_, v)| v)
+        .unwrap()
 }
 
 /// A panic in a unit worker surfaces as that unit's error, not an unwind,

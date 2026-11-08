@@ -781,6 +781,7 @@ fn derive_changes_block_pair(
         jobs,
         direct_io,
         true,
+        false,
         &make_sink,
         &mut consumer,
         host,

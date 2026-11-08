@@ -851,6 +851,15 @@ pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 /// 1 MiB chunks; a target, not a cap, since a frame is never split (planet
 /// blobs of ~318k nodes make one-blob units). Only a scheduling input:
 /// claims never change the output.
+///
+/// A text diff that prints common elements (no `-c`) turns every element of
+/// every frame into a line, so there every taken frame's elements count,
+/// both sides summed. Without that, a diff of two equal files framed
+/// differently ran serial on the head unit: denmark against its own
+/// `cat --dedupe` output took 8.2 s at `4e0eaa50` on bygg, 0.65 s with every
+/// frame counted (reference/performance.md, "Common lines cut by elements").
+/// Verbose details on modified elements are not
+/// bounded by any element count and can still outrun the channel.
 pub(crate) const DIFF_UNIT_LONE_ELEMENTS: u64 = 1 << 17;
 
 /// Frame bytes past which a unit that still cannot close is refused as a

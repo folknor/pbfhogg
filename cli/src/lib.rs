@@ -1782,11 +1782,10 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
-        // Diff's N is a shard count as well as a thread cap: the block-pair
-        // merge partitions the ID space into N shards, writes their text to
-        // scratch and stitches it in order. Sharding needs both inputs
-        // indexed and no negative IDs; otherwise the run uses one shard (or,
-        // unindexed, the element stream) with a note, whatever -j says.
+        // Diff's N is the worker count of the block-pair merge over work
+        // units streamed from both inputs; their text reaches the output in
+        // unit order. It needs both inputs indexed; unindexed, the run uses
+        // the sequential element stream with a note, whatever -j says.
         #[arg(
             short = 'j',
             long = "jobs",

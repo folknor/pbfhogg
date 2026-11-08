@@ -268,7 +268,9 @@ fn compare<W: Write>(
     host.invocation.marker("DIFF_SCAN_START");
 
     // Path selection depends on the inputs only, never on whether text is
-    // wanted: a count-only run cuts units exactly as a text run.
+    // wanted. Unit cuts may follow the output: a text run printing common
+    // elements cuts by every frame's elements (see `units::run`), which
+    // moves only scheduling, never the answer.
     let stats = if both_indexed {
         diff_block_pair(old, new, output, options, &filter, jobs, direct_io, host)?
     } else {
@@ -352,6 +354,7 @@ fn diff_block_pair<W: Write>(
         jobs,
         direct_io,
         options.suppress_common,
+        text && !options.suppress_common,
         &make_sink,
         &mut consumer,
         host,
@@ -506,6 +509,22 @@ impl<'o, W: Write> units::UnitConsumer for TextConsumer<'_, 'o, W> {
     fn finish_unit(&mut self, stats: DiffStats) -> Result<()> {
         self.stats.add(&stats);
         Ok(())
+    }
+
+    fn on_kind_end(
+        &mut self,
+        kind: ElementKind,
+        units: usize,
+        _max_blobs: usize,
+        _min_blobs: usize,
+        invocation: &crate::host::Recorder,
+    ) {
+        let name = match kind {
+            ElementKind::Node => "diffpar_node_units",
+            ElementKind::Way => "diffpar_way_units",
+            ElementKind::Relation => "diffpar_rel_units",
+        };
+        invocation.counter(name, units);
     }
 
     #[cfg(feature = "test-hooks")]

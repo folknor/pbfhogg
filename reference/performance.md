@@ -4034,6 +4034,41 @@ header as it arrives, which removes the walk and brings back
 `f3e1c9b9`. The unstored cells also carry `f3e1c9b9`'s cheaper block
 construction, so they compare with `79d2e923` only approximately.
 
+## Common lines cut by elements (bygg, 2026-11-09, against `71976fd7`)
+
+`pbfhogg diff OLD NEW` without `-c` on Denmark indexed against its own
+`cat --dedupe` output: equal elements in different framing, so no blob
+pair is byte-equal and every one of 59,152,282 elements prints a common
+line. The diff child of `dedupe-self --cache warm --check yes` cells, one
+run each, input warm, 16 workers:
+
+| Cell | Build | diff child | send wait | head wait |
+|---|---|---|---|---|
+| `89f2ce1e` | `79d2e923`, sharded engine, text through scratch (`--commit`) | 1.29 s | - | - |
+| `f6d7708e` | `4e0eaa50`, work units (`--commit`) | 8.22 s | 128.8 s | 7.86 s |
+| `2e89d66e` | `71976fd7` plus every frame counted (main tree, dirty) | 0.65 s | 0 | 0.43 s |
+
+"send wait" is `ordered_pool_result_send_wait_ns`, "head wait"
+`ordered_pool_result_recv_wait_ns`. At `4e0eaa50` a 32 MiB unit made about
+30 MB of common lines against a channel of four 1 MiB chunks, so every
+unit behind the head parked and the run formatted on one core. The
+single-sided element cut (`DIFF_UNIT_LONE_ELEMENTS`) never fired, since
+every frame overlaps the other input. Counting every taken frame's
+claimed elements when common lines print cuts units of about 131k
+elements, whose text fits the channel. The diff source is identical
+between `4e0eaa50` and `71976fd7`; the variant arm is a main-tree build
+against worktree builds (brokkr#105 measured worktree builds up to 18 %
+slower in one CPU-bound phase), which does not touch a 12x difference.
+No standard planet cell exercises the change: brokkr's `diff` and
+`diff-snapshots` text cells pass `--suppress-common`, and `--format osc`
+plans as before, so their units are unchanged.
+
+The planet `diff-snapshots` A/B of `2c12a955^` against `2c12a955` was not
+run: both arms are the sharded engine `587bfc12` replaced, and no code
+decision rides on it. The stored `brokkr diff` pair at those two commits
+(base against its apply-changes output, above) is a different workload
+and is not a substitute for it.
+
 ## Inspect --extended: validator-projection scan (bygg, 2026-10-31)
 
 `4dbc2d47` scans each blob inside the block validator instead of

@@ -2873,6 +2873,40 @@ there freed live memory but moved no peak, since the freed chunks stay in
 the arenas and the way write's worker-side buffers do not reuse them; it was
 not landed (the reason sits at the site in `simple.rs`).
 
+### WILLNEED on simple's node and way classify (bygg, 2026-11-08, at `e91e5f11`)
+
+`8928de18` moved simple's node and way classify onto the unordered driver
+(`run_unordered_per_blob`), which gave them the dispatcher's sliding
+`WILLNEED` advice. This is a HEAD policy assessment, not the historical
+`8928de18^` against `8928de18` pair: that commit also changed the classify
+descriptor, the worker buffers and the counters, all reshaped since, so its
+pair could not be acted on at HEAD. Those other parts stay unmeasured in
+isolation. Baseline = HEAD stored; variant = uncommitted, the driver building
+its `WillneedPrefetch` from an empty schedule (no ranges, no advice, no
+range construction), `--force`. In an `extract --simple` run only simple's
+two classify pools reach that driver; the relation classify keeps its own
+advice in both arms. Box `-25,34,45,72` on both datasets, `--bench 1`,
+interleaved, each cell preceded by an extract cell of the same dataset; no
+trim before the suite.
+
+| Dataset | order | with WILLNEED | without |
+|---------|-------|---------------|---------|
+| planet-20260223-reindexed | A B A A B, first A after a tags-filter | 109.76 s (`ac10b032`, warm-up), 108.71 s (`2bc9cc4a`), 108.14 s (`ecee41b7`) | 108.59 s (`45e8afe4`), 108.12 s (`56b95ea5`) |
+| europe indexed | A B B A A B, first A after the planet cells | 53.07 s (`887fe55d`, warm-up), 44.63 s (`5d94493b`), 43.35 s (`dfe4ec94`) | 46.21 s (`08411270`), 43.97 s (`0171e902`), 43.70 s (`6e4d4afe`) |
+
+`ac10b032` was stored and then lost from `results.db` to a stash; its wall
+is from the run output. Planet phases match to within 1 % (node classify
+16.59 against 16.44 s, way classify 8.05 against 8.21 s, `ecee41b7` against
+`56b95ea5`). On europe the classify phases run slightly longer without the
+advice (node 5.67 against 5.81 s, way 3.08 against 3.26 s, `dfe4ec94`
+against `6e4d4afe`), about 0.3 s in a 43 s wall. Disk read differs more
+than wall: the arm with the advice read 3.7 against 2.6 GB in node classify
+and 9.7 against 9.4 GB in way classify, but its schedule scan also read 3.3
+against 2.4 GB, so the gap tracks what the predecessor cell left resident
+as much as the advice. Verdict: no demonstrated benefit or cost on either dataset; the
+advice stays. A neutral result is not proof of equivalence: two or three
+cells per arm cannot resolve a difference inside the planet band.
+
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each

@@ -1037,6 +1037,9 @@ struct DecodeLocal<S> {
 /// sends and then the dispatcher's. The ordered pools moved to
 /// `crate::ordered_pool`; this one keeps its dispatcher because that is
 /// where the advice lives, and no dispatch cost has been shown to recover.
+/// For extract simple's node and way classify, removing the advice
+/// measured neutral on planet and europe (bygg, 2026-11-08, at `e91e5f11`,
+/// reference/performance.md): it is kept, not proven to pay there.
 ///
 /// Its four blocking points (dispatcher send, descriptor lock and receive,
 /// result send, consumer receive) record into `metrics`, which is emitted

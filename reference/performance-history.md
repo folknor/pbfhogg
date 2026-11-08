@@ -1088,7 +1088,9 @@ measured, recorded so a fourth starts from them.
   (through `parallel_scan_blobs_raw`, whose work now gets the schedule
   position) and record the `classify_unordered_*` set, and in exchange gain
   the dispatcher's sliding `WILLNEED` advice the other classify pools have.
-  Unmeasured.
+  The advice was later measured at HEAD as neither a benefit nor a cost
+  (`reference/performance.md`, "WILLNEED on simple's node and way
+  classify"); the rest of the move stays unmeasured in isolation.
 
 ## Retired plan docs
 

@@ -237,16 +237,12 @@ attribution is superseded: the callers were reshaped since (`7e7ede73`,
 - `WILLNEED` on the consumer thread (one `posix_fadvise` per consumed
   item on the serial writer, further ahead than the old dispatcher; it can
   enter reclaim at planet scale) is unmeasured against any alternative
-  placement. Shares the footprint of WRK-085 and WRK-098.
+  placement. Shares the footprint of WRK-098; the dispatcher-side
+  advice on extract simple's unordered pools measured neutral at HEAD
+  (reference/performance.md, "WILLNEED on simple's node and way classify").
 - Claim workers against a dispatcher: no cell isolates it.
 - altw external stage 4 under `--keep-untagged-nodes`, the case the eager
   passthrough targets, is unmeasured: brokkr cannot forward the flag.
-
-### WRK-085: extract simple on the unordered driver
-
-`8928de18` moved extract simple's two pools onto the unordered driver and
-gave them `WILLNEED` (ruled kept, to be measured): `extract --simple` on
-planet and europe, `8928de18^` vs `8928de18`.
 
 ### WRK-086: cat --dedupe on Denmark and Japan across the engine move
 

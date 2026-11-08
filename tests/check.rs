@@ -450,6 +450,92 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     );
 }
 
+fn verify_ids_full(
+    path: &std::path::Path,
+    max_errors: usize,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::check::verify_ids::VerifyIdsReport {
+    let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors,
+        direct_io: false,
+        full: true,
+        type_filter: None,
+    };
+    pbfhogg::check::verify_ids::verify_ids(path, &opts, host)
+        .expect("verify_ids")
+        .complete()
+        .expect("verify_ids completes")
+}
+
+/// A kind in strict order under `osm_id_cmp` holds no duplicate, so
+/// `--ids --full` settles it from the order alone and never builds its ID
+/// set: an ID above the pre-allocation is never inserted into the overflow
+/// side set the duplicate pass would use.
+#[test]
+fn check_ids_full_proves_an_ordered_kind_duplicate_free_without_its_set() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("ordered.osm.pbf");
+    let nodes = [node(1), node(2), node(HIGH_NODE)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+
+    let host = crate::common::test_host();
+    let report = verify_ids_full(&input, 0, &host);
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        host.invocation
+            .faults()
+            .check_overflow_ids
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an ordered kind needs no duplicate pass"
+    );
+    assert!(report.full);
+    assert!(report.passed);
+    assert_eq!(report.node_count, 3);
+}
+
+/// The order proof does not change what `--ids --full` says about negative
+/// IDs: each one is still an `IdOutOfRange` violation, ordered file or not.
+#[test]
+fn check_ids_full_still_reports_negative_ids_on_an_ordered_file() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("negatives.osm.pbf");
+    write_nodes_in_order(&input, &[0, -1, -2, 1, 2]);
+
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    assert!(!report.passed);
+    assert_eq!(report.total_violations, 2);
+    let negatives: Vec<i64> = report
+        .violations
+        .iter()
+        .filter_map(|v| match v {
+            pbfhogg::check::verify_ids::IdViolation::IdOutOfRange { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(negatives, [-1, -2]);
+}
+
+/// On a kind out of order `--ids --full` reads it again with its set, and
+/// the stored details stay in report order under the error cap: the second
+/// pass's findings replace the first's rather than adding to them.
+#[test]
+fn check_ids_full_duplicate_pass_replaces_the_order_pass_findings() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("dup_neg.osm.pbf");
+    let nodes = [node(-1), node(5), node(5)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    // -1 out of range, 5 -> 5 out of order, the second 5 a duplicate.
+    assert_eq!(report.total_violations, 3);
+    assert_eq!(report.violations.len(), 3);
+
+    let capped = verify_ids_full(&input, 1, &crate::common::test_host());
+    assert_eq!(capped.total_violations, 3);
+    assert_eq!(capped.violations.len(), 1);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_refs_show_ids_reports_unique_counts_and_occurrences() {

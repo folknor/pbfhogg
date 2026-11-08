@@ -4090,6 +4090,25 @@ union and one call per group. Planet, interleaved `--bench 1`, base
 
 Both within noise: no cost.
 
+## check --ids --full proves an ordered kind duplicate-free (bygg, 2026-11-08, against `cbdb79f0`)
+
+`--full` now runs the plain order scan first (recording negative IDs as
+`IdOutOfRange`, as before); a kind in strict `osm_id_cmp` order cannot hold
+a duplicate and is final, and only a kind found out of order is read again
+with its pre-allocated `IdSet`. Planet `planet-20260223-reindexed.osm.pbf`
+(indexed, ordered), interleaved `--bench 1`, base `cbdb79f0` (stored,
+`--commit`) against the working tree on it (`--force`, not stored):
+
+| Arm | Walls | Peak anon (ways phase) |
+|---|---:|---:|
+| base | 26.87, 26.65 s (`bf61b8f6`, `d32e145d`) | 2,283 MB |
+| working tree | 25.98, 25.95 s | 446 MB |
+
+The wall difference (about 3 %, same sign in both pairs) sits at the noise
+line; the nodes phase loses the set's 1.9 GB of page faults (minflt 393k to
+28k). The memory drop is the result. Not measured: an unsorted file, where
+each out-of-order kind costs one extra read at the old peak.
+
 ## Cost of appending the offset tables to the payload (bygg, 2026-11-01)
 
 What block construction pays to append the string-table and group

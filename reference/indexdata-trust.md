@@ -286,7 +286,9 @@ as evidence of a kind.
 ## Allocation from claims
 
 Anything sized from a claim must survive the claim being wrong (ADR-0013,
-consequence 2). `check --refs` and `check --ids --full` pre-allocate their
+consequence 2). `check --refs` and `check --ids --full` (for a kind its
+order pass found out of order; a kind in strict order is proven
+duplicate-free from the decoded IDs alone and gets no set) pre-allocate their
 ID bitsets to the claimed `max_id` bounded by the input file's size,
 floored at the live-OSM ID range (`id_alloc_bound` in
 `src/commands/check/mod.rs`), and insert any decoded positive ID above the

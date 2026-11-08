@@ -194,21 +194,17 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Memory and throughput: structural work
 
-### WRK-180: check --ids --full proves duplicates absent from monotonicity
+### WRK-180: check --ids --full on negative IDs (maintainer decision)
 
-The default mode of `src/commands/check/verify_ids.rs` already proves
-strict per-kind monotonicity from the data, in `osm_id_cmp` order
-(`KindJudge::push` within a blob, `merge_kind` across blobs in file
-order). A strictly increasing sequence holds no duplicate, so for a kind
-with no monotonicity violation `--full`'s pre-allocated `IdSet` (the node
-set about 1.6 GB at planet) can only confirm zero. Run the default pass
-first; a kind with violations gets a second pass with its set. No header
-or indexdata claim is believed. Planet on bygg: `--full` 2.37 GB and 37 s
-against 566 MB and 31 s default. Open for the maintainer: today `--full`
-reports every negative ID as `IdOutOfRange` and exits 1; on the proof
-path a monotonic file with negative IDs (JOSM staging IDs) is proven
-duplicate-free and would exit 0. A behaviour change, so a CHANGELOG line.
-On unsorted input peak is unchanged and wall gains one read.
+`--full` now proves an ordered kind duplicate-free from its order alone
+(`verify_ids_full_parallel` in `src/commands/check/verify_ids.rs`), but
+keeps reporting every negative ID as `IdOutOfRange` (exit 1): the proof
+pass records them so the report is unchanged. The proof covers negatives
+too (`osm_id_cmp` is injective), so on an ordered kind they could pass
+instead; whether they should is open, tracked with the DEVIATIONS gap in
+bz pbfhogg#50. Changing it is dropping the `negatives` recording in the
+proof pass, plus a CHANGELOG line and the docs/cli/commands.md sentence in
+the `check --refs` section.
 
 ### WRK-181: Shared region membership for multi-extract
 

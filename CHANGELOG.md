@@ -390,6 +390,13 @@ state.
   violations (exit `1`) where it used to pass. A blob holding several
   kinds in order passes. With `-t`, type order is still judged over every
   kind, as it already was on an indexed file. No cost on planet.
+- `check --ids --full` no longer allocates its duplicate-detection bitmap
+  for a kind whose IDs are in strict canonical order, since such a kind
+  cannot hold a duplicate. On an ordered planet on bygg peak memory falls
+  from about 2.3 GB to about 450 MB, at the plain `check --ids` wall. A
+  kind found out of order is read a second time with its bitmap, so on an
+  unsorted file `--full` takes one extra read of those kinds at the old
+  peak. Reports are unchanged, negative IDs included.
 - `inspect`'s full-decode modes (`--extended`, `--locations`,
   `--distrust-metadata`, and any report on an unindexed file) decode on every
   core: planet `--extended` takes about 27 s on bygg, at about 0.3 GB peak

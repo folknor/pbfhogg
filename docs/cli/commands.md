@@ -867,7 +867,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--index` | Verify blob-level metadata against the blobs. Decompresses every blob |
 | `--locations` | Verify a LocationsOnWays file's inline way-node coordinates against its node records |
 | `--agreement` | Also require every inline coordinate of a node the file does not contain to agree across the ways referencing it. Requires `--locations` |
-| `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
+| `--full` | Full duplicate detection (applies to ID check). A kind whose IDs are in strict canonical order holds no duplicate, so on an ordered file `--full` costs what the plain ID check does; each kind found out of order is read a second time with an ID bitmap (gigabytes at planet scale) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check). Limits the kinds whose IDs are judged; type order is judged over every kind |
 | `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue. The ref check retains details only under `--show-ids` [default: 100] |
 | `--check-relations` | Also check relation member references (applies to ref check) |

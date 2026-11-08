@@ -5,13 +5,20 @@
 //! node is the one whose stored coordinate equals the node's, not the nearest
 //! one. Nothing here depends on a cell level or a distance.
 //!
-//! **The street.** A way that carries `addr:street` keeps it, and only
-//! addresses on that street count. A way without one (the OSM convention:
-//! the street is on the end nodes, and the way "doesn't take addr:street=*")
-//! takes the one street that the addresses at its first node and at its last
-//! node have in common; none, or more than one, refuses the way. The street
-//! is chosen before any house number is looked at, so an unusable number on
-//! one street cannot decide between two.
+//! **The street or place.** A way numbers along one parent: a street, or a
+//! place (`addr:place`, for addresses that belong to a place, not a
+//! street). An address is on street `S` when its `addr:street` is `S`, and
+//! on place `P` when its `addr:place` is `P` and it names no street: an
+//! address with a street is numbered along its street, so a place never
+//! pulls a street-numbered house into a place range. A way that carries a
+//! non-empty `addr:street` keeps it; else one that carries `addr:place`
+//! keeps that. A way with neither (the OSM convention: the street is on the
+//! end nodes, and the way "doesn't take addr:street=*") takes the one street
+//! that the addresses at its first node and at its last node have in
+//! common; if they share no street, the one place they share. More than one
+//! at the deciding tier, or none at both, refuses the way. Streets match by
+//! name alone. The parent is chosen before any house number is looked at,
+//! so an unusable number on one street cannot decide between two.
 //!
 //! **The numbers.** At every node, the addresses on the way's street either
 //! are absent, or all carry one house-number string. That string is an
@@ -26,9 +33,10 @@
 //! last node of one record and the first of the next, in place in
 //! `interp_nodes.bin`). A section with equal numbers at both anchors
 //! establishes no range and refuses the way; one whose `even` or `odd`
-//! anchors have the other parity refuses it too. A section whose anchors are
-//! adjacent numbers (10 to 12 even, 10 to 11 all) has no number between them
-//! and is dropped, without refusing the rest of the way.
+//! anchors have the other parity refuses it too. A section with no number
+//! between its anchors (10 to 12 even, 10 to 11 all, 10 to 13 by 3) is
+//! dropped, without refusing the rest of the way. Both rules are
+//! [`InterpolationType`]'s, which the reader answers by too.
 //!
 //! A way is resolved whole or not at all: a refused way is kept as one
 //! record over all its nodes with both numbers at the zero sentinel (see
@@ -204,7 +212,8 @@ pub(super) fn resolve_interpolation_ways_mmap(
                 way_id: way.way_id,
                 node_file_offset: way.node_file_offset
                     + u64::from(section.first) * NodeCoord::SIZE as u64,
-                street_offset: resolved.street_offset,
+                parent_kind: resolved.parent.kind,
+                parent_offset: resolved.parent.offset,
                 interpolation: way.interpolation,
                 node_count: section.last - section.first + 1,
                 complete: true,
@@ -218,7 +227,7 @@ pub(super) fn resolve_interpolation_ways_mmap(
 
 /// A resolved way: its street and the sections that have numbers to infer.
 struct Resolved {
-    street_offset: u32,
+    parent: Parent,
     sections: Vec<Section>,
 }
 
@@ -253,22 +262,21 @@ fn resolve_one_way(
     let interpolation = way.interpolation?;
     let nodes = way_nodes(way, interp_nodes)?;
     let (&first, &last) = (nodes.first()?, nodes.last()?);
-    let street_offset = if way.street_offset != 0 {
-        way.street_offset
+    let parent = if way.parent_offset != 0 {
+        Parent {
+            kind: way.parent_kind,
+            offset: way.parent_offset,
+        }
     } else {
-        common_end_street(first, last, addr_points, addrs)?
+        common_end_parent(first, last, addr_points, addrs)?
     };
 
-    let step = match interpolation {
-        InterpolationType::All => 1,
-        InterpolationType::Even | InterpolationType::Odd => 2,
-    };
     let last_index = nodes.len() - 1;
     let mut sections = Vec::new();
     let mut previous: Option<(u16, u32)> = None;
     for (index, &key) in nodes.iter().enumerate() {
         let is_end = index == 0 || index == last_index;
-        let number = match node_number(key, street_offset, addr_points, strings, addrs) {
+        let number = match node_number(key, parent, addr_points, strings, addrs) {
             NodeNumber::Anchor(number) => number,
             NodeNumber::Absent | NodeNumber::PassedOver if !is_end => continue,
             NodeNumber::Absent | NodeNumber::PassedOver | NodeNumber::Refused => return None,
@@ -278,10 +286,10 @@ fn resolve_one_way(
         if let Some((first, start)) = previous {
             // Equal numbers establish no range; OSM requires an even or
             // odd way's anchors to follow its declared rule.
-            if start == number || !interpolation.steps(start, number) {
+            if !interpolation.anchors_agree(start, number) {
                 return None;
             }
-            if start.abs_diff(number) > step {
+            if interpolation.answers(start, number) {
                 sections.push(Section {
                     first,
                     last: index,
@@ -292,45 +300,81 @@ fn resolve_one_way(
         }
         previous = Some((index, number));
     }
-    Some(Resolved {
-        street_offset,
-        sections,
-    })
+    Some(Resolved { parent, sections })
 }
 
-/// The one non-empty street that the addresses at both end nodes share, or
-/// `None` when they share none or more than one.
-fn common_end_street(
+/// The street or place a way numbers along.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Parent {
+    kind: ParentKind,
+    offset: u32,
+}
+
+impl Parent {
+    /// Whether `point` is on this parent (see the module documentation).
+    /// The builder stores an absent name as offset 0, never an empty
+    /// string at another offset.
+    fn holds(self, point: &AddrPoint) -> bool {
+        match self.kind {
+            ParentKind::Street => point.street_offset == self.offset,
+            ParentKind::Place => point.street_offset == 0 && point.place_offset == self.offset,
+        }
+    }
+}
+
+/// The one street that the addresses at both end nodes share; if they
+/// share none, the one place that the place addresses (those naming no
+/// street) at both share; `None` when the deciding tier holds more than one,
+/// or neither holds any.
+fn common_end_parent(
     first: CoordKey,
     last: CoordKey,
     addr_points: Table<'_, AddrPoint>,
     addrs: &NodeAddrs,
-) -> Option<u32> {
-    let streets_at = |key| {
-        let mut streets: Vec<u32> = addrs
+) -> Option<Parent> {
+    let names_at = |key, name: fn(&AddrPoint) -> u32| {
+        let mut names: Vec<u32> = addrs
             .at(key)
             .filter_map(|index| addr_points.get(index as usize))
-            .map(|point| point.street_offset)
+            .map(|point| name(&point))
             .filter(|&offset| offset != 0)
             .collect();
-        streets.sort_unstable();
-        streets.dedup();
-        streets
+        names.sort_unstable();
+        names.dedup();
+        names
     };
-    let at_last = streets_at(last);
-    let mut common = streets_at(first)
-        .into_iter()
-        .filter(|street| at_last.binary_search(street).is_ok());
-    let street = common.next()?;
-    common.next().is_none().then_some(street)
+    let shared = |name: fn(&AddrPoint) -> u32| {
+        let at_last = names_at(last, name);
+        names_at(first, name)
+            .into_iter()
+            .filter(|offset| at_last.binary_search(offset).is_ok())
+            .collect::<Vec<u32>>()
+    };
+    let streets = shared(|point| point.street_offset);
+    let (kind, names) = if streets.is_empty() {
+        let places = shared(|point| {
+            if point.street_offset == 0 {
+                point.place_offset
+            } else {
+                0
+            }
+        });
+        (ParentKind::Place, places)
+    } else {
+        (ParentKind::Street, streets)
+    };
+    match names.as_slice() {
+        &[offset] => Some(Parent { kind, offset }),
+        _ => None,
+    }
 }
 
-/// The house number the addresses on `street_offset` at exactly `key`
-/// give that node. Disagreement is judged on the strings before any
-/// parsing, so a refused spelling cannot hide a conflict.
+/// The house number the addresses on `parent` at exactly `key` give that
+/// node. Disagreement is judged on the strings before any parsing, so a
+/// refused spelling cannot hide a conflict.
 fn node_number(
     key: CoordKey,
-    street_offset: u32,
+    parent: Parent,
     addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
     addrs: &NodeAddrs,
@@ -340,7 +384,7 @@ fn node_number(
         let Some(point) = addr_points.get(index as usize) else {
             continue;
         };
-        if point.street_offset != street_offset {
+        if !parent.holds(&point) {
             continue;
         }
         // The pool interns each string once, so equal offsets are equal
@@ -393,15 +437,36 @@ mod tests {
             }
         }
 
-        fn address(&mut self, (lat_e7, lon_e7): (i32, i32), housenumber: &str, street: &str) {
+        fn address(&mut self, key: (i32, i32), housenumber: &str, street: &str) {
+            self.address_named(key, housenumber, street, "");
+        }
+
+        /// An address naming `street` and `place`, an empty one absent as
+        /// Pass 2 stores it.
+        fn address_named(
+            &mut self,
+            (lat_e7, lon_e7): (i32, i32),
+            housenumber: &str,
+            street: &str,
+            place: &str,
+        ) {
             let point = AddrPoint {
                 lat_e7,
                 lon_e7,
                 housenumber_offset: self.strings.intern(housenumber),
-                street_offset: self.strings.intern(street),
+                street_offset: self.name(street),
                 postcode_offset: 0,
+                place_offset: self.name(place),
             };
             self.addr_bytes.extend_from_slice(&point.to_bytes());
+        }
+
+        fn name(&mut self, value: &str) -> u32 {
+            if value.is_empty() {
+                0
+            } else {
+                self.strings.intern(value)
+            }
         }
 
         /// A way carrying `addr:street` STREET.
@@ -421,6 +486,28 @@ mod tests {
             street: &str,
             complete: bool,
         ) {
+            self.way_with(nodes, interpolation, ParentKind::Street, street, complete);
+        }
+
+        /// A way carrying `addr:place` `place`.
+        fn place_way(
+            &mut self,
+            nodes: &[(i32, i32)],
+            interpolation: Option<InterpolationType>,
+            place: &str,
+        ) {
+            self.way_with(nodes, interpolation, ParentKind::Place, place, true);
+        }
+
+        fn way_with(
+            &mut self,
+            nodes: &[(i32, i32)],
+            interpolation: Option<InterpolationType>,
+            parent_kind: ParentKind,
+            parent: &str,
+            complete: bool,
+        ) {
+            let parent_offset = self.name(parent);
             let node_file_offset = self.node_bytes.len() as u64;
             for &(lat_e7, lon_e7) in nodes {
                 self.node_bytes
@@ -429,7 +516,8 @@ mod tests {
             self.ways.push(SlimInterpWay {
                 way_id: i64::try_from(self.ways.len()).expect("test way count") + 1,
                 node_file_offset,
-                street_offset: self.strings.intern(street),
+                parent_kind,
+                parent_offset,
                 interpolation,
                 node_count: u16::try_from(nodes.len()).expect("test way"),
                 complete,
@@ -600,10 +688,113 @@ mod tests {
         assert_eq!(resolution.resolved_ways, 1);
         let record = &resolution.records[0];
         assert_eq!((record.start_number, record.end_number), (10, 30));
+        assert_eq!(record.parent_kind, ParentKind::Street);
         assert_eq!(
-            read_string_from_pool(&strings, record.street_offset),
+            read_string_from_pool(&strings, record.parent_offset),
             STREET
         );
+    }
+
+    const PLACE: &str = "Lhota";
+
+    /// Addresses that belong to a place, not a street, number a way along
+    /// the place, whether the way names it or takes it from its ends.
+    #[test]
+    fn place_addresses_number_a_way_along_their_place() {
+        for tagged in [true, false] {
+            let mut fx = Fixture::new();
+            fx.address_named(A, "10", "", PLACE);
+            fx.address_named(B, "30", "", PLACE);
+            if tagged {
+                fx.place_way(&[A, M, B], Some(InterpolationType::Even), PLACE);
+            } else {
+                fx.bare_way(&[A, M, B], Some(InterpolationType::Even));
+            }
+            let (resolution, strings) = fx.run();
+            assert_eq!(resolution.resolved_ways, 1, "tagged {tagged}");
+            let record = &resolution.records[0];
+            assert_eq!((record.start_number, record.end_number), (10, 30));
+            assert_eq!(record.parent_kind, ParentKind::Place);
+            assert_eq!(read_string_from_pool(&strings, record.parent_offset), PLACE);
+        }
+    }
+
+    /// A street and a place of the same name are different parents.
+    #[test]
+    fn a_place_is_not_a_street_of_the_same_name() {
+        let mut fx = Fixture::new();
+        fx.address_named(A, "10", "", STREET);
+        fx.address(B, "30", STREET);
+        fx.way(&[A, B], Some(InterpolationType::Even));
+        fx.place_way(&[A, B], Some(InterpolationType::Even), STREET);
+        assert_eq!(fx.resolve(), vec![(0, 0), (0, 0)]);
+    }
+
+    /// An address with a street is numbered along its street, so its place
+    /// neither anchors a place range nor splits one.
+    #[test]
+    fn an_address_with_a_street_is_not_on_its_place() {
+        let mut fx = Fixture::new();
+        fx.address_named(A, "10", "Main Road", PLACE);
+        fx.address_named(B, "30", "", PLACE);
+        fx.place_way(&[A, B], Some(InterpolationType::Even), PLACE);
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+
+        let mut fx = Fixture::new();
+        fx.address_named(A, "10", "", PLACE);
+        fx.address_named(M, "80", "Other Road", PLACE);
+        fx.address_named(B, "30", "", PLACE);
+        fx.place_way(&[A, M, B], Some(InterpolationType::Even), PLACE);
+        assert_eq!(fx.resolve(), vec![(10, 30)]);
+
+        // Ends on different streets in one place share no parent.
+        let mut fx = Fixture::new();
+        fx.address_named(A, "10", "North Road", PLACE);
+        fx.address_named(B, "30", "South Road", PLACE);
+        fx.bare_way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    /// A shared street decides before places are looked at; two shared
+    /// places with no shared street refuse.
+    #[test]
+    fn a_shared_street_outranks_a_shared_place() {
+        let mut fx = Fixture::new();
+        fx.address_named(A, "10", STREET, PLACE);
+        fx.address_named(B, "30", STREET, PLACE);
+        fx.bare_way(&[A, B], Some(InterpolationType::Even));
+        let (resolution, _) = fx.run();
+        assert_eq!(resolution.records[0].parent_kind, ParentKind::Street);
+        assert_eq!(resolution.resolved_ways, 1);
+
+        let mut fx = Fixture::new();
+        for (key, number) in [(A, "10"), (B, "30")] {
+            fx.address_named(key, number, "", PLACE);
+            fx.address_named(key, number, "", "Other Place");
+        }
+        fx.bare_way(&[A, B], Some(InterpolationType::Even));
+        assert_eq!(fx.resolve(), vec![(0, 0)]);
+    }
+
+    /// A numeric step: its anchors need no common grid, and a section with
+    /// no step between its anchors is dropped.
+    #[test]
+    fn a_numeric_step_resolves_sections_wider_than_the_step() {
+        let every =
+            |n| InterpolationType::Every(InterpolationStep::new(n).expect("a step in 2..=9"));
+        let mut fx = Fixture::new();
+        fx.address(A, "10", STREET);
+        fx.address(M, "13", STREET);
+        fx.address(B, "21", STREET);
+        fx.way(&[A, M, B], Some(every(3)));
+        let (resolution, _) = fx.run();
+        assert_eq!(resolution.resolved_ways, 1);
+        let records: Vec<_> = resolution
+            .records
+            .iter()
+            .map(|r| (r.start_number, r.end_number))
+            .collect();
+        assert_eq!(records, vec![(13, 21)]);
     }
 
     /// The street is chosen before the numbers: two shared streets refuse

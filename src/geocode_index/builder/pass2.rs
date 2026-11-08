@@ -61,10 +61,15 @@ use super::super::format::*;
 pub(super) struct SlimInterpWay {
     pub(super) way_id: i64,
     pub(super) node_file_offset: u64,
-    pub(super) street_offset: u32,
-    /// The way's `addr:interpolation` mode; `None` for a value the reader
-    /// cannot step (`alphabetic`, a numeric step, anything but `all`,
-    /// `even` and `odd`), which is never resolved.
+    /// What the way numbers along: from Pass 2, the way's own non-empty
+    /// `addr:street`, else its `addr:place`, else `Street` at offset 0
+    /// (none: the resolver infers one from the end nodes); after
+    /// resolution, the resolved street or place.
+    pub(super) parent_kind: ParentKind,
+    pub(super) parent_offset: u32,
+    /// The way's `addr:interpolation` mode; `None` for a value the index
+    /// does not step (`alphabetic`, anything but `all`, `even`, `odd` and
+    /// a digit 1 to 9), which is never resolved.
     pub(super) interpolation: Option<InterpolationType>,
     pub(super) node_count: u16,
     /// Every node ref of the source way resolved to a coordinate.
@@ -97,8 +102,77 @@ struct PendingAddrPoint {
     lat_e7: i32,
     lon_e7: i32,
     hn: Box<str>,
-    st: Box<str>,
+    st: Option<Box<str>>,
+    place: Option<Box<str>>,
     pc: Option<Box<str>>,
+}
+
+/// The names an address carries, as `(street, place)`: an empty value is
+/// no name, and an address must name a street, a place or both, else it is
+/// not an address point. The one rule for nodes and buildings; offset 0 in
+/// the index is the absent name it produces.
+fn address_names<'t>(
+    street: Option<&'t str>,
+    place: Option<&'t str>,
+) -> Option<(Option<&'t str>, Option<&'t str>)> {
+    let street = street.filter(|s| !s.is_empty());
+    let place = place.filter(|s| !s.is_empty());
+    (street.is_some() || place.is_some()).then_some((street, place))
+}
+
+/// What an interpolation way says it numbers along: its non-empty
+/// `addr:street`, else its non-empty `addr:place`, else nothing (the OSM
+/// convention, inferred from the end nodes).
+fn interpolation_parent<'t>(
+    street: Option<&'t str>,
+    place: Option<&'t str>,
+) -> Option<(ParentKind, &'t str)> {
+    match (
+        street.filter(|s| !s.is_empty()),
+        place.filter(|s| !s.is_empty()),
+    ) {
+        (Some(street), _) => Some((ParentKind::Street, street)),
+        (None, Some(place)) => Some((ParentKind::Place, place)),
+        (None, None) => None,
+    }
+}
+
+/// Intern and append a blob's pending address points, in order. Both Pass
+/// 2 merges run this serially for every address, so it is one out-of-line
+/// loop rather than two inlined copies in the merge closures: inlined, the
+/// Pass 2a merge became the planet bottleneck (Pass 2a 21 s to 30 s on
+/// bygg; `reference/performance.md`, build-geocode-index).
+#[inline(never)]
+fn write_addr_points(
+    points: Vec<PendingAddrPoint>,
+    strings: &mut StringPool,
+    out: &mut impl Write,
+    count: &mut u32,
+) -> Result<()> {
+    for point in points {
+        out.write_all(&point.intern(strings).to_bytes())?;
+        *count = count.checked_add(1).ok_or_else(|| {
+            Error::invalid_data("address point count exceeds u32::MAX; bump FORMAT_VERSION")
+        })?;
+    }
+    Ok(())
+}
+
+impl PendingAddrPoint {
+    fn intern(&self, strings: &mut StringPool) -> AddrPoint {
+        let housenumber_offset = strings.intern(&self.hn);
+        let street_offset = self.st.as_deref().map_or(0, |s| strings.intern(s));
+        let postcode_offset = self.pc.as_deref().map_or(0, |s| strings.intern(s));
+        let place_offset = self.place.as_deref().map_or(0, |s| strings.intern(s));
+        AddrPoint {
+            lat_e7: self.lat_e7,
+            lon_e7: self.lon_e7,
+            housenumber_offset,
+            street_offset,
+            postcode_offset,
+            place_offset,
+        }
+    }
 }
 
 /// View the anonymous coordinate mmap as `slot_count` atomic slots, one per
@@ -210,7 +284,7 @@ struct PendingStreet {
 
 struct PendingInterp {
     way_id: i64,
-    street: Box<str>,
+    parent: Option<(ParentKind, Box<str>)>,
     interpolation: Option<InterpolationType>,
     /// Every node ref resolved to a coordinate. A shortened way would join
     /// its surviving nodes across the gap and could put an interior address
@@ -249,6 +323,7 @@ fn classify_way_into(
     let mut name: Option<&str> = None;
     let mut hn: Option<&str> = None;
     let mut addr_st: Option<&str> = None;
+    let mut addr_place: Option<&str> = None;
     let mut pc: Option<&str> = None;
     let mut building = false;
     let mut interp: Option<&str> = None;
@@ -259,6 +334,7 @@ fn classify_way_into(
             "name" => name = Some(v),
             "addr:housenumber" => hn = Some(v),
             "addr:street" => addr_st = Some(v),
+            "addr:place" => addr_place = Some(v),
             "addr:postcode" => pc = Some(v),
             "building" => building = true,
             "addr:interpolation" => interp = Some(v),
@@ -279,6 +355,7 @@ fn classify_way_into(
         building,
         hn.is_some(),
         addr_st.is_some(),
+        addr_place.is_some(),
         interp.is_some(),
     );
 
@@ -343,15 +420,10 @@ fn classify_way_into(
     // path's `u16::try_from` - worker sets `state.error` on overflow.
     if is_interp {
         if coords.len() >= 2 {
-            // Only the modes the reader steps are accepted; reading any other
-            // value as `all` would interpolate an alphabetic or stepped range
-            // as consecutive integers.
-            let interpolation = match interp.unwrap_or("") {
-                "all" => Some(InterpolationType::All),
-                "even" => Some(InterpolationType::Even),
-                "odd" => Some(InterpolationType::Odd),
-                _ => None,
-            };
+            // Only the modes the index steps are accepted; reading any other
+            // value as `all` would interpolate an alphabetic range as
+            // consecutive integers.
+            let interpolation = interp.and_then(InterpolationType::from_tag);
             if u16::try_from(coords.len()).is_err() {
                 state.error = Some(Error::invalid_data(format!(
                     "interp way: {} coords exceeds u16::MAX. OSM ways are capped at \
@@ -364,9 +436,10 @@ fn classify_way_into(
             state.interps.push(PendingInterp {
                 way_id,
                 // An interpolation way tagged by the OSM convention carries
-                // no street; the empty string interns to offset 0, and the
-                // resolver takes the street from the end nodes' addresses.
-                street: addr_st.unwrap_or("").into(),
+                // no street; the resolver takes it from the end nodes'
+                // addresses.
+                parent: interpolation_parent(addr_st, addr_place)
+                    .map(|(kind, name)| (kind, name.into())),
                 interpolation,
                 complete: missing_node_ref_count == 0,
                 coords,
@@ -376,7 +449,14 @@ fn classify_way_into(
     }
 
     // Building addresses (centroid) - main thread interns + streams.
-    if is_building_addr {
+    // The classifier saw presence; an address whose names are all empty is
+    // no address point.
+    let building_names = if is_building_addr {
+        address_names(addr_st, addr_place)
+    } else {
+        None
+    };
+    if let Some((street, place)) = building_names {
         // This is the arithmetic mean of every resolved way coordinate. An
         // explicitly closed way counts its first vertex twice, and the mean
         // can fall outside a concave footprint. Replacing it with an area
@@ -397,7 +477,8 @@ fn classify_way_into(
             lat_e7: clat,
             lon_e7: clon,
             hn: hn.unwrap_or("").into(),
-            st: addr_st.unwrap_or("").into(),
+            st: street.map(Into::into),
+            place: place.map(Into::into),
             pc: pc.map(Into::into),
         });
     }
@@ -565,21 +646,30 @@ pub(super) fn run_pass2(
                             }
                             let mut hn: Option<&str> = None;
                             let mut st: Option<&str> = None;
+                            let mut place: Option<&str> = None;
                             let mut pc: Option<&str> = None;
+                            // Nearly every node tag is no `addr:` key, so one
+                            // prefix test rejects it before the key match.
                             for (k, v) in node.tags() {
-                                match k {
-                                    "addr:housenumber" => hn = Some(v),
-                                    "addr:street" => st = Some(v),
-                                    "addr:postcode" => pc = Some(v),
+                                let Some(key) = k.strip_prefix("addr:") else {
+                                    continue;
+                                };
+                                match key {
+                                    "housenumber" => hn = Some(v),
+                                    "street" => st = Some(v),
+                                    "place" => place = Some(v),
+                                    "postcode" => pc = Some(v),
                                     _ => {}
                                 }
                             }
-                            if let (Some(h), Some(s)) = (hn, st) {
+                            let names = hn.and_then(|h| Some((h, address_names(st, place)?)));
+                            if let Some((h, (st, place))) = names {
                                 state.addr_points.push(PendingAddrPoint {
                                     lat_e7,
                                     lon_e7,
                                     hn: h.into(),
-                                    st: s.into(),
+                                    st: st.map(Into::into),
+                                    place: place.map(Into::into),
                                     pc: pc.map(Into::into),
                                 });
                             }
@@ -600,24 +690,12 @@ pub(super) fn run_pass2(
                 }
             },
             |_seq, out| {
-                for pap in out.addr_points {
-                    let hn_off = strings.intern(&pap.hn);
-                    let st_off = strings.intern(&pap.st);
-                    let pc_off = pap.pc.as_deref().map_or(0, |s| strings.intern(s));
-                    let ap = AddrPoint {
-                        lat_e7: pap.lat_e7,
-                        lon_e7: pap.lon_e7,
-                        housenumber_offset: hn_off,
-                        street_offset: st_off,
-                        postcode_offset: pc_off,
-                    };
-                    addr_points_out.write_all(&ap.to_bytes())?;
-                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
-                        Error::invalid_data(
-                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
-                        )
-                    })?;
-                }
+                write_addr_points(
+                    out.addr_points,
+                    strings,
+                    &mut addr_points_out,
+                    &mut addr_point_count,
+                )?;
                 Ok(())
             },
             host,
@@ -688,11 +766,15 @@ pub(super) fn run_pass2(
                             pi.coords.len(),
                         ))
                     })?;
-                    let street_offset = strings.intern(&pi.street);
+                    let (parent_kind, parent_offset) = match &pi.parent {
+                        Some((kind, name)) => (*kind, strings.intern(name)),
+                        None => (ParentKind::Street, 0),
+                    };
                     interp_ways.push(SlimInterpWay {
                         way_id: pi.way_id,
                         node_file_offset: interp_node_offset,
-                        street_offset,
+                        parent_kind,
+                        parent_offset,
                         interpolation: pi.interpolation,
                         node_count: nc,
                         complete: pi.complete,
@@ -713,24 +795,12 @@ pub(super) fn run_pass2(
                 }
 
                 // Building-centroid addresses
-                for pap in out.building_addrs {
-                    let hn_off = strings.intern(&pap.hn);
-                    let st_off = strings.intern(&pap.st);
-                    let pc_off = pap.pc.as_deref().map_or(0, |s| strings.intern(s));
-                    let ap = AddrPoint {
-                        lat_e7: pap.lat_e7,
-                        lon_e7: pap.lon_e7,
-                        housenumber_offset: hn_off,
-                        street_offset: st_off,
-                        postcode_offset: pc_off,
-                    };
-                    addr_points_out.write_all(&ap.to_bytes())?;
-                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
-                        Error::invalid_data(
-                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
-                        )
-                    })?;
-                }
+                write_addr_points(
+                    out.building_addrs,
+                    strings,
+                    &mut addr_points_out,
+                    &mut addr_point_count,
+                )?;
 
                 // Streets
                 for ps in out.streets {

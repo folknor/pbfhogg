@@ -216,22 +216,6 @@ still held. Only adversarial or many-version input reaches the hold.
 
 ## Correctness
 
-### WRK-185: geocode addresses ignore `addr:place`, and stepped interpolation is unread
-
-Found 2026-11-05 while landing the OSM-shaped interpolation reading
-(ADR-0026). Address points (nodes and building ways, Pass 2) require
-`addr:street` and never read `addr:place`, which OSM uses instead of a
-street for addresses that belong to a place (Nominatim maps `addr:place`
-and `addr:substreet` to its `place` field, `lib-lua/themes/nominatim/presets.lua`).
-So such addresses are absent from the index, and an interpolation way
-between them has no street to take. Deciding it means choosing what a
-query answers in the street field for a place address; interpolation then
-follows the address points with no change of its own.
-
-`addr:interpolation` numeric steps (`1` to `9`, a few hundred planet ways)
-stay unresolved: `InterpWay` has no step value, so supporting them is a
-format change (Nominatim steps them).
-
 ### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
 
 Found 2026-11-03 running `check --index` over the planet bench file

@@ -291,27 +291,28 @@ and the second added one - see `DEVIATIONS.md`.
 numbers in `start_number: u32, end_number: u32`. The resolver
 (`resolve_interpolation_ways_mmap` in `src/geocode_index/builder/interp.rs`)
 runs after Pass 2 and takes each node's number from the addr points on
-the way's street at exactly that node's coordinate (ADR-0024), splitting
+the way's street or place at exactly that node's coordinate (ADR-0024), splitting
 the way into one record per section between address nodes.
 Matching rejects house number 0;
 only positive matched numbers overwrite `start_number` and `end_number`.
 If any part of the way fails, it stays one record with both fields at
 their initial `0` (an end with no match, disagreeing coincident numbers,
 a number that is not a positive decimal, equal or wrong-parity numbers,
-no single street, a missing node, an unsupported `addr:interpolation`
+no single street or place, a missing node, an unsupported `addr:interpolation`
 mode).
 
 **Impact:** A 0 at either end means unresolved, so the way yields no
 interpolated number
-(`interpolation_resolvable` and `interpolated_number` in
-`src/geocode_index/reader.rs`). House number 0 is therefore unsupported as
+(`InterpolationType::answers` in `src/geocode_index/format.rs`, which
+the reader's `interpolation_total_length` and `number_at` both apply). House number 0 is therefore unsupported as
 an interpolation endpoint. "0" as a house number is rare but exists in
 some regions.
 
 **Why not fix:** The clean fix is a `resolved: bool` field persisted into
 `InterpWay`, allowing zero-valued matches, and a `FORMAT_VERSION` bump.
-The format growth and regeneration cost for existing indexes remain
-deferred until support for house number 0 is needed. Fix shape is captured
+Format version 5 (`addr:place`, numeric steps) did not take it: no
+workload has needed house number 0 as an endpoint, so the field waits for
+one. Fix shape is captured
 at the struct comment in `SlimInterpWay`.
 
 ## Geocode index: u16 on-disk count caps (hard error on overflow)

@@ -15,8 +15,8 @@ use s2::latlng::LatLng;
 
 use super::format::{
     self, ADMIN_LEVEL_SLOTS, AddrEntry, AddrPoint, AdminCell, AdminEntry, AdminPolygon, GeoCell,
-    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, Record, Records, RunError,
-    SegmentRef, StreetWay, Table,
+    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, ParentKind, Record, Records,
+    RunError, SegmentRef, StreetWay, Table,
 };
 use crate::geo;
 use crate::tunables::{
@@ -43,7 +43,11 @@ pub struct AddressMatch<'a> {
     pub lat_e7: i32,
     pub lon_e7: i32,
     pub house_number: &'a str,
-    pub street: &'a str,
+    /// The address's `addr:street`, when it has one.
+    pub street: Option<&'a str>,
+    /// The address's `addr:place`, when it has one. Every address names a
+    /// street, a place, or both.
+    pub place: Option<&'a str>,
     pub postcode: Option<&'a str>,
     pub distance_m: f64,
 }
@@ -58,7 +62,12 @@ pub struct StreetMatch<'a> {
 
 #[derive(Debug)]
 pub struct InterpolationMatch<'a> {
-    pub street: &'a str,
+    /// The street the range numbers along; `None` when it numbers along a
+    /// place instead. Exactly one of `street` and `place` is set.
+    pub street: Option<&'a str>,
+    /// The `addr:place` the range numbers along, for addresses that name a
+    /// place and no street.
+    pub place: Option<&'a str>,
     pub house_number: u32,
     pub distance_m: f64,
 }
@@ -87,7 +96,10 @@ pub struct Candidates<'a> {
 /// A raw interpolation hit (house number not yet computed).
 #[derive(Debug)]
 pub struct InterpolationCandidate<'a> {
-    pub street: &'a str,
+    /// As [`InterpolationMatch::street`].
+    pub street: Option<&'a str>,
+    /// As [`InterpolationMatch::place`].
+    pub place: Option<&'a str>,
     /// Index of the interpolation record in `interp_ways.bin`. A record is
     /// one section of an OSM way between two of its address nodes, so this
     /// is not an OSM way identity: one way can own several records.
@@ -155,6 +167,7 @@ impl<'a> Candidates<'a> {
                 let hn = reader.interpolate(c)?;
                 Some(InterpolationMatch {
                     street: c.street,
+                    place: c.place,
                     house_number: hn,
                     distance_m: c.distance_m,
                 })
@@ -496,7 +509,8 @@ impl Reader {
     /// silently, and the reader answers queries without it.
     ///
     /// String-pool offsets (`name_offset`, `housenumber_offset`,
-    /// `street_offset`, `postcode_offset`, `country_code_offset`) are validated
+    /// `street_offset`, `place_offset`, `postcode_offset`, `parent_offset`,
+    /// `country_code_offset`) are validated
     /// here as well: each must frame a whole length-prefixed UTF-8 entry
     /// inside `strings.bin` (`format::read_pool_string`). That proves the
     /// offset decodes, not that it is the start of an entry the builder
@@ -519,13 +533,29 @@ impl Reader {
             (|| -> Result<()> {
                 InterpolationType::try_from(way.interpolation_type)
                     .map_err(crate::Error::invalid_data_from)?;
+                ParentKind::try_from(way.parent_kind).map_err(crate::Error::invalid_data_from)?;
                 validate_span(
                     &self.interp_nodes,
                     way.node_offset,
                     u64::from(way.node_count),
                     "interpolation way node",
                 )?;
-                validate_string_offset(way.street_offset, &self.strings, "interpolation way street")
+                validate_string_offset(
+                    way.parent_offset,
+                    &self.strings,
+                    "interpolation way parent",
+                )?;
+                // A resolved record names what it numbers along; only the
+                // zero-sentinel record of a refused way may name nothing.
+                let resolved = way.start_number != 0 && way.end_number != 0;
+                if resolved && self.pool_name(way.parent_offset).is_none() {
+                    return Err(corrupt(
+                        "invalid geocode index: a resolved interpolation record names no \
+                         street or place"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
             })()
             .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
         }
@@ -559,7 +589,20 @@ impl Reader {
                     "address housenumber",
                 )?;
                 validate_string_offset(pt.street_offset, &self.strings, "address street")?;
-                validate_string_offset(pt.postcode_offset, &self.strings, "address postcode")
+                validate_string_offset(pt.place_offset, &self.strings, "address place")?;
+                validate_string_offset(pt.postcode_offset, &self.strings, "address postcode")?;
+                // Judged on the decoded strings: another pool entry can be
+                // empty as well as offset 0.
+                if self.pool_name(pt.street_offset).is_none()
+                    && self.pool_name(pt.place_offset).is_none()
+                {
+                    return Err(corrupt(
+                        "invalid geocode index: an address point names neither a street \
+                         nor a place"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
             })()
             .map_err(|e| in_record(e, format::FILE_ADDR_POINTS, index))?;
         }
@@ -661,7 +704,8 @@ impl Reader {
                 lat_e7: pt.lat_e7,
                 lon_e7: pt.lon_e7,
                 house_number: self.read_string(pt.housenumber_offset),
-                street: self.read_string(pt.street_offset),
+                street: self.pool_name(pt.street_offset),
+                place: self.pool_name(pt.place_offset),
                 postcode: nonzero_string(self, pt.postcode_offset),
                 distance_m: radians_sq_to_meters(dist_sq),
             }
@@ -777,17 +821,15 @@ impl Reader {
     /// usable coarse fallback. The unranked candidate API still checks each
     /// returned hit and avoids an eager all-ways cache at reader open.
     ///
-    /// A range is usable when both ends are set and its mode
-    /// [steps](InterpolationType::steps) it. The builder writes no other
-    /// resolved range, but an index built before it checked parity can hold
-    /// one. Checking here, where the sinks admit a hit, keeps such a way from
-    /// shadowing the coarse fallback as well as from answering.
+    /// A range is usable when its mode [answers](InterpolationType::answers)
+    /// it, the same rule the builder writes sections by: the zero sentinel
+    /// of a refused way, a wrong-parity range or one with no number between
+    /// its anchors never answers. Checking here, where the sinks admit a
+    /// hit, keeps such a record from shadowing the coarse fallback as well
+    /// as from answering.
     fn interpolation_total_length(&self, iw: InterpWay) -> Option<f64> {
-        if iw.start_number == 0 || iw.end_number == 0 {
-            return None;
-        }
         let mode = InterpolationType::try_from(iw.interpolation_type).ok()?;
-        if !mode.steps(iw.start_number, iw.end_number) {
+        if !mode.answers(iw.start_number, iw.end_number) {
             return None;
         }
         let total_len = self.way_length_radians(&iw);
@@ -824,25 +866,15 @@ impl Reader {
         if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
             return None;
         }
-        if iw.start_number == 0
-            || iw.end_number == 0
-            || total_len < crate::tunables::INTERP_MIN_TOTAL_LEN
-        {
+        if total_len < crate::tunables::INTERP_MIN_TOTAL_LEN {
             return None;
         }
         let acc_len = self.accumulated_length_radians(&iw, segment_index, snap_lat_e7, snap_lon_e7);
-        let t = acc_len / total_len;
-        let diff = iw.end_number as f64 - iw.start_number as f64;
-        // Even and odd step by two from start_number; interpolation_total_length
-        // has already refused a range whose ends do not both have that parity.
-        let number = match InterpolationType::try_from(iw.interpolation_type).ok()? {
-            InterpolationType::All => iw.start_number as f64 + (t * diff).round(),
-            InterpolationType::Even | InterpolationType::Odd => {
-                iw.start_number as f64 + 2.0 * ((t * diff) / 2.0).round()
-            }
-        };
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        Some(number.max(0.0) as u32)
+        // number_at refuses a range its mode does not answer, the zero
+        // sentinel included, and a non-finite fraction.
+        InterpolationType::try_from(iw.interpolation_type)
+            .ok()?
+            .number_at(iw.start_number, iw.end_number, acc_len / total_len)
     }
 
     // -- Header accessors ----------------------------------------------------
@@ -1096,7 +1128,8 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
             lat_e7: point.lat_e7,
             lon_e7: point.lon_e7,
             house_number: reader.read_string(point.housenumber_offset),
-            street: reader.read_string(point.street_offset),
+            street: reader.pool_name(point.street_offset),
+            place: reader.pool_name(point.place_offset),
             postcode: nonzero_string(reader, point.postcode_offset),
             distance_m: radians_sq_to_meters(dist_sq),
         });
@@ -1137,8 +1170,10 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
         if reader.interpolation_total_length(way).is_none() {
             return;
         }
+        let (street, place) = reader.interp_parent(way);
         self.interpolations.push(InterpolationCandidate {
-            street: reader.read_string(way.street_offset),
+            street,
+            place,
             way_index: segment.way_index,
             segment_index: segment.segment_index,
             snap_lat_e7: snap_lat,
@@ -1844,6 +1879,23 @@ impl Reader {
             .expect("Reader::open validated every referenced string")
     }
 
+    /// A pool string as an optional name: `None` when it is empty, which
+    /// is how the builder stores an absent name. For an offset open has not
+    /// validated, `None` as well.
+    fn pool_name(&self, offset: u32) -> Option<&str> {
+        format::read_pool_string(&self.strings, offset).filter(|s| !s.is_empty())
+    }
+
+    /// An interpolation record's street or place, by its parent kind.
+    fn interp_parent(&self, iw: InterpWay) -> (Option<&str>, Option<&str>) {
+        let name = self.pool_name(iw.parent_offset);
+        match ParentKind::try_from(iw.parent_kind) {
+            Ok(ParentKind::Street) => (name, None),
+            Ok(ParentKind::Place) => (None, name),
+            Err(_) => (None, None),
+        }
+    }
+
     // -- Interpolation helpers -----------------------------------------------
 
     fn resolve_interpolation(
@@ -1858,8 +1910,10 @@ impl Reader {
         let iw = self.read_interp_way(way_idx)?;
         let house_number =
             self.interpolated_number_at_length(iw, seg_idx, snap_lat, snap_lon, total_len)?;
+        let (street, place) = self.interp_parent(iw);
         Some(InterpolationMatch {
-            street: self.read_string(iw.street_offset),
+            street,
+            place,
             house_number,
             distance_m: radians_sq_to_meters(dist_sq),
         })

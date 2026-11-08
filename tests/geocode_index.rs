@@ -892,7 +892,7 @@ fn synthetic_build_query_matches_low_level_api() {
         .as_ref()
         .expect("query should find the address");
     assert_eq!(addr.house_number, "10");
-    assert_eq!(addr.street, "Main Street");
+    assert_eq!(addr.street, Some("Main Street"));
     assert_eq!(addr.postcode, Some("1234"));
     let street = result
         .street
@@ -914,7 +914,7 @@ fn synthetic_build_query_matches_low_level_api() {
         .as_ref()
         .expect("candidates should find the address");
     assert_eq!(cand_addr.house_number, "10");
-    assert_eq!(cand_addr.street, "Main Street");
+    assert_eq!(cand_addr.street, Some("Main Street"));
     assert_eq!(cand_addr.postcode, Some("1234"));
     let cand_street = via_candidates
         .street
@@ -986,7 +986,7 @@ fn tag_values_holding_a_nul_are_answered_whole() {
     let result = reader.query(55.70005, 12.5005).expect("valid query");
     let addr = result.address.as_ref().expect("the address is indexed");
     assert_eq!(addr.house_number, "10\0a");
-    assert_eq!(addr.street, "Main\0Street");
+    assert_eq!(addr.street, Some("Main\0Street"));
     assert_eq!(addr.postcode, Some("12\x0034"));
     let street = result.street.as_ref().expect("the street is indexed");
     assert_eq!(street.name, "Main\0Street");
@@ -1925,7 +1925,7 @@ fn fallback_recovers_hits_outside_fine_radius() {
         .as_ref()
         .expect("coarse fallback should recover the nearby address");
     assert_eq!(addr.house_number, "10");
-    assert_eq!(addr.street, "Main Street");
+    assert_eq!(addr.street, Some("Main Street"));
     let street = with_fallback_result
         .street
         .as_ref()
@@ -2396,7 +2396,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
         .interpolation
         .as_ref()
         .expect("query should resolve the interpolation");
-    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.street, Some("Interp Street"));
     assert_eq!(
         interp.house_number, 20,
         "midpoint on the interpolation should resolve to 20"
@@ -2418,7 +2418,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
         .interpolation
         .as_ref()
         .expect("candidates().into_result() should resolve the interpolation");
-    assert_eq!(cand_interp.street, "Interp Street");
+    assert_eq!(cand_interp.street, Some("Interp Street"));
     assert_eq!(cand_interp.house_number, 20);
 }
 
@@ -2475,7 +2475,7 @@ fn a_streetless_interpolation_way_takes_its_street_and_sections_from_its_nodes()
         .interpolation
         .as_ref()
         .expect("query should resolve the interpolation");
-    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.street, Some("Interp Street"));
     assert_eq!(interp.house_number, 30);
 }
 
@@ -2510,31 +2510,31 @@ fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
             .query(lat, lon)
             .expect("valid query")
             .interpolation
-            .map(|i| (i.street.to_owned(), i.house_number));
-        let candidates: Vec<String> = reader
+            .map(|i| (i.street.map(str::to_owned), i.house_number));
+        let candidates: Vec<Option<String>> = reader
             .candidates(lat, lon)
             .expect("valid query")
             .interpolations
             .iter()
-            .map(|c| c.street.to_owned())
+            .map(|c| c.street.map(str::to_owned))
             .collect();
         (answer, candidates)
     };
     let (built, _) = query(&index_dir);
     assert_eq!(
         built,
-        Some(("Near Street".to_owned(), 20)),
+        Some((Some("Near Street".to_owned()), 20)),
         "as built, the near all 10..30 way answers"
     );
 
     // Rewrite the near way (record 0, the `all` one; the far way is `even`)
-    // as `even` 10..13: end_number is bytes 16..20 of a 23-byte record and
+    // as `even` 10..13: end_number is bytes 16..20 of a 24-byte record and
     // the mode is byte 22 (format.rs pins the field offsets).
     let path = index_dir.join("interp_ways.bin");
     let mut bytes = std::fs::read(&path).expect("read interp_ways.bin");
-    assert_eq!(bytes.len(), 46, "two interpolation records");
+    assert_eq!(bytes.len(), 48, "two interpolation records");
     assert_eq!(
-        (bytes[22], bytes[23 + 22]),
+        (bytes[22], bytes[24 + 22]),
         (0, 1),
         "near is all, far is even"
     );
@@ -2545,21 +2545,25 @@ fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
     let (answer, candidates) = query(&index_dir);
     assert_eq!(
         answer,
-        Some(("Far Street".to_owned(), 20)),
+        Some((Some("Far Street".to_owned()), 20)),
         "the wrong-parity near way must not answer or suppress the coarse fallback"
     );
     // A segment listed under several cells can appear more than once.
     assert!(
-        !candidates.is_empty() && candidates.iter().all(|street| street == "Far Street"),
+        !candidates.is_empty()
+            && candidates
+                .iter()
+                .all(|street| street.as_deref() == Some("Far Street")),
         "only the far way is a candidate: {candidates:?}"
     );
 }
 
-/// `addr:interpolation=alphabetic` (or a numeric step) is not a mode the
-/// reader steps; reading it as `all` would interpolate 10..30 as integers.
+/// `addr:interpolation=alphabetic` (or a step outside 1 to 9) is not a mode
+/// the index steps; reading it as `all` would interpolate 10..30 as
+/// integers.
 #[test]
 fn an_unsupported_interpolation_mode_does_not_answer() {
-    for mode in ["alphabetic", "2"] {
+    for mode in ["alphabetic", "0", "10"] {
         let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let index_dir = dir.path().join("index");
@@ -2613,6 +2617,127 @@ fn an_unsupported_interpolation_mode_does_not_answer() {
             "{mode}: an unsupported mode must not answer"
         );
     }
+}
+
+/// Build an index from `nodes` and `ways` with a 1 m coarse radius, the
+/// way the interpolation tests here build theirs.
+fn build_small_index(
+    nodes: &[TestNode],
+    ways: &[TestWay],
+) -> (
+    tempfile::TempDir,
+    pbfhogg::geocode_index::builder::BuildStats,
+    pbfhogg::geocode_index::reader::Reader,
+) {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_test_pbf_sorted(&input, nodes, ways, &[]);
+    let stats = build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            coarse_search_radius_m: 1.0,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build should succeed");
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    (dir, stats, reader)
+}
+
+/// `addr:interpolation=4` steps by four from the lower anchor, whichever
+/// way the geometry runs.
+#[test]
+fn a_numeric_interpolation_step_answers_on_its_grid() {
+    for refs in [vec![100, 101], vec![101, 100]] {
+        let address = |id: i64, lon: i32, number: &'static str| TestNode {
+            id,
+            lat: 557_000_000,
+            lon,
+            tags: vec![
+                ("addr:housenumber", number),
+                ("addr:street", "Interp Street"),
+            ],
+            meta: None,
+        };
+        let (_dir, _stats, reader) = build_small_index(
+            &[
+                address(100, 125_000_000, "10"),
+                address(101, 125_060_000, "30"),
+            ],
+            &[TestWay {
+                id: 200,
+                refs: refs.clone(),
+                tags: vec![("addr:interpolation", "4")],
+                meta: None,
+            }],
+        );
+        let interp = reader
+            .query(55.7000, 12.5036)
+            .expect("valid query")
+            .interpolation
+            .expect("a stepped range answers");
+        assert_eq!(interp.house_number, 22, "refs {refs:?}");
+        assert_eq!(interp.street, Some("Interp Street"));
+    }
+}
+
+/// An address that belongs to a place (`addr:place`, no street) is an
+/// address point answering its place, and an interpolation way between
+/// two of them numbers along the place.
+#[test]
+fn place_addresses_are_indexed_and_interpolated() {
+    let address = |id: i64, lon: i32, number: &'static str| TestNode {
+        id,
+        lat: 557_000_000,
+        lon,
+        tags: vec![("addr:housenumber", number), ("addr:place", "Lhota")],
+        meta: None,
+    };
+    let (_dir, stats, reader) = build_small_index(
+        &[
+            address(100, 125_000_000, "10"),
+            address(101, 125_060_000, "30"),
+            // Empty names are no names: not an address point.
+            TestNode {
+                id: 102,
+                lat: 557_010_000,
+                lon: 125_030_000,
+                tags: vec![
+                    ("addr:housenumber", "5"),
+                    ("addr:street", ""),
+                    ("addr:place", ""),
+                ],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 200,
+            refs: vec![100, 101],
+            tags: vec![("addr:interpolation", "even")],
+            meta: None,
+        }],
+    );
+    assert_eq!(stats.addr_points, 2);
+    let result = reader.query(55.7000, 12.5000).expect("valid query");
+    let address = result.address.expect("the place address answers");
+    assert_eq!(
+        (address.house_number, address.street, address.place),
+        ("10", None, Some("Lhota"))
+    );
+    let interp = reader
+        .query(55.7000, 12.5030)
+        .expect("valid query")
+        .interpolation
+        .expect("the place range answers");
+    assert_eq!(
+        (interp.street, interp.place, interp.house_number),
+        (None, Some("Lhota"), 20)
+    );
 }
 
 #[test]
@@ -2746,7 +2871,7 @@ fn fallback_recovers_interpolation_outside_fine_radius() {
         .interpolation
         .as_ref()
         .expect("coarse fallback should recover the interpolation");
-    assert_eq!(interp.street, "Interp Street");
+    assert_eq!(interp.street, Some("Interp Street"));
     assert_eq!(interp.house_number, 20);
 
     let candidates = with_fallback
@@ -2795,7 +2920,7 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
         .interpolation
         .as_ref()
         .expect("the query point lies on the interpolation segment");
-    assert_eq!(interp.street, "Dateline Street");
+    assert_eq!(interp.street, Some("Dateline Street"));
     assert_eq!(
         interp.house_number, 20,
         "midpoint of a 10..30 even interpolation is 20; a long-arc snap point \
@@ -2857,7 +2982,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
         .interpolation
         .as_ref()
         .expect("the unresolvable near way must not suppress the coarse fallback");
-    assert_eq!(interp.street, "Far Street");
+    assert_eq!(interp.street, Some("Far Street"));
     assert_eq!(interp.house_number, 20);
 
     // candidates() gates its fallback the same way, and into_result() ranks
@@ -2875,7 +3000,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
         candidates
             .interpolations
             .iter()
-            .any(|c| c.street == "Far Street"),
+            .any(|c| c.street == Some("Far Street")),
         "coarse fallback should have run for candidates() too"
     );
     let ranked = reader
@@ -3736,7 +3861,7 @@ fn coarse_search_finds_an_interpolation_way_outside_the_query_neighbourhood() {
         .expect("valid query")
         .interpolation
         .expect("an interpolation way within the coarse radius");
-    assert_eq!(interpolation.street, "Far Interp");
+    assert_eq!(interpolation.street, Some("Far Interp"));
     assert!(
         (interpolation.distance_m - 800.0).abs() < 2.0,
         "{interpolation:?}"

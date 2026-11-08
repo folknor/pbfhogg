@@ -137,7 +137,7 @@ state.
   keeping an old ID that may name another element.
 - `removeid` and `sort` summaries count only the elements they decoded.
 - `cat --clean` writes elements in input order and no longer needs indexdata.
-- `build-geocode-index` writes index format version 4 (rebuild existing
+- `build-geocode-index` writes index format version 5 (rebuild existing
   indexes), splits `--force` into `--overwrite` and `--allow-unindexed`, and
   caps `--admin-level` at 10 and `--street-level` / `--coarse-level` at 19.
   `--search-radius` and `--coarse-search-radius` are capped at a fixed
@@ -238,6 +238,13 @@ state.
 
 ### Added
 
+- `build-geocode-index` indexes addresses tagged `addr:place` (an address
+  belonging to a place rather than a street), and interpolation ways
+  between them, and steps `addr:interpolation` digits `1` to `9`. The
+  library reader's `AddressMatch.street`, `InterpolationMatch.street` and
+  `InterpolationCandidate.street` become `Option<&str>`, beside a new
+  `place` field; an address with an empty `addr:street` and no place is
+  no longer indexed.
 - `digest`: an encoding-independent digest of a PBF's header and elements
   (`xxh128 v2`; `--form content` gives the element-only `v1` digest).
 - `check --index` verifies blob indexdata and tagdata against the blobs, and

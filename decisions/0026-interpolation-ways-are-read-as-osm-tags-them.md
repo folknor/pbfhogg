@@ -1,7 +1,7 @@
 # ADR-0026: Interpolation ways are read as OSM tags them
 
 Date: 2026-11-05
-Status: Accepted
+Status: Accepted; extended by ADR-0027
 
 ## Decision
 

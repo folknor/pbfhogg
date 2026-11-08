@@ -202,7 +202,7 @@ fn assert_index_of(index_dir: &Path, fixture: &Fixture, cell: &str) {
     let address = result.address.expect("an address at the address node");
     assert_eq!(
         (address.house_number, address.street),
-        (fixture.house_number, fixture.street),
+        (fixture.house_number, Some(fixture.street)),
         "{cell}"
     );
     assert_eq!(

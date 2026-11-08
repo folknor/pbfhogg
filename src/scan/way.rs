@@ -41,7 +41,12 @@ impl WayGeocodeFlags {
     /// also carries `addr:housenumber` is an addressed object, not a range
     /// (Nominatim excludes it the same way), and is classified as a building
     /// address when it qualifies as one.
-    #[allow(clippy::fn_params_excessive_bools)]
+    ///
+    /// A building address names an `addr:street` or an `addr:place` (OSM's
+    /// tag for an address that belongs to a place, not a street). This is
+    /// presence only: Pass 2 then drops one whose names are all empty, so
+    /// Pass 1.5 collects at most a few refs more than Pass 2 uses.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     pub(crate) fn classify(
         highway: bool,
         name: bool,
@@ -49,11 +54,12 @@ impl WayGeocodeFlags {
         building: bool,
         housenumber: bool,
         street: bool,
+        place: bool,
         interpolation: bool,
     ) -> Self {
         Self {
             is_street: highway && name && !excluded,
-            is_building_addr: building && housenumber && street,
+            is_building_addr: building && housenumber && (street || place),
             is_interp: interpolation && !housenumber,
         }
     }
@@ -66,6 +72,7 @@ pub(crate) struct GeocodeTagLiterals<'a> {
     pub(crate) k_name: &'a [u8],
     pub(crate) k_addr_housenumber: &'a [u8],
     pub(crate) k_addr_street: &'a [u8],
+    pub(crate) k_addr_place: &'a [u8],
     pub(crate) k_building: &'a [u8],
     pub(crate) k_addr_interpolation: &'a [u8],
     pub(crate) excluded_highway_values: &'a [&'a [u8]],
@@ -78,6 +85,7 @@ impl GeocodeTagLiterals<'_> {
             k_name: b"name",
             k_addr_housenumber: b"addr:housenumber",
             k_addr_street: b"addr:street",
+            k_addr_place: b"addr:place",
             k_building: b"building",
             k_addr_interpolation: b"addr:interpolation",
             excluded_highway_values: &GEOCODE_EXCLUDED_HIGHWAYS,
@@ -95,6 +103,7 @@ struct ResolvedTagIndices {
     k_name: Option<u32>,
     k_addr_housenumber: Option<u32>,
     k_addr_street: Option<u32>,
+    k_addr_place: Option<u32>,
     k_building: Option<u32>,
     k_addr_interpolation: Option<u32>,
     // Bitmask over `excluded_highway_values` indices: if the highway
@@ -324,6 +333,7 @@ pub(crate) fn scan_way_geocode_tagged_refs(
         || resolved.k_name.is_some()
         || resolved.k_addr_housenumber.is_some()
         || resolved.k_addr_street.is_some()
+        || resolved.k_addr_place.is_some()
         || resolved.k_building.is_some()
         || resolved.k_addr_interpolation.is_some();
 
@@ -384,6 +394,9 @@ fn resolve_tag_indices(
             if s == literals.k_addr_street && resolved.k_addr_street.is_none() {
                 resolved.k_addr_street = Some(idx);
             }
+            if s == literals.k_addr_place && resolved.k_addr_place.is_none() {
+                resolved.k_addr_place = Some(idx);
+            }
             if s == literals.k_building && resolved.k_building.is_none() {
                 resolved.k_building = Some(idx);
             }
@@ -438,6 +451,7 @@ fn parse_way_tagged_refs(
     let mut has_name = false;
     let mut has_addr_hn = false;
     let mut has_addr_st = false;
+    let mut has_addr_place = false;
     let mut has_building = false;
     let mut has_addr_interp = false;
 
@@ -465,6 +479,8 @@ fn parse_way_tagged_refs(
                 has_addr_hn = true;
             } else if Some(key_idx) == resolved.k_addr_street {
                 has_addr_st = true;
+            } else if Some(key_idx) == resolved.k_addr_place {
+                has_addr_place = true;
             } else if Some(key_idx) == resolved.k_building {
                 has_building = true;
             } else if Some(key_idx) == resolved.k_addr_interpolation {
@@ -489,6 +505,7 @@ fn parse_way_tagged_refs(
         has_building,
         has_addr_hn,
         has_addr_st,
+        has_addr_place,
         has_addr_interp,
     );
 
@@ -520,13 +537,14 @@ mod tests {
             .chain([b"residential".as_slice(), b"".as_slice()])
         {
             let highway = std::str::from_utf8(highway).expect("ASCII policy");
-            for bits in 0u8..64 {
+            for bits in 0u8..128 {
                 let fields = [
                     ("highway", highway),
                     ("name", ""),
                     ("building", "no"),
                     ("addr:housenumber", ""),
                     ("addr:street", ""),
+                    ("addr:place", ""),
                     ("addr:interpolation", "even"),
                 ];
                 let tags: Vec<_> = fields
@@ -546,6 +564,7 @@ mod tests {
                     bits & 8 != 0,
                     bits & 16 != 0,
                     bits & 32 != 0,
+                    bits & 64 != 0,
                 );
                 let mut seen = 0;
                 scan_way_geocode_tagged_refs(

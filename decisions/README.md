@@ -238,3 +238,10 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   end addresses share. Interior address nodes split it into one record per
   section; equal or wrong-parity numbers refuse the way, adjacent ones drop
   the section. No format change.
+- [ADR-0027](0027-geocode-addresses-name-a-street-or-a-place.md) - A
+  geocode address names a non-empty `addr:street`, `addr:place` or both and
+  answers each in its own field; an interpolation way numbers along one
+  street or one place (a place holds only addresses naming no street;
+  inference tries shared streets, then shared places), and steps digits 1 to
+  9 on a grid from its lower anchor. `addr:substreet` is not read. Format
+  version 5.

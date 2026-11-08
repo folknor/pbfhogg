@@ -253,7 +253,9 @@ pub(super) fn create_data_file(
     path: &std::path::Path,
 ) -> Result<std::io::BufWriter<std::fs::File>> {
     std::fs::File::create(path)
-        .map(std::io::BufWriter::new)
+        .map(|file| {
+            std::io::BufWriter::with_capacity(crate::tunables::GEOCODE_DATA_FILE_BUFFER_BYTES, file)
+        })
         .map_err(|e| Error::from(e).context(format!("failed to create {}", path.display())))
 }
 
@@ -658,8 +660,8 @@ fn build_generation(
             host.diagnostics,
             Warning,
             "geocode.pass2.interp_unresolved",
-            "{unresolved_ways} interpolation ways are unresolved (no single street at both \
-             ends, a node with no same-street address at an end, coincident addresses that \
+            "{unresolved_ways} interpolation ways are unresolved (no single street or place at \
+             both ends, a node with no address on its street or place at an end, coincident addresses that \
              disagree, a number that is not a positive decimal, equal numbers or the wrong \
              parity between address nodes, a missing node, or an unsupported \
              addr:interpolation value); way IDs (sample): {unresolved_ids:?}"
@@ -682,14 +684,15 @@ fn build_generation(
         for iw in &interp_ways {
             let rec = InterpWay {
                 node_offset: iw.node_file_offset,
-                street_offset: iw.street_offset,
+                parent_offset: iw.parent_offset,
                 start_number: iw.start_number,
                 end_number: iw.end_number,
                 node_count: iw.node_count,
                 // An unsupported mode is never resolved, so its numbers are
                 // the zero sentinel and the reader never steps it; the
                 // record still needs a wire value `Reader::open` accepts.
-                interpolation_type: iw.interpolation.unwrap_or(InterpolationType::All) as u8,
+                interpolation_type: iw.interpolation.unwrap_or(InterpolationType::All).to_wire(),
+                parent_kind: iw.parent_kind.to_wire(),
             };
             iw_out.write_all(&rec.to_bytes())?;
         }

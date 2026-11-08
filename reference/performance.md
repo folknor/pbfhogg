@@ -3411,6 +3411,40 @@ mmap would thrash (same as dense ALTW).
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany's
 interpolation counts are under "Interpolation ways as OSM tags them" below.
 
+### addr:place addresses and numeric steps, format 5 (bygg, 2026-11-08, against `fb5f05cc`)
+
+`AddrPoint` grows 20 to 24 bytes (`place_offset`), `InterpWay` 23 to 24
+(`parent_kind`); address points also come from `addr:place` (ADR-0027).
+Planet (`planet-20260223-reindexed`), interleaved `--bench 1` cells,
+variant uncommitted (`--force`, dirty sidecars):
+
+| Cell | Arm | Wall | Pass 2a |
+|---|---|---|---|
+| `82d91ad9` | baseline | 178.3 s | 21.4 s |
+| `c0ffdb9a` | first variant | 188.8 s | 30.2 s |
+| `d0549866` | baseline | 175.2 s | 21.3 s |
+| `136bdef0` | first variant | 186.5 s | 30.2 s |
+| `c9273b60` | final variant | 176.5 s | 21.7 s |
+| `bcb822dd` | baseline | 172.6 s | 21.2 s |
+| `a1efce29` | final variant | 176.3 s | 21.5 s |
+
+Baseline median 175.2 s, final variant 176.4 s: no wall difference.
+The first variant was 6 % slower, all in Pass 2a, whose serial merge became
+the bottleneck (`ordered_pool_result_send_wait_ns` at its end 41 s to 91 s
+summed over workers). Neither the node tag loop (restored to the old one:
+still slow) nor the interning shape moved it. On Germany a 1 MiB write
+buffer for the streamed data files (`GEOCODE_DATA_FILE_BUFFER_BYTES`)
+restored Pass 2a (0.95 s baseline, 1.44 s variant, 0.95 s with it); at
+planet it did not (29.7 s), and moving the address merge loop into one
+out-of-line function shared by both merges did (21.7 s). A `--hotpath`
+build of the slow variant also ran Pass 2a in 21.5 s, so the slowdown was
+code generation of the inlined merge, not work. The remaining
+difference is the segment after the admin index, which writes the index
+files (about 14 to 16.5 s, 24.8 to 26.0 GB written): the larger records.
+The variant planet index holds 167,816,443 address points; no baseline
+count was taken. Only `82d91ad9` of the baseline cells is stored in
+`results.db`.
+
 ### Interpolation ways as OSM tags them (plantasjen, 2026-11-05, against `f4838f76`)
 
 Interpolation ways no longer need `addr:street` on the way, and interior

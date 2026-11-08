@@ -20,9 +20,11 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// Current format version. Version 3 widens `AdminCell.entries_offset` and
 /// `AdminPolygon.vertex_offset` from u32 to u64; version 4 stores
 /// `strings.bin` entries length-prefixed instead of NUL-terminated (see
-/// [`read_pool_string`]). Readers deliberately reject other versions:
+/// [`read_pool_string`]); version 5 adds `AddrPoint.place_offset`
+/// (`addr:place`), `InterpWay.parent_kind`, and the numeric-step
+/// `interpolation_type` values. Readers deliberately reject other versions:
 /// existing indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -35,27 +37,132 @@ pub const MAX_ADMIN_LEVEL: u8 = 10;
 pub const ADMIN_LEVEL_SLOTS: usize = POSTAL_BOUNDARY_LEVEL as usize + 1;
 const _: () = assert!(MAX_ADMIN_LEVEL < POSTAL_BOUNDARY_LEVEL);
 
-/// Wire values retained from version 3; naming them does not change bytes.
+/// A numeric `addr:interpolation` step from 2 to 9; the step 1 is
+/// [`InterpolationType::All`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+pub struct InterpolationStep(u8);
+
+impl InterpolationStep {
+    /// The step `n`, or `None` outside 2..=9.
+    pub fn new(n: u8) -> Option<Self> {
+        (2..=9).contains(&n).then_some(Self(n))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// How an interpolation way numbers the houses between its anchors, as
+/// `addr:interpolation` tags it: `all` steps by one, `even` and `odd` by
+/// two with the declared parity, and a digit `2` to `9` by that step from
+/// the lower anchor with no parity (as Nominatim reads it).
+///
+/// This type owns the numbering rule: which anchor pairs a section may run
+/// between ([`Self::answers`]) and which number a point along it gets
+/// ([`Self::number_at`]). The builder and the reader both use it, so the
+/// sections the builder writes are exactly the ones the reader answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpolationType {
-    All = 0,
-    Even = 1,
-    Odd = 2,
+    All,
+    Even,
+    Odd,
+    Every(InterpolationStep),
 }
 
 impl InterpolationType {
-    /// Whether `start..end` is a range this mode can step: any two numbers
-    /// for `All`, two even ones for `Even`, two odd ones for `Odd`. The
-    /// reader steps an even or odd range by two from `start`, so an end of
-    /// the other parity yields numbers of the wrong parity or past the end
-    /// (`Even` 10..13 ends at 14).
-    pub(crate) fn steps(self, start: u32, end: u32) -> bool {
-        match self {
-            Self::All => true,
-            Self::Even => start.is_multiple_of(2) && end.is_multiple_of(2),
-            Self::Odd => !start.is_multiple_of(2) && !end.is_multiple_of(2),
+    /// The mode an `addr:interpolation` value names, or `None` for one the
+    /// index does not step (`alphabetic`, anything else).
+    pub(crate) fn from_tag(value: &str) -> Option<Self> {
+        match value {
+            "all" | "1" => Some(Self::All),
+            "even" => Some(Self::Even),
+            "odd" => Some(Self::Odd),
+            _ => {
+                let &[digit] = value.as_bytes() else {
+                    return None;
+                };
+                let n = digit.checked_sub(b'0')?;
+                InterpolationStep::new(n).map(Self::Every)
+            }
         }
+    }
+
+    /// The `interpolation_type` byte: 0 `all`, 1 `even`, 2 `odd` (the
+    /// version 3 values), 3 to 10 the steps 2 to 9.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::All => 0,
+            Self::Even => 1,
+            Self::Odd => 2,
+            Self::Every(step) => step.get() + 1,
+        }
+    }
+
+    /// The distance between consecutive numbers.
+    pub fn step(self) -> u32 {
+        match self {
+            Self::All => 1,
+            Self::Even | Self::Odd => 2,
+            Self::Every(step) => u32::from(step.get()),
+        }
+    }
+
+    /// Whether `a` and `b` can be two anchors of one way in this mode:
+    /// positive, different, and of the declared parity for `even` and
+    /// `odd`. A pair that fails refuses the whole way; the anchors of a
+    /// numeric step need not lie on one grid (Nominatim does not ask it).
+    pub(crate) fn anchors_agree(self, a: u32, b: u32) -> bool {
+        if a == 0 || b == 0 || a == b {
+            return false;
+        }
+        match self {
+            Self::All | Self::Every(_) => true,
+            Self::Even => a.is_multiple_of(2) && b.is_multiple_of(2),
+            Self::Odd => !a.is_multiple_of(2) && !b.is_multiple_of(2),
+        }
+    }
+
+    /// Whether a section between anchors `a` and `b` answers queries: the
+    /// anchors agree and at least one number lies strictly between them
+    /// (`even` 10 to 12, `all` 10 to 11 hold none, and the builder writes no
+    /// such section). Zero at either end is the unresolved sentinel.
+    pub(crate) fn answers(self, a: u32, b: u32) -> bool {
+        self.anchors_agree(a, b) && a.abs_diff(b) > self.step()
+    }
+
+    /// The number at fraction `t` of the way from anchor `start` to anchor
+    /// `end`, for a section that [answers](Self::answers). The candidates
+    /// are the grid `lo, lo + step, ...` up to `hi` plus `hi` itself, where
+    /// `lo` and `hi` are the lower and higher anchor; the answer is the one
+    /// nearest the position, a tie going to the lower number. Measured from
+    /// the lower anchor, so reversing a way's geometry changes no answer.
+    /// `None` for a non-finite `t`; `t` outside 0..=1 is clamped.
+    pub(crate) fn number_at(self, start: u32, end: u32, t: f64) -> Option<u32> {
+        if !t.is_finite() || !self.answers(start, end) {
+            return None;
+        }
+        let t = t.clamp(0.0, 1.0);
+        let (lo, hi, u) = if start <= end {
+            (start, end, t)
+        } else {
+            (end, start, 1.0 - t)
+        };
+        let diff = hi - lo;
+        let step = self.step();
+        let k_max = diff / step;
+        let offset = u * f64::from(diff);
+        // Ties to the lower grid number: ceil(v - 0.5) rounds half down.
+        let v = offset / f64::from(step);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let k = ((v - 0.5).ceil().max(0.0) as u32).min(k_max);
+        let grid = lo + k * step;
+        if grid == hi {
+            return Some(grid);
+        }
+        let to_grid = (offset - f64::from(grid - lo)).abs();
+        let to_hi = f64::from(diff) - offset;
+        Some(if to_hi < to_grid { hi } else { grid })
     }
 }
 
@@ -67,8 +174,43 @@ impl TryFrom<u8> for InterpolationType {
             0 => Ok(Self::All),
             1 => Ok(Self::Even),
             2 => Ok(Self::Odd),
+            _ => value
+                .checked_sub(1)
+                .and_then(InterpolationStep::new)
+                .map(Self::Every)
+                .ok_or_else(|| {
+                    FormatError::InvalidMetadata(format!("unknown interpolation type {value}"))
+                }),
+        }
+    }
+}
+
+/// Which address name an interpolation record numbers along: an
+/// `addr:street`, or an `addr:place` for addresses that name no street.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentKind {
+    Street,
+    Place,
+}
+
+impl ParentKind {
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Street => 0,
+            Self::Place => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for ParentKind {
+    type Error = FormatError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Street),
+            1 => Ok(Self::Place),
             _ => Err(FormatError::InvalidMetadata(format!(
-                "unknown interpolation type {value}"
+                "unknown interpolation parent kind {value}"
             ))),
         }
     }
@@ -357,7 +499,8 @@ record! {
 }
 
 record! {
-    /// `addr_points.bin`.
+    /// `addr_points.bin`. An address names a non-empty `addr:street`, a
+    /// non-empty `addr:place`, or both; offset 0 is an absent name.
     #[derive(Debug, Clone, Copy)]
     pub struct AddrPoint {
         pub lat_e7: i32,
@@ -365,6 +508,7 @@ record! {
         pub housenumber_offset: u32,
         pub street_offset: u32,
         pub postcode_offset: u32,
+        pub place_offset: u32,
     }
 }
 
@@ -377,12 +521,16 @@ record! {
     pub struct InterpWay {
         /// Byte offset into interp_nodes.bin (u64 for consistency).
         pub node_offset: u64,
-        pub street_offset: u32,
+        /// The street or place the section numbers along (see
+        /// `parent_kind`); 0 only on an unresolved record.
+        pub parent_offset: u32,
         pub start_number: u32,
         pub end_number: u32,
         pub node_count: u16,
         /// Serialized InterpolationType; checked when opening the index.
         pub interpolation_type: u8,
+        /// Serialized ParentKind; checked when opening the index.
+        pub parent_kind: u8,
     }
 }
 
@@ -1079,7 +1227,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            InterpolationType::try_from(9)
+            InterpolationType::try_from(11)
                 .unwrap_err()
                 .source()
                 .is_none()
@@ -1248,11 +1396,91 @@ mod tests {
     #[test]
     fn interpolation_wire_values_are_closed() {
         for value in 0..=u8::MAX {
-            assert_eq!(InterpolationType::try_from(value).is_ok(), value <= 2);
+            let parsed = InterpolationType::try_from(value);
+            assert_eq!(parsed.is_ok(), value <= 10, "wire value {value}");
+            if let Ok(mode) = parsed {
+                assert_eq!(mode.to_wire(), value);
+            }
+            assert_eq!(ParentKind::try_from(value).is_ok(), value <= 1);
         }
-        assert_eq!(InterpolationType::All as u8, 0);
-        assert_eq!(InterpolationType::Even as u8, 1);
-        assert_eq!(InterpolationType::Odd as u8, 2);
+        assert_eq!(InterpolationType::All.to_wire(), 0);
+        assert_eq!(InterpolationType::Even.to_wire(), 1);
+        assert_eq!(InterpolationType::Odd.to_wire(), 2);
+    }
+
+    #[test]
+    fn interpolation_tags_name_the_modes_nominatim_steps() {
+        assert_eq!(
+            InterpolationType::from_tag("all"),
+            Some(InterpolationType::All)
+        );
+        assert_eq!(
+            InterpolationType::from_tag("1"),
+            Some(InterpolationType::All)
+        );
+        assert_eq!(
+            InterpolationType::from_tag("even"),
+            Some(InterpolationType::Even)
+        );
+        assert_eq!(
+            InterpolationType::from_tag("odd"),
+            Some(InterpolationType::Odd)
+        );
+        for n in 2..=9u8 {
+            let tag = n.to_string();
+            let mode = InterpolationType::from_tag(&tag).expect("a digit step");
+            assert_eq!(mode.step(), u32::from(n));
+        }
+        for tag in ["alphabetic", "0", "10", "", "2 ", "x"] {
+            assert_eq!(InterpolationType::from_tag(tag), None, "{tag:?}");
+        }
+    }
+
+    fn every(n: u8) -> InterpolationType {
+        InterpolationType::Every(InterpolationStep::new(n).expect("a step in 2..=9"))
+    }
+
+    #[test]
+    fn a_section_answers_only_with_a_number_between_its_anchors() {
+        assert!(!InterpolationType::Even.answers(10, 12));
+        assert!(InterpolationType::Even.answers(10, 14));
+        assert!(!InterpolationType::Even.answers(10, 13));
+        assert!(!InterpolationType::Odd.answers(10, 20));
+        assert!(!InterpolationType::All.answers(10, 11));
+        assert!(!InterpolationType::All.answers(0, 11));
+        assert!(!InterpolationType::All.answers(5, 5));
+        assert!(!every(4).answers(10, 14));
+        assert!(every(4).answers(10, 15));
+        assert!(every(4).answers(21, 10));
+    }
+
+    #[test]
+    fn stepped_numbers_run_from_the_lower_anchor_whichever_way_the_way_runs() {
+        // 10..21 by 4: 10, 14, 18 and the anchor 21; 18 and 21 meet at 19.5.
+        let mode = every(4);
+        let at = |t: f64| mode.number_at(10, 21, t).expect("answers");
+        let reversed = |t: f64| mode.number_at(21, 10, 1.0 - t).expect("answers");
+        for (t, expected) in [
+            (0.0, 10),
+            (0.1, 10),
+            (0.5, 14),
+            (0.75, 18),
+            (9.0 / 11.0, 18),
+            (9.6 / 11.0, 21),
+            (1.0, 21),
+        ] {
+            assert_eq!(at(t), expected, "t {t}");
+            assert_eq!(reversed(t), expected, "reversed t {t}");
+        }
+        // A tie goes to the lower number in both directions.
+        assert_eq!(InterpolationType::All.number_at(10, 12, 0.25), Some(10));
+        assert_eq!(InterpolationType::All.number_at(12, 10, 0.75), Some(10));
+        assert_eq!(InterpolationType::Even.number_at(10, 20, 0.5), Some(14));
+        assert_eq!(InterpolationType::Even.number_at(20, 10, 0.5), Some(14));
+        assert_eq!(InterpolationType::Even.number_at(10, 20, 0.6), Some(16));
+        assert_eq!(InterpolationType::All.number_at(10, 20, f64::NAN), None);
+        assert_eq!(InterpolationType::All.number_at(10, 20, 7.0), Some(20));
+        assert_eq!(InterpolationType::All.number_at(10, 11, 0.5), None);
     }
 
     #[test]
@@ -1344,6 +1572,7 @@ mod tests {
             housenumber_offset: 100,
             street_offset: 200,
             postcode_offset: 0, // no postcode
+            place_offset: 300,
         };
         let bytes = pt.to_bytes();
         let parsed = AddrPoint::from_bytes(&bytes);
@@ -1352,26 +1581,29 @@ mod tests {
         assert_eq!(parsed.housenumber_offset, 100);
         assert_eq!(parsed.street_offset, 200);
         assert_eq!(parsed.postcode_offset, 0);
+        assert_eq!(parsed.place_offset, 300);
     }
 
     #[test]
     fn interp_way_roundtrip() {
         let iw = InterpWay {
             node_offset: 50000,
-            street_offset: 300,
+            parent_offset: 300,
             start_number: 2,
             end_number: 50,
             node_count: 5,
             interpolation_type: 1, // even
+            parent_kind: 1,
         };
         let bytes = iw.to_bytes();
         let parsed = InterpWay::from_bytes(&bytes);
         assert_eq!(parsed.node_offset, 50000);
-        assert_eq!(parsed.street_offset, 300);
+        assert_eq!(parsed.parent_offset, 300);
         assert_eq!(parsed.start_number, 2);
         assert_eq!(parsed.end_number, 50);
         assert_eq!(parsed.node_count, 5);
         assert_eq!(parsed.interpolation_type, 1);
+        assert_eq!(parsed.parent_kind, 1);
     }
 
     #[test]
@@ -1605,8 +1837,8 @@ mod tests {
         assert_eq!(SegmentRef::SIZE, 6);
         assert_eq!(AddrEntry::SIZE, 4);
         assert_eq!(StreetWay::SIZE, 14);
-        assert_eq!(AddrPoint::SIZE, 20);
-        assert_eq!(InterpWay::SIZE, 23);
+        assert_eq!(AddrPoint::SIZE, 24);
+        assert_eq!(InterpWay::SIZE, 24);
         assert_eq!(AdminCell::SIZE, 16);
         assert_eq!(AdminPolygon::SIZE, 26);
         assert_eq!(NodeCoord::SIZE, 8);
@@ -1631,11 +1863,12 @@ mod tests {
 
         let iw = InterpWay {
             node_offset: 7,
-            street_offset: 8,
+            parent_offset: 8,
             start_number: 9,
             end_number: 10,
             node_count: 11,
             interpolation_type: 2,
+            parent_kind: 1,
         };
         let bytes = iw.to_bytes();
         assert_eq!(&bytes[0..8], &7u64.to_le_bytes());
@@ -1644,6 +1877,7 @@ mod tests {
         assert_eq!(&bytes[16..20], &10u32.to_le_bytes());
         assert_eq!(&bytes[20..22], &11u16.to_le_bytes());
         assert_eq!(bytes[22], 2);
+        assert_eq!(bytes[23], 1);
 
         let pt = AddrPoint {
             lat_e7: -1,
@@ -1651,11 +1885,15 @@ mod tests {
             housenumber_offset: 3,
             street_offset: 4,
             postcode_offset: 5,
+            place_offset: 6,
         };
         let bytes = pt.to_bytes();
         assert_eq!(&bytes[0..4], &(-1i32).to_le_bytes());
         assert_eq!(&bytes[4..8], &2i32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &3u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &4u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &5u32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &6u32.to_le_bytes());
 
         let sr = SegmentRef {
             way_index: 0xAABB_CCDD,

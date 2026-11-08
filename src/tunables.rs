@@ -1068,6 +1068,14 @@ pub(crate) const PIPE_BUF: usize = 512;
 /// parks the workers.
 pub(crate) const GEOCODE_MERGE_WINDOW_BLOBS: usize = 256;
 
+/// Write buffer of each index data file the builder streams record by
+/// record. The Pass 2 merges are serial and write one small record per
+/// address, street or node. With std's 8 KiB default, growing `AddrPoint`
+/// from 20 to 24 bytes made the node merge the bottleneck of Pass 2a on
+/// Germany (0.95 s to 1.44 s on bygg); a 1 MiB buffer took it back to
+/// 0.95 s. See `reference/performance.md`, build-geocode-index.
+pub(crate) const GEOCODE_DATA_FILE_BUFFER_BYTES: usize = 1 << 20;
+
 /// IDs the dense node-ID bitmap may cover per input byte, passed to
 /// `IdSet::file_bounded_max_id` because `max_node_id` can come from
 /// unverified indexdata. References above the resulting bound are collected

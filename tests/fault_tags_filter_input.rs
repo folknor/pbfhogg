@@ -71,13 +71,17 @@ impl Route {
 
     /// Opens of one run. Under `invert` every relation is selected (no
     /// expression admits a relation, so none matches), so the closure runs.
+    /// The way-dependency walk opens the input only when the closure pulled
+    /// in a way that is not a direct match: path way 2000, which `invert`
+    /// selects directly.
     fn opens(self) -> u64 {
         let probe = u64::from(self.probes());
         if self.omit_referenced {
             return probe + 1;
         }
         let closure = u64::from(self.relations || self.invert);
-        probe + 5 + closure
+        let way_deps = u64::from(self.relations && !self.invert);
+        probe + 4 + closure + way_deps
     }
 
     fn expressions(self) -> Vec<String> {
@@ -332,13 +336,14 @@ fn check_route(route: Route, expected_opens: u64) {
 #[test]
 fn two_pass_reads_only_the_pinned_input() {
     check_route(Route::TWO_PASS, 7);
-    // No relation selected: no closure walk.
+    // No relation selected: no closure walk, and no way-dependency walk
+    // (every included way is a direct match).
     check_route(
         Route {
             relations: false,
             ..Route::TWO_PASS
         },
-        6,
+        5,
     );
     // Forced on an input without indexdata: the probe still runs.
     check_route(
@@ -358,7 +363,7 @@ fn two_pass_without_the_probe_reads_only_the_pinned_input() {
             relations: false,
             ..Route::TWO_PASS
         },
-        6,
+        5,
     );
     check_route(
         Route {
@@ -373,7 +378,7 @@ fn two_pass_without_the_probe_reads_only_the_pinned_input() {
             relations: false,
             ..Route::TWO_PASS
         },
-        5,
+        4,
     );
 }
 

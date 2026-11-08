@@ -289,6 +289,12 @@ state.
   membership once instead of once per region. Planet on bygg, five regions
   inside `-10,35,32,72`: peak anon 9.8 GB -> 3.9 GB at the same wall; five
   small regions: 2.0 GB -> 0.8 GB and 88 s -> 68 s.
+- `extract --complete` and `--smart` hold far less memory: planet on bygg,
+  Europe-sized box `-25,34,45,72`, peak anon 4.4 GB -> 2.8 GB
+  (`--complete`) and 8.1 GB -> 2.9 GB (`--smart`) at the same wall.
+- Two-pass `tags-filter` with no matched relation skips its way-dependency
+  pass: planet `w/highway=primary` on bygg 70 s -> 56 s, peak anon
+  2.5 GB -> 2.3 GB.
 - `apply-changes` is faster and holds less memory. On a planet daily diff
   (OSC 4913) on bygg it takes about 92 s at about 1.9 GB peak anon with
   `--compression zstd:1`, and with `--locations-on-ways` on a planet with

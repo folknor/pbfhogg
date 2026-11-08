@@ -97,7 +97,11 @@ GB host. Answer: yes. The highest peak is `inspect --tags -j 16` at 17.5 GB,
 unchanged from the README. (Since superseded for `inspect --tags`: 36 s and
 10.8 GB peak anon at default `-j` on bygg, reference/performance.md
 "inspect tags counts into a sharded table"; `build-geocode-index` is now the
-highest row below.)
+highest row below. Also superseded: `extract --complete` 2.76 GB and
+`extract --smart` 2.87 GB, `tags-filter w/highway=primary` 2.27-2.31 GB and
+56 s, on the reindexed planet, reference/performance.md "ID sets that hold
+only what the writer does not already have" and "Direct and member ways kept
+apart".)
 
 Setup: host bygg (Ryzen 9 9950X3D2, 16c/32t, 30.5 GiB, 29.1 GiB available),
 pbfhogg `627883d7`, one `--bench 1` cell per command after `fstrim`, input
@@ -193,50 +197,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 ---
 
 ## Memory and throughput: structural work
-
-### WRK-182: extract set lifetimes
-
-Each strategy builds four `IdSet`s: `bbox_node_ids`, `matched_way_ids`,
-`matched_relation_ids` and `all_way_node_ids` (`src/commands/extract/
-simple.rs`, `complete.rs`, `smart.rs`, shared code in `common.rs`;
-simple.rs builds them in two places, its two code paths). Planet on bygg
-(`-25,34,45,72`): `--simple` 3.09 GB, `--complete` 4.87 GB, `--smart`
-8.2 GB peak anon. The peak phases (reference/performance.md, "glibc's
-sliding mmap threshold across commands", default arm at `3c5b8d3a`):
-simple in the relation write, complete in `PREAD_WRITE_EXECUTE`, smart in
-pass 1 relation classify. Question: which sets are still alive in the
-peak phase without being read there, and can each be dropped after its
-last reader (a set that only classified ways, still held through the
-write, for example)? Part of what those peaks are is glibc's retained
-arena memory, not live data (the same section: `--complete` ends with a
-5.16 GB arena, 1.36 GB free), so a set dropped late may show less saving
-than its size. "Swap `IdSet` for a compressed bitmap" is too shallow:
-`IdSet` already has sparse and dense chunks. Unaudited. The audit is code reading, the tests cover
-output, and each fix that results needs one matched planet pair per
-strategy it touches.
-
-### WRK-183: tags-filter two-pass set lifetimes
-
-`src/commands/tags_filter/mod.rs` holds seven `IdSet`s in two-pass mode:
-`matched_node_ids`, `direct_way_ids`, `included_way_ids`,
-`direct_relation_ids`, `included_relation_ids`, `way_dep_node_ids` and
-`relation_dep_node_ids`. Planet on bygg: `w/highway=primary` 2.57 GB
-peak anon (`b8491cfd`), `r/route=bus` with the relation closure 2.59 GB
-(`4e5ca3bf`), both peaking in pass 2 (reference/performance.md, "glibc's sliding
-mmap threshold across commands", default arm at `3c5b8d3a`). Question:
-which sets are still alive in pass 2 without being read there, whether
-the direct and included sets of a kind need to coexist, and whether each
-dependency set can be dropped once the pass that consumes it ends, rather
-than at command end. Part of what the peak is is glibc's retained arena
-memory, not live data (the same section measured tags-filter two-pass 11
-to 12 % lower with the mmap threshold pinned at 128 KiB), so a set
-dropped late may show less saving than its size. "Swap `IdSet` for a
-compressed bitmap" is too shallow: `IdSet` already has sparse and dense
-chunks. `tags-filter -R` (one pass, 659 MB) builds none of these sets and
-is out of scope; `-i` (7.49 GB peak, `9bf96ab2`) was not looked at for
-this. Unaudited. The audit is code reading, the existing tests cover
-output, and each fix that results needs one matched planet pair, with and
-without the relation closure.
 
 ### WRK-178: Same-ID groups in the overlap sweep are unbounded
 

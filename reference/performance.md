@@ -2737,6 +2737,32 @@ Prepared segments and bands are built once per region; the per-node cost is
 the band's segments instead of every vertex, so the gain grows with the
 polygon's vertex count.
 
+### ID sets that hold only what the writer does not already have (bygg, 2026-11-08, against `0973c352`)
+
+complete and smart keep the node refs of matched ways only where they are
+outside the region set (the writer includes the union and tests the region
+set first, so a ref in both bought nothing); smart's relation-driven extras
+skip matched ways and already-included nodes, and its pass-1 relation
+classify sends member IDs per blob instead of accumulating an `IdSet` per
+worker. Planet (`planet-20260223-reindexed`), Europe box
+`-25,34,45,72`, `--bench 1` main-tree cells; baseline = `0973c352` stored,
+variant = the uncommitted change, `--force` (dirty sidecar rows):
+
+| Strategy | baseline wall | variant wall | baseline peak anon | variant peak anon |
+|----------|---------------|--------------|--------------------|-------------------|
+| complete | 116.98 s (`80089cbc`) | 116.14 s (`8c487309`) | 4.44 GB | 2.76 GB |
+| smart | 129.21 s (`05bbc210`) | 128.73 s (`15c17254`) | 8.06 GB | 2.87 GB |
+| simple, node set dropped before the way write | 106.81 s (`38954d07`) | 107.51 s (`6d5424f1`) | 2.57 GB | 2.60 GB |
+
+complete's way classify fell from 16.1 s to 12.5 s (it sets far fewer IDs).
+smart's 8 GB was the relation classify phase: 32 workers each promoting
+dense chunks for dispersed member IDs; per-blob send removes it, and the
+phase falls from 0.85 s to 0.36 s. The simple row is a refusal: moving the
+relation classify ahead of the way write so the node set could be dropped
+there freed live memory but moved no peak, since the freed chunks stay in
+the arenas and the way write's worker-side buffers do not reuse them; it was
+not landed (the reason sits at the site in `simple.rs`).
+
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each
@@ -2953,6 +2979,28 @@ path ignores it (CLI rejects the combination).
 Saturates at `j16`; `j24` is within single-shot noise. Default
 auto-detect on this 24-thread host lands the same workload at
 108.2 s (`7e4301f9`), inside the noise band.
+
+### Direct and member ways kept apart (bygg, 2026-11-08, against `0973c352`)
+
+The included-ways set held every direct match a second time; it now holds
+only the ways the relation closure pulled in that are not direct matches,
+and the way-dependency walk, which only those ways need, is skipped when
+there are none (every expression without a matched relation). Planet
+(`planet-20260223-reindexed`), `w/highway=primary`, `--bench 1` main-tree
+cells in the order A B B A; baseline = `0973c352` stored, variant =
+uncommitted, `--force` (dirty sidecar rows):
+
+| Arm | Wall | Peak anon | UUID |
+|-----|-----:|----------:|------|
+| baseline | 69.05 s | 2.49 GB | `f60408df` |
+| variant | 55.93 s | 2.27 GB | `0b19b3c4` |
+| variant | 56.67 s | 2.31 GB | `6e9a4f10` |
+| baseline | 71.37 s | 2.44 GB | `097ae97a` |
+
+The wall gain is the removed walk (its schedule scan plus about 9.6 s of way
+blobs read for nothing); the peak gain is the duplicate way set. Relation
+expressions still walk the way blobs, and their peak moves by the size of
+their direct-way set only.
 
 ## Merge-changes
 

@@ -579,7 +579,9 @@ fn tags_filter_single_pass(
 struct Pass2IdSets<'a> {
     matched_node_ids: &'a IdSet,
     direct_way_ids: &'a IdSet,
-    included_way_ids: &'a IdSet,
+    /// Ways the relation closure pulled in that are not direct matches;
+    /// disjoint from `direct_way_ids`, the included ways are their union.
+    member_way_ids: &'a IdSet,
     direct_relation_ids: &'a IdSet,
     included_relation_ids: &'a IdSet,
     way_dep_node_ids: &'a IdSet,
@@ -665,10 +667,10 @@ fn filter_block_pass2(
                 }
             }
             Element::Way(w) => {
-                if ids.included_way_ids.get(w.id()) {
+                let direct = ids.direct_way_ids.get(w.id());
+                if direct || ids.member_way_ids.get(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
-                    let direct = ids.direct_way_ids.get(w.id());
                     if !remove_tags || direct {
                         tags_buf.extend(w.tags());
                     }
@@ -750,11 +752,18 @@ fn tags_filter_two_pass(
     // --- Pass 1: Collect match results and way dependencies ---
     host.invocation.marker("TAGSFILTER_PASS1_START");
     //
-    // IdSet: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
+    // IdSet: O(1) set/get, memory bounded by the distinct IDs per chunk.
     // No sort/dedup step needed between passes (bitset deduplicates inherently).
+    //
+    // The included ways are `direct_way_ids` plus `member_way_ids`, kept
+    // disjoint: an included-ways set holding the direct matches again was a
+    // second copy of a set that spans the way ID space (dense chunks at
+    // planet for a common tag), and every reader tests the direct set first
+    // anyway. The relation pair stays direct plus included: relation IDs fill
+    // one or two chunks, so splitting them saves nothing.
     let mut matched_node_ids = IdSet::new();
     let mut direct_way_ids = IdSet::new();
-    let mut included_way_ids = IdSet::new();
+    let mut member_way_ids = IdSet::new();
     let mut direct_relation_ids = IdSet::new();
     let mut included_relation_ids = IdSet::new();
     let mut way_dep_node_ids = IdSet::new();
@@ -905,9 +914,7 @@ fn tags_filter_two_pass(
                 }
                 for (way_id, refs) in cr.matched_ways {
                     direct_way_ids.set(way_id);
-                    if included_way_ids.set_if_new(way_id) {
-                        has_included_way = true;
-                    }
+                    has_included_way = true;
                     for r in refs {
                         way_dep_node_ids.set(r);
                     }
@@ -935,7 +942,8 @@ fn tags_filter_two_pass(
             direct_io,
             distrust_metadata,
             &mut included_relation_ids,
-            &mut included_way_ids,
+            &direct_way_ids,
+            &mut member_way_ids,
             &mut relation_dep_node_ids,
             jobs,
             host,
@@ -945,18 +953,24 @@ fn tags_filter_two_pass(
     }
     host.invocation.marker("TAGSFILTER_CLOSURE_END");
 
-    // Any included way (direct match or pulled from relation members) contributes node deps.
+    // A direct match's node refs entered `way_dep_node_ids` in pass 1, so only
+    // the ways the closure pulled in still need theirs. With none (every
+    // expression without a matched relation, and closures that reach no new
+    // way) there is nothing to collect, and the way-blob walk is skipped.
+    // Every included way is direct or in `member_way_ids`; that is the
+    // whole argument.
     host.invocation.marker("TAGSFILTER_WAYDEPS_START");
-    collect_way_node_dependencies(
-        input,
-        direct_io,
-        distrust_metadata,
-        &included_way_ids,
-        Some(&direct_way_ids),
-        &mut relation_dep_node_ids,
-        jobs,
-        host,
-    )?;
+    if !member_way_ids.is_empty() {
+        collect_way_node_dependencies(
+            input,
+            direct_io,
+            distrust_metadata,
+            &member_way_ids,
+            &mut relation_dep_node_ids,
+            jobs,
+            host,
+        )?;
+    }
     host.invocation.marker("TAGSFILTER_WAYDEPS_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
@@ -1056,7 +1070,7 @@ fn tags_filter_two_pass(
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,
         direct_way_ids: &direct_way_ids,
-        included_way_ids: &included_way_ids,
+        member_way_ids: &member_way_ids,
         direct_relation_ids: &direct_relation_ids,
         included_relation_ids: &included_relation_ids,
         way_dep_node_ids: &way_dep_node_ids,
@@ -1173,7 +1187,8 @@ fn collect_relation_member_closure(
     _direct_io: bool,
     distrust_metadata: bool,
     included_relation_ids: &mut IdSet,
-    included_way_ids: &mut IdSet,
+    direct_way_ids: &IdSet,
+    member_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
     host: &crate::host::Entered<'_>,
@@ -1255,7 +1270,9 @@ fn collect_relation_member_closure(
                 relation_dep_node_ids.set(id);
             }
             for id in cr.way_ids {
-                if included_way_ids.set_if_new(id) {
+                // A direct match is already included and its refs already
+                // collected; only a new non-direct way is a member way.
+                if !direct_way_ids.get(id) && member_way_ids.set_if_new(id) {
                     summary.has_way = true;
                 }
             }
@@ -1294,7 +1311,8 @@ fn kind_schedule_filter(
     if distrust_metadata { None } else { Some(kind) }
 }
 
-/// Scan all way blobs and add node refs for ways selected for output.
+/// Scan all way blobs and add the node refs of the closure's member ways
+/// (direct matches collected theirs in pass 1).
 ///
 /// `distrust_metadata` widens the schedule to every OsmData blob. See
 /// [`kind_schedule_filter`].
@@ -1307,8 +1325,7 @@ fn collect_way_node_dependencies(
     // flag reaches once those reads honour it.
     _direct_io: bool,
     distrust_metadata: bool,
-    included_way_ids: &IdSet,
-    skip_way_ids: Option<&IdSet>,
+    member_way_ids: &IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
     host: &crate::host::Entered<'_>,
@@ -1348,13 +1365,8 @@ fn collect_way_node_dependencies(
             let mut node_ids: Vec<i64> = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
-                    && included_way_ids.get(w.id())
+                    && member_way_ids.get(w.id())
                 {
-                    if let Some(skip) = skip_way_ids
-                        && skip.get(w.id())
-                    {
-                        continue;
-                    }
                     for r in w.refs() {
                         node_ids.push(r);
                     }

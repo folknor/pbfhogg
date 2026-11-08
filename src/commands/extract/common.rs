@@ -555,7 +555,7 @@ where
 /// Read-only ID sets for Pass 2 of complete-ways strategy, shared across rayon threads.
 pub(super) struct ExtractPass2IdSets<'a> {
     pub(super) bbox_node_ids: &'a IdSet,
-    pub(super) all_way_node_ids: &'a IdSet,
+    pub(super) outside_way_node_ids: &'a IdSet,
     pub(super) matched_way_ids: &'a IdSet,
     pub(super) matched_relation_ids: &'a IdSet,
 }
@@ -603,7 +603,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
         match &element {
             Element::DenseNode(dn) if emit_nodes => {
                 let in_bbox = ids.bbox_node_ids.get(dn.id());
-                let from_way = ids.all_way_node_ids.get(dn.id());
+                let from_way = ids.outside_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(dense_node_metadata(dn)?, clean);
@@ -623,7 +623,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
             }
             Element::Node(n) if emit_nodes => {
                 let in_bbox = ids.bbox_node_ids.get(n.id());
-                let from_way = ids.all_way_node_ids.get(n.id());
+                let from_way = ids.outside_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(

@@ -75,7 +75,7 @@ pub(super) fn extract_complete_ways(
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &result.bbox_node_ids,
-        all_way_node_ids: &result.all_way_node_ids,
+        outside_way_node_ids: &result.outside_way_node_ids,
         matched_way_ids: &result.matched_way_ids,
         matched_relation_ids: &result.matched_relation_ids,
     };

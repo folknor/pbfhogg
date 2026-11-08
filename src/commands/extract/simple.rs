@@ -229,7 +229,7 @@ fn extract_simple_two_pass(
     host.invocation.marker("SIMPLE_UNSORTED_PASS1_END");
 
     host.invocation.marker("SIMPLE_UNSORTED_PASS2_START");
-    let all_way_node_ids = IdSet::new();
+    let outside_way_node_ids = IdSet::new();
 
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
@@ -248,7 +248,7 @@ fn extract_simple_two_pass(
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
-        all_way_node_ids: &all_way_node_ids,
+        outside_way_node_ids: &outside_way_node_ids,
         matched_way_ids: &matched_way_ids,
         matched_relation_ids: &matched_relation_ids,
     };
@@ -407,7 +407,7 @@ fn extract_simple_single_pass(
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
     let empty_relation_ids = IdSet::new(); // placeholder for node/way phases
-    let all_way_node_ids = IdSet::new();
+    let outside_way_node_ids = IdSet::new();
 
     // --- Phase 1: Classify nodes (parallel pread + scanner) ---
     // Workers pread node blobs, decompress, scan with node-only scanner,
@@ -474,7 +474,7 @@ fn extract_simple_single_pass(
     {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
-            all_way_node_ids: &all_way_node_ids,
+            outside_way_node_ids: &outside_way_node_ids,
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
@@ -539,6 +539,15 @@ fn extract_simple_single_pass(
     }
     host.invocation.marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
+    //
+    // `bbox_node_ids` stays live, unread, through this write: its last reader
+    // is the relation classify below. Moving that classify ahead of this
+    // write (it needs only the two finished sets) and dropping the node set
+    // here was built and measured at planet (bygg, Europe-sized box, against
+    // 0973c352): peak anon 2.60 GB against 2.57 GB, no change. The freed
+    // chunks stay in the allocator's arenas and the write's worker-side
+    // buffers do not land in them, so the drop moves no peak; do not redo it
+    // without a change to how the set's chunks are allocated.
     host.invocation.marker("SIMPLE_WAY_WRITE_START");
     let way_descs: Vec<BlobDesc> = way_schedule
         .iter()
@@ -550,7 +559,7 @@ fn extract_simple_single_pass(
     {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
-            all_way_node_ids: &all_way_node_ids,
+            outside_way_node_ids: &outside_way_node_ids,
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
@@ -618,7 +627,7 @@ fn extract_simple_single_pass(
     {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
-            all_way_node_ids: &all_way_node_ids,
+            outside_way_node_ids: &outside_way_node_ids,
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &matched_relation_ids,
         };

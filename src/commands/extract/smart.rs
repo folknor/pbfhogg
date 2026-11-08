@@ -26,7 +26,13 @@ use super::{ExtractStats, Region};
 pub(super) struct Pass1Result {
     pub(super) bbox_node_ids: IdSet,
     pub(super) matched_way_ids: IdSet,
-    pub(super) all_way_node_ids: IdSet,
+    /// The node refs of matched ways that are not in `bbox_node_ids`. The
+    /// nodes a writer includes are the union of the two, and every writer
+    /// tests the region set first, so holding a ref in both bought nothing:
+    /// at a large region nearly every way ref is in the region, and the full
+    /// way-node set was a second node-ID-space-wide set (about 2.2 GB at
+    /// planet for a Europe-sized box) alive from the way classify to the end.
+    pub(super) outside_way_node_ids: IdSet,
     pub(super) matched_relation_ids: IdSet,
     /// Unfiltered way blob schedule built during PASS1's manual scan, plumbed
     /// out so smart PASS2 can reuse it instead of calling
@@ -51,17 +57,14 @@ pub(super) struct Pass1Result {
 /// - `SmartRelationHandler`: additionally collects way/node member IDs from
 ///   multipolygon/boundary relations
 pub(super) trait RelationHandler {
-    /// Whether workers should collect extra way/node member IDs from smart
+    /// Whether pass 1 collects extra way/node member IDs from smart
     /// relations (multipolygon/boundary). Compile-time constant - the compiler
     /// eliminates the dead branch in `CompleteRelationHandler`.
     const COLLECT_MEMBER_IDS: bool;
 
-    /// Process a single matched relation in the unsorted/mixed fallback path.
-    /// Called after the relation ID has already been added to `matched_relation_ids`.
-    fn handle_relation(&mut self, r: &crate::Relation);
-
-    /// Merge extra way/node IDs from parallel workers (sorted path phase 3).
-    fn merge_worker_extras(&mut self, extra_way_ids: IdSet, extra_node_ids: IdSet);
+    /// Take the member IDs [`Pass1Known::push_new_members`] collected,
+    /// leaving both vectors empty.
+    fn merge_extras(&mut self, way_ids: &mut Vec<i64>, node_ids: &mut Vec<i64>);
 }
 
 pub(super) struct CompleteRelationHandler;
@@ -69,11 +72,16 @@ pub(super) struct CompleteRelationHandler;
 impl RelationHandler for CompleteRelationHandler {
     const COLLECT_MEMBER_IDS: bool = false;
 
-    fn handle_relation(&mut self, _r: &crate::Relation) {}
-
-    fn merge_worker_extras(&mut self, _extra_way_ids: IdSet, _extra_node_ids: IdSet) {}
+    fn merge_extras(&mut self, way_ids: &mut Vec<i64>, node_ids: &mut Vec<i64>) {
+        way_ids.clear();
+        node_ids.clear();
+    }
 }
 
+/// Smart's relation-driven extras. Both sets are kept disjoint from what
+/// pass 1 already includes (`extra_way_ids` from `matched_way_ids`,
+/// `extra_node_ids` from the region and outside-way node sets): pass 3 tests
+/// those first, so an ID in both changed nothing but the set's size.
 struct SmartRelationHandler {
     extra_way_ids: IdSet,
     extra_node_ids: IdSet,
@@ -91,21 +99,39 @@ impl SmartRelationHandler {
 impl RelationHandler for SmartRelationHandler {
     const COLLECT_MEMBER_IDS: bool = true;
 
-    fn handle_relation(&mut self, r: &crate::Relation) {
-        if is_smart_relation(r) {
-            for m in r.members() {
-                match m.id {
-                    MemberId::Way(id) => self.extra_way_ids.set(id),
-                    MemberId::Node(id) => self.extra_node_ids.set(id),
-                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                }
-            }
+    fn merge_extras(&mut self, way_ids: &mut Vec<i64>, node_ids: &mut Vec<i64>) {
+        for id in way_ids.drain(..) {
+            self.extra_way_ids.set(id);
+        }
+        for id in node_ids.drain(..) {
+            self.extra_node_ids.set(id);
         }
     }
+}
 
-    fn merge_worker_extras(&mut self, extra_way_ids: IdSet, extra_node_ids: IdSet) {
-        self.extra_way_ids.merge(extra_way_ids);
-        self.extra_node_ids.merge(extra_node_ids);
+/// The pass 1 sets that are final by the time relations are classified,
+/// which a smart relation's members are filtered against.
+struct Pass1Known<'a> {
+    bbox_node_ids: &'a IdSet,
+    outside_way_node_ids: &'a IdSet,
+    matched_way_ids: &'a IdSet,
+}
+
+impl Pass1Known<'_> {
+    /// Push the members of smart relation `r` that pass 1 does not already
+    /// include.
+    fn push_new_members(&self, r: &crate::Relation, ways: &mut Vec<i64>, nodes: &mut Vec<i64>) {
+        for m in r.members() {
+            match m.id {
+                MemberId::Way(id) if !self.matched_way_ids.get(id) => ways.push(id),
+                MemberId::Node(id)
+                    if !self.bbox_node_ids.get(id) && !self.outside_way_node_ids.get(id) =>
+                {
+                    nodes.push(id);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -123,7 +149,7 @@ enum UnsortedPhase {
 /// three sequential `BlobReader` sweeps. Collects:
 /// - `bbox_node_ids`: nodes within the bounding box
 /// - `matched_way_ids`: ways referencing at least one bbox node
-/// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
+/// - `outside_way_node_ids`: node refs of matched ways outside the region
 /// - `matched_relation_ids`: relations with a member node in the region or a
 ///   member way matched, then every relation reaching one of those through
 ///   relation-type members, recursively (see [`add_parent_relations`])
@@ -142,7 +168,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 ) -> Result<Pass1Result> {
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
-    let mut all_way_node_ids = IdSet::new();
+    let mut outside_way_node_ids = IdSet::new();
     let mut matched_relation_ids = IdSet::new();
     // (member relation, parent relation) for every relation-type member of
     // every relation, matched or not: the parent closure below walks it.
@@ -162,6 +188,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     if !is_sorted {
         drop(blob_reader);
         let (mut st_scratch, mut gr_scratch) = (Vec::new(), Vec::new());
+        let (mut extras_ways, mut extras_nodes) = (Vec::new(), Vec::new());
         // One sweep per element kind, for the same reason the simple
         // strategy's unsorted fallback does it: matching a way needs
         // `bbox_node_ids` already complete, and matching a relation needs
@@ -225,15 +252,23 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                             if w.refs().any(|r| bbox_node_ids.get(r)) =>
                         {
                             matched_way_ids.set(w.id());
-                            for r in w.refs() {
-                                all_way_node_ids.set(r);
+                            for r in w.refs().filter(|&r| !bbox_node_ids.get(r)) {
+                                outside_way_node_ids.set(r);
                             }
                         }
                         (UnsortedPhase::Relations, Element::Relation(r)) => {
                             push_parent_edges(r, &mut parent_edges);
                             if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
                                 matched_relation_ids.set(r.id());
-                                handler.handle_relation(r);
+                                if H::COLLECT_MEMBER_IDS && is_smart_relation(r) {
+                                    let known = Pass1Known {
+                                        bbox_node_ids: &bbox_node_ids,
+                                        outside_way_node_ids: &outside_way_node_ids,
+                                        matched_way_ids: &matched_way_ids,
+                                    };
+                                    known.push_new_members(r, &mut extras_ways, &mut extras_nodes);
+                                    handler.merge_extras(&mut extras_ways, &mut extras_nodes);
+                                }
                             }
                         }
                         _ => {}
@@ -245,7 +280,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         return Ok(Pass1Result {
             bbox_node_ids,
             matched_way_ids,
-            all_way_node_ids,
+            outside_way_node_ids,
             matched_relation_ids,
             way_schedule: Vec::new(),
             pass3_blob_schedule: Vec::new(),
@@ -254,7 +289,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     // Sorted path: parallel three-phase classification via pread-from-workers.
     // Phase 1: nodes (bbox check) → bbox_node_ids
-    // Phase 2: ways (ref check against bbox_node_ids) → matched_way_ids + all_way_node_ids
+    // Phase 2: ways (ref check against bbox_node_ids) → matched_way_ids + outside_way_node_ids
     // Phase 3: relations (member check) → matched_relation_ids + handler extras
     drop(blob_reader);
     drop(decompress_buf);
@@ -453,7 +488,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     && w.refs().any(|r| bbox_node_ids.get(r))
                 {
                     way_ids.push(w.id());
-                    node_ids.extend(w.refs());
+                    node_ids.extend(w.refs().filter(|&r| !bbox_node_ids.get(r)));
                 }
             }
             Ok((way_ids, node_ids))
@@ -463,7 +498,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 matched_way_ids.set(id);
             }
             for id in node_ids {
-                all_way_node_ids.set(id);
+                outside_way_node_ids.set(id);
             }
         },
         host,
@@ -477,37 +512,49 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // under the noise floor of a 130 s run; smart also reads the relation
     // tags (`is_smart_relation`).
     host.invocation.marker("PASS1_RELATION_CLASSIFY_START");
-    let collect_member_ids = H::COLLECT_MEMBER_IDS;
-    crate::scan::classify::parallel_classify_accumulate(
+    // Per-blob send, not per-worker accumulation: a worker-held `IdSet` of
+    // smart member IDs promoted its own dense chunks for members dispersed
+    // over the ID space, so the phase's memory scaled with the worker count
+    // (planet, Europe-sized box: 7.8 GB peak against 4.5 GB either side).
+    // Workers only read `bbox_node_ids`, `outside_way_node_ids` and
+    // `matched_way_ids`, all final here, while the consumer writes the
+    // relation set, the handler's extras and the edge list.
+    let known = Pass1Known {
+        bbox_node_ids: &bbox_node_ids,
+        outside_way_node_ids: &outside_way_node_ids,
+        matched_way_ids: &matched_way_ids,
+    };
+    let known = &known;
+    crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &relation_schedule,
         None,
-        || (IdSet::new(), IdSet::new(), IdSet::new(), Vec::new()),
-        |block, (rel_ids, extra_way_ids, extra_node_ids, edges)| {
+        || (),
+        |block, _s| {
+            let mut rel_ids = Vec::new();
+            let mut extra_ways = Vec::new();
+            let mut extra_nodes = Vec::new();
+            let mut edges = Vec::new();
             for element in block.elements_skip_metadata() {
                 let Element::Relation(r) = &element else {
                     continue;
                 };
-                push_parent_edges(r, edges);
-                if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                    rel_ids.set(r.id());
-                    if collect_member_ids && is_smart_relation(r) {
-                        for m in r.members() {
-                            match m.id {
-                                MemberId::Way(id) => extra_way_ids.set(id),
-                                MemberId::Node(id) => extra_node_ids.set(id),
-                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                            }
-                        }
+                push_parent_edges(r, &mut edges);
+                if relation_has_matched_member(r, known.bbox_node_ids, known.matched_way_ids) {
+                    rel_ids.push(r.id());
+                    if H::COLLECT_MEMBER_IDS && is_smart_relation(r) {
+                        known.push_new_members(r, &mut extra_ways, &mut extra_nodes);
                     }
                 }
             }
-            Ok(())
+            Ok((rel_ids, extra_ways, extra_nodes, edges))
         },
-        |(worker_rel_ids, worker_extra_way_ids, worker_extra_node_ids, worker_edges)| {
-            matched_relation_ids.merge(worker_rel_ids);
-            handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
-            parent_edges.extend(worker_edges);
+        |_seq, (rel_ids, mut extra_ways, mut extra_nodes, edges)| {
+            for id in rel_ids {
+                matched_relation_ids.set(id);
+            }
+            handler.merge_extras(&mut extra_ways, &mut extra_nodes);
+            parent_edges.extend(edges);
         },
         host,
     )?;
@@ -519,7 +566,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     Ok(Pass1Result {
         bbox_node_ids,
         matched_way_ids,
-        all_way_node_ids,
+        outside_way_node_ids,
         matched_relation_ids,
         way_schedule: full_way_schedule,
         pass3_blob_schedule,
@@ -572,8 +619,8 @@ pub(super) fn extract_smart(
 
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---
     host.invocation.marker("SMART_PASS2_START");
-    // For each way in extra_way_ids not already in matched_way_ids,
-    // collect all node refs into extra_node_ids.
+    // For each way in extra_way_ids (none of them matched), collect the node
+    // refs pass 1 does not include into extra_node_ids.
     // Reuses PASS1's full_way_schedule (built during the manual header scan
     // in collect_pass1_generic) to avoid a second 19-second
     // build_classify_schedule call after PASS1's parallel work. Saves ~16%
@@ -598,7 +645,8 @@ pub(super) fn extract_smart(
         host.invocation.marker("SMART_PASS2_SCHEDULE_END");
 
         let extra_way_ids_ref = &handler.extra_way_ids;
-        let matched_way_ids_ref = &result.matched_way_ids;
+        let bbox_node_ids_ref = &result.bbox_node_ids;
+        let outside_way_node_ids_ref = &result.outside_way_node_ids;
         // Per-blob send (not accumulate): extra_way_ids is relation-driven and
         // can be wide + globally dispersed. Per-worker IdSet accumulate over
         // an unbounded node-ID set is the unsafe shape the helper doc warns
@@ -623,10 +671,13 @@ pub(super) fn extract_smart(
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element {
                         let wid = w.id();
-                        if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
-                            for r in w.refs() {
-                                scratch.push(r);
-                            }
+                        // `extra_way_ids` holds no matched way (see
+                        // `SmartRelationHandler`), and refs pass 1 already
+                        // includes stay out of `extra_node_ids`.
+                        if extra_way_ids_ref.get(wid) {
+                            scratch.extend(w.refs().filter(|&r| {
+                                !bbox_node_ids_ref.get(r) && !outside_way_node_ids_ref.get(r)
+                            }));
                         }
                     }
                 }
@@ -670,7 +721,7 @@ pub(super) fn extract_smart(
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &result.bbox_node_ids,
-        all_way_node_ids: &result.all_way_node_ids,
+        outside_way_node_ids: &result.outside_way_node_ids,
         extra_node_ids: &extra_node_ids,
         matched_way_ids: &result.matched_way_ids,
         extra_way_ids: &handler.extra_way_ids,
@@ -713,7 +764,7 @@ pub(super) fn extract_smart(
 /// Read-only ID sets for Pass 3 of smart strategy, shared across rayon threads.
 struct ExtractPass3IdSets<'a> {
     bbox_node_ids: &'a IdSet,
-    all_way_node_ids: &'a IdSet,
+    outside_way_node_ids: &'a IdSet,
     extra_node_ids: &'a IdSet,
     matched_way_ids: &'a IdSet,
     extra_way_ids: &'a IdSet,
@@ -750,7 +801,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
             Element::DenseNode(dn) => {
                 let id = dn.id();
                 let in_bbox = ids.bbox_node_ids.get(id);
-                let from_way = ids.all_way_node_ids.get(id);
+                let from_way = ids.outside_way_node_ids.get(id);
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
@@ -774,7 +825,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
             Element::Node(n) => {
                 let id = n.id();
                 let in_bbox = ids.bbox_node_ids.get(id);
-                let from_way = ids.all_way_node_ids.get(id);
+                let from_way = ids.outside_way_node_ids.get(id);
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;

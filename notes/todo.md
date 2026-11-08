@@ -1173,6 +1173,27 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **Byte-budgeted fused task engine (moved from the pre-release
+  note 2026-11-08).** One execution model for decode, transform, encode
+  and frame under one byte budget, replacing the unordered classify pool,
+  `run_ordered`, the writer's separate rayon framing dispatch and
+  apply-changes' private scanner/worker/drain pipeline. Admit tasks in
+  sequence order against the budget; reserve a completion envelope before
+  a task runs (piecemeal credit acquisition deadlocks: every worker holds
+  input credit while waiting on output credit and the earliest task
+  starves); release credit when storage becomes reusable (ordering
+  reservation at ordered delivery, output lease at I/O completion). Makes
+  transient memory a chosen constant independent of worker count. Moving
+  storage from workers to tasks does not lower peak by itself at
+  saturation; the budget value is the memory control, and fusion shrinks
+  the envelope so the same budget sustains more concurrency. Risks: the
+  admission protocol's liveness around the earliest task, oversized and
+  hostile blobs, cancellation and error paths that release leases, and a
+  byte ledger does not bound pages glibc retains. apply-changes now bounds
+  outstanding seqs by count (`apply_changes/window.rs`, 512, non-binding
+  at planet with in-flight peaks of 300-410); a byte budget here would
+  replace that window, not sit beside it.
+
 - [ ] **glibc's mmap threshold, per command.** A CLI-wide fixed threshold
   was ruled out at planet; a per-command choice, the measurements it still
   needs across dataset sizes and hosts, and the structural route (recycling

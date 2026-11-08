@@ -227,7 +227,7 @@ pub(crate) fn release_scratch<T>(v: &mut Vec<T>) {
     if v.capacity().saturating_mul(std::mem::size_of::<T>())
         > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY
     {
-        *v = Vec::new();
+        drop(std::mem::take(v));
     }
 }
 

@@ -173,7 +173,7 @@ fn rejects_oversize(
 /// decoding the blob.
 pub(crate) fn release_decode_outlier(buf: &mut Vec<u8>, invocation: &crate::host::Recorder) {
     if rejects_oversize(buf.capacity(), &invocation.metrics().decompress) {
-        *buf = Vec::new();
+        drop(std::mem::take(buf));
     }
 }
 

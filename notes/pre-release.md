@@ -194,27 +194,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Memory and throughput: structural work
 
-### WRK-022: Byte-budgeted fused task engine
-
-One execution model for decode, transform, encode and frame under one byte
-budget, replacing the unordered classify pool, `run_ordered`, the writer's
-separate rayon framing dispatch and apply-changes' private
-scanner/worker/drain pipeline. Admit tasks in sequence order against the
-budget; reserve a completion envelope before a task runs (piecemeal credit
-acquisition deadlocks: every worker holds input credit while waiting on
-output credit and the earliest task starves); release credit when storage
-becomes reusable (ordering reservation at ordered delivery, output lease at
-I/O completion). Makes transient memory a chosen constant independent of
-worker count. Moving storage from workers to tasks does not lower peak by
-itself at saturation; the budget value is the memory control, and fusion
-shrinks the envelope so the same budget sustains more concurrency. Risks:
-the admission protocol's liveness around the earliest task, oversized and
-hostile blobs, cancellation and error paths that release leases, and a byte
-ledger does not bound pages glibc retains. apply-changes now bounds outstanding seqs by count
-(`apply_changes/window.rs`, 512, non-binding at planet with in-flight
-peaks of 300-410); a byte budget here would replace that window, not sit
-beside it.
-
 ### WRK-180: check --ids --full proves duplicates absent from monotonicity
 
 The default mode of `src/commands/check/verify_ids.rs` already proves
@@ -341,10 +320,11 @@ from tagdata; `dd37f62e` (2026-10-22, after v0.5.0, unreleased) keeps it,
 and the CHANGELOG has no entry for that fix. Consequence: on files written
 by pbfhogg v0.5.0 or earlier, a `tags-filter` expression naming the empty
 key can skip a blob holding a match, silently. The CHANGELOG says so and
-names the repair. Plantasjen's planet is reindexed
-(`planet-20260223-reindexed.osm.pbf`, `check --index` OK). Left, filed in
-bz: bygg's planet, and `check --index` over every other indexed dataset
-file on both hosts, reindexing any that fail.
+names the repair. Both hosts' planets are reindexed
+(`planet-20260223-reindexed.osm.pbf`, xxhash `e7f431ab...`, byte-identical
+on plantasjen and bygg, `check --index` OK on both). Left, filed in bz:
+`check --index` over every other indexed dataset file on both hosts,
+reindexing any that fail.
 
 ### WRK-179: check --index takes 11 minutes at planet
 

@@ -377,8 +377,8 @@ download_date = "2026-03-07"
 bbox = "13.0,52.3,13.8,52.7"
 
 [bygg.datasets.planet.pbf.indexed]
-file = "planet-20260223-with-indexdata.osm.pbf"
-xxhash = "3ce64c662db10ed2c551ad2737144df1"
+file = "planet-20260223-reindexed.osm.pbf"
+xxhash = "e7f431ab422a0ccdb75d270528ac3e2e"
 seq = 4912
 
 [bygg.datasets.planet.pbf.altw]

@@ -35,9 +35,9 @@ import sys
 SENTINEL = "hotpath-cpu absent"
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 AUDITED = {
-    "hotpath": "0.31.0",
-    "hotpath-macros": "0.31.0",
-    "hotpath-drain": "0.31.0",
+    "hotpath": "0.31.1",
+    "hotpath-macros": "0.31.1",
+    "hotpath-drain": "0.31.1",
 }
 FORBIDDEN = "hotpath-cpu"
 

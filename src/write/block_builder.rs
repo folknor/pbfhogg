@@ -1485,7 +1485,7 @@ impl BlockBuilder {
         const LIMIT: usize = MAX_RETAINED_SCRATCH_CAPACITY;
         fn release<T>(v: &mut Vec<T>) {
             if v.capacity().saturating_mul(std::mem::size_of::<T>()) > LIMIT {
-                *v = Vec::new();
+                drop(std::mem::take(v));
             }
         }
         release(&mut self.dense_ids);

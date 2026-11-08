@@ -1016,6 +1016,43 @@ suite; the rest still carry their older commit in the Notes column.
 > planet groups are two copies, below the index threshold and inside one
 > block, so normal input takes the old path.
 
+> **Denmark and Japan across the engine move (2026-11-08, bygg, kernel
+> 7.2.14).** `cat --dedupe` of each dataset's indexed file with itself,
+> `dd312160` (the old engine, parent of the move) against `79d2e923` (the
+> move: `HeaderWalker` pass 1, overlap runs swept on dedicated threads)
+> against HEAD `4e0eaa50`, every arm a `--commit` worktree build (so
+> brokkr#105's build offset cancels). Script bench `dedupe-self`
+> (`benches/cat/dedupe-self.lua`), one iteration per cell, the input's page
+> cache fixed and fincore-checked as the merge starts: cold (evicted) or
+> warm (wholly resident). Arms rotated across rounds, denmark cold all six
+> orders, the other conditions three. Walls in seconds; per cell, range
+> across cells:
+>
+> | Condition | `dd312160` | `79d2e923` | `4e0eaa50` |
+> |---|---|---|---|
+> | denmark cold (6 cells) | 28.1-28.9 | 2.8 | 1.3-1.4 |
+> | denmark warm (3) | 27.9-28.9 | 2.1-2.2 | 1.2 |
+> | japan cold (3) | 141-142 | 13.0-13.1 | 6.1-6.5 |
+> | japan warm (3) | 140-141 | 9.4-9.6 | 5.2-5.7 |
+>
+> The move made the self-merge about 10x faster on Denmark and 11-15x on
+> Japan; everything after it to HEAD (the borrowed-cursor sweep `13ec0927`
+> among it, not isolated here) halved it again. Cold costs the old engine
+> nothing measurable (its cold and warm walls overlap); at HEAD, cold
+> Japan's pass 1 is 0.92 s against 0.04 s warm (`2bcd9315` against
+> `91bf8ad9`), almost all of that cell pair's 0.89 s gap; pass 2 took
+> 5.61 s against 5.60 s although it read from disk cold. Japan
+> peak anon: 89 MB, 1.18 GB, 368 MB for the three arms (`1524888a`,
+> `83fc73eb`, `91bf8ad9`); the move's sweep threads bought the speed with
+> memory, and HEAD gives most of it back. Output is the same size on every
+> arm (denmark 495,905,546 bytes, japan 2,417,611,089), and `--check yes`
+> runs (`19f2ce5f`, `89f2ce1e`, `f6d7708e`) diff each arm's denmark output
+> against its input with no difference. The iteration wall includes about
+> 12-15 ms of fincore and eviction before the merge, about 1 % of the
+> fastest (denmark HEAD) cells and less elsewhere.
+> What this does not measure: the self-merge puts every blob in a two-blob
+> run, so passthrough and its coalesced `copy_file_range` never run.
+
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
 > (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day.

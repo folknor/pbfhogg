@@ -21,6 +21,21 @@
 # and goes up, with a changelog entry and a new date, whenever a change
 # makes its runs stop comparing with earlier ones.
 
+# -- cat
+
+[bench.dedupe-self]
+script_file = "../benches/cat/dedupe-self.lua"
+description = "cat --dedupe of a dataset's file with itself, input cold or warm as the merge starts"
+version = 1
+date = 2026-11-08
+changelog = [
+  { version = 1, date = 2026-11-08, note = "Added: cache state fixed and checked with fincore inside the timed block" },
+]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the PBF variant merged with itself" }
+params.cache = { required = true, help = "cold or warm: the input's page-cache state as the merge starts" }
+params.check = { default = "no", help = "yes: diff the output against the input after the merge (a correctness run, not a timing cell)" }
+
 # -- compare
 
 [bench.vs-osmium]

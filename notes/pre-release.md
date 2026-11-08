@@ -244,11 +244,18 @@ attribution is superseded: the callers were reshaped since (`7e7ede73`,
 - altw external stage 4 under `--keep-untagged-nodes`, the case the eager
   passthrough targets, is unmeasured: brokkr cannot forward the flag.
 
-### WRK-086: cat --dedupe on Denmark and Japan across the engine move
+### WRK-086: cat --dedupe passthrough across the engine move
 
-`79d2e923^` vs `79d2e923`, then HEAD. Pass 1 moved to `HeaderWalker` preads,
-passthrough to coalesced `copy_file_range`, overlap runs to dedicated sweep
-threads; `13ec0927` has since replaced the sweep itself.
+Residue. The self-merge is measured on both datasets across `79d2e923^`,
+`79d2e923` and HEAD (reference/performance.md, "Denmark and Japan across
+the engine move": about 10x faster at the move, halved again since). A
+self-merge puts every blob in an overlap run, so the move's coalesced
+`copy_file_range` passthrough is unmeasured. Measuring it needs an input
+pair whose plan shows nonzero passthrough with adjacent ranges that
+coalesce (check `cat_dedupe_blobs_passthrough` and
+`cat_dedupe_copy_range_coalesced` at HEAD first), then the same pair on all
+three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
+second input.
 
 ### WRK-087: sort on planet across the engine move
 
@@ -275,6 +282,14 @@ Planet `diff-snapshots --from base --to 20260411`, text and osc,
 `2c12a955^` vs `2c12a955`, expected unchanged. Recorded sequential planet
 figures, which cannot be re-measured: text 2134 s (`a9d430f2`), osc
 2225.6 s, peak anon about 28-41 MB per phase; header walk about 15 s cold.
+
+An observed, unbisected slowdown worth checking first: `pbfhogg diff` of the Denmark
+indexed file against its own `cat --dedupe` self-merge (equal elements,
+different framing) took 1.29 s at `79d2e923` (an ancestor of `2c12a955`)
+and 8.22 s at `4e0eaa50`, both `--commit` worktree builds on bygg, input
+warm, one run each (`dedupe-self --check yes` cells `89f2ce1e` and
+`f6d7708e`, the diff child). Each arm diffed its own merge output, so a
+matched pair on the same two files comes first; then bisect.
 
 ### WRK-093: Unindexed sequential diff
 

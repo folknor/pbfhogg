@@ -538,7 +538,7 @@ fn ceil_div(a: i128, b: i128) -> i128 {
 )]
 mod tests {
     use super::*;
-    use crate::blob_meta::{BlobFilter, scan_block_ids, scan_block_ids_checked, scan_block_tags};
+    use crate::blob_meta::{scan_block_ids, scan_block_ids_checked, scan_block_tags};
 
     // --- Minimal protobuf wire-format builders --------------------------
 
@@ -1077,17 +1077,15 @@ mod tests {
         assert_eq!(ti.keys(), &[Box::<[u8]>::from(&b"amenity"[..])]);
     }
 
-    /// The decoder yields empty-string keys, and `-e ',highway'` requires
-    /// one; an index without it makes the filter skip a matching blob.
+    /// The decoder yields empty-string keys, so the scanned index lists one;
+    /// `check --index` compares a stored set against this exactly.
     #[test]
     fn empty_string_keys_are_in_the_tag_index() {
         let mut g = Vec::new();
         write_len_delimited(3, &element_msg(1, &[1], &[2]), &mut g);
         let block = block_with_strings(&[b"", b"", b"v"], &[&g]);
         let ti = scan_block_tags(&block).unwrap();
-        let filter = BlobFilter::new(true, true, true)
-            .with_required_tag_keys(vec![String::new(), "highway".to_string()]);
-        assert!(filter.wants_tag_index(&ti));
+        assert_eq!(ti.keys(), &[Box::<[u8]>::from(&b""[..])]);
     }
 
     // --- bbox -----------------------------------------------------------

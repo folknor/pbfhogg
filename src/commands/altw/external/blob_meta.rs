@@ -112,6 +112,15 @@ pub(super) fn scan_blob_metadata(
             None
         };
         let has_tagindex = tag_index.is_some();
+        // An entirely empty stored key set is trusted as "no tagged
+        // elements", and lets stage 4 drop the blob's untagged nodes without
+        // decoding it. Accepted residue: pbfhogg 0.5.0 and earlier dropped an
+        // explicit empty tag key from tagdata, so a legacy node blob whose
+        // only tag key is "" carries this same encoding and loses its
+        // empty-key-tagged nodes here. It cannot be told apart from the
+        // scanner's legitimate zero-key tagdata for an untagged blob without
+        // decoding the payload, which would forfeit the skip on every file;
+        // `check --index` reports the omission and `cat --reindex` repairs it.
         let has_tags = if parse_tagdata {
             tag_index.is_none_or(|ti| !ti.keys_empty())
         } else {

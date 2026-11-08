@@ -10,8 +10,12 @@ Status: Accepted
 
 `BlobHeader.indexdata` (element kind, ID range, element count, spatial bbox)
 and `BlobHeader.tagdata` (the blob's tag key set) stay **trusted by default**
-on every read path. Verification is a separate, opt-in command rather than a
-precondition of using the fields:
+on every read path, with one narrow exception: tag-key filtering never uses
+tagdata to reject a blob for a required empty key or empty prefix, because
+pbfhogg 0.5.0 and earlier omitted an explicit empty key from the tagdata they
+wrote (the external add-locations-to-ways join still trusts an entirely empty
+key set; `reference/indexdata-trust.md` states the residue). Verification is a
+separate, opt-in command rather than a precondition of using the fields:
 
 - `pbfhogg check --index` decompresses every blob, re-derives the metadata from
   the payload with `scan_block_ids` / `scan_block_tags`, and reports each

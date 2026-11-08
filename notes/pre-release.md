@@ -69,9 +69,8 @@ actually gives, not an assumption:
 
 - Planet `pbf.indexed`: `check-refs = "clean"` (`0accad98`, exit 0) and
   `check-ids = "clean"` (`4edab6b2`, and `f6ba05d4` for `--full`), both
-  post-split cells at `627883d7`. `check-index = "clean"` on plantasjen's
-  reindexed planet (`e7f431ab...`, 2026-11-05); bygg's is still the old
-  file until its own reindex.
+  post-split cells at `627883d7`. `check-index = "clean"` on the reindexed
+  planet (`e7f431ab...`, both hosts).
 - Denmark, germany, europe and the other regional extracts: every stored
   check cell predates the exit-code split (`854f9465`), so exit 1 there is
   ambiguous. A Geofabrik cut may carry relation members outside the region,
@@ -80,7 +79,7 @@ actually gives, not an assumption:
 - `diff` per OSC: a primary diffed against itself with its next OSC applied
   should be `differs` (denmark 4705, planet 4913, and so on).
 - `expect.diff-snapshots`: planet base against `20260411`
-  (`3ce64c66...` on bygg, `e7f431ab...` on plantasjen, + `7facb638...`) is
+  (`e7f431ab...` on both hosts, + `7facb638...`) is
   two different planets, `differs`.
 - Deliberately broken snapshots: `unsorted` / `test-unsorted`
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
@@ -216,22 +215,19 @@ still held. Only adversarial or many-version input reaches the hold.
 
 ## Correctness
 
-### WRK-165: tagdata written by v0.5.0 and earlier can omit an empty tag key
+### WRK-186: `cat --reindex` summary counts only indexdata changes
 
-Found 2026-11-03 running `check --index` over the planet bench file
-(`planet-20260223-with-indexdata`, written by an older pbfhogg): every one
-of its 50,816 blobs carries tagdata, all well-formed, and exactly one
-(blob 32633, offset 61377444639) fails: "tagdata omits 1 key(s) the blob
-carries (e.g. "")". The builder used to drop an explicit empty tag key
-from tagdata; `dd37f62e` (2026-10-22, after v0.5.0, unreleased) keeps it,
-and the CHANGELOG has no entry for that fix. Consequence: on files written
-by pbfhogg v0.5.0 or earlier, a `tags-filter` expression naming the empty
-key can skip a blob holding a match, silently. The CHANGELOG says so and
-names the repair. Both hosts' planets are reindexed
-(`planet-20260223-reindexed.osm.pbf`, xxhash `e7f431ab...`, byte-identical
-on plantasjen and bygg, `check --index` OK on both). Left, filed in bz:
-`check --index` over every other indexed dataset file on both hosts,
-reindexing any that fail.
+`cat --reindex` prints "Reindexed N blobs; M carried indexdata that was
+missing or disagreed with the payload", and `ReindexStats::blobs_changed`
+compares only the indexdata (src/commands/cat/reindex.rs). Repairing the
+three bygg planet files whose tagdata omitted the empty key (2026-11-08,
+at `b00e2e0b`) printed "0 carried" each time, though every one changed
+tagdata (one blob each, and blobs that had no tagdata gained it). A user
+running the documented repair for false tagdata is told nothing was wrong.
+The fix counts a blob as changed when its tagdata differs from the rescan
+too, or reports the two counts separately; the line is documented in
+docs/cli/commands.md (`--reindex`), so the wording change is a CLI
+contract change with a CHANGELOG entry.
 
 ---
 

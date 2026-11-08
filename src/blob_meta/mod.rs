@@ -529,14 +529,22 @@ impl BlobFilter {
     /// Returns true (conservative) if no tag filter is set. When both keys and
     /// prefixes are configured, the blob passes if ANY key OR ANY prefix matches
     /// (union semantics - each expression contributes either a key or prefix).
+    ///
+    /// A required empty key or empty prefix always passes: tagdata is never
+    /// used to prove a blob lacks the empty key. pbfhogg 0.5.0 and earlier
+    /// dropped an explicit empty tag key from the tagdata they wrote, and raw
+    /// copies (plain `cat`, add-locations-to-ways node passthrough) carry such
+    /// tagdata into newer files, so on those files a key set without `""`
+    /// says nothing about it. `check --index` still compares the stored set
+    /// exactly and reports the omission; `cat --reindex` repairs it.
     pub(crate) fn wants_tag_index(&self, tag_index: &TagIndex) -> bool {
         if let Some(ref keys) = self.required_tag_keys
-            && tag_index.has_any_key(keys)
+            && (keys.iter().any(|k| k.is_empty()) || tag_index.has_any_key(keys))
         {
             return true;
         }
         if let Some(ref prefixes) = self.required_tag_prefixes
-            && tag_index.has_any_prefix(prefixes)
+            && (prefixes.iter().any(|p| p.is_empty()) || tag_index.has_any_prefix(prefixes))
         {
             return true;
         }

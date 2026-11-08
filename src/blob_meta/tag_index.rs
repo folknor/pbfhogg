@@ -536,4 +536,28 @@ mod tests {
             "neither key nor prefix matches → reject"
         );
     }
+
+    /// Tagdata written by pbfhogg 0.5.0 and earlier omits an explicit empty
+    /// key, so a key set lacking `""` (even an empty set) cannot reject a
+    /// blob for a filter that asks for the empty key or an empty prefix.
+    #[test]
+    fn wants_tag_index_never_rejects_for_the_empty_key() {
+        let legacy = TagIndex {
+            keys: vec![b"name"[..].into()],
+        };
+        let empty = TagIndex { keys: Vec::new() };
+        let key = BlobFilter::new(true, true, true)
+            .with_required_tag_keys(vec![String::new(), "highway".to_string()]);
+        assert!(key.wants_tag_index(&legacy));
+        assert!(key.wants_tag_index(&empty));
+        let prefix =
+            BlobFilter::new(true, true, true).with_required_tag_prefixes(vec![String::new()]);
+        assert!(prefix.wants_tag_index(&empty));
+        let other =
+            BlobFilter::new(true, true, true).with_required_tag_keys(vec!["highway".to_string()]);
+        assert!(
+            !other.wants_tag_index(&legacy),
+            "a non-empty key still skips"
+        );
+    }
 }

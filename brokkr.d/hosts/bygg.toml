@@ -382,8 +382,8 @@ xxhash = "e7f431ab422a0ccdb75d270528ac3e2e"
 seq = 4912
 
 [bygg.datasets.planet.pbf.altw]
-file = "planet-20260223-altw.osm.pbf"
-xxhash = "e83b43b8b1883efcc252e47b5c275535"
+file = "planet-20260223-altw-reindexed.osm.pbf"
+xxhash = "ba84918280f56f697d8f41c5b2bfb13d"
 seq = 4912
 
 # Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes
@@ -391,8 +391,8 @@ seq = 4912
 # --locations-on-ways resolves every OSC-way ref. The plain `altw` variant
 # drops untagged nodes and cannot take -l on a real diff.
 [bygg.datasets.planet.pbf.altw-keep-untagged]
-file = "planet-20260223-altw-keep-untagged.osm.pbf"
-xxhash = "bdf1f1b6b242b3650ce2dca39ee868c7"
+file = "planet-20260223-altw-keep-untagged-reindexed.osm.pbf"
+xxhash = "7032bf0fa72fee2845f7355e4e2c7a64"
 seq = 4912
 
 [bygg.datasets.planet.pbf.raw]
@@ -452,5 +452,5 @@ seq = 4954
 download_date = "2026-07-10"
 
 [bygg.datasets.planet.snapshot.8k.pbf.indexed]
-file = "planet-8k-with-indexdata.osm.pbf"
-xxhash = "0725049652040e1d361f8a2471a6739f"
+file = "planet-8k-reindexed.osm.pbf"
+xxhash = "8055a8ce2618e9762c4798c8e26e7278"

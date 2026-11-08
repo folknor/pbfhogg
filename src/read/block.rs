@@ -1743,6 +1743,12 @@ fn validate_info(info_data: Option<&[u8]>) -> Result<Option<super::wire::WireInf
 /// views (a private pairing type assembled only where the slice is derived)
 /// are possible without runtime cost, but would restate the boundary this
 /// module already keeps, not replace the invariant or this check.
+///
+/// Cost: measured on planet against the tree before this check, the
+/// per-element parse refusals and the re-encode `Result`s in `owned.rs`
+/// together cost nothing visible on `brokkr read` or `repack`
+/// (reference/performance.md, "Element parse and re-encode refusals checked
+/// in release"). Re-measure only after a change to these sites.
 #[inline]
 #[track_caller]
 pub(super) fn validated<T, E: std::fmt::Display>(

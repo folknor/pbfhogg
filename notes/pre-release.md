@@ -225,16 +225,6 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-082: The validated-invariant trio
-
-`brokkr read --dataset planet` plus one tag-heavy re-encoding command
-(`tags-filter` or `inspect --tags`), `5a9d40e4` vs `85c1428c`. Covers
-`e28fdf69` (`take_message` slot check per element parse, elements parsed
-twice), `9c85d37e` (a cold panic call per element and two per dense tag
-varint, through a generic `#[inline]` `#[track_caller]` helper) and
-`85c1428c` (a `Result` per kept element on every re-encoding command, a push
-loop instead of `extend` for roles). Bisect only above 3 %.
-
 ### WRK-083: The partial-index guard
 
 `brokkr read --dataset planet`, `84f50b31^` vs `84f50b31`. An armed frame now

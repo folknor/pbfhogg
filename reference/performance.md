@@ -2341,6 +2341,43 @@ plus the change, built in the main tree. No trim of its own.
 No cost: the variant is faster, by an amount within the run-to-run spread
 these cells show, so no gain is claimed either.
 
+### Element parse and re-encode refusals checked in release (bygg, 2026-11-08, `5a9d40e4` vs `85c1428c`)
+
+The pair brackets exactly three changes (`5a9d40e4` itself touches only
+altw external): `e28fdf69` (`take_message` refuses a second data-bearing
+`Info` or `DenseInfo` at element parse; the `info()` accessors panic on a
+broken invariant instead of defaulting), `9c85d37e` (the block iterators
+and the per-node dense `keys_vals` walk go through `validated`, an inlined
+branch onto a cold panic, instead of skipping or reading less) and
+`85c1428c` (the re-encoding paths in `src/owned.rs` return a `Result` per
+element for the user lookup and per member for the role, through
+`relation_members_into`).
+
+Planet (`planet-20260223-reindexed`), both arms `--commit` worktree builds
+(the same build path, so brokkr#105's worktree offset cancels), `--bench 1`,
+arms alternated A B B A, kernel 7.2.14. `brokkr read` runs the element parse
+and iterator checks but never touches `info()` or a re-encode; `repack`
+re-encodes every element with its metadata (10.45G nodes, 1.17G ways,
+14.1M relations through `relation_members_into`, 98.4 GB written), so it
+runs every `85c1428c` site. A way-only `tags-filter` was rejected as the
+re-encode cell: it keeps no relation and never reaches the role loop.
+
+| cell | `5a9d40e4` (s) | `85c1428c` (s) | delta |
+|---|---|---|---|
+| read sequential, round 1 | 512.3 (`a5bbad97`) | 508.4 (`a3bdd79a`) | -0.8 % |
+| read sequential, round 2 | 512.9 (`a139aae7`) | 508.3 (`314f89ac`) | -0.9 % |
+| read parallel, round 1 | 28.6 (`6ce94499`) | 28.7 (`65019195`) | +0.2 % |
+| read parallel, round 2 | 30.2 (`16bf1999`) | 30.2 (`b8df6cad`) | 0.0 % |
+| repack, round 1 | 260.5 (`1000e419`) | 261.8 (`65d789b4`) | +0.5 % |
+| repack, round 2 | 263.5 (`2d9e0431`) | 264.6 (`00e308e4`) | +0.4 % |
+
+No measurable cost on any cell: every delta is under 1 %, inside the noise
+floor, and both rounds agree. This is a screen for a regression, not a
+proof of a bound: the pair can say the checks cost nothing visible at
+planet, not that their cost is under any figure. The verdict is for the
+pair; the checked functions are unchanged since, but the code around them
+is not, so it is not re-claimed for later trees without a cell there.
+
 ### HeaderWalker / next_header_skip_blob regression check (commit `436998b`, re-measured 2026-04-26 at `16e3694`)
 
 The `436998b` (2026-04-26) read-path truncation alignment added small

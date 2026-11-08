@@ -893,6 +893,27 @@ pub(crate) const EXTRACT_SIMPLE_BATCH_SIZE: usize = 64;
 /// candidates instead of testing every region linearly.
 pub(crate) const GRID_REGION_THRESHOLD: usize = 16;
 
+/// Largest member count a multi-extract membership page (4096 IDs) stores
+/// as a sorted offset list instead of a union bitmap. A lookup policy, not
+/// the memory crossover (about 264 members): above it a binary search on the
+/// hot way-classify path costs more than the bitmap's rank.
+pub(crate) const MEMBERSHIP_SPARSE_MEMBERS_MAX: usize = 256;
+
+/// Largest member count of one region's sorted offset list inside a mutable
+/// multi-extract membership page, before it becomes a 64-word bitmap.
+pub(crate) const MEMBERSHIP_PART_SPARSE_MAX: usize = 32;
+
+/// Whole-page merges a compact multi-extract membership page takes before it
+/// converts, one way, to its mutable form. Honest sorted input merges only
+/// pages two blobs share; the budget bounds what a page that keeps being
+/// revisited (duplicates, false sort claims, tiny blobs) costs to rebuild.
+pub(crate) const MEMBERSHIP_MERGE_BUDGET: u8 = 2;
+
+/// Pages a multi-extract membership chunk (2^25 IDs) keeps in a sorted list
+/// before it switches to its 8192-slot table, so scattered isolated IDs do not
+/// each pay a whole table.
+pub(crate) const MEMBERSHIP_SPARSE_TABLE_MAX: usize = 256;
+
 /// Maximum number of extracts a multi-extract config may declare.
 pub(crate) const MAX_EXTRACTS: usize = 500;
 

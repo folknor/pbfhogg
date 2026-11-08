@@ -2747,8 +2747,43 @@ after the final flush, once `MULTI_REL_WRITE_END` and every other phase
 marker has ended, between `PUBLISH_START` and `PUBLISH_END`; the `writer_sync_all_ns` and
 `writer_sync_all_calls` counters attribute that cost). The rows below
 predate the per-output sync and the 256 KiB per-output buffer. 3-phase
-barrier (nodes → ways → relations) with per-region `IdSetDense` +
-`BlockBuilder`. 5 disjoint longitude strips per configured bench.
+barrier (nodes → ways → relations), with per-region `BlockBuilder`s and,
+since the shared region membership below, one membership structure per
+kind (the rows in this table predate it and used one `IdSet` per region
+and kind). 5 disjoint longitude strips per configured bench.
+
+### Shared region membership (bygg, baseline `4109d1c4`, 2026-11-08)
+
+One `extract/membership.rs` `Membership` per kind (pages of 4096 IDs, a
+union of members with a palette of region masks, a per-region mutable form
+for revisited pages) replaced N `IdSet`s per kind. Before it, the five node
+sets were 406 dense 4 MiB chunks each (8.5 GB, essentially the whole peak):
+OSM IDs are chronological, so every region's nodes spread over the whole
+ID history, and even 1M members over 400 chunks passes the 1024-member
+sparse cap. Counted with temporary counters at baseline, item config: node
+members per region 0.38e9 / 0.90e9 / 1.11e9 / 0.67e9 / 0.36e9 over 13.6e9
+ID positions; way sets 5 x 45 chunks for 0.42e9 members.
+
+Planet `planet-20260223-reindexed`, `--simple`, `--bench 1` cells,
+interleaved. A is clean `4109d1c4` (stored); B is the uncommitted variant
+on the same base (`--force`, numbers from `brokkr sidecar dirty`).
+
+| Config | Arm | Wall | Peak anon | Node classify | Way classify | UUID |
+|---|---|---:|---:|---:|---:|---|
+| `--bbox=-10,35,32,72` | B1 | 118.8 s | 3.93 GB | 20.1 s | 17.4 s | (forced) |
+| `--bbox=-10,35,32,72` | A1 | 121.5 s | 9.80 GB | 18.3 s | 20.9 s | `a89f3c1e` |
+| `--bbox=-10,35,32,72` | B2 | 119.6 s | 3.94 GB | 20.2 s | 17.6 s | (forced) |
+| default (dataset bbox) | B | 68.4 s | 0.79 GB | 16.8 s | 13.2 s | (forced) |
+| default (dataset bbox) | A | 88.3 s | 2.01 GB | 17.2 s | 25.0 s | `21d32a8f` |
+
+Item config: peak anon -60 %, wall -2 % (noise). Node classify pays
+about 1.8 s for worker-side page encoding; way classify gains about 3 s
+from one lookup per ref in place of up to N. Default config: -61 % peak
+anon and -23 % wall: way classify halves and node write drops 29.4 s ->
+23.3 s, the N small-but-dense sets having been cache-hostile lookups.
+An earlier variant re-encoded every Incidence page at freeze (5.5 s
+single-core at the end of node classify); freeze now re-chooses only
+pages changed after their last encoding (52 ms).
 
 | Dataset | 5-region wall | Commit | UUID | Mode |
 |---------|--------------:|--------|------|------|

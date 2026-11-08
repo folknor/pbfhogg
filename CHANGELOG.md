@@ -285,6 +285,10 @@ state.
   the relation blobs (about 0.3 s at planet), plus a second one only when a
   relation in a relation is reached. Library: `getid::AddReferenced` and
   `GetidStats::found` follow the same rules.
+- Multi-extract with `--simple` on sorted input holds each object's region
+  membership once instead of once per region. Planet on bygg, five regions
+  inside `-10,35,32,72`: peak anon 9.8 GB -> 3.9 GB at the same wall; five
+  small regions: 2.0 GB -> 0.8 GB and 88 s -> 68 s.
 - `apply-changes` is faster and holds less memory. On a planet daily diff
   (OSC 4913) on bygg it takes about 92 s at about 1.9 GB peak anon with
   `--compression zstd:1`, and with `--locations-on-ways` on a planet with

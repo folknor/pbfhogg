@@ -569,6 +569,12 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
   osmium's `check-refs` keeps a second `IdSetDense` for negatives and
   checks them. Under `--check-relations` a relation member of an
   unknown type is refused as well, where osmium skips it.
+- `check --ids --full` - **verdict**, not a refusal: every negative
+  element ID is reported as an `IdOutOfRange` violation and the check
+  exits 1, even in a file whose negatives are in canonical `id_order`
+  (`src/commands/check/verify_ids.rs`). The streaming `check --ids`
+  orders negatives canonically by `osm_id_cmp` and does not fail on
+  them, as libosmium's `CheckOrder` and `osmium fileinfo` do not.
 - `add-locations-to-ways` (both backends) - **silent**, by
   inheritance from `IdSet`, for negative relation-member refs.
   Relation-member node IDs are collected into an `IdSet` that decides

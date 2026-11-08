@@ -675,16 +675,36 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
 // Relation member matching
 // ---------------------------------------------------------------------------
 
+/// A relation member that can make the relation match: a node or a way.
+/// Relation and unknown members never do (no relation closure; see
+/// DEVIATIONS.md, "extract: per-strategy membership against osmium").
+pub(super) enum MatchableMember {
+    Node(i64),
+    Way(i64),
+}
+
+/// The members of `r` that can match it, in member order. The one member
+/// dispatch both [`relation_has_matched_member`] and multi-extract's
+/// per-region mask reduction use.
+pub(super) fn matchable_members<'a>(
+    r: &'a crate::Relation<'a>,
+) -> impl Iterator<Item = MatchableMember> + 'a {
+    r.members().filter_map(|m| match m.id {
+        MemberId::Node(id) => Some(MatchableMember::Node(id)),
+        MemberId::Way(id) => Some(MatchableMember::Way(id)),
+        MemberId::Relation(_) | MemberId::Unknown(_, _) => None,
+    })
+}
+
 /// Check if a relation has any member whose ID is in the matched node or way sets.
 pub(super) fn relation_has_matched_member(
     r: &crate::Relation,
     node_ids: &IdSet,
     way_ids: &IdSet,
 ) -> bool {
-    r.members().any(|m| match m.id {
-        MemberId::Node(id) => node_ids.get(id),
-        MemberId::Way(id) => way_ids.get(id),
-        MemberId::Relation(_) | MemberId::Unknown(_, _) => false,
+    matchable_members(r).any(|m| match m {
+        MatchableMember::Node(id) => node_ids.get(id),
+        MatchableMember::Way(id) => way_ids.get(id),
     })
 }
 

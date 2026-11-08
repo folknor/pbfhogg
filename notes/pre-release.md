@@ -194,39 +194,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Memory and throughput: structural work
 
-### WRK-180: check --ids --full on negative IDs (maintainer decision)
-
-`--full` now proves an ordered kind duplicate-free from its order alone
-(`verify_ids_full_parallel` in `src/commands/check/verify_ids.rs`), but
-keeps reporting every negative ID as `IdOutOfRange` (exit 1): the proof
-pass records them so the report is unchanged. The proof covers negatives
-too (`osm_id_cmp` is injective), so on an ordered kind they could pass
-instead; whether they should is open, tracked with the DEVIATIONS gap in
-bz pbfhogg#50. Changing it is dropping the `negatives` recording in the
-proof pass, plus a CHANGELOG line and the docs/cli/commands.md sentence in
-the `check --refs` section.
-
-### WRK-181: Shared region membership for multi-extract
-
-`src/commands/extract/multi.rs` builds three `IdSet`s per region
-(`bbox_node_ids`, `matched_way_ids`, `matched_relation_ids`, a `Vec` of n
-each), so five regions hold fifteen sets, and where regions overlap most
-of their members are the same IDs held several times. Planet on bygg, 5
-regions inside `-10,35,32,72`: `--simple` peak anon 9.90 GB (`eded8718`),
-`--smart` 6.9 GB (`d4d8d0dc`), against a single `extract --simple` of a
-larger box at 3.09 GB. Idea: one structure answering "which regions hold
-this ID" (an ID set plus a small per-ID region mask, or per-chunk masks
-inside `IdSet`'s dense chunks) in place of n sets per kind. The trade is
-a mask lookup per element in every phase that tests membership against
-the memory saved, and the saving depends on how much the regions overlap,
-so the bench's five regions (tiled inside one box) may overstate or
-understate it. "Swap `IdSet` for a compressed bitmap" is too shallow:
-`IdSet` already has sparse and dense chunks. Not designed. First step: read multi.rs for how each
-region's sets are filled and tested, and count per-region set bytes at
-planet (an `IdSet` size counter or the sidecar), which says how much of
-the 9.9 GB the sets are at all. Measuring needs planet pairs; europe with
-`--regions 5` may show the shape cheaper.
-
 ### WRK-182: extract set lifetimes
 
 Each strategy builds four `IdSet`s: `bbox_node_ids`, `matched_way_ids`,

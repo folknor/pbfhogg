@@ -1437,13 +1437,13 @@ the fastest one.
 Single-pass multi-extract shipped for simple strategy on sorted input
 (commit `542aad0`). Reads PBF once, classifies each element against N
 regions, writes to N sync-mode PbfWriters. 3-phase barrier (nodes →
-ways → relations) with per-region IdSet + BlockBuilder. Memory:
-N × ~1.5 GB at planet scale. Falls back to sequential for unsorted
+ways → relations) with one shared region membership per kind
+(`extract/membership.rs`) + per-region BlockBuilder. Falls back to sequential for unsorted
 input or --clean. Verified via `brokkr verify multi-extract`. Node
 classify (the only coordinate-driven phase) is grid-pruned at N ≥ 16
 regions via a CSR region grid (256 MiB coverage budget, linear
-fallback above it); way/relation classify stay linear (IdSet
-membership, not spatial).
+fallback above it); way/relation classify are membership lookups, not
+spatial.
 
 **Known issues:**
 

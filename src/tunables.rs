@@ -843,6 +843,16 @@ pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
 /// while the fold waits on the head. Not measured.
 pub(crate) const FRAME_POOL_WINDOW_SLACK: usize = 2;
 
+/// Record buffers `digest` keeps for reuse once its ordered consumer has
+/// hashed them; beyond it a returned buffer is freed. A buffer is taken by
+/// an admitted decode task and returned before that task's permit is
+/// released, so with the read pipeline's default window
+/// ([`DEFAULT_DECODE_AHEAD`]) no more than that many exist, pooled or in
+/// use, and a cap at the window never refuses one. Retention is by
+/// capacity, not count: a planet block's full-form records run to tens of
+/// megabytes, so at planet this holds a few hundred megabytes for the run.
+pub(crate) const DIGEST_RECORD_BUFFERS_KEPT: usize = DEFAULT_DECODE_AHEAD;
+
 /// Formatted output bytes a unit's worker gathers before handing a chunk to
 /// the consumer, so a unit with a large output streams it instead of
 /// holding it whole. The text diff takes a chunk after a whole merge action,

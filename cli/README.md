@@ -24,7 +24,7 @@ Requires the Rust version named by the crate's `rust-version`. The binary is cal
 | `export` | Stream tagged nodes and ways to GeoJSON / GeoJSONSeq |
 | `tags-filter` | Filter elements by tag expressions (also supports OSC input) |
 | `diff` | Compare two PBFs; `--format osc` generates an OSC diff |
-| `digest` | Print a digest of a PBF's element content, equal for files `diff` finds identical |
+| `digest` | Print an encoding-independent digest of a PBF's header and elements; `--form content` gives one equal for files `diff` finds identical |
 | `getid` | Extract or remove (`--invert`) elements by ID |
 | `getparents` | Find ways/relations referencing given IDs |
 | `apply-changes` | Apply OSC diff to a sorted PBF with blob passthrough |

@@ -283,6 +283,10 @@ state.
 
 ### Changed
 
+- `digest` reuses its per-block record buffers instead of growing a fresh
+  one per blob: the default full form on planet about 63 s instead of
+  107 s, `--form content` about 53 s instead of 60 s. The digests are
+  unchanged.
 - `check --index` and `cat --reindex` decompress and scan blobs on a worker
   pool instead of one thread: at planet about 29 s instead of 494 s for
   `check --index`, and about 44 s instead of 444 s for `cat --reindex`,

@@ -98,6 +98,7 @@ use crate::content::{Prepass, write_full_record, write_header_record, write_reco
 use crate::error::{Error, Location};
 use crate::read::input::InputSource;
 use crate::read::pipeline::DecodeTransform;
+use crate::tunables::DIGEST_RECORD_BUFFERS_KEPT;
 use crate::{BlockType, ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
@@ -236,14 +237,16 @@ fn digest_inner(
             })
         }
     };
+    let buffers = Arc::new(RecordBuffers::default());
     let transform = DigestTransform {
         full: full.as_ref().map(|f| (f.prepass, f.way_members)),
+        buffers: Arc::clone(&buffers),
     };
     // Field 5 is read only where it is authoritative and asked for.
     let reader = reader.parsing_way_members(full.as_ref().is_some_and(|f| f.way_members));
 
     host.invocation.marker("DIGEST_SCAN_START");
-    let mut state = DigestState::new(Arc::from(path), full.is_none());
+    let mut state = DigestState::new(Arc::from(path), full.is_none(), buffers);
     reader.for_each_fused_blob(transform, |summary| state.absorb(summary))?;
     let digest = state.finish(form, full.as_ref().map(|f| f.header_record.as_slice()));
     host.invocation.marker("DIGEST_SCAN_END");
@@ -265,6 +268,44 @@ struct DigestTransform {
     /// `None` for the content form; the full form's prepass declarations
     /// and whether `pbfhogg.WayMembers-v1` is declared.
     full: Option<(Prepass, bool)>,
+    buffers: Arc<RecordBuffers>,
+}
+
+/// Record buffers the ordered consumer has hashed, for the decode workers
+/// to serialize later blocks into.
+///
+/// A planet blob holds about 200k elements, so one block's full-form
+/// records run to about 14 MB. Built fresh per block, every worker grew such
+/// a buffer from empty and freed it on the consumer: mapped, faulted and
+/// unmapped per block on every worker at once. At planet that left the
+/// workers off-CPU about a quarter of their time and the full form at
+/// 106.8 s against 61.7 s with reuse (bygg, reference/performance.md,
+/// "digest v2 cost"). Buffers are cleared before reuse and pass by
+/// ownership, so no bytes cross between blocks; a buffer dropped on an
+/// error path is simply not reused.
+#[derive(Default)]
+struct RecordBuffers(std::sync::Mutex<Vec<Vec<u8>>>);
+
+impl RecordBuffers {
+    fn take(&self) -> Vec<u8> {
+        let reused = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        reused.unwrap_or_default()
+    }
+
+    fn give(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.len() < DIGEST_RECORD_BUFFERS_KEPT {
+            kept.push(buffer);
+        }
+    }
 }
 
 impl DecodeTransform for DigestTransform {
@@ -304,7 +345,7 @@ impl DecodeTransform for DigestTransform {
                 index: blob.index(),
                 blob: blob.blob_index(),
                 offset: blob.offset(),
-                content: summarize_block(block, records)?,
+                content: summarize_block(block, records, &self.buffers)?,
             })
         }))
     }
@@ -424,6 +465,7 @@ fn block_kind(block_type: BlockType) -> crate::Result<Option<ElementKind>> {
 fn summarize_block(
     block: PrimitiveBlock,
     records: Records<'_>,
+    buffers: &RecordBuffers,
 ) -> crate::Result<Option<BlockContent>> {
     let classified = block_kind(block.block_type())?;
     // The full form's per-block inputs. A way block in a file declaring
@@ -461,7 +503,8 @@ fn summarize_block(
             min_id: id,
             max_id: id,
             count: 0,
-            records: Vec::new(),
+            // Taken at the first element, so an empty block takes none.
+            records: buffers.take(),
         });
         if c.count > 0 && crate::osm_id::osm_id_cmp(c.last_id, id).is_ge() {
             return Err(Error::invalid_data(format!(
@@ -530,12 +573,15 @@ struct DigestState {
     /// full form, whose first line is computed from the kind digests.
     all: Option<Xxh3>,
     kinds: [(u64, Xxh3); 3],
+    /// Where a hashed block's record buffer goes back to.
+    buffers: Arc<RecordBuffers>,
 }
 
 impl DigestState {
-    fn new(path: Arc<Path>, hash_all_records: bool) -> Self {
+    fn new(path: Arc<Path>, hash_all_records: bool, buffers: Arc<RecordBuffers>) -> Self {
         Self {
             path,
+            buffers,
             last: None,
             all: hash_all_records.then(Xxh3::new),
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
@@ -583,6 +629,14 @@ impl DigestState {
         let (count, hasher) = &mut self.kinds[usize::from(content.kind.ordinal())];
         *count += content.count;
         hasher.update(&content.records);
+        // Hashing stays here, serial. An exact split of these XXH3-128
+        // streams - each 1024-byte block's lane sums computed on a pool,
+        // folded here in order, bit-identical output, no new version - was
+        // built and measured at planet and did not beat this (66.2 s
+        // against 61.7 s, bygg, reference/performance.md, "digest v2
+        // cost"). Reconsider it only if serialization gets faster or this
+        // hashing is shown to be the limit.
+        self.buffers.give(content.records);
         Ok(())
     }
 

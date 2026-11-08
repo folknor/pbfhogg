@@ -229,16 +229,6 @@ density threshold. Planet's cold walk is unmeasured.
 
 ## Tooling
 
-### WRK-073: Digest v2 cost
-
-brokkr#61 landed `brokkr digest` (brokkr `cb83a5f`). Its single-sample
-denmark indexed cells put digest at 503 ms on `d2d8836a` against 701 ms on
-`4157567d`, about 39 % slower, after the digest `v2` change (`16154b0d`).
-The ticket suggests a `--form content` run to separate drift from code.
-The recorded "no cost" claim for v2 needs re-checking against that.
-Decided 2026-11-05: run it later as matched interleaved pairs, on denmark
-and on larger datasets.
-
 ---
 
 ## The measurement campaign

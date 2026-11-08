@@ -993,8 +993,8 @@ impl RunResources {
 
 /// Pass 2: write the plan in order to `writer`.
 ///
-/// `dedupe` drops, inside overlap runs, an element whose (id, version)
-/// equals the one just emitted. Passthrough splices when `sources` allows
+/// `dedupe` keeps, inside overlap runs, one element per (id, version), the
+/// copy from the earliest input, then frame, then position. Passthrough splices when `sources` allows
 /// it (see [`open_sources`]).
 ///
 /// With no overlap runs (an already-sorted input: production `sort`) this is

@@ -1006,6 +1006,16 @@ suite; the rest still carry their older commit in the Notes column.
 > chunk, so every frame is one piece and the counters are identical
 > (63,466 chunks, largest 2,097,145 bytes): no cost on normal input.
 
+> **Same-ID groups ship block by block, dedupe lookup indexed past a
+> threshold (2026-11-08, bygg, `5903b4cd` plus the change, measured
+> uncommitted with `--force`).** `cat --dedupe` reindexed planet with
+> itself, interleaved `--bench 1`, no fstrim: HEAD `33e06a0f` 201.9 s,
+> variant 201.4 s (dirty sidecar `b01f27ad`), HEAD `a6d92ca1` 200.3 s,
+> variant 200.8 s (dirty sidecar `33f2ce2b`). Signs mixed, under 1 %.
+> Counters unchanged (12.5 MB pinned, 63,466 chunks, staged 3.9 MB):
+> planet groups are two copies, below the index threshold and inside one
+> block, so normal input takes the old path.
+
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**
 > (`43041dd4`) vs `--commit cb99106` **200.4 s** (`9755cafc`), same day.

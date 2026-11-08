@@ -1198,8 +1198,8 @@ fn largest_frame(path: &std::path::Path) -> u64 {
 /// run holds both blocks for its whole length (a dense overlap is not
 /// demoted), while its output, about thirty blocks, streams out in more
 /// chunks than the run's channel holds. Every chunk stays within the chunk
-/// budget, and completed output waits on the sweep's side for one ID group
-/// at most: shipping only at the end of the run, or keeping filled blocks
+/// budget, and completed output waits on the sweep's side for one block at
+/// most: shipping only at the end of the run, or keeping filled blocks
 /// across groups, would hold the whole run there.
 ///
 /// One run is swept by one worker, whatever the host; the worker-count
@@ -1417,5 +1417,83 @@ fn sorted_views_are_charged_to_the_run() {
     assert!(
         pinned >= payload + views,
         "the run's charge of {pinned} bytes leaves out its sorted views"
+    );
+}
+
+/// One node in very many versions, the same versions in both inputs: in
+/// reverse order in the first, ascending in the second (a blob may hold one
+/// ID's versions in any order). The merge writes every version once, in
+/// version order, the first input's copy surviving each; the group spans
+/// many output blocks and ships them one at a time, so completed output
+/// waits for one block at most, and the dedupe lookup is not quadratic in
+/// the versions (a scan of the group per copy would not finish here).
+#[test]
+fn a_many_version_group_ships_block_by_block() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    const VERSIONS: i32 = 100_000;
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let write = |path: &std::path::Path, input: &str, versions: &[i32]| {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+            .expect("write header");
+        let cap = std::num::NonZeroUsize::new(versions.len()).expect("versions");
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap, 8_000);
+        for &version in versions {
+            let v = format!("{input}{version:040}");
+            let meta = Metadata {
+                version,
+                timestamp: 1,
+                changeset: 1,
+                uid: 1,
+                user: "u",
+                visible: true,
+            };
+            bb.add_node(1, 0, 0, [("v", v.as_str())], Some(&meta));
+        }
+        let bytes = bb.take().expect("encode").expect("non-empty block");
+        writer.write_primitive_block(bytes).expect("write block");
+        writer.flush().expect("flush fixture");
+    };
+    let ascending: Vec<i32> = (1..=VERSIONS).collect();
+    let descending: Vec<i32> = ascending.iter().rev().copied().collect();
+    write(&a, "a", &descending);
+    write(&b, "b", &ascending);
+
+    let (host, counters) = recording_host(4);
+    let stats = merge_pbf(
+        &[a.as_path(), b.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+    let n = u64::try_from(VERSIONS).expect("count");
+    assert_eq!(stats.nodes, n);
+    assert_eq!(stats.duplicates_removed, n);
+    let expected: Vec<(i64, String)> = ascending
+        .iter()
+        .map(|version| (1, format!("a{version:040}")))
+        .collect();
+    assert!(
+        nodes_with_value(&output) == expected,
+        "the merge is not every version once, in order, from the first input"
+    );
+    let largest = largest_frame(&output);
+    let output_len = std::fs::metadata(&output).expect("stat output").len();
+    assert!(
+        output_len > 2 * (CHUNK_BYTES + largest),
+        "fixture: the group's {output_len} bytes of output fit one ship"
+    );
+    let staged = counters.get("overlap_run_staged_high_water_bytes");
+    assert!(
+        staged <= CHUNK_BYTES + largest,
+        "{staged} bytes of completed output were held before shipping"
     );
 }

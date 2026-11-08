@@ -198,18 +198,18 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ## Memory and throughput: structural work
 
-### WRK-178: Same-ID groups in the overlap sweep are unbounded
+### WRK-178: Same-ID groups in the overlap sweep are held whole
 
-The sweep gathers every copy of one ID from every cursor before writing any
-(`emit_group` in `src/commands/blob_merge/sweep.rs`). A group's members keep
-their blocks alive past the cursor's release and are not charged against
-`SWEEP_PINNED_BYTES`, and a group large enough fills several output blocks
-before `ship` runs, so `overlap_run_staged_high_water_bytes` is bounded by
-one block only for groups of ordinary size. Under dedupe, `insert` finds
-the kept copy of a version by a linear scan of the group, so a group of k
-distinct versions costs about k squared over two comparisons. Only
-adversarial input (`sort` of many copies of one ID) or a history file with
-an object of very many versions reaches either. Unmeasured.
+The sweep still gathers every copy of one ID before writing any
+(`emit_group` in `src/commands/blob_merge/sweep.rs`), uncharged against
+`SWEEP_PINNED_BYTES`, because a cursor delivers an ID's copies in block
+order and `sort` accepts descending versions inside a blob. Output now
+ships block by block inside a group and the dedupe lookup is indexed past
+`SWEEP_GROUP_INDEX_THRESHOLD`, so only the hold remains. Removing it means
+a merge keyed on (ID, version, tie) with an eager (ID, version) pass over
+every overlap blob before its cursor opens (sorted views where it fails):
+a second pass over normal input, and live cursor blocks and views are
+still held. Only adversarial or many-version input reaches the hold.
 
 ---
 

@@ -60,6 +60,19 @@
 //! (whose elements keep their block alive after the cursor has released it)
 //! and one cursor slot per opened entry.
 //!
+//! The group is held whole, uncharged and unbounded: every copy of one ID
+//! is gathered before any is written, because a cursor delivers an ID's
+//! copies in whatever version order its block holds them (`sort` accepts a
+//! blob whose versions of one ID descend), so ordering by version needs
+//! them all. Demotion cannot free a group member. Ordinary groups are a
+//! few elements; only adversarial input (`sort` of many copies of one ID)
+//! or an object of very many versions grows one. Removing the hold would
+//! take a merge keyed on (ID, version, tie) with every cursor delivering
+//! that order, which means an eager (ID, version) pass over every overlap
+//! blob before its cursor opens (or sorted views for any blob that fails
+//! it) - a second pass over normal input to bound what normal input never
+//! reaches. That merge would still hold live cursor blocks and views.
+//!
 //! Each borrowed element carries an [`Rc`] of the block it borrows from, so a
 //! block lives exactly as long as the cursor reading it or any element taken
 //! from it; an exhausted cursor releases its block at once.
@@ -77,9 +90,9 @@
 //! whatever its size. A sweep blocked on its full channel while sending a
 //! large frame's pieces still holds the pieces not yet sent and the group's
 //! filled blocks not yet framed: worker-local, one frame and one group at
-//! most, and only on the workers sweeping, never per issued run. Filled
-//! blocks are shipped after every ID group, so completed output
-//! waits on the sweep's side for one group at most.
+//! most, and only on the workers sweeping, never per issued run. A block is
+//! shipped as soon as the builder fills it, even inside a group, so
+//! completed output waits on the sweep's side for one block at most.
 //!
 //! # Resource counters
 //!
@@ -103,7 +116,7 @@
 //! [`OVERLAP_RUN_CHANNEL_DEPTH`]: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::rc::Rc;
 
 use super::{BlobEntry, Frame, FrameBuf, RunCounts, Sources, element_id, read_block};
@@ -604,6 +617,8 @@ struct Merge {
     pinned: usize,
     next_scan: usize,
     group: Vec<Member>,
+    /// The group's dedupe index, once it is large (see [`Sweep::insert`]).
+    versions: HashMap<i32, usize>,
     visits: usize,
     /// What the run reports (see the module docs, "Resource counters").
     pinned_high_water: usize,
@@ -657,6 +672,7 @@ impl Sweep<'_, '_> {
             pinned: 0,
             next_scan: crate::tunables::SWEEP_PINNED_BYTES,
             group: Vec::new(),
+            versions: HashMap::new(),
             visits: 0,
             pinned_high_water: 0,
             demoted: 0,
@@ -840,28 +856,67 @@ impl Sweep<'_, '_> {
                 tie,
                 item,
             };
-            self.insert(&mut merge.group, member, counts)?;
+            self.insert(&mut merge.group, &mut merge.versions, member, counts)?;
+        }
+        // The index points into the unsorted group; sorting invalidates it.
+        merge.versions.clear();
+        // A large group's sort and encode get their own checks; an ordinary
+        // one is covered by the pull checks around it.
+        let large = merge.group.len() >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS;
+        if large {
+            self.checkpoint()?;
         }
         merge.group.sort_by_key(|m| (m.version, m.tie));
+        if large {
+            self.checkpoint()?;
+        }
+        let mut encoded = 0usize;
         for member in merge.group.drain(..) {
             out.encode(&member.item)
                 .map_err(|e| self.locate(member.tie.0, member.tie.1, e))?;
             counts.elements += 1;
+            // Ship each block as it fills, so a group spanning several
+            // blocks stages one at a time (see the module docs, "Memory").
+            if !out.filled.is_empty() {
+                out.ship(self.emitter)?;
+            }
+            encoded += 1;
+            if encoded >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS {
+                encoded = 0;
+                self.checkpoint()?;
+            }
         }
-        out.ship(self.emitter)
+        Ok(())
     }
 
     /// Add one element to the group; under dedupe keep one per version, the
     /// one with precedence, validating and counting the other.
+    ///
+    /// The kept copy of a version is found by a scan of the group while it
+    /// is small, and through `versions` (version to group slot, built once
+    /// the group reaches [`SWEEP_GROUP_INDEX_THRESHOLD`]) after, so a group
+    /// of k versions costs linear time, not quadratic. A replacement keeps
+    /// its slot, so the index stays valid until the group is sorted.
+    ///
+    /// [`SWEEP_GROUP_INDEX_THRESHOLD`]: crate::tunables::SWEEP_GROUP_INDEX_THRESHOLD
     fn insert(
         &self,
         group: &mut Vec<Member>,
+        versions: &mut HashMap<i32, usize>,
         member: Member,
         counts: &mut RunCounts,
     ) -> Result<()> {
-        if self.dedupe
-            && let Some(kept) = group.iter_mut().find(|m| m.version == member.version)
-        {
+        if !self.dedupe {
+            group.push(member);
+            return Ok(());
+        }
+        let found = if versions.is_empty() {
+            group.iter().position(|m| m.version == member.version)
+        } else {
+            versions.get(&member.version).copied()
+        };
+        if let Some(slot) = found {
+            let kept = &mut group[slot];
             let loser = if member.tie < kept.tie {
                 std::mem::replace(kept, member)
             } else {
@@ -871,7 +926,13 @@ impl Sweep<'_, '_> {
             counts.duplicates += 1;
             return Ok(());
         }
+        if !versions.is_empty() {
+            versions.insert(member.version, group.len());
+        }
         group.push(member);
+        if versions.is_empty() && group.len() >= crate::tunables::SWEEP_GROUP_INDEX_THRESHOLD {
+            versions.extend(group.iter().enumerate().map(|(slot, m)| (m.version, slot)));
+        }
         Ok(())
     }
 

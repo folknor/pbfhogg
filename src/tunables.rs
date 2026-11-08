@@ -761,6 +761,15 @@ pub(crate) const SWEEP_PINNED_BYTES: usize = 64 << 20;
 /// keep a check's cost far below the removals it covers; not measured.
 pub(crate) const SWEEP_CHECKPOINT_REMOVALS: usize = 4096;
 
+/// Distinct versions an overlap sweep's same-ID group holds before its
+/// dedupe lookup switches from a linear scan of the group to a per-group
+/// version index. Ordinary groups (one version, a few copies) never reach
+/// it, so they pay no hashing; a group of very many versions (a history
+/// object, adversarial input) costs linear time instead of quadratic. Not
+/// measured: any value far above ordinary group sizes and far below the
+/// sizes where a scan dominates serves.
+pub(crate) const SWEEP_GROUP_INDEX_THRESHOLD: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Diff
 // ---------------------------------------------------------------------------

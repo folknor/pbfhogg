@@ -221,7 +221,7 @@ phase per kind (see `src/commands/cat/mod.rs`).
 
 ### cat --dedupe
 
-K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `src/commands/blob_merge.rs`), over several inputs, dropping an element equal in (type, id, version) to the one just emitted; an absent version is 0.
+K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `src/commands/blob_merge.rs`), over several inputs, keeping one element per (type, id, version), the copy from the earliest input, then frame, then position; an absent version is 0.
 Sidecar phases: `MERGEPBF_*` spans both passes (from after the input pins
 and indexdata probes to the writer's flush, before publication), with
 `MERGEPBF_PASS1_*` (index walk and plan) and `MERGEPBF_PASS2_*` inside it,

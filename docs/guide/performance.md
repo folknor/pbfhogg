@@ -32,22 +32,32 @@ With pipelined writes, all compression modes converge to ~6.2s - the decode + wi
 
 ## CLI command benchmarks
 
-Denmark (487 MB, 59M elements, commit `6fc1283`, osmium from `23862d1`):
+Denmark (487 MB indexed file, 59M elements), pbfhogg commit `b355badd`
+against osmium 1.19.1 (libosmium 2.23.1) on bygg, 2026-11-08. Both tools
+read the same indexed file with default options, and each run starts with
+that file (and the change file) dropped from the page cache; osmium drops
+its input as it reads by default, so cold is the state it always runs in.
+Each figure is the median of three single runs, the tools alternating.
+Where defaults differ in what is promised, osmium is given the flag that
+matches pbfhogg: `--fsync` on every command that writes a PBF, and
+`--keep-member-nodes` on add-locations-to-ways. The commands are the
+`vs-osmium` bench in `brokkr.d/benches.toml`.
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexdata) | **0.1s** | -- | index-only fast path |
-| sort (sorted, indexdata) | **0.7s** | 11.6s | **17x** |
-| apply-changes (indexdata + zlib) | **0.6s** | 7.2s | **12x** |
-| tags-filter w/highway=primary -R | **0.2s** | 0.56s | **2.8x** |
-| tags-filter amenity=restaurant -R | **0.5s** | 1.19s | **2.4x** |
-| cat --type way (raw passthrough) | **0.24s** | 2.22s | **9.3x** |
-| inspect tags --type way (indexdata) | **0.4s** | 0.59s | **1.5x** |
-| getid (9 elements) | **0.6s** | 0.83s | **1.4x** |
-| add-locations-to-ways (sparse) | **9.9s** | 12.1s | **1.2x** |
-| add-locations-to-ways (external) | **9.7s** | 12.1s | **1.2x** |
+| inspect (indexdata) | **0.64s** | -- | answers from indexdata; no osmium counterpart |
+| sort (already sorted, indexdata) | **1.0s** | 7.5s | **7.5x** |
+| apply-changes (daily diff, indexdata) | **0.77s** | 4.4s | **5.7x** |
+| tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
+| tags-filter -R amenity=restaurant | **0.23s** | 0.82s | **3.6x** |
+| cat --type way (raw passthrough) | **0.17s** | 1.5s | **8.8x** |
+| inspect tags (bare, every key) | **0.77s** | 1.0s | **1.3x** |
+| inspect tags --type way | 0.69s | **0.39s** | osmium 1.8x faster |
+| getid (9 elements) | 0.65s | **0.59s** | osmium 1.1x faster |
+| add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
+| add-locations-to-ways (external) | **2.5s** | 7.4s | **3.0x** |
 
-The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely.
+The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely. The commands that answer from indexdata (inspect, inspect tags --type way, getid) pay about 0.6 s on a cold cache to walk the blob headers, which is slower than osmium's sequential read of the whole file on this host; with the file already cached the same pbfhogg runs take 5 ms, 49 ms and 14 ms.
 
 ## Extract benchmarks
 
@@ -135,4 +145,4 @@ With pipelined writes (the production path), compression is dispatched to rayon 
 
 ## System
 
-All benchmarks measured on plantasjen: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD (input/output) + HDD (build artifacts), Linux 6.18. Measured with `brokkr bench`, cross-validated with `brokkr verify`.
+The CLI command table was measured on bygg: AMD Ryzen 9 9950X3D2 (16c/32t). Every other table was measured on plantasjen: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD (input/output) + HDD (build artifacts), Linux 6.18. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).

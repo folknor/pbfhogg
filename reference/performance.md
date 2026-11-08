@@ -4464,6 +4464,59 @@ planet instead of 187 M, so the row build and serial sort that were never
 measured for the pair default are no longer a bare run's concern; `'*=*'`
 with the default thresholds still builds every pair as a row.
 
+## CLI commands against osmium, cold cache (bygg, 2026-11-08, at `b355badd`)
+
+The guide's "CLI command benchmarks" table, re-measured: until this run its
+pbfhogg column came from `6fc1283` cells on plantasjen and its osmium column
+from February 2026 runs of an earlier script, and its inspect tags row timed
+pair counting against osmium's key counting. Script bench `vs-osmium`
+(`brokkr.d/benches.toml`), denmark `pbf.indexed`
+(`denmark-20260220-seq4704-with-indexdata.osm.pbf`) read by both tools,
+apply-changes against `osc.4705`, osmium 1.19.1 / libosmium 2.23.1.
+`scripts/vs-osmium.sh 3`: per row three pairs of `--iterations 1`
+invocations, order pbfhogg-osmium, osmium-pbfhogg, pbfhogg-osmium. Runs are
+stored in brokkr's bench store, marked dirty only because the bench files
+were uncommitted (the binary is HEAD's).
+
+Cache state decides the comparison. libosmium advises its input out of the
+page cache as it reads (`remove_buffered_pages`, `POSIX_FADV_DONTNEED`, on by
+default), so a first campaign without eviction had pbfhogg slow after every
+osmium run and fast after a pbfhogg run, by about 0.6 s on the light rows
+(inspect 636 ms against 5 and 4 ms; getid 648 and 651 against 14 ms;
+inspect tags --type way 690 and 696 against 49 ms), osmium flat. That
+campaign is diagnostic only. The bench's preflight now drops each arm's
+inputs (`dd iflag=nocache count=0`) and fails unless `fincore` finds none
+resident, so every run below starts cold.
+
+| Row | pbfhogg runs | osmium runs | Medians | Ratio |
+|---|---|---|---|---:|
+| sort, already sorted | 1.1, 1.0, 1.0 s | 7.5, 7.6, 7.5 s | 1.0 / 7.5 s | 7.5x |
+| apply-changes | 785, 756, 774 ms | 4.4, 4.4, 4.5 s | 0.77 / 4.4 s | 5.7x |
+| tags-filter -R w/highway=primary | 161, 164, 167 ms | 370, 361, 373 ms | 164 / 370 ms | 2.3x |
+| tags-filter -R amenity=restaurant | 224, 227, 233 ms | 770, 815, 818 ms | 227 / 815 ms | 3.6x |
+| cat --type way | 171, 162, 175 ms | 1.5 s x3 | 171 ms / 1.5 s | 8.8x |
+| inspect tags, bare | 784, 769, 774 ms | 1.0 s x3 | 774 ms / 1.0 s | 1.3x |
+| inspect tags --type way | 697, 689, 687 ms | 407, 392, 393 ms | 689 / 393 ms | osmium 1.8x |
+| getid, 9 IDs | 644, 645, 646 ms | 589, 592, 581 ms | 645 / 589 ms | osmium 1.1x |
+| add-locations-to-ways sparse | 1.9, 1.9, 2.0 s | 7.4, 7.5, 7.3 s | 1.9 / 7.4 s | 3.9x |
+| add-locations-to-ways external | 2.5 s x3 | 7.3, 7.4, 7.4 s | 2.5 / 7.4 s | 3.0x |
+| inspect | 638, 638, 639 ms | none | 638 ms | - |
+
+Last-campaign run UUIDs (pbfhogg, osmium, in run order): sort `e4c201d9`
+`44219ebb` `875dd38c` `b75e9538` `b72d7f0b` `01c875f2`; inspect tags --type
+way `f1191e3a` `81cfc999` `373fa2c3` `83338ccf` `c4a028a7` `8433d981`;
+inspect `1ef7bd64` `46c5d8da` `fdf00786`; the rest are in `brokkr results`
+under bench `vs-osmium`.
+
+The rows that answer from indexdata pay a cold header walk. Sidecar of
+`f1191e3a` (inspect tags --type way): `SCHEDULE_SCAN_LOOP` 633 ms reading
+47 MB with 5.8 K voluntary context switches and no measurable CPU, then 61 ms
+of decode; bare inspect (`1ef7bd64`) is the same 637 ms walk alone, 56 MB
+read. osmium's tags-count -t way (`81cfc999`) reads all 475 MB in 407 ms at
+10.8 cores. The walk is latency-bound on one thread, a synchronous read per
+blob, so on a cold cache it costs more than a sequential read of the whole
+file. Warm, the same walk is the 5 to 49 ms above.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

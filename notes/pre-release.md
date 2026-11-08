@@ -212,20 +212,18 @@ still held. Only adversarial or many-version input reaches the hold.
 
 ---
 
-## Documentation and comment corrections
+### WRK-187: The schedule scan's header walk is latency-bound on a cold cache
 
-### WRK-168: The guide's inspect tags speedup row compares different counts
-
-`docs/guide/performance.md`, "CLI command benchmarks" (Denmark, commit
-`6fc1283`), lists `inspect tags --type way` at 0.4 s against osmium's
-0.59 s, a 1.5x speedup. At that commit a bare `inspect tags` counted every
-key=value pair while a bare `osmium tags-count` counts keys, so the row
-timed two different workloads. Since `inspect tags` counts keys as osmium
-does (found 2026-11-03 while landing that change), the two now count the
-same rows. Decided 2026-11-05: re-measure the whole table at HEAD on
-denmark, each row against osmium on equal workloads (bare against bare),
-as part of the release docs pass; the other rows share the old commit and
-were never checked for the same mismatch.
+Found 2026-11-08 timing the guide's osmium table (reference/performance.md,
+"CLI commands against osmium, cold cache"). On a cold page cache, bare
+`inspect`, `inspect tags --type way` and `getid` on denmark spend about
+0.63 s in `SCHEDULE_SCAN_LOOP`: 47-56 MB read on one thread with about 6 K
+voluntary context switches and no CPU, a synchronous read per blob header.
+osmium reads the whole 475 MB file sequentially in 0.39 s, so it wins the
+`--type way` and getid rows; warm, the same pbfhogg walk takes 5-49 ms.
+Candidates: read the headers with readahead or a larger window, issue them
+in parallel (io_uring or several preads), or read sequentially past a
+density threshold. Planet's cold walk is unmeasured.
 
 ---
 

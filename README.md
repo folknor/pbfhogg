@@ -197,20 +197,22 @@ Read throughput - 59M elements in Denmark (461 MB), best of 3 (commit `90df51f`)
 | osmpbf 0.3 | sequential | 5.6s |
 | osmium 1.19 | cat → opl | 5.7s |
 
-CLI commands vs osmium - Denmark (487 MB, commit `6fc1283`):
+CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed, commit `b355badd`, bygg, cold page cache on both sides; the full table and method are in the [performance guide](docs/guide/performance.md)):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| sort (sorted, indexdata) | **0.7s** | 11.6s | **17x** |
-| apply-changes (indexdata) | **0.6s** | 7.2s | **12x** |
-| cat --type way (raw passthrough) | **0.24s** | 2.22s | **9.3x** |
-| extract --smart (Tokyo bbox, Japan) | **4.7s** | 13.4s | **2.9x** |
-| tags-filter highway=primary -R | **0.2s** | 0.56s | **2.8x** |
-| add-locations-to-ways | **9.7s** | 12.1s | **1.2x** |
+| cat --type way (raw passthrough) | **0.17s** | 1.5s | **8.8x** |
+| sort (already sorted, indexdata) | **1.0s** | 7.5s | **7.5x** |
+| apply-changes (indexdata) | **0.77s** | 4.4s | **5.7x** |
+| add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
+| tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
+| inspect tags --type way | 0.69s | **0.39s** | osmium 1.8x faster |
+
+extract --smart (Tokyo bbox, Japan, plantasjen, an older commit): **4.7s** against osmium's 13.4s, 2.9x.
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
-System: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18. Measured with `brokkr bench`.
+System: the osmium table on bygg, AMD Ryzen 9 9950X3D2 (16c/32t); the rest on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18. Measured with brokkr.
 
 ## Acknowledgements
 

@@ -8,6 +8,7 @@ project = "pbfhogg"
 include = [
     "brokkr.d/checks.toml",
     "brokkr.d/lints.toml",
+    "brokkr.d/benches.toml",
     "brokkr.d/hosts/plantasjen.toml",
     "brokkr.d/hosts/dm6.toml",
     "brokkr.d/hosts/bygg.toml",

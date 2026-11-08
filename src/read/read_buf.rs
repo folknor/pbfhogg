@@ -128,6 +128,10 @@ mod tests {
             }
             Ok(())
         }
+
+        fn read_cached(&self, _buf: &mut [u8], _offset: u64) -> crate::read::header_walker::Cached {
+            crate::read::header_walker::Cached::Unsupported
+        }
     }
 
     /// The pattern's byte at offset `i`.

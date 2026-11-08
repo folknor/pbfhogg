@@ -115,12 +115,11 @@ walk term even though their payload phase is shape-2. Callers of
 
 The serial walk cannot be trivially parallelized: PBF has no top-level
 blob index, so blob N+1's offset is only known after reading blob N's
-header. Flattening it needs io_uring-batched header probes (the
-non-pursued getparents lever) or a dispatch to a buffered sequential
-walk on high blob count - both unmeasured, and low production priority
-because the production planet dump is 50 k blobs where the walk is
-negligible. tags-filter escapes this because its own scan is not the
-serial `build_classify_schedules_split` walk.
+header. On a cold file of small blobs the walk reads ahead in windows
+(see "The walk term" below), which shortens the walk term without
+parallelising it; a header-warm walk and a walk of the planet dump's
+large blobs keep the per-blob probe. tags-filter escapes this because
+its own scan is not the serial `build_classify_schedules_split` walk.
 
 The rest of this note's asymmetry evidence is about shape 1 and the
 shape-3 walk term. Shapes 2/3 are covered by the tags-filter and
@@ -244,42 +243,43 @@ prediction. Consistency check: europe 522 k × 45 µs ≈ 23 s walk +
 
 The dispatch rule this supports: HeaderWalker wins iff
 `blob_count × ~45 µs < bytes_skipped / scan_rate`. Crossover for
-getparents-shaped workloads sits between 51 k and 522 k blobs.
-io_uring-batched header probes would flatten the walk term entirely
-(known non-pursued lever; see "The unbuilt batched-walker primitive"
-below).
+getparents-shaped workloads sits between 51 k and 522 k blobs. The
+walk term these figures price is the per-blob probe; on cold files of
+small blobs the walk now reads ahead instead (next section), so they
+overstate the cold walk there.
 
-### The unbuilt batched-walker primitive (deferred; do not build speculatively)
+### The walk term: a dependency chain, and the read-ahead that shortens it
 
-Consolidated from the header-walk batching note (retired 2026-07-16;
-full text in git history). Every serial-schedule-walk cost in this
-document shares one physical term: `HeaderWalker::next_header` is a
-single-threaded QD=1 pread per blob, ~45-70 µs, linear in blob count -
-~3.5 s at 50 k production-planet blobs (invisible), ~100 s at 1.45 M
-8k blobs (dominant). The one primitive that would flatten it is an
-**io_uring batched-header-probe walker**: submit K header preads in
-flight, harvest completions, resubmit - call site stays
-single-threaded, `fadvise(RANDOM)` preserved, NVMe queue-depth
-concurrency recovered. Four call-site families would share it: sort
-pass 1, the getparents/getid walker arms, `check --refs`/`--ids` (the
-big winners, ~2/3 walk at 8k), and the re-encoding
-`build_classify_schedules_split` callers (marginal, 18-29 % walk).
+Every serial-schedule-walk cost in this document shares one physical
+term: `HeaderWalker::next_header` resolves one header per read, and
+blob N+1's offset is only known after reading blob N's header, because
+the PBF stream has no top-level blob index. That dependency is why no
+form of batching exact header probes can help - an io_uring walker
+"submitting K header preads in flight", which this document used to
+list as the unbuilt lever, never has more than one known offset to
+submit - and why sharding across threads needs a resync-to-blob-boundary
+primitive that does not exist. The only way to resolve more than one
+header per device latency is to read bytes before knowing they hold a
+header.
 
-Why it is not trivial: the PBF stream has no top-level blob index, so
-blob N+1's offset is only known after reading blob N's header -
-sharding across threads cannot work without a resync-to-blob-boundary
-primitive that does not exist. Batching hides the latency without
-breaking the dependency. Rejected alternatives: buffered-sequential
-walk dispatched on blob count (measured for sort as the "M3"
-experiment - europe -21 % but planet +11 %, see
-`reference/performance-history.md` "Sort"), and a worker-sharded
-resync scan (days of work, needs the missing primitive).
+That is what the walk does now (`PreadSource` in
+`src/read/header_walker.rs`): it keeps its read window across payload
+skips and, on a cold file of small frames, reads 1 MiB windows covering
+many frames instead of a 4 KiB probe per frame. Two gates keep it from
+reading payloads for nothing: density (a mean recent frame size below
+128 KiB; the planet dump's ~1.8 MB frames keep the probe) and residency
+(a cache-only probe first; only a run of misses authorises a window, so
+a walk whose headers an earlier walk left cached reads the headers
+alone). Measured in `reference/performance.md` "Header walk read-ahead
+on cold dense files": denmark cold inspect 0.64 to 0.22 s, europe cold
+inspect 45.6 to 14.4 s, planet unchanged. Rejected alternatives: a
+buffered-sequential walk dispatched on blob count (measured for sort as
+the "M3" experiment - europe -21 % but planet +11 %, see
+`reference/performance-history.md` "Sort"), read-ahead on density alone
+(it read the bodies under cached headers: europe check --refs 8.3 to
+27.6 s), and a worker-sharded resync scan.
 
-Deferred because production planet is 50 k blobs and production sort
-input is already sorted: the lever only pays on high-blob-count or
-unsorted-at-scale workloads, neither configured nor real today. Build
-it the day one becomes real - it is one primitive, not four fixes.
-Estimating its payoff requires the eviction pattern, never the sum of
+Estimating a walk's cost requires the eviction pattern, never the sum of
 per-phase walk durations: a walk is only expensive if something evicted
 the headers since the previous one, so a command that walks N times
 pays roughly one cold walk per eviction, not N (measured on sparse

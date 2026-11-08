@@ -67,7 +67,8 @@ pub(crate) trait FrameSource {
     /// Fill `buf` from the current position, stopping short only where the
     /// input ends. Returns the bytes delivered. Used for the length prefix
     /// alone, so a short count is the clean-EOF signal; every other failure
-    /// is an error and is never read as end of input.
+    /// is an error and is never read as end of input. `PreadSource` relies
+    /// on that use: a `fill` marks a frame's start for its density gate.
     fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 
     /// Append up to `n` bytes to `out`, stopping short only where the input

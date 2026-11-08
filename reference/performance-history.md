@@ -525,10 +525,10 @@ chase in software on this storage stack.
   (`reference/pipelined-reader-paths.md`); sort uses direct pread per blob,
   correct for the two-pass shape.
 
-The io_uring batched-header-probe walker that would flatten the europe
-pass-1 regression (and the same primitive several other commands want) is
-consolidated in `reference/blob-density.md` "The unbuilt batched-walker
-primitive"; deferred, production-negligible.
+The walk term behind the europe pass-1 regression, why batched exact
+probes cannot flatten it, and the cold read-ahead the walker now does on
+files of small blobs are in `reference/blob-density.md` "The walk term";
+sort pass 1 on europe has not been re-measured since.
 
 ### Correctness: intra-blob disorder (fixed 2026-07-11)
 

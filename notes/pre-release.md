@@ -212,21 +212,6 @@ still held. Only adversarial or many-version input reaches the hold.
 
 ---
 
-### WRK-187: The schedule scan's header walk is latency-bound on a cold cache
-
-Found 2026-11-08 timing the guide's osmium table (reference/performance.md,
-"CLI commands against osmium, cold cache"). On a cold page cache, bare
-`inspect`, `inspect tags --type way` and `getid` on denmark spend about
-0.63 s in `SCHEDULE_SCAN_LOOP`: 47-56 MB read on one thread with about 6 K
-voluntary context switches and no CPU, a synchronous read per blob header.
-osmium reads the whole 475 MB file sequentially in 0.39 s, so it wins the
-`--type way` and getid rows; warm, the same pbfhogg walk takes 5-49 ms.
-Candidates: read the headers with readahead or a larger window, issue them
-in parallel (io_uring or several preads), or read sequentially past a
-density threshold. Planet's cold walk is unmeasured.
-
----
-
 ## Tooling
 
 ---

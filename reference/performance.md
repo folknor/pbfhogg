@@ -4568,7 +4568,60 @@ of decode; bare inspect (`1ef7bd64`) is the same 637 ms walk alone, 56 MB
 read. osmium's tags-count -t way (`81cfc999`) reads all 475 MB in 407 ms at
 10.8 cores. The walk is latency-bound on one thread, a synchronous read per
 blob, so on a cold cache it costs more than a sequential read of the whole
-file. Warm, the same walk is the 5 to 49 ms above.
+file. Warm, the same walk is the 5 to 49 ms above. The next section is the
+fix; the inspect, inspect tags --type way and getid rows of the guide come
+from it.
+
+## Header walk read-ahead on cold dense files (bygg, 2026-11-08, baseline `bb414882`)
+
+`PreadSource` (`src/read/header_walker.rs`) keeps its read window across
+payload skips and, on a refill, reads a 1 MiB window instead of the 4 KiB
+probe when two gates pass: density (mean of the last 8 completed frames
+below 128 KiB, so the planet dump's ~1.8 MB frames never qualify) and
+residency (a 4 KiB `preadv2(RWF_NOWAIT)` probe first; a hit is the window
+at no I/O, and only 4 dense refills missing in a row authorise a window).
+The walk is a dependency chain, so read-ahead is the only lever: in-flight
+exact probes cannot overlap it. Variant cells are `bb414882` plus the
+uncommitted change (bench store marks them dirty); baseline cells are
+`--commit bb414882`. Every `vs-osmium` cell starts with its input evicted.
+
+Density gate alone (first variant), alternating pairs:
+
+| Row | Baseline | Variant |
+|---|---|---|
+| denmark inspect | 644 (`e7be7f03`), 638 (`e009a69f`) ms | 227 (`c108e83b`), 190 (`24f225ca`) ms |
+| denmark inspect tags --type way | 693 (`9a53c4ee`), 691 (`92a2efbd`) ms | 263 (`b5f2b35b`), 240 (`c4cf854d`) ms |
+| denmark getid | 650 (`2fb09f94`), 649 (`6e3c7fae`) ms | 198 (`6e0f1abd`), 199 (`f274ac24`) ms |
+| planet inspect | 6.1 (`8d48e999`), 6.8 (`eb1cb944`) s | 6.8 (`c0c93714`), 6.1 (`6b01c0bb`) s |
+| europe inspect | 45.6 s (`1f4345fc`) | 14.4 s (`1520f7b2`) |
+
+Planet is unchanged: both arms read 654-659 MB and the second cell of each
+pair was the faster one, an order effect. But density alone regressed a
+header-warm walk: europe `check --refs` after a cold europe inspect had left
+the headers cached and the bodies not, baseline `3dee9165` 8.3 s with
+`SCHEDULE_SCAN_LOOP` 270 ms and no disk read, variant 27.6 s with the walk at
+19.8 s reading 15.9 GB - windows fired at refills whose headers were
+resident and read the bodies between them, and on a file larger than RAM
+(35 GB against 29.8 GB) every walk of a multi-walk command would repeat it.
+That is what the residency gate is for.
+
+Final shape (both gates):
+
+| Row | Cells | Median |
+|---|---|---|
+| denmark inspect | 224, 208, 217 ms | 217 ms (baseline 638-644 ms) |
+| denmark inspect tags --type way | 266, 259, 264 ms | 264 ms (baseline 691-693 ms; osmium 395 ms, `7e13294a`) |
+| denmark getid | 217, 216, 194 ms | 216 ms (baseline 649-650 ms; osmium 619 ms, `ac1e2007`) |
+| europe inspect | 14.4 s (`445a6c9a`) | baseline 45.5-45.6 s (`1f4345fc`, `cb4aad64`) |
+| planet inspect | 6.8 s (`8fdf1ee1`) | inside the baseline's 6.1-6.8 s |
+| europe check --refs, headers cached | 8.24 s, walk 288 ms, no disk read | baseline 8.28 s (`3dee9165`), walk 270 ms |
+
+The header-warm check-refs cell followed the same predecessor as its
+baseline (a cold baseline europe inspect, `cb4aad64`); its counters were
+464,510 cache hits, no misses, no windows. A warm denmark inspect is still
+5 ms. Not measured: a header-warm walk under memory pressure with scattered
+evicted headers (the unit tests pin that isolated misses read no window,
+not its wall), and the multi-walk commands on a cold europe.
 
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 

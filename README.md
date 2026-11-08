@@ -206,7 +206,7 @@ CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed, commit `b355badd`, bygg
 | apply-changes (indexdata) | **0.77s** | 4.4s | **5.7x** |
 | add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
 | tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
-| inspect tags --type way | 0.69s | **0.39s** | osmium 1.8x faster |
+| inspect tags --type way (re-measured after the header-walk read-ahead) | **0.26s** | 0.39s | **1.5x** |
 
 extract --smart (Tokyo bbox, Japan, plantasjen, an older commit): **4.7s** against osmium's 13.4s, 2.9x.
 

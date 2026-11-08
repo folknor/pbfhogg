@@ -69,6 +69,7 @@ disallowed-methods = [
     { path = "libc::pread", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
     { path = "libc::pread64", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
     { path = "libc::preadv", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
+    { path = "libc::preadv2", reason = "the one cache-only read is read::header_walker's Positional::read_cached for File; range reads go through crate::write::copy_range::read_range, others through std FileExt" },
     { path = "libc::pwrite", reason = "positioned writes go through std FileExt::write_all_at" },
     { path = "libc::pwrite64", reason = "positioned writes go through std FileExt::write_all_at" },
     { path = "libc::pwritev", reason = "positioned writes go through std FileExt::write_all_at" },

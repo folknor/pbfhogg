@@ -41,23 +41,25 @@ Each figure is the median of three single runs, the tools alternating.
 Where defaults differ in what is promised, osmium is given the flag that
 matches pbfhogg: `--fsync` on every command that writes a PBF, and
 `--keep-member-nodes` on add-locations-to-ways. The commands are the
-`vs-osmium` bench, `benches/compare/vs-osmium.lua`.
+`vs-osmium` bench, `benches/compare/vs-osmium.lua`. The inspect,
+inspect tags --type way and getid rows were re-measured the same day once
+the blob-header walk began reading ahead on cold files of small blobs.
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexdata) | **0.64s** | -- | answers from indexdata; no osmium counterpart |
+| inspect (indexdata) | **0.22s** | -- | answers from indexdata; no osmium counterpart |
 | sort (already sorted, indexdata) | **1.0s** | 7.5s | **7.5x** |
 | apply-changes (daily diff, indexdata) | **0.77s** | 4.4s | **5.7x** |
 | tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
 | tags-filter -R amenity=restaurant | **0.23s** | 0.82s | **3.6x** |
 | cat --type way (raw passthrough) | **0.17s** | 1.5s | **8.8x** |
 | inspect tags (bare, every key) | **0.77s** | 1.0s | **1.3x** |
-| inspect tags --type way | 0.69s | **0.39s** | osmium 1.8x faster |
-| getid (9 elements) | 0.65s | **0.59s** | osmium 1.1x faster |
+| inspect tags --type way | **0.26s** | 0.39s | **1.5x** |
+| getid (9 elements) | **0.22s** | 0.59s | **2.7x** |
 | add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
 | add-locations-to-ways (external) | **2.5s** | 7.4s | **3.0x** |
 
-The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely. The commands that answer from indexdata (inspect, inspect tags --type way, getid) pay about 0.6 s on a cold cache to walk the blob headers, which is slower than osmium's sequential read of the whole file on this host; with the file already cached the same pbfhogg runs take 5 ms, 49 ms and 14 ms.
+The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely. The commands that answer from indexdata (inspect, inspect tags --type way, getid) spend most of their cold time walking the blob headers. Each header's position comes from the one before it, so on a cold cache the walk reads ahead in 1 MiB windows on files of small blobs like this one, rather than paying one device latency per blob; a walk whose headers are already cached reads them alone (bare inspect takes 5 ms with the file cached).
 
 ## Extract benchmarks
 

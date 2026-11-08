@@ -1,7 +1,9 @@
 //! Pread-only blob header walker.
 //!
-//! Walks a PBF file's blob headers by `pread`-ing just the length prefix
-//! and header bytes per blob, skipping data bytes without reading them.
+//! Walks a PBF file's blob headers by `pread`, skipping data bytes without
+//! needing them: a probe of the length prefix and header per blob, or on
+//! files of small frames a window of several frames per read
+//! (`PreadSource`).
 //! The file is opened with `posix_fadvise(RANDOM)` so the kernel does
 //! not speculatively prefetch the blob bodies that the header walk
 //! skips over; a walk honouring `--direct-io` opens it `O_DIRECT`
@@ -31,7 +33,10 @@ use crate::blob::BlobKind;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::frame::Frames;
-use crate::tunables::{HEADER_PROBE_SIZE, SAMPLE_CAP};
+use crate::tunables::{
+    HEADER_PROBE_SIZE, HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK,
+    HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE, SAMPLE_CAP,
+};
 
 /// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
 /// leading blob headers.
@@ -167,12 +172,73 @@ pub(crate) struct BlobHeaderMeta {
 /// [`DirectPositional`]: crate::read::direct_reader::DirectPositional
 pub(crate) trait Positional {
     fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+
+    /// Read into `buf` at `offset` only what can be delivered without
+    /// waiting on the device. Evidence about residency, never about the
+    /// file: a miss says nothing about EOF or errors, which the exact read
+    /// that follows decides.
+    fn read_cached(&self, buf: &mut [u8], offset: u64) -> Cached;
+}
+
+/// What [`Positional::read_cached`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cached {
+    /// The first `n` (at least one) bytes were delivered.
+    Hit(usize),
+    /// Nothing could be delivered without waiting: not resident, in flight,
+    /// contended, or a zero count (which inside the extent is not EOF).
+    Miss,
+    /// The transport cannot tell: no residency evidence will ever come.
+    Unsupported,
 }
 
 impl Positional for std::fs::File {
     fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         self.read_exact_at(buf, offset)
+    }
+
+    /// `preadv2(RWF_NOWAIT)`: a buffered read that returns `EAGAIN` rather
+    /// than wait for the device.
+    #[cfg(target_os = "linux")]
+    fn read_cached(&self, buf: &mut [u8], offset: u64) -> Cached {
+        use std::os::unix::io::AsRawFd as _;
+        let Ok(offset) = libc::off_t::try_from(offset) else {
+            return Cached::Miss;
+        };
+        let iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // The crate's one `preadv2`.
+        #[allow(clippy::disallowed_methods)]
+        // Safety: the iovec covers `buf`, which the borrow keeps alive and
+        // exclusive for the call, as the borrow of `self` keeps the
+        // descriptor open.
+        let n = unsafe {
+            libc::preadv2(
+                self.as_raw_fd(),
+                &raw const iov,
+                1,
+                offset,
+                libc::RWF_NOWAIT,
+            )
+        };
+        match usize::try_from(n) {
+            Ok(0) => Cached::Miss,
+            Ok(n) => Cached::Hit(n.min(buf.len())),
+            Err(_) => match std::io::Error::last_os_error().raw_os_error() {
+                // No RWF_NOWAIT for buffered reads on this kernel or
+                // filesystem, or no preadv2 at all.
+                Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => Cached::Unsupported,
+                _ => Cached::Miss,
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_cached(&self, _buf: &mut [u8], _offset: u64) -> Cached {
+        Cached::Unsupported
     }
 }
 
@@ -181,22 +247,61 @@ impl Positional for crate::read::direct_reader::DirectPositional {
     fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
         self.read_exact_at(buf, offset)
     }
+
+    /// An `O_DIRECT` read never comes from the page cache: every read waits
+    /// on the device, so every refill is a miss, without a syscall.
+    fn read_cached(&self, _buf: &mut [u8], _offset: u64) -> Cached {
+        Cached::Miss
+    }
 }
 
 /// The walker's byte source: `pread` at the walk's position on the shared
 /// file, bounded by the size captured at open.
 ///
-/// The I/O shape is the measured one. Each frame starts with one probe
-/// `pread` of up to [`HEADER_PROBE_SIZE`] bytes covering the length prefix
-/// and (in the common case) the whole header; a header past the probe window
-/// costs one more `pread` for exactly its remainder. A payload is never read:
-/// skipping it is a check of its extent against the captured size, and drops
-/// the probe window, so every frame gets a fresh probe.
+/// Reads come in windows that persist across payload skips: a frame whose
+/// prefix and header lie inside the current window costs no syscall. When the
+/// walk reaches a position outside it, a refill reads at that position
+/// ([`Self::refill`]): a [`HEADER_PROBE_SIZE`] probe covering the length
+/// prefix and (in the common case) the whole header, or, on a cold dense
+/// file, a [`HEADER_WINDOW_SIZE`] window covering many frames.
 ///
-/// Bytes inside the captured extent are committed: a file that shrank after
-/// open fails the `pread` (`UnexpectedEof`, an error) rather than reading as
-/// a shorter file. Only a captured remainder of 0-3 bytes at a frame boundary
-/// is the clean tail, and it is recognised without reading it.
+/// Why windows: the walk is a dependency chain - frame N+1's offset comes
+/// from frame N's header - so no number of in-flight exact probes could
+/// overlap it, and on a cold cache each probe is one device latency with
+/// nothing else in flight. Reading ahead is the only way to resolve more than
+/// one header per latency. Two gates keep it from reading payload bytes for
+/// nothing:
+///
+/// - Density: only while the mean of the last [`HEADER_WINDOW_SAMPLE_FRAMES`]
+///   completed frames is below [`HEADER_WINDOW_DENSE_FRAME_BYTES`]. On sparse
+///   files (the planet dump) a window holds about one header. The first
+///   completed frame (the OSMHeader) does not count, and until one data
+///   frame has completed the walk probes.
+/// - Residency: a dense refill first tries a cache-only read
+///   ([`Positional::read_cached`]); a hit is the window, at no I/O. Only
+///   after [`HEADER_WINDOW_MISS_STREAK`] dense refills in a row have missed
+///   does an exact refill read a window rather than a probe. Without this a
+///   walk over headers an earlier walk left cached, bodies not, read the
+///   bodies: europe `check --refs` measured 0.27 s and no disk read for its
+///   schedule walk with probes, 19.8 s and 15.9 GB with density-gated windows
+///   alone (`reference/performance.md`). A transport that cannot tell
+///   residency never reads windows; the `O_DIRECT` one always misses, since
+///   none of its reads come from cache.
+///
+/// A header past the window costs one more `pread` for exactly its
+/// remainder. A payload is never read on purpose: skipping it is a check of
+/// its extent against the captured size.
+///
+/// The frame size is measured here, from positions: `fill` is only ever
+/// asked for a length prefix (`FrameSource::fill`), so it marks a frame's
+/// start, and the payload skip that follows marks its end.
+///
+/// The extent is captured at open, and bytes already read into the window are
+/// retained: a file that shrank after open fails the next `pread` inside the
+/// captured extent (`UnexpectedEof`, an error) rather than reading as a
+/// shorter file, but headers a window already holds are served from it. Only
+/// a captured remainder of 0-3 bytes at a frame boundary is the clean tail,
+/// and it is recognised without reading it, window or not.
 ///
 /// The extent policy lives here for every transport `P`: a transport only
 /// reads exactly the bytes it is asked for, so the direct one's aligned
@@ -211,9 +316,80 @@ pub(crate) struct PreadSource<P = std::fs::File> {
     window: Vec<u8>,
     window_at: u64,
     window_len: usize,
+    /// Where the frame being walked started (set by the prefix `fill`).
+    frame_start: u64,
+    /// Completed frames so far, the OSMHeader included.
+    frames_done: u64,
+    /// Sizes of the last [`HEADER_WINDOW_SAMPLE_FRAMES`] completed data
+    /// frames, a ring indexed by the data-frame count.
+    recent: [u64; HEADER_WINDOW_SAMPLE_FRAMES],
+    /// Consecutive dense refills whose cache-only read missed.
+    miss_streak: u32,
+    /// Whether the transport can tell residency; once it says it cannot,
+    /// no window is ever read.
+    residency_known: bool,
+    stats: WindowStats,
+}
+
+/// What a walk's refills did, emitted as counters when the walk ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowStats {
+    /// Dense refills served by a cache-only read.
+    pub(crate) cached_hits: u64,
+    /// Dense refills whose cache-only read could not deliver.
+    pub(crate) cached_misses: u64,
+    /// Cache-only reads the transport refused (at most one per walk).
+    pub(crate) cached_unsupported: u64,
+    /// Windows read, and the bytes they asked for.
+    pub(crate) windows: u64,
+    pub(crate) window_bytes: u64,
 }
 
 impl<P> PreadSource<P> {
+    fn new(file: Arc<P>, file_size: u64) -> Self {
+        Self {
+            file,
+            pos: 0,
+            file_size,
+            window: Vec::new(),
+            window_at: 0,
+            window_len: 0,
+            frame_start: 0,
+            frames_done: 0,
+            recent: [0; HEADER_WINDOW_SAMPLE_FRAMES],
+            miss_streak: 0,
+            residency_known: true,
+            stats: WindowStats::default(),
+        }
+    }
+
+    /// Record a completed frame ending at the current position.
+    fn complete_frame(&mut self) {
+        if self.frames_done > 0 {
+            // A data frame: frames after the first. The slot is below the
+            // ring length, a usize.
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = ((self.frames_done - 1) % HEADER_WINDOW_SAMPLE_FRAMES as u64) as usize;
+            self.recent[slot] = self.pos.saturating_sub(self.frame_start);
+        }
+        self.frames_done += 1;
+    }
+
+    /// Whether recent frames are dense: false before any data frame has
+    /// completed.
+    fn dense(&self) -> bool {
+        let samples = self
+            .frames_done
+            .saturating_sub(1)
+            .min(HEADER_WINDOW_SAMPLE_FRAMES as u64);
+        if samples == 0 {
+            return false;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let total: u64 = self.recent[..samples as usize].iter().sum();
+        total / samples < HEADER_WINDOW_DENSE_FRAME_BYTES
+    }
+
     /// The bytes left in the captured extent from the current position.
     fn remaining(&self) -> u64 {
         self.file_size.saturating_sub(self.pos)
@@ -234,29 +410,76 @@ impl<P> PreadSource<P> {
     }
 }
 
+impl<P: Positional> PreadSource<P> {
+    /// Refill the window at the walk's position, which lies inside the
+    /// captured extent. Sparse: one exact probe. Dense: first a cache-only
+    /// probe, whose hit (any positive count) is the window; on a miss, an
+    /// exact read, the [`HEADER_WINDOW_SIZE`] window once
+    /// [`HEADER_WINDOW_MISS_STREAK`] dense refills in a row have missed,
+    /// else the probe.
+    fn refill(&mut self) -> std::io::Result<()> {
+        let remaining = usize::try_from(self.remaining()).unwrap_or(usize::MAX);
+        let mut size = remaining.min(HEADER_PROBE_SIZE);
+        if !self.dense() {
+            self.miss_streak = 0;
+        } else if self.residency_known {
+            self.window.resize(size, 0);
+            match self.file.read_cached(&mut self.window, self.pos) {
+                Cached::Hit(n) => {
+                    self.stats.cached_hits += 1;
+                    self.miss_streak = 0;
+                    self.window_at = self.pos;
+                    self.window_len = n;
+                    return Ok(());
+                }
+                Cached::Miss => {
+                    self.stats.cached_misses += 1;
+                    self.miss_streak = self.miss_streak.saturating_add(1);
+                }
+                Cached::Unsupported => {
+                    self.stats.cached_unsupported += 1;
+                    self.residency_known = false;
+                    self.miss_streak = 0;
+                }
+            }
+            if self.residency_known && self.miss_streak >= HEADER_WINDOW_MISS_STREAK {
+                size = remaining.min(HEADER_WINDOW_SIZE);
+                self.stats.windows += 1;
+                self.stats.window_bytes += size as u64;
+            }
+        }
+        self.window.resize(size, 0);
+        self.file.pread_exact(&mut self.window, self.pos)?;
+        self.window_at = self.pos;
+        self.window_len = size;
+        Ok(())
+    }
+}
+
 impl<P: Positional> crate::frame::FrameSource for PreadSource<P> {
     fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.remaining();
-        if remaining < buf.len() as u64 && self.windowed().is_empty() {
-            // The clean tail (or the end): not read, as the walk always did.
+        // A frame boundary: `fill` is only asked for a length prefix.
+        self.frame_start = self.pos;
+        if self.remaining() < buf.len() as u64 {
+            // The clean tail (or the end): not read, as the walk always did,
+            // whether or not a window holds it.
             return Ok(0);
         }
-        if self.windowed().is_empty() {
-            // A frame boundary: one probe pread covering the prefix and,
-            // usually, the whole header.
-            let probe = usize::try_from(remaining)
-                .unwrap_or(usize::MAX)
-                .min(HEADER_PROBE_SIZE);
-            self.window.resize(probe, 0);
-            self.file.pread_exact(&mut self.window, self.pos)?;
-            self.window_at = self.pos;
-            self.window_len = probe;
+        let mut filled = 0;
+        while filled < buf.len() {
+            if self.windowed().is_empty() {
+                // The remaining extent covers the whole request, so a prefix
+                // the old window ended inside is completed here, never cut
+                // short.
+                self.refill()?;
+            }
+            let have = self.windowed();
+            let n = have.len().min(buf.len() - filled);
+            buf[filled..filled + n].copy_from_slice(&have[..n]);
+            self.pos += n as u64;
+            filled += n;
         }
-        let have = self.windowed();
-        let n = have.len().min(buf.len());
-        buf[..n].copy_from_slice(&have[..n]);
-        self.pos += n as u64;
-        Ok(n)
+        Ok(filled)
     }
 
     fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
@@ -285,11 +508,12 @@ impl<P: Positional> crate::frame::FrameSource for PreadSource<P> {
 
 impl<P: Positional> crate::frame::FrameSkip for PreadSource<P> {
     fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool> {
-        self.window_len = 0;
+        // The window is kept: the next prefix may lie inside it.
         if n > self.remaining() {
             return Ok(false);
         }
         self.pos += n;
+        self.complete_frame();
         Ok(true)
     }
 }
@@ -429,14 +653,7 @@ impl<P: Positional> HeaderWalker<P> {
     /// A walk from the start of `file`, whose size was captured as
     /// `file_size`.
     fn over(file: Arc<P>, file_size: u64, path: &Path, host: &crate::host::Entered<'_>) -> Self {
-        let source = PreadSource {
-            file: Arc::clone(&file),
-            pos: 0,
-            file_size,
-            window: Vec::new(),
-            window_at: 0,
-            window_len: 0,
-        };
+        let source = PreadSource::new(Arc::clone(&file), file_size);
         Self {
             frames: Frames::of_input(source, path, host),
             diagnostics: host.diagnostics.clone(),
@@ -521,15 +738,16 @@ impl<P: Positional> HeaderWalker<P> {
     /// Read the next blob's header and advance the internal offset past the
     /// data payload without reading it. Returns `None` at EOF.
     ///
-    /// Issues a single probe `pread` of up to [`HEADER_PROBE_SIZE`] bytes
-    /// covering the 4-byte length prefix plus the blob header in the common
-    /// case (typical headers run ~100-200 B; indexed blobs with tagdata a
-    /// bit more). A second `pread` is only needed for the rare header that
-    /// extends past the probe window. The payload is not read: the walk
+    /// Serves the 4-byte length prefix and the blob header from the source's
+    /// current window, or refills it with one `pread` (a [`HEADER_PROBE_SIZE`]
+    /// probe, or a [`HEADER_WINDOW_SIZE`] window on dense files; see
+    /// [`PreadSource`]). A second `pread` is only needed for a header that
+    /// extends past the window. The payload is not read: the walk
     /// refuses a frame whose declared payload runs past the file, located at
     /// that frame, so a truncated tail blob cannot end the walk silently.
     pub(crate) fn next_header(&mut self) -> Result<Option<BlobHeaderMeta>> {
         let Some(header) = self.frames.next_header()? else {
+            self.report_windows();
             return Ok(None);
         };
         // The frame's declared datasize is bounded by `MAX_BLOB_DATASIZE`, so
@@ -557,6 +775,26 @@ impl<P: Positional> HeaderWalker<P> {
             frame_size: payload_offset + header.data_size,
         };
         Ok(Some(meta))
+    }
+
+    /// What this walk's refills did so far.
+    pub(crate) fn window_stats(&self) -> WindowStats {
+        self.frames.src.stats
+    }
+
+    /// Emit the refill counters of a walk that reached its end. Nested under
+    /// the command running the walk, so never refused there; a sealed
+    /// invocation reports nothing.
+    fn report_windows(&self) {
+        let Ok(call) = self.frames.cancel_token().call() else {
+            return;
+        };
+        let stats = self.window_stats();
+        call.counter("header_walk_cached_hits", stats.cached_hits);
+        call.counter("header_walk_cached_misses", stats.cached_misses);
+        call.counter("header_walk_cached_unsupported", stats.cached_unsupported);
+        call.counter("header_walk_windows", stats.windows);
+        call.counter("header_walk_window_bytes", stats.window_bytes);
     }
 
     /// `pread` `size` bytes at `offset` (a payload or a whole frame) into
@@ -603,6 +841,375 @@ pub(crate) mod tests {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// An in-memory file that logs every exact positional read as
+    /// `(offset, len)`, can be cut short mid-walk, and answers cache-only
+    /// reads from its `resident` ranges (none: a cold file), or refuses them
+    /// all when `no_residency`.
+    #[derive(Default)]
+    struct LoggedFile {
+        bytes: std::sync::Mutex<Vec<u8>>,
+        reads: std::sync::Mutex<Vec<(u64, usize)>>,
+        resident: Vec<std::ops::Range<u64>>,
+        no_residency: bool,
+    }
+
+    impl LoggedFile {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: std::sync::Mutex::new(bytes),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl super::Positional for LoggedFile {
+        #[allow(clippy::unwrap_in_result)]
+        fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.reads.lock().expect("reads").push((offset, buf.len()));
+            let bytes = self.bytes.lock().expect("bytes");
+            let start = usize::try_from(offset).expect("offset");
+            let Some(src) = bytes.get(start..start + buf.len()) else {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            };
+            buf.copy_from_slice(src);
+            Ok(())
+        }
+
+        fn read_cached(&self, buf: &mut [u8], offset: u64) -> super::Cached {
+            if self.no_residency {
+                return super::Cached::Unsupported;
+            }
+            let Some(range) = self.resident.iter().find(|r| r.contains(&offset)) else {
+                return super::Cached::Miss;
+            };
+            let n = buf
+                .len()
+                .min(usize::try_from(range.end - offset).expect("range"));
+            let bytes = self.bytes.lock().expect("bytes");
+            let start = usize::try_from(offset).expect("offset");
+            buf[..n].copy_from_slice(&bytes[start..start + n]);
+            super::Cached::Hit(n)
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// One raw frame: prefix, a BlobHeader of `kind` declaring `payload`
+    /// bytes plus `pad` bytes of an unknown header field, then the payload.
+    fn raw_frame(kind: &str, payload: usize, pad: usize) -> Vec<u8> {
+        let mut header = vec![0x0A];
+        varint(kind.len() as u64, &mut header);
+        header.extend_from_slice(kind.as_bytes());
+        header.push(0x18);
+        varint(payload as u64, &mut header);
+        if pad > 0 {
+            // Field 15, length-delimited: skipped as unknown.
+            header.push(0x7A);
+            varint(pad as u64, &mut header);
+            header.extend(std::iter::repeat_n(0x55, pad));
+        }
+        let mut frame = u32::try_from(header.len())
+            .expect("len")
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&header);
+        frame.extend(std::iter::repeat_n(0xAB, payload));
+        frame
+    }
+
+    /// The size of a raw data frame carrying `payload` bytes and no pad.
+    fn frame_len(payload: usize) -> usize {
+        raw_frame("OSMData", payload, 0).len()
+    }
+
+    /// A file of an OSMHeader frame then one OSMData frame per `(payload,
+    /// pad)`, with the frame starts.
+    fn raw_file(frames: &[(usize, usize)]) -> (Vec<u8>, Vec<u64>) {
+        let mut bytes = raw_frame("OSMHeader", 16, 0);
+        let mut starts = vec![0];
+        for &(payload, pad) in frames {
+            starts.push(bytes.len() as u64);
+            bytes.extend(raw_frame("OSMData", payload, pad));
+        }
+        (bytes, starts)
+    }
+
+    /// Walk a cold `bytes` through the pread source, checking every frame
+    /// start against `starts`, and return the exact reads it made.
+    fn walk_logged(bytes: Vec<u8>, starts: &[u64]) -> Vec<(u64, usize)> {
+        walk_file(LoggedFile::new(bytes), starts).0
+    }
+
+    /// [`walk_logged`] over a prepared file, also returning the walk's
+    /// refill statistics.
+    fn walk_file(file: LoggedFile, starts: &[u64]) -> (Vec<(u64, usize)>, super::WindowStats) {
+        let host = crate::host::Host::entered_for_tests();
+        let size = file.bytes.lock().expect("bytes").len() as u64;
+        let file = Arc::new(file);
+        let mut walker = super::HeaderWalker::over(
+            Arc::clone(&file),
+            size,
+            std::path::Path::new("logged.pbf"),
+            &host,
+        )
+        .accepting_partial_index();
+        let mut seen = Vec::new();
+        while let Some(meta) = walker.next_header().expect("walk") {
+            seen.push(meta.frame_start);
+        }
+        assert_eq!(seen, starts, "the walk's frame starts");
+        let stats = walker.window_stats();
+        let reads = file.reads.lock().expect("reads").clone();
+        (reads, stats)
+    }
+
+    use crate::tunables::{
+        HEADER_PROBE_SIZE, HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK,
+        HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE,
+    };
+    use std::sync::Arc;
+
+    /// The refill index (counting exact reads) of a cold dense walk's first
+    /// window: the OSMHeader's probe, then one probe per miss of the streak.
+    const FIRST_WINDOW_READ: usize = HEADER_WINDOW_MISS_STREAK as usize;
+
+    /// A cold dense file reads windows once a data frame has completed and
+    /// the miss streak has run, so far fewer reads than frames.
+    #[test]
+    fn a_cold_dense_walk_reads_windows_after_its_miss_streak() {
+        let (bytes, starts) = raw_file(&[(10_000, 0); 300]);
+        let reads = walk_logged(bytes, &starts);
+        assert!(
+            reads[..FIRST_WINDOW_READ]
+                .iter()
+                .all(|&(_, len)| len <= HEADER_PROBE_SIZE),
+            "{reads:?}"
+        );
+        assert_eq!(
+            reads[FIRST_WINDOW_READ],
+            (starts[FIRST_WINDOW_READ + 1], HEADER_WINDOW_SIZE),
+            "{reads:?}"
+        );
+        assert!(reads.len() < 20, "{} reads for 301 frames", reads.len());
+    }
+
+    /// Headers an earlier walk left cached, bodies not: every dense refill
+    /// is a cache hit and no window reads a body.
+    #[test]
+    fn cached_headers_over_cold_bodies_read_no_window() {
+        let (bytes, starts) = raw_file(&[(10_000, 0); 300]);
+        let mut file = LoggedFile::new(bytes);
+        file.resident = starts.iter().map(|&s| s..s + 64).collect();
+        let (reads, stats) = walk_file(file, &starts);
+        assert_eq!(stats.windows, 0, "{stats:?}");
+        assert_eq!(stats.cached_misses, 0, "{stats:?}");
+        assert!(
+            reads.iter().all(|&(_, len)| len <= HEADER_PROBE_SIZE),
+            "{reads:?}"
+        );
+    }
+
+    /// Cached headers with scattered cold ones (every third): the misses
+    /// never run to the streak, so no window is read.
+    #[test]
+    fn scattered_cold_headers_read_no_window() {
+        let (bytes, starts) = raw_file(&[(10_000, 0); 300]);
+        let mut file = LoggedFile::new(bytes);
+        file.resident = starts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != 0)
+            .map(|(_, &s)| s..s + 64)
+            .collect();
+        let (_, stats) = walk_file(file, &starts);
+        assert_eq!(stats.windows, 0, "{stats:?}");
+        assert!(stats.cached_misses > 0, "{stats:?}");
+    }
+
+    /// A transport that cannot tell residency reads no windows, and is asked
+    /// once.
+    #[test]
+    fn unknowable_residency_reads_no_window() {
+        let (bytes, starts) = raw_file(&[(10_000, 0); 300]);
+        let mut file = LoggedFile::new(bytes);
+        file.no_residency = true;
+        let (_, stats) = walk_file(file, &starts);
+        assert_eq!(stats.windows, 0, "{stats:?}");
+        assert_eq!(stats.cached_unsupported, 1, "{stats:?}");
+    }
+
+    /// The real buffered transport: a page just written is resident, so a
+    /// cache-only read of it delivers (or the platform cannot tell).
+    #[test]
+    fn a_cache_only_read_of_a_fresh_file_delivers() {
+        use super::Positional as _;
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("fresh.bin");
+        std::fs::write(&path, [7_u8; 8192]).expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        let mut buf = [0_u8; 4096];
+        match file.read_cached(&mut buf, 100) {
+            super::Cached::Hit(n) => {
+                assert!(n > 0 && n <= buf.len());
+                assert!(buf[..n].iter().all(|&b| b == 7));
+            }
+            super::Cached::Unsupported => {}
+            super::Cached::Miss => panic!("a page just written read as not resident"),
+        }
+    }
+
+    /// Small and large frames alternating read as their mean: no window.
+    #[test]
+    fn alternating_frame_sizes_keep_the_probe() {
+        let frames: Vec<_> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (16 * 1024, 0)
+                } else {
+                    (2 * 1024 * 1024, 0)
+                }
+            })
+            .collect();
+        let (bytes, starts) = raw_file(&frames);
+        let reads = walk_logged(bytes, &starts);
+        let windows = reads
+            .iter()
+            .filter(|&&(_, len)| len > HEADER_PROBE_SIZE)
+            .count();
+        assert_eq!(windows, 0, "{reads:?}");
+    }
+
+    /// Large frames then frames just below the threshold: the walk switches
+    /// to windows within the sample ring's length and the miss streak of
+    /// the transition.
+    #[test]
+    fn a_density_change_settles_within_the_sample_ring() {
+        let small = usize::try_from(HEADER_WINDOW_DENSE_FRAME_BYTES).expect("threshold") - 1024;
+        let mut frames = vec![(2 * 1024 * 1024, 0); 10];
+        frames.extend(std::iter::repeat_n((small, 0), 40));
+        let (bytes, starts) = raw_file(&frames);
+        let reads = walk_logged(bytes, &starts);
+        let transition = starts[11];
+        assert!(
+            reads
+                .iter()
+                .all(|&(at, len)| at >= transition || len <= HEADER_PROBE_SIZE),
+            "a window before the transition: {reads:?}"
+        );
+        let deadline = starts[11 + HEADER_WINDOW_SAMPLE_FRAMES + FIRST_WINDOW_READ];
+        assert!(
+            reads
+                .iter()
+                .any(|&(at, len)| at <= deadline && len > HEADER_PROBE_SIZE),
+            "no window within the ring of the transition: {reads:?}"
+        );
+    }
+
+    /// The frame size the gate sees includes the header: payloads below the
+    /// threshold behind headers that carry it above never read windows.
+    #[test]
+    fn header_bytes_count_toward_frame_density() {
+        let (bytes, starts) = raw_file(&[(100 * 1024, 40 * 1024); 30]);
+        let reads = walk_logged(bytes, &starts);
+        // Probes, plus one exact read of each header's remainder past it.
+        assert!(
+            reads.iter().all(|&(_, len)| len <= 40 * 1024 + 64),
+            "{reads:?}"
+        );
+    }
+
+    /// A window that ends 1-3 bytes into a length prefix, or inside a
+    /// header, is completed by the next read rather than ending the walk.
+    /// The cold walk's first window opens at the data frame after the miss
+    /// streak, so that frame's size places the window's end inside a uniform
+    /// run.
+    #[test]
+    fn a_window_ending_inside_a_frame_does_not_end_the_walk() {
+        let uniform = 10_000;
+        let f = frame_len(uniform) as u64;
+        for k in [1_u64, 2, 3, 6] {
+            // Choose the window frame's size so the window's end lies k
+            // bytes into a uniform frame.
+            let mut opener = uniform;
+            while (HEADER_WINDOW_SIZE as u64 - frame_len(opener) as u64) % f != k {
+                opener += 1;
+            }
+            let mut frames = vec![(uniform, 0); FIRST_WINDOW_READ];
+            frames.push((opener, 0));
+            frames.extend(std::iter::repeat_n((uniform, 0), 200));
+            let (bytes, starts) = raw_file(&frames);
+            let reads = walk_logged(bytes, &starts);
+            assert!(
+                reads
+                    .iter()
+                    .any(|&(at, _)| starts.iter().any(|&s| at == s + k)),
+                "k {k}: no read resumed {k} bytes into a frame: {reads:?}"
+            );
+        }
+    }
+
+    /// A clean tail of 0-3 bytes reads as the end inside a window as well.
+    #[test]
+    fn a_short_tail_inside_a_window_is_the_end() {
+        for tail in 0..4 {
+            let (mut bytes, starts) = raw_file(&[(10_000, 0); 20]);
+            bytes.extend(std::iter::repeat_n(0xAA, tail));
+            walk_logged(bytes, &starts);
+        }
+    }
+
+    /// A file cut short after a window captured later frames: those frames
+    /// are served from the window, and the walk still fails at the next
+    /// read inside the captured extent rather than ending cleanly.
+    #[test]
+    fn a_shrink_after_a_window_still_fails_the_walk() {
+        let (bytes, starts) = raw_file(&[(10_000, 0); 300]);
+        let host = crate::host::Host::entered_for_tests();
+        let size = bytes.len() as u64;
+        let file = Arc::new(LoggedFile::new(bytes));
+        let mut walker = super::HeaderWalker::over(
+            Arc::clone(&file),
+            size,
+            std::path::Path::new("cut.pbf"),
+            &host,
+        )
+        .accepting_partial_index();
+        // Past the first window's opening frame.
+        for _ in 0..=FIRST_WINDOW_READ + 1 {
+            walker.next_header().expect("walk").expect("frame");
+        }
+        assert_eq!(walker.window_stats().windows, 1);
+        let cut = 50;
+        file.bytes
+            .lock()
+            .expect("bytes")
+            .truncate(usize::try_from(starts[cut]).expect("start"));
+        let mut walked = FIRST_WINDOW_READ + 2;
+        let err = loop {
+            match walker.next_header() {
+                Ok(Some(_)) => walked += 1,
+                Ok(None) => panic!("a shrunk file ended the walk cleanly"),
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            walked > cut,
+            "the window's frames were not served: {walked}"
+        );
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Io(io)
+                if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
     }
 
     /// Open a walk of `path` (`O_DIRECT` when `direct`), then grow the file

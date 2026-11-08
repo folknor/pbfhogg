@@ -210,8 +210,44 @@ pub(crate) const DEFAULT_MAX_WINDOW: usize = 65_536;
 /// Size of the initial header probe `pread` per blob. One page covers the
 /// 4-byte length prefix plus the header bytes for essentially every blob
 /// in real PBFs; the fallback path in `next_header` handles the rare
-/// exception where a blob's header exceeds the probe window.
+/// exception where a blob's header exceeds the probe window. The walk uses
+/// it where recent frames are large; dense files read
+/// [`HEADER_WINDOW_SIZE`] windows instead.
 pub(crate) const HEADER_PROBE_SIZE: usize = 4096;
+
+/// Size of a header walk's read when its recent frames are dense
+/// ([`HEADER_WINDOW_DENSE_FRAME_BYTES`]) and its recent cache-only reads
+/// missed ([`HEADER_WINDOW_MISS_STREAK`]): one `pread` covering the next
+/// header and the frames after it, kept across payload skips so the headers
+/// inside it cost no syscall. The walk's frame N+1 offset is only known from
+/// frame N's header, so on a cold cache a 4 KiB probe per frame is one
+/// device latency per frame with nothing else in flight; a window this size
+/// resolves many headers per latency, and the block layer splits it into
+/// several requests in flight. It bounds what a walk that stops early (the
+/// blob-count probe) reads past its last header.
+pub(crate) const HEADER_WINDOW_SIZE: usize = 1024 * 1024;
+
+/// Mean frame size (prefix, header and payload) below which a header walk
+/// reads [`HEADER_WINDOW_SIZE`] windows instead of [`HEADER_PROBE_SIZE`]
+/// probes. Roughly one cold read latency times device bandwidth: above it,
+/// the bytes a window reads between headers cost more than the latency they
+/// save. Geofabrik-style 8,000-element files (about 66 KB per frame) fall
+/// below it, the official planet dump (about 1.8 MB per frame) above it, so
+/// its walk keeps the per-frame probe.
+pub(crate) const HEADER_WINDOW_DENSE_FRAME_BYTES: u64 = 128 * 1024;
+
+/// How many recently completed frames the header walk's window decision
+/// averages over. A fixed ring, so a change of density settles within this
+/// many frames, and an alternation of small and large frames reads as its
+/// mean rather than as whichever frame came last.
+pub(crate) const HEADER_WINDOW_SAMPLE_FRAMES: usize = 8;
+
+/// Dense header-walk refills in a row whose cache-only read must miss before
+/// an exact refill reads a [`HEADER_WINDOW_SIZE`] window instead of a probe.
+/// A single miss is weak evidence (an in-flight page, contention, one evicted
+/// header among cached ones); a run of them is a cold region. A cold walk
+/// pays this many cold probes before its first window; any hit resets it.
+pub(crate) const HEADER_WINDOW_MISS_STREAK: u32 = 4;
 
 /// Number of leading frames sampled when estimating a file's blob count.
 pub(crate) const SAMPLE_CAP: usize = 1_000;

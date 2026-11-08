@@ -67,6 +67,20 @@ pub(crate) struct Frame {
 
 /// The index and tag key set a reframed passthrough carries, both scanned
 /// from its payload, so it is indexed as plain `cat` indexes it.
+///
+/// Every reframed passthrough's serialized key set is held from pass 1
+/// until the plan is dropped after pass 2 (`plan` frees only a rewritten
+/// frame's), so its memory is the sum of the tagdata the output gains, with
+/// no fixed bound. Measured on an unindexed Europe input, 522k blobs all
+/// passed through: about 895 MB of peak anon more than indexdata alone, the
+/// 877 MB of tagdata the output grew by (reference/performance.md, "sort
+/// --force on unindexed Europe"). Accepted: only `--force` on an unindexed
+/// input and `--distrust-metadata` reframe blobs at that scale, and `cat`
+/// is the streaming reindex for such a file. If bounded memory here becomes
+/// a requirement, the remedy is spilling these headers past a budget to
+/// scratch, read back by offset (pass 2 visits frames in output order, not
+/// input order); re-scanning payloads in pass 2 would decompress every blob
+/// twice.
 pub(crate) struct Reindex {
     index: BlobIndex,
     tagdata: Option<Box<[u8]>>,

@@ -257,14 +257,6 @@ coalesce (check `cat_dedupe_blobs_passthrough` and
 three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
 second input.
 
-### WRK-089: sort --force on unindexed input
-
-`sort --force` on an unindexed europe or planet input (`pbf.raw`),
-`060c2f74^` vs `060c2f74`: the `SORT_INDEX_BUILD` wall and peak RSS. Every
-unindexed blob now pays the combined ID-and-tag scan in serial pass 1, and
-its serialized key set is held to pass 2 (up to GBs at 8k-encoding blob
-counts). `plan` adds four per-frame `Vec<bool>`s and about 60 B per blob.
-
 ### WRK-091: diff-snapshots across the block-pair engine
 
 Planet `diff-snapshots --from base --to 20260411`, text and osc,

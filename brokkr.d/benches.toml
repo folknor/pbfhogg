@@ -52,3 +52,17 @@ params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = 
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
 params.row = { required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
+
+# -- sort
+
+[bench.sort-cold]
+script_file = "../benches/sort/sort-cold.lua"
+description = "sort of a dataset's file into scratch, input evicted from the page cache, sort's --force optional"
+version = 1
+date = 2026-11-08
+changelog = [
+  { version = 1, date = 2026-11-08, note = "Added: reaches unindexed inputs through sort's own --force" },
+]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.variant = { from = "datasets.{dataset}.pbf", default = "raw", help = "the PBF variant sorted" }
+params.force = { default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }

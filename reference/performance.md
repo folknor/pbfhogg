@@ -4855,6 +4855,43 @@ Pass 2 runs one sweep per component, so parallelism on unsorted input is
 bounded by the component count: on `chained` three sweeps cover the whole
 file and the node component dominates.
 
+## sort --force on unindexed Europe (bygg, 2026-11-08)
+
+`060c2f74` made sort's pass 1 scan each unindexed blob's tag keys along
+with its IDs and hold the serialized key set to pass 2, so a reframed
+passthrough carries tagdata as plain `cat` writes it. Measured
+`060c2f74^` (`9744a9fc`) against `060c2f74` with the `sort-cold` script
+bench (`benches/sort/sort-cold.lua`, `--force yes`), both arms `--commit`
+worktrees, alternated A B B A, one iteration per invocation, input
+evicted and checked 0 B resident by fincore. Input: europe `pbf.raw`
+(`europe-20260301-seq4714.osm.pbf`, 31.6 GB, 522,168 blobs, header
+claims `Sort.Type_then_ID`, no indexdata). Every arm: all 522,168 blobs
+passthrough, none overlapping, rewritten or restructured.
+
+| Arm | Run | SORT_INDEX_BUILD | Pass 2 | Child wall | Peak anon | Output bytes |
+|---|---|---|---|---|---|---|
+| `9744a9fc` | `7eeed226` | 164.66 s | 14.97 s | 179.6 s | 59.7 MB | 33,981,195,365 |
+| `060c2f74` | `35892bd8` | 167.63 s | 19.24 s | 186.9 s | 954.6 MB | 34,858,236,257 |
+| `060c2f74` | `224bd93a` | 165.12 s | 15.27 s | 180.5 s | 956.1 MB | 34,858,236,257 |
+| `9744a9fc` | `ec335d61` | 161.57 s | 15.03 s | 176.6 s | 58.8 MB | 33,981,195,365 |
+| `fc076a09` (HEAD) | `13828c41` | 170.64 s | 15.30 s | 186.0 s | 954.6 MB | - |
+
+- Index build: median 163.1 s against 166.4 s, +2.0 %, the noise floor.
+  Pass 1 runs at 0.8 cores in both arms: the payload scan was already
+  serial before `060c2f74`, which added the tag-key marking and
+  serialization to it, not the serial read. The HEAD cell is one sample
+  and sits inside the band.
+- Peak anon: +~895 MB, matching the 877 MB of tagdata the output gained
+  (about 1.7 KB per blob). The key sets live from pass 1 until the plan is
+  dropped after pass 2; `plan`'s four per-frame flag vectors are planning
+  scratch (about 2 MB here) and are gone before pass 2.
+- Verdict: no wall cost; a memory cost equal to the output's tagdata,
+  with no fixed bound (it scales with reframed passthrough content, so the
+  Europe ratio of 2.6 % of input is an observation, not an envelope).
+  Accepted on this path; the rationale and the spill remedy are at
+  `Reindex` in `src/commands/blob_merge.rs`. Planet `pbf.raw` (50,816
+  blobs) was not measured.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

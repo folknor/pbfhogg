@@ -19,7 +19,9 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
 ## 'brokkr' tool
 
-Dev tool at `~/Programs/brokkr`. Invoked as `brokkr` from project root (reads `./brokkr.toml`, which includes the files in `brokkr.d/`: `checks.toml` for sweeps and test profiles, `lints.toml` for text lints and script checks, `hosts/<hostname>.toml` for each host's paths and datasets; "brokkr.toml" below means the composed config).
+Dev tool at `~/Programs/brokkr`. Invoked as `brokkr` from project root (reads `./brokkr.toml`, which includes the files in `brokkr.d/`: `checks.toml` for sweeps and test profiles, `lints.toml` for text lints and script checks, `benches.toml` for the script-bench registry, `hosts/<hostname>.toml` for each host's paths and datasets; "brokkr.toml" below means the composed config).
+
+Script benches (`brokkr bench NAME`, `brokkr man bench`): each is a `[bench.NAME]` table in `brokkr.d/benches.toml` with `description`/`version`/`date`/`changelog`, its Lua in `benches/<family>/<NAME>.lua` (family = the pbfhogg command driven, or `compare` for cross-tool benches; NAME = file stem, globally unique, no family prefix). Never inline a script. The header of `brokkr.d/benches.toml` holds the full convention.
 
 ```
 brokkr <command> [--dataset D] [--variant V]   # run once, print timing

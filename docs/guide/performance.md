@@ -41,7 +41,7 @@ Each figure is the median of three single runs, the tools alternating.
 Where defaults differ in what is promised, osmium is given the flag that
 matches pbfhogg: `--fsync` on every command that writes a PBF, and
 `--keep-member-nodes` on add-locations-to-ways. The commands are the
-`vs-osmium` bench in `brokkr.d/benches.toml`.
+`vs-osmium` bench, `benches/compare/vs-osmium.lua`.
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|

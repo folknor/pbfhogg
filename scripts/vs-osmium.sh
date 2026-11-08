@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the vs-osmium script bench (brokkr.d/benches.toml) for every row of
+# Run the vs-osmium script bench (benches/compare/vs-osmium.lua, registered
+# in brokkr.d/benches.toml) for every row of
 # the guide's CLI command table as alternating single-iteration pairs, the
 # starting tool reversed from pair to pair. Usage: scripts/vs-osmium.sh [PAIRS]
 set -euo pipefail

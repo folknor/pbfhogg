@@ -1277,6 +1277,7 @@ fn write_frame(
                         reindex.tagdata.as_deref(),
                         &mut header_buf,
                     )
+                    .map(|(bytes, _)| bytes)
                 })
                 .map_err(|e| source.locate_at(frame.file_offset, e))?;
             writer.write_raw(&reframed)?;

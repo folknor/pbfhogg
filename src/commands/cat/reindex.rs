@@ -26,14 +26,22 @@ use crate::read::input::InputSource;
 use crate::read::wire_schema::BlobHeaderField;
 use crate::write::WriteOptions;
 
-/// What a reindex run did.
+/// What a reindex run did. The two change counts are independent (a blob
+/// can be in both) and describe what the rewrite changed, not a verdict on
+/// the input: `check --index` is the verdict.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReindexStats {
     /// OSMData blobs written, each with indexdata scanned from its payload.
     pub blobs: u64,
-    /// Of those, the blobs whose indexdata the input lacked or stated
-    /// differently.
-    pub blobs_changed: u64,
+    /// Of those, the blobs whose input indexdata was absent, unreadable or
+    /// stated a different index. Compared as index values, so a readable
+    /// older index version describing the same block is not counted.
+    pub indexdata_changed: u64,
+    /// Of those, the blobs whose tagdata as written differs from the input's:
+    /// gained where the input had none, removed (the header-size fallback
+    /// drops it), replaced by a different key set, or freed of repeated
+    /// occurrences. The encoding is canonical, so equal bytes are equal sets.
+    pub tagdata_changed: u64,
 }
 
 impl ReindexStats {
@@ -41,9 +49,8 @@ impl ReindexStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             w,
-            "Reindexed {} blobs; {} carried indexdata that was missing or disagreed with \
-             the payload",
-            self.blobs, self.blobs_changed
+            "Reindexed {} blobs; indexdata changed in {}, tagdata changed in {}",
+            self.blobs, self.indexdata_changed, self.tagdata_changed
         )
     }
 }
@@ -132,7 +139,8 @@ fn reindex_to(
             writer.write_raw_owned(reframed.bytes)?;
             if let Some(changed) = reframed.data {
                 stats.blobs += 1;
-                stats.blobs_changed += u64::from(changed);
+                stats.indexdata_changed += u64::from(changed.indexdata);
+                stats.tagdata_changed += u64::from(changed.tagdata);
             }
             Ok(())
         },
@@ -147,16 +155,22 @@ struct ReindexScratch {
     header_buf: Vec<u8>,
 }
 
-/// One frame ready to write: its bytes, and for a data blob whether its
-/// indexdata changed.
+/// One frame ready to write: its bytes, and for a data blob what changed.
 struct Reframed {
     bytes: Vec<u8>,
-    data: Option<bool>,
+    data: Option<Changed>,
 }
 
-/// The reframed bytes of one OSMData frame and whether its indexdata was
-/// missing or disagreed with the payload.
-fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(Vec<u8>, bool)> {
+/// Which of a data blob's two claims the rewrite changed; see
+/// [`ReindexStats`] for what each means.
+#[derive(Clone, Copy)]
+struct Changed {
+    indexdata: bool,
+    tagdata: bool,
+}
+
+/// The reframed bytes of one OSMData frame and what the rewrite changed.
+fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(Vec<u8>, Changed)> {
     scratch.payload.clear();
     decompress_blob_data_into(frame.blob_bytes(), &mut scratch.payload)?;
     let (index, tags) = crate::blob_meta::scan_block_ids_and_tags(&scratch.payload)?;
@@ -167,17 +181,25 @@ fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(
              groups), so it cannot be reindexed without re-encoding it",
         ));
     };
-    let changed = frame.index != Some(index);
     let tagdata = tags
         .as_ref()
         .and_then(crate::blob_meta::TagIndex::serialize);
-    let out = reframe_preserving(
+    let (out, tagdata_kept) = reframe_preserving(
         frame.header_bytes(),
         frame.blob_bytes(),
         &index.serialize(),
         tagdata.as_deref(),
         &mut scratch.header_buf,
     )?;
+    let written_tagdata = tagdata.as_deref().filter(|_| tagdata_kept);
+    // `tagdata` is `None` with `tagdata_present` set when the input repeated
+    // the field: the rewrite leaves one occurrence or none, a change either
+    // way.
+    let repeated_tagdata = frame.tagdata_present && frame.tagdata.is_none();
+    let changed = Changed {
+        indexdata: frame.index != Some(index),
+        tagdata: written_tagdata != frame.tagdata.as_deref() || repeated_tagdata,
+    };
     Ok((out, changed))
 }
 
@@ -187,16 +209,17 @@ fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(
 /// field and any field this build does not know survive, so a reindexed
 /// blob loses nothing its payload still supports. Over the header-size limit
 /// the tag index is dropped first, as the writer drops it; still over, the
-/// blob is refused rather than stripped of a preserved field. `header_buf`
-/// is scratch.
+/// blob is refused rather than stripped of a preserved field. Returns the
+/// frame and whether `tagdata` went into it. `header_buf` is scratch.
 pub(crate) fn reframe_preserving(
     header: &[u8],
     blob: &[u8],
     index: &[u8],
     tagdata: Option<&[u8]>,
     header_buf: &mut Vec<u8>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     let mut rebuilt = rebuild_header(header, index, tagdata, header_buf)?;
+    let tagdata_kept = rebuilt && tagdata.is_some();
     if !rebuilt {
         // A blob without tagdata claims no key set.
         rebuilt = rebuild_header(header, index, None, header_buf)?;
@@ -214,7 +237,7 @@ pub(crate) fn reframe_preserving(
     out.extend_from_slice(&header_len.to_be_bytes());
     out.extend_from_slice(header_buf);
     out.extend_from_slice(blob);
-    Ok(out)
+    Ok((out, tagdata_kept))
 }
 
 /// `header` with every `indexdata` and `tagdata` field replaced by `index`

@@ -1141,7 +1141,7 @@ so plain `cat` cannot repair false indexdata; `--reindex` (below) does.
 through on their kind and range, both believed without a decode. See
 [indexdata-trust.md](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
-**`--reindex`: the repair for false indexdata.** Every data blob is
+**`--reindex`: the repair for false indexdata and tagdata.** Every data blob is
 decompressed and scanned, and its `BlobHeader` is rewritten with every
 `indexdata` (field 2) and `tagdata` (field 4) occurrence replaced by one
 derived from the payload; the compressed payload and every other header
@@ -1152,9 +1152,16 @@ header blob's own `BlobHeader` or `Blob` envelope is not kept), and any
 other blob is copied as it is. The input is read front to back through one
 open while blobs are scanned on a worker pool, so it may be a stream, read a
 window of blobs ahead of the output; a failure partway through a stream can
-wait for the stream's writer to write again or close it. The summary counts the blobs written
-and how many carried indexdata that was missing or disagreed with the
-payload. A block no single index can describe (no elements, a group carrying
+wait for the stream's writer to write again or close it. The summary,
+`Reindexed N blobs; indexdata changed in I, tagdata changed in T`, counts
+the data blobs written and, independently (a blob can be in both), those
+whose indexdata changed (absent, unreadable or a different index; compared
+as values, so an older index version describing the same block does not
+count) and those whose tagdata as written differs from the input's (gained,
+dropped by the header-size rule below, a different key set, or repeated
+occurrences collapsed). The counts describe the rewrite, not a verdict on
+the input: blobs that gain tagdata the input never had were not wrong, and
+`check --index` is the verdict. A block no single index can describe (no elements, a group carrying
 more than one element field, or kinds mixed across groups) is refused (exit
 2, nothing published) rather than left unindexed, which would make the
 output partially indexed, or re-encoded, which is not lossless; such a file

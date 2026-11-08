@@ -2847,7 +2847,7 @@ fn reindex_repairs_false_kind_claims_losslessly() {
     let output = dir.path().join("reindexed.osm.pbf");
     let out = run_reindex(&lying, &output);
     assert!(out.status.success(), "{}", out.stderr_str());
-    out.assert_stderr_contains("Reindexed 2 blobs; 2 carried indexdata");
+    out.assert_stderr_contains("Reindexed 2 blobs; indexdata changed in 2, tagdata changed in 0");
     CliInvoker::new()
         .args(["check", "--index"])
         .arg(&output)
@@ -2868,8 +2868,51 @@ fn reindex_repairs_false_kind_claims_losslessly() {
     let again = dir.path().join("again.osm.pbf");
     let out = run_reindex(&honest, &again);
     assert!(out.status.success(), "{}", out.stderr_str());
-    out.assert_stderr_contains("Reindexed 2 blobs; 0 carried indexdata");
+    out.assert_stderr_contains("Reindexed 2 blobs; indexdata changed in 0, tagdata changed in 0");
     assert_eq!(data_payloads(&again), data_payloads(&honest));
+}
+
+/// False tagdata alone is counted: `degrade --corrupt-tagdata` replaces
+/// every blob's key set and leaves indexdata true, so the reindex summary
+/// reports every blob's tagdata changed and no indexdata, and the result
+/// passes `check --index`.
+#[test]
+fn reindex_counts_false_tagdata() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [("name", "a")], None);
+    bb.add_node(2, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    bb.add_way(10, [("highway", "path")], &[1, 2], None);
+    let ways = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&honest, true, &[], &[(true, nodes), (true, ways)]);
+
+    let corrupt = dir.path().join("tags.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&corrupt)
+        .arg("--corrupt-tagdata")
+        .assert_success();
+    let bad = CliInvoker::new()
+        .args(["check", "--index"])
+        .arg(&corrupt)
+        .run();
+    assert_eq!(bad.status.code(), Some(1), "{}", bad.stderr_str());
+
+    let output = dir.path().join("reindexed.osm.pbf");
+    let out = run_reindex(&corrupt, &output);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("Reindexed 2 blobs; indexdata changed in 0, tagdata changed in 2");
+    CliInvoker::new()
+        .args(["check", "--index"])
+        .arg(&output)
+        .assert_success();
+    assert_eq!(data_payloads(&output), data_payloads(&corrupt));
 }
 
 /// `--reindex` refuses a block no single index describes rather than give

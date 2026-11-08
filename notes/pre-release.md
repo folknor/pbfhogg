@@ -212,25 +212,6 @@ still held. Only adversarial or many-version input reaches the hold.
 
 ---
 
-
-## Correctness
-
-### WRK-186: `cat --reindex` summary counts only indexdata changes
-
-`cat --reindex` prints "Reindexed N blobs; M carried indexdata that was
-missing or disagreed with the payload", and `ReindexStats::blobs_changed`
-compares only the indexdata (src/commands/cat/reindex.rs). Repairing the
-three bygg planet files whose tagdata omitted the empty key (2026-11-08,
-at `b00e2e0b`) printed "0 carried" each time, though every one changed
-tagdata (one blob each, and blobs that had no tagdata gained it). A user
-running the documented repair for false tagdata is told nothing was wrong.
-The fix counts a blob as changed when its tagdata differs from the rescan
-too, or reports the two counts separately; the line is documented in
-docs/cli/commands.md (`--reindex`), so the wording change is a CLI
-contract change with a CHANGELOG entry.
-
----
-
 ## Documentation and comment corrections
 
 ### WRK-168: The guide's inspect tags speedup row compares different counts

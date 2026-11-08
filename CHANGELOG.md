@@ -249,9 +249,10 @@ state.
   (`xxh128 v2`; `--form content` gives the element-only `v1` digest).
 - `check --index` verifies blob indexdata and tagdata against the blobs, and
   `check --locations` verifies a LocationsOnWays file's inline coordinates.
-- `cat --reindex` rewrites false indexdata losslessly, and
-  `sort --distrust-metadata` sorts a file whose sort claim or indexdata is
-  false.
+- `cat --reindex` rewrites false indexdata and tagdata losslessly, and its
+  summary counts the blobs whose indexdata and whose tagdata it changed,
+  separately; `sort --distrust-metadata` sorts a file whose sort claim or
+  indexdata is false.
 - `--distrust-metadata` on `tags-filter` and `inspect`.
 - `degrade --corrupt-tagdata`, `--corrupt-indexdata` and
   `--corrupt-indexdata-kind` write well-formed but false hints.

@@ -17,8 +17,11 @@
 //! `--corrupt-indexdata-kind` / `--corrupt-tagdata` can manufacture a file whose
 //! hints are well-formed and false - but the pair was one-sided. This is the
 //! other side: it decompresses every blob, re-derives the metadata from the
-//! payload with [`crate::blob_meta::try_scan_block_ids_checked`] /
-//! [`scan_block_tags`], and diffs. Those are
+//! payload with [`crate::blob_meta::try_scan_block_ids_checked`], or, where
+//! the blob carries tagdata to compare, with
+//! [`crate::blob_meta::try_scan_block_ids_and_tags`], whose one walk yields
+//! the same index and the key set `try_scan_block_tags` would, and diffs.
+//! Those are
 //! the writer's *passthrough*-path scanners; the ordinary write path derives
 //! its index incrementally inside `BlockBuilder` and never rescans what it
 //! emitted, so against it this check is genuinely independent.
@@ -82,11 +85,11 @@
 //! treats them as exact, so anything but equality is a lie with a consumer.
 
 use crate::blob::BlobKind;
-use crate::blob_meta::{BboxClaim, BlobBbox, BlobIndex, scan_block_tags};
+use crate::blob_meta::{BboxClaim, BlobBbox, BlobIndex};
 use crate::error::Result;
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
-use crate::read::frame::Frames;
+use crate::read::frame::{Frames, RawBlobFrame};
 use crate::read::input::InputSource;
 
 /// Options for [`check_index`].
@@ -438,13 +441,20 @@ fn diff_blob(
 ///
 /// `stored_bytes` is the raw `BlobHeader.tagdata`. Absent tagdata makes no
 /// claim and is not a violation - readers treat it as "decode this blob".
-fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexViolationKind>) {
+/// `observed` is the blob's scanned key set (`try_scan_block_tags`'s, from
+/// the same walk as its index), `None` for a
+/// blob no tag index can describe.
+fn diff_tagdata(
+    stored_bytes: Option<&[u8]>,
+    observed: Option<&crate::blob_meta::TagIndex>,
+    out: &mut Vec<IndexViolationKind>,
+) {
     let Some(bytes) = stored_bytes else { return };
     let Some(stored) = crate::blob_meta::TagIndex::deserialize(bytes) else {
         out.push(IndexViolationKind::MalformedTagdata);
         return;
     };
-    let Some(observed) = scan_block_tags(block) else {
+    let Some(observed) = observed else {
         // The blob is one no tag index can describe (a mixed-kind group; a
         // malformed payload already failed the ID scan in `check_index`), yet
         // a well-formed tag index was stored for it.
@@ -493,6 +503,71 @@ fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexVi
     }
 }
 
+/// One data blob's findings, from a frame-pool worker, folded in file order.
+struct BlobVerdict {
+    /// Ordinal among the file's OSMData blobs.
+    ordinal: u64,
+    file_offset: u64,
+    /// The header carried a readable indexdata.
+    indexed: bool,
+    tagdata_present: bool,
+    /// The payload is one no index can describe.
+    unindexable: bool,
+    /// The payload is indexable and the header carries no indexdata field at
+    /// all (present but unreadable indexdata is its own finding instead).
+    unindexed_candidate: bool,
+    /// Index findings first, then tag findings, as they are reported.
+    found: Vec<IndexViolationKind>,
+}
+
+/// Decompress one OSMData blob into `block` (worker scratch) and diff its
+/// payload against its header's claims.
+fn verify_blob(ordinal: u64, frame: &RawBlobFrame, block: &mut Vec<u8>) -> Result<BlobVerdict> {
+    // Unconditional decode: the stored metadata is under test, so it must
+    // not be allowed to decide which blobs get looked at.
+    block.clear();
+    decompress_blob_data_into(frame.blob_bytes(), block)?;
+    // A malformed payload is an error even when no metadata was stored.
+    // Valid unsupported shapes remain unindexable rather than malformed. One
+    // walk yields both the index and, where readable tagdata wants comparing,
+    // the key set; the ID result and the tag result stay independent (a
+    // block of separate way and relation groups has no index but a complete
+    // key set).
+    let malformed =
+        |e: crate::Error| e.context(format!("OsmData blob {ordinal}: malformed payload"));
+    let (observed, observed_tags) = if frame.tagdata.is_some() {
+        crate::blob_meta::try_scan_block_ids_and_tags(block).map_err(malformed)?
+    } else {
+        (
+            crate::blob_meta::try_scan_block_ids_checked(block).map_err(malformed)?,
+            None,
+        )
+    };
+    let observed = observed.map(|(index, _sorted)| index);
+
+    let mut found = Vec::new();
+    diff_blob(
+        frame.index.as_ref(),
+        frame.index_present,
+        observed.as_ref(),
+        &mut found,
+    );
+    if frame.tagdata_present && frame.tagdata.is_none() {
+        found.push(IndexViolationKind::MalformedTagdata);
+    } else {
+        diff_tagdata(frame.tagdata.as_deref(), observed_tags.as_ref(), &mut found);
+    }
+    Ok(BlobVerdict {
+        ordinal,
+        file_offset: frame.file_offset(),
+        indexed: frame.index.is_some(),
+        tagdata_present: frame.tagdata_present,
+        unindexable: observed.is_none(),
+        unindexed_candidate: observed.is_some() && !frame.index_present,
+        found,
+    })
+}
+
 /// Decompress every OSMData blob and diff its payload against the metadata its
 /// `BlobHeader` claims.
 ///
@@ -524,82 +599,60 @@ fn check_index_inner(
     // The verifier is exempt from the command-input refusal of a partially
     // indexed file: reporting it, as a violation, is part of its job.
     frames.accept_partial_index();
-    let mut block = Vec::new();
     let mut report = IndexReport::default();
-    let mut found = Vec::new();
     // The first indexable blob with no indexdata, for the partial-index verdict.
     let mut first_unindexed: Option<(u64, u64)> = None;
 
     host.invocation.marker("CHECK_INDEX_START");
-    let mut first = true;
-    while let Some(frame) = frames.next_raw()? {
-        // The header comes first or the file is not a PBF: a zero-byte or
-        // header-less file gets the one missing-header error, not a clean
-        // report over data blobs it cannot place.
-        if first && !matches!(frame.blob_type, BlobKind::OsmHeader) {
-            return Err(crate::error::new_missing_header(path));
-        }
-        first = false;
-        if !matches!(frame.blob_type, BlobKind::OsmData) {
-            continue;
-        }
-        let ordinal = report.blobs;
-        report.blobs += 1;
-        if frame.index.is_some() {
-            report.blobs_with_index += 1;
-        }
-        if frame.tagdata_present {
-            report.blobs_with_tagdata += 1;
-        }
+    // The header comes first or the file is not a PBF: a zero-byte or
+    // header-less file gets the one missing-header error, not a clean report
+    // over data blobs it cannot place. Its payload is not decoded.
+    match frames.next_raw()? {
+        Some(frame) if matches!(frame.blob_type, BlobKind::OsmHeader) => {}
+        _ => return Err(crate::error::new_missing_header(path)),
+    }
 
-        // Unconditional decode: the stored metadata is under test, so it must
-        // not be allowed to decide which blobs get looked at.
-        decompress_blob_data_into(frame.blob_bytes(), &mut block)
-            .map_err(|e| frames.locate(frame.id, e))?;
-        // A malformed payload is an error even when no metadata was stored.
-        // Valid unsupported shapes remain unindexable rather than malformed.
-        let observed = crate::blob_meta::try_scan_block_ids_checked(&block)
-            .map_err(|e| {
-                frames.locate(
-                    frame.id,
-                    e.context(format!("OsmData blob {ordinal}: malformed payload")),
-                )
-            })?
-            .map(|(index, _sorted)| index);
-        if observed.is_none() {
-            report.blobs_unindexable += 1;
-        } else if !frame.index_present && first_unindexed.is_none() {
-            first_unindexed = Some((ordinal, frame.file_offset()));
-        }
-
-        found.clear();
-        diff_blob(
-            frame.index.as_ref(),
-            frame.index_present,
-            observed.as_ref(),
-            &mut found,
-        );
-        if frame.tagdata_present && frame.tagdata.is_none() {
-            found.push(IndexViolationKind::MalformedTagdata);
-        } else {
-            diff_tagdata(frame.tagdata.as_deref(), &block, &mut found);
-        }
-        block.clear();
-
-        for kind in found.drain(..) {
-            report.total_violations += 1;
-            if opts.max_errors == 0 || report.violations.len() < opts.max_errors {
-                report.violations.push(IndexViolation {
-                    blob_ordinal: ordinal,
-                    file_offset: frame.file_offset(),
-                    kind,
-                });
+    // The walk stays one sequential read on this thread (so a stream is an
+    // input); each data blob's decompression and scan run on the frame pool,
+    // and the verdicts are folded here in file order, so the report is the
+    // one a sequential loop builds.
+    let mut data_ordinal = 0_u64;
+    crate::read::frame_pool::map_frames_ordered(
+        &mut frames,
+        host,
+        |frame| {
+            if !matches!(frame.blob_type, BlobKind::OsmData) {
+                return None;
             }
-        }
-    }
-    if first {
-        return Err(crate::error::new_missing_header(path));
-    }
+            let ordinal = data_ordinal;
+            data_ordinal += 1;
+            Some((ordinal, frame))
+        },
+        Vec::new,
+        |block: &mut Vec<u8>, (ordinal, frame): (u64, RawBlobFrame)| {
+            verify_blob(ordinal, &frame, block)
+        },
+        |verdict: BlobVerdict| {
+            report.blobs += 1;
+            report.blobs_with_index += u64::from(verdict.indexed);
+            report.blobs_with_tagdata += u64::from(verdict.tagdata_present);
+            report.blobs_unindexable += u64::from(verdict.unindexable);
+            if verdict.unindexed_candidate && first_unindexed.is_none() {
+                first_unindexed = Some((verdict.ordinal, verdict.file_offset));
+            }
+            for kind in verdict.found {
+                report.total_violations += 1;
+                if opts.max_errors == 0 || report.violations.len() < opts.max_errors {
+                    report.violations.push(IndexViolation {
+                        blob_ordinal: verdict.ordinal,
+                        file_offset: verdict.file_offset,
+                        kind,
+                    });
+                }
+            }
+            Ok(())
+        },
+    )?;
     host.invocation.marker("CHECK_INDEX_END");
 
     if let Some((blob_ordinal, file_offset)) = first_unindexed
@@ -623,6 +676,7 @@ fn check_index_inner(
 mod tests {
     use super::*;
     use crate::ElementKind;
+    use crate::blob_meta::scan_block_tags;
 
     fn idx(kind: ElementKind, min_id: i64, max_id: i64, count: u64) -> BlobIndex {
         BlobIndex {
@@ -819,11 +873,11 @@ mod tests {
     #[test]
     fn malformed_tagdata_is_reported_but_absent_tagdata_is_not() {
         let mut out = Vec::new();
-        diff_tagdata(Some(&[0xFF, 0x00, 0x00]), &[], &mut out);
+        diff_tagdata(Some(&[0xFF, 0x00, 0x00]), None, &mut out);
         assert_eq!(out, vec![IndexViolationKind::MalformedTagdata]);
 
         let mut out = Vec::new();
-        diff_tagdata(None, &[], &mut out);
+        diff_tagdata(None, None, &mut out);
         assert!(out.is_empty(), "no tagdata is no claim");
     }
 
@@ -919,7 +973,7 @@ mod tests {
             .expect("one short key is encodable");
 
         let mut out = Vec::new();
-        diff_tagdata(Some(&stored), &block, &mut out);
+        diff_tagdata(Some(&stored), scan_block_tags(&block).as_ref(), &mut out);
         assert_eq!(
             out,
             vec![IndexViolationKind::TagdataOnUnindexableBlob],
@@ -930,7 +984,7 @@ mod tests {
         // Paired counterpart: no tagdata over the same blob is legal and is
         // exactly what this crate writes for it, so the check must stay quiet.
         let mut out = Vec::new();
-        diff_tagdata(None, &block, &mut out);
+        diff_tagdata(None, scan_block_tags(&block).as_ref(), &mut out);
         assert!(
             out.is_empty(),
             "a mixed-kind blob with no tag index is what pbfhogg itself \
@@ -959,7 +1013,7 @@ mod tests {
         clean.push(u8::try_from(group.len()).unwrap());
         clean.extend_from_slice(&group);
         let mut out = Vec::new();
-        diff_tagdata(Some(&stored), &clean, &mut out);
+        diff_tagdata(Some(&stored), scan_block_tags(&clean).as_ref(), &mut out);
         assert!(
             out.is_empty(),
             "an honest tag index over a scannable blob must verify clean: \

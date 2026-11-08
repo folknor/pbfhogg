@@ -4236,6 +4236,24 @@ line; the nodes phase loses the set's 1.9 GB of page faults (minflt 393k to
 28k). The memory drop is the result. Not measured: an unsorted file, where
 each out-of-order kind costs one extra read at the old peak.
 
+## check --index and cat --reindex on a frame pool (bygg, 2026-11-08, against `74be4015`)
+
+Both were one thread: read a frame, decompress, scan (`check --index`
+scanned twice, IDs then tags). Now the frame walk stays sequential on the
+calling thread (a stream is still an input) and feeds an ordered worker pool
+(`read::frame_pool`, `workers + 2` frames in flight) that decompresses and
+scans in one walk; results are folded in file order. Planet
+`planet-20260223-reindexed.osm.pbf`:
+
+| Command | Base `74be4015` | Working tree (`--force` / `brokkr run`, not stored) |
+|---|---:|---:|
+| `check-index --bench 1` | 494.2 s (`3965701e`), 1.0 cores, peak anon 15 MB | 28.9 s, 15.5 cores, peak anon 334 MB, read 3.1 GB/s |
+| `cat --reindex` of `planet-20260223-with-indexdata` | 444 s (`brokkr history` 62313, at `3f8ed0ec`, dirty) | about 44 s (`brokkr history` 62538, 1.8 m minus a 64 s build) |
+
+The base was CPU-bound on one core; the pool is near the drive's read rate.
+The reindex output is byte-identical (`cmp`) to the sequential run's. One
+cell per arm: the gap is 10 to 17 times, far outside any drift band.
+
 ## Cost of appending the offset tables to the payload (bygg, 2026-11-01)
 
 What block construction pays to append the string-table and group

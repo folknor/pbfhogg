@@ -59,13 +59,6 @@ admission and the regressions.
   orchestrate spec loop before implementation. Supersedes the parked
   GeoPackage idea under Milestone 3.
 
-- [ ] **Cross-repo, filed in bz: `brokkr#64`** (a `check-index`
-  subcommand, so `check --index` gets bench rows, a sidecar profile,
-  `--snapshot` addressing and a suite entry) **and `brokkr#65`** (record
-  pbfhogg exit 1 as a negative answer, not a failed run). Until #64 lands
-  there is no recorded timing for `check --index` at any scale; it is
-  covered by `cli/tests/cli_check_index.rs` and by hand on Denmark.
-
 - [ ] **GeoJSON export v2**
   ([notes/geojson-export-design.md](geojson-export-design.md)):
   relations -> MultiPolygon, raw-PBF index fallback, brokkr-side

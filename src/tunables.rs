@@ -836,6 +836,13 @@ pub(crate) const DIFF_UNIT_QUEUE_DEPTH: usize = 4;
 /// consumer drains the head. Not measured.
 pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
 
+/// Frames issued beyond one per worker by `read::frame_pool` (`check
+/// --index`, `cat --reindex`): the walk runs at most `workers +
+/// FRAME_POOL_WINDOW_SLACK` raw frames ahead of the in-order fold, which
+/// bounds the frames in flight, and a little slack keeps every worker busy
+/// while the fold waits on the head. Not measured.
+pub(crate) const FRAME_POOL_WINDOW_SLACK: usize = 2;
+
 /// Formatted output bytes a unit's worker gathers before handing a chunk to
 /// the consumer, so a unit with a large output streams it instead of
 /// holding it whole. The text diff takes a chunk after a whole merge action,

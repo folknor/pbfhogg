@@ -10,6 +10,7 @@ pub mod direct_reader;
 pub mod elements;
 pub mod file_reader;
 pub(crate) mod frame;
+pub(crate) mod frame_pool;
 pub(crate) mod header_walker;
 pub mod input;
 pub(crate) mod pipeline;

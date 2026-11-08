@@ -62,6 +62,7 @@ pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
 ///
 /// Same collapse as [`scan_block_ids_checked`]; [`try_scan_block_tags`] keeps
 /// malformed bytes as an `Err`. Never a truncated key set.
+#[cfg(test)]
 pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
     try_scan_block_tags(raw).ok().flatten() // ok-deliberate: advisory, see doc
 }

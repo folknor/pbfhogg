@@ -949,8 +949,14 @@ with `--ids`, which checks ID and type order.
 
 `check --index` is the other side of that boundary. It decompresses every
 OSMData blob, re-derives the metadata from the payload with `try_scan_block_ids_checked`
-and `scan_block_tags`, and reports each disagreement with the blob's ordinal and
-byte offset.
+(and, where the blob carries tagdata, the key set from the same walk), and
+reports each disagreement with the blob's ordinal and byte offset.
+
+The input is read front to back through one open, so with `--index` alone
+`<FILE>` may be a stream (a FIFO, `/dev/stdin`). Blobs are decompressed and
+scanned on a worker pool while the read runs a little ahead of the report,
+so a failure partway through a stream can wait for the stream's writer to
+write again or close it before the command exits.
 
 Those are the same two scanners the writer's passthrough path uses, so on a
 re-framed blob the check cannot catch a bug *in the scanner itself* - it can
@@ -1143,7 +1149,10 @@ field (the `WayMembers-v1` field 5 and unknown fields included) are copied
 byte for byte, the file header's `HeaderBlock` is carried through unchanged
 (its frame is written afresh under `--compression`, so a field of the
 header blob's own `BlobHeader` or `Blob` envelope is not kept), and any
-other blob is copied as it is. The summary counts the blobs written
+other blob is copied as it is. The input is read front to back through one
+open while blobs are scanned on a worker pool, so it may be a stream, read a
+window of blobs ahead of the output; a failure partway through a stream can
+wait for the stream's writer to write again or close it. The summary counts the blobs written
 and how many carried indexdata that was missing or disagreed with the
 payload. A block no single index can describe (no elements, a group carrying
 more than one element field, or kinds mixed across groups) is refused (exit

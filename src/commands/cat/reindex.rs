@@ -21,7 +21,7 @@
 use crate::blob::{BlobKind, decompress_blob_data_into};
 use crate::error::{Error, Result};
 use crate::file_reader::FileReader;
-use crate::read::frame::Frames;
+use crate::read::frame::{Frames, RawBlobFrame};
 use crate::read::input::InputSource;
 use crate::read::wire_schema::BlobHeaderField;
 use crate::write::WriteOptions;
@@ -102,47 +102,83 @@ fn reindex_to(
         host,
     )?;
 
+    // The walk stays one sequential read on this thread; every later frame
+    // is a frame-pool task (a data blob's decompression, scan and reframe on
+    // a worker, any other frame passed through as it is), and the frames are
+    // written here in input order.
     let mut stats = ReindexStats::default();
-    let mut payload: Vec<u8> = Vec::new();
-    let mut header_buf: Vec<u8> = Vec::new();
-    while let Some(mut frame) = frames.next_raw()? {
-        if !matches!(frame.blob_type, BlobKind::OsmData) {
-            writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
-            continue;
-        }
-        let id = frame.id;
-        let reframed = (|| -> Result<(Vec<u8>, bool)> {
-            payload.clear();
-            decompress_blob_data_into(frame.blob_bytes(), &mut payload)?;
-            let (index, tags) = crate::blob_meta::scan_block_ids_and_tags(&payload)?;
-            let Some(index) = index else {
-                return Err(Error::invalid_data(
-                    "the blob's block cannot be described by one index (no elements, a group \
-                     carrying more than one element field, or element kinds mixed across \
-                     groups), so it cannot be reindexed without re-encoding it",
-                ));
-            };
-            let changed = frame.index != Some(index);
-            let tagdata = tags
-                .as_ref()
-                .and_then(crate::blob_meta::TagIndex::serialize);
-            let out = reframe_preserving(
-                frame.header_bytes(),
-                frame.blob_bytes(),
-                &index.serialize(),
-                tagdata.as_deref(),
-                &mut header_buf,
-            )?;
-            Ok((out, changed))
-        })()
-        .map_err(|e| frames.locate(id, e))?;
-        let (bytes, changed) = reframed;
-        writer.write_raw_owned(bytes)?;
-        stats.blobs += 1;
-        stats.blobs_changed += u64::from(changed);
-    }
+    crate::read::frame_pool::map_frames_ordered(
+        &mut frames,
+        host,
+        Some,
+        || ReindexScratch {
+            payload: Vec::new(),
+            header_buf: Vec::new(),
+        },
+        |scratch: &mut ReindexScratch, mut frame: RawBlobFrame| {
+            if !matches!(frame.blob_type, BlobKind::OsmData) {
+                return Ok(Reframed {
+                    bytes: std::mem::take(&mut frame.frame_bytes),
+                    data: None,
+                });
+            }
+            let (bytes, changed) = reindex_frame(&frame, scratch)?;
+            Ok(Reframed {
+                bytes,
+                data: Some(changed),
+            })
+        },
+        |reframed: Reframed| {
+            writer.write_raw_owned(reframed.bytes)?;
+            if let Some(changed) = reframed.data {
+                stats.blobs += 1;
+                stats.blobs_changed += u64::from(changed);
+            }
+            Ok(())
+        },
+    )?;
     writer.flush()?;
     Ok(stats)
+}
+
+/// One frame-pool worker's scratch.
+struct ReindexScratch {
+    payload: Vec<u8>,
+    header_buf: Vec<u8>,
+}
+
+/// One frame ready to write: its bytes, and for a data blob whether its
+/// indexdata changed.
+struct Reframed {
+    bytes: Vec<u8>,
+    data: Option<bool>,
+}
+
+/// The reframed bytes of one OSMData frame and whether its indexdata was
+/// missing or disagreed with the payload.
+fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(Vec<u8>, bool)> {
+    scratch.payload.clear();
+    decompress_blob_data_into(frame.blob_bytes(), &mut scratch.payload)?;
+    let (index, tags) = crate::blob_meta::scan_block_ids_and_tags(&scratch.payload)?;
+    let Some(index) = index else {
+        return Err(Error::invalid_data(
+            "the blob's block cannot be described by one index (no elements, a group \
+             carrying more than one element field, or element kinds mixed across \
+             groups), so it cannot be reindexed without re-encoding it",
+        ));
+    };
+    let changed = frame.index != Some(index);
+    let tagdata = tags
+        .as_ref()
+        .and_then(crate::blob_meta::TagIndex::serialize);
+    let out = reframe_preserving(
+        frame.header_bytes(),
+        frame.blob_bytes(),
+        &index.serialize(),
+        tagdata.as_deref(),
+        &mut scratch.header_buf,
+    )?;
+    Ok((out, changed))
 }
 
 /// The frame `[4-byte length][BlobHeader][Blob]` of a blob whose header

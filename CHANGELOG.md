@@ -282,6 +282,13 @@ state.
 
 ### Changed
 
+- `check --index` and `cat --reindex` decompress and scan blobs on a worker
+  pool instead of one thread: at planet about 29 s instead of 494 s for
+  `check --index`, and about 44 s instead of 444 s for `cat --reindex`,
+  whose output is unchanged byte for byte. Both still read their input front
+  to back through one open, so a stream is still accepted, but the read
+  runs a window of blobs ahead, so a failure partway through a stream can
+  wait for the stream's writer to write again or close it.
 - `getid --add-referenced` follows relation members as `osmium getid -r`
   does: the members of requested relations, recursively through relations
   in relations, then the nodes of every way requested or pulled in. It used

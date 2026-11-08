@@ -233,13 +233,6 @@ on plantasjen and bygg, `check --index` OK on both). Left, filed in bz:
 `check --index` over every other indexed dataset file on both hosts,
 reindexing any that fail.
 
-### WRK-179: check --index takes 11 minutes at planet
-
-`brokkr check-index --dataset planet` on plantasjen at `779b263e`: 652 s
-(unstored, dirty tree), against about 30 s for `check-ids` and
-`check-refs` on the same host. The plain `cat --reindex` that wrote the
-file took about 9 minutes. Unprofiled; the phase split is the first step.
-
 ---
 
 ## Documentation and comment corrections

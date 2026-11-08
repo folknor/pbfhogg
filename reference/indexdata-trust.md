@@ -331,8 +331,9 @@ take the bound from `IdSet::file_bounded_max_id`.
 
 How `check --index` is built, so its verdict means what it says:
 
-- It re-derives the sidecars with `try_scan_block_ids_checked` / `scan_block_tags`, the
-  scanners the writer's passthrough path uses. On a re-framed blob it
+- It re-derives the sidecars with `try_scan_block_ids_checked`, or
+  `try_scan_block_ids_and_tags` where a blob carries tagdata (one walk, the
+  same index and key set as the separate scans), the scanners the writer's passthrough path uses. On a re-framed blob it
   therefore cannot catch a bug inside those scanners, only a sidecar that has
   diverged from its payload; against `BlockBuilder`, which derives its index
   incrementally and never rescans what it emitted, it is independent. The

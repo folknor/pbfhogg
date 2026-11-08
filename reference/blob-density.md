@@ -75,7 +75,7 @@ encodings:
 - `getparents` (`src/commands/getparents/mod.rs`) - **dispatched**
 - `removeid` raw-frame passthrough - walker-only (unmeasured full-scan;
   see ADR-0006)
-- `sort` pass 1 (`src/commands/sort/mod.rs::build_blob_index`) - **not
+- `sort` and `cat --dedupe` pass 1 (`src/commands/blob_merge.rs::index_inputs`) - **not
   dispatched**, separate seek-skip mechanism (see below)
 - `inspect` index-only (`src/commands/inspect/scan.rs::try_index_only_scan`)
 

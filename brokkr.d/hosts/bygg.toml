@@ -94,6 +94,36 @@ download_date = "2026-10-27"
 file = "denmark-ways-only-with-indexdata.osm.pbf"
 xxhash = "222152d6a1093e27f40e87bbafbb1bb6"
 
+[bygg.datasets.denmark.snapshot.grow-9001]
+download_date = "2026-11-08"
+
+[bygg.datasets.denmark.snapshot.grow-9001.pbf.indexed]
+file = "denmark-grow-9001-with-indexdata.osm.pbf"
+xxhash = "41e60ca3c5fdcf3593f9e86bfbefd755"
+
+[bygg.datasets.denmark.snapshot.grow-10007]
+download_date = "2026-11-08"
+
+[bygg.datasets.denmark.snapshot.grow-10007.pbf.indexed]
+file = "denmark-grow-10007-with-indexdata.osm.pbf"
+xxhash = "821b40d87bd637a45c07fde6b42f6f27"
+
+[bygg.datasets.denmark.snapshot.chained]
+download_date = "2026-11-08"
+
+[bygg.datasets.denmark.snapshot.chained.pbf.indexed]
+file = "denmark-chained-with-indexdata.osm.pbf"
+
+[bygg.datasets.denmark.snapshot.twin]
+download_date = "2026-11-08"
+
+[bygg.datasets.denmark.snapshot.twin.pbf.indexed]
+file = "denmark-twin-with-indexdata.osm.pbf"
+
+[bygg.datasets.denmark.expect.diff-snapshots]
+"41e60ca3c5fdcf3593f9e86bfbefd755+55760485369644887ae34df411b8034e" = "same"
+"55760485369644887ae34df411b8034e+821b40d87bd637a45c07fde6b42f6f27" = "same"
+
 [bygg.datasets.germany]
 origin = "Geofabrik"
 download_date = "2026-02-24"

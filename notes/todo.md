@@ -1167,6 +1167,14 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **Sort pass 2 parallelism is bounded by overlap component count
+  (2026-11-08).** One sweep per component: an input whose every kind is
+  one connected component (the Denmark `chained` snapshot) sweeps in
+  three jobs, the node component dominating (`SORT_PASS2` 24.1 s at
+  `d044980e`, bygg; reference/performance.md, "Sort across the blob-merge
+  engine move on unsorted Denmark"). Thread utilization and the critical
+  path were not measured; this records the limit, not a defect or a
+  remedy.
 - [ ] **Byte-budgeted fused task engine (moved from the pre-release
   note 2026-11-08).** One execution model for decode, transform, encode
   and frame under one byte budget, replacing the unordered classify pool,

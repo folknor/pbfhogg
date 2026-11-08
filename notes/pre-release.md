@@ -257,12 +257,6 @@ coalesce (check `cat_dedupe_blobs_passthrough` and
 three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
 second input.
 
-### WRK-088: sort on the Denmark unsorted snapshot
-
-`79d2e923^` vs `79d2e923` on snapshot `unsorted` (or `test-unsorted`, the
-same file). Sort's recorded trade from the pass-1 move: a planet win, a
-dense-europe pass-1 regression.
-
 ### WRK-089: sort --force on unindexed input
 
 `sort --force` on an unindexed europe or planet input (`pbf.raw`),

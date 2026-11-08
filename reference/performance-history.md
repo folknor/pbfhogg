@@ -413,8 +413,10 @@ heap. **Production reality: Geofabrik / planet input already ships
 sorted**, so overlap count is ~zero and pass 2 is pure blob-level
 `copy_file_range` passthrough - the command runs as a verify-and-reframe
 step, not a sort. The genuinely-unsorted path (osmosis output, hand-edited
-fixtures) is the only scenario exercising the decode-merge path and has no
-configured benchmark dataset.
+fixtures) is the only scenario exercising the decode-merge path. Its
+benchmark inputs are Denmark snapshots (`unsorted`, `twin`, `chained`);
+reference/performance.md, "Sort across the blob-merge engine move on
+unsorted Denmark", has what each one exercises.
 
 Optimization arc drafted 2026-04-23 in a sort plan note (retired 2026-07-13;
 this is its durable record). All measurements plantasjen, NVMe->NVMe on one
@@ -458,11 +460,13 @@ the cargo `target/` dir, not the sort scratch path).
   `overlap_runs.par_iter()` producing `Vec<OwnedBlock>` buffered before the
   serial write loop; zero-cost on already-sorted input
   (`overlap_runs.is_empty()` short-circuits). Predicted 1.5-3x on overlap
-  work, **unverified** - production input is already sorted (zero overlap
-  runs) and no unsorted dataset is configured. Memory: buffered overlap
+  work, unverified at the time (no unsorted input was configured then) and
+  never measured against the serial sweep before it. Memory: buffered overlap
   output is uncapped; pathological unsorted input could approach input size
   (fix if it bites: bounded rayon pipeline + reorder buffer).
-  **Superseded 2026-10-25, unmeasured:** sort and `cat --dedupe` became one
+  **Superseded 2026-10-25** (measured afterwards, 2026-11-08, see
+  reference/performance.md "Sort across the blob-merge engine move on
+  unsorted Denmark"): sort and `cat --dedupe` became one
   engine (`src/commands/blob_merge.rs`), whose overlap runs are swept on
   dedicated worker threads and stream their blocks to the write loop in run
   order (a bounded channel per run, an admission window of two runs per
@@ -471,8 +475,8 @@ the cargo `target/` dir, not the sort scratch path).
   the collect-then-write phase; `SORT_WRITE_LOOP` now spans the sweeps.
   A run is now one overlap component; it was a maximal stretch of adjacent
   rewrite blobs of one kind, so input whose every blob overlaps a
-  neighbour (a file merged with itself) had at most one run per kind and
-  the old `par_iter` was serial there.
+  neighbour (a file merged with itself) had at most one run per kind, so
+  the old `par_iter` ran at most three jobs, each swept serially.
   Workers read the pass-2 source by position instead of opening the input
   once per run. On already-sorted input (no runs) nothing starts and the
   pass is the coalesced copy as before. Later (2026-10-26, unmeasured) the

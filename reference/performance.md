@@ -4794,6 +4794,67 @@ baseline (a cold baseline europe inspect, `cb4aad64`); its counters were
 evicted headers (the unit tests pin that isolated misses read no window,
 not its wall), and the multi-walk commands on a cold europe.
 
+## Sort across the blob-merge engine move on unsorted Denmark (bygg, 2026-11-08)
+
+`brokkr sort --dataset denmark --snapshot KEY --bench 1 --commit REF`,
+arms `dd312160` (before the move), `79d2e923` (the move: sort and
+`cat --dedupe` on one engine, overlap runs streamed from worker threads)
+and HEAD `d044980e`, all three `--commit` worktree builds, kernel 7.2.14,
+buffered, no fstrim. Three rounds per input with the arm order rotated
+(old, move, HEAD; move, HEAD, old; HEAD, old, move). Walls in round order:
+
+| input | blobs, overlap runs (old / move / HEAD) | `dd312160` | `79d2e923` | HEAD | peak anon old / move / HEAD |
+|---|---|---|---|---|---|
+| `unsorted` | 7396; 3 runs over 6 blobs | 2.55, 2.08, 2.03 s | 2.54, 2.02, 2.08 s | 2.21, 2.03, 1.98 s | - |
+| `twin` | 14792; 3 / 7396 / 7396 | 30.6, 29.6, 29.2 s | 6.03, 6.08, 6.01 s | 4.94, 4.96, 4.95 s | 2354 / 791 / 200 MB |
+| `chained` | 12487; 3 / 3 / 3 | 31.0, 30.2, 30.3 s | 37.7, 37.6, 37.5 s | 27.3, 27.8, 27.3 s | 2376 / 124 / 46 MB |
+
+UUIDs, in table order. `unsorted`: `1d43e776` `a54557c7` `37ff193a`,
+`d30735cf` `92c587ab` `b64a2d8e`, `84a25a94` `fe4316a5` `6e597f1d`.
+`twin`: `9ed3f88d` `4e61665b` `33f33c3e`, `74cc5d63` `3357c694` `a2d87928`,
+`97141886` `f15dda22` `637079d4`. `chained`: `1230eb36` `73ac97ab`
+`d3b85feb`, `720206af` `e9be4e44` `8db6623d`, `d261fa4a` `6ce0b853`
+`5ceb86fb`. Peak anon from `brokkr sidecar --stat anon` on `a2d87928`,
+`74cc5d63`, `3357c694` (twin) and `8db6623d`, `720206af`, `e9be4e44`
+(chained).
+
+The inputs, all with every blob indexed and no sorted claim:
+
+- `unsorted` is `degrade --unsort` of Denmark: one adjacent element pair
+  swapped per kind, so at most three two-blob overlap components on this
+  otherwise sorted source. It measures pass 1's decode of every payload
+  (an unclaimed header) and passthrough; the overlap work is tens of
+  milliseconds. Flat across all three arms; the first round's two cells
+  ran before the input was warm.
+- `twin` is `pbfhogg cat` of the Denmark indexed file with itself: every
+  blob overlaps its twin. The old engine grouped adjacent rewrite blobs of
+  one kind into a run, so it swept three kind-wide runs and collected
+  their output before writing; the move sweeps one run per component (7396)
+  and streams. The table measures that whole change, partition included,
+  not scheduler overhead on equal jobs.
+- `chained` is `pbfhogg cat` of two grow repacks of Denmark at
+  `--elements-per-blob 9001` and `10007` (registered as snapshots
+  `grow-9001` and `grow-10007`): with no shared interior blob boundary,
+  each kind is one connected component, three runs on every arm. Pass 1
+  is equal (`SORT_INDEX_BUILD` about 3.65 s); `SORT_PASS2` is 26.5 s old,
+  33.9 s move, 24.1 s HEAD (`8db6623d`, `720206af`, `e9be4e44`). The move
+  regressed this shape by about 28 % of pass 2 and HEAD is about 9 %
+  faster than the old engine. The cause of the regression and of the
+  recovery is not isolated (scheduling, buffering, positional reads and
+  write overlap changed together at the move; the borrowed-cursor sweep of
+  `13ec0927` is a plausible contributor to the recovery, not an
+  attribution), and with HEAD ahead of both arms no bisect is warranted.
+
+Every arm keeps both copies of a duplicated element (HEAD's twin output:
+104,979,306 nodes, 13,233,052 ways, 92,206 relations, twice Denmark);
+output bytes differ legitimately across the move, which flushes a block
+at each component boundary. Element contents were not compared across
+arms here; `brokkr verify sort` is the correctness check.
+
+Pass 2 runs one sweep per component, so parallelism on unsorted input is
+bounded by the component count: on `chained` three sweeps cover the whole
+file and the node component dominates.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

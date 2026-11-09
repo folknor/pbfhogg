@@ -726,11 +726,11 @@ fn assert_stopped<R>(
         panic!("{what}: the check must stop at the contradicted claim");
     };
     assert_eq!(
-        stopped.contradiction,
-        pbfhogg::KindContradiction {
+        stopped.contradiction(),
+        Some(pbfhogg::KindContradiction {
             claimed,
             found: pbfhogg::ElementKind::Way,
-        },
+        }),
         "{what}"
     );
     assert_eq!(stopped.blob, Some(WAY_BLOB as u64), "{what}");

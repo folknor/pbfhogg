@@ -312,7 +312,7 @@ pub fn check_refs<'a>(
     let host = &host.enter()?;
     let input = input.into();
     host.invocation
-        .decided(|| super::CheckOutcome::stop_on_contradiction(check_refs_inner(input, opts, host)))
+        .decided(|| super::CheckOutcome::stop_on_finding(check_refs_inner(input, opts, host)))
 }
 
 /// What judging a blob's ways and relations needs besides the sets.

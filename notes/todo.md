@@ -53,9 +53,15 @@ admission and the regressions.
 
 - [ ] **GeoJSON export v2**
   ([notes/geojson-export-design.md](geojson-export-design.md)):
-  relations -> MultiPolygon, raw-PBF index fallback, brokkr-side
-  verify + throughput baseline (brokkr#139). Same `export` command GeoParquet
-  extends, so touch it once for both formats.
+  relations -> MultiPolygon, raw-PBF index fallback, verify + throughput
+  baseline (brokkr#139). Same `export` command GeoParquet extends, so
+  touch it once for both formats. brokkr#139 is blocked on us
+  (2026-11-09): brokkr builds no `export` command, so the throughput
+  baseline is a pbfhogg script bench in `brokkr.d/benches.toml`; and its
+  verify judges only the agreement surface (ways and nodes both tools
+  export, by ID, geometry within a tolerance, tags), which needs pbfhogg
+  to state the contract first, in ADR-0010 or the design note: which
+  divergences from `osmium export` are allowed and which are bugs.
 
 - [ ] **Multi-extract v2 complete/smart strategies**: per-region
   way/relation ID tracking. Single-pass multi-extract covers the simple
@@ -746,6 +752,18 @@ cells land. This section tracks the remaining axes and dataset gaps.
   snapshot-range axis is a single pairing. Downloading another
   snapshot 2-4 weeks away would let us measure diff-wall vs
   snapshot-delta-size empirically.
+- [ ] **No real dataset crosses the antimeridian (brokkr#138).** Denmark
+  was byte-identical across four antimeridian fixes in the geocode
+  builder, so the real-data gate is blind to that defect class. Split on
+  2026-11-09, both halves now on pbfhogg: the dataset entry (Geofabrik
+  `australia-oceania/fiji` via `brokkr download`, plus its
+  `brokkr.d/hosts` block) is our config, and brokkr asks what queries a
+  pbfhogg-built geocode index from the command line. Nothing does today:
+  the CLI only builds the index, and the reader is reached through
+  nidhogg. A lookup command (`pbfhogg geocode INDEX LAT LON` with
+  machine-readable output) would let brokkr hold pinned points per
+  dataset after its `expect` pattern; it is a feature, not yet decided.
+  The alternative is a nidhogg-served gate. Answer brokkr#138 either way.
 
 ### Un-benched permutations (low priority)
 
@@ -981,12 +999,6 @@ the fastest one.
   which flags, and how each recovery is reported. First candidate: a repeated `Info` or
   `DenseInfo` message, refused while the block is parsed, before any
   `--clean` applies, so `cat --clean` cannot rescue that file today.
-- [ ] **`check --ids --index` and `check --refs --index` lose the index
-  report on a partially indexed file** (found 2026-10-26, older than
-  `84f50b31`). `--ids --index` stops before printing the index report;
-  `--refs --index` computes it and exits without printing it. Plain
-  `check --index` reports the file as a violation, as intended. Noted on
-  `reference/indexdata-trust.md`; not fixed.
 - [ ] **A mislabelled row in the partial-index contract table** (found
   2026-10-26). In `cli/tests/cli_input_contract.rs`, the reverse-order
   table's `getparents --full-scan-min-blobs 1` row runs the walker arm,

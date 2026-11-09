@@ -354,7 +354,7 @@ pub fn verify_ids<'a>(
     let host = &host.enter()?;
     let input = input.into();
     host.invocation
-        .decided(|| super::CheckOutcome::stop_on_contradiction(verify_ids_inner(input, opts, host)))
+        .decided(|| super::CheckOutcome::stop_on_finding(verify_ids_inner(input, opts, host)))
 }
 
 fn verify_ids_inner(

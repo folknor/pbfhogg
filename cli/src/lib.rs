@@ -3975,18 +3975,32 @@ fn run_check(
                 }
             }
         }
-        let stopped = [
-            ids_report
-                .as_ref()
-                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
-            refs_result
-                .as_ref()
-                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
-            locations_report
-                .as_ref()
-                .is_some_and(|r| matches!(r, pbfhogg::check::CheckOutcome::Stopped(_))),
+        // One note per stop reason met, whichever checks met it: the repair
+        // for a false kind claim (`cat --reindex`) is not the one for a
+        // partially indexed file (plain `cat`, which keeps carried indexdata
+        // and indexes the blobs that lack it), so neither replaces the other.
+        let reasons = [
+            stop_reason(ids_report.as_ref()),
+            stop_reason(refs_result.as_ref()),
+            stop_reason(locations_report.as_ref()),
         ];
-        if stopped.contains(&true) {
+        let any_contradiction = reasons
+            .iter()
+            .any(|r| matches!(r, Some(pbfhogg::check::StopReason::KindContradiction(_))));
+        let any_partial = reasons
+            .iter()
+            .any(|r| matches!(r, Some(pbfhogg::check::StopReason::PartiallyIndexed)));
+        if any_partial {
+            host::cli_note(
+                "cli.check_stopped_on_partial_index",
+                format_args!(
+                    "`pbfhogg cat {path} -o indexed.osm.pbf` indexes every blob that lacks \
+                     indexdata",
+                    path = exit_code::shell_word(path),
+                ),
+            );
+        }
+        if any_contradiction {
             host::cli_note(
                 "cli.check_stopped_on_kind_claim",
                 format_args!(
@@ -4008,6 +4022,16 @@ fn run_check(
     } else {
         Outcome::Positive
     })
+}
+
+/// Why a check stopped, if it ran and stopped.
+fn stop_reason<R>(
+    outcome: Option<&pbfhogg::check::CheckOutcome<R>>,
+) -> Option<pbfhogg::check::StopReason> {
+    match outcome {
+        Some(pbfhogg::check::CheckOutcome::Stopped(stopped)) => Some(stopped.reason),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

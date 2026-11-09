@@ -16,21 +16,32 @@ pub mod refs;
 pub mod verify_ids;
 
 /// How a check over a file ended: it ran to completion, or it stopped at a
-/// blob whose decoded elements contradict the blob's indexdata kind claim.
+/// blob that leaves it nothing true to compute from ([`StopReason`]).
 ///
 /// `--refs`, `--ids` and `--locations` route blobs by their claimed kind, so
 /// a contradiction invalidates the partition every later finding would be
-/// computed from: a stopped check carries the contradiction and nothing
-/// else, no counts and no earlier findings, which may already be false (a
-/// node hidden in a blob claiming relations makes a way's reference to it
-/// look missing before the relation phase finds the lie). The file fails the
-/// check (exit 1): a false claim is a definite answer to "is this file
-/// right?", the one `check --index` gives for the same file.
+/// computed from: a stopped check carries the reason and nothing else, no
+/// counts and no earlier findings, which may already be false (a node hidden
+/// in a blob claiming relations makes a way's reference to it look missing
+/// before the relation phase finds the lie). The file fails the check (exit
+/// 1): a false claim is a definite answer to "is this file right?", the one
+/// `check --index` gives for the same file.
+///
+/// A partially indexed file stops these checks too, rather than being
+/// refused as other command inputs refuse it: their walks still compute
+/// nothing over the mixture (the command input contract, ruled 2026-10-26,
+/// stands), but `check` answers "is this file right?", and a file the
+/// commands refuse is a definite negative answer. It is a policy verdict,
+/// not a proof that a claim is false: the walks see headers only, so a blob
+/// no index can describe (empty, or mixed kinds) carrying no indexdata among
+/// indexed ones stops them while `check --index`, which decodes it and
+/// exempts it, passes the file. Stopping instead of refusing is what lets
+/// the other selected checks, `--index` included, still run and report.
 #[derive(Debug)]
 pub enum CheckOutcome<R> {
     /// The check ran over the whole file; `R` is its report.
     Complete(R),
-    /// The check stopped at a kind contradiction.
+    /// The check stopped; see [`StoppedCheck::reason`].
     Stopped(StoppedCheck),
 }
 
@@ -53,9 +64,9 @@ impl<R> CheckOutcome<R> {
     }
 
     /// `result` as an outcome: an error carrying a decoded kind
-    /// contradiction becomes [`CheckOutcome::Stopped`], every other error
-    /// stays an error.
-    pub(crate) fn stop_on_contradiction(result: crate::Result<R>) -> crate::Result<Self> {
+    /// contradiction, or the partial-index refusal, becomes
+    /// [`CheckOutcome::Stopped`]; every other error stays an error.
+    pub(crate) fn stop_on_finding(result: crate::Result<R>) -> crate::Result<Self> {
         match result {
             Ok(report) => Ok(Self::Complete(report)),
             Err(error) => match StoppedCheck::from_error(&error) {
@@ -66,12 +77,22 @@ impl<R> CheckOutcome<R> {
     }
 }
 
-/// Where a check stopped and why: the blob whose decoded elements contradict
-/// its indexdata kind claim.
+/// Why a check stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// A blob's decoded elements contradict its indexdata kind claim: the
+    /// claim and one foreign kind the blob holds.
+    KindContradiction(crate::KindContradiction),
+    /// The file carries indexdata on some data blobs and not others; the
+    /// blob named is the first data blob without readable indexdata.
+    PartiallyIndexed,
+}
+
+/// Where a check stopped and why.
 #[derive(Debug, Clone)]
 pub struct StoppedCheck {
-    /// The claim and one foreign kind the blob holds.
-    pub contradiction: crate::KindContradiction,
+    /// What stopped it.
+    pub reason: StopReason,
     /// The input the blob is in, when known.
     pub path: Option<std::path::PathBuf>,
     /// 0-based ordinal of the blob in the file, when known.
@@ -82,12 +103,27 @@ pub struct StoppedCheck {
 
 impl StoppedCheck {
     fn from_error(error: &crate::Error) -> Option<Self> {
+        let reason = match (error.kind_contradiction(), error.kind()) {
+            (Some(contradiction), _) => StopReason::KindContradiction(contradiction),
+            (None, crate::ErrorKind::MissingIndexdata { partial: true, .. }) => {
+                StopReason::PartiallyIndexed
+            }
+            _ => return None,
+        };
         Some(Self {
-            contradiction: error.kind_contradiction()?,
+            reason,
             path: error.source_path().map(std::path::Path::to_path_buf),
             blob: error.blob_index(),
             offset: error.byte_offset().map(|offset| offset.0),
         })
+    }
+
+    /// The kind contradiction, when that is what stopped the check.
+    pub fn contradiction(&self) -> Option<crate::KindContradiction> {
+        match self.reason {
+            StopReason::KindContradiction(contradiction) => Some(contradiction),
+            StopReason::PartiallyIndexed => None,
+        }
     }
 
     /// The one-line reason, prefixed with the check's name (`"Reference
@@ -100,26 +136,44 @@ impl StoppedCheck {
         if let Some(offset) = self.offset {
             place.push_str(&format!(" at byte offset {offset}"));
         }
-        format!(
-            "{check} stopped: blob{place} claims {} elements but holds {} elements; \
-             its claimed-kind partition is invalid",
-            self.contradiction.claimed, self.contradiction.found
-        )
+        match self.reason {
+            StopReason::KindContradiction(contradiction) => format!(
+                "{check} stopped: blob{place} claims {} elements but holds {} elements; \
+                 its claimed-kind partition is invalid",
+                contradiction.claimed, contradiction.found
+            ),
+            StopReason::PartiallyIndexed => format!(
+                "{check} stopped: blob{place} has no indexdata, but other data blobs carry \
+                 it; the file is partially indexed, which this check does not accept"
+            ),
+        }
     }
 
-    /// The JSON form a stopped check reports in place of its report.
+    /// The JSON form a stopped check reports in place of its report: the
+    /// reason under `kind_contradiction` or `partially_indexed`.
     pub fn to_json_value(&self, file_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "file": file_name,
-            "complete": false,
-            "passed": false,
-            "kind_contradiction": {
-                "claimed": self.contradiction.claimed.as_str(),
-                "found": self.contradiction.found.as_str(),
-                "blob": self.blob,
-                "offset": self.offset,
-            },
-        })
+        match self.reason {
+            StopReason::KindContradiction(contradiction) => serde_json::json!({
+                "file": file_name,
+                "complete": false,
+                "passed": false,
+                "kind_contradiction": {
+                    "claimed": contradiction.claimed.as_str(),
+                    "found": contradiction.found.as_str(),
+                    "blob": self.blob,
+                    "offset": self.offset,
+                },
+            }),
+            StopReason::PartiallyIndexed => serde_json::json!({
+                "file": file_name,
+                "complete": false,
+                "passed": false,
+                "partially_indexed": {
+                    "blob": self.blob,
+                    "offset": self.offset,
+                },
+            }),
+        }
     }
 }
 

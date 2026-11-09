@@ -913,8 +913,22 @@ claiming relations, and `--ids -t` reads only the selected kinds' blobs;
 `--index` verifies every claim. When a file has two lying blobs, which one
 is named can vary from run to run.
 
-**A wholly unindexed input is checked, not refused** (a partially indexed
-one is refused, as by every command). With no claims to read blobs by,
+**A partially indexed file stops the check (exit 1).** `--refs`, `--ids`
+and `--locations` do not run over a file with indexdata on some data blobs
+and not others, which the other commands refuse; instead the check stops,
+its report the one line `<Check> stopped: blob N at byte offset M has no
+indexdata, but other data blobs carry it; the file is partially indexed,
+which this check does not accept` (blob N is the first data blob without
+indexdata), its JSON section `{"complete": false, "passed": false,
+"partially_indexed": {"blob", "offset"}}`. Other selected checks still run
+and print, so `check --ids --index` reports the index check beside it. A
+`Note:` names [`cat`](#cat), which indexes every blob that lacks
+indexdata. The judgement is made on blob headers only: a data blob no index
+can describe (empty, or mixed kinds) carrying no indexdata among indexed
+ones stops these checks too, while `--index`, which decodes it, passes the
+file.
+
+**A wholly unindexed input is checked, not refused.** With no claims to read blobs by,
 `--ids` and `--refs` read each blob once and judge every kind it holds in
 that one read; `--refs` reads a blob again, once per kind at most, only
 where a way's reference or a relation's node or way member missed in that
@@ -1045,9 +1059,7 @@ without a node record. The six sum to the reference count.
 a header declaring `HistoricalInformation` (several versions of a node
 legitimately disagree); a way referencing a negative node ID (ADR-0002: the
 store is keyed through an `IdSet`, and a skipped comparison cannot be
-certified); a partially indexed file (a blob whose indexdata cannot be read,
-a reversed range included, counts as unindexed, so among indexed blobs it
-makes the file partially indexed); any data blob the reader refuses to build
+certified); any data blob the reader refuses to build
 a block from - every blob is validated once with the reader's own
 construction, which checks group and element framing, tag, `Info` and
 `DenseInfo` arrays, way geometry and relation member arrays and string table
@@ -1056,7 +1068,9 @@ string-table index past the end of the table passes). A blob whose
 indexdata claims ways while it holds elements of another kind is not a
 refusal: the check reads such a blob only in its way passes, so it stops
 there and fails the file (exit 1), as described under
-[`check`](#check) above.
+[`check`](#check) above. A partially indexed file stops it the same way (a
+blob whose indexdata cannot be read, a reversed range included, counts as
+unindexed, so among indexed blobs it makes the file partially indexed).
 
 **Comparison.** Each coordinate is `offset + granularity * raw` nanodegrees,
 computed in 128-bit arithmetic (a product that overflows `i64` can be brought

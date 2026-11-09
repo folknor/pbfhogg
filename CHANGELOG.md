@@ -17,6 +17,12 @@ state.
   differences, `check` found violations), `2` failure, `3` `--direct-io` or
   `--io-uring` unavailable on this host, `64` usage error, and `130` / `143`
   after SIGINT / SIGTERM; see "Exit codes" in `docs/cli/commands.md`.
+- `check` (bare, `--ids`, `--refs`, `--locations`) on a partially indexed
+  file now stops that check and exits `1` instead of refusing with exit `2`;
+  the other selected checks still run and print, so `check --ids --index`
+  and `check --refs --index` no longer lose the index report. The stopped
+  check's JSON section carries `partially_indexed` (`blob`, `offset`), and
+  a `Note:` names `pbfhogg cat` as the repair.
 - Every short flag has one meaning across all subcommands; the shorts that
   meant something else on one command are long-only there, and the old letter
   is refused with the long name.

@@ -927,11 +927,11 @@ fn a_way_claim_over_two_foreign_kinds_names_the_same_witness_in_any_order() {
             panic!("a way claim over nodes and a relation must stop the check");
         };
         assert_eq!(
-            stopped.contradiction,
-            pbfhogg::KindContradiction {
+            stopped.contradiction(),
+            Some(pbfhogg::KindContradiction {
                 claimed: pbfhogg::ElementKind::Way,
                 found: pbfhogg::ElementKind::Node,
-            }
+            })
         );
         assert_eq!(stopped.blob, Some(2));
     }

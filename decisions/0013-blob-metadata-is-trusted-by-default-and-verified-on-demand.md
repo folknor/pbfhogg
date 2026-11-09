@@ -78,7 +78,9 @@ Four consequences follow, and are binding on new code (the fourth added on
    alternative is the phase silently dropping it and the phase that needed
    it never seeing the blob. In `check`, which answers "is this file right?",
    the same finding stops the check and fails the file (exit 1) instead of
-   refusing it. This adds no decode and no per-element pass; phases adopt it
+   refusing it (and so does the partial-index refusal, which is no false
+   claim but a file every other command refuses: a stopped check lets the
+   other selected checks, `--index` among them, still report). This adds no decode and no per-element pass; phases adopt it
    one by one (`KindClaims::Refuse`), and the ones that have not yet still
    believe their claims unchecked. The same holds for the range and count of
    a blob a run places, counts or copies by its claim and decodes anyway

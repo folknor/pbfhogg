@@ -1515,7 +1515,14 @@ enum Mixed {
     /// partially indexed file: the typed missing-indexdata error, so the
     /// CLI's indexing advice follows it.
     RefusesPartial,
+    /// Exit 1 (a negative answer, not a refusal): a check that keeps the
+    /// partial-index guard reports the mixture as its stopped outcome, and
+    /// the CLI's note names plain `pbfhogg cat`.
+    StopsPartial,
 }
+
+/// How a check stopped by a partially indexed file reads.
+const PARTIAL_STOP: &str = "the file is partially indexed, which this check does not accept";
 
 /// How the schedule walks' partial-index refusal reads.
 const PARTIAL_INDEX: &str = "the file is partially indexed";
@@ -1531,8 +1538,9 @@ type MixedRow = (&'static str, fn(&Ctx, &Path) -> Invocation, Mixed);
 /// partially indexed input once its reads have seen both kinds of data blob
 /// and points at `pbfhogg cat`, except `cat` itself (the remedy), `check
 /// --index` (which reports it as a violation) and `inspect` (which
-/// describes it). A few commands refuse any unindexed blob with their own
-/// reason first.
+/// describes it). `check`'s other checks do not run over it either, but
+/// answer with a stopped check (exit 1) instead of a refusal. A few
+/// commands refuse any unindexed blob with their own reason first.
 const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("sort", sort, Mixed::RefusesPartial),
     ("repack", repack, Mixed::RefusesPartial),
@@ -1676,6 +1684,11 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         check_index,
         Mixed::Violates("partially indexed"),
     ),
+    // The other checks keep the guard, but answer with a stopped check
+    // (exit 1) rather than a refusal, so selected checks still report.
+    ("check", check, Mixed::StopsPartial),
+    ("check --ids", check_ids, Mixed::StopsPartial),
+    ("check --refs", check_refs, Mixed::StopsPartial),
 ];
 
 /// One row: label, invocation builder, the words added to it, outcome.
@@ -1808,6 +1821,9 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
         &[],
         Mixed::Violates("partially indexed"),
     ),
+    ("check", check, &[], Mixed::StopsPartial),
+    ("check --ids", check_ids, &[], Mixed::StopsPartial),
+    ("check --refs", check_refs, &[], Mixed::StopsPartial),
 ];
 
 fn first_blob_only_holds(
@@ -1882,6 +1898,21 @@ fn mixed_holds(
                 ensure!(
                     !text.contains(unwanted),
                     "[{label}] advises {unwanted:?}; output:\n{text}"
+                );
+            }
+        }
+        Mixed::StopsPartial => {
+            ensure!(code == Some(1), "[{label}] exit {code:?}; output:\n{text}");
+            for wanted in [PARTIAL_STOP, "pbfhogg cat "] {
+                ensure!(
+                    text.contains(wanted),
+                    "[{label}] wanted {wanted:?}; output:\n{text}"
+                );
+            }
+            for unwanted in ["Error:", "--force", "--reindex"] {
+                ensure!(
+                    !text.contains(unwanted),
+                    "[{label}] has {unwanted:?}; output:\n{text}"
                 );
             }
         }
@@ -2450,4 +2481,111 @@ fn what_each_command_does_with_input_unindexed_on_its_first_blob_only_is_pinned(
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// `--index` beside another check on a partially indexed file: the other
+/// check stops rather than refusing, so the index report is printed beside
+/// it, in human and JSON output, in both orders of the mixture. The stop
+/// names the first data blob without indexdata, which in the reverse order
+/// is an earlier frame than the one the mixture shows at.
+#[test]
+fn check_reports_the_index_beside_a_check_a_partial_file_stops() {
+    let fx = Fx::new();
+    // Frame ordinal and offset of the first data blob without indexdata.
+    let first_unindexed = |fixture: &str, ordinal: usize| {
+        let bytes = std::fs::read(fx.path(fixture)).unwrap();
+        let blobs = crate::common::adversarial::locate_blobs(&bytes);
+        (ordinal as u64, blobs[ordinal].frame_start as u64)
+    };
+    for (fixture, ordinal) in [
+        ("first-blob-only.osm.pbf", 2),
+        ("first-blob-unindexed.osm.pbf", 1),
+    ] {
+        let (blob, offset) = first_unindexed(fixture, ordinal);
+        for (other, key, name) in [
+            ("--ids", "ids", "ID check"),
+            ("--refs", "refs", "Reference check"),
+        ] {
+            let cell = format!("{fixture} {other} --index");
+            let human = run(&Invocation::new(&["check"])
+                .arg(fx.path(fixture))
+                .words(&[other, "--index"]));
+            let text = format!("{}{}", human.stdout_str(), human.stderr_str());
+            assert_eq!(human.status.code(), Some(1), "{cell}:\n{text}");
+            assert!(
+                text.contains(&format!(
+                    "{name} stopped: blob {blob} at byte offset {offset} has no indexdata"
+                )),
+                "{cell}:\n{text}"
+            );
+            assert!(
+                text.contains("partially indexed (first such blob shown)"),
+                "{cell}:\n{text}"
+            );
+            assert!(!text.contains("Error:"), "{cell}:\n{text}");
+
+            let json = run(&Invocation::new(&["check"])
+                .arg(fx.path(fixture))
+                .words(&[other, "--index", "--json"]));
+            assert_eq!(json.status.code(), Some(1), "{cell} --json");
+            let value: serde_json::Value =
+                serde_json::from_str(&json.stdout_str()).expect("valid JSON");
+            assert_eq!(
+                value[key]["passed"],
+                serde_json::Value::Bool(false),
+                "{cell}"
+            );
+            assert_eq!(
+                value[key]["complete"],
+                serde_json::Value::Bool(false),
+                "{cell}"
+            );
+            assert_eq!(value[key]["partially_indexed"]["blob"], blob, "{cell}");
+            assert_eq!(value[key]["partially_indexed"]["offset"], offset, "{cell}");
+            assert_eq!(
+                value["index"]["passed"],
+                serde_json::Value::Bool(false),
+                "{cell}"
+            );
+        }
+    }
+}
+
+/// The policy divergence a partial stop carries: the walks see headers
+/// only, so an empty data blob without indexdata among indexed ones stops
+/// `--ids`, while `--index`, which decodes it and finds nothing to index,
+/// passes the file. The run exits 1 on the stop alone.
+#[test]
+fn an_unindexable_blob_among_indexed_ones_stops_ids_while_index_passes() {
+    let dir = crate::common::test_scratch();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    crate::common::write_test_pbf_sorted(&indexed, &crate::common::generate_nodes(5, 1), &[], &[]);
+    let mut bytes = std::fs::read(&indexed).unwrap();
+    // An unindexed data blob emptied to a PrimitiveBlock holding only an
+    // empty string table: no index can describe it.
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    crate::common::write_test_pbf_non_indexed(
+        &unindexed,
+        &crate::common::generate_nodes(5, 6),
+        &[],
+        &[],
+    );
+    let tail = crate::common::adversarial::mutate_blob_payload(
+        &std::fs::read(&unindexed).unwrap(),
+        1,
+        |payload| *payload = vec![0x0a, 0x00],
+    );
+    let blobs = crate::common::adversarial::locate_blobs(&tail);
+    bytes.extend_from_slice(&tail[blobs[1].frame_start..]);
+    let path = dir.path().join("empty-tail.osm.pbf");
+    std::fs::write(&path, bytes).unwrap();
+
+    let out = run(&Invocation::new(&["check"])
+        .arg(&path)
+        .words(&["--ids", "--index", "--json"]));
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{}", out.stdout_str());
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_str()).expect("valid JSON");
+    assert_eq!(value["index"]["passed"], serde_json::Value::Bool(true));
+    assert_eq!(value["ids"]["passed"], serde_json::Value::Bool(false));
+    assert!(value["ids"]["partially_indexed"].is_object(), "{value}");
 }

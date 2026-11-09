@@ -650,7 +650,8 @@ fn walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Walk> {
         }
         // Indexdata the reader cannot use (a reversed range among others)
         // reads as `None` here, as on every walk: in a file whose other data
-        // blobs are indexed the walk refuses it as partially indexed, and in
+        // blobs are indexed the walk ends at it as partially indexed (the
+        // check stops: `CheckOutcome::stop_on_finding`), and in
         // a wholly unindexed file it is an ordinary unindexed blob.
         let facts = BlobFacts {
             blob: meta.blob_index,
@@ -702,15 +703,15 @@ fn route(walk: &Walk) -> (Schedule, Schedule) {
 /// Refuses, rather than reports, a file it cannot check: one whose header
 /// does not declare `LocationsOnWays` (`MissingFeature`) or declares
 /// `HistoricalInformation` (several versions of a node legitimately carry
-/// different coordinates); a partially indexed file; a way referencing a
-/// negative node ID (ADR-0002); and any data blob the reader refuses to
-/// build a block from (every blob is validated once as the reader validates
-/// it).
+/// different coordinates); a way referencing a negative node ID (ADR-0002);
+/// and any data blob the reader refuses to build a block from (every blob
+/// is validated once as the reader validates it).
 ///
 /// A blob whose indexdata claims ways while it holds elements of another
 /// kind is not a refusal but a stopped check
 /// ([`CheckOutcome::Stopped`](super::CheckOutcome)): the check reads such a
 /// blob only in its way passes, so the claim is false and the file fails.
+/// A partially indexed file stops the check the same way.
 ///
 /// # Input
 ///
@@ -723,9 +724,8 @@ pub fn check_locations<'a>(
 ) -> Result<super::CheckOutcome<LocationsReport>> {
     let host = &host.enter()?;
     let input = input.into();
-    host.invocation.decided(|| {
-        super::CheckOutcome::stop_on_contradiction(check_locations_inner(input, opts, host))
-    })
+    host.invocation
+        .decided(|| super::CheckOutcome::stop_on_finding(check_locations_inner(input, opts, host)))
 }
 
 /// What one blob contributes to the up-front pass.

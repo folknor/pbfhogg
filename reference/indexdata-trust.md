@@ -411,7 +411,16 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   blob whatever its indexdata, `--reindex` rescans every blob); `check --index`, the verifier, which
   reports the file as a violation (exit 1); and `inspect`'s descriptions
   (the default index-only scan, which falls back to a full decode at the
-  first unindexed blob, `--extended` and `--show`). `inspect --nodes` and
+  first unindexed blob, `--extended` and `--show`). `check --ids`,
+  `--refs` and `--locations` are not exempt: their walks stay armed and
+  compute nothing over the mixture, but `check` answers "is this file
+  right?", so the refusal becomes the check's stopped outcome (exit 1, the
+  other selected checks still run and print, `--index` included, and a
+  `Note:` names `pbfhogg cat`) rather than ending the run (exit 2). This is
+  a policy verdict, not a proof of a false claim: the walks see headers
+  only, so a blob no index can describe (empty, or mixed kinds) carrying no
+  indexdata among indexed ones stops them while `check --index`, which
+  decodes it and exempts it, passes the file. `inspect --nodes` and
   `inspect tags` are not descriptions of the file but analyses of its
   elements, and refuse. Probes that look at the front of a file only are
   not reads of it and are not armed: the first-blob gate, and the
@@ -475,19 +484,10 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
 
 Current behaviour recorded as such, not as a contract to preserve:
 
-- `check --refs`, `check --ids` and `check --locations` refuse a partially
-  indexed file,
-  although `check` answers "is this file right?" and `check --index`
-  reports the same file as a violation (exit 1). A false kind claim they
-  meet at decode is not refused but fails the file (exit 1), and other
-  selected checks still run. Combined with `--index`,
-  the other check's refusal ends the run: `check --ids --index` stops
-  before the index report, and `check --refs --index` computes it and
-  then exits on the refusal without printing it.
 - The walks see headers only, so they cannot tell a blob no index can
   describe (empty, or mixed kinds), which carries no indexdata legitimately,
-  from an unindexed one; such a blob among indexed ones is refused.
-  `check --index` exempts it. Since `cat` (and `sort`, and `cat --dedupe`)
+  from an unindexed one; such a blob among indexed ones is refused (and
+  stops `check`'s walking checks). `check --index` exempts it. Since `cat` (and `sort`, and `cat --dedupe`)
   re-encode such blocks into indexable ones, only a hand-made file has one.
 - `inspect --indexed` reports the first-blob probe, so it says yes for a
   partially indexed file whose first data blob is indexed, and no for one

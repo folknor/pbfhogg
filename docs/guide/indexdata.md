@@ -122,7 +122,7 @@ Except for renumber's scan, the check reads only the first data blob's
 header. It is not a whole-file validation: a file whose first data blob is
 indexed passes it even if later blobs are not. Such a partially indexed file
 (indexdata on some data blobs and not others, in either order) is refused by
-every command except `cat`, `check --index` and `inspect`, once its reads
+every command except `cat`, `check` and `inspect`, once its reads
 have met both kinds of blob, with the missing-indexdata error located at the
 first data blob without indexdata and this advice:
 
@@ -139,7 +139,10 @@ with `--force` it then stops at the partial refusal. `pbfhogg cat` indexes
 every blob of such a file, and every `cat` mode runs on it: `--type`,
 `--clean` and `--dedupe` decode or scan each blob that lacks indexdata, so
 their output is the same as from the file fully indexed. `check --index`
-reports the file as a violation, and `inspect` describes it.
+reports the file as a violation, and `inspect` describes it. `check`'s
+other checks (`--ids`, `--refs`, `--locations`) do not run over it either,
+but stop and fail the file (exit 1) instead of refusing it, so `check
+--index --ids` still prints the index report beside the stopped ID check.
 
 ## The --force flag
 

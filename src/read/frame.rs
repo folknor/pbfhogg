@@ -381,7 +381,10 @@ impl<S> Frames<S> {
     /// This is the project's policy for command inputs (ruled 2026-10-26):
     /// a command fails loudly on such a file and the front end points at
     /// `pbfhogg cat`, which indexes every blob, rather than each path
-    /// arguing whether it could cope with the missing indexdata. It is
+    /// arguing whether it could cope with the missing indexdata. `check
+    /// --ids`, `--refs` and `--locations` keep the guard armed and report
+    /// its error as a stopped check (`check::CheckOutcome::stop_on_finding`),
+    /// a negative answer rather than a refusal. It is
     /// judged here, in the one frame walk every reader shares, so a command
     /// cannot accept the file on one path and refuse it on another. The
     /// observation needs the indexdata parsed, so an armed walk parses it

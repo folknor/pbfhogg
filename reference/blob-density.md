@@ -279,6 +279,17 @@ the "M3" experiment - europe -21 % but planet +11 %, see
 (it read the bodies under cached headers: europe check --refs 8.3 to
 27.6 s), and a worker-sharded resync scan.
 
+A window is still one synchronous read, so windows alone walk a cold
+file at queue depth one. A window read past the end of the last prefetch
+episode therefore also advises `WILLNEED` over a bounded distance after
+it, in calls no longer than the kernel's per-call cap; crossing an
+episode's end restarts the miss streak, so the walk's own in-flight
+advice never renews it and a header-warm region ends it within one
+episode. Measured in `reference/performance.md` "Header walk prefetch on
+cold dense files": europe cold inspect 14.2 to 9.7 s, cold denmark
+`cat --dedupe` passthrough back at the old engine's wall, planet
+unchanged.
+
 Estimating a walk's cost requires the eviction pattern, never the sum of
 per-phase walk durations: a walk is only expensive if something evicted
 the headers since the previous one, so a command that walks N times

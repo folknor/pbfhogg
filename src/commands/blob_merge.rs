@@ -168,10 +168,12 @@ pub(crate) struct IndexPolicy {
 /// (`read::frame::check_header_position`) rather than ignored, because what
 /// it declares would otherwise be silently left out of the output header.
 ///
-/// The walk preads headers only (`fadvise(RANDOM)`), never pulling skipped
-/// payloads into the page cache: `sort`'s planet pass 1 measured 32 GB read
-/// through a buffered reader against 674 MB walked (reference/
-/// performance-history.md, "Sort"). An indexed blob under a header claiming
+/// The walk preads headers (`fadvise(RANDOM)`) rather than streaming the
+/// file: `sort`'s planet pass 1 measured 32 GB read through a buffered
+/// reader against 674 MB walked (reference/performance-history.md, "Sort").
+/// Only on a cold region of small frames does it read windows and prefetch
+/// ahead of them (`header_walker::PreadSource`), which also leaves those
+/// payloads cached for pass 2's copy. An indexed blob under a header claiming
 /// `Sort.Type_then_ID` is indexed from its indexdata alone. Every other blob
 /// is preaded, decompressed and scanned, which also checks its intra-blob
 /// order: indexdata alone does not prove it (`cat` attaches indexdata to

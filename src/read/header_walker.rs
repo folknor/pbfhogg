@@ -8,7 +8,10 @@
 //! not speculatively prefetch the blob bodies that the header walk
 //! skips over; a walk honouring `--direct-io` opens it `O_DIRECT`
 //! instead (`HeaderWalker::open_direct`) and reads aligned spans that
-//! bypass the page cache.
+//! bypass the page cache. The one exception is a cold region of small
+//! frames, where the walk reads windows and advises `WILLNEED` a bounded
+//! distance ahead of them (`PreadSource`): there it is reading the bodies
+//! anyway, and only explicit advice puts more than one read in flight.
 //!
 //! # When to use
 //!
@@ -34,8 +37,9 @@ use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::frame::Frames;
 use crate::tunables::{
-    HEADER_PROBE_SIZE, HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK,
-    HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE, SAMPLE_CAP,
+    HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WALK_PREFETCH_CHUNK,
+    HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES,
+    HEADER_WINDOW_SIZE, SAMPLE_CAP,
 };
 
 /// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
@@ -178,6 +182,11 @@ pub(crate) trait Positional {
     /// file: a miss says nothing about EOF or errors, which the exact read
     /// that follows decides.
     fn read_cached(&self, buf: &mut [u8], offset: u64) -> Cached;
+
+    /// Advise that `len` (nonzero) bytes at `offset` will be read soon.
+    /// Optional: whatever it does, the exact reads that follow decide every
+    /// byte, EOF and error. Returns whether advice was issued.
+    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> bool;
 }
 
 /// What [`Positional::read_cached`] found.
@@ -240,6 +249,16 @@ impl Positional for std::fs::File {
     fn read_cached(&self, _buf: &mut [u8], _offset: u64) -> Cached {
         Cached::Unsupported
     }
+
+    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> bool {
+        crate::fadvise::advise(
+            self,
+            offset,
+            len,
+            crate::fadvise::Hint::WillNeed,
+            invocation,
+        )
+    }
 }
 
 #[cfg(feature = "linux-direct-io")]
@@ -252,6 +271,11 @@ impl Positional for crate::read::direct_reader::DirectPositional {
     /// on the device, so every refill is a miss, without a syscall.
     fn read_cached(&self, _buf: &mut [u8], _offset: u64) -> Cached {
         Cached::Miss
+    }
+
+    /// No advice: `O_DIRECT` reads never come from the page cache.
+    fn will_need(&self, _offset: u64, _len: u64, _invocation: &crate::host::Invocation) -> bool {
+        false
     }
 }
 
@@ -287,6 +311,19 @@ impl Positional for crate::read::direct_reader::DirectPositional {
 ///   alone (`reference/performance.md`). A transport that cannot tell
 ///   residency never reads windows; the `O_DIRECT` one always misses, since
 ///   none of its reads come from cache.
+///
+/// Prefetch: a window is still one synchronous read (under `RANDOM`, Linux
+/// fills it in readahead-sized steps one after another), so windows alone
+/// walk a cold file at queue depth one. A window read at or past the end of
+/// the last prefetch episode opens the next: `WILLNEED` over the
+/// [`HEADER_WALK_PREFETCH_BYTES`] after the window, clipped to the captured
+/// extent, in [`HEADER_WALK_PREFETCH_CHUNK`] calls (the kernel drops what a
+/// longer call asks past its cap). Renewal needs fresh evidence: when the
+/// walk crosses the end of an episode the miss streak restarts, so misses on
+/// pages the walk's own advice put in flight never open the next episode,
+/// and a region whose headers are cached (hits) ends the prefetch within one
+/// episode. Advice is optional: the exact reads decide every byte, EOF and
+/// error as before, and the `O_DIRECT` transport gives none.
 ///
 /// A header past the window costs one more `pread` for exactly its
 /// remainder. A payload is never read on purpose: skipping it is a check of
@@ -328,6 +365,14 @@ pub(crate) struct PreadSource<P = std::fs::File> {
     /// Whether the transport can tell residency; once it says it cannot,
     /// no window is ever read.
     residency_known: bool,
+    /// End of the last prefetch episode: advice was attempted (issued or
+    /// not, honoured or not) for bytes up to here. Zero before the first.
+    advised_to: u64,
+    /// Whether the walk is inside an episode it has not yet crossed the end
+    /// of.
+    in_episode: bool,
+    /// The invocation advice failures and wait time count into.
+    invocation: crate::host::Invocation,
     stats: WindowStats,
 }
 
@@ -343,10 +388,14 @@ pub(crate) struct WindowStats {
     /// Windows read, and the bytes they asked for.
     pub(crate) windows: u64,
     pub(crate) window_bytes: u64,
+    /// Prefetch episodes opened, and the bytes their `WILLNEED` calls asked
+    /// for (requested, not read: the kernel may ignore advice).
+    pub(crate) prefetch_episodes: u64,
+    pub(crate) prefetch_bytes: u64,
 }
 
 impl<P> PreadSource<P> {
-    fn new(file: Arc<P>, file_size: u64) -> Self {
+    fn new(file: Arc<P>, file_size: u64, invocation: crate::host::Invocation) -> Self {
         Self {
             file,
             pos: 0,
@@ -359,6 +408,9 @@ impl<P> PreadSource<P> {
             recent: [0; HEADER_WINDOW_SAMPLE_FRAMES],
             miss_streak: 0,
             residency_known: true,
+            advised_to: 0,
+            in_episode: false,
+            invocation,
             stats: WindowStats::default(),
         }
     }
@@ -420,6 +472,11 @@ impl<P: Positional> PreadSource<P> {
     fn refill(&mut self) -> std::io::Result<()> {
         let remaining = usize::try_from(self.remaining()).unwrap_or(usize::MAX);
         let mut size = remaining.min(HEADER_PROBE_SIZE);
+        if self.in_episode && self.pos >= self.advised_to {
+            // Past the episode: only misses in unadvised bytes count now.
+            self.in_episode = false;
+            self.miss_streak = 0;
+        }
         if !self.dense() {
             self.miss_streak = 0;
         } else if self.residency_known {
@@ -446,6 +503,11 @@ impl<P: Positional> PreadSource<P> {
                 size = remaining.min(HEADER_WINDOW_SIZE);
                 self.stats.windows += 1;
                 self.stats.window_bytes += size as u64;
+                if !self.in_episode {
+                    // Advised before the window's own read, so the device
+                    // works on the episode while the walk waits on it.
+                    self.open_episode(self.pos + size as u64);
+                }
             }
         }
         self.window.resize(size, 0);
@@ -453,6 +515,36 @@ impl<P: Positional> PreadSource<P> {
         self.window_at = self.pos;
         self.window_len = size;
         Ok(())
+    }
+
+    /// Advise `WILLNEED` over the episode from `start` (the end of the
+    /// window being read), clipped to the captured extent, in chunks the
+    /// kernel honours whole.
+    fn open_episode(&mut self, start: u64) {
+        let end = start
+            .saturating_add(HEADER_WALK_PREFETCH_BYTES)
+            .min(self.file_size);
+        if end <= start {
+            return;
+        }
+        let mut issued = 0;
+        let mut at = start;
+        while at < end {
+            let len = (end - at).min(HEADER_WALK_PREFETCH_CHUNK);
+            if !self.file.will_need(at, len, &self.invocation) {
+                // A transport (or platform) that gives no advice: no episode,
+                // so the walk's window policy stays exactly what it was.
+                break;
+            }
+            issued += len;
+            at += len;
+        }
+        if issued > 0 {
+            self.in_episode = true;
+            self.advised_to = start + issued;
+            self.stats.prefetch_episodes += 1;
+            self.stats.prefetch_bytes += issued;
+        }
     }
 }
 
@@ -647,7 +739,11 @@ impl<P: Positional> HeaderWalker<P> {
     /// A walk from the start of `file`, whose size was captured as
     /// `file_size`.
     fn over(file: Arc<P>, file_size: u64, path: &Path, host: &crate::host::Entered<'_>) -> Self {
-        let source = PreadSource::new(Arc::clone(&file), file_size);
+        let source = PreadSource::new(
+            Arc::clone(&file),
+            file_size,
+            host.invocation.handle().clone(),
+        );
         Self {
             frames: Frames::of_input(source, path, host),
             diagnostics: host.diagnostics.clone(),
@@ -789,6 +885,8 @@ impl<P: Positional> HeaderWalker<P> {
         call.counter("header_walk_cached_unsupported", stats.cached_unsupported);
         call.counter("header_walk_windows", stats.windows);
         call.counter("header_walk_window_bytes", stats.window_bytes);
+        call.counter("header_walk_prefetch_episodes", stats.prefetch_episodes);
+        call.counter("header_walk_prefetch_bytes", stats.prefetch_bytes);
     }
 
     /// `pread` `size` bytes at `offset` (a payload or a whole frame) into
@@ -847,6 +945,10 @@ pub(crate) mod tests {
         reads: std::sync::Mutex<Vec<(u64, usize)>>,
         resident: Vec<std::ops::Range<u64>>,
         no_residency: bool,
+        /// Every `WILLNEED` asked for, as `(offset, len)`.
+        advised: std::sync::Mutex<Vec<(u64, u64)>>,
+        /// Whether advised bytes become resident (advice that landed).
+        advice_lands: bool,
     }
 
     impl LoggedFile {
@@ -875,7 +977,19 @@ pub(crate) mod tests {
             if self.no_residency {
                 return super::Cached::Unsupported;
             }
-            let Some(range) = self.resident.iter().find(|r| r.contains(&offset)) else {
+            let landed: Vec<std::ops::Range<u64>> = if self.advice_lands {
+                let advised = self.advised.lock().expect("advised");
+                advised.iter().map(|&(at, len)| at..at + len).collect()
+            } else {
+                Vec::new()
+            };
+            let Some(range) = self
+                .resident
+                .iter()
+                .chain(landed.iter())
+                .find(|r| r.contains(&offset))
+                .cloned()
+            else {
                 return super::Cached::Miss;
             };
             let n = buf
@@ -885,6 +999,11 @@ pub(crate) mod tests {
             let start = usize::try_from(offset).expect("offset");
             buf[..n].copy_from_slice(&bytes[start..start + n]);
             super::Cached::Hit(n)
+        }
+
+        fn will_need(&self, offset: u64, len: u64, _invocation: &crate::host::Invocation) -> bool {
+            self.advised.lock().expect("advised").push((offset, len));
+            true
         }
     }
 
@@ -946,11 +1065,18 @@ pub(crate) mod tests {
     /// [`walk_logged`] over a prepared file, also returning the walk's
     /// refill statistics.
     fn walk_file(file: LoggedFile, starts: &[u64]) -> (Vec<(u64, usize)>, super::WindowStats) {
+        let file = Arc::new(file);
+        let stats = walk_shared(&file, starts);
+        let reads = file.reads.lock().expect("reads").clone();
+        (reads, stats)
+    }
+
+    /// [`walk_file`] over a file the caller keeps, for its advice log.
+    fn walk_shared(file: &Arc<LoggedFile>, starts: &[u64]) -> super::WindowStats {
         let host = crate::host::Host::entered_for_tests();
         let size = file.bytes.lock().expect("bytes").len() as u64;
-        let file = Arc::new(file);
         let mut walker = super::HeaderWalker::over(
-            Arc::clone(&file),
+            Arc::clone(file),
             size,
             std::path::Path::new("logged.pbf"),
             &host,
@@ -961,16 +1087,135 @@ pub(crate) mod tests {
             seen.push(meta.frame_start);
         }
         assert_eq!(seen, starts, "the walk's frame starts");
-        let stats = walker.window_stats();
-        let reads = file.reads.lock().expect("reads").clone();
-        (reads, stats)
+        walker.window_stats()
     }
 
     use crate::tunables::{
-        HEADER_PROBE_SIZE, HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK,
-        HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE,
+        HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WALK_PREFETCH_CHUNK,
+        HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES,
+        HEADER_WINDOW_SIZE,
     };
     use std::sync::Arc;
+
+    /// A cold dense file of `frames` 60 KB frames, enough to span more than
+    /// two prefetch episodes.
+    fn prefetch_file() -> (Vec<u8>, Vec<u64>) {
+        let frames = usize::try_from(3 * HEADER_WALK_PREFETCH_BYTES / 60_000).expect("frames");
+        raw_file(&vec![(60_000, 0); frames])
+    }
+
+    /// The advice a walk gave, as episodes: maximal runs of contiguous calls.
+    fn episodes(advised: &[(u64, u64)]) -> Vec<std::ops::Range<u64>> {
+        let mut out: Vec<std::ops::Range<u64>> = Vec::new();
+        for &(at, len) in advised {
+            match out.last_mut() {
+                Some(last) if last.end == at => last.end = at + len,
+                _ => out.push(at..at + len),
+            }
+        }
+        out
+    }
+
+    /// A cold dense walk advises ahead of its first window, in calls no
+    /// longer than the chunk, within the extent, each byte once, and opens
+    /// each later episode only from a window past the previous one's end:
+    /// with advice that never lands, every episode is reached cold and renews.
+    #[test]
+    fn a_cold_dense_walk_prefetches_in_bounded_renewed_episodes() {
+        let (bytes, starts) = prefetch_file();
+        let size = bytes.len() as u64;
+        let file = Arc::new(LoggedFile::new(bytes));
+        let stats = walk_shared(&file, &starts);
+        let advised = file.advised.lock().expect("advised").clone();
+        assert!(
+            advised
+                .iter()
+                .all(|&(at, len)| len > 0 && len <= HEADER_WALK_PREFETCH_CHUNK && at + len <= size),
+            "{advised:?}"
+        );
+        let eps = episodes(&advised);
+        assert!(eps.len() >= 3, "{eps:?}");
+        assert_eq!(stats.prefetch_episodes, eps.len() as u64);
+        assert_eq!(
+            stats.prefetch_bytes,
+            advised.iter().map(|&(_, len)| len).sum::<u64>()
+        );
+        // The first starts where the first window ends.
+        let first_window = starts[FIRST_WINDOW_READ + 1];
+        assert_eq!(eps[0].start, first_window + HEADER_WINDOW_SIZE as u64);
+        for pair in eps.windows(2) {
+            assert!(
+                pair[1].start > pair[0].end,
+                "renewed inside its own episode: {eps:?}"
+            );
+        }
+        for ep in &eps[..eps.len() - 1] {
+            assert_eq!(ep.end - ep.start, HEADER_WALK_PREFETCH_BYTES, "{eps:?}");
+        }
+    }
+
+    /// Advice that lands turns the episode's headers into hits, and a tail
+    /// whose headers are cached (bodies cold) gives no fresh misses: the
+    /// prefetch ends after the one episode the cold prefix opened.
+    #[test]
+    fn a_cached_header_tail_ends_the_prefetch_within_one_episode() {
+        let (bytes, starts) = prefetch_file();
+        let mut file = LoggedFile::new(bytes);
+        file.advice_lands = true;
+        let tail_from = HEADER_WALK_PREFETCH_BYTES;
+        file.resident = starts
+            .iter()
+            .filter(|&&s| s >= tail_from)
+            .map(|&s| s..s + 64)
+            .collect();
+        let file = Arc::new(file);
+        let stats = walk_shared(&file, &starts);
+        assert_eq!(stats.prefetch_episodes, 1, "{stats:?}");
+        assert!(
+            stats.prefetch_bytes <= HEADER_WALK_PREFETCH_BYTES,
+            "{stats:?}"
+        );
+    }
+
+    /// A transport that gives no advice opens no episode, so its windows
+    /// are exactly what they were without prefetch.
+    #[test]
+    fn a_transport_without_advice_opens_no_episode() {
+        struct NoAdvice(LoggedFile);
+        impl super::Positional for NoAdvice {
+            fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+                self.0.pread_exact(buf, offset)
+            }
+            fn read_cached(&self, buf: &mut [u8], offset: u64) -> super::Cached {
+                self.0.read_cached(buf, offset)
+            }
+            fn will_need(&self, _: u64, _: u64, _: &crate::host::Invocation) -> bool {
+                false
+            }
+        }
+        let (bytes, starts) = prefetch_file();
+        let size = bytes.len() as u64;
+        let host = crate::host::Host::entered_for_tests();
+        let mut walker = super::HeaderWalker::over(
+            Arc::new(NoAdvice(LoggedFile::new(bytes))),
+            size,
+            std::path::Path::new("logged.pbf"),
+            &host,
+        )
+        .accepting_partial_index();
+        let mut seen = Vec::new();
+        while let Some(meta) = walker.next_header().expect("walk") {
+            seen.push(meta.frame_start);
+        }
+        assert_eq!(seen, starts);
+        let stats = walker.window_stats();
+        assert_eq!((stats.prefetch_episodes, stats.prefetch_bytes), (0, 0));
+        // One miss streak at the start, then windows to the end.
+        assert_eq!(
+            stats.cached_misses,
+            stats.windows + u64::from(HEADER_WINDOW_MISS_STREAK) - 1
+        );
+    }
 
     /// The refill index (counting exact reads) of a cold dense walk's first
     /// window: the OSMHeader's probe, then one probe per miss of the streak.

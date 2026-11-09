@@ -5200,6 +5200,44 @@ baseline (a cold baseline europe inspect, `cb4aad64`); its counters were
 evicted headers (the unit tests pin that isolated misses read no window,
 not its wall), and the multi-walk commands on a cold europe.
 
+## Header walk prefetch on cold dense files (bygg, 2026-11-09, baseline `bd2408d5`)
+
+The windows above are still one synchronous read each: under the walk's
+`fadvise(RANDOM)` Linux fills a 1 MiB window in readahead-sized steps, one
+after another, and caps every `WILLNEED` call at the larger of the device's
+optimal I/O size and the readahead window (128 KiB each on bygg's
+nvme0n1). A cold denmark `cat --dedupe` (`dedupe-pair --with one-relation
+--cache cold`, baseline `e4484a26`) read 306 MB in 292 windows during its
+177 ms pass 1, about 1.7 GB/s, and its copy then read the other ~150 MB cold;
+the old engine's SEQUENTIAL `BufReader` pass 1 read the whole file at about
+3.5 GB/s and copied from cache. So the cold gap was the walk's queue depth,
+not a header-only walk.
+
+Change: a window read at or past the end of the last prefetch episode
+advises `WILLNEED` over the 32 MiB after it, in 128 KiB calls; crossing an
+episode's end restarts the miss streak, so only fresh misses in unadvised
+bytes open the next. Variant = `bd2408d5` plus the uncommitted change
+(stored dirty), baseline = `--commit bd2408d5`, alternated, after
+`sudo fstrim -av`. Walls are bench iterations; child walls in parentheses.
+
+| Row | Baseline | Variant |
+|---|---|---|
+| denmark dedupe-pair cold | 554 (`19906e02`), 538 (`45668a5a`), 534 (`66f7bbbc`) ms | 370 (`23f1b16e`), 380 (`0b904335`), 391 (`f9a5570b`) ms |
+| europe inspect cold (`vs-osmium`) | 14.2 s (`59ab7bd5`) | 9.7 s (`81c02c14`) |
+| planet inspect cold (`vs-osmium`) | 6.8 s (`69bb00b9`) | 6.8 s (`7766bd50`) |
+
+Denmark phase split, `45668a5a` against `0b904335`: pass 1 223 to 126 ms,
+copy flush 272 to 210 ms (warm flush 152 ms, `abfcf184`), child 509 to
+351 ms; the variant's walk read 12 windows, opened 12 episodes advising
+403 MB, and hit cache on 6,203 refills. The old engine's cold cells were
+327-389 ms (`4f376168` and the callout above), so cold passthrough is back
+at the old engine's wall. Planet never qualifies for windows
+(`header_walk_prefetch_episodes` 0). Not measured: the header-warm europe
+`check --refs` cell above (by construction a walk with cached headers has no
+misses and opens no episode; the unit test
+`a_cached_header_tail_ends_the_prefetch_within_one_episode` pins the mixed
+case), cold sort on a dense file, and memory pressure.
+
 ## Sort across the blob-merge engine move on unsorted Denmark (bygg, 2026-11-08)
 
 `brokkr sort --dataset denmark --snapshot KEY --bench 1 --commit REF`,

@@ -205,22 +205,6 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-189: cold passthrough-dominated cat --dedupe slower than the old engine
-
-On denmark base merged with the `one-relation` snapshot (nearly every frame
-passes through as one coalesced copy), cold cells at `f49dd460` run about
-half again the old engine's wall (median 513 against 333 ms at `dd312160`);
-warm cells are at parity (reference/performance.md, "Denmark passthrough
-across the engine move"). HEAD's split is pass 1 177 ms, copy flush 244 ms.
-Suspected, not shown: the old pass 1's buffered sequential skip warmed the
-cache for its pass 2, and the header-only walk leaves the copy to read the
-file cold. Unmeasured beyond denmark; planet is all passthrough on a sorted
-`sort`, which shares this pass 2. Candidate designs, none established:
-sequential readahead advice over each passthrough stretch ahead of its
-copy, or a pass 1 that streams payloads when the plan will pass most of
-them through. Confirm the mechanism first (disk-read attribution per
-phase), then design.
-
 ### WRK-111: altw external pass A exposure to sustained-write state
 
 Residue. A short trim before a cell restores pass A (about 23 s against

@@ -295,9 +295,12 @@ state.
   and others) read ahead on a cold page cache when the file's blobs are
   small, instead of one read per blob: on denmark cold, `inspect` about
   0.22 s instead of 0.64 s, `inspect tags --type way` 0.26 s instead of
-  0.69 s, `getid` 0.22 s instead of 0.65 s; europe cold `inspect` 14 s
-  instead of 46 s. Walks whose headers are already cached, and files of
-  large blobs such as the planet dump, read as before.
+  0.69 s, `getid` 0.22 s instead of 0.65 s; europe cold `inspect` 10 s
+  instead of 46 s. The read-ahead keeps several reads in flight, which also
+  leaves the file cached for a later pass: a cold denmark `cat --dedupe`
+  that copies nearly every blob through takes about 0.38 s instead of
+  0.54 s, the old engine's wall. Walks whose headers are already cached,
+  and files of large blobs such as the planet dump, read as before.
 - `digest` reuses its per-block record buffers instead of growing a fresh
   one per blob: the default full form on planet about 63 s instead of
   107 s, `--form content` about 53 s instead of 60 s. The digests are

@@ -222,10 +222,30 @@ pub(crate) const HEADER_PROBE_SIZE: usize = 4096;
 /// inside it cost no syscall. The walk's frame N+1 offset is only known from
 /// frame N's header, so on a cold cache a 4 KiB probe per frame is one
 /// device latency per frame with nothing else in flight; a window this size
-/// resolves many headers per latency, and the block layer splits it into
-/// several requests in flight. It bounds what a walk that stops early (the
-/// blob-count probe) reads past its last header.
+/// resolves many headers per latency. It is still one synchronous read: under
+/// the walk's `fadvise(RANDOM)` Linux fills it in readahead-sized steps, one
+/// after another, so a run of windows alone keeps one request in flight
+/// ([`HEADER_WALK_PREFETCH_BYTES`] is what deepens it). It bounds what a walk
+/// that stops early (the blob-count probe) reads past its last header.
 pub(crate) const HEADER_WINDOW_SIZE: usize = 1024 * 1024;
+
+/// How far past a cold window a header walk advises `WILLNEED`: one
+/// prefetch episode. A window read at or past the end of the previous
+/// episode (a fresh miss streak in unadvised bytes, never misses on pages
+/// the walk's own advice put in flight) opens the next one, so the advice
+/// renews only on new evidence of a cold region and stops within one
+/// episode of a region whose headers are cached. Without it a cold dense
+/// walk reads at queue depth one: denmark `cat --dedupe` pass 1 read 306 MB
+/// in 1 MiB windows at about 1.7 GB/s (`reference/performance.md`, "Header
+/// walk prefetch on cold dense files").
+pub(crate) const HEADER_WALK_PREFETCH_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Length of each `WILLNEED` call of a header-walk prefetch episode. Linux
+/// caps one call at the larger of the device's optimal I/O size and the
+/// file's readahead window (128 KiB each on the bench host) and silently
+/// drops the rest of a longer range, so an episode is issued as consecutive
+/// calls no longer than this rather than as one range.
+pub(crate) const HEADER_WALK_PREFETCH_CHUNK: u64 = 128 * 1024;
 
 /// Mean frame size (prefix, header and payload) below which a header walk
 /// reads [`HEADER_WINDOW_SIZE`] windows instead of [`HEADER_PROBE_SIZE`]

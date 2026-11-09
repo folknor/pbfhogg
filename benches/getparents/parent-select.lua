@@ -24,33 +24,13 @@ local function selected_ids(params)
     return ids
 end
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local compression = require("compression")
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
-    if params.compression then
-        local value = params.compression:match("^%s*(.-)%s*$")
-        local level = value:match("^zstd:([%+%-]?%d+)$")
-        local zlib = value:match("^zlib:(%+?%d+)$")
-        local valid_zlib = zlib and tonumber(zlib) <= 9
-        local valid_zstd = false
-        if level then
-            local n = tonumber(level)
-            valid_zstd = n ~= nil and n >= -2147483648 and n <= 2147483647
-        end
-        if value ~= "none" and value ~= "zlib" and value ~= "zstd"
-            and not valid_zlib and not valid_zstd then
-            fail("--compression must be none, zlib[:0-9] or zstd[:signed 32-bit level]")
-        end
-    end
-    if params.stop then
-        if not params.stop:match("^%-?[%w_]+$") or stop_marker(params.stop) == "_END" then
-            fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-        end
-    end
+    compression.parse(params.compression)
+    stops.resolve(params.stop)
 end
 
 function bench(params)
@@ -60,10 +40,9 @@ function bench(params)
     table.insert(args, {
         output = output("parents.pbf"),
         ["direct-io"] = params["direct-io"] == "yes",
-        compression = params.compression and params.compression:match("^%s*(.-)%s*$"),
+        compression = compression.parse(params.compression),
     })
-    local options = { hotpath = "getparents" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("getparents", params.stop)
     local r = binary_with(options, table.unpack(args)):ok()
     record.ids = ids
     record.summary = r.stderr

@@ -10,25 +10,17 @@
 --   brokkr bench --dry-run geocode-build --variant raw --direct-io yes
 --   brokkr bench --alloc geocode-build --stop -GEOCODE_PASS2
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
     if params["io-uring"] == "yes" then fail("build-geocode-index has no io_uring writer") end
     if params.compression then fail("build-geocode-index writes no PBF: compression is unsupported") end
-    if params.stop then
-        if not params.stop:match("^%-?[%w_]+$") or stop_marker(params.stop) == "_END" then
-            fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-        end
-    end
+    stops.resolve(params.stop)
 end
 
 function bench(params)
-    local options = { hotpath = "build-geocode-index" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("build-geocode-index", params.stop)
     local r = binary_with(options, "build-geocode-index", params.variant.file, {
         ["output-dir"] = output("geocode-index"),
         ["tmp-dir"] = scratch("geocode"),

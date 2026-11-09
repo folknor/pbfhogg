@@ -29,18 +29,11 @@ local function expected(params)
     end
 end
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
-    if params.stop then
-        if not params.stop:match("^%-?[%w_]+$") or stop_marker(params.stop) == "_END" then
-            fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-        end
-    end
+    stops.resolve(params.stop)
 end
 
 function preflight(params)
@@ -50,8 +43,7 @@ function preflight(params)
 end
 
 function bench(params)
-    local options = { hotpath = "check-locations" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("check-locations", params.stop)
     local r = binary_with(options, "check", "--locations", params.variant.file, {
         agreement = params.agreement == "yes",
     })

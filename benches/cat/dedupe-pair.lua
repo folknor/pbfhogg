@@ -34,12 +34,7 @@
 -- Compare commits on the cat child's own wall. --cache and --check are
 -- checked by their choices in brokkr.d/benches.toml.
 
-local function resident(path)
-    local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
-    local res = tonumber(r.stdout:match("%d+"))
-    if res == nil then fail("fincore gave no resident size for " .. path) end
-    return res
-end
+local cache = require("cache")
 
 function validate(params)
     -- validate() sees each file as its path string; bench sees a handle.
@@ -59,7 +54,7 @@ function bench(params)
         end
     end
     for name, f in pairs({ base = base, with = with }) do
-        local res = resident(f.path)
+        local res = cache.resident(f.path)
         local size = filesize(f)
         record[name .. "_resident_bytes"] = res
         record[name .. "_bytes"] = size

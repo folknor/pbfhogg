@@ -17,11 +17,9 @@
 --   brokkr bench --dry-run copy-pbf --type way,relation --clean yes,no
 --   brokkr bench --alloc copy-pbf --dedupe yes --io-uring yes
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local compression = require("compression")
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
     if params["as-snapshot"] or params["replace-snapshot"] == "yes" then
@@ -33,31 +31,12 @@ function validate(params)
     if params["io-uring"] == "yes" and params.dedupe ~= "yes" then
         fail("--io-uring yes requires --dedupe yes")
     end
-    if params.compression then
-        local value = params.compression:match("^%s*(.-)%s*$")
-        local level = value:match("^zstd:([%+%-]?%d+)$")
-        local zlib = value:match("^zlib:(%+?%d+)$")
-        local valid_zlib = zlib and tonumber(zlib) <= 9
-        local valid_zstd = false
-        if level then
-            local n = tonumber(level)
-            valid_zstd = n ~= nil and n >= -2147483648 and n <= 2147483647
-        end
-        if value ~= "none" and value ~= "zlib" and value ~= "zstd"
-            and not valid_zlib and not valid_zstd then
-            fail("--compression must be none, zlib[:0-9] or zstd[:signed 32-bit level]")
-        end
-    end
-    if params.stop then
-        if not params.stop:match("^%-?[%w_]+$") or stop_marker(params.stop) == "_END" then
-            fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-        end
-    end
+    compression.parse(params.compression)
+    stops.resolve(params.stop)
 end
 
 function bench(params)
-    local options = { hotpath = "cat" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("cat", params.stop)
     local args = { "cat", params.variant.file }
     if params.dedupe == "yes" then args[#args + 1] = params.variant.file end
     local out = output("cat.pbf")
@@ -69,7 +48,7 @@ function bench(params)
         dedupe = params.dedupe == "yes",
         ["direct-io"] = params["direct-io"] == "yes",
         ["io-uring"] = params["io-uring"] == "yes",
-        compression = params.compression and params.compression:match("^%s*(.-)%s*$"),
+        compression = compression.parse(params.compression),
     }
     local r = binary_with(options, table.unpack(args)):ok()
     record.summary = r.stderr

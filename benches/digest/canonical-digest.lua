@@ -19,18 +19,11 @@
 --   brokkr bench --dry-run canonical-digest --form auto,full,content
 --   brokkr bench --alloc canonical-digest --form content --direct-io yes
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
-    if params.stop then
-        if not params.stop:match("^%-?[%w_]+$") or stop_marker(params.stop) == "_END" then
-            fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-        end
-    end
+    stops.resolve(params.stop)
 end
 
 function bench(params)
@@ -41,8 +34,7 @@ function bench(params)
     end
     local flag = form
     if form == "content" and not takes_form then flag = nil end
-    local options = { hotpath = "digest" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("digest", params.stop)
     local r = binary_with(options, "digest", params.variant.file, {
         form = flag,
         ["direct-io"] = params["direct-io"] == "yes",

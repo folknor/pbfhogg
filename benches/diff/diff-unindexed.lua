@@ -21,12 +21,7 @@
 -- output size and the summary are recorded so arms can be checked for
 -- parity.
 
-local function resident(path)
-    local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
-    local res = tonumber(r.stdout:match("%d+"))
-    if res == nil then fail("fincore gave no resident size for " .. path) end
-    return res
-end
+local cache = require("cache")
 
 -- --type is checked by its choices in brokkr.d/benches.toml.
 function validate(params)
@@ -42,7 +37,7 @@ function bench(params)
         binary_with({ program = "dd" }, "if=" .. f.path, "iflag=nocache", "count=0", "status=none"):ok()
     end
     for _, f in ipairs({ old, new }) do
-        local res = resident(f.path)
+        local res = cache.resident(f.path)
         if res > 0 then
             fail(res .. " bytes of " .. f.path .. " are cached after eviction")
         end

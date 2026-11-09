@@ -22,12 +22,7 @@
 -- the cat child). --cache and --check are checked by their choices in
 -- brokkr.d/benches.toml.
 
-local function resident(path)
-    local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
-    local res = tonumber(r.stdout:match("%d+"))
-    if res == nil then fail("fincore gave no resident size for " .. path) end
-    return res
-end
+local cache = require("cache")
 
 function bench(params)
     local pbf = params.variant.file
@@ -36,7 +31,7 @@ function bench(params)
     else
         binary_with({ program = "dd" }, "if=" .. pbf.path, "of=/dev/null", "bs=4M", "status=none"):ok()
     end
-    local res = resident(pbf.path)
+    local res = cache.resident(pbf.path)
     local size = filesize(pbf)
     record.input_resident_bytes = res
     record.input_bytes = size

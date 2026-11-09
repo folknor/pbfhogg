@@ -10,11 +10,8 @@
 --   brokkr bench --dry-run file-info --mode tags --expr 'a=b,c'
 --   brokkr bench --alloc file-info --mode tags --expr 'a=b,c'
 
-local function stop_marker(value)
-    local marker = value:gsub("^-", "")
-    if marker:sub(-4) ~= "_END" then marker = marker .. "_END" end
-    return marker
-end
+local stops = require("stop")
+local profiling = require("profiling")
 
 function validate(params)
     if params.mode ~= "tags" and (params.type or params.expr) then
@@ -37,10 +34,7 @@ function validate(params)
             fail("expressions must be strings without NUL and must not start with '-'")
         end
     end
-    if params.stop and (not params.stop:match("^%-?[%w_]+$")
-        or stop_marker(params.stop) == "_END") then
-        fail("--stop must be a marker name: FOO_END, FOO or -FOO")
-    end
+    stops.resolve(params.stop)
 end
 
 function bench(params)
@@ -57,8 +51,7 @@ function bench(params)
         jobs = params.jobs,
         ["direct-io"] = params["direct-io"] == "yes",
     })
-    local options = { hotpath = "inspect" }
-    if params.stop then options.stop_at = stop_marker(params.stop) end
+    local options = profiling.options("inspect", params.stop)
     local r = binary_with(options, table.unpack(args)):ok()
     record.summary = r.stderr
     if r.stopped_at then

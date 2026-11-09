@@ -17,17 +17,12 @@
 -- (`brokkr results UUID`). --force is checked by its choices in
 -- brokkr.d/benches.toml.
 
-local function resident(path)
-    local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
-    local res = tonumber(r.stdout:match("%d+"))
-    if res == nil then fail("fincore gave no resident size for " .. path) end
-    return res
-end
+local cache = require("cache")
 
 function bench(params)
     local pbf = params.variant.file
     binary_with({ program = "dd" }, "if=" .. pbf.path, "iflag=nocache", "count=0", "status=none"):ok()
-    local res = resident(pbf.path)
+    local res = cache.resident(pbf.path)
     record.input_resident_bytes = res
     record.input_bytes = filesize(pbf)
     if res > 0 then

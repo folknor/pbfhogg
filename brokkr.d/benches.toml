@@ -98,6 +98,26 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read 
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
+# -- check-locations
+
+[bench.location-integrity]
+script_file = "../benches/check-locations/location-integrity.lua"
+description = "Check inline way-node coordinates against node records, optionally requiring agreement across ways"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed check-locations: agreement checks, snapshots, declared verdicts and profiling with marker stops" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "altw-keep-untagged", help = "the LocationsOnWays input; set altw explicitly for the typed --agreement default" }
+params.agreement = { choices = ["yes", "no"], default = "no", help = "yes: also require inline copies of absent nodes to agree across ways" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- check-refs
 
 [bench.ref-integrity]

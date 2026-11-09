@@ -275,16 +275,6 @@ but costs the text diff's no-scratch contract; a cut by an estimate of
 detail bytes would not. Unmeasured; no input of that shape exists in the
 datasets.
 
-### WRK-096: Writer cluster
-
-One A/B of `ae646053^` vs `52690f1e` covers the per-block dispatch
-(`ae646053`), the shared pipeline spawn (`3ab1b4ce`), the checked frame
-header encoder (`f9625b94`), the one-meaning writer counters (`62046948`),
-the shared ordered-delivery loop (`7abba0df`) and the OSC gzip writer's
-`ReorderBuffer` (`52690f1e`). A block-encoding command on europe or planet
-(repack or cat `--clean`) plus planet `diff --format osc` covers it. Bisect
-only if it moves.
-
 ### WRK-111: altw external pass A exposure to sustained-write state
 
 Stage 1 pass A runs 32 s on planet as the first cell after a trim or rest
@@ -419,7 +409,11 @@ knows what it changed.
 
 - Write side: `frame_in_scratch` (`1db71d8a`, `f9625b94`); the permit taken
   through `acquire_permit` before spawn (`1db71d8a`); `fadvise::advise` on
-  every `posix_fadvise` (`d510bbd7`); the copy loops made two (`bd2de78d`).
+  every `posix_fadvise` (`d510bbd7`); the copy loops made two (`bd2de78d`);
+  the `307982d7..52690f1e` writer cluster on the `pwrite` pool and io_uring
+  backends and on borrowed `write_primitive_block` calls (the buffered
+  backend measured neutral, reference/performance.md "Writer cluster
+  across six commits").
 - Read side: `BlobReader::next` as `next_frame` plus `into_blob`, eviction
   before the envelope parse (`8881415e`); `OrderWatermark`'s mixed-sign
   `min_id` (`8881415e`); one `statx` per direct open (`ea17fd86`); the

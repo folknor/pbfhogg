@@ -5260,6 +5260,45 @@ per-run cost) nor the reframe's `MAX_BLOB_DATASIZE` compare (`f9625b94`,
 in neither arm, and plain cat on indexed input never reframes). Not to be
 re-measured without a change to the walk's read path.
 
+## Writer cluster across six commits (bygg, 2026-11-09, `307982d7` vs `52690f1e`)
+
+`307982d7..52690f1e` is six linear commits: one per-block dispatch
+(`write_osm_data` over `BlobMeta`, one `reserve`, one `send_raw`), one
+`WritePipeline` spawn, one checked frame header encoder
+(`encode_frame_header`), writer counters that mean one thing on every
+backend, one ordered-delivery loop (`deliver_in_order`) and the OSC gzip
+writer reordering with `ReorderBuffer`. No single command reaches all of
+it: repack and cat `--clean` frame on their own threads and send
+`write_raw_owned`, so they never call `write_osm_data`. Three commands,
+both arms `--commit` worktrees, order A B B A, `--bench 1`, untrimmed:
+
+| Command | `307982d7` | `52690f1e` | `52690f1e` | `307982d7` |
+|---|---:|---:|---:|---:|
+| europe `repack` (raw send, framing, counters, loop) | 151.9 s (`5f0a1965`) | 141.0 s (`8de80460`) | 140.4 s (`99ce34ff`) | 140.9 s (`05e546f7`) |
+| germany `extract --simple -b 5.8,47.2,15.1,55.1` (per-block dispatch) | 14.5 s (`2368455a`) | 13.0 s (`9e94ace5`) | 8.68 s (`ce19a942`) | 8.60 s (`ad0ae918`) |
+| planet `diff-snapshots --format osc -j 16` (`ParallelGzipWriter`) | 257.4 s (`d673ef92`) | 256.0 s (`a5dd0067`) | 255.8 s (`2d9b1b50`) | 255.5 s (`d17d94db`) |
+
+The germany extract walls fall as the cache warms; one more warm pair,
+B then A, gave 8.70 s (`c8f486f7`) and 8.64 s (`5f34dc1a`), so warm B
+is about 0.8 % slower: noise. Repack's first cell is the suite's first
+and stands apart from the other three. The planet OSC assembly span
+(`DERIVECHANGES_WRITE`, the `ParallelGzipWriter` stage) is 8.50 s at A
+and 8.23 s at B (`d17d94db` against `2d9b1b50`). Verdict: no detected net
+regression for these workloads on the buffered backend. It is a
+regression screen, not a per-commit bound: a cost in one commit could
+cancel a gain in another. Uncovered: the `pwrite` pool and io_uring
+backends (io_uring cannot run on bygg) and the borrowed `BlobMeta::Scan`
+and `Bare` branches. Repack at both arms runs under the CLI's two-arena
+malloc cap (removed in `25172fc3`); extract and diff never asked for it.
+
+Whole-Europe extract `--simple` is not a usable cell at either arm: both
+panic with `reorder buffer window exceeded: seq 65536 is 65536 ahead of
+0 (max 65536)`, and the Germany box on Europe panics the same way at
+seq 117597, with blob 0 never delivered. Both arms fail identically, so
+it is not the writer cluster. HEAD runs the same extract (`dfe4ec94`);
+`56a50e0d`, which put every ordered blob pool on one bounded engine, is
+the likely fix but was not bisected. Not to be re-measured without a code reason.
+
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.

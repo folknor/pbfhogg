@@ -69,6 +69,29 @@ repository.workspace = true
 readme = "LIBRARY.md"
 keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
+# An allowlist, so a new top-level file stays out of the published crate
+# unless it is named here. It ships the sources, the durable documents the
+# sources and README cite (reference/, decisions/, the docs pages,
+# DEVIATIONS.md, CORRECTNESS.md, LLM.md) and the doc examples' input; the
+# bench database, docs-site assets, host configs, notes, scripts and test
+# suite serve development, not library users.
+include = [
+    "/src/**/*.rs",
+    "/examples/*.rs",
+    "/tests/test.osm.pbf",
+    "/reference/*.md",
+    "/decisions/*.md",
+    "/docs/**/*.md",
+    "/Cargo.toml",
+    "/README.md",
+    "/LIBRARY.md",
+    "/CHANGELOG.md",
+    "/DEVIATIONS.md",
+    "/CORRECTNESS.md",
+    "/LLM.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
 # Integration tests are declared below rather than discovered: one binary
 # per file made every check sweep link ~50 harnesses and a focused
 # `brokkr test` list every one of them to find one test. A file in tests/
@@ -113,7 +136,7 @@ quick-xml = "0.42.0"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 serde_json = { workspace = true, optional = true }
 s2 = { version = "0.2.0", default-features = false, optional = true }
-io-uring = { version = "0.7.13", optional = true }
+io-uring = { version = "0.7.16", optional = true }
 libc = "0.2.191"
 
 

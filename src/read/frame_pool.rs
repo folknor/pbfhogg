@@ -37,7 +37,9 @@ use crate::tunables::{
 /// order.
 ///
 /// `admit` runs on the calling thread as each frame is read: `None` skips
-/// the frame (it is never worked or folded), `Some(payload)` issues it.
+/// the frame (it is never worked or folded, though its payload has already
+/// been read with it, so this cannot skip reading one; `sort`'s pass 1,
+/// which must, runs its own header-first walk), `Some(payload)` issues it.
 /// `local` builds each worker's scratch on its own thread. A `work` failure
 /// is located at its frame, as `Frames::locate` locates one; a `fold`
 /// failure is the caller's own and is returned as it is.

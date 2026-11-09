@@ -283,6 +283,13 @@ state.
 
 ### Changed
 
+- `sort`'s first pass scans the blobs it cannot index from their headers
+  (an unindexed input under `--force`, every blob under
+  `--distrust-metadata`, an indexed input whose header does not claim
+  sorted) on a worker pool instead of one blob at a time, as does
+  `cat --dedupe` for unindexed blobs: europe unindexed `sort --force`
+  pass 1 about 14 s instead of 165 s (whole sort about 30 s instead of
+  180 s), with about 125 MB more peak memory.
 - Commands that walk the blob headers (`inspect`, `inspect tags --type`,
   `getid`, the schedule walks of `tags-filter`, `check --refs`, `extract`
   and others) read ahead on a cold page cache when the file's blobs are

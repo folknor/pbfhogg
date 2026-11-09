@@ -1189,18 +1189,6 @@ Known to work, no performance question open, but not in the results DB:
   engine move on unsorted Denmark"). Thread utilization and the critical
   path were not measured; this records the limit, not a defect or a
   remedy.
-- [ ] **Sort pass 1 scans payloads on one thread (2026-11-08).** Every
-  blob the walk scans (unindexed under `--force`, all under
-  `--distrust-metadata`, indexed under an unclaimed header) is preaded,
-  decompressed and scanned serially in `blob_merge::index_inputs`: europe
-  `pbf.raw` `SORT_INDEX_BUILD` 165 s of a 180 s sort at 0.8 cores
-  (reference/performance.md, "sort --force on unindexed Europe").
-  `src/read/frame_pool.rs` already does sequential read plus parallel
-  decompress and scan in file order for check --index and cat --reindex
-  (494 s to 29 s at planet). Moving the scanned path onto it must keep the
-  header-only path's payload skipping for believed blobs, the partial
-  index refusal, direct-I/O walks and located errors in file order. Same
-  walk serves `cat --dedupe`.
 - [ ] **Byte-budgeted fused task engine (moved from the pre-release
   note 2026-11-08).** One execution model for decode, transform, encode
   and frame under one byte budget, replacing the unordered classify pool,

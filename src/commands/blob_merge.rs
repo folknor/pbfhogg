@@ -41,7 +41,14 @@ use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
 use crate::read::input::{InputFile, PinnedInput};
+use crate::tunables::{
+    DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED, FRAME_POOL_WINDOW_SLACK,
+    PASS1_BELIEVED_BATCH,
+};
 use crate::writer::PbfWriter;
+use std::convert::Infallible;
+use std::path::Path;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Blob index
@@ -186,6 +193,25 @@ pub(crate) struct IndexPolicy {
 /// no box, makes any carried box false). [`BlobIndex::bbox_claim`] is that
 /// rule's bbox half, shared with the check.
 ///
+/// The header walk, the OSMHeader decode and the fold into [`Indexed`] run on
+/// the calling thread; each scanned blob's pread, decompression, scan and
+/// reframing decision run on a worker pool (`ordered_pool`'s streamed
+/// tasks), at most `workers + FRAME_POOL_WINDOW_SLACK` tasks ahead of the
+/// fold. A task is up to [`PASS1_BELIEVED_BATCH`] believed blobs followed by
+/// at most one scanned one, so a believed walk stays header-only and pays
+/// no pool round trip per blob. Buffered workers pread from the walker's
+/// descriptor; an `O_DIRECT` walk reads each scanned payload on its own
+/// thread, since its descriptor cannot leave it. The fold pushes in file
+/// order, so frames, entries and the omitted count are the serial walk's,
+/// and failures are reported as the serial walk reports them: a scanned
+/// blob's failure after every earlier blob is folded (and after the
+/// unclaimed-order note, if that blob is the first it covers), a walk
+/// failure (framing, the partial index refusal, a missing or misplaced
+/// header) after every earlier blob. Only a cancellation racing a failure
+/// can differ: a failure the workers or the walk reached ahead of the fold
+/// is speculative until the fold reaches it, and may lose to `Cancelled`
+/// (ADR-0019).
+///
 /// `direct_io` (the `--direct-io` flag) walks every input `O_DIRECT`
 /// ([`HeaderWalker::open_direct`]): the same probes and payload reads, as
 /// aligned reads that bypass the page cache (where the filesystem honours
@@ -202,151 +228,575 @@ pub(crate) fn index_inputs(
     if direct_io {
         return Err(crate::file_reader::direct_reads_unsupported());
     }
+    #[cfg(feature = "linux-direct-io")]
+    if direct_io {
+        return index_over(inputs, policy, host, |input| {
+            HeaderWalker::open_direct(input, host)
+        });
+    }
+    index_over(inputs, policy, host, |input| {
+        HeaderWalker::open(input, host)
+    })
+}
+
+/// How a walk's scanned payloads reach the workers.
+trait PayloadRead: Positional + Sized {
+    /// The descriptor workers pread a scanned payload from, or `None` when
+    /// the walk must read it on its own thread: an `O_DIRECT` walker's reads
+    /// share one aligned scratch buffer, so its descriptor stays with it.
+    fn worker_file(walker: &HeaderWalker<Self>) -> Option<Arc<std::fs::File>>;
+}
+
+impl PayloadRead for std::fs::File {
+    fn worker_file(walker: &HeaderWalker<Self>) -> Option<Arc<std::fs::File>> {
+        Some(Arc::clone(walker.shared_file()))
+    }
+}
+
+#[cfg(feature = "linux-direct-io")]
+impl PayloadRead for crate::read::direct_reader::DirectPositional {
+    fn worker_file(_walker: &HeaderWalker<Self>) -> Option<Arc<std::fs::File>> {
+        None
+    }
+}
+
+/// Pass 1 over walkers `open` makes, one per input in order: the walk and
+/// fold on the calling thread, the payload scans on a worker pool.
+fn index_over<P: PayloadRead>(
+    inputs: &[PinnedInput],
+    policy: &IndexPolicy,
+    host: &crate::host::Entered<'_>,
+    open: impl Fn(&PinnedInput) -> Result<HeaderWalker<P>>,
+) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
     let mut walk = Walk {
+        inputs,
         policy,
-        host,
+        open,
+        input: 0,
+        current: None,
+        believed: Vec::new(),
+        deferred: None,
+        headers: Vec::with_capacity(inputs.len()),
+        data_buf: crate::read::read_buf::ReadBuf::default(),
         invocation: &host.invocation,
+    };
+    let mut fold = Fold {
+        host,
         indexed: Indexed {
             frames: Vec::new(),
             entries: Vec::new(),
             omitted: 0,
         },
-        data_buf: crate::read::read_buf::ReadBuf::default(),
-        decompress_buf: Vec::new(),
         noted_unclaimed: false,
     };
-    let mut headers = Vec::with_capacity(inputs.len());
-    for (source, input) in inputs.iter().enumerate() {
-        #[cfg(feature = "linux-direct-io")]
-        if direct_io {
-            let walker = HeaderWalker::open_direct(input, host)?;
-            headers.push(walk.input(source, input, walker)?);
-            continue;
-        }
-        let walker = HeaderWalker::open(input, host)?;
-        headers.push(walk.input(source, input, walker)?);
-    }
-    Ok((headers, walk.indexed))
+    let workers = crate::host::sized_workers(
+        &*host.resources,
+        DECODE_WORKERS_RESERVED,
+        DECODE_WORKERS_MIN,
+        DECODE_WORKERS_FALLBACK,
+    );
+    let config = crate::ordered_pool::StreamConfig {
+        window: std::num::NonZeroUsize::new(workers.saturating_add(FRAME_POOL_WINDOW_SLACK))
+            .unwrap_or(std::num::NonZeroUsize::MIN),
+        // Terminal-only tasks: one slot lets a worker deposit its result and
+        // take the next task without waiting for the fold.
+        depth: 1,
+        cancel: &host.invocation,
+    };
+    let base: &crate::host::Host = host;
+    let cancel = &base.invocation;
+    let recorder: &crate::host::Recorder = &host.invocation;
+    let mut source = || walk.next_task();
+    crate::ordered_pool::run_ordered_streams_from(
+        &mut source,
+        workers,
+        config,
+        |_| Scratch::default(),
+        |scratch: &mut Scratch,
+         _task: usize,
+         task: Task,
+         _emitter: &crate::ordered_pool::Emitter<'_, Infallible, Done>| {
+            Ok(work(
+                scratch,
+                task,
+                policy.distrust_metadata,
+                cancel,
+                recorder,
+            ))
+        },
+        &mut fold,
+    )?;
+    Ok((walk.headers, fold.indexed))
 }
 
-/// Pass-1 state shared across every input of a run.
-struct Walk<'a> {
+/// The calling thread's walk: every input's headers in order, cut into
+/// [`Task`]s. A failure is the source failure of the task it did not
+/// produce, so every earlier blob is folded first; believed blobs it holds
+/// when one strikes go out as a task of their own before it is returned.
+struct Walk<'a, P, O> {
+    inputs: &'a [PinnedInput],
     policy: &'a IndexPolicy,
-    host: &'a crate::host::Host,
-    /// The command's admission, which the buffers' releases count into.
-    invocation: &'a crate::host::Recorder,
-    indexed: Indexed,
-    /// Kept across blobs and inputs; both follow their retention limits once
-    /// per blob (`data_blob`, `header`).
+    open: O,
+    /// The next input to open.
+    input: usize,
+    /// The input being walked: its index, walker and header once read.
+    current: Option<(usize, HeaderWalker<P>, Option<crate::HeaderBlock>)>,
+    /// Believed blobs of the current input not yet sent.
+    believed: Vec<Believed>,
+    /// A failure held back while `believed` went out first.
+    deferred: Option<Error>,
+    headers: Vec<crate::HeaderBlock>,
+    /// The OSMHeader payloads, and under `O_DIRECT` every scanned payload,
+    /// are read here, on the walk's thread.
     data_buf: crate::read::read_buf::ReadBuf,
-    decompress_buf: Vec<u8>,
-    noted_unclaimed: bool,
+    invocation: &'a crate::host::Recorder,
 }
 
-/// What the payload scan made of one block.
-enum Scanned {
-    /// One index describes it. `tagdata` is its serialized tag key set, when
-    /// the scan was asked for it and the key set encodes.
+/// A believed blob: indexed from its header alone.
+struct Believed {
+    file_offset: u64,
+    frame_len: u64,
+    index: BlobIndex,
+}
+
+/// One pool task: believed blobs of one input in file order, then at most
+/// one scanned blob after them.
+struct Task {
+    source: usize,
+    believed: Vec<Believed>,
+    scan: Option<ScanJob>,
+}
+
+/// A blob to pread, decompress and scan.
+struct ScanJob {
+    file_offset: u64,
+    frame_len: u64,
+    /// Its indexdata, if it carried any.
+    claimed: Option<BlobIndex>,
+    /// Its carried tagdata, compared under `--distrust-metadata`.
+    carried_tags: Option<Box<[u8]>>,
+    /// Whether this blob is one the once-per-run order note announces (an
+    /// indexed blob scanned under an unclaimed header, not under distrust).
+    note: bool,
+    path: Arc<Path>,
+    blob_index: u64,
+    payload: Payload,
+}
+
+/// Where a scanned blob's compressed bytes are.
+enum Payload {
+    /// To be preaded by the worker from this buffered descriptor.
+    At {
+        file: Arc<std::fs::File>,
+        offset: u64,
+        size: usize,
+    },
+    /// Read by the walk (an `O_DIRECT` walk): the bytes, or the read's
+    /// failure, which the worker reports as the scan's.
+    Read(Result<Vec<u8>>),
+}
+
+/// A task's result: always delivered, so the fold sees the believed prefix
+/// and the note before a scan failure, as the serial walk did.
+struct Done {
+    source: usize,
+    believed: Vec<Believed>,
+    scan: Option<ScanDone>,
+}
+
+struct ScanDone {
+    file_offset: u64,
+    frame_len: u64,
+    note: bool,
+    outcome: Result<Outcome>,
+}
+
+/// What the worker decided for one scanned blob.
+enum Outcome {
+    /// One index describes it; `reindex` is the header a passthrough gives
+    /// it instead of its own, `None` to copy it whole.
     Block {
         index: BlobIndex,
         sorted: bool,
-        tagdata: Option<Box<[u8]>>,
+        reindex: Option<Reindex>,
     },
     /// No single index does: the index of each kind it holds, in kind order,
     /// empty when it holds no element.
     Kinds(Vec<BlobIndex>),
 }
 
-impl Walk<'_> {
-    /// Index one input over `walker`, freshly opened on it.
-    fn input<P: Positional>(
-        &mut self,
-        source: usize,
-        input: &PinnedInput,
-        mut walker: HeaderWalker<P>,
-    ) -> Result<crate::HeaderBlock> {
-        if self.policy.accept_partial_index || self.policy.distrust_metadata {
-            walker = walker.accepting_partial_index();
+impl<P: PayloadRead, O: Fn(&PinnedInput) -> Result<HeaderWalker<P>>> Walk<'_, P, O> {
+    /// The next task, `None` after the last input, or the walk's failure.
+    fn next_task(&mut self) -> Result<Option<Task>> {
+        if let Some(e) = self.deferred.take() {
+            return Err(e);
         }
-        let mut header: Option<crate::HeaderBlock> = None;
-        while let Some(meta) = walker.next_header()? {
+        loop {
+            let Some((source, walker, header)) = self.current.as_mut() else {
+                let Some(input) = self.inputs.get(self.input) else {
+                    return Ok(None);
+                };
+                let source = self.input;
+                self.input += 1;
+                let mut walker = (self.open)(input)?;
+                if self.policy.accept_partial_index || self.policy.distrust_metadata {
+                    walker = walker.accepting_partial_index();
+                }
+                self.current = Some((source, walker, None));
+                continue;
+            };
+            let source = *source;
+            let meta = match walker.next_header() {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    let path = Arc::clone(walker.path());
+                    let header = header.take();
+                    self.current = None;
+                    let Some(header) = header else {
+                        return self.fail(source, crate::error::new_missing_header(&path));
+                    };
+                    self.headers.push(header);
+                    if let Some(task) = self.flush(source) {
+                        return Ok(Some(task));
+                    }
+                    continue;
+                }
+                Err(e) => return self.fail(source, e),
+            };
             let claims_sorted = header.as_ref().map(crate::HeaderBlock::is_sorted);
             match meta.blob_type {
                 // The walk refuses an OSMHeader anywhere but first.
-                BlobKind::OsmHeader => header = Some(self.header(&walker, &meta)?),
+                BlobKind::OsmHeader => {
+                    match read_header(
+                        walker,
+                        &meta,
+                        self.policy,
+                        &mut self.data_buf,
+                        self.invocation,
+                    ) {
+                        Ok(hdr) => *header = Some(hdr),
+                        Err(e) => return self.fail(source, e),
+                    }
+                }
                 _ if claims_sorted.is_none() => {
-                    return Err(crate::error::new_missing_header(input.path()));
+                    let e = crate::error::new_missing_header(walker.path());
+                    return self.fail(source, e);
                 }
                 BlobKind::OsmData => {
-                    let believed = claims_sorted == Some(true) && !self.policy.distrust_metadata;
-                    self.data_blob(source, &walker, &meta, believed)?;
+                    let distrust = self.policy.distrust_metadata;
+                    let believed = claims_sorted == Some(true) && !distrust;
+                    match meta.index {
+                        Some(index) if believed => {
+                            self.believed.push(Believed {
+                                file_offset: meta.frame_start,
+                                frame_len: meta.frame_size as u64,
+                                index,
+                            });
+                            if self.believed.len() >= PASS1_BELIEVED_BATCH {
+                                return Ok(self.flush(source));
+                            }
+                        }
+                        claimed => {
+                            let job = scan_job(
+                                walker,
+                                meta,
+                                claimed,
+                                distrust,
+                                &mut self.data_buf,
+                                self.invocation,
+                            );
+                            return Ok(Some(Task {
+                                source,
+                                believed: std::mem::take(&mut self.believed),
+                                scan: Some(job),
+                            }));
+                        }
+                    }
                 }
                 // Unknown extension blob: the walk has already stepped past it.
                 _ => {}
             }
         }
-        header.ok_or_else(|| crate::error::new_missing_header(input.path()))
     }
 
-    fn header<P: Positional>(
-        &mut self,
-        walker: &HeaderWalker<P>,
-        meta: &BlobHeaderMeta,
-    ) -> Result<crate::HeaderBlock> {
-        let located = |e| walker.locate_meta(meta, e);
-        let data = walker
-            .pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)
-            .map_err(located)?;
-        let hdr = decode_blob_to_headerblock(data).map_err(located);
-        self.data_buf.release_outlier(self.invocation);
-        let hdr = hdr?;
-        if let Some(reason) = self.policy.require_sorted {
-            let path = walker.path();
-            crate::commands::require_sorted(
-                hdr.is_sorted(),
-                path,
-                &format!("Input file {}", path.display()),
-                reason,
-            )
-            .map_err(located)?;
-        }
-        Ok(hdr)
-    }
-
-    /// Index one OSMData blob: push its frame and entries, or count it
-    /// omitted. See [`index_inputs`] for the outcomes.
-    fn data_blob<P: Positional>(
-        &mut self,
-        source: usize,
-        walker: &HeaderWalker<P>,
-        meta: &BlobHeaderMeta,
-        claims_sorted: bool,
-    ) -> Result<()> {
-        let frame = self.indexed.frames.len();
-        let new_frame = Frame {
+    /// The believed blobs held for `source`, as a task, if there are any.
+    fn flush(&mut self, source: usize) -> Option<Task> {
+        (!self.believed.is_empty()).then(|| Task {
             source,
-            file_offset: meta.frame_start,
-            frame_len: meta.frame_size as u64,
-            reindex: None,
-        };
-        let claimed = match meta.index {
+            believed: std::mem::take(&mut self.believed),
+            scan: None,
+        })
+    }
+
+    /// Fail the walk with `e`, after the believed blobs it holds.
+    fn fail(&mut self, source: usize, e: Error) -> Result<Option<Task>> {
+        self.current = None;
+        self.input = self.inputs.len();
+        match self.flush(source) {
+            Some(task) => {
+                self.deferred = Some(e);
+                Ok(Some(task))
+            }
+            None => Err(e),
+        }
+    }
+}
+
+/// The scan job for a blob the walk cannot believe. An `O_DIRECT` walk
+/// reads its payload here; a buffered one leaves the read to the worker.
+fn scan_job<P: PayloadRead>(
+    walker: &HeaderWalker<P>,
+    meta: BlobHeaderMeta,
+    claimed: Option<BlobIndex>,
+    distrust: bool,
+    data_buf: &mut crate::read::read_buf::ReadBuf,
+    invocation: &crate::host::Recorder,
+) -> ScanJob {
+    let payload = match P::worker_file(walker) {
+        Some(file) => Payload::At {
+            file,
+            offset: meta.data_offset,
+            size: meta.data_size,
+        },
+        None => {
+            let read = walker
+                .pread_data(meta.data_offset, meta.data_size, data_buf)
+                .map(<[u8]>::to_vec);
+            data_buf.release_outlier(invocation);
+            Payload::Read(read)
+        }
+    };
+    ScanJob {
+        file_offset: meta.frame_start,
+        frame_len: meta.frame_size as u64,
+        claimed,
+        carried_tags: meta.tagdata,
+        note: claimed.is_some() && !distrust,
+        path: Arc::clone(walker.path()),
+        blob_index: meta.blob_index,
+        payload,
+    }
+}
+
+/// Read and decode an input's OSMHeader, refusing it where the policy
+/// requires the sorted claim.
+fn read_header<P: Positional>(
+    walker: &HeaderWalker<P>,
+    meta: &BlobHeaderMeta,
+    policy: &IndexPolicy,
+    data_buf: &mut crate::read::read_buf::ReadBuf,
+    invocation: &crate::host::Recorder,
+) -> Result<crate::HeaderBlock> {
+    let located = |e| walker.locate_meta(meta, e);
+    let data = walker
+        .pread_data(meta.data_offset, meta.data_size, data_buf)
+        .map_err(located)?;
+    let hdr = decode_blob_to_headerblock(data).map_err(located);
+    data_buf.release_outlier(invocation);
+    let hdr = hdr?;
+    if let Some(reason) = policy.require_sorted {
+        let path = walker.path();
+        crate::commands::require_sorted(
+            hdr.is_sorted(),
+            path,
+            &format!("Input file {}", path.display()),
+            reason,
+        )
+        .map_err(located)?;
+    }
+    Ok(hdr)
+}
+
+/// A worker's buffers, kept across its blobs; both follow their retention
+/// limits once per blob.
+#[derive(Default)]
+struct Scratch {
+    data_buf: crate::read::read_buf::ReadBuf,
+    decompress_buf: Vec<u8>,
+}
+
+/// Run one task on a worker: scan its blob, if it has one.
+fn work(
+    scratch: &mut Scratch,
+    task: Task,
+    distrust: bool,
+    cancel: &crate::host::Invocation,
+    recorder: &crate::host::Recorder,
+) -> Done {
+    let Task {
+        source,
+        believed,
+        scan,
+    } = task;
+    let scan = scan.map(|job| {
+        let location = crate::error::Location::new(
+            Some(&job.path),
+            Some(job.blob_index),
+            Some(crate::ByteOffset(job.file_offset)),
+        );
+        let ScanJob {
+            claimed,
+            carried_tags,
+            payload,
+            ..
+        } = job;
+        let outcome = scan_blob(
+            scratch,
+            payload,
+            claimed,
+            carried_tags.as_deref(),
+            distrust,
+            cancel,
+            recorder,
+        )
+        .map_err(|e| e.locate(location));
+        ScanDone {
+            file_offset: job.file_offset,
+            frame_len: job.frame_len,
+            note: job.note,
+            outcome,
+        }
+    });
+    Done {
+        source,
+        believed,
+        scan,
+    }
+}
+
+/// Pread (or take), decompress and scan one payload's IDs, checking
+/// intra-blob monotonicity on the way (one compare per element, on a scan
+/// that visits every ID anyway), and its tag keys where a passthrough would
+/// be reframed: a blob without indexdata, and under distrust every blob,
+/// whose carried key set is checked against them. Otherwise an indexed blob
+/// is copied whole unless its claim turns out false, which rescans the
+/// buffer. A block no single index describes is decoded for the kinds it
+/// holds.
+fn scan_blob(
+    scratch: &mut Scratch,
+    payload: Payload,
+    claimed: Option<BlobIndex>,
+    carried_tags: Option<&[u8]>,
+    distrust: bool,
+    cancel: &crate::host::Invocation,
+    recorder: &crate::host::Recorder,
+) -> Result<Outcome> {
+    let decompressed = match payload {
+        Payload::At { file, offset, size } => {
+            let read = scratch
+                .data_buf
+                .read_exact_at(&*file, offset, size)
+                .map_err(Error::from)
+                .and_then(|data| decompress_blob_data_into(data, &mut scratch.decompress_buf));
+            scratch.data_buf.release_outlier(recorder);
+            read
+        }
+        Payload::Read(read) => {
+            read.and_then(|data| decompress_blob_data_into(&data, &mut scratch.decompress_buf))
+        }
+    };
+    let outcome =
+        decompressed.and_then(|()| decide(scratch, claimed, carried_tags, distrust, cancel));
+    crate::blob::release_decode_outlier(&mut scratch.decompress_buf, recorder);
+    outcome
+}
+
+/// What the decompressed block in `scratch` makes of `job`'s blob: its
+/// entry and, for a passthrough, whether and how it is reframed.
+fn decide(
+    scratch: &mut Scratch,
+    claimed: Option<BlobIndex>,
+    carried_tags: Option<&[u8]>,
+    distrust: bool,
+    cancel: &crate::host::Invocation,
+) -> Result<Outcome> {
+    let with_tags = claimed.is_none() || distrust;
+    let (index, tags) = if with_tags {
+        try_scan_block_ids_and_tags(&scratch.decompress_buf)?
+    } else {
+        (try_scan_block_ids_checked(&scratch.decompress_buf)?, None)
+    };
+    let Some((index, sorted)) = index else {
+        return kind_indexes(std::mem::take(&mut scratch.decompress_buf), cancel)
+            .map(Outcome::Kinds);
+    };
+    let tagdata = tags.as_ref().and_then(serialize_tags);
+    let tags_hold = !distrust || carried_tags_hold(carried_tags, tagdata.as_deref());
+    let reindex = match claimed {
+        None => Some(Reindex {
+            index,
+            tagdata,
+            replaces_false_claim: false,
+        }),
+        Some(claim) if claim_holds(&claim, &index) && tags_hold => None,
+        Some(_) if distrust => Some(Reindex {
+            index,
+            tagdata,
+            replaces_false_claim: true,
+        }),
+        Some(_) => Some(Reindex {
+            index,
+            tagdata: scanned_tagdata(&scratch.decompress_buf)?,
+            replaces_false_claim: true,
+        }),
+    };
+    Ok(Outcome::Block {
+        index,
+        sorted,
+        reindex,
+    })
+}
+
+/// The calling thread's fold: every task's blobs pushed in file order, as
+/// the serial walk pushed them.
+struct Fold<'a, 'h> {
+    host: &'a crate::host::Entered<'h>,
+    indexed: Indexed,
+    noted_unclaimed: bool,
+}
+
+impl Fold<'_, '_> {
+    fn push(&mut self, frame: Frame, entries: impl IntoIterator<Item = BlobEntry>) {
+        self.indexed.frames.push(frame);
+        self.indexed.entries.extend(entries);
+    }
+}
+
+impl crate::ordered_pool::StreamConsumer<Infallible, Done> for Fold<'_, '_> {
+    fn item(&mut self, _task: usize, item: Infallible) -> Result<()> {
+        match item {}
+    }
+
+    fn finish_task(&mut self, _task: usize, done: Done) -> Result<()> {
+        let Done {
+            source,
+            believed,
+            scan,
+        } = done;
+        for b in believed {
+            let frame = self.indexed.frames.len();
             // Believed: the frame's own header (its tagdata included) is
             // what a passthrough copies.
-            Some(index) if claims_sorted => {
-                self.indexed.frames.push(new_frame);
-                self.indexed.entries.push(BlobEntry {
+            self.push(
+                Frame {
+                    source,
+                    file_offset: b.file_offset,
+                    frame_len: b.frame_len,
+                    reindex: None,
+                },
+                [BlobEntry {
                     frame,
-                    index,
+                    index: b.index,
                     intra_unsorted: false,
                     restructured: false,
                     index_scanned: false,
-                });
-                return Ok(());
-            }
-            claimed => claimed,
+                }],
+            );
+        }
+        let Some(scan) = scan else {
+            return Ok(());
         };
-        let distrust = self.policy.distrust_metadata;
-        if claimed.is_some() && !self.noted_unclaimed && !distrust {
+        if scan.note && !self.noted_unclaimed {
             self.noted_unclaimed = true;
             // Only `sort` reaches this: `cat --dedupe` refuses an input
             // whose header does not claim sorted.
@@ -358,117 +808,44 @@ impl Walk<'_> {
                  intra-blob order (pass 1 decodes every blob payload)"
             );
         }
-        let located = |e| walker.locate_meta(meta, e);
-        // Tag keys are wanted where a passthrough is reframed: a blob
-        // without indexdata, and under distrust every blob, whose carried
-        // key set is checked against them. Otherwise an indexed blob is
-        // copied whole unless its claim turns out false, which rescans the
-        // buffer below.
-        let scanned = self.scan_payload(walker, meta, claimed.is_none() || distrust);
-        // The compressed bytes are done with; the decoded ones stay until
-        // the reindex below has read them.
-        self.data_buf.release_outlier(self.invocation);
-        let scanned = scanned.map_err(located);
-        let result = scanned
-            .and_then(|scanned| self.record(walker, frame, new_frame, meta, claimed, scanned));
-        crate::blob::release_decode_outlier(&mut self.decompress_buf, self.invocation);
-        result
-    }
-
-    /// Push the frame and entries `scanned` describes, or count the blob
-    /// omitted.
-    fn record<P: Positional>(
-        &mut self,
-        walker: &HeaderWalker<P>,
-        frame: usize,
-        mut new_frame: Frame,
-        meta: &BlobHeaderMeta,
-        claimed: Option<BlobIndex>,
-        scanned: Scanned,
-    ) -> Result<()> {
-        let distrust = self.policy.distrust_metadata;
-        let located = |e| walker.locate_meta(meta, e);
-        match scanned {
-            Scanned::Block {
+        let frame = self.indexed.frames.len();
+        let mut new_frame = Frame {
+            source,
+            file_offset: scan.file_offset,
+            frame_len: scan.frame_len,
+            reindex: None,
+        };
+        match scan.outcome? {
+            Outcome::Block {
                 index,
                 sorted,
-                tagdata,
+                reindex,
             } => {
-                let tags_hold =
-                    !distrust || carried_tags_hold(meta.tagdata.as_deref(), tagdata.as_deref());
-                new_frame.reindex = match claimed {
-                    None => Some(Reindex {
-                        index,
-                        tagdata,
-                        replaces_false_claim: false,
-                    }),
-                    Some(claim) if claim_holds(&claim, &index) && tags_hold => None,
-                    Some(_) if distrust => Some(Reindex {
-                        index,
-                        tagdata,
-                        replaces_false_claim: true,
-                    }),
-                    Some(_) => Some(Reindex {
-                        index,
-                        tagdata: scanned_tagdata(&self.decompress_buf).map_err(located)?,
-                        replaces_false_claim: true,
-                    }),
-                };
-                self.indexed.frames.push(new_frame);
-                self.indexed.entries.push(BlobEntry {
-                    frame,
-                    index,
-                    intra_unsorted: !sorted,
-                    restructured: false,
-                    index_scanned: true,
-                });
-            }
-            Scanned::Kinds(kinds) if kinds.is_empty() => self.indexed.omitted += 1,
-            Scanned::Kinds(kinds) => {
-                self.indexed.frames.push(new_frame);
-                self.indexed
-                    .entries
-                    .extend(kinds.into_iter().map(|index| BlobEntry {
+                new_frame.reindex = reindex;
+                self.push(
+                    new_frame,
+                    [BlobEntry {
                         frame,
                         index,
-                        intra_unsorted: false,
-                        restructured: true,
+                        intra_unsorted: !sorted,
+                        restructured: false,
                         index_scanned: true,
-                    }));
+                    }],
+                );
             }
+            Outcome::Kinds(kinds) if kinds.is_empty() => self.indexed.omitted += 1,
+            Outcome::Kinds(kinds) => self.push(
+                new_frame,
+                kinds.into_iter().map(|index| BlobEntry {
+                    frame,
+                    index,
+                    intra_unsorted: false,
+                    restructured: true,
+                    index_scanned: true,
+                }),
+            ),
         }
         Ok(())
-    }
-
-    /// Pread, decompress and scan one payload's IDs, checking intra-blob
-    /// monotonicity on the way (one compare per element, on a scan that
-    /// visits every ID anyway), and its tag keys when `with_tags`. A block
-    /// no single index describes is decoded for the kinds it holds.
-    fn scan_payload<P: Positional>(
-        &mut self,
-        walker: &HeaderWalker<P>,
-        meta: &BlobHeaderMeta,
-        with_tags: bool,
-    ) -> Result<Scanned> {
-        let data = walker.pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)?;
-        decompress_blob_data_into(data, &mut self.decompress_buf)?;
-        let (index, tags) = if with_tags {
-            try_scan_block_ids_and_tags(&self.decompress_buf)?
-        } else {
-            (try_scan_block_ids_checked(&self.decompress_buf)?, None)
-        };
-        match index {
-            Some((index, sorted)) => Ok(Scanned::Block {
-                index,
-                sorted,
-                tagdata: tags.as_ref().and_then(serialize_tags),
-            }),
-            None => kind_indexes(
-                std::mem::take(&mut self.decompress_buf),
-                &self.host.invocation,
-            )
-            .map(Scanned::Kinds),
-        }
     }
 }
 

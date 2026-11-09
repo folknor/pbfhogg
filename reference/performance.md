@@ -5129,6 +5129,31 @@ passthrough, none overlapping, rewritten or restructured.
   `Reindex` in `src/commands/blob_merge.rs`. Planet `pbf.raw` (50,816
   blobs) was not measured.
 
+### Pass 1 scans on a worker pool (bygg, 2026-11-09, against `252ad27a`)
+
+Pass 1's payload scans (pread, decompress, ID and tag-key scan, the
+reframing decision) moved to an ordered worker pool; the header walk and
+the in-order fold stay on the calling thread, and believed blobs travel
+in batches with no payload read. Same `sort-cold` bench and input as
+above; baseline `--commit 252ad27a` worktree, variant the uncommitted
+working tree (`--force` runs, numbers from the run output and sidecar).
+
+| Arm | Run | SORT_INDEX_BUILD | Pass 2 | Child wall | Peak anon | Output bytes |
+|---|---|---|---|---|---|---|
+| variant | `663943f9` | 14.62 s | 21.68 s | 36.3 s | - | 34,858,236,257 |
+| `252ad27a` | `19a8bdfa` | 164.75 s | 15.10 s | 179.9 s | 949 MB | - |
+| variant | `e3e28886` | 13.56 s | 11.93 s | 25.5 s | 1,073 MB | 34,858,236,257 |
+
+- Index build: 164.7 s to about 14 s (11x); the sort's wall 180 s to
+  26-36 s. Pass 2 is untouched; its spread across the variant cells is
+  page-cache carry-over from pass 1, not code.
+- Peak anon: about +125 MB, the workers' read and decompression scratch.
+- The believed path (indexed europe, `brokkr sort --bench 1`, header-only
+  walk), alternated variant / base / variant / base: SORT_INDEX_BUILD
+  14.0 / 7.0 / 8.6 / 10.3 s (`cc4fd3d7`, `a5dabcf8`, `8d2bb173`,
+  `c5fd3184`). The signs disagree across the pairs, so no cost is shown;
+  that walk is I/O bound and swings with cache state in both arms.
+
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
 The pipelined writer admits each item against a delivery window

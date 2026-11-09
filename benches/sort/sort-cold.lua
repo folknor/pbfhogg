@@ -5,8 +5,7 @@
 -- an unindexed input (`pbf.raw`) at all; this bench can, with `--force yes`.
 --
 -- An unindexed input sends every blob through pass 1's payload scan (pread,
--- decompress, ID and tag-key scan, one blob at a time on the calling
--- thread), so pass 1 is judged by its SORT_INDEX_BUILD span
+-- decompress, ID and tag-key scan, on pass 1's worker pool), so pass 1 is judged by its SORT_INDEX_BUILD span
 -- (`brokkr sidecar UUID --durations`) and peak anon (`--stat anon`). Take one
 -- iteration per invocation and alternate the commits under comparison:
 --

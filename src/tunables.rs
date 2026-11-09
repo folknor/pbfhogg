@@ -888,6 +888,15 @@ pub(crate) const DIFF_UNIT_WINDOW_SLACK: usize = 2;
 /// while the fold waits on the head. Not measured.
 pub(crate) const FRAME_POOL_WINDOW_SLACK: usize = 2;
 
+/// Believed blobs (indexed, under a sorted claim, read from their headers
+/// alone) that `sort` / `cat --dedupe` pass 1 carries in one pool task ahead
+/// of the next scanned blob. Batching keeps a wholly believed walk from
+/// paying one pool round trip per blob; the cap keeps the walk streaming
+/// into the fold (each held entry is a header-sized record). Pass 1 issues
+/// at most `workers + FRAME_POOL_WINDOW_SLACK` tasks ahead of its fold, as
+/// the frame pool does. Not measured.
+pub(crate) const PASS1_BELIEVED_BATCH: usize = 4096;
+
 /// Record buffers `digest` keeps for reuse once its ordered consumer has
 /// hashed them; beyond it a returned buffer is freed. A buffer is taken by
 /// an admitted decode task and returned before that task's permit is

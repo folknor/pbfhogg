@@ -863,8 +863,11 @@ fn deliver<T, C: OrderedConsumer<T>>(
         // never passes the buffer's `next_seq`.
         reorder.push(task, result);
         while let Some(result) = reorder.pop_ready() {
+            // A failure reached in order is the run's (ADR-0019): returned
+            // before the checkpoint, which only guards a success.
+            let result = result?;
             cancel.check()?;
-            consumer.consume(consumed, result?)?;
+            consumer.consume(consumed, result)?;
             consumed += 1;
             consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
             gate.advance(consumed);
@@ -1308,6 +1311,13 @@ where
             loop {
                 cancel.check()?;
                 let msg = recv_counted(rx, metrics);
+                // A task's failure, once the consumer has reached it in
+                // order, is the run's failure: it is returned without a
+                // cancellation check that could mask it (ADR-0019). Every
+                // other message is checked first.
+                if let Ok(StreamMsg::End(Err(e))) = msg {
+                    return Err(e);
+                }
                 cancel.check()?;
                 match msg {
                     Ok(StreamMsg::Item(item)) => consumer.item(task, item)?,
@@ -1343,10 +1353,16 @@ where
                 }
             }
         }
-        cancel.check()?;
+        // Every earlier task is consumed, so a source failure is now the
+        // run's failure and no cancellation check masks it (ADR-0019). Until
+        // here it was speculative, and an earlier checkpoint may still have
+        // answered `Cancelled`.
         match state {
             Issue::Failed(e) => Err(e),
-            Issue::Open | Issue::Done => Ok(()),
+            Issue::Open | Issue::Done => {
+                cancel.check()?;
+                Ok(())
+            }
         }
     })
 }

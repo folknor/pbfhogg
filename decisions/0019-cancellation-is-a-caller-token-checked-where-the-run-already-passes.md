@@ -47,7 +47,11 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   (unordered shard, bucket and accumulate pools). The first error recorded
   wins and is recorded before peers are woken, so a run that failed and was
   then cancelled reports the failure, and one that was cancelled reports
-  `Cancelled`, not a disconnected channel.
+  `Cancelled`, not a disconnected channel. In an ordered pool a failure is
+  recorded when the consumer reaches it in task order, since an earlier task
+  may still fail: from then on no checkpoint masks it, while a failure a
+  worker or the source produced ahead of the consumer is still speculative
+  and may lose to `Cancelled` at an earlier task's checkpoint.
 - **Outputs are bound to their invocation explicitly, before work.** An
   output is constructed unbound (it can be built before a run's per-call
   token exists) and `Output::bind(self, &Invocation)` (likewise `OutputDir`

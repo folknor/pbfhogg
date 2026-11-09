@@ -1,8 +1,8 @@
 -- sort-cold: `sort` of a dataset's file into scratch, the input evicted from
 -- the page cache as the timed block starts. Registered in
--- brokkr.d/benches.toml. The typed `brokkr sort` cannot forward sort's own
--- `--force` (brokkr's `--force` means a dirty tree), so it cannot run sort on
--- an unindexed input (`pbf.raw`) at all; this bench can, with `--force yes`.
+-- brokkr.d/benches.toml. Use `--force yes` for an unindexed input
+-- (`pbf.raw`), equivalent to typed `brokkr sort --force-sort`.
+-- sort-pbf covers the typed workload without cache preparation.
 --
 -- An unindexed input sends every blob through pass 1's payload scan (pread,
 -- decompress, ID and tag-key scan, on pass 1's worker pool), so pass 1 is judged by its SORT_INDEX_BUILD span

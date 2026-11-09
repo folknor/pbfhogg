@@ -7,8 +7,9 @@
 --
 -- The self-merge puts every blob in a two-blob overlap run: it exercises
 -- pass 1's walk and the overlap sweep, never passthrough or the coalesced
--- copy_file_range (dedupe-pair reaches those). Take one iteration per invocation (later iterations of a
--- cold invocation start warm) and alternate the commits under comparison:
+-- copy_file_range (dedupe-pair reaches those). Cache state is reset and checked
+-- every iteration. Take one iteration per invocation and alternate the
+-- commits under comparison:
 --
 --   brokkr bench --iterations 1 --commit REF dedupe-self --dataset japan --cache cold
 --

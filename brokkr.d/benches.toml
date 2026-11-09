@@ -350,6 +350,28 @@ params.dataset = { from = "datasets", default = "denmark", help = "the dataset" 
 params.variant = { from = "datasets.{dataset}.pbf", default = "raw", help = "the PBF variant sorted" }
 params.force = { choices = ["yes", "no"], default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }
 
+[bench.sort-pbf]
+script_file = "../benches/sort/sort-pbf.lua"
+description = "Sort a dataset or snapshot with optional unindexed input, compression and output I/O modes"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed sort: snapshots, force-sort, compression, direct I/O, io_uring and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.force-sort = { choices = ["yes", "no"], default = "no", help = "yes: pass sort's --force for input without indexdata" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
+
 # -- tags-filter
 
 [bench.tag-select]

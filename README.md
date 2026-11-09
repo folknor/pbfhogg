@@ -34,48 +34,49 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 Every command listed below runs on the full planet on normal hardware, within 28 GB of RAM. Measured on bygg: AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, one NVMe SSD for input, output and scratch. Input: the 2026-02-23 indexed planet PBF (87 GB, 11.6B elements). Each row is one stored brokkr cell; the commit is on the row.
 
-<!-- Rows marked "pending" await a fresh bygg cell; the cell list and the
-reasons are in .plans/readme-refresh.md. -->
-
 | Command | Wall | Peak anon RSS | Commit |
 |---------|------|---------------|--------|
-| `add-locations-to-ways --index-type external` | pending | pending | pending |
-| `apply-changes` (OSC-only daily diff, `zstd:1`) | pending | pending | pending |
-| `apply-changes --locations-on-ways` (daily diff, base keeps untagged nodes) ¹ | pending | pending | pending |
-| `build-geocode-index` | pending | pending | pending |
-| `cat` (indexdata generation) | pending | pending | pending |
-| `cat --clean version` | pending | pending | pending |
-| `cat --dedupe` (the planet merged with itself) | pending | pending | pending |
-| `cat --type way` (raw passthrough) | pending | pending | pending |
-| `check --ids` (streaming, default) | pending | pending | pending |
-| `check --ids --full` | pending | pending | pending |
-| `check --refs` | pending | pending | pending |
-| `diff -j 16` (two independent 47-day-apart planets, text) | pending | pending | pending |
-| `diff --format osc -j 16` (two independent 47-day-apart planets) | pending | pending | pending |
-| `extract --complete` (Europe bbox) | pending | pending | pending |
-| `extract --simple` (Europe bbox) | pending | pending | pending |
-| `extract --smart` (Europe bbox) | pending | pending | pending |
-| `getid` | pending | pending | pending |
-| `getid --invert` | pending | pending | pending |
-| `getparents` | pending | pending | pending |
-| `inspect` | pending | pending | pending |
-| `inspect --extended` | pending | pending | pending |
-| `inspect --nodes` | pending | pending | pending |
-| `inspect tags` (key counts, as `osmium tags-count`) | pending | pending | pending |
-| `merge-changes` (1-OSC daily) | pending | pending | pending |
-| `merge-changes` (7-OSC, ~1 week of dailies) | pending | pending | pending |
-| `multi-extract --simple -c` (5 regions, Europe bbox) | pending | pending | pending |
-| `multi-extract --smart -c` (5 regions, Europe bbox) | pending | pending | pending |
-| `renumber` | pending | pending | pending |
-| `sort` (already-sorted input) | pending | pending | pending |
-| `tags-filter` (default two-pass, `w/highway=primary`) | pending | pending | pending |
-| `tags-filter -i w/highway=primary` (invert-match) | pending | pending | pending |
-| `tags-filter -R highway=primary` | pending | pending | pending |
-| `time-filter` (snapshot, cutoff 2024-01-01) | pending | pending | pending |
+| `add-locations-to-ways --index-type external` ² | 294 s | 11.1 GiB | `53360af4` |
+| `apply-changes` (OSC-only daily diff, `zstd:1`) | 97.9 s | 1.79 GiB | `53360af4` |
+| `apply-changes --locations-on-ways` (daily diff, base keeps untagged nodes) ¹ | 256 s | 2.77 GiB | `53360af4` |
+| `build-geocode-index` | 176 s | 13.0 GiB | `53360af4` |
+| `cat` (indexdata generation) | 42.4 s | 72 MiB | `53360af4` |
+| `cat --clean version` | 140 s | 823 MiB | `53360af4` |
+| `cat --dedupe` (the planet merged with itself) | 206 s | 945 MiB | `53360af4` |
+| `cat --type way` (raw passthrough) | 31.8 s | 10 MiB | `53360af4` |
+| `check --ids` (streaming, default) | 17.3 s | 432 MiB | `53360af4` |
+| `check --ids --full` | 17.2 s | 451 MiB | `53360af4` |
+| `check --refs` | 19.8 s | 2.06 GiB | `53360af4` |
+| `diff -j 16` (two independent 47-day-apart planets, text) | 139 s | 1.20 GiB | `53360af4` |
+| `diff --format osc -j 16` (two independent 47-day-apart planets) | 151 s | 1.17 GiB | `53360af4` |
+| `extract --complete` (Europe bbox) | 115 s | 2.62 GiB | `53360af4` |
+| `extract --simple` (Europe bbox) | 108 s | 2.49 GiB | `53360af4` |
+| `extract --smart` (Europe bbox) | 128 s | 2.74 GiB | `53360af4` |
+| `getid` ³ | 0.10 s | not sampled | `53360af4` |
+| `getid --invert` | 61.8 s | 43 MiB | `53360af4` |
+| `getparents` | 16.4 s | 298 MiB | `53360af4` |
+| `inspect` (cold header walk) | 6.6 s | not sampled | `53360af4` |
+| `inspect --extended` | 27.8 s | 314 MiB | `53360af4` |
+| `inspect --nodes` | 18.7 s | 303 MiB | `53360af4` |
+| `inspect tags` (key counts, as `osmium tags-count`) | 24.3 s | 472 MiB | `53360af4` |
+| `merge-changes` (1-OSC daily) | 2.3 s | 21 MiB | `53360af4` |
+| `merge-changes` (7-OSC, ~1 week of dailies) | 3.5 s | 141 MiB | `53360af4` |
+| `multi-extract --simple -c` (5 regions, Europe bbox) | 119 s | 3.77 GiB | `53360af4` |
+| `multi-extract --smart -c` (5 regions, Europe bbox) | 432 s | 3.05 GiB | `53360af4` |
+| `renumber` | 135 s | 3.09 GiB | `53360af4` |
+| `sort` (already-sorted input) | 52.8 s | 9 MiB | `53360af4` |
+| `tags-filter` (default two-pass, `w/highway=primary`) | 56.1 s | 2.23 GiB | `53360af4` |
+| `tags-filter -i w/highway=primary` (invert-match) | 298 s | 6.76 GiB | `53360af4` |
+| `tags-filter -R highway=primary` | 34.4 s | 404 MiB | `53360af4` |
+| `time-filter` (snapshot, cutoff 2024-01-01) | 120 s | 688 MiB | `53360af4` |
 
 ¹ On a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs; on a base without its untagged nodes most of the diff's way references go unresolved and the command refuses. See [reference/performance.md](reference/performance.md).
 
-`add-locations-to-ways` defaults to `--index-type sparse`, whose coordinate store at planet scale is larger than the page cache of a 28 GB host; the row above is `--index-type external`, the mode for planet on such a host.
+² Median of two cells, each the first after a trim; the cell-to-cell band on identical code is about 280-300 s.
+
+³ Run after `inspect`, so the header walk was already cached; a cold `getid` pays about the `inspect` row's header walk on top. Runs this short are not reliably caught by the memory sampler.
+
+`add-locations-to-ways` defaults to `--index-type auto`, which runs sparse unless the estimated coordinate store exceeds the page-cache budget it can read from the host, and then runs external. At planet scale the sparse store is larger than the page cache of a 28 GB host; the row above is `--index-type external`, the mode auto picks for planet on such a host.
 
 The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (hundreds of GB at planet) and `diff --format osc` (its change XML: compressed, about the output's size, for a `.osc.gz` from indexed inputs; plain and several times larger otherwise). A text `diff` writes none at any `-j`: its output goes out as it is produced.
 
@@ -89,7 +90,7 @@ The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on 
 
 ```toml
 [dependencies]
-pbfhogg = "0.5"
+pbfhogg = "0.6"
 ```
 
 ```rust
@@ -190,52 +191,45 @@ See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentat
 
 ## Performance
 
-Read throughput - 59M elements in Denmark (461 MB), best of 3 (commit `90df51f`):
-
-| Tool | Mode | Time |
-|------|------|------|
-| **pbfhogg** | parallel | **0.31s** |
-| osmpbf 0.3 | parallel | 0.53s |
-| **pbfhogg** | pipelined | **1.3s** |
-| Planetiler 0.10 | parallel | 2.0s |
-| **pbfhogg** | sequential | 2.8s |
-| osmpbf 0.3 | sequential | 5.6s |
-| osmium 1.19 | cat → opl | 5.7s |
+Read-throughput figures against osmpbf, Planetiler and osmium are in the [performance guide](docs/guide/performance.md).
 
 CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed), bygg, both tools starting with their inputs evicted from the page cache, median of three alternating single runs (brokkr script bench `vs-osmium`, run by `scripts/vs-osmium.sh 3`; the full table and method are in the [performance guide](docs/guide/performance.md)):
 
-<!-- pending: one vs-osmium campaign at a commit that carries the
-header-walk prefetch; see .plans/readme-refresh.md. -->
-
 | Command | pbfhogg | osmium | speedup | Commit |
 |---------|---------|--------|---------|--------|
-| cat --type way (raw passthrough) | pending | pending | pending | pending |
-| sort (already sorted, indexdata) | pending | pending | pending | pending |
-| apply-changes (indexdata) | pending | pending | pending | pending |
-| add-locations-to-ways (sparse) | pending | pending | pending | pending |
-| add-locations-to-ways (external) | pending | pending | pending | pending |
-| tags-filter -R w/highway=primary | pending | pending | pending | pending |
-| tags-filter -R amenity=restaurant | pending | pending | pending | pending |
-| inspect tags (every key) | pending | pending | pending | pending |
-| inspect tags --type way | pending | pending | pending | pending |
-| getid (9 elements) | pending | pending | pending | pending |
+| cat --type way (raw passthrough) | 162 ms | 1488 ms | 9.2x | `53360af4` |
+| sort (already sorted, indexdata) | 305 ms | 7681 ms | 25.2x | `53360af4` |
+| apply-changes (indexdata) | 308 ms | 4484 ms | 14.5x | `53360af4` |
+| add-locations-to-ways (sparse) ⁴ | 1401 ms | 7486 ms | 5.3x | `53360af4` |
+| add-locations-to-ways (external) ⁴ | 1938 ms | 7479 ms | 3.9x | `53360af4` |
+| tags-filter -R w/highway=primary | 162 ms | 360 ms | 2.2x | `53360af4` |
+| tags-filter -R amenity=restaurant | 229 ms | 802 ms | 3.5x | `53360af4` |
+| inspect tags (every key) | 208 ms | 1029 ms | 5.0x | `53360af4` |
+| inspect tags --type way | 161 ms | 389 ms | 2.4x | `53360af4` |
+| getid (9 elements) | 119 ms | 619 ms | 5.2x | `53360af4` |
+
+Times are the tool process's own wall, without the bench's cache-eviction preparation. osmium writes with `--fsync`.
+
+⁴ osmium has one add-locations-to-ways mode (run with `--keep-member-nodes`), so both rows time the same osmium command against pbfhogg's two index types.
 
 Library mode - the same work called through the library API from the `pbfhogg-harness` executable, against the CLI running the equivalent command, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified; the CLI arm timed from its command interval, inputs evicted before each arm):
 
-<!-- pending: no `brokkr library --bench` row is stored yet; see
-.plans/readme-refresh.md. -->
+<!-- The planet isolation-cat row is held back: its CLI arm ran well
+behind a typed `brokkr cat` cell at the same commit, and that gap is
+not yet explained. -->
 
 | Scenario | Dataset | Library | CLI | Commit |
 |----------|---------|---------|-----|--------|
-| `isolation-cat` (one `cat` in a fresh process) | Denmark | pending | pending | pending |
-| `isolation-cat` | planet | pending | pending | pending |
-| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | pending | - | pending |
-| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | pending | - | pending |
-| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | pending | - | pending |
+| `isolation-cat` (one `cat` in a fresh process) | Denmark | 262 ms | 222 ms | `53360af4` |
+| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | 154 ms, 140 ms | - | `53360af4` |
+| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | 0.99 ms each | - | `53360af4` |
+| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | 6.96 s, 6.21 s | - | `53360af4` |
+
+`isolation-cat` gives medians of five paired processes; the other rows give each call's best of three. The calls run with the page cache kept and fixed parallelism; the CLI evicts its input and sizes its work by probing the machine.
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
-System: the planet, osmium and library tables on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, NVMe SSD; the read-throughput table on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD. Measured with brokkr.
+System: every table above on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, NVMe SSD. Measured with brokkr.
 
 ## Acknowledgements
 

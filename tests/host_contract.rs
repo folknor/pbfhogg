@@ -1269,13 +1269,26 @@ fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
     assert!(!missing.exists(), "the scratch parent must not be created");
 }
 /// Auto routes a sorted, indexed input on the memory the host supplies:
-/// plenty routes its small store to sparse, none leaves no page-cache
-/// budget and routes external.
+/// plenty routes its small store to sparse; one byte above the sparse run's
+/// fixed 3 GiB anon allowance leaves a one-byte page-cache budget, which the
+/// store exceeds, so it routes external; memory unknown or at the allowance
+/// cannot justify external and keeps sparse without a store estimate.
 #[test]
 fn fixed_memory_routes_auto() {
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
-    for (memory, backend) in [(8 << 30, "sparse"), (0, "external")] {
+    let allowance: u64 = 3 << 30;
+    for (memory, backend, prefix) in [
+        (Some(8 << 30), "sparse", "(store estimate"),
+        (Some(allowance + 1), "external", "(store estimate"),
+        (Some(allowance), "sparse", "(sorted=true, indexed=true;"),
+        (Some(0), "sparse", "(sorted=true, indexed=true;"),
+        (
+            None,
+            "sparse",
+            "(sorted=true, indexed=true; available memory unknown",
+        ),
+    ] {
         let sink = Arc::new(Recording::default());
         let mut host = crate::common::test_host();
         host.diagnostics = pbfhogg::host::Diagnostics::new(
@@ -1283,7 +1296,7 @@ fn fixed_memory_routes_auto() {
         );
         host.resources = Arc::new(pbfhogg::host::Fixed {
             parallelism: std::num::NonZeroUsize::new(4),
-            memory_available: Some(memory),
+            memory_available: memory,
         });
         let opts = pbfhogg::altw::AltwOptions {
             keep_untagged_nodes: true,
@@ -1294,21 +1307,21 @@ fn fixed_memory_routes_auto() {
         };
         pbfhogg::altw::add_locations_to_ways(
             &base,
-            crate::common::out(dir.path().join(format!("auto-{backend}.pbf"))),
+            crate::common::out(dir.path().join(format!("auto-{memory:?}.pbf"))),
             &opts,
             &Default::default(),
             &host,
             crate::common::scratch_in(dir.path()),
         )
         .expect("auto");
-        let prefix = format!("auto-selected index type {backend} (store estimate");
+        let prefix = format!("auto-selected index type {backend} {prefix}");
         assert!(
             sink.0
                 .lock()
                 .expect("sink")
                 .iter()
                 .any(|(key, text)| key == "altw.auto_select" && text.starts_with(&prefix)),
-            "{memory} bytes must route {backend}"
+            "{memory:?} bytes must route {backend}"
         );
     }
 }

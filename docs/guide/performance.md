@@ -2,7 +2,7 @@
 
 ## Read throughput
 
-Count all 59M elements in Denmark extract (461 MB), best of 3 runs, fat LTO (commit `90df51f`):
+Count all 59M elements in Denmark extract (461 MB), best of 3 runs, fat LTO, on plantasjen at commit `90df51f`:
 
 | Tool | Mode | Time | Notes |
 |------|------|------|-------|
@@ -20,7 +20,7 @@ Count all 59M elements in Denmark extract (461 MB), best of 3 runs, fat LTO (com
 
 ## Write throughput
 
-Decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null` (commit `def80d9`):
+Decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null`, on plantasjen at commit `def80d9`:
 
 | Compression | Sync | Pipelined | Notes |
 |-------------|------|-----------|-------|
@@ -32,38 +32,38 @@ With pipelined writes, all compression modes converge to ~6.2s - the decode + wi
 
 ## CLI command benchmarks
 
-Denmark (487 MB indexed file, 59M elements), pbfhogg commit `b355badd`
-against osmium 1.19.1 (libosmium 2.23.1) on bygg, 2026-11-08. Both tools
-read the same indexed file with default options, and each run starts with
-that file (and the change file) dropped from the page cache; osmium drops
-its input as it reads by default, so cold is the state it always runs in.
-Each figure is the median of three single runs, the tools alternating.
-Where defaults differ in what is promised, osmium is given the flag that
-matches pbfhogg: `--fsync` on every command that writes a PBF, and
-`--keep-member-nodes` on add-locations-to-ways. The commands are the
-`vs-osmium` bench, `benches/compare/vs-osmium.lua`. The inspect,
-inspect tags --type way and getid rows were re-measured the same day once
-the blob-header walk began reading ahead on cold files of small blobs.
+Denmark (487 MB indexed file, 59M elements), pbfhogg commit `53360af4`
+against osmium 1.19.1 on bygg, 2026-11-09. Both tools read the same
+indexed file (`pbf.indexed`) with default options, and each run starts
+with that file (and the change file) evicted from the page cache.
+Each figure is the median of three single runs, the tools alternating,
+and is the tool process's own wall, without the bench's cache-eviction
+preparation. Where defaults differ in what is promised, osmium is given
+the flag that matches pbfhogg: `--fsync` on every command that writes a
+PBF, and `--keep-member-nodes` on add-locations-to-ways. osmium has one
+add-locations-to-ways mode, so both add-locations-to-ways rows time the
+same osmium command against pbfhogg's two index types. The commands are
+the `vs-osmium` bench, `benches/compare/vs-osmium.lua`.
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexdata) | **0.22s** | -- | answers from indexdata; no osmium counterpart |
-| sort (already sorted, indexdata) | **1.0s** | 7.5s | **7.5x** |
-| apply-changes (daily diff, indexdata) | **0.77s** | 4.4s | **5.7x** |
-| tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
-| tags-filter -R amenity=restaurant | **0.23s** | 0.82s | **3.6x** |
-| cat --type way (raw passthrough) | **0.17s** | 1.5s | **8.8x** |
-| inspect tags (bare, every key) | **0.77s** | 1.0s | **1.3x** |
-| inspect tags --type way | **0.26s** | 0.39s | **1.5x** |
-| getid (9 elements) | **0.22s** | 0.59s | **2.7x** |
-| add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
-| add-locations-to-ways (external) | **2.5s** | 7.4s | **3.0x** |
+| inspect (indexdata) | **111 ms** | -- | answers from indexdata; no osmium counterpart |
+| sort (already sorted, indexdata) | **305 ms** | 7681 ms | **25.2x** |
+| apply-changes (indexdata) | **308 ms** | 4484 ms | **14.5x** |
+| tags-filter -R w/highway=primary | **162 ms** | 360 ms | **2.2x** |
+| tags-filter -R amenity=restaurant | **229 ms** | 802 ms | **3.5x** |
+| cat --type way (raw passthrough) | **162 ms** | 1488 ms | **9.2x** |
+| inspect tags (bare, every key) | **208 ms** | 1029 ms | **5.0x** |
+| inspect tags --type way | **161 ms** | 389 ms | **2.4x** |
+| getid (9 elements) | **119 ms** | 619 ms | **5.2x** |
+| add-locations-to-ways (sparse) | **1401 ms** | 7486 ms | **5.3x** |
+| add-locations-to-ways (external) | **1938 ms** | 7479 ms | **3.9x** |
 
-The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely. The commands that answer from indexdata (inspect, inspect tags --type way, getid) spend most of their cold time walking the blob headers. Each header's position comes from the one before it, so on a cold cache the walk reads ahead in 1 MiB windows on files of small blobs like this one, rather than paying one device latency per blob; a walk whose headers are already cached reads them alone (bare inspect takes 5 ms with the file cached).
+The largest speedups come from blob passthrough (sort, apply-changes, cat --type) where pbfhogg avoids decompressing and re-compressing unmodified blobs entirely. The commands that answer from indexdata (inspect, inspect tags --type way, getid) spend most of their cold time walking the blob headers. Each header's position comes from the one before it, so on a cold cache the walk reads ahead in 1 MiB windows on files of small blobs like this one, rather than paying one device latency per blob; a walk whose headers are already cached reads them alone.
 
 ## Extract benchmarks
 
-Japan (2.4 GB, 344M elements, Tokyo bbox):
+Japan (2.4 GB, 344M elements, Tokyo bbox), on plantasjen; these figures predate the CLI command table above and the commit they were taken at is not recorded here:
 
 | Strategy | pbfhogg | osmium | ratio |
 |----------|---------|--------|-------|
@@ -75,7 +75,7 @@ Simple extract uses a 3-phase barrier pipeline with parallel classification and 
 
 ## Apply-changes at scale
 
-Single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `a6ebbfe`):
+Single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing, on plantasjen at commit `a6ebbfe`:
 
 | Dataset | Config | Time | vs osmium |
 |---------|--------|------|-----------|
@@ -91,7 +91,7 @@ At Japan scale, osmium takes 36.6s for the same operation. pbfhogg passes ~92% o
 
 ## Apply-changes with LocationsOnWays
 
-Denmark (501 MB with LocationsOnWays, daily diff, commit `e7bbfa2`):
+Denmark (501 MB with LocationsOnWays, daily diff), on plantasjen at commit `e7bbfa2`:
 
 | Pipeline | pbfhogg | osmium | speedup |
 |----------|---------|--------|---------|
@@ -120,9 +120,10 @@ Generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent 
 
 ### Choose the right ALTW index type
 
-`sparse` (the default) is fastest while the referenced nodes' working set
-fits the page cache; past that, `external` trades heavy scratch-disk use for
-bounded memory, and `auto` picks between them at run time. When to use each
+`sparse` is fastest while the referenced nodes' working set fits the page
+cache; past that, `external` trades heavy scratch-disk use for bounded
+memory, and `auto`, the default, picks between them at run time (staying on
+sparse where it cannot read the host's memory). When to use each
 is in [Advanced Topics](./advanced.md#add-locations-to-ways-index-types),
 and measured comparisons between the strategies are in
 [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
@@ -147,4 +148,4 @@ With pipelined writes (the production path), compression is dispatched to rayon 
 
 ## System
 
-The CLI command table was measured on bygg: AMD Ryzen 9 9950X3D2 (16c/32t). Every other table was measured on plantasjen: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD (input/output) + HDD (build artifacts), Linux 6.18. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).
+The CLI command table was measured on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), at commit `53360af4`. The read throughput, write throughput, extract, apply-changes at scale and apply-changes with LocationsOnWays tables, and the io_uring figures under Performance tips, were measured on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, at the older commits each table names; they have not been re-measured since. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).

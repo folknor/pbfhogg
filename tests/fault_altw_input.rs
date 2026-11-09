@@ -30,7 +30,7 @@ enum Route {
     /// sparse is front, pass 0, pass 1, the relation scan and the pass 2
     /// walk; external is front, the metadata scan, stage 1 and the relation
     /// scan (concurrently), stage 2 and stage 4. Auto adds the estimate walk
-    /// after the front.
+    /// after the front when it has a page-cache budget to route on.
     Indexed(IndexType),
     /// Forced sparse on an unindexed input: the pass 2 walk is replaced by
     /// the decode-all reader.
@@ -61,7 +61,7 @@ fn write_replacement(path: &Path) {
 }
 
 /// The test host, reporting `memory_available` as given: auto routes
-/// external when the page-cache budget cannot hold the store estimate.
+/// external when a known page-cache budget cannot hold the store estimate.
 fn host(memory_available: Option<u64>) -> pbfhogg::host::Host {
     let mut host = crate::common::test_host();
     host.resources = Arc::new(pbfhogg::host::Fixed {
@@ -252,9 +252,22 @@ fn auto_routed_sparse_reads_only_the_pinned_input() {
     check_route(Route::Indexed(IndexType::Auto), Some(8 << 30), 6, None);
 }
 
-/// No memory budget: auto routes this indexed input external, after its
-/// estimate walk.
+/// One byte above the sparse run's fixed 3 GiB anon allowance leaves a
+/// one-byte page-cache budget: auto routes this indexed input external,
+/// after its estimate walk.
 #[test]
 fn auto_routed_external_reads_only_the_pinned_input() {
-    check_route(Route::Indexed(IndexType::Auto), Some(0), 7, Some(3));
+    check_route(
+        Route::Indexed(IndexType::Auto),
+        Some((3 << 30) + 1),
+        7,
+        Some(3),
+    );
+}
+
+/// Unknown memory: auto keeps sparse and skips the estimate walk, so it
+/// opens the input exactly as many times as explicit sparse.
+#[test]
+fn auto_unknown_memory_skips_the_estimate_walk() {
+    check_route(Route::Indexed(IndexType::Auto), None, 5, None);
 }

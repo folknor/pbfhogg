@@ -2848,6 +2848,30 @@ per worker was tried and refused (next section). Measurement consequence:
 trim before every altw external cell of a matched A/B on this host, not
 only before the suite.
 
+### altw external from `098c89cb` to `53360af4`, matched (bygg, 2026-11-09)
+
+The README campaign's altw external cell (`2bf49e1d`, 301.6 s) came in
+25 s behind the 276.4 s of cell 1 above. Its `sidecar --compare` against
+`6bf4f504` put the gap in the relation scan (11.1 to 21.0 s at half the
+cores) and in stage-4 segments that read several GB more from disk, with
+no host difference annotated: a cache- or drive-state shape, not a code
+one. It had followed a trim, but after two scratch-heavy apply-changes
+cells. Matched check: four `--bench 1` cells, A B B A, `sudo fstrim -av`
+before each, A = `--commit 098c89cb`, B = HEAD.
+
+| Order | Arm | Wall | Peak anon | UUID |
+|---|---|---:|---:|---|
+| 1 | `098c89cb` | 282.6 s | - | `7cb3f140` |
+| 2 | `53360af4` | 292.8 s | 11.1 GiB | `d9bdc5d7` |
+| 3 | `53360af4` | 295.7 s | 11.0 GiB | `72ee9cd9` |
+| 4 | `098c89cb` | 296.5 s | - | `167ee35f` |
+
+B averages 294.3 s against 289.6 s, 1.6 %, and the pairs disagree in sign
+(B +3.6 %, then -0.3 %). Not a regression. The A arm alone spans 282.6 to
+296.5 s on identical code, so the trimmed band at planet is about 280-300
+s; 276.4 s and 301.6 s are its edges. The README row is the B median,
+294 s.
+
 ### Shared per-bucket id shards, refused (bygg, 2026-11-09, against `09c86a56`)
 
 The variant replaced pass A's per-worker x 256 id-shard files with one
@@ -5886,6 +5910,97 @@ consumer thread spends seven times longer in the syscall without the wall
 noticing, so it is still not what binds. Not measured: the other classify
 commands (tags-filter, getid, getparents, extract, altw pass 0) and europe;
 the extract simple neutral reading above predates the fix.
+
+## README campaign (bygg, 2026-11-09, at `53360af4`)
+
+Every README table re-measured at one commit, in one detached run of
+`overnight.sh` (131 cells, 1h20m, no failures): the read-only planet
+block after one trim, the regional check answer runs, then each
+write-heavy planet cell after its own `sudo fstrim -av`, then the
+vs-osmium campaign, then the library scenarios. Planet input
+`planet-20260223-reindexed.osm.pbf`; peaks are `brokkr sidecar --stat
+anon`. All planet cells are `--bench 1` except inspect, getid and the two
+merge-changes rows (`--bench 3`).
+
+Planet cells (wall, peak anon):
+
+| Command | Wall | Peak | UUID |
+|---|---:|---:|---|
+| inspect, iteration 1 of 3 (cold) | 6.62 s | - | `95fe678d` |
+| getid, after inspect (warm headers) | 0.10 s | - | `19b48473` |
+| check --refs | 19.8 s | 2.06 GiB | `e744c657` |
+| check --ids | 17.3 s | 432 MiB | `0081b181` |
+| check --ids --full | 17.2 s | 451 MiB | `5dd906c2` |
+| inspect --extended | 27.8 s | 314 MiB | `d5d23b24` |
+| inspect --nodes | 18.7 s | 303 MiB | `136cca9b` |
+| inspect tags | 24.3 s | 472 MiB | `2d636e3a` |
+| getparents | 16.4 s | 298 MiB | `a4478ff5` |
+| getid --invert | 61.8 s | 43 MiB | `4db57439` |
+| merge-changes 4913 | 2.3 s | 21 MiB | `ab508211` |
+| merge-changes 4914..4920 | 3.5 s | 141 MiB | `10de5c6b` |
+| tags-filter -R highway=primary | 34.4 s | 404 MiB | `fcc9c1ee` |
+| tags-filter, two-pass | 56.1 s | 2.23 GiB | `49cf423f` |
+| extract simple | 108.1 s | 2.49 GiB | `a1a00fed` |
+| extract complete | 115.3 s | 2.62 GiB | `e95f5c10` |
+| extract smart | 127.9 s | 2.74 GiB | `cb72eaa0` |
+| multi-extract simple | 118.5 s | 3.77 GiB | `3b04a4c7` |
+| multi-extract smart | 431.9 s | 3.05 GiB | `1e45ddf7` |
+| build-geocode-index | 176.5 s | 13.0 GiB | `c5960c1d` |
+| diff-snapshots text, base vs `20260411` | 139.3 s | 1.20 GiB | `12a929fe` |
+| diff-snapshots osc | 151.2 s | 1.17 GiB | `4bba79ab` |
+| cat | 42.4 s | 72 MiB | `be808f35` |
+| cat --type way | 31.8 s | 10 MiB | `0f29e808` |
+| sort | 52.8 s | 9 MiB | `07c95720` |
+| cat --clean | 140.1 s | 823 MiB | `013a844c` |
+| time-filter | 120.4 s | 688 MiB | `78629c21` |
+| renumber | 134.6 s | 3.09 GiB | `1101563c` |
+| tags-filter -i | 297.7 s | 6.76 GiB | `185cdb38` |
+| cat --dedupe | 205.6 s | 945 MiB | `37a17bb3` |
+| apply-changes zstd:1 | 97.9 s | 1.79 GiB | `3608960f` |
+| apply-changes -l, keep-untagged base | 255.8 s | 2.77 GiB | `e0fc0c25` |
+| altw external | 301.6 s | 10.9 GiB | `2bf49e1d` |
+
+The altw external row was re-checked in a matched A/B (Add-locations-to-ways
+above); the README carries that check's 294 s. Multi-extract smart against
+its last stored cell (`d4d8d0dc`, `627883d7`, 484.9 s, about 7 GB): 11 %
+faster at under half the peak. The diff-snapshots cells exit 1 (the
+planets differ), as they should.
+
+vs-osmium, denmark `pbf.indexed`, `scripts/vs-osmium.sh 3` (three
+alternating single-iteration pairs per row, inputs evicted and
+fincore-checked). Since brokkr#134 the iteration wall includes the
+eviction preparation, up to about 30 ms; the figures here are each tool
+process's child wall, median of three:
+
+| Row | pbfhogg | osmium | Ratio |
+|---|---:|---:|---:|
+| sort | 305 ms | 7681 ms | 25.2x |
+| apply-changes | 308 ms | 4484 ms | 14.5x |
+| cat --type way | 162 ms | 1488 ms | 9.2x |
+| altw sparse | 1401 ms | 7486 ms | 5.3x |
+| getid | 119 ms | 619 ms | 5.2x |
+| inspect tags | 208 ms | 1029 ms | 5.0x |
+| altw external | 1938 ms | 7479 ms | 3.9x |
+| tags-filter -R amenity=restaurant | 229 ms | 802 ms | 3.5x |
+| inspect tags --type way | 161 ms | 389 ms | 2.4x |
+| tags-filter -R w/highway=primary | 162 ms | 360 ms | 2.2x |
+| inspect | 111 ms | none | - |
+
+Against the `b355badd` campaign above, the rows that pay a cold header
+walk moved most: inspect 638 to 111 ms, getid 645 to 119 ms (osmium was
+1.1x ahead, now 5.2x behind), inspect tags --type way 689 to 161 ms
+(osmium was 1.8x ahead). sort 1.0 s to 305 ms and apply-changes 774 to
+308 ms also moved; neither row was re-attributed here. The osmium column
+is flat. Both altw rows time one osmium command, osmium having one mode.
+
+Library, `brokkr library`: isolation-cat denmark `--bench 5` (`f819d165`)
+library median 262 ms, CLI median 222 ms, CLI/library 0.86; repeat-cat
+(`2a4070ac`) 154 and 140 ms; concurrent-cat (`d1548769`) 0.99 ms each;
+fixed-resources-executor (`71eed863`) 6.96 and 6.21 s; `--all --dataset
+denmark` passed. isolation-cat planet `--bench 3` (`d73fbee8`): library
+43.1, 55.4, 54.4 s, CLI 55.9, 61.3, 69.5 s, ratio 1.28. Not published:
+the CLI arm's best is 13 s behind the typed `cat` cell above on the same
+file and commit, and that gap is unexplained.
 
 ## Changes with no cell of their own (2026-10-24 to 2026-10-30)
 

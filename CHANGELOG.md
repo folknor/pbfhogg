@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-09
 
 This release makes pbfhogg safe to embed as a library and strict about its
 input. Commands refuse files they would otherwise answer wrongly about,
@@ -11,627 +11,347 @@ state.
 
 **CLI**
 
-- Existing outputs are refused unless `--overwrite` (`-O`) is given, and a
+- Existing outputs are refused unless `--overwrite` (`-O`) is given; a
   symlink, directory or special file is never accepted as an output.
-- Exit codes are `0` success, `1` a negative answer (`diff` found
-  differences, `check` found violations), `2` failure, `3` `--direct-io` or
-  `--io-uring` unavailable on this host, `64` usage error, and `130` / `143`
-  after SIGINT / SIGTERM; see "Exit codes" in `docs/cli/commands.md`.
-- `check` (bare, `--ids`, `--refs`, `--locations`) on a partially indexed
-  file now stops that check and exits `1` instead of refusing with exit `2`;
-  the other selected checks still run and print, so `check --ids --index`
-  and `check --refs --index` no longer lose the index report. The stopped
-  check's JSON section carries `partially_indexed` (`blob`, `offset`), and
-  a `Note:` names `pbfhogg cat` as the repair.
-- Every short flag has one meaning across all subcommands; the shorts that
-  meant something else on one command are long-only there, and the old letter
-  is refused with the long name.
-- `getid --verbose-ids` is now `-v, --verbose`.
-- A flag the rest of the command line makes ineffective is refused as a usage
-  error instead of being warned about or ignored.
-- `--type` takes one comma-list grammar on every command and refuses an
-  unknown element type.
-- OSC outputs are framed by their name: `.osc` is plain XML, `.osc.gz` is
-  gzip, and any other name is refused.
-- Input that used to be read partly or silently misread is refused: malformed
-  elements and dense arrays, a `Blob` with two payload fields or a wrong
-  `raw_size`, zero-length frames, truncated or malformed OSC. That includes
-  a relation member's `role` whose text cannot be read, which `apply-changes`
-  used to write as an empty role; an absent `role` is still an empty role.
-- OSC input must follow the change-file element hierarchy (`<osmChange>`
-  root, sections holding objects, objects holding `tag` / `nd` / `member` /
-  `bbox`); a misplaced element, such as an object nested in another, a
-  section inside a section, or an unknown element inside an object, is
-  refused instead of silently misreading the change. See the OSC section of
-  `CORRECTNESS.md`.
-- The `tag` / `nd` / `member` children of an object in `<delete>` are
-  checked by the same rules as live ones in every OSC command, so a
-  malformed one is refused by `apply-changes`, `merge-changes` and
-  `tags-filter` alike (only `merge-changes` refused all of them before).
-  They are still dropped: no command keeps or writes them.
-- An OSMHeader blob anywhere but first is an error in every command and
-  reader.
-- Every command except `cat` refuses a partially indexed input; `cat` (and the
-  new `cat --reindex`) is the repair.
-- `inspect tags` asks for indexdata only when it would skip blobs on it:
-  with `--type`, or with expressions that together leave some element type
-  out (`w/highway`). Any other run, including a plain `inspect tags`, reads
-  an unindexed input as it is instead of refusing it, and refuses `--force`
-  as ineffective (exit `64`). `tags-filter -R` does the same when its
-  expressions name every element type (`highway`): it no longer refuses
-  unindexed input there, and refuses `--force`. A script passing `--force`
-  to such a command line drops it.
-- `add-locations-to-ways` and `apply-changes --locations-on-ways` fail on a
-  way node reference they cannot resolve instead of writing `(0, 0)`;
+- Exit codes: `0` success, `1` negative answer (`diff` found differences,
+  `check` found violations), `2` failure, `3` `--direct-io` or `--io-uring`
+  unavailable, `64` usage error, `130` / `143` after SIGINT / SIGTERM. See
+  "Exit codes" in `docs/cli/commands.md`.
+- Every command except `cat` refuses a partially indexed input; `cat` (and
+  the new `cat --reindex`) is the repair. `check` instead stops the affected
+  check with exit `1` (JSON `partially_indexed`) and still runs the others.
+- Every short flag has one meaning across subcommands; letters that meant
+  something else on one command are long-only there. `getid --verbose-ids`
+  is now `-v, --verbose`.
+- A flag the rest of the command line makes ineffective is a usage error
+  (exit `64`) instead of a warning or ignored. This includes `--force` where
+  no indexdata is needed, `check --direct-io` under `--refs` / `--locations`,
+  and `--max-errors` under `check --refs` without `--show-ids`.
+- `--type` takes one comma-list grammar everywhere and refuses an unknown
+  element type.
+- OSC outputs are framed by name: `.osc` is plain XML, `.osc.gz` gzip, any
+  other name is refused.
+- Input that used to be read partly or silently misread is refused:
+  malformed elements and dense arrays, a `Blob` with two payloads or a wrong
+  `raw_size`, zero-length frames, truncated or malformed OSC (including an
+  unreadable member `role`, elements outside the change-file hierarchy, and
+  malformed children of `<delete>` objects in every OSC command), and an
+  OSMHeader blob anywhere but first.
+- `inspect tags` needs indexdata only with `--type` or with expressions that
+  leave an element type out; `tags-filter -R` no longer needs it when its
+  expressions cover every element type.
+- `add-locations-to-ways` and `apply-changes --locations-on-ways` fail on an
+  unresolvable way node instead of writing `(0, 0)`;
   `--ignore-missing-nodes` restores the old behaviour.
-- `apply-changes` and `merge-changes --simplify` refuse a change whose
-  version is lower than one already seen for the object;
+- `apply-changes` and `merge-changes --simplify` refuse a version regression;
   `--allow-version-regression` opts out.
 - `tags-filter` and `inspect tags` expressions follow osmium's matcher (`*`
-  as prefix or substring match and comma alternatives on either half,
-  whitespace trimmed), which changes what some existing expressions select.
-- `inspect tags` counts what `osmium tags-count` counts. With no expression,
-  or for an expression without `=` (`highway`), it counts keys: one row per
-  key, two fields (`120`, TAB, `"highway"`), its occurrences whatever their
-  values. An expression with `=` (`highway=*`, `highway=primary`) counts
-  key=value pairs in three-field rows as before, and a tag matched both ways
-  counts in both rows. A plain `inspect tags` used to list every pair and
-  `inspect tags highway` every `highway` value: pass `'*=*'` and
-  `'highway=*'` for those. A bare planet run takes 30 s and 0.4 GB peak
-  memory on bygg.
-- `time-filter` refuses input whose elements carry no timestamps.
+  prefix or substring match, comma alternatives, whitespace trimmed), which
+  changes what some expressions select.
+- `inspect tags` counts as `osmium tags-count`: with no expression or a
+  key-only one (`highway`) it prints key rows of two fields; `=` expressions
+  count pairs as before. For the old output pass `'*=*'` or `'highway=*'`.
+- `time-filter` refuses input without timestamps.
 - `check --refs --show-ids` lists at most `--max-errors` missing references
-  (default `100`, `0` for no limit), where it listed every one; the count
-  stays exact. An explicit `--max-errors` under `--refs` alone without
-  `--show-ids`, where it caps nothing, is refused (exit `64`) instead of
-  accepted unused.
-- `check` refuses `--direct-io` (exit `64`) under `--refs`, `--locations`
-  or the two together, whose checks read buffered; under `--refs` the flag
-  used to be accepted and silently ignored. Any selection with the ID or
-  index check, the default pair included, still takes it.
-- `degrade --block-cap`, a hidden test flag, is now the documented
-  `--elements-per-blob`, the name `repack` gives the same per-blob element
-  cap. `--block-cap` is no longer accepted, and `--elements-per-blob` is
-  refused (exit `64`) without a flag that re-encodes the data
-  (`--strip-locations`, `--unsort`, `--unsort-intra`, `--drop-ids`).
-- `extract` (complete-ways and `--smart`, single region or `--config`)
-  also writes every relation that has an included relation as a member,
-  recursively, as osmium extract's `complete_ways` and `smart` do: a route
-  inside the box now brings its route master and superroute. A relation
-  included that way adds nothing else, and smart does not complete it.
-  `--simple` is unchanged. On a European box of the planet that adds
-  78 408 relations. On a bbox, complete-ways now writes exactly osmium's
-  element set, and smart exactly that of `osmium extract -s smart -S
-  types=multipolygon,boundary`; `--simple` differs from osmium by counting
-  any member, not only the first.
-- A bbox edge in `extract` and `export --bbox` is the decimal it is typed
-  as, rounded half away from zero to a decimicrodegree, and inclusive, as
-  in osmium: a node exactly on `-b 12.4,...` is inside. Each edge used to
-  be widened outward to the next decimicrodegree, which could include
-  nodes just outside the box. `--config` edges are read from their own
-  number text the same way, so `-b` and `--config` agree. `--set-bounds`
-  writes that quantized envelope.
-- `extract --smart` decides whether to complete a relation from its first
-  `type` tag, as osmium does, not from any `type` tag.
-- `extract` with a polygon (`-p` or a `--config` `polygon` or
-  `polygon_file`) decides membership by osmium's integer rule: a node on a
-  vertex is inside and a node on an edge is decided as osmium decides it,
-  where the floating-point test used to drop about half of the nodes on the
-  boundary. A boundary exported from OSM has every vertex on a node, so this
-  is visible on ordinary input: on four Danish municipality boundaries
-  pbfhogg used to miss 413 to 4617 boundary nodes and up to 100 ways each,
-  and now writes osmium's element set exactly (complete-ways and smart; simple
-  differs only by its documented relation rule). The rings of one
-  MultiPolygon share one parity, so overlapping members cancel as in osmium
-  (except in a geometry crossing the antimeridian, whose members are
-  unioned); separate FeatureCollection features are unioned. A polygon
-  crossing the antimeridian whose ring circles a pole or spans 360 degrees
-  is refused. Polygon extracts are also faster: a 9694-vertex boundary on
-  Denmark takes 0.35 s on bygg.
-- A relative `"directory"` in an `extract --config` file resolves against the
-  config file's directory.
-- `diff --format osc` exits `1` when the inputs differ.
-- `diff -v` detail lines are positioned edit scripts, with keys, values and
-  roles quoted and escaped.
-- `inspect` text output quotes and escapes text taken from the file, and
-  `inspect --json` is `schema_version` 2 (`ordering.sequence` is replaced by
-  a bounded `segments_head`).
-- `apply-changes` no longer copies the base's replication timestamp and
-  sequence number, and `renumber` writes no replication state.
-- The writing program is now `pbfhogg/<version>`.
+  (default `100`, `0` for no limit); the count stays exact.
+- `degrade --block-cap` is now `--elements-per-blob`, accepted only with a
+  flag that re-encodes.
+- `extract` complete-ways and `--smart` also write every relation that has
+  an included relation as a member, recursively, as osmium does (a route
+  brings its route master). On a bbox they now match osmium's element set
+  exactly; `--smart` decides on a relation's first `type` tag.
+- `extract` and `export --bbox` edges are inclusive and rounded half away
+  from zero to a decimicrodegree, as in osmium, instead of widened outward;
+  `--config` edges agree with `-b`.
+- `extract` polygons use osmium's integer membership rule; the old test
+  dropped about half the boundary nodes, and on OSM boundaries the output
+  now matches osmium. A polygon crossing the antimeridian that circles a
+  pole or spans 360 degrees is refused.
+- A relative `"directory"` in `extract --config` resolves against the config
+  file's directory.
+- `diff --format osc` exits `1` when the inputs differ; `diff -v` prints
+  positioned edit scripts with quoted, escaped keys, values and roles.
+- `inspect` text output quotes and escapes file text; `inspect --json` is
+  `schema_version` 2 (`ordering.sequence` replaced by `segments_head`).
+- `apply-changes` no longer copies the base's replication state, and
+  `renumber` writes none.
+- The writing program is `pbfhogg/<version>`.
 - `renumber` moves orphan references to `start + count + old_id` instead of
   keeping an old ID that may name another element.
 - `removeid` and `sort` summaries count only the elements they decoded.
 - `cat --clean` writes elements in input order and no longer needs indexdata.
-- `build-geocode-index` writes index format version 5 (rebuild existing
-  indexes), splits `--force` into `--overwrite` and `--allow-unindexed`, and
-  caps `--admin-level` at 10 and `--street-level` / `--coarse-level` at 19.
-  `--search-radius` and `--coarse-search-radius` are capped at a fixed
-  number of cell widths at their own level (see Fixed), and an index whose
-  header exceeds that no longer opens.
-- Indexdata is written as format v3; earlier pbfhogg releases read such files
-  as unindexed.
+- `build-geocode-index` writes index format 5 (rebuild existing indexes),
+  splits `--force` into `--overwrite` and `--allow-unindexed`, caps
+  `--admin-level` at 10, `--street-level` / `--coarse-level` at 19 and the
+  search radii at a fixed number of cell widths; an index exceeding that no
+  longer opens.
+- Indexdata is format v3; earlier releases read such files as unindexed.
+- `add-locations-to-ways` now defaults to `--index-type auto` (library:
+  `IndexType::default()` is `Auto`). Auto picks external only for sorted,
+  indexed input whose estimated node store exceeds 80 % of the available
+  page-cache budget, and otherwise runs sparse, the previous default. When
+  available memory cannot be determined (every non-Linux host, containers
+  without a visible cgroup v2 mount) or is below the sparse run's fixed
+  3 GiB headroom, auto now keeps sparse and skips its estimate, instead of
+  choosing external, so a small file no longer picks up external's
+  scratch-disk demand. Every default run prints an `auto-selected index
+  type` note. Pass `--index-type sparse` for the previous behaviour.
 
 **Library**
 
-- The minimum supported Rust version is 1.99 (library and CLI), up from
-  1.96.
-- Commands take an explicit `&Host` (process actions, resources, diagnostics,
-  page-cache policy, executor, invocation); the library never mutates process
-  state, reads the environment or writes to stderr (ADR-0016).
-- Command outputs are an `Output`, `OutputDir` or `OutputSet`, bound to an
-  invocation, staged, synced and published only on success.
-- `BoxResult` is gone: every fallible function returns `pbfhogg::Result`,
-  with errors classified by `ErrorKind`, located by file, blob and byte
-  offset, and rendered whole by `Error::report`.
-- Write entry points take `WriteOptions` with an `OutputBackend`, and job
-  counts are a `Parallelism`.
+- MSRV is 1.99 (library and CLI), up from 1.96.
+- Commands take an explicit `&Host` (process actions, resources,
+  diagnostics, page-cache policy, executor, invocation); the library never
+  mutates process state, reads the environment or writes to stderr
+  (ADR-0016). It also sets no allocator policy; call
+  `process::cap_malloc_arenas` or `process::set_mmap_threshold` yourself if
+  you want one.
+- Command outputs are an `Output`, `OutputDir` or `OutputSet`, staged and
+  published only on success. Scratch-using commands take a `RunScratch`.
+- `BoxResult` is gone: fallible functions return `pbfhogg::Result`, with
+  `ErrorKind`, file / blob / offset location, and `Error::report`.
+- Write entry points take `WriteOptions` with an `OutputBackend`; job counts
+  are a `Parallelism`. `PbfWriter::to_path*` take an `Executor`,
+  `write_raw_copy` takes an `&InputFile`, `into_inner` returns a `Result`.
 - `pbfhogg::ElementKind` replaces `OscElementKind`, `ElemKindTag`,
   `DefaultType` and `ShowElementType`.
-- Report types write into an `io::Write` instead of printing to stdout.
-- `BlobReader` and `ElementReader` no longer evict the page cache unless asked
-  to (`evict_page_cache(true)`).
-- `PbfWriter::to_path*` take an `Executor`, `write_raw_copy` takes an
-  `&InputFile`, and `into_inner` returns a `Result`.
-- Scratch-using commands take a `RunScratch`; `diff::diff` writes none and
-  takes none.
-- `merge_changes::merge_changes` takes a `MergeMode` in place of
-  `simplify: bool`: `MergeMode::Stream { scratch }`, with an optional
-  `RunScratch` required exactly when `merge_changes::stream_writes_scratch`
-  says so, or `MergeMode::Simplify { allow_version_regression }`, which
-  takes none.
+- Report types write into an `io::Write` instead of stdout.
+- `BlobReader` and `ElementReader` evict the page cache only when asked
+  (`evict_page_cache(true)`).
+- `merge_changes::merge_changes` takes a `MergeMode` (`Stream { scratch }`
+  or `Simplify { allow_version_regression }`) in place of `simplify: bool`.
 - Removed: `IndexedReader`, `IdRanges`, `IdSet::count_below` and
   `count_in_range`, `BlockBuilder::with_element_cap`,
-  `HeaderBuilder::from_header`, `PrimitiveBlock::new`, `inspect::show_element`,
-  `DiffOptions::summary`, `MergeStats::blobs_skip_decompress` and
-  `blobs_scan_only`.
+  `HeaderBuilder::from_header`, `PrimitiveBlock::new`,
+  `inspect::show_element`, `DiffOptions::summary`,
+  `MergeStats::blobs_skip_decompress` and `blobs_scan_only`.
 - Signature changes: element caps are `NonZeroUsize`; `inspect` takes
-  `InspectOptions`, `check_refs` takes `CheckRefsOptions` (whose `show_ids`
-  is an `Option<check::refs::ShowIds { max_errors }>`), and the `check`
-  calls return `CheckOutcome`; `derive_changes` takes `timestamp: Option<u64>`;
-  type filters are a typed `TypeFilter`; `HeaderOverrides` fields are
-  `FieldOverride`; `HeaderBuilder::optional_feature` takes `impl Into<Feature>`.
-- `BlockBuilder` refuses an element it cannot encode correctly (poisoning the
-  builder) instead of panicking or writing it wrong.
-- `extract::Region::Polygon` holds a prepared `extract::Polygon`, built
-  once by `Polygon::new` from geometries of `PolygonRings` (one entry per
-  GeoJSON Polygon or MultiPolygon), which validates the rings as the GeoJSON
-  reader does. The `polygons` and `bbox` fields are gone; `Polygon::bbox`
-  returns the region's integer envelope.
-- `extract::Region::contains` quantizes the point and the edges to
-  decimicrodegrees and compares inclusively, so it agrees with what
-  `extract` selects; a nonfinite point is outside. `extract::parse_bbox`
-  stores each edge at the decimicrodegree its text names.
-- `tags_count::tags_count` refuses unindexed input only where
-  `TagCountOptions::requires_indexdata` says so, and
-  `tags_filter::tags_filter` only where
-  `TagsFilterOptions::requires_indexdata` does; both methods are new.
-- `tags_filter::osc::tags_filter_osc` takes a `Parallelism` after the
-  expressions: `Fixed(n)` runs the filtering on a pool of `n` threads built
-  for the call, `Auto` on `Host::executor`.
-- `tags_count::tags_count` counts keys or pairs as `inspect tags` does,
-  and returns `TagCounts { rows, stats }` instead of the bare rows.
-  `TagCount::value` is an `Option<String>`: `None` for a key row,
-  `Some("")` for a pair with the empty value. `stats` is a `TagCountStats`
-  with `key_rows` and `pair_rows` (the distinct rows of each kind selected,
-  before the count thresholds), `retained_rows` (those the thresholds kept)
-  and `write_summary`.
-- Settings that mean something in one mode only now live inside that
-  mode, so a combination that used to be ignored at run time cannot be
-  written:
-  - `tags_filter::TagsFilterOptions` replaces `omit_referenced`,
-    `remove_tags` and `jobs` with `add_referenced:
-    Option<tags_filter::AddReferenced { remove_tags, parallelism }>`.
-    `None` is the old `omit_referenced: true`; `remove_tags` with
-    `omit_referenced`, which was ignored, can no longer be written.
-  - `getid::GetidOptions` replaces `add_referenced` and `remove_tags` with
-    `add_referenced: Option<getid::AddReferenced { remove_tags }>`;
-    `remove_tags` without `add_referenced`, which was ignored, can no
-    longer be written.
-  - `apply_changes::MergeOptions::locations_on_ways` is an
-    `Option<apply_changes::LocationsOnWays { ignore_missing_nodes }>`
-    instead of a bool; the default is still `None`.
-  - `degrade::degrade` no longer takes a `block_cap`, which the header-only
-    passthrough ignored. `degrade::DegradeFlags` replaces `unsort`,
-    `unsort_intra`, `strip_locations` and `drop_ids` with `reencode:
-    Option<degrade::Reencode { block_cap, unsort, strip_locations, drop_ids }>`,
-    where `unsort` is an `Option<degrade::Unsort>` (`CrossBlob` for the old
-    `unsort`, `IntraBlob` for `unsort_intra`), so the two unsort modes can
-    no longer both be asked for. `Some` selects the decode path, `None` the
-    passthrough. A `Reencode` with none of its transformations set is
-    accepted as a plain re-encode, and `Reencode::default` carries the
-    default block cap.
+  `InspectOptions`, `check_refs` takes `CheckRefsOptions` (`show_ids:
+  Option<ShowIds { max_errors }>`), `check` calls return `CheckOutcome`;
+  `derive_changes` takes `timestamp: Option<u64>`; type filters are a
+  `TypeFilter`; `HeaderOverrides` fields are `FieldOverride`;
+  `HeaderBuilder::optional_feature` takes `impl Into<Feature>`;
+  `tags_filter::osc::tags_filter_osc` takes a `Parallelism`.
+- `BlockBuilder` refuses (and poisons itself on) an element it cannot encode
+  correctly instead of panicking or writing it wrong.
+- `extract::Region::Polygon` holds a prepared `extract::Polygon` built by
+  `Polygon::new` from `PolygonRings`; the `polygons` and `bbox` fields are
+  gone (`Polygon::bbox` replaces the latter). `Region::contains` and
+  `parse_bbox` quantize to decimicrodegrees inclusively, matching `extract`.
+- `tags_count::tags_count` counts keys or pairs as `inspect tags` does and
+  returns `TagCounts { rows, stats }`; `TagCount::value` is an
+  `Option<String>` (`None` for a key row). It and `tags_filter::tags_filter`
+  refuse unindexed input only where the new `requires_indexdata` methods on
+  their options say so.
+- Mode-only settings moved inside their mode, so ignored combinations can no
+  longer be written: `TagsFilterOptions::add_referenced:
+  Option<AddReferenced { remove_tags, parallelism }>` (replaces
+  `omit_referenced`, `remove_tags`, `jobs`), `GetidOptions::add_referenced:
+  Option<AddReferenced { remove_tags }>`,
+  `MergeOptions::locations_on_ways: Option<LocationsOnWays {
+  ignore_missing_nodes }>`, and `DegradeFlags::reencode: Option<Reencode {
+  block_cap, unsort, strip_locations, drop_ids }>` with `unsort` an
+  `Option<Unsort>` (`CrossBlob` / `IntraBlob`); `degrade::degrade` no longer
+  takes a `block_cap`.
 
 ### Added
 
-- `build-geocode-index` indexes addresses tagged `addr:place` (an address
-  belonging to a place rather than a street), and interpolation ways
-  between them, and steps `addr:interpolation` digits `1` to `9`. The
-  library reader's `AddressMatch.street`, `InterpolationMatch.street` and
-  `InterpolationCandidate.street` become `Option<&str>`, beside a new
-  `place` field; an address with an empty `addr:street` and no place is
-  no longer indexed.
+- `build-geocode-index` indexes `addr:place` addresses and interpolation
+  ways between them, and steps `addr:interpolation` digits `1` to `9`. The
+  reader's `street` fields on `AddressMatch`, `InterpolationMatch` and
+  `InterpolationCandidate` become `Option<&str>` beside a new `place`; an
+  address with an empty `addr:street` and no place is no longer indexed.
 - `digest`: an encoding-independent digest of a PBF's header and elements
-  (`xxh128 v2`; `--form content` gives the element-only `v1` digest).
-- `check --index` verifies blob indexdata and tagdata against the blobs, and
-  `check --locations` verifies a LocationsOnWays file's inline coordinates.
-- `cat --reindex` rewrites false indexdata and tagdata losslessly, and its
-  summary counts the blobs whose indexdata and whose tagdata it changed,
-  separately; `sort --distrust-metadata` sorts a file whose sort claim or
-  indexdata is false.
-- `--distrust-metadata` on `tags-filter` and `inspect`.
+  (`xxh128 v2`; `--form content` gives the element-only `v1`).
+- `check --index` verifies blob indexdata and tagdata; `check --locations`
+  verifies a LocationsOnWays file's inline coordinates.
+- `cat --reindex` rewrites false indexdata and tagdata losslessly;
+  `--distrust-metadata` on `sort`, `tags-filter` and `inspect` ignores false
+  sort claims and indexdata.
 - `degrade --corrupt-tagdata`, `--corrupt-indexdata` and
   `--corrupt-indexdata-kind` write well-formed but false hints.
 - A global `-q, --quiet`.
 - `--tmp-dir` on `add-locations-to-ways`, `diff --format osc`,
-  `build-geocode-index` and `merge-changes` (see Changed), and
-  `--staging-dir` on every command that writes an output.
-- Ctrl-C and SIGTERM stop a run cleanly, removing its staging and scratch.
-- Leftovers of runs that never finished are reported (never removed).
+  `build-geocode-index` and `merge-changes`; `--staging-dir` on every command
+  that writes an output.
+- Ctrl-C and SIGTERM stop a run cleanly, removing its staging and scratch;
+  leftovers of unfinished runs are reported (never removed).
 - `getid` and `getparents` accept `node/123`-style IDs.
 - `apply-changes` and `tags-filter --input-kind osc` accept uncompressed
-  `.osc`.
-- `apply-changes -j 1` runs.
-- `tags-filter --input-kind osc` accepts `-j`, which it refused: `-j N`
-  caps the workers filtering the document at `N` threads, and `-j 1` runs
-  one beside the reader thread. The output is the same at any `-j`.
+  `.osc`; `apply-changes -j 1` runs, and `tags-filter --input-kind osc`
+  accepts `-j`.
 - Builds against musl. Contributed by Steffen Trog (#2).
-- Notes when passthrough copies leave `copy_file_range`, when `cat` rebuilds
-  or omits a block, when a run loses parallelism or blob skipping, and when
-  a `--force` run reads input without indexdata (`Note: Input contains
-  blobs without indexdata; proceeding without its optimizations`).
-- Library: cancellation (`Invocation::cancel`) and sealing
-  (`Invocation::seal`); counters and instrumentation per invocation;
-  per-call sidecar streams (`MarkerFifo::call`); a reserving descriptor
-  provider for concurrent calls (`host::FdPool`); `PinnedInput`;
-  `PbfWriter::to_path_sync`; `BlobReader::leading_header` and `new_named`;
-  `tags_checked`; `diff::diff_stats`; `inspect::inspect_header`.
+- Notes when a run falls back from `copy_file_range`, loses parallelism or
+  blob skipping, when `cat` rebuilds or omits a block, and when a `--force`
+  run reads input without indexdata.
+- Library: `Invocation::cancel` and `Invocation::seal`; per-invocation
+  counters and sidecar streams (`MarkerFifo::call`); `host::FdPool`;
+  `PinnedInput`; `PbfWriter::to_path_sync`; `BlobReader::leading_header` and
+  `new_named`; `tags_checked`; `diff::diff_stats`; `inspect::inspect_header`.
 
 ### Changed
 
-- `sort`'s first pass scans the blobs it cannot index from their headers
-  (an unindexed input under `--force`, every blob under
-  `--distrust-metadata`, an indexed input whose header does not claim
-  sorted) on a worker pool instead of one blob at a time, as does
-  `cat --dedupe` for unindexed blobs: europe unindexed `sort --force`
-  pass 1 about 14 s instead of 165 s (whole sort about 30 s instead of
-  180 s), with about 125 MB more peak memory.
-- Commands that walk the blob headers (`inspect`, `inspect tags --type`,
-  `getid`, the schedule walks of `tags-filter`, `check --refs`, `extract`
-  and others) read ahead on a cold page cache when the file's blobs are
-  small, instead of one read per blob: on denmark cold, `inspect` about
-  0.22 s instead of 0.64 s, `inspect tags --type way` 0.26 s instead of
-  0.69 s, `getid` 0.22 s instead of 0.65 s; europe cold `inspect` 10 s
-  instead of 46 s. The read-ahead keeps several reads in flight, which also
-  leaves the file cached for a later pass: a cold denmark `cat --dedupe`
-  that copies nearly every blob through takes about 0.38 s instead of
-  0.54 s, the old engine's wall. Walks whose headers are already cached,
-  and files of large blobs such as the planet dump, read as before.
-- The read-ahead advice of the scheduled worker pools now reaches the
-  whole 256 MiB window it asks for; Linux had been reading only the first
-  128 KiB of each request. Planet `check --refs` takes about 26 s instead
-  of 31 s; `cat --clean` is unchanged.
-- `digest` reuses its per-block record buffers instead of growing a fresh
-  one per blob: the default full form on planet about 63 s instead of
-  107 s, `--form content` about 53 s instead of 60 s. The digests are
-  unchanged.
-- `check --index` and `cat --reindex` decompress and scan blobs on a worker
-  pool instead of one thread: at planet about 29 s instead of 494 s for
-  `check --index`, and about 44 s instead of 444 s for `cat --reindex`,
-  whose output is unchanged byte for byte. Both still read their input front
-  to back through one open, so a stream is still accepted, but the read
-  runs a window of blobs ahead, so a failure partway through a stream can
-  wait for the stream's writer to write again or close it.
-- `getid --add-referenced` follows relation members as `osmium getid -r`
-  does: the members of requested relations, recursively through relations
-  in relations, then the nodes of every way requested or pulled in. It used
-  to add only the nodes of requested ways. `--remove-tags` now strips every
-  pulled-in object, ways and relations included, that was not itself
-  requested, and `-v` still reports requested IDs only. A query naming no
-  relation reads the file as before; one naming relations adds a read of
-  the relation blobs (about 0.3 s at planet), plus a second one only when a
-  relation in a relation is reached. Library: `getid::AddReferenced` and
-  `GetidStats::found` follow the same rules.
-- Multi-extract with `--simple` on sorted input holds each object's region
-  membership once instead of once per region. Planet on bygg, five regions
-  inside `-10,35,32,72`: peak anon 9.8 GB -> 3.9 GB at the same wall; five
-  small regions: 2.0 GB -> 0.8 GB and 88 s -> 68 s.
-- `extract --complete` and `--smart` hold far less memory: planet on bygg,
-  Europe-sized box `-25,34,45,72`, peak anon 4.4 GB -> 2.8 GB
-  (`--complete`) and 8.1 GB -> 2.9 GB (`--smart`) at the same wall.
-- Two-pass `tags-filter` with no matched relation skips its way-dependency
-  pass: planet `w/highway=primary` on bygg 70 s -> 56 s, peak anon
-  2.5 GB -> 2.3 GB.
-- `apply-changes` is faster and holds less memory. On a planet daily diff
-  (OSC 4913) on bygg it takes about 92 s at about 1.9 GB peak anon with
-  `--compression zstd:1`, and with `--locations-on-ways` on a planet with
-  inline locations, at the default compression, about 264 s at 3.0 GB.
-  The summary's diff memory line now reads `OSC diff heap` and, like
-  `MergeStats::diff_heap_bytes`, counts what is held for the run (about
-  530 MB on that diff).
+- `getid --add-referenced` follows relation members recursively, then the
+  nodes of every way requested or pulled in, as `osmium getid -r` does; it
+  used to add only the nodes of requested ways. `--remove-tags` strips every
+  pulled-in object that was not itself requested.
+- `check --ids` judges type order on files without indexdata too: a file
+  whose kinds are out of order now fails (exit `1`) where it used to pass.
 - `apply-changes --locations-on-ways` refreshes the inline coordinates of
-  ways the OSC does not touch, and refuses missing nodes before writing
-  anything.
-- `cat`, `check`, `degrade`, `renumber`, `repack`, `time-filter` and
-  `build-geocode-index` no longer cap glibc at two malloc arenas, which
-  made every worker's larger allocations queue on two locks. The library
-  sets no allocator policy; a program that wants one calls
-  `process::cap_malloc_arenas` or `process::set_mmap_threshold` at start.
-  Re-encoding no longer allocates per string or per block, so `cat
-  --clean` and `repack` run as fast under such a cap as without it. On
-  planet on bygg, `build-geocode-index` takes 177 s, `cat --clean` about
-  154 s, `repack` and `degrade --strip-locations` about 170 s, and
-  `time-filter` about 132 s.
-- `repack` and `degrade` (outside `--unsort` and `--unsort-intra`) encode
-  each input blob on the worker that decoded it, so their merge thread no
-  longer re-encodes every blob's remainder from decoded copies, and their
-  workers no longer walk a blob once just to count it. On planet on bygg
-  `repack` takes about 148 s and `degrade --strip-locations` about 153 s,
-  against about 164 s for both, and peak anon falls from about 1.7 GB to
-  about 0.8 GB.
-  `degrade`'s output is unchanged. `repack` writes the remainder of an input
-  blob holding at least the cap as its own block, where it used to merge it
-  with smaller input blobs that follow; an input whose blobs are all above
-  or all below the cap repacks as before.
-- `repack` of an input already written at the cap (any extract at the
-  default 8000 elements per blob) peaks lower: each phase's last, short
-  block no longer starts the framing thread pool just after the phase's
-  workers exit, where its idle threads kept those workers' freed memory.
-  A planet written at 8000 per blob peaks at about 0.59 GB against 0.62 to
-  0.69 GB on bygg, at the same speed. Output is unchanged.
-- `extract` (simple on sorted input, complete and smart) compresses each
-  output block on the worker that built it instead of on a second, framing
-  thread pool, which simple extract started just after its node classify
-  workers exited and then left idle through each later classify phase. A
-  planet simple extract of Europe's bbox on plantasjen peaks at about
-  2.4 GB of anon against 2.85 GB, with half the threads, at the same
-  speed. Output is unchanged.
-- Commands that decode on a worker pool recycle right-sized decode buffers
-  instead of allocating one per blob, which lowers their peak memory.
-- `diff` runs one engine at every `-j`: each input is read once as one
-  sequential stream (no up-front header walk), cut into work units the
-  workers merge, and the text goes to the output as it is produced, so a
-  text diff writes no scratch and refuses `--tmp-dir`. `-v` runs at any `-j`,
-  `-c`, `-q` and `--format osc` skip byte-equal blob pairs at every `-j`,
-  `--direct-io` applies at every `-j`, and inputs holding negative IDs run in
-  parallel too. A planet text diff of a base against itself with one daily
-  diff applied takes 284 s on bygg, at 1.8 GB peak anon.
-- A text `diff` without `-c` of two files holding mostly the same elements
-  no longer prints its common lines on one core: Denmark against its own
-  `cat --dedupe` output takes 0.65 s on bygg, against 8.2 s with the work
-  units as first landed and 1.3 s with the sharded engine before them.
-  Output is unchanged.
-- `diff --format osc` to a `.osc.gz` from indexed inputs deflates on every
-  worker and keeps its scratch compressed (about the output's size rather
-  than several times it), and no stretch of large changes (a planet's new
-  nodes) runs on one core any more: a planet against a planet 47 days
-  later takes 156 s on bygg, at 1.25 GB peak anon. The decompressed output
-  is unchanged; its gzip member boundaries are not.
-- `merge-changes` (without `--simplify`) cuts every input into batches
-  encoded in parallel, one input or many, and with several inputs keeps
-  output for later inputs in scratch instead of memory. It takes
-  `--tmp-dir` for that scratch only with several inputs, without
-  `--simplify` and at any `-j` but `1`, and refuses it (exit `64`)
-  elsewhere. `--simplify` reads its inputs in parallel batches and no
-  longer holds every change as a parsed object. The output has one gzip
-  member and action section run per batch (same changes, same order). On
-  planet on bygg, seven daily diffs merge in 3.7 s at 123 MB peak anon,
-  one in 2.4 s, and seven under `--simplify` in 5.4 s at 12.0 GB.
-- `tags-filter --input-kind osc` filters on several threads: a planet daily
-  diff takes about 2.4 s on bygg.
-- `cat --dedupe` runs on `sort`'s engine (header walk, `copy_file_range`
-  passthrough, parallel merge), and `sort` streams its overlap output instead
-  of buffering it: planet merged with itself takes about 216 s and 1.1 GB
-  peak anon on bygg.
-- `cat --dedupe --direct-io` and `sort --direct-io` read their second pass
-  `O_DIRECT` too, so the run no longer fills the page cache, with
-  `--io-uring` as well: a blob copied through unchanged is read `O_DIRECT`
-  into the io_uring writer's buffers. Merging a file with itself is slower
-  this way (every blob is read from the device twice).
-- Multi-region `extract --config` with `--simple` on sorted input
-  compresses every region's output in parallel instead of on one thread:
-  a 5-region planet extract takes about 128 s on bygg, with unchanged
-  output bytes.
-- `check --ids`, `check --refs`, `getparents`, `getid --add-referenced`
-  and `inspect --nodes` read blobs faster, with the same output. On planet
-  on bygg, `check --ids` takes about 30 s (`--full` likewise), `check
-  --refs` about 31 s, `getparents` 16 to 17 s, `getid --add-referenced`
-  41 s and `inspect --nodes` 22.4 s.
-- `check --ids` and `check --refs` read a wholly unindexed input once,
-  not once per element kind, with the same reports. `check --refs` reads
-  a blob again only where a reference missed in that read (its target not
-  yet read, above the range the check sized, or missing in fact). On an
-  unindexed planet on bygg, `check --refs` takes about 29 s (with
-  `--check-relations` too) and `check --ids` about 27 s (`--full`
-  likewise). Both checks print the `Note:` that the input has blobs
-  without indexdata, which `--quiet` silences.
-- `check --ids` judges type order on a file without indexdata too, from
-  the elements it decodes, in the order pbfhogg reads them: a file whose
-  ways, relations and nodes are out of kind order, across blobs or across
-  the groups of one blob, now fails with `type order: ... after ...`
-  violations (exit `1`) where it used to pass. A blob holding several
-  kinds in order passes. With `-t`, type order is still judged over every
-  kind, as it already was on an indexed file. No cost on planet.
-- `check --ids --full` no longer allocates its duplicate-detection bitmap
-  for a kind whose IDs are in strict canonical order, since such a kind
-  cannot hold a duplicate. On an ordered planet on bygg peak memory falls
-  from about 2.3 GB to about 450 MB, at the plain `check --ids` wall. A
-  kind found out of order is read a second time with its bitmap, so on an
-  unsorted file `--full` takes one extra read of those kinds at the old
-  peak. Reports are unchanged, negative IDs included.
-- `inspect`'s full-decode modes (`--extended`, `--locations`,
-  `--distrust-metadata`, and any report on an unindexed file) decode on every
-  core: planet `--extended` takes about 27 s on bygg, at about 0.3 GB peak
-  anon. Unknown blobs are skipped without parsing their body.
-- `inspect tags` counts on every worker thread instead of merging every
-  blob's counts on one: on planet on bygg, counting every pair (`'*=*'`)
-  takes about 37 s. The count thresholds still apply only after the whole
-  file is counted, so they do not bound memory.
+  ways the OSC does not touch, and refuses missing nodes before writing.
+- `diff` runs one engine at every `-j`: a text diff writes no scratch and
+  refuses `--tmp-dir`, and `-v`, blob skipping and `--direct-io` work at any
+  `-j`. `diff --format osc` to `.osc.gz` changes gzip member boundaries
+  (decompressed output unchanged).
+- `merge-changes` takes `--tmp-dir` only with several inputs, without
+  `--simplify` and at `-j` above `1`, and refuses it elsewhere (exit `64`).
+  Its output has one gzip member and action section per batch (same
+  changes, same order).
+- `repack` writes the remainder of an input blob holding at least the cap as
+  its own block instead of merging it with following smaller blobs.
 - `inspect tags` ends with `K key rows and P key/value rows counted, R
   passed the count thresholds` on stderr in place of `N distinct tag
-  values`, whose number was the rows printed, not distinct values: with
-  `--min-count` or `--max-count` narrowing the rows, the distinct count was
-  not shown at all.
-- `inspect tags` with expressions skips blobs on the tag index.
-- `getid --add-referenced` skips way blobs when no way ID is requested; it
-  decoded every way blob before.
-- A refusal of unindexed input says what indexdata would have bought the
-  run (skipping blobs by element type, ID range or node bounding box, or
-  copying them whole) instead of calling the type, tag-key, ID or bbox
-  filter "a no-op": on a `--force` run every filter still applies to every
-  decoded element, and tag-key skipping, which reads tagdata, still skips
-  blobs.
-- A file whose first blob is not an OSMHeader is refused as header-less
-  before that blob is decoded.
+  values`.
 - In `sort` and `cat --dedupe` overlaps, the earliest input's copy of a
   duplicate survives, and a blob claimed sorted that descends internally is
   refused instead of reordered.
-- Default Linux builds use `copy_file_range`, readahead hints and external
-  scratch eviction without needing the `linux-direct-io` or `linux-io-uring`
-  feature.
-- A command that reads its input more than once pins it, so a file renamed
-  over mid-run is never read partly from each; such commands refuse a FIFO,
-  socket or device.
-- Plain `cat` holds a descriptor per input and refuses up front when the
-  open-file limit cannot hold them.
-- Multi-region `extract --config` refuses up front when the open-file limit
-  cannot hold a writer per region, instead of failing partway with EMFILE.
-- `add-locations-to-ways --index-type auto` respects cgroup memory limits,
-  and `--index-type external` checks scratch space and open descriptors
-  before it starts.
+- `cat --dedupe --direct-io` and `sort --direct-io` read their second pass
+  `O_DIRECT` too, so the page cache stays clean; merging a file with itself
+  is slower this way.
+- Default Linux builds use `copy_file_range`, readahead hints and scratch
+  eviction without the `linux-direct-io` or `linux-io-uring` feature, and
+  fall back to userspace copies where the kernel refuses `copy_file_range`.
+- A command that reads its input more than once pins it against renames and
+  refuses a FIFO, socket or device.
+- Plain `cat`, multi-region `extract --config` and `add-locations-to-ways
+  --index-type external` check the open-file limit (and, for external,
+  scratch space) up front instead of failing partway. `--index-type auto`
+  respects cgroup memory limits.
 - `--direct-io` and `--io-uring` use the alignment the device reports.
-- Passthrough copies fall back to userspace wherever the kernel refuses
-  `copy_file_range`.
 - Warnings start with `Warning:` and notes with `Note:`.
-- A blob over the format's size limits is refused at write time, naming
-  the part that is too large (`OversizePart`, the OSMHeader apart from
-  data blobs), and an oversize tag index is dropped instead of failing the
-  write.
+- A blob over the format's size limits is refused at write time
+  (`OversizePart`); an oversize tag index is dropped instead.
 - Geocoding handles the antimeridian, fills each missing result class from
   the coarse fallback, keeps more vertices for high admin levels, and builds
   reproducibly.
 
+**Performance** (planet unless another dataset is named; on bygg, except
+the first four entries, which were recorded without a host)
+
+- `check --index` 494 s -> 29 s and `cat --reindex` 444 s -> 44 s (worker
+  pool instead of one thread). A pipe or FIFO input is still accepted, but
+  because the read now runs ahead of the workers, an error partway through
+  one is reported only once the process feeding it writes more or closes
+  it; until then the command waits.
+- Europe unindexed `sort --force` 180 s -> 30 s, with about 125 MB more
+  peak memory; `cat --dedupe` scans unindexed blobs the same way.
+- Cold header walks (`inspect`, `getid`, `tags-filter`, `extract` and others)
+  read ahead on files of small blobs: europe cold `inspect` 46 s -> 10 s,
+  denmark cold `inspect` 0.64 s -> 0.22 s. Planet `check --refs` takes
+  about 20 s (`53360af4`).
+- `digest` 107 s -> 63 s (`--form content` 60 s -> 53 s).
+- `extract --complete` peak anon 4.4 GB -> 2.8 GB and `--smart` 8.1 GB ->
+  2.9 GB on a Europe-sized box; `--simple` multi-extract of five regions
+  9.8 GB -> 3.9 GB; multi-region `--config --simple` compresses in
+  parallel (5 regions about 128 s).
+- Two-pass `tags-filter` with no matched relation skips its way-dependency
+  pass: `w/highway=primary` 70 s -> 56 s.
+- `apply-changes` on a daily diff about 92 s at 1.9 GB peak anon
+  (`--compression zstd:1`), and with `--locations-on-ways` about 264 s at
+  3.0 GB. The summary's memory line now reads `OSC diff heap`.
+- `cat`, `check`, `degrade`, `renumber`, `repack`, `time-filter` and
+  `build-geocode-index` no longer cap glibc malloc arenas. `repack` about
+  148 s and `degrade --strip-locations` about 153 s (from 164 s), peak anon
+  1.7 GB -> 0.8 GB; `build-geocode-index` 177 s, `cat --clean` about 154 s,
+  `time-filter` about 132 s.
+- Text `diff` without `-c` of near-identical files no longer prints common
+  lines on one core (denmark 1.3 s -> 0.65 s); base against base plus one
+  daily diff 284 s at 1.8 GB. `diff --format osc` to `.osc.gz` deflates on
+  every worker and keeps scratch compressed: planet against planet 47 days
+  later 156 s at 1.25 GB.
+- `merge-changes` encodes in parallel batches: seven daily diffs 3.7 s at
+  123 MB peak anon, seven under `--simplify` 5.4 s at 12.0 GB.
+- `tags-filter --input-kind osc` runs multi-threaded: a daily diff in about
+  2.4 s.
+- `cat --dedupe` runs on `sort`'s engine: planet merged with itself about
+  206 s at 945 MiB peak anon (`53360af4`).
+- `check --ids` about 17 s, `getparents` about 16 s, `inspect --nodes`
+  about 19 s (`53360af4`).
+  `check --ids --full` on an ordered planet peaks at about 450 MB instead of
+  2.3 GB.
+- `inspect`'s full-decode modes use every core: `--extended` about 27 s at
+  0.3 GB. `inspect tags '*=*'` about 37 s.
+- `extract` with a 9694-vertex polygon on denmark takes 0.35 s.
+
 ### Fixed
 
-- `apply-changes` could write wrong tags, roles and user names, with no
-  error, into the blobs it rewrote after a blob the diff deleted whole on
-  the same worker thread: the deleted blob's string table stayed behind and
-  the next rewrite's strings were read through it. A valid base and diff
-  were enough.
-- `apply-changes` refuses a rewritten blob holding a tag key or value,
-  member role or user name whose string table index lies past its block's
-  string table (exit 2, nothing published, the error naming the element),
-  and one whose string table does not begin with the empty string. Such an
-  index used to be copied into the output, where it could name an unrelated
-  string the diff added to the same block, and a tag key there panicked the
-  run.
+- `apply-changes` could silently write wrong tags, roles and user names into
+  blobs rewritten after a wholly deleted blob on the same worker, from a
+  valid base and diff.
+- `apply-changes` refuses a rewritten blob with a string table index past
+  its table, or a table not starting with the empty string, instead of
+  copying it (where it could name an unrelated string, or panic).
 - `apply-changes` no longer writes out-of-order creates, duplicated upserts
   or mislabelled tags, keeps non-default block framing, and with `--force`
   writes a wholly indexed output.
-- Blob tagdata whose key list is out of order, repeats a key, or carries
-  bytes after the last key is now treated as no tagdata, so the blob is
-  decoded. `tags-filter`, `inspect tags` and filtered reads used to believe
-  an out-of-order list and could skip a blob holding matches, with no
-  error. `check --index` reports such tagdata as malformed, and
-  `sort --distrust-metadata` replaces it.
-- Blob tagdata now lists an explicit empty tag key; earlier versions dropped
-  it, so on files they wrote a `tags-filter` or `inspect tags` expression
-  naming the empty key could skip a blob holding a match, with no error.
-  `tags-filter` and `inspect tags` no longer use tagdata to skip a blob for
-  an expression that can match the empty key, so such files now give the
-  right answer as they are. `add-locations-to-ways --index-type external`
-  without `--keep-untagged-nodes` can still drop a node blob on such a file
-  when the empty key is its only tag key. `check --index` finds such blobs,
-  and `cat --reindex` or `sort --distrust-metadata` repairs the file.
-- Commands that decode a blob refuse one whose indexdata is false instead of
-  answering from the claim.
-- Blob indexdata and tagdata are generated exactly or not at all.
+- Malformed blob tagdata (out of order, repeated key, trailing bytes) is
+  treated as absent; `tags-filter`, `inspect tags` and filtered reads could
+  silently skip a blob holding matches.
+- Tagdata now lists an explicit empty key; on files written by earlier
+  versions, `tags-filter` and `inspect tags` no longer skip blobs for an
+  expression that can match the empty key. `add-locations-to-ways
+  --index-type external` without `--keep-untagged-nodes` can still drop a
+  node blob whose only key is empty on such files; `check --index` finds
+  them and `cat --reindex` repairs.
+- Commands that decode a blob refuse false indexdata instead of answering
+  from it; indexdata and tagdata are generated exactly or not at all.
 - `sort` and `cat --dedupe` no longer write unsorted output stamped sorted.
-- `extract` complete-ways and `--smart` on a sorted input with a bbox
-  dropped every node stored as a plain (non-dense) Node message, and with
-  it every way and relation that node would have matched. They are now
-  classified like dense nodes.
-- `extract` on an unsorted input no longer drops ways and relations.
+- `extract` complete-ways and `--smart` on sorted input with a bbox dropped
+  every plain (non-dense) node and the ways and relations it matched.
+- `extract` on unsorted input no longer drops ways and relations.
 - A GeoJSON FeatureCollection contributes every polygonal feature.
-- `add-locations-to-ways` no longer treats a node at `(0, 0)` as missing, and
-  reads plain (non-dense) nodes.
-- `add-locations-to-ways --index-type external` refuses an input past its
-  way-side encoding limits (exit 2, nothing published, the message naming
-  the limit and the sparse index): more than 2^32 way blobs, or about
-  2^40 way node refs in total (a slot bucket of more than 2^32 refs). Past
-  either, a release build used to wrap the stored position and write
-  coordinates into the wrong ways with no error. The limits sit far above
-  planet (about 88 times its refs), but highly compressible input reaches
-  them in a much smaller file.
-- `inspect --extended` metadata coverage counts fields carrying a value, as
-  `osmium fileinfo -e` does: a present uid 0, changeset 0 or empty user name
-  (which pbfhogg's own writer stores for anonymous users) no longer reports
-  that field as available, and an Osmosis `-1` dense slot's real timestamp,
-  uid and user now count.
-- `diff` handles negative IDs, `i64::MIN`, empty blocks and corrupt elements
-  correctly.
+- `add-locations-to-ways` no longer treats a node at `(0, 0)` as missing,
+  and reads plain (non-dense) nodes.
+- `add-locations-to-ways --index-type external` refuses input past 2^32 way
+  blobs or about 2^40 way node refs (exit 2), where it silently wrote
+  coordinates into the wrong ways. Highly compressible input reaches this
+  far below planet size.
+- `inspect --extended` metadata coverage counts fields as `osmium fileinfo
+  -e` does (uid 0, changeset 0 and empty user are not available).
+- `diff` handles negative IDs, `i64::MIN`, empty blocks and corrupt
+  elements correctly.
 - `renumber` refuses input it would renumber wrongly, and no longer hangs on
   an error.
 - `check --ids` uses canonical OSM ID order, and `check` no longer panics on
   IDs past its bitsets.
-- `tags-filter --input-kind osc` keeps element metadata and escapes XML, and
+- `tags-filter --input-kind osc` keeps element metadata and escapes XML;
   `merge-changes` keeps the metadata of an element without a version.
-- A truncated zlib blob no longer hangs, and decompression bombs are bounded
-  during inflation.
-- Output headers describe the output (no sorted flag on an unsorted extract,
-  enrichment features kept, a multi-input `cat` bbox covering every input).
-- Piping output into a reader that exits early, or closing stderr, no longer
+- A truncated zlib blob no longer hangs; decompression bombs are bounded.
+- Output headers describe the output (no sorted flag on an unsorted
+  extract, enrichment features kept, a multi-input `cat` bbox covering every
+  input).
+- A reader exiting early on piped output, or a closed stderr, no longer
   panics or aborts the run.
 - `build-geocode-index` no longer deletes an input kept inside the index
   directory, and refuses an index its format cannot address.
-- `build-geocode-index` lists every street, interpolation way and admin
-  polygon under every S2 cell its lines pass through. It used to step along
-  each line at a fraction of a cell and miss a cell the line clips near its
-  corner, which about one street segment in six did at the default level;
-  a query in a cell next to the missed one could miss a street within the
-  search radius. The admin interior hint is now only set on cells wholly inside
-  their polygon (queries still test containment). The index format is
-  unchanged; rebuild to gain the cells.
-- Geocode queries search the whole fine and coarse search radius. They read
-  only the query's cell and its eight neighbours, which reach about one cell
-  width, less than the default radii, so a street, address or interpolation
-  way inside the radius was passed over for a farther one or for nothing; on
-  uniform points over Germany that was about one street answer in twelve,
-  mostly from the coarse search. A segment is also measured to its true
-  nearest point near the poles (across the antimeridian side) and when very
-  short. Applies to existing indexes; no rebuild needed for this fix.
-  `build-geocode-index` refuses a `--search-radius` or
-  `--coarse-search-radius` wider than a fixed number of cell widths at its
-  level, and the reader refuses an index whose header carries one, or whose
-  cell files are out of order.
-- `build-geocode-index` takes an interpolation way's end numbers only from
-  the addresses on its end nodes (same street, same coordinate). It used to
-  borrow the nearest same-street address within the end's street-level cell
-  and its eight neighbours, so how many ways resolved moved with
-  `--street-level` (Germany 71 of 78 at 17, 77 at 16) and the numbers were
-  often a nearby house's: most such ways in Germany are closed outlines
-  answering one borrowed number. A way is also left unresolved, and never
-  answers, when coincident addresses at an end disagree, an end number is not
-  a plain positive integer (`57a`, `18-20`), an `even` or `odd` way's ends
-  have the other parity, or `addr:interpolation` is not `all`, `even` or
-  `odd`; those used to be read as their leading digits, or as `all`. Fewer
-  ways resolve (Germany 7 of 78 at any level). Queries on existing indexes
-  also refuse an `even` or `odd` range whose ends have the wrong parity,
-  which stepped past the end; rebuild for the rest.
-- `build-geocode-index` reads interpolation ways as OSM tags them: a way
-  needs only `addr:interpolation` and takes its street from the addresses on
-  its end nodes when it has no `addr:street` (it used to be dropped, which
-  was most of them). An address node inside the way splits it into separate
-  ranges (10, 20, 40 is 10-20 and 20-40, not 10-40), so the index's
-  interpolation count is now ranges, not ways. A way that also carries
-  `addr:housenumber` is no longer interpolation, and one with equal numbers
-  at both ends (a closed outline with one address), a node missing from the
-  input, or a zero or oversized interior number never answers. Rebuild
-  existing indexes to gain this.
-- `build-geocode-index` stores names, house numbers, streets, postcodes and
-  country codes whole. A PBF tag value holding a NUL byte used to be answered
-  as the part before the NUL (`10\0a` as `10`); the index string pool is now
-  length-prefixed, which is why the format version is 4.
+- `build-geocode-index` lists streets, interpolation ways and admin polygons
+  under every S2 cell they pass through; about one street segment in six
+  missed a cell. Rebuild to gain the cells.
+- Geocode queries search the whole fine and coarse radius instead of about
+  one cell width (about one street answer in twelve over Germany was wrong
+  or missing), and measure segments correctly near the poles. No rebuild
+  needed. The reader refuses an index with out-of-order cell files.
+- `build-geocode-index` takes interpolation end numbers only from addresses
+  on the end nodes, and leaves unresolved a way with disagreeing ends, a
+  non-integer number, wrong parity or an unknown `addr:interpolation`; it
+  used to borrow a nearby house's number. Fewer ways resolve (Germany 7 of
+  78). Rebuild for the full fix.
+- `build-geocode-index` reads interpolation ways as OSM tags them (street
+  from the end addresses when no `addr:street`, which was most of them),
+  splits a way at interior address nodes, and stops treating a way with
+  `addr:housenumber` as interpolation. Rebuild to gain this.
+- `build-geocode-index` stores strings holding a NUL byte whole instead of
+  truncating at the NUL.
 - Concurrent library runs no longer share scratch.
 - io_uring writers opened one after another no longer fail with ENOMEM.
 

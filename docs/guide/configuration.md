@@ -19,10 +19,10 @@ The default, `zlib`, produces standard PBF files every tool reads. Use `none` fo
 Select the node coordinate index strategy with `--index-type`:
 
 ```sh
-pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type auto
+pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type sparse
 ```
 
-Options: `sparse` (default), `external`, `auto`. See [Advanced Topics](./advanced.md#add-locations-to-ways-index-types) for when to use each.
+Options: `auto` (default), `sparse`, `external`. See [Advanced Topics](./advanced.md#add-locations-to-ways-index-types) for when to use each.
 
 ## Output header metadata
 

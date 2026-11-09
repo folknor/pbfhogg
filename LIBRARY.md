@@ -12,21 +12,21 @@ For the CLI toolkit (`pbfhogg-cli`), see [the CLI crate](https://crates.io/crate
 
 ```toml
 [dependencies]
-pbfhogg = "0.5"
+pbfhogg = "0.6"
 ```
 
 Library users who only need read/write can disable the `commands` feature to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.5", default-features = false }
+pbfhogg = { version = "0.6", default-features = false }
 ```
 
 For reverse geocoding queries (memory-mapped index reader), enable just the `geocode-reader` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.6", default-features = false, features = ["geocode-reader"] }
 ```
 
 ### Reading

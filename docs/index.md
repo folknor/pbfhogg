@@ -23,7 +23,7 @@ features:
   - icon:
       src: /icons/gauge.svg
     title: Planet-Scale Performance
-    details: "Read 59M elements in 0.31s (parallel) or 1.3s (pipelined). Apply a daily diff to 18.8 GB North America in 12 seconds at under 600 MB RSS."
+    details: "Read Denmark's 59M elements in 0.31s (parallel) or 1.3s (pipelined). Apply a daily diff to the full planet in under 100 seconds at under 2 GiB peak memory."
   - icon:
       src: /icons/wrench.svg
     title: 25+ CLI Commands

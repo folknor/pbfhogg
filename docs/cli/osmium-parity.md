@@ -252,7 +252,7 @@ These osmium flags have no pbfhogg equivalent:
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
 | `extract -S, --option` | Strategy options are fixed: complete-ways always includes parent relations (osmium's `relations=true`), smart completes `multipolygon` and `boundary` (osmium's `types=multipolygon,boundary`), with no `complete-partial-relations` or `tags` filter. See [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
-| `--index-type` | `sparse` (default), `external` (bounded-memory join with sequential I/O), `auto` (runtime routing; see `reference/pipeline.md`). Different valid values from osmium's `-i, --index-type`. |
+| `--index-type` | `auto` (default; runtime routing between the other two, see `reference/pipeline.md`), `sparse`, `external` (bounded-memory join with sequential I/O). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 
@@ -265,7 +265,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--generator` | Most write commands | Set writing program name in output header |
 | `--output-header` | Most write commands | Set replication header fields |
 | `--json` | inspect, check | Machine-readable output |
-| `--index-type` | add-locations-to-ways | `sparse` (default), `external`, `auto` (different values from osmium's `-i`) |
+| `--index-type` | add-locations-to-ways | `auto` (default), `sparse`, `external` (different values from osmium's `-i`) |
 | `--inject-prepass` | add-locations-to-ways | Emit opt-in `pbfhogg.WayMembers-v1` / `pbfhogg.SharedNodePins-v1` metadata for downstream reuse |
 
 ## Commands pbfhogg doesn't have

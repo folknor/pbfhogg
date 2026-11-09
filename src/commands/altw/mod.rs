@@ -125,12 +125,14 @@ fn relation_member_ids(
 
 /// Strategy for storing node coordinates during add-locations-to-ways.
 ///
-/// `Sparse` is the default, and the docs recommend no backend over it.
-/// Sparse took the default when `dense` was removed; `Auto` stays opt-in
-/// because its threshold is bracketed by only two measured inputs on one
-/// host, and when an estimate is unavailable (every non-Linux target among
-/// others) it routes sorted, indexed input to external, whose scratch-disk
-/// demand a user who never asked for external would not expect.
+/// `Auto` is the default. It runs sparse, the default before it, unless it
+/// has a known page-cache budget that the estimated sparse store exceeds:
+/// when the budget is unknown (every non-Linux target among others), or the
+/// available memory does not exceed the sparse run's fixed anon allowance,
+/// it keeps sparse rather than imposing external's scratch-disk demand on a
+/// caller who never asked for it. The routing threshold is a chosen point
+/// between two measured inputs, not a fitted crossover; see
+/// `reference/pipeline.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexType {
     /// Rank-indexed flat sparse array, sized at `referenced.total_count() * 8`
@@ -139,19 +141,20 @@ pub enum IndexType {
     /// syscall per tuple). Works on any PBF. Runtime and page-cache behavior
     /// depend on the input and host; see `reference/performance.md` for
     /// measurements.
-    #[default]
     Sparse,
     /// External join via double radix permutation. Uses bounded working
     /// memory and sequential I/O, and requires sorted input with indexdata.
     /// Its temporary-disk demand depends on the input; see
     /// `reference/performance.md` for measurements.
     External,
-    /// Selects a backend at runtime. Unsorted or unindexed input uses sparse.
-    /// For sorted, indexed input, external is selected when the estimated
-    /// sparse store exceeds a fixed share of the page-cache budget; if
-    /// either estimate is unavailable, external is selected. See
-    /// `reference/pipeline.md` for the routing rule and
-    /// `reference/performance.md` for measurements.
+    /// Selects a backend at runtime (the default). Unsorted or unindexed
+    /// input uses sparse. For sorted, indexed input, external is selected
+    /// when the estimated sparse store exceeds a fixed share of the
+    /// page-cache budget; when the budget is unknown, or the available
+    /// memory does not exceed the sparse run's anon allowance, sparse is
+    /// kept and the store estimate is skipped. See `reference/pipeline.md`
+    /// for the routing rule and `reference/performance.md` for measurements.
+    #[default]
     Auto,
 }
 
@@ -423,8 +426,9 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // learns (sparse from the referenced-node set, external from stage 1),
     // and check it then.
     let mut front = InputFront::open(input, options.write.direct_reads, host)?;
-    // Auto-select: sparse unless the input qualifies for external AND the
-    // estimated store exceeds the page-cache budget (see IndexType::Auto).
+    // Auto-select: sparse unless the input qualifies for external AND a
+    // known page-cache budget is exceeded by the estimated store (see
+    // IndexType::Auto).
     let backend = match options.index_type {
         IndexType::Sparse => ResolvedBackend::Sparse,
         IndexType::External => ResolvedBackend::External,
@@ -456,9 +460,9 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     )?;
 
     // Suggest external index for sorted indexed PBFs on *explicit* sparse
-    // selection only. When auto resolved to sparse it did so because the
-    // store fits the page-cache budget; hinting external there would
-    // contradict the routing it just explained on stderr.
+    // selection only. When auto resolved to sparse it has already explained
+    // why on stderr (the store fits, or no budget could justify external);
+    // hinting external there would contradict that note.
     let hint_external =
         options.index_type == IndexType::Sparse && indexdata_present && front.is_sorted()?;
     drop(front);
@@ -583,7 +587,7 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 }
 
 // Auto-select: sparse unless the input qualifies for external (sorted +
-// indexed) AND the estimated sparse store exceeds the page-cache budget.
+// indexed) AND the estimated sparse store exceeds a known page-cache budget.
 // The threshold is relative to runtime RAM, never a hardcoded byte
 // constant: the knee is defined by store-vs-cache, and a constant fitted
 // to one host misroutes every other machine.
@@ -614,13 +618,39 @@ fn auto_select_backend(
         return Ok(ResolvedBackend::Sparse);
     }
 
-    // Both backends can run: route on scale. The walk reads headers the
-    // selected backend will also need, so it can warm those pages for the
-    // following pass rather than adding another cold header walk.
+    // Both backends can run. The budget is probed first: when it cannot
+    // justify leaving sparse, the estimate walk would decide nothing and is
+    // skipped.
+    let available = host.resources.memory_available();
+    host.invocation.counter(
+        "altw_auto_memory_available_bytes",
+        available.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+    );
+    let Some(budget) = page_cache_budget_bytes(available) else {
+        let why = match available {
+            None => "available memory unknown".to_string(),
+            Some(bytes) => format!(
+                "{:.1} GB available does not exceed the {:.1} GB anon allowance",
+                bytes as f64 / 1e9,
+                AUTO_ANON_HEADROOM_BYTES as f64 / 1e9,
+            ),
+        };
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_select",
+            "auto-selected index type sparse (sorted=true, indexed=true; {why}, so no \
+             page-cache budget can justify the external index)"
+        );
+        return Ok(ResolvedBackend::Sparse);
+    };
+
+    // Route on scale. The walk reads headers the selected backend will also
+    // need, so it can warm those pages for the following pass rather than
+    // adding another cold header walk.
     host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_START");
     let store = estimate_sparse_store_bytes(input, host)?;
     host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_END");
-    let budget = page_cache_budget_bytes(host);
     let chosen = route_sorted_indexed(store, budget);
 
     host.invocation.counter(
@@ -629,10 +659,10 @@ fn auto_select_backend(
     );
     host.invocation.counter(
         "altw_auto_cache_budget_bytes",
-        budget.map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+        i64::try_from(budget).unwrap_or(i64::MAX),
     );
 
-    if let (Some(store), Some(budget)) = (store, budget) {
+    if let Some(store) = store {
         let rel = if chosen == ResolvedBackend::External {
             ">"
         } else {
@@ -653,40 +683,40 @@ fn auto_select_backend(
             Note,
             "altw.auto_select",
             "auto-selected index type {chosen} (sorted=true, indexed=true; \
-             store estimate available={}, memory budget available={})",
-            store.is_some(),
-            budget.is_some()
+             store estimate unavailable)"
         );
     }
     Ok(chosen)
 }
 
 /// Pure routing decision for an input both backends can handle (sorted +
-/// indexed). External iff the estimated store exceeds
-/// [`AUTO_STORE_BUDGET_PCT`] of the page-cache budget. An unavailable
-/// store or budget estimate routes external, preserving a conservative
-/// choice when the sparse working set cannot be estimated: misrouting a
-/// small input to external costs less than running an oversized input on
-/// sparse into page-cache thrashing.
-fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> ResolvedBackend {
-    match (store_bytes, budget_bytes) {
-        (Some(store), Some(budget)) => {
-            if store.saturating_mul(100) > budget.saturating_mul(AUTO_STORE_BUDGET_PCT) {
-                ResolvedBackend::External
-            } else {
-                ResolvedBackend::Sparse
-            }
+/// indexed), given a known page-cache budget. External iff the estimated
+/// store exceeds [`AUTO_STORE_BUDGET_PCT`] of the budget. An unavailable
+/// store estimate keeps sparse, the default before auto: external is
+/// chosen only on positive evidence, since it imposes scratch-disk demand
+/// the caller did not ask for.
+fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: u64) -> ResolvedBackend {
+    match store_bytes {
+        Some(store)
+            if store.saturating_mul(100) > budget_bytes.saturating_mul(AUTO_STORE_BUDGET_PCT) =>
+        {
+            ResolvedBackend::External
         }
-        _ => ResolvedBackend::External,
+        _ => ResolvedBackend::Sparse,
     }
 }
 
 /// Estimate the sparse store size for an indexed input: total node count
 /// from per-blob indexdata, times 8 bytes per rank slot. Total nodes is
 /// an upper bound on referenced nodes (the store is sized by
-/// way-referenced ids only) - tight when most nodes are way-referenced and
-/// looser when that share is lower, which errs toward external, the cheap
-/// direction. Returns
+/// way-referenced ids only): tight when most nodes are way-referenced,
+/// loose when many are standalone. Overestimating routes toward external,
+/// which is not free: a file of mostly standalone nodes can be sent to
+/// external, whose scratch demand (per way reference, see
+/// `reference/pipeline.md`) a tiny real store would never have needed, and
+/// whose scratch check can then refuse a run sparse would complete.
+/// Indexdata counts elements, not references, so no tighter bound is
+/// available without decoding. Returns
 /// `None` when the first OsmData blob lacks indexdata, since the sum would
 /// silently undercount; an input that is indexed on its first OsmData blob
 /// and not on a later one is refused by the walk.
@@ -714,15 +744,22 @@ fn estimate_sparse_store_bytes(
 
 /// Page-cache budget for the sparse store: the host's available memory
 /// (`MachineProbe`: `MemAvailable`, capped on Linux by visible cgroup v2
-/// headroom) minus the anon headroom the sparse run itself needs. The caller
-/// owns the memory facts: fixed resources can route on any platform without
-/// procfs. Unknown memory retains the conservative external fallback
-/// documented in reference/pipeline.md; small input alone cannot establish
-/// that its random-access store fits RAM.
-fn page_cache_budget_bytes(host: &crate::host::Entered<'_>) -> Option<u64> {
-    host.resources
-        .memory_available()
-        .map(|b| b.saturating_sub(AUTO_ANON_HEADROOM_BYTES))
+/// headroom) minus the anon allowance the sparse run itself needs. The
+/// caller owns the memory facts: fixed resources can route on any platform
+/// without procfs.
+///
+/// `None` when memory is unknown, and also when it does not exceed the
+/// allowance. The second is a compatibility rule, not a resource model:
+/// the fixed allowance was measured at large scale, so below it the model
+/// would send even a store of a few megabytes to external, and it cannot
+/// justify departing from sparse, the default before auto. The rule is not
+/// monotonic in memory (a large store routes external just above the
+/// allowance and sparse just below it), and it is documented as such in
+/// `reference/pipeline.md`.
+fn page_cache_budget_bytes(available: Option<u64>) -> Option<u64> {
+    available
+        .filter(|&bytes| bytes > AUTO_ANON_HEADROOM_BYTES)
+        .map(|bytes| bytes.saturating_sub(AUTO_ANON_HEADROOM_BYTES))
 }
 
 /// Per-run instrumentation for the injected-prepass producer.
@@ -1315,7 +1352,10 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
-    use super::{AUTO_STORE_BUDGET_PCT, ResolvedBackend, route_sorted_indexed};
+    use super::{
+        AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT, ResolvedBackend, page_cache_budget_bytes,
+        route_sorted_indexed,
+    };
 
     const GB: u64 = 1_000_000_000;
 
@@ -1325,7 +1365,7 @@ mod tests {
     /// values are fixed test inputs, not a claim about today's datasets.
     #[test]
     fn route_reproduces_the_measured_grid() {
-        let budget = Some(25 * GB);
+        let budget = 25 * GB;
         assert_eq!(
             route_sorted_indexed(Some(18_750_000_000), budget),
             ResolvedBackend::Sparse,
@@ -1338,25 +1378,31 @@ mod tests {
         );
     }
 
+    /// Known memory above the allowance routes on the store; unknown memory,
+    /// or memory at or below the allowance, yields no budget, which
+    /// `auto_select_backend` turns into sparse without an estimate walk.
     #[test]
-    fn route_uses_injected_memory_budget() {
+    fn budget_follows_available_memory() {
+        let store = Some(18_750_000_000);
         for (memory, expected) in [
-            (Some(32 * GB), ResolvedBackend::Sparse),
-            (Some(8 * GB), ResolvedBackend::External),
-            (Some(0), ResolvedBackend::External),
-            (None, ResolvedBackend::External),
+            (32 * GB, ResolvedBackend::Sparse),
+            (8 * GB, ResolvedBackend::External),
+            (AUTO_ANON_HEADROOM_BYTES + 1, ResolvedBackend::External),
         ] {
-            let mut host = crate::host::Host::for_tests();
-            host.resources = std::sync::Arc::new(crate::host::Fixed {
-                parallelism: None,
-                memory_available: memory,
-            });
-            let host = host.entered_leaked();
+            let budget = page_cache_budget_bytes(Some(memory)).expect("above the allowance");
+            assert_eq!(route_sorted_indexed(store, budget), expected, "{memory}");
+        }
+        for memory in [None, Some(0), Some(AUTO_ANON_HEADROOM_BYTES)] {
             assert_eq!(
-                route_sorted_indexed(Some(18_750_000_000), super::page_cache_budget_bytes(&host)),
-                expected,
+                page_cache_budget_bytes(memory),
+                None,
+                "{memory:?} cannot justify leaving sparse"
             );
         }
+        assert_eq!(
+            page_cache_budget_bytes(Some(AUTO_ANON_HEADROOM_BYTES + 1)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1364,45 +1410,37 @@ mod tests {
         let budget = 10 * GB;
         let threshold = budget * AUTO_STORE_BUDGET_PCT / 100;
         assert_eq!(
-            route_sorted_indexed(Some(threshold), Some(budget)),
+            route_sorted_indexed(Some(threshold), budget),
             ResolvedBackend::Sparse,
             "exactly at the threshold stays sparse"
         );
         assert_eq!(
-            route_sorted_indexed(Some(threshold + 1), Some(budget)),
+            route_sorted_indexed(Some(threshold + 1), budget),
             ResolvedBackend::External,
             "one byte over the threshold routes external"
         );
     }
 
-    /// Unknown store or budget routes external for sorted + indexed input,
-    /// since the sparse working set cannot be compared with the available
-    /// page-cache budget.
+    /// An unknown store keeps sparse: external is chosen only on positive
+    /// evidence.
     #[test]
-    fn route_unknowns_fall_back_to_external() {
-        assert_eq!(
-            route_sorted_indexed(None, Some(25 * GB)),
-            ResolvedBackend::External
-        );
-        assert_eq!(
-            route_sorted_indexed(Some(GB), None),
-            ResolvedBackend::External
-        );
-        assert_eq!(route_sorted_indexed(None, None), ResolvedBackend::External);
+    fn route_unknown_store_keeps_sparse() {
+        assert_eq!(route_sorted_indexed(None, 25 * GB), ResolvedBackend::Sparse);
+        assert_eq!(route_sorted_indexed(None, 1), ResolvedBackend::Sparse);
     }
 
     #[test]
     fn route_survives_extreme_inputs_without_overflow() {
         assert_eq!(
-            route_sorted_indexed(Some(u64::MAX), Some(25 * GB)),
+            route_sorted_indexed(Some(u64::MAX), 25 * GB),
             ResolvedBackend::External,
             "a store big enough to overflow the pct math must saturate \
              toward external, never wrap into a sparse verdict"
         );
         assert_eq!(
-            route_sorted_indexed(Some(0), Some(0)),
+            route_sorted_indexed(Some(0), 1),
             ResolvedBackend::Sparse,
-            "zero store on a zero budget is not greater-than"
+            "zero store is never greater-than"
         );
     }
 }

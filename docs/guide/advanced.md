@@ -63,7 +63,7 @@ Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
 
 ## Add-locations-to-ways index types
 
-`add-locations-to-ways` embeds node coordinates in ways. It supports two index strategies (plus `auto`) via `--index-type`:
+`add-locations-to-ways` embeds node coordinates in ways. It supports two index strategies, chosen between at runtime by `auto`, the default, or named with `--index-type`:
 
 ```sh
 pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type external
@@ -71,9 +71,9 @@ pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type exter
 
 Which to choose:
 
-- **sparse** (the default) when the referenced nodes' working set (about 8 bytes per referenced node) fits the page cache. It works on any PBF, sorted or not. With `--inject-prepass` its first pass also remembers which referenced nodes are shared, so its ID-set memory can approach double the default's.
+- **auto** (the default) to let the run decide: unsorted or unindexed input goes to sparse, and sorted, indexed input to external when the estimated store exceeds a fixed share of the page-cache budget. Where that budget cannot be read from the host (every non-Linux host, some containers) or available memory is under about 3 GiB, it stays on sparse. The choice is reported on stderr. Its estimate counts every node, so a sorted file of mostly standalone nodes can be sent to external needlessly; name sparse there.
+- **sparse** when the referenced nodes' working set (about 8 bytes per referenced node) fits the page cache. It works on any PBF, sorted or not. With `--inject-prepass` its first pass also remembers which referenced nodes are shared, so its ID-set memory can approach double what it is without that flag.
 - **external** when it does not: bounded memory at the cost of heavy scratch-disk use. It needs sorted input with indexdata.
-- **auto** to let the run decide: unsorted or unindexed input goes to sparse, and sorted, indexed input to external when the estimated store exceeds a fixed share of the page-cache budget (or either estimate is unavailable). The choice is reported on stderr.
 
 The flag's exact contract is in the CLI reference's [add-locations-to-ways](../cli/commands.md#add-locations-to-ways) section; how each backend works, and the full routing rule, in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways), and measured resource use in [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
@@ -125,7 +125,7 @@ The index can be queried from Rust using the `geocode-reader` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.6", default-features = false, features = ["geocode-reader"] }
 ```
 
 `Reader::query` and `Reader::candidates` return a `Result`: a non-finite or

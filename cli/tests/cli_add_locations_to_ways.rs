@@ -70,7 +70,10 @@ fn test_ways() -> Vec<TestWay> {
 
 #[derive(Clone, Copy)]
 enum IndexBackend {
-    Default, // sparse (CLI default)
+    // No --index-type: the CLI default, auto. Tests use it on unsorted
+    // input, where auto routes sparse without consulting host memory; a
+    // test that means sparse on sorted input asks for Sparse.
+    Default,
     Sparse,
     External,
     Auto,
@@ -287,7 +290,7 @@ fn read_relation_ids(path: &Path) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Basic tests (default / sparse backend, non-indexed input)
+// Basic tests (default backend, auto routing to sparse on unsorted input)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -885,6 +888,29 @@ fn auto_on_sorted_indexed_input_reports_its_choice() {
         !stderr.contains("Note: this sorted indexed PBF is eligible"),
         "an auto-resolved backend must not be second-guessed by the \
          explicit-sparse hint; stderr:\n{stderr}",
+    );
+}
+
+/// Omitting `--index-type` runs auto: the default reports an auto choice
+/// (sparse on this unsorted input, whatever the runner's memory).
+#[test]
+fn default_index_type_is_auto() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Default, false);
+    assert!(
+        out.status.success(),
+        "default backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected index type sparse (sorted="),
+        "the default must be auto; stderr:\n{stderr}",
     );
 }
 

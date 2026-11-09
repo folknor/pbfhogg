@@ -147,9 +147,9 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 
 | Type | Memory | Temp disk | Best for |
 |------|--------|-----------|----------|
-| `sparse` (default) | Depends on the referenced-node working set | `referenced_count * 8` bytes of scratch storage | rank-indexed flat mmap; see [reference/performance.md](reference/performance.md) for measurements |
+| `sparse` | Depends on the referenced-node working set | `referenced_count * 8` bytes of scratch storage | rank-indexed flat mmap; see [reference/performance.md](reference/performance.md) for measurements |
 | `external` | One ID or slot bucket per stage worker, not a node-ID-wide index; the mode that fits planet on a 30 GB-class host | High scratch-disk demand; see [reference/performance.md](reference/performance.md) for measurements | ID- and slot-position-bucketed join; requires sorted input with indexdata |
-| `auto` | (one of the above) | (one of the above) | Runtime routing; see [reference/pipeline.md](reference/pipeline.md) |
+| `auto` (default) | (one of the above) | (one of the above) | Runtime routing, sparse unless a known page-cache budget is exceeded; see [reference/pipeline.md](reference/pipeline.md) |
 
 `dense` was removed. See [reference/performance.md](reference/performance.md) for measured comparisons with the rank-indexed sparse path.
 

@@ -62,10 +62,10 @@ The passthrough path adds indexdata via decompress+scan without re-compressing b
 
 Indexdata generation timings:
 
-| Dataset | Size | Time | Notes |
-|---------|------|------|-------|
-| Denmark | 461 MB | **2.8s** | commit `69a127f`, buffered |
-| Planet | 87 GB | **86.5s** (1m26s) | commit `aee7727`, buffered, post-regression-fix |
+| Dataset | Size | Time | Peak anon | Notes |
+|---------|------|------|-----------|-------|
+| Denmark | 461 MB | **2.8s** | - | commit `69a127f`, buffered, host not recorded |
+| Planet | 87 GB | **42.4s** | 72 MiB | commit `53360af4`, buffered, bygg (AMD Ryzen 9 9950X3D2, 30.5 GiB RAM, NVMe SSD) |
 
 Buffered I/O wins for this workload - sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
 

@@ -382,10 +382,10 @@ counterpart doesn't exist yet.
 ### add-locations-to-ways
 
 Embeds node coordinates in ways. Index strategies (`--index-type`, default
-`sparse`; `dense` was removed. See [performance.md](performance.md) for
-measured comparisons):
+`auto`, which routes to one of the other two; `dense` was removed. See
+[performance.md](performance.md) for measured comparisons):
 
-**Sparse** (default): rank-indexed flat mmap. Builds an `IdSet` of
+**Sparse**: rank-indexed flat mmap. Builds an `IdSet` of
 way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
 offset `rank_if_set(node_id) << 3` via relaxed `AtomicU64::store`
 directly into a pre-allocated, `MmapMut`-mapped values file
@@ -435,9 +435,10 @@ decode of every way blob; a full scratch filesystem during the way pass
 itself still fails as an ordinary write error within that pass. The
 final output's space is not included.
 
-**Auto**: sparse is selected unless the input is sorted and indexed and the
-estimated sparse store (the per-blob indexed node count times 8 bytes) exceeds
-80 % of the page-cache budget. The budget is the host's available memory
+**Auto** (the default, CLI and library): sparse is selected unless the
+input is sorted and indexed, the page-cache budget is known, and the
+estimated sparse store (the per-blob indexed node count times 8 bytes)
+exceeds 80 % of that budget. The budget is the host's available memory
 minus 3 GiB of anonymous-memory headroom. Available memory comes from the
 caller's `host::Resources`: `Fixed` resources supply it directly on any
 platform, and the CLI's machine probe reads `MemAvailable` and, on Linux,
@@ -448,15 +449,33 @@ conservative. Cgroup v1 limits, `memory.high` and ancestors hidden above a
 delegated mount are not observed; a cgroup v1-only host uses `MemAvailable`
 alone.
 
-The budget is unknown when `/proc/meminfo` or `/proc/self/cgroup` cannot be
-read (every non-Linux target), when the process is in a unified hierarchy
-but no `cgroup2` mount covering its group is visible, or when a limited
-group's `memory.max` or `memory.current` cannot be read or parsed. The store
-estimate's header walk refuses a partially indexed input (some OsmData blobs
-indexed, others not) with the missing-indexdata error, so a sorted input
-whose first data blob is indexed always gets an estimate. If the budget is
-unknown, sorted and indexed inputs fall back to external, and the auto-select
-note says which estimate was missing. Unsorted or unindexed inputs always
+The budget is unknown when `/proc/meminfo`, `/proc/self/cgroup` or
+`/proc/self/mountinfo` cannot be read (`/proc/meminfo` is absent on every
+non-Linux target), when the process is in a unified hierarchy but no
+`cgroup2` mount covering its group is visible (common in containers that
+do not mount cgroupfs), when the group's path relative to that mount is
+not a plain descent, or when a limited group's `memory.max` or
+`memory.current` cannot be read or parsed. There is also no budget when
+the available memory does not exceed the 3 GiB headroom. Without a budget,
+auto keeps sparse, the default before auto, and skips the store estimate's
+header walk, which could not change the decision; the auto-select note
+says which case applied. The rule is that auto leaves sparse only on
+positive evidence: external's scratch-disk demand is not imposed on a
+caller who never asked for it. It is not a performance claim: a huge input
+on a host whose memory cannot be read runs sparse, exactly as it did when
+sparse was the default.
+
+The below-headroom case is a compatibility rule, not a resource model. The
+3 GiB headroom was measured at large scale, and subtracting it from a small
+host's memory would leave a zero budget that sends even a store of a few
+megabytes to external. The rule is not monotonic in memory: a large store
+routes external with a little more than 3 GiB available and sparse with a
+little less.
+
+The store estimate's header walk refuses a partially indexed input (some
+OsmData blobs indexed, others not) with the missing-indexdata error, so a
+sorted input whose first data blob is indexed always gets an estimate; an
+unavailable estimate would keep sparse. Unsorted or unindexed inputs always
 select sparse, since external cannot run on them. Whether the input is
 indexed is read from the first data blob's indexdata, the same hint the
 backends' own indexdata check reads, so a header-only file counts as indexed
@@ -465,11 +484,21 @@ frame header up to there is an input error, not a reason to pick sparse; the
 data blob payloads are not read by the selection. This runtime rule follows the measured
 store-versus-cache behavior documented in [performance.md](performance.md).
 
-Sparse, not auto, is the default, and the docs recommend neither over the
-other. The 80 % threshold is bracketed by two measured inputs on a single
-host rather than fitted, and the unknown-estimate fallback sends sorted,
-indexed input to external and its scratch-disk demand. Auto becoming the
-default needs that calibration first.
+Limits of the rule, both accepted with auto as the default:
+
+- The 80 % threshold is a chosen point between two measured inputs on a
+  single host (one near 75 % of its budget that stayed linear on sparse,
+  one near 116 % that thrashed), biased toward external; it is not a fitted
+  crossover. It decides only inputs whose store falls in that band. Outside
+  it the measured ordering holds, and with no budget auto behaves as the
+  old sparse default did.
+- The store estimate counts every indexed node, while the sparse store
+  holds only way-referenced ones. A sorted file with many standalone nodes
+  and few ways can therefore route external with a small real store, and
+  external's scratch check (above) can then refuse a run sparse would have
+  completed. Indexdata counts elements, not references, so no tighter
+  bound is available without decoding; `--index-type sparse` is the
+  remedy.
 
 ### renumber
 

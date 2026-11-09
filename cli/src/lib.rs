@@ -1998,16 +1998,17 @@ enum Command {
         ///   auto     - route by input eligibility and estimated node-store size:
         ///              unsorted or unindexed input uses sparse; sorted, indexed
         ///              input uses external when the estimate exceeds the
-        ///              fixed share of the page-cache budget. If either
-        ///              estimate is unavailable, sorted, indexed input uses
-        ///              external. See reference/pipeline.md.
+        ///              fixed share of the page-cache budget. When available
+        ///              memory is unknown or below the sparse run's anon
+        ///              allowance, sparse is kept. See reference/pipeline.md.
+        ///              This is the default.
         ///   sparse   - rank-indexed flat mmap array, sized at 8 bytes per
         ///              referenced node. Works on any PBF and needs temporary
-        ///              disk equal to referenced_nodes * 8 bytes. This is the default.
+        ///              disk equal to referenced_nodes * 8 bytes.
         ///   external - double radix join with bounded working memory and
         ///              sequential I/O. Requires sorted input with indexdata and
         ///              has high temporary-disk demand. See reference/performance.md.
-        #[arg(long, default_value = "sparse")]
+        #[arg(long, default_value = "auto")]
         index_type: IndexTypeArg,
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.
         #[arg(long)]

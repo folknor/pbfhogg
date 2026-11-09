@@ -1702,9 +1702,11 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 ### add-locations-to-ways
 
-Embed node coordinates in ways. Two index strategies:
+Embed node coordinates in ways. Two index strategies, and `auto` (the
+default) to choose between them:
 
-- **sparse** (default) - A flat memory-mapped array of 8 bytes per referenced node, in scratch storage; works on any PBF, sorted or not. How it is laid out is in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways). Working-set behavior depends on the available page cache; see [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measurements.
+- **auto** (default) - Runs sparse unless the input is sorted and indexed, the page-cache budget can be read from the host, and the estimated sparse store exceeds 80 % of that budget; then it runs external. Where available memory cannot be read (every non-Linux host, containers without a visible cgroup v2 mount) or is at most the 3 GiB the sparse run reserves for itself, it runs sparse. A `Note:` on stderr names the choice and why. The estimate counts every node, so a sorted file of mostly standalone nodes can be routed to external, whose scratch demand is far higher; pass `--index-type sparse` there. Rule and limits in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
+- **sparse** - A flat memory-mapped array of 8 bytes per referenced node, in scratch storage; works on any PBF, sorted or not. How it is laid out is in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways). Working-set behavior depends on the available page cache; see [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measurements.
 - **external** - Double radix permutation via 4-stage pipeline with bounded memory and high scratch-disk demand. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. See [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured resource use. It has encoding limits the sparse index does not: node IDs up to 2^38 (about 2.7e11), at most 2^32 way blobs, and about 2^40 (1.1e12) way node refs in total. Past one, the run fails with exit 2 naming the limit and pointing at sparse, and nothing is published; details in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
 
 `--index-type dense` was removed; see [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured comparisons. `dense` survives as a hidden value (absent from `--help`) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
@@ -1734,7 +1736,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (runtime routing; see [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways)) |
+| `--index-type <TYPE>` | Node index type: `auto` (default; runtime routing, see above), `sparse` or `external` |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata into the output header, readable back via `Blob::way_members` / `Way::shared_node_pins` |
 | `--ignore-missing-nodes` | Accept ways whose node references are absent from the input, writing those vertices as `(0, 0)`. Without it the run fails and no output is written: `(0, 0)` is Null Island, a real coordinate, so a placeholder vertex cannot be told apart from genuine data by any reader. Matches osmium in name and in default. |

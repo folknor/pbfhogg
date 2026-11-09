@@ -16,14 +16,14 @@ Add the library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pbfhogg = "0.5"
+pbfhogg = "0.6"
 ```
 
 This enables the default `commands` feature. If you only need read/write (no `check`, `export`, `extract` or geocode index builder), disable it to skip `serde_json` and `s2` dependencies:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.5", default-features = false }
+pbfhogg = { version = "0.6", default-features = false }
 ```
 
 ### Feature flags
@@ -41,7 +41,7 @@ For reverse geocoding queries without the full `commands` feature:
 
 ```toml
 [dependencies]
-pbfhogg = { version = "0.5", default-features = false, features = ["geocode-reader"] }
+pbfhogg = { version = "0.6", default-features = false, features = ["geocode-reader"] }
 ```
 
 ## Building from source

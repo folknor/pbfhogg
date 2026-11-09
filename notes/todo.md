@@ -1,10 +1,68 @@
 # pbfhogg TODO
 
-## 0.6.0: what is left before the release
+## Carried over from the 0.6.0 release (2026-11-09)
 
-- [ ] **0.6.0 release items**: version bump, expect declarations in
-  brokkr.toml (brokkr#71) and README numbers on bygg. Tracked until the
-  release ships; delete this item then.
+The README's three tables come from the campaign at `53360af4`
+(reference/performance.md "README campaign"). Left open:
+
+- [ ] **Planet isolation-cat row, held back from the README library
+  table.** `d73fbee8`: library 43.1-55.4 s, CLI 55.9-69.5 s, ratio 1.28,
+  where the typed `brokkr cat` cell on the same file and commit
+  (`be808f35`) took 42.4 s. The CLI arm's interval is 13 s or more behind
+  a plain cat, and the library arm swings 12 s between iterations.
+  Unexplained.
+- [ ] **Script benches with no clean cell since their engines moved**
+  (`--iterations 1`, three invocations per condition; dry-run first with
+  `brokkr bench --dry-run NAME ...`, the flag before the bench name;
+  dedupe-self, dedupe-pair, vs-osmium and diff-text are v2 since
+  brokkr#134, so compare on child walls):
+  - dedupe-pair `--with one-relation`, cold x3, warm x2: `6fdde3f4` is
+    the dirty variant measured at `bd2408d5`.
+  - dedupe-self, denmark and `--dataset japan`, cold and warm x3, plus one
+    `--cache warm --check yes`: `5432aac7` and `6fdde3f4` changed the
+    engine.
+  - sort-cold `--dataset europe --force yes` x3 after a trim, plus typed
+    `brokkr sort --dataset europe --bench 1` x2: `5432aac7` was only ever
+    an uncommitted variant.
+  - diff-unindexed `--new 20260420`, all and `--type way`, x3:
+    `b58e8ef3` is on its read path.
+  - diff-text denmark `--new 320k` x3, and germany `--new 20260420
+    --verbose yes --common no` x3: `3286a9c5` landed with no clean cell.
+- [ ] **Remaining expect declarations (brokkr#71).** The check and
+  diff-snapshots answers are declared in `brokkr.d/hosts/bygg.toml`. Not
+  run: `diff` per OSC (a primary diffed against itself with its next OSC
+  applied should be `differs`: denmark 4705, planet 4913, and so on). The
+  `test-unsorted` snapshot is the same file as `unsorted` and has no
+  `check-ids = "violations"` of its own.
+- [ ] **check --index loose ends** (from the 2026-11-09 ruling that a
+  wholly unindexed file is a clean pass by design):
+  - docs/guide/indexdata.md says flatly that `check --index` reports a
+    partially indexed file as a violation, but `unindexed_candidate`
+    needs an observable kind, so an empty or mixed-kind unindexed blob
+    among indexed ones passes while the consumers' guard in
+    `src/read/frame.rs` refuses the same file. Qualify the sentence, or
+    make coverage independent of indexability.
+  - `blobs_with_index` counts only parseable indexdata while
+    `blobs_with_tagdata` counts any present field.
+  - `MissingAmongIndexed` is raised once, for the first unindexed blob,
+    after every other finding, so a `max_errors` cap can hide it from the
+    listing (the exit code still carries it).
+  - Optional: say "no indexdata claims to verify" beside OK on a file
+    with none, and extend `a_file_that_makes_no_claims_passes` to assert
+    it.
+- [ ] **vs-osmium extract row.** vs-osmium has none, so README's Tokyo
+  extract line stays dropped; a row in `benches/compare/vs-osmium.lua`
+  would bring it back.
+- [ ] **Performance guide plantasjen tables** (Japan extract, apply-changes
+  at scale and with LocationsOnWays, write throughput, the io_uring and
+  O_DIRECT tips) carry host and commit labels but were not re-measured on
+  bygg.
+- [ ] **CHANGELOG 0.6.0 pipe and FIFO caveat** on `check --index` /
+  `cat --reindex`: its wording was checked against commit `b00e2e0b` and
+  docs/cli/commands.md, not against `src/read/frame_pool.rs`.
+- [ ] **brokkr doc fix.** `brokkr man library isolation-scenarios` still
+  lists "the capped malloc arenas" in the CLI interval (gone since
+  `25172fc3`).
 
 ## 0.7.0 items (moved from the 0.6.0 list on 2026-10-30)
 

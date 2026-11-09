@@ -158,7 +158,7 @@ fn diagnostic_prefix(kind: EventKind) -> Option<&'static str> {
 fn diagnostic_hint(key: &str) -> &'static str {
     match key {
         "altw.external_hint" => {
-            " Pass --index-type external to use it, or --index-type auto to choose."
+            " Pass --index-type external to use it, or omit --index-type to let auto choose."
         }
         "extract.passthrough_demoted" => " `pbfhogg check --index` checks it.",
         _ => "",

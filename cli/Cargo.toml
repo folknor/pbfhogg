@@ -62,7 +62,7 @@ linux-io-uring = ["pbfhogg/linux-io-uring"]
 test-hooks = ["pbfhogg/test-hooks"]
 
 [dependencies]
-pbfhogg = { version = "0.5", path = "..", default-features = false, features = ["commands"] }
+pbfhogg = { version = "0.6", path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4.6.1", features = ["derive"] }
 serde_json.workspace = true
 hotpath = "0.31.0"

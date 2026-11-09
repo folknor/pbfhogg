@@ -10,7 +10,7 @@ pbfhogg is a Rust library and CLI toolkit for reading, writing, and transforming
 
 ```toml
 [dependencies]
-pbfhogg = "0.5"
+pbfhogg = "0.6"
 ```
 
 ```rust

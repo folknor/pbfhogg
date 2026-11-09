@@ -175,8 +175,9 @@ enum PlanMsg {
 /// element, common ones included (a text diff without `-c`). The planner
 /// then counts every frame's claimed elements toward the element cut, not
 /// only single-sided frames', which limits a unit's run-ahead text to about
-/// its channel (an oversized frame or verbose details can still pass it); see
-/// [`DIFF_UNIT_LONE_ELEMENTS`]. It steers scheduling only, never the bytes.
+/// its channel (verbose details, or frames on both inputs too large for any
+/// cut between them, can still pass it; the text diff's sink absorbs that in
+/// memory up to `DIFF_TEXT_OVERFLOW_BYTES`); see [`DIFF_UNIT_LONE_ELEMENTS`]. It steers scheduling only, never the bytes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run<C: UnitConsumer>(
     old: &PinnedInput,

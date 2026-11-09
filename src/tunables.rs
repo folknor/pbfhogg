@@ -858,8 +858,11 @@ pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 /// differently ran serial on the head unit: denmark against its own
 /// `cat --dedupe` output took 8.2 s at `4e0eaa50` on bygg, 0.65 s with every
 /// frame counted (reference/performance.md, "Common lines cut by elements").
-/// Verbose details on modified elements are not
-/// bounded by any element count and can still outrun the channel.
+/// Verbose details on modified elements, and frames on both inputs too
+/// large for a cut between them (a one-sided oversized frame is carried and
+/// clipped at the other side's cuts), are not bounded by any element count and can still outrun the channel; the text
+/// diff absorbs that run-ahead in memory up to
+/// [`DIFF_TEXT_OVERFLOW_BYTES`].
 pub(crate) const DIFF_UNIT_LONE_ELEMENTS: u64 = 1 << 17;
 
 /// Frame bytes past which a unit that still cannot close is refused as a
@@ -909,10 +912,12 @@ pub(crate) const DIGEST_RECORD_BUFFERS_KEPT: usize = DEFAULT_DECODE_AHEAD;
 
 /// Formatted output bytes a unit's worker gathers before handing a chunk to
 /// the consumer, so a unit with a large output streams it instead of
-/// holding it whole. The text diff takes a chunk after a whole merge action,
-/// so a single-sided blob run can pass it by a blob's lines; derive polls
-/// such runs element by element, so a derive chunk (one gzip member of a
-/// `.osc.gz`) passes it by at most one element. Not measured.
+/// holding it whole. The text diff formats a whole merge action into a
+/// worker-local buffer and hands it over in pieces of exactly this size (the
+/// rest waits for the next action), so every text chunk it queues holds this
+/// many bytes or, at a unit's end, fewer; derive polls single-sided runs
+/// element by element, so a derive chunk (one gzip member of a `.osc.gz`)
+/// passes it by at most one element. Not measured.
 pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 
 /// Read buffer for appending a derive unit's spill file to its fragment;
@@ -928,6 +933,17 @@ pub(crate) const OSC_GZIP_WRITE_BUFFER: usize = 256 << 10;
 /// Output chunks one unit may have queued for the consumer before its
 /// worker blocks (text) or spills the rest of the unit to scratch (derive).
 pub(crate) const DIFF_OUTPUT_CHUNK_DEPTH: usize = 4;
+
+/// Text-diff chunks, in bytes summed over the whole run, that units whose
+/// channels are full may hold in memory instead of blocking. A unit the
+/// consumer is not reading yet keeps formatting into this shared allowance
+/// and blocks only once it is spent, so a burst of output past the channel
+/// (verbose details, an oversized frame) does not park every later unit
+/// behind the head. A bound on run-ahead, not sustained parallelism: units
+/// that each outrun it still wait. The text diff writes no scratch, so
+/// memory is the only place this run-ahead can live. Not measured beyond
+/// the oversized-frame cell in reference/performance.md.
+pub(crate) const DIFF_TEXT_OVERFLOW_BYTES: usize = 256 << 20;
 
 // ---------------------------------------------------------------------------
 // Cat

@@ -151,6 +151,57 @@ fn a_unit_output_larger_than_a_chunk_arrives_whole() {
     }
 }
 
+/// Text handed over in many small chunks, with units holding pieces past a
+/// full channel against an allowance that is spent at once, partly, or
+/// never: the text is the same, whole and in order, in every case.
+#[test]
+fn held_text_chunks_keep_the_answer() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("held-old.osm.pbf");
+    let new = dir.path().join("held-new.osm.pbf");
+    let count = 60_000;
+    write_multi_block_test_pbf(&old, &generate_nodes(count, 1), &[], &[], 8_000);
+    let moved: Vec<TestNode> = generate_nodes(count, 1)
+        .into_iter()
+        .map(|mut n| {
+            n.lat = n.lat.saturating_add(7);
+            n
+        })
+        .collect();
+    write_multi_block_test_pbf(&new, &moved, &[], &[], 6_000);
+    let reference = diff_text(&old, &new, 1, 0, true);
+    let faults_text = |chunk: usize, overflow: usize, jobs: usize, unit: usize| {
+        let host = crate::common::test_host();
+        let faults = host.invocation.faults();
+        faults.diff_unit_target_bytes.store(unit, Ordering::Relaxed);
+        faults.diff_text_chunk_bytes.store(chunk, Ordering::Relaxed);
+        faults
+            .diff_text_overflow_bytes
+            .store(overflow, Ordering::Relaxed);
+        let options = DiffOptions {
+            suppress_common: false,
+            verbose: true,
+            type_filter: None,
+            parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+        };
+        let mut out = Vec::new();
+        let stats = diff(&old, &new, &mut out, &options, false, &host)
+            .unwrap_or_else(|e| panic!("chunk {chunk}, overflow {overflow}: {}", e.report()));
+        format!("{}{stats:?}", String::from_utf8_lossy(&out))
+    };
+    for chunk in [7, 977, 4096] {
+        for overflow in [1, 64 << 10, usize::MAX / 2] {
+            for (jobs, unit) in [(1, 0), (3, 0), (4, 100_000)] {
+                assert_eq!(
+                    faults_text(chunk, overflow, jobs, unit),
+                    reference,
+                    "chunk {chunk}, overflow {overflow}, jobs {jobs}, unit {unit}"
+                );
+            }
+        }
+    }
+}
+
 /// A long stretch only the new file holds (created nodes past the old
 /// file's last ID, as in a later planet snapshot) is cut by its claimed
 /// element count as well as by bytes: the text is the same at every worker

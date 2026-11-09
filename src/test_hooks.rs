@@ -209,6 +209,13 @@ pub struct FaultPlan {
     /// channel were full (`usize::MAX`, the default, leaves it to the
     /// channel), so the spill and its ordering run on a small fixture.
     pub derive_spill_after: AtomicUsize,
+    /// Overrides a text diff unit's output chunk bytes when nonzero, so a
+    /// small fixture hands its text over in many chunks.
+    pub diff_text_chunk_bytes: AtomicUsize,
+    /// Overrides the text diff's run-wide overflow budget when nonzero, so
+    /// the overflow and its fallback to blocking sends run on a small
+    /// fixture.
+    pub diff_text_overflow_bytes: AtomicUsize,
 
     // --- merge-changes ordered merge (`commands::merge_changes::stream`) ---
     /// Members of input 1 the ordered merge (not `--simplify`) spills before
@@ -521,6 +528,8 @@ impl FaultPlan {
             diff_unit_target_bytes: AtomicUsize::new(0),
             derive_chunk_bytes: AtomicUsize::new(0),
             derive_spill_after: AtomicUsize::new(usize::MAX),
+            diff_text_chunk_bytes: AtomicUsize::new(0),
+            diff_text_overflow_bytes: AtomicUsize::new(0),
             merge_changes_spill_first: AtomicUsize::new(usize::MAX),
             merge_changes_members_spilled: AtomicU64::new(0),
             merge_changes_spilled_input_complete: AtomicBool::new(false),

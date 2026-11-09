@@ -27,7 +27,7 @@ use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, strea
 use crate::owned::TypeFilter;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::text_quote::{MemberLabel, Quoted};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -341,7 +341,14 @@ fn diff_block_pair<W: Write>(
     .collect();
 
     let text = output.is_some();
-    let make_sink = |_unit: usize| DiffSink::new(text.then(Vec::new), options);
+    let (chunk_bytes, overflow_cap) = text_unit_limits(&host.invocation);
+    let overflow = TextOverflow::new(overflow_cap);
+    let make_sink = |_unit: usize| TextUnitSink {
+        sink: DiffSink::new(text.then(Vec::new), options),
+        chunk_bytes,
+        overflow: &overflow,
+        held: VecDeque::new(),
+    };
     let mut consumer = TextConsumer {
         output,
         stats: DiffStats::default(),
@@ -360,6 +367,17 @@ fn diff_block_pair<W: Write>(
         host,
     )?;
     emit_merge_stats_counters(&merge_stats, &host.invocation);
+    if text {
+        use std::sync::atomic::Ordering;
+        host.invocation.counter(
+            "diff_text_overflow_chunks",
+            overflow.held.load(Ordering::Relaxed),
+        );
+        host.invocation.counter(
+            "diff_text_overflow_peak_bytes",
+            overflow.peak.load(Ordering::Relaxed),
+        );
+    }
     Ok(consumer.stats)
 }
 
@@ -450,37 +468,209 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
     }
 }
 
-/// A text diff unit's worker side: the shared sink formatting into a buffer
-/// (`None` counting only), handed over each time it passes a chunk.
-impl units::UnitSink for DiffSink<'_, Vec<u8>> {
+/// The text diff's run-wide allowance for chunks held past a full channel
+/// ([`crate::tunables::DIFF_TEXT_OVERFLOW_BYTES`]), shared by every unit.
+struct TextOverflow {
+    cap: usize,
+    used: std::sync::atomic::AtomicUsize,
+    /// The most `used` ever reached, and how many chunks were ever held
+    /// (sidecar counters).
+    peak: std::sync::atomic::AtomicUsize,
+    held: std::sync::atomic::AtomicUsize,
+}
+
+impl TextOverflow {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            used: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            held: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Charge `bytes` if the allowance has room for all of it, never past
+    /// the cap (checked update, so concurrent units cannot oversubscribe).
+    fn reserve(&self, bytes: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let reserved = self
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|&n| n <= self.cap)
+            });
+        match reserved {
+            Ok(before) => {
+                self.peak.fetch_max(before + bytes, Ordering::Relaxed);
+                self.held.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// One chunk held past its unit's full channel, owning its charge on the
+/// allowance: dropping it, sent or not (an error, a cancellation, a caught
+/// panic), releases what it was charged.
+struct HeldChunk<'r> {
+    chunk: Vec<u8>,
+    charged: usize,
+    overflow: &'r TextOverflow,
+}
+
+impl Drop for HeldChunk<'_> {
+    fn drop(&mut self) {
+        self.overflow
+            .used
+            .fetch_sub(self.charged, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A text diff unit's worker side: the shared sink formatting each action
+/// into a worker-local buffer (`None` counting only), handed over in pieces
+/// of the chunk size. When the unit's channel is full a piece is held in
+/// memory against the run's [`TextOverflow`] allowance instead of blocking,
+/// so a unit the consumer is not reading yet keeps formatting; once the
+/// allowance is spent it blocks as before. Held pieces go out strictly in
+/// order, ahead of any newer piece.
+struct TextUnitSink<'a> {
+    sink: DiffSink<'a, Vec<u8>>,
+    chunk_bytes: usize,
+    overflow: &'a TextOverflow,
+    held: VecDeque<HeldChunk<'a>>,
+}
+
+impl TextUnitSink<'_> {
+    /// Send held pieces, oldest first, while the channel has room.
+    fn drain_held(&mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<()> {
+        while let Some(mut front) = self.held.pop_front() {
+            let chunk = std::mem::take(&mut front.chunk);
+            if let Some(back) = out.try_send(chunk)? {
+                front.chunk = back;
+                self.held.push_front(front);
+                break;
+            }
+            // Sent: the channel owns the bytes now; `front` releases its
+            // charge here.
+        }
+        Ok(())
+    }
+
+    /// Send every held piece, blocking, each keeping its charge until its
+    /// send returns.
+    fn flush_held(&mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<()> {
+        while let Some(mut front) = self.held.pop_front() {
+            out.send(std::mem::take(&mut front.chunk))?;
+        }
+        Ok(())
+    }
+
+    /// Hand one piece over: straight to the channel when nothing is held
+    /// and it has room, else held against the allowance, else (allowance
+    /// spent) after every held piece, blocking.
+    fn emit(&mut self, piece: Vec<u8>, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<()> {
+        self.drain_held(out)?;
+        let piece = if self.held.is_empty() {
+            match out.try_send(piece)? {
+                None => return Ok(()),
+                Some(piece) => piece,
+            }
+        } else {
+            piece
+        };
+        let charged = piece.capacity();
+        if self.overflow.reserve(charged) {
+            self.held.push_back(HeldChunk {
+                chunk: piece,
+                charged,
+                overflow: self.overflow,
+            });
+            return Ok(());
+        }
+        self.flush_held(out)?;
+        out.send(piece)
+    }
+}
+
+impl units::UnitSink for TextUnitSink<'_> {
     type Item = Vec<u8>;
     type Stats = DiffStats;
 
-    /// Text chunks are taken after a whole action, a single-sided blob run
-    /// included: compact lines keep such a chunk a few MB at planet density,
-    /// and the text path has no scratch to spill a unit's run-ahead to, so
-    /// a larger chunk is what lets a later unit format ahead of the head.
+    /// An action is formatted whole into the local buffer, then every full
+    /// chunk-size piece is copied out into its own allocation and handed
+    /// over; the remainder waits for the next action, and the unit's tail
+    /// is copied out the same way. So a queued or held piece owns about one
+    /// chunk of allocation however large one action's text grew (verbose
+    /// details, a single-sided blob run); only the worker-local buffer
+    /// keeps an action's size.
     fn record_into(
         &mut self,
         kind: ElementKind,
         action: &BlockMergeAction<'_>,
         out: &mut dyn units::UnitOut<Vec<u8>>,
     ) -> Result<()> {
-        self.record(kind, action)?;
-        if let Some(buf) = self.output.as_mut()
-            && buf.len() >= crate::tunables::DIFF_OUTPUT_CHUNK_BYTES
-        {
-            out.send(std::mem::take(buf))?;
+        // Opportunistic: frees held pieces as the channel drains, and fails
+        // fast once the run is abandoned.
+        if !self.held.is_empty() {
+            self.drain_held(out)?;
         }
+        self.sink.record(kind, action)?;
+        let chunk_bytes = self.chunk_bytes;
+        let Some(buf) = self.sink.output.as_mut() else {
+            return Ok(());
+        };
+        if buf.len() < chunk_bytes {
+            return Ok(());
+        }
+        let mut buf = std::mem::take(buf);
+        let mut taken = 0;
+        while buf.len() - taken >= chunk_bytes {
+            let piece = buf[taken..taken + chunk_bytes].to_vec();
+            taken += chunk_bytes;
+            self.emit(piece, out)?;
+        }
+        buf.drain(..taken);
+        // One huge action leaves its allocation behind; keep the local
+        // buffer near a chunk between actions.
+        buf.shrink_to(2 * chunk_bytes);
+        self.sink.output = Some(buf);
         Ok(())
     }
 
-    fn finish_into(self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<DiffStats> {
-        if let Some(buf) = self.output.filter(|buf| !buf.is_empty()) {
-            out.send(buf)?;
+    fn finish_into(mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<DiffStats> {
+        self.flush_held(out)?;
+        // The tail goes out in its own allocation too: the local buffer may
+        // still carry an earlier action's capacity.
+        if let Some(buf) = self.sink.output.take().filter(|buf| !buf.is_empty()) {
+            out.send(buf[..].to_vec())?;
         }
-        Ok(self.stats)
+        Ok(self.sink.stats)
     }
+}
+
+/// A text diff unit's chunk size and the run's overflow allowance: the
+/// tunables, or the fault plan's overrides in a test-hooks build.
+fn text_unit_limits(invocation: &crate::host::Recorder) -> (usize, usize) {
+    let (mut chunk, mut overflow) = (
+        crate::tunables::DIFF_OUTPUT_CHUNK_BYTES,
+        crate::tunables::DIFF_TEXT_OVERFLOW_BYTES,
+    );
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::sync::atomic::Ordering;
+        let faults = invocation.faults();
+        let forced = faults.diff_text_chunk_bytes.load(Ordering::Relaxed);
+        if forced > 0 {
+            chunk = forced;
+        }
+        let forced = faults.diff_text_overflow_bytes.load(Ordering::Relaxed);
+        if forced > 0 {
+            overflow = forced;
+        }
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = (invocation, &mut chunk, &mut overflow);
+    (chunk, overflow)
 }
 
 /// The text diff's side on the calling thread: chunks to the caller's
@@ -493,7 +683,7 @@ struct TextConsumer<'w, 'o, W: Write> {
 }
 
 impl<'o, W: Write> units::UnitConsumer for TextConsumer<'_, 'o, W> {
-    type Sink = DiffSink<'o, Vec<u8>>;
+    type Sink = TextUnitSink<'o>;
 
     const WORKER: &'static str = "diff unit worker";
 
@@ -897,4 +1087,139 @@ fn write_seq_edit<T: Eq>(
         )?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod text_unit_sink_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// A unit's channel under the test's control: `room` free slots for
+    /// `try_send`; a blocking `send` stands for the consumer reaching the
+    /// unit, and fails when `fail_send` is set.
+    #[derive(Default)]
+    struct Channel {
+        room: usize,
+        fail_send: bool,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl units::UnitOut<Vec<u8>> for Channel {
+        fn send(&mut self, item: Vec<u8>) -> Result<()> {
+            if self.fail_send {
+                return Err(crate::error::Error::internal("test: consumer gone"));
+            }
+            self.sent.push(item);
+            Ok(())
+        }
+        fn try_send(&mut self, item: Vec<u8>) -> Result<Option<Vec<u8>>> {
+            if self.room == 0 {
+                return Ok(Some(item));
+            }
+            self.room -= 1;
+            self.sent.push(item);
+            Ok(None)
+        }
+        fn abandoned(&self) -> bool {
+            false
+        }
+    }
+
+    fn options() -> DiffOptions {
+        DiffOptions {
+            suppress_common: false,
+            verbose: false,
+            type_filter: None,
+            parallelism: crate::host::Parallelism::from_jobs(1),
+        }
+    }
+
+    fn sink<'a>(options: &'a DiffOptions, overflow: &'a TextOverflow) -> TextUnitSink<'a> {
+        TextUnitSink {
+            sink: DiffSink::new(Some(Vec::new()), options),
+            chunk_bytes: 4,
+            overflow,
+            held: VecDeque::new(),
+        }
+    }
+
+    fn piece(byte: u8) -> Vec<u8> {
+        vec![byte; 4]
+    }
+
+    /// Pieces refused by a full channel are held, charged, and sent oldest
+    /// first, ahead of the piece that finds the channel open again.
+    #[test]
+    fn held_pieces_go_out_in_order_and_release_their_charge() {
+        let (options, overflow) = (options(), TextOverflow::new(1 << 20));
+        let mut s = sink(&options, &overflow);
+        let mut ch = Channel::default();
+        for b in 0..3 {
+            s.emit(piece(b), &mut ch).unwrap();
+        }
+        assert!(ch.sent.is_empty());
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 12);
+        ch.room = 2;
+        s.emit(piece(3), &mut ch).unwrap();
+        // Two held pieces fit; the third and the new one stay held, in order.
+        assert_eq!(ch.sent, vec![piece(0), piece(1)]);
+        ch.room = 10;
+        s.emit(piece(4), &mut ch).unwrap();
+        assert_eq!(ch.sent, (0..5).map(piece).collect::<Vec<_>>());
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
+        assert_eq!(overflow.peak.load(Ordering::Relaxed), 12);
+    }
+
+    /// A spent allowance makes the unit block: every held piece first, then
+    /// the new one, and nothing stays charged.
+    #[test]
+    fn a_spent_allowance_blocks_after_the_held_pieces() {
+        let (options, overflow) = (options(), TextOverflow::new(6));
+        let mut s = sink(&options, &overflow);
+        let mut ch = Channel::default();
+        s.emit(piece(0), &mut ch).unwrap();
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 4);
+        s.emit(piece(1), &mut ch).unwrap();
+        assert_eq!(ch.sent, vec![piece(0), piece(1)]);
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
+    }
+
+    /// A failed send and a sink dropped with pieces still held both give
+    /// every charge back.
+    #[test]
+    fn failures_release_every_charge() {
+        let (options, overflow) = (options(), TextOverflow::new(8));
+        let mut s = sink(&options, &overflow);
+        let mut ch = Channel::default();
+        s.emit(piece(0), &mut ch).unwrap();
+        s.emit(piece(1), &mut ch).unwrap();
+        ch.fail_send = true;
+        assert!(s.emit(piece(2), &mut ch).is_err());
+        drop(s);
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
+
+        let mut s = sink(&options, &overflow);
+        let mut ch = Channel::default();
+        s.emit(piece(0), &mut ch).unwrap();
+        drop(s);
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
+    }
+
+    /// The unit's tail leaves in its own allocation, not the local buffer
+    /// an earlier large action grew, and after the held pieces.
+    #[test]
+    fn the_tail_is_sent_last_in_a_fresh_allocation() {
+        let (options, overflow) = (options(), TextOverflow::new(1 << 20));
+        let mut s = sink(&options, &overflow);
+        let mut ch = Channel::default();
+        s.emit(piece(0), &mut ch).unwrap();
+        let mut tail = Vec::with_capacity(1 << 20);
+        tail.extend_from_slice(b"ab");
+        s.sink.output = Some(tail);
+        units::UnitSink::finish_into(s, &mut ch).unwrap();
+        assert_eq!(ch.sent, vec![piece(0), b"ab".to_vec()]);
+        assert!(ch.sent[1].capacity() < 1 << 10, "{}", ch.sent[1].capacity());
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
+    }
 }

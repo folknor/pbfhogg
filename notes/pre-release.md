@@ -263,19 +263,6 @@ coalesce (check `cat_dedupe_blobs_passthrough` and
 three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
 second input.
 
-### WRK-188: diff -v details can still outrun a text unit's channel
-
-A text diff's units are cut by claimed elements (single-sided frames, or
-every frame without `-c`), which bounds compact lines but not `-v`
-details: files with identical framing and many modified elements carrying
-long tag changes (`diff -c -v`) can make a unit's text tens of MB against
-the four 1 MiB chunks it may queue, so later units park and the head
-formats alone. Also an oversized frame (far past 131k elements) can do it
-with compact lines. Derive's per-unit spill to scratch would cover both
-but costs the text diff's no-scratch contract; a cut by an estimate of
-detail bytes would not. Unmeasured; no input of that shape exists in the
-datasets.
-
 ### WRK-111: altw external pass A exposure to sustained-write state
 
 Residue. Pass A's id shards are now packed 8-byte words (99.5 GB at

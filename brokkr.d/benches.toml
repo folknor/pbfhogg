@@ -55,6 +55,22 @@ params.tool = { default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
 
 # -- diff
 
+[bench.diff-text]
+script_file = "../benches/diff/diff-text.lua"
+description = "Text diff without -c, optionally -v, of two indexed snapshots of one dataset, inputs warm"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Added: prints common lines, which the typed diff cells never do" },
+]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.old = { from = "datasets.{dataset}.snapshot", default = "base", help = "the old side's snapshot" }
+params.old_variant = { from = "datasets.{dataset}.snapshot.{old}.pbf", default = "indexed", help = "the old side's PBF variant" }
+params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "the new side's snapshot" }
+params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "indexed", help = "the new side's PBF variant" }
+params.verbose = { default = "no", help = "yes: pass diff's -v" }
+params.common = { default = "yes", help = "no: pass diff's -c, printing no common lines" }
+
 [bench.diff-unindexed]
 script_file = "../benches/diff/diff-unindexed.lua"
 description = "Text diff -c of two unindexed snapshots of one dataset, inputs cold, optional --type"

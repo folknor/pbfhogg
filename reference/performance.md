@@ -4271,6 +4271,33 @@ decision rides on it. The stored `brokkr diff` pair at those two commits
 (base against its apply-changes output, above) is a different workload
 and is not a substitute for it.
 
+## Text units hold pieces past a full channel (bygg, 2026-11-09, against `5432aac7`)
+
+The text diff's sink now hands output over in exact `DIFF_OUTPUT_CHUNK_BYTES`
+pieces and, once a unit's channel is full, holds further pieces in memory
+against `DIFF_TEXT_OVERFLOW_BYTES` instead of blocking. `diff-text` script
+bench (`benches/diff/diff-text.lua`), inputs warm, one iteration per cell,
+diff child's wall; base arm a `--commit HEAD` worktree, variant the dirty main
+tree:
+
+| Input | Cell | Build | diff child | send wait | overflow chunks |
+|---|---|---|---|---|---|
+| denmark base vs `320k` repack, no `-c` | `66c7ae25` | `5432aac7` | 2.82 s | 0 | - |
+| | `edea221b` | variant | 2.81 s | 0 | 0 |
+| germany base vs `20260420`, `-c -v` | `dde2ffe5` | `5432aac7` | 5.51 s | 63 ms | - |
+| | `bd12c886` | variant | 5.54 s | 3.6 ms | 0 |
+
+No cost, and no gain: neither real input outruns a unit's channel, so the
+allowance is never used. The denmark pair was meant as an oversized-frame
+input and is not one: a 320k-element frame on one side is carried and
+clipped at the other side's cuts, so units stay at the element cut's size
+(493 node units); that run is limited by the planner and head (job lock wait
+17 s, head recv wait 2.4 s summed), not by send waits. Two months of
+germany changes under `-v` (3.46M modified, 440 MB of text) waited 63 ms
+in sends at the base; the variant's exact pieces cut that to 3.6 ms. The
+shape the mechanism exists for (many modified elements with long details, or
+both inputs framed past any cut) is in no dataset, so its gain is unmeasured.
+
 ## Inspect --extended: validator-projection scan (bygg, 2026-10-31)
 
 `4dbc2d47` scans each blob inside the block validator instead of

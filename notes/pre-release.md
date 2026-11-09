@@ -291,13 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-103: The Mutex Receiver dispatch question
-
-Read `classify_unordered_desc_lock_wait_ns` against
-`classify_unordered_desc_recv_wait_ns` on a planet tags-filter or extract
-run (`reference/performance-history.md` has the history). Stored cells may
-already answer it.
-
 ### WRK-104: Counter name sets survive the refactors
 
 Observability, not performance: compare `brokkr sidecar <uuid> --counters`
@@ -342,9 +335,10 @@ an apply-changes and a renumber run for `13dd02aa`.
   `build_classify_schedule_blob_filtered_accepting_partial`.
 - Every ordered pool records `ordered_pool_*_wait_ns`, every unordered
   classify pool `classify_unordered_*_wait_ns`: one process-wide running
-  total emitted after every pool run. `classify_unordered_desc_lock_wait_ns`
-  is the shared-receiver mutex's own cost only while
-  `classify_unordered_desc_recv_wait_ns` stays near zero.
+  total emitted after every pool run. The desc lock wait includes peers
+  queued behind a holder blocked in its receive (reference/
+  performance-history.md, "Mutex<Receiver> blob dispatch is not a
+  bottleneck", which records the planet reading).
 - The encode-storage change (2026-11-01, the commit after `5789830e`)
   removed the writer's `Framed` chunk: every pipelined frame is now one
   owned buffer, so `writer_frame_ns` gains the header-and-body copy the

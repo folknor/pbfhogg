@@ -738,8 +738,27 @@ arc above. Do not build a batch-drain over this dispatch on "one lock per
 blob" reasoning without first measuring the lock is the binding cost. The
 classify pools that keep the dispatch record it: workers queued on the lock
 in `classify_unordered_desc_lock_wait_ns`, the holder waiting on an empty
-channel in `classify_unordered_desc_recv_wait_ns` (the first is the mutex's
-own cost only while the second stays near zero).
+channel in `classify_unordered_desc_recv_wait_ns`. The holder keeps the
+lock across its receive, so a receive wait of t with n peers queued adds up
+to n x t of lock wait: lock wait cannot be split into mutex cost and queue
+starvation by subtracting the receive wait. Both time only the slow path
+(a failed `try_lock`, an empty `try_recv`); uncontended acquisitions and
+successful receives are invisible, so they are stall counters, not a
+measure of the dispatch's whole CPU cost.
+
+Measured 2026-11-09 from stored cells, no new runs: every planet extract
+(simple, smart, complete) and tags-filter cell on bygg that carries the
+counters (26 cells, stored between `003fe717` and `141bb4c4`) records 43-420 ms of
+desc lock wait and 2-37 ms of desc recv wait per invocation, summed across
+about 30 workers, on walls of 52-316 s. The worst, extract --smart
+`a49fcc12` (`4a3ba718`, 132.6 s), splits per pool run (differences between
+successive emissions) as 77 / 85 / 80 / 170 ms lock and 1.5 / 4.5 / 3.5 /
+6.5 ms recv; the 80 ms run lasts under a second but is still summed over
+the workers, not a serial pause. Descriptor blocking is negligible on these
+workloads. This does not establish that an atomic-index claim or a batch
+drain would cost the same, only that there is no measured reason to replace
+the dispatch; an atomic claim would also have to re-home the dispatcher's
+one advancing `WILLNEED` cursor.
 
 ---
 

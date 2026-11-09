@@ -885,10 +885,11 @@ crate::counters::counter_set! {
         /// A worker blocked acquiring the mutex over the shared descriptor
         /// receiver, queued behind a peer that holds it. The holder keeps the
         /// lock across its receive, so this is the fan-out's queueing. Read
-        /// it against `classify_unordered_desc_recv_wait_ns`: with that near
-        /// zero (positions always waiting) this is the mutex's own cost; with
-        /// that large, the holder was starved of positions and this is mostly
-        /// peers queued behind the starved holder.
+        /// it against `classify_unordered_desc_recv_wait_ns`, but never by
+        /// subtraction: a holder's receive wait of t with n peers queued adds
+        /// up to n x t here, so even a small receive wait can account for much
+        /// of this. Only the slow path is timed (a failed `try_lock`);
+        /// uncontended acquisitions record nothing.
         desc_lock_wait_ns => "classify_unordered_desc_lock_wait_ns",
         /// A worker holding the descriptor receiver blocked on an empty
         /// channel: the dispatcher (and its `WILLNEED` advice) behind the
@@ -915,6 +916,14 @@ crate::counters::counter_set! {
 /// after it is released. The mutex guards no application state that recovery
 /// could expose half updated, so a poisoned guard lets the remaining workers
 /// go on; a worker's panic still propagates when the scope joins.
+///
+/// One lock per blob is not a measured cost: stored planet extract and
+/// tags-filter cells on bygg (through `141bb4c4`) record well under half a
+/// second of descriptor lock wait per invocation, summed over every worker,
+/// on walls above 50 s (reference/performance-history.md, "Mutex<Receiver>
+/// blob dispatch is not a bottleneck"). A batch drain or an atomic claim
+/// needs a measurement showing this lock binding first; an atomic claim
+/// would also have to re-home the dispatcher's advancing `WILLNEED` cursor.
 fn next_position(
     rx: &std::sync::Mutex<std::sync::mpsc::Receiver<usize>>,
     metrics: &UnorderedPoolMetrics,

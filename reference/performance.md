@@ -43,9 +43,12 @@ pbfhogg spreads a handful of coarse `hotpath::measure` points across each
 command, so `--hotpath` / `--alloc` overhead is workload-dependent and
 usually small.
 
-- **Verdicts come from `--bench 3` best-of, not a single `--bench 1` run.**
-  `brokkr <cmd> --bench` defaults to three runs and stores the best. Planet
-  is often run `--bench 1` on cost, so a single-shot delta of a few percent
+- **Use matched, interleaved cells for verdicts.**
+  `brokkr bench NAME --dataset D` defaults to three iterations and stores
+  the best. For A/B comparisons, alternate `brokkr bench --iterations 1
+  [--commit REF] NAME --dataset D` cells and compare medians and sign
+  consistency across pairs. Planet is often run with one iteration on
+  cost, so a single-shot delta of a few percent
   at sub-150-s walls, and a larger fraction at sub-10-s walls, sits inside
   observed bench-to-bench variance (this file flags such rows "within
   noise"). A spec claiming a win states the expected bound up front and the
@@ -62,11 +65,11 @@ usually small.
   seconds relative to wall clock: on the denmark run `frame_blob_into`
   reports 614% and `process_block` 158%, the parallel compression and
   block-processing pools spending several core-seconds per wall-second.
-- **Neither `--hotpath` nor `--alloc` emits a peak-RSS figure.** Both run
-  under the instrumentation features and produce no `/proc` sidecar timeline
-  at all - only a point-in-time thread snapshot (415.9 MB hotpath, 315.6 MB
-  alloc on the denmark run), which is not the peak and here sits below the
-  clean 1.49 GB. Peak anon RSS comes from `--bench` or plain runs only.
+- **Read peak RSS from the child sidecar.** Current script benches store
+  `/proc` samples for profiling runs too. In the historical typed denmark
+  calibration above, hotpath and alloc captured only point-in-time thread
+  snapshots (415.9 MB hotpath, 315.6 MB alloc), below the clean 1.49 GB;
+  those snapshots are not peak figures.
 - **`--alloc` numbers are valid only from commit `678478d` onward.** That
   commit installs `CountingAllocator` as the global allocator under the
   hotpath-alloc feature; before it, tracking was not wired to the global

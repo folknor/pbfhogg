@@ -46,11 +46,12 @@ impl BlobTask {
 }
 
 /// Header-only scan building a per-kind schedule with element counts.
-/// Requires indexed PBFs (all brokkr datasets are indexed): the per-blob
+/// Requires indexed PBFs: the per-blob
 /// element count is read from `BlobIndex.count`, which is required to
 /// precompute each blob's `base_new_id` without a full decode pass. If a
-/// matching blob is missing indexdata, we error out with a pointer to
-/// `brokkr cat` / indexed datasets.
+/// matching blob is missing indexdata, we error out. Use an indexed dataset
+/// from `brokkr download`; `brokkr bench copy-pbf` measures indexing into
+/// iteration scratch and does not retain a reusable indexed file.
 /// Scan all blob headers once and build per-kind schedules.
 /// Returns `(node_schedule, way_schedule, relation_schedule)`.
 ///

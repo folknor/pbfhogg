@@ -33,7 +33,7 @@ Specifications are saved to the ./notes folder.
    (`brokkr check --profile full`, or a named `brokkr test <file> <name>`)
    for changes to the reader, writer, `BlockBuilder`, or `PbfWriter`, where
    re-encoding a whole PBF and reading it back is the check no smaller test
-   makes; a `brokkr <command> --dataset <D> --bench` run for anything
+   makes; a `brokkr bench NAME --dataset <D>` run for anything
    claiming or risking a performance effect (the win, its neutrality, or -
    when a feature knowingly pays for capability with throughput - the
    accepted cost, stated as an explicit bound the keep/revert verdict is
@@ -83,7 +83,7 @@ Specifications are saved to the ./notes folder.
    at every landing: commit first, then measure, then record numbers
    against the commit hash (never benchmark uncommitted code). For a
    before/after comparison, land the change, bench HEAD for the after
-   number, and bench the baseline with `brokkr <cmd> --commit <ref> --bench`,
+   number, and bench the baseline with `brokkr bench --commit <ref> NAME`,
    which builds and benches a prior commit in its own worktree and stores the
    row tagged to it - so a baseline is available at any time from your own
    branch.

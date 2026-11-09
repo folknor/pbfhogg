@@ -147,7 +147,8 @@ are the whole phase.
 > **New japan baseline: 12.3 s `--bench 3` (`26203e64`, `fb743f6`).**
 > Retire 15.5 s (cold-walk single sample) and 11.9 s (pre-prepass).
 > Re-pin japan with a *warm* first walk or the number measures cache
-> state - and prefer `--bench 3`, whose best-of-N escapes the cold walk
+> state - and prefer `brokkr bench --iterations 3 embed-locations --dataset japan`,
+> whose best-of-N escapes the cold walk
 > by construction.
 
 Sparse-vs-external, all at `dcc445e` (2026-07-14) - see P1 for how to

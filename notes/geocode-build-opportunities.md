@@ -22,7 +22,7 @@ Denmark 5.0 s -> 3.4 s (-32 %).
 build-geocode-index change landed between `82db8ed` and `052da8b`;
 the win came from cross-cutting read/write-path restructures (commits
 between `aee7727` and `052da8b` - blob wire-format split, raw-frame
-split, write framing/pipeline split). Worth a `--bench 3` confirm
+split, write framing/pipeline split). Worth a `brokkr bench --iterations 3 geocode-build --dataset planet` confirm
 before treating this as the new baseline - single-sample at this
 scale sits inside run-to-run variance.
 

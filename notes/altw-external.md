@@ -124,8 +124,8 @@ That is precisely what produced the +5.5 % (2026-07-14 blocked
 opposite signs, both pure run order.
 
 **Method note worth keeping:** matched sample counts are necessary but
-not sufficient. `--bench N` is best-of-N *within* a cell, so a blocked
-pair still samples one point in drive-state time. Alternate `--bench 1`
+not sufficient. `--iterations N` is best-of-N *within* a cell, so a blocked
+pair still samples one point in drive-state time. Alternate `--iterations 1`
 cells and compare medians; weigh sign consistency across pairs above the
 median gap.
 

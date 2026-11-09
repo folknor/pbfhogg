@@ -383,7 +383,7 @@ are removed; git history keeps them. Detail stays in notes/.
   then planet ship/no-ship, keep gate >= 3 % europe at equivalent
   output size AND an explicit revisit of the "zero C deps" policy from
   `d180d62` - the policy rejection stands until deliberately
-  overturned. Never measure it on `brokkr bench write` (proven unable
+  overturned. Never measure it on `brokkr bench encode-workload` (proven unable
   to discriminate).
 - apply-changes #11 splice-in-place / #13 exact-membership metadata
   (see the apply-changes entry below).
@@ -840,7 +840,7 @@ Known to work, no performance question open, but not in the results DB:
 - [ ] **`renumber` with non-default flags**. Has no non-default flags
   in pbfhogg today (just the one variant since the in-memory path
   was retired). If a future variant adds flags this reopens.
-- [ ] **`brokkr read` / `bench-write` / `bench-merge` at planet**.
+- [ ] **`brokkr bench decode-workload` / `brokkr bench encode-workload` / `brokkr bench merge-workload` at planet**.
   Synthetic benchmarks, intentionally excluded from the README user
   surface. Periodically-useful diagnostic tools; not a validation
   target.

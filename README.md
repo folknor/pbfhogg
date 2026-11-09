@@ -229,6 +229,8 @@ not yet explained. -->
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
+Run a workload with `brokkr bench --iterations 1 copy-pbf --dataset denmark`; use `brokkr bench NAME --help` for its params and the [bench mapping](AGENTS.md#pbfhogg-bench-mapping) for other commands. Runner options such as `--hotpath`, `--alloc`, `--commit REF` and `--dry-run` go before NAME.
+
 System: every table above on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, NVMe SSD. Measured with brokkr.
 
 ## Acknowledgements

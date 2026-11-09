@@ -1,7 +1,6 @@
 # Script benches (`brokkr man bench`, `brokkr man bench-config`), run as
 # `brokkr bench NAME ...` and stored in brokkr's per-user bench store, which
-# `brokkr results` reads. They stand beside the typed `brokkr <command>
-# --bench` layer.
+# `brokkr results` reads. Use these instead of typed pbfhogg bench subcommands.
 #
 # Layout. This file is the registry: one [bench.NAME] table per bench,
 # holding its annotations, build settings and params. The Lua lives in

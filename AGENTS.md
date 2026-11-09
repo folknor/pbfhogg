@@ -24,28 +24,30 @@ Dev tool at `~/Programs/brokkr`. Invoked as `brokkr` from project root (reads `.
 
 Script benches (`brokkr bench NAME`, `brokkr man bench`): each is a `[bench.NAME]` table in `brokkr.d/benches.toml` with `description`/`version`/`date`/`changelog`, its Lua in `benches/<family>/<NAME>.lua` (family = the pbfhogg command driven, or `compare` for cross-tool benches; NAME = file stem, globally unique, no family prefix). Never inline a script. The header of `brokkr.d/benches.toml` holds the full convention.
 
-```
-brokkr <command> [--dataset D] [--variant V]   # run once, print timing
-brokkr <command> [--dataset D] --bench          # 3 runs, store in DB + sidecar profiler
-brokkr <command> [--dataset D] --hotpath        # function-level timing
-brokkr <command> [--dataset D] --alloc          # allocation tracking
-brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg
-brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg
-brokkr <command> [--dataset D] --commit <ref>   # build+bench an old commit in a worktree (baselines)
+```sh
+brokkr bench [--iterations N] [--hotpath | --alloc] [--commit REF] NAME --dataset D
+brokkr bench --dry-run NAME --dataset D
+brokkr bench NAME --help
 ```
 
-`--commit <ref>` builds and benchmarks a prior commit in brokkr's own git
-worktree and stores the result tagged to that commit - pass it to capture a
-before/after baseline from your own branch.
+Runner options go before NAME; script params go after it. `--iterations N`
+defaults to 3 and stores the fastest iteration. `--hotpath` profiles functions;
+`--alloc` profiles allocations. `--commit REF` builds an old revision in a
+persistent worktree with its own target directory, using the current scripts.
+`--dry-run` validates without building or measuring. See `brokkr man bench`.
 
-Each worktree builds into its own `CARGO_TARGET_DIR`, so `--commit` cells
-interleave freely with HEAD cells. The first build per commit is a cold
-rebuild; worktrees persist and are reused, so that cost is once per
-commit, not per cell (`brokkr clean --worktrees` removes them).
+Params and supported modes are declared in `brokkr.d/benches.toml` and each
+script's header. Boolean params take `yes` or `no`, for example
+`--direct-io yes` or `--io-uring yes` where supported. Marker stops are a
+script param: `--stop RENUMBER_EXT_STAGE2D_END`, `--stop -RENUMBER_EXT_STAGE2D`
+and `--stop RENUMBER_EXT_STAGE2D` resolve to the same end marker. Stopped
+outputs are incomplete; consult the bench help for stop support.
 
-`--stop MARKER` requires a measured mode. Kills process after the named marker. Accepts three spellings: verbatim (`--stop RENUMBER_EXT_STAGE2D_END`), the `-` sigil (`--stop -RENUMBER_EXT_STAGE2D` → resolves to `RENUMBER_EXT_STAGE2D_END`), and the bare-name fallback (`--stop RENUMBER_EXT_STAGE2D` → also resolves to `RENUMBER_EXT_STAGE2D_END`; the sidecar log line shows the resolved form).
-
-Markers are point-in-time bookmarks - the FIFO protocol is `<timestamp_us> <name>` per marker, nothing else. The default `brokkr sidecar <uuid>` view segments the stream between consecutive markers; `brokkr sidecar <uuid> --durations` is the one view that opts into the `FOO_START` / `FOO_END` pairing convention for duration math.
+Runs are stored even for dirty trees, marked dirty and excluded from
+comparisons. There is no runner `--force` option. Markdown and config edits
+are excluded from the measurement dirty policy. Script results live in the
+per-user bench store, read through `brokkr results`; older typed results
+remain in `.brokkr/results.db`.
 
 ### Sidecar conventions
 
@@ -60,26 +62,66 @@ Brokkr is convention-free at the protocol layer. Two optional naming conventions
 
 Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count - derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
-`--bench N` runs N times, stores best. Default `--bench 3`.
+### pbfhogg bench mapping
 
-Requires clean git tree (except for `*.md` and `.brokkr/results.db`); `--force` permits a dirty tree, but dirty tree results are not stored in the database.
+Use `brokkr bench NAME --help` for params. The former typed commands map to:
 
-I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--force` is a per-subcommand flag (`brokkr <cmd> --force ...`, not `brokkr --force <cmd> ...`).
+| Former typed command | Bench NAME and required mode |
+|---|---|
+| `sort` | `sort-pbf` |
+| `cat` | `copy-pbf` |
+| `inspect` | `file-info` |
+| `add-locations-to-ways` | `embed-locations` |
+| `apply-changes` | `apply-diff` |
+| `merge-changes` | `merge-diffs` |
+| `diff` | `diff-applied` |
+| `diff-snapshots` | `diff-pair` |
+| `extract` | `region-extract` |
+| `multi-extract` | `region-extract --mode multi` |
+| `getid` | `id-select` |
+| `getparents` | `parent-select` |
+| `tags-filter` | `tag-select` |
+| `time-filter` | `time-snapshot` |
+| `renumber` | `id-remap` |
+| `repack` | `reencode-pbf` |
+| `degrade` | `perturb-pbf` |
+| `check-ids` | `id-order` |
+| `check-refs` | `ref-integrity` |
+| `check-index` | `index-integrity` |
+| `check-locations` | `location-integrity` |
+| `digest` | `canonical-digest` |
+| `build-geocode-index` | `geocode-build` |
+| `read` | `decode-workload` |
+| `write` | `encode-workload` |
+| `merge` | `merge-workload` |
 
-### pbfhogg commands (every CLI command is a brokkr subcommand)
+Examples:
 
-- `brokkr inspect --tags --dataset denmark` (add `--type way` to narrow, or `--nodes` for node stats)
-- `inspect` describes a file (what it is and claims, from indexdata by default; exit 0), `check` verifies it (contents against claims and invariants; exit 1 on a violation). A new flag that answers "is this file right?" belongs on `check`, one that answers "what is in it?" on `inspect`.
-- `brokkr add-locations-to-ways --dataset europe --index-type external --bench`
-- `brokkr build-geocode-index --dataset denmark --hotpath`
-- `brokkr multi-extract --dataset japan --regions 5 --bench`
-- `brokkr read --bench` - multi-variant read benchmark
-- `brokkr cat [--type way|relation] [--dedupe] [--clean] --dataset planet --bench` - no flags = indexdata-generation passthrough (no re-decode). `--type way|relation` filters to one object kind. `--dedupe` runs the two-input dedupe path (supports `--io-uring`). `--clean` passes `--clean version`, so every blob is decoded and re-encoded in one ordered pass. Flags combine, except `--dedupe` with `--clean`, which pbfhogg refuses.
-- `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench` - multi-OSC merge. Expands range to configured `osc.<seq>` entries. Variant suffix `+range-LO-HI`.
-- `brokkr diff-snapshots --dataset planet --from base --to 20260411 --bench 1` - diff two independent PBFs (no byte-level overlap, full decode both sides). `--from`/`--to` accept snapshot keys or `base`. `--format default|osc`.
-- `brokkr repack --dataset denmark --bench` - re-encode a PBF with a configurable elements-per-blob cap. Flags: `--elements-per-blob N` (omit for pbfhogg default 8000), `--compression zlib:N|zstd:N|none`, `--snapshot KEY` (read from a registered snapshot), `--as-snapshot KEY` (promote final iteration into the dataset graph as `pbf.indexed`; `--replace-snapshot` to overwrite), `--force-repack` (skip indexdata requirement). Default writes to scratch, overwritten each `--bench` iteration.
-- `brokkr degrade --dataset denmark --bench --strip-locations` - produce an adversarial PBF by stripping properties or perturbing structure. Transformation flags compose: `--strip-indexdata` (clear `BlobHeader.indexdata` on every OsmData blob; metadata-only fast path, no element decode), `--strip-locations` (drop `LocationsOnWays`, re-encode ways without inline coords), `--unsort` (clear `Sort.Type_then_ID` and emit one adjacent same-kind blob pair per kind with overlapping ID ranges). At least one transformation flag is required. Other flags: `--snapshot KEY`, `--as-snapshot KEY` (promotes to `pbf.raw` if `--strip-indexdata` else `pbf.indexed`; `--replace-snapshot` to overwrite), `--compression zlib:N|zstd:N|none`.
-- `brokkr suite pbfhogg --bench` - full suite
+```sh
+brokkr bench file-info --dataset denmark --mode tags --type way
+brokkr bench --iterations 1 embed-locations --dataset europe --index-type external
+brokkr bench --hotpath geocode-build --dataset denmark
+brokkr bench region-extract --dataset japan --mode multi --regions 5
+brokkr bench copy-pbf --dataset planet --clean yes
+brokkr bench merge-diffs --dataset planet --osc 4914..4920
+brokkr bench --iterations 1 diff-pair --dataset planet --from base --to 20260411
+brokkr bench reencode-pbf --dataset denmark --elements-per-blob 8000
+brokkr bench perturb-pbf --dataset denmark --strip-locations yes
+```
+
+`file-info --mode nodes` reads node statistics. Its tags mode suppresses row
+printing with a high minimum count, matching the former typed workload.
+`copy-pbf` defaults to indexdata-generation passthrough; `--clean yes` strips
+version while re-encoding, `--type way|relation` filters, and `--dedupe yes`
+merges the input with itself. Dedupe conflicts with cleaning and type filtering;
+io_uring requires dedupe. `merge-diffs --osc` accepts sequences, lists and ranges.
+`perturb-pbf` requires at least one of `--strip-indexdata yes`,
+`--strip-locations yes` or `--unsort yes`. Snapshot promotion is not supported
+by these scripts; see the snapshot model below.
+
+`inspect` describes a file; `check` verifies claims and invariants. Flags that
+answer "is this file right?" belong on `check`; descriptive flags on `inspect`.
+`brokkr suite pbfhogg --bench` remains a generic suite command.
 
 ### Utility commands
 
@@ -92,9 +134,9 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 - `brokkr results [--commit X] [--compare A B] [--command CMD] [--mode M] [--grep STR] [--grep-v STR] [--dataset D] [--meta K=V] [--env K=V] [--top N]` - query/compare from SQLite. `--command` substring-matches; `--mode` filters by measurement mode (`bench`/`hotpath`/`alloc`); `--dataset` substring match on input file; `--meta` / `--env` exact match, composable with AND.
   - `--grep STR` substring-matches against both `cli_args` and `brokkr_args`, repeatable with AND semantics (`--grep apply-changes --grep zstd:1`).
   - `--grep-v STR` excludes; repeatable, excludes on ANY match; composes with `--grep`. **This is how you select the arm of an A/B distinguished only by an absent flag** - `--grep add-locations-to-ways --grep-v inject-prepass` gets the flag-OFF arm, which `--grep` alone cannot express. Both work with `--compare`.
-- `brokkr results <uuid>` renders per-iteration walls for `--bench N` runs. **The iteration order is the diagnostic**: iteration 1 slow then 2/3 fast is a cold page cache; iteration 1 fast then 3 slow is drive-state exhaustion. These are opposite diagnoses, so never read a `--bench N` row as a single number when the walls disagree.
+- `brokkr results <uuid>` renders per-iteration walls for `--iterations N` runs. **The iteration order is the diagnostic**: iteration 1 slow then 2/3 fast is a cold page cache; iteration 1 fast then 3 slow is drive-state exhaustion. These are opposite diagnoses, so never read a `--iterations N` row as a single number when the walls disagree.
 - `brokkr sidecar <UUID>` - per-phase JSONL summary (default view). Pass `--human` for a fixed-width table.
-- `brokkr sidecar <UUID> --run N|all` - pick an iteration within a `--bench N` result (default: the best run). **The sidecar stores every iteration even though older `results` rows kept only the best wall** - this is how you recover a cold-vs-warm story from an already-recorded bench.
+- `brokkr sidecar <UUID> --run N|all` - pick an iteration within a `--iterations N` result (default: the best run). **The sidecar stores every iteration even though older `results` rows kept only the best wall** - this is how you recover a cold-vs-warm story from an already-recorded bench.
 - `brokkr sidecar <UUID> --samples` - raw /proc samples as JSONL. Composable: `--fields`, `--where`, `--every`, `--head`/`--tail`, `--phase`, `--range`.
 - `brokkr sidecar <UUID> --stat FIELD` - min/max/avg/p50/p95 for a /proc field (composes with `--phase`, `--range`, `--where`).
 - `brokkr sidecar <UUID> --markers` - raw marker events (JSONL).
@@ -112,22 +154,44 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 
 ### OSC resolver
 
-`--osc-seq` auto-selects only with exactly one `[osc.<seq>]` entry. Multiple OSCs require explicit `--osc-seq N`. Applies to both primary and snapshot-scoped OSC tables.
+`apply-diff` and `diff-applied` use `--osc N`; omission requires exactly one
+entry in the selected snapshot's OSC table. `merge-diffs --osc` is required
+and supports lists, repeated flags, `all` and inclusive ranges.
+`tag-select --input-kind osc --input N` requires an explicit sequence.
+`merge-workload --osc-seq N` selects from the primary OSC table only.
+Generic commands retain their own OSC options; see their help.
 
 ### Snapshot model
 
-Datasets have one **primary** PBF (`[datasets.<region>.pbf.*]` + `[datasets.<region>.osc.*]`) plus optional named **snapshots** (`[datasets.<region>.snapshot.<key>.*]`). Primary is the default; snapshots addressable via `--snapshot <key>` on `apply-changes`, `merge-changes`, `tags-filter --input-kind osc`, `diff` (including `--format osc`), `--from`/`--to` on `diff-snapshots`, and as input to `repack` / `degrade`. `--snapshot base` = primary. Key `base` is reserved. Snapshot-scoped runs: find them with `brokkr results --grep <key>` (e.g. `--grep 20260411`); `--snapshot <key>` shows up verbatim in `cli_args`.
+Datasets have a primary PBF (`[datasets.<region>.pbf.*]`) and OSC table,
+plus optional `[datasets.<region>.snapshot.<key>.*]` tables. `base` is reserved
+for the primary. Snapshot-aware scripts take `--snapshot KEY`, usually with
+`--variant`; `tag-select` uses `--input` for the PBF variant or OSC sequence.
+`diff-pair` takes `--from` and `--to`; non-indexed pairs require both
+`--variant` and `--to-variant` set to the same key. `encode-workload` and
+`merge-workload` remain primary-only. Bound params and input digests are
+stored with script results; inspect them with `brokkr results UUID`.
 
-**Producer side** (`--as-snapshot KEY` on `download`, `repack`, `degrade`): writes the artifact into the dataset graph as a new `[snapshot.<key>]` block. `repack` always writes `pbf.indexed`. `degrade` writes `pbf.raw` if `--strip-indexdata` is set, otherwise `pbf.indexed`. `--replace-snapshot` overwrites an existing key (without it, an existing key is a hard error). The pbfhogg child runs to completion *before* the existence check, so omitting `--replace-snapshot` on an existing key wastes the build.
+**Producer gap (brokkr ticket 145):** script outputs are iteration-owned
+scratch. Snapshot promotion via `--as-snapshot` and `--replace-snapshot`
+still needs the typed repack/degrade producer until persistent output and
+registration land. There is no equivalent bench invocation yet. Repack
+registers `pbf.indexed`; degrade registers `pbf.raw` when stripping indexdata,
+otherwise `pbf.indexed`. `brokkr download --as-snapshot KEY` remains available.
 
-**Consumer-side `--snapshot` is complete** (brokkr commit `e635f5b`, confirmed 2026-07-10): every consumer command (`sort`, `inspect`, `cat`, `getid`, `getparents`, `check-refs`, `check-ids`, `renumber`, `time-filter`, `add-locations-to-ways`, `build-geocode-index`, `tags-filter` PBF and OSC, `extract`, `multi-extract`) accepts `--snapshot KEY`, resolved centrally with `--variant` composition, xxhash verification, and hard error on unknown keys. Snapshot runs are greppable via `brokkr results --grep <key>` (the flag lands verbatim in `brokkr_args`). `brokkr verify <cmd> --snapshot <key>` and `brokkr read --snapshot <key>` are also supported (brokkr 2026-07-10, commit `90749cc` + OSC-resolution follow-up); only the synthetic `bench-write`/`bench-merge` commands remain snapshot-unaware. Change-consuming verifies (merge / derive-changes / diff / all) resolve OSC three-way: snapshot-scoped when the snapshot has its own osc table (point-in-time snapshots), base fallback when it does not (encoding-only snapshots from repack/degrade - the base chain is the logically-correct diff stream for a same-sequence re-encode), narrated on stderr whenever `--snapshot` was passed. `verify all` skips merge/derive cleanly on snapshots with no resolvable OSC.
+`brokkr verify <cmd> --snapshot KEY` remains available. Change-consuming
+verifies use the snapshot OSC table if present, otherwise the primary OSC
+table for encoding-only snapshots; they narrate fallback on stderr.
+`verify all` skips merge/derive if no OSC resolves. The script benches use
+only the selected snapshot's OSC table, without this fallback.
 
-`brokkr diff-snapshots` compares two independent PBFs (full decode both sides). `brokkr diff` runs apply-changes internally first (byte-equal blob fast-path). Different code paths, different things measured.
+`diff-pair` compares independent PBFs with full decode on both sides.
+`diff-applied` first applies changes, then uses the byte-equal blob fast path.
 
 ### brokkr.toml schema
 
 - `pbf.<variant>` - PBF files keyed by variant (raw/indexed/altw). `--variant` selects (default: indexed).
-- `osc.<seq>` - OSC diff files keyed by seq. `--osc-seq` selects.
+- `osc.<seq>` - OSC diff files keyed by seq. `--osc` selects in apply/diff benches; `tag-select` uses `--input`, and `merge-workload` uses `--osc-seq`.
 - `snapshot.<key>` - named point-in-time captures with own `pbf`/`osc` tables.
 - `download_date` - human annotation only, not read by code.
 - `xxhash` - XXH128 hash. `brokkr env` shows computed values.
@@ -135,13 +199,13 @@ Datasets have one **primary** PBF (`[datasets.<region>.pbf.*]` + `[datasets.<reg
 - `bbox` (dataset level) - default box for `extract` / `multi-extract` benches and `verify`; absent, verify skips extract and multi-extract. Choose it for verify cost on the host, not only for lying inside the region.
 - `getid_ids` / `getparents_ids` (dataset level) - IDs the getid/getparents benches request; absent, brokkr's built-in Denmark IDs. A configured list qualifies the result rows' pairing key. `brokkr man datasets` has the full rules.
 
-Results in `.brokkr/results.db` (SQLite, tracked in git).
+Legacy typed results are in `.brokkr/results.db` (SQLite, tracked in git); script results use the per-user bench store.
 
 ## Indexdata PBFs
 
-Generated by `brokkr download` (passthrough cat after raw PBF lands). Benchmark: `brokkr cat --dataset planet --bench 1`.
+Generated by `brokkr download` (passthrough cat after raw PBF lands). Benchmark: `brokkr bench --iterations 1 copy-pbf --dataset planet`.
 
-Commands requiring indexdata: the per-command truth is the "Proceeding without indexdata" table in `docs/cli/commands.md`. Use `--force` to run without (slower; for `repack` the flag is `--force-repack` to disambiguate from brokkr's own `--force`). `inspect --indexed` checks (exit 0/1).
+Commands requiring indexdata: the per-command truth is the "Proceeding without indexdata" table in `docs/cli/commands.md`. For benchmarks, use the script-specific fallback param, such as `sort-pbf --force-sort yes`, `embed-locations --force-altw yes` or `reencode-pbf --force-repack yes`. `geocode-build` always enables its forced fallback. See each bench help. Use `brokkr bench index-integrity` to verify indexdata against payloads.
 
 ### add-locations-to-ways index types
 
@@ -162,7 +226,7 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 - **Never run `brokkr verify` on any dataset larger than germany.** Planet, europe and north-america are bench-only; correctness on real data is checked on denmark and germany.
 - Multiple benchmark runs in an optimization workflow: run sequentially, report between runs.
 - **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.
-- **Interleave matched A/B cells.** `--bench N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--bench 3` cells are still confounded. Alternate `--bench 1` cells, compare medians, and check sign consistency across pairs.
+- **Interleave matched A/B cells.** `--iterations N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--iterations 3` cells are still confounded. Alternate `--iterations 1` cells, compare medians, and check sign consistency across pairs.
 - **A same-day matched pair beats any historical number.** Old baselines were recorded under uncontrolled drive and page-cache state; when they disagree with a fresh matched pair, retire the historical figure rather than defend it.
 - **Balance what precedes each arm, not only the arm order.** A planet cell that follows a scratch-heavy cell (altw external, apply-changes, merge-changes) can run tens of seconds slower than the first cell after a trim or a rest, on identical code. When run-history effects appear, give each arm the same predecessor workload and the same first-after-trim position; alternation alone does not do it when the arms write different scratch volumes.
 - **Read a span from its START/END pair, not from a segment row.** `brokkr sidecar --human` and `--compare` label each segment by the marker that begins it, so a row named `FOO_END` measures what ran after FOO, not FOO; `--durations` gives the span itself.
@@ -195,7 +259,7 @@ The third member, **`pbfhogg-harness`** (`harness/`, bin only, `publish = false`
 
 ## Conventions
 - Library code never mutates process state, reads the environment or writes stderr; see ADR-0016.
-- Performance numbers in markdown must include commit hash and hostname. Results auto-stored in `.brokkr/results.db`.
+- Performance numbers in markdown must include commit hash and hostname. Script results are auto-stored in the per-user bench store; legacy typed results remain in `.brokkr/results.db`.
 - `reference/performance-history.md` is a record of measured numbers and their verdicts, not of machinery: how the code works is described in the code and the other reference documents.
 - Strict clippy: `unwrap_used = "deny"`, `expect_used = "deny"` (tests exempt; a production `expect` carries `#[expect(clippy::expect_used, reason = "...")]` saying why it cannot fire - see `clippy.toml`), `cognitive_complexity = "deny"`.
 - Tunables (sizes, depths, worker counts and caps, channel and reorder capacities, timeouts, thresholds, geocode policy values) live in `src/tunables.rs`, grouped by scope with their rationale. A new tunable goes there, not in a local `const` or an inline literal. Format and protocol constants (field numbers, record layouts, spec limits) stay with the code that owns the format.

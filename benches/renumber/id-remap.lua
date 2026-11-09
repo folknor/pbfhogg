@@ -2,8 +2,8 @@
 -- Use the binary's default start IDs and external renumber path, as the
 -- typed runner does; it exposes no start-ID or scratch-directory option.
 -- No cache preparation. Child wall matches the typed workload; iteration
--- wall also includes Lua bookkeeping. Output is iteration-owned on the
--- project disk, rather than host scratch. Compression is omitted by
+-- wall also includes Lua bookkeeping. Output is iteration-owned under
+-- bench-iterations on the host's resolved scratch. Compression is omitted by
 -- default so the built revision chooses its own default. Current renumber
 -- also maps explicit zlib and zlib:6 to zlib:1; forward them unchanged.
 -- Profiling and marker stops combine; a stop makes no complete-run claim.

@@ -3,8 +3,8 @@
 -- does; otherwise use its fixed Denmark IDs. Preserve their order and
 -- canonicalize leading zeros without converting 64-bit IDs to Lua numbers.
 -- No cache preparation. Child wall matches the typed workload; iteration
--- wall also includes Lua bookkeeping. Output is iteration-owned, on the
--- project disk rather than the typed runner's configured scratch disk.
+-- wall also includes Lua bookkeeping. Output is iteration-owned under
+-- bench-iterations on the host's resolved scratch.
 -- Profiling and marker stops combine; a stop makes no complete-run claim.
 -- io_uring is absent because typed getparents refuses it too. Build features,
 -- commit selection and iteration counts belong to the bench runner.

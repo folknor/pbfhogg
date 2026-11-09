@@ -193,6 +193,28 @@ params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "th
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
 params.type = { choices = ["all", "node", "way", "relation"], default = "all", help = "diff's --type, all for none" }
 
+# -- digest
+
+[bench.canonical-digest]
+script_file = "../benches/digest/canonical-digest.lua"
+description = "Digest a dataset or snapshot in full or content canonical form"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed digest: canonical forms, snapshots, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.form = { choices = ["auto", "full", "content"], default = "auto", help = "auto: typed omitted-form behavior, full since 16154b0d and content before; set an explicit form for matched comparisons" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- getid
 
 [bench.id-select]

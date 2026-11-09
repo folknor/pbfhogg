@@ -2,7 +2,7 @@
 -- PBF defaults to the two-pass reference-preserving path; OSC emits direct
 -- matches into .osc.gz, matching the typed runner. No cache preparation.
 -- Child wall matches the typed workload; iteration wall includes Lua work.
--- Output is iteration-owned on the project disk. Compression is omitted
+-- Output is iteration-owned on host scratch under bench-iterations. Compression is omitted
 -- by default so the built revision chooses it. Profiling and stops combine.
 --
 -- --input selects the typed --variant for PBF, or --osc-seq for OSC. It is

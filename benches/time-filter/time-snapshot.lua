@@ -2,7 +2,7 @@
 -- Preserve its fixed 2024-01-01T00:00:00Z cutoff; typed time-filter exposes
 -- no timestamp option. No cache preparation. Child wall matches the typed
 -- workload; iteration wall also includes Lua bookkeeping. Output is
--- iteration-owned on the project disk, rather than host scratch.
+-- iteration-owned under bench-iterations on the host's resolved scratch.
 -- Profiling and marker stops combine; a stop makes no complete-run claim.
 -- io_uring is absent because the typed command refuses it. Build features,
 -- commit selection and iteration counts belong to the bench runner.

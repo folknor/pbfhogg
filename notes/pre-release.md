@@ -229,8 +229,13 @@ question.
 
 Residue. The gate now notifies only parked workers and passthrough runs
 ahead of its decode result (reference/performance.md, "Ordered pool:
-notify only parked workers"); the window measured as never binding, so
-stage 1 parking is not a cost. The `60e1b691` against `c2409c45`
+notify only parked workers"); the window did not bind in any cell of that
+measurement, so stage 1 parking is not a cost. It has bound elsewhere:
+planet `cat --clean` cell `a8a4384e` (bygg, `627883d7`, under the two-arena
+malloc cap removed in `25172fc3`) records 74.2 s of
+`ordered_pool_window_wait_ns`, 31 % of its wall, and germany cells
+`62ee147e` and `42a26ca1` about 3 s (18 %); the HEAD-era planet cell
+`6f9896db` records 0. The `60e1b691` against `c2409c45`
 attribution is superseded: the callers were reshaped since (`7e7ede73`,
 `9ebcfa97`, `44c62853`), so HEAD is the shape to measure. Left:
 
@@ -269,18 +274,6 @@ with compact lines. Derive's per-unit spill to scratch would cover both
 but costs the text diff's no-scratch contract; a cut by an estimate of
 detail bytes would not. Unmeasured; no input of that shape exists in the
 datasets.
-
-### WRK-095: cat --clean version across the single ordered pass
-
-`cat --clean version` on planet, `a05b3d25` vs `8da26b23` (one ordered pass
-per input instead of three per-kind phases, window 64, not tuned): wall,
-peak anon, stall counters, and whether workers stall behind a slow head
-blob. Baseline `f2315551`: 333.8 s, 750 MB peak anon (plantasjen). The HEAD
-half is done: `6f9896db` at `1f93e674` on bygg, 146 s and 766 MB, no window
-or send wait and the consumer idle 89 % of the wall, so at HEAD no worker
-stalls behind a slow head (reference/performance.md, "cat --clean's peak
-against the README row"). What is left is the pair across `8da26b23`
-itself.
 
 ### WRK-096: Writer cluster
 

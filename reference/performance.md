@@ -1695,9 +1695,41 @@ The ordered pool's 64-task window does not hold it. Stall counters:
 idle for want of a result), `ordered_pool_window_wait_ns` and
 `ordered_pool_result_send_wait_ns` 0. The consumer only writes raw frames,
 so results in flight stay near one per worker and the window binds only
-behind a slow head, which this run never had. The peak is the workers' own
+behind a slow head. Zero window wait says the admission window did not bind
+in this run; consumer receive wait is not worker idle time, so it does not
+prove no result ever waited behind a slow head. The peak is the workers' own
 working sets: decode, read and encode buffers and frames of the blob in
 hand.
+
+### cat --clean across the single ordered pass (bygg, 2026-11-09, `a05b3d25` vs `8da26b23`)
+
+Planet `cat --clean version` on `planet-20260223-reindexed`, the parent
+(three per-kind phases, a `ReorderBuffer` each) against the commit that made
+it one ordered pass with a private 64-slot credit window. Both arms built as
+`--commit` worktrees (brokkr#105 cancels), `--bench 1`, A B B A, untrimmed:
+
+| Cell | Commit | Wall | Peak anon | Avg anon |
+|---|---|---|---|---|
+| `8b442cca` | `a05b3d25` | 229.3 s | 1,043 MB | 941 MB |
+| `5cba4939` | `8da26b23` | 231.4 s | 1,104 MB | 902 MB |
+| `91b5ebba` | `8da26b23` | 233.3 s | 1,097 MB | 871 MB |
+| `c726040f` | `a05b3d25` | 228.7 s | 1,077 MB | 959 MB |
+
+The one pass is 0.9 % and 2.0 % slower in the two pairs, below the noise
+floor: no measurable net cost. Peak anon is 2-6 % higher and average anon
+4-9 % lower, the per-kind phases' tails replaced by one steady pool. Phase
+split (`8b442cca` vs `5cba4939`): schedule walk 6.2 vs 5.4 s, the work 223.1 s
+across the three kind phases vs 226.0 s in `CAT_FILTERED`, both at 26-27
+cores. Writer stalls match: `writer_recv` 88.5 % of the wall on both,
+`writer_pipeline_send` 12.8 vs 12.3 s. Both arms predate `25172fc3`, so both
+ran under the two-arena malloc cap; that is why they sit near 230 s against
+the 146 s at `1f93e674` above.
+
+Not answered: whether the 64-slot window stalled workers behind a slow head
+at `8da26b23`. Its credit gate parks the dispatcher on a condvar and counts
+nothing (`ordered_pool_*_wait_ns` arrive with the engine in `c2409c45`), and
+a net-neutral wall does not rule out a stall offset by savings elsewhere.
+With no regression to attribute, the historical gate was not instrumented.
 
 ### Dense-node direct encoding, refused (plantasjen, 2026-11-05, against `9ebcfa97`)
 

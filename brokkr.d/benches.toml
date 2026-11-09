@@ -272,6 +272,54 @@ params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", hel
 
 # -- diff
 
+[bench.diff-applied]
+script_file = "../benches/diff/diff-applied.lua"
+description = "Diff a base PBF against its applied OSC, measuring the diff child"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed diff two-step workload, raw-vs-indexed pairs, formats, jobs, type, snapshots and profiling" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
+params.jobs = { validated = true, help = "unsigned 64-bit worker count; omitted uses the binary default" }
+params.stop = { validated = true, help = "diff marker: FOO_END, FOO, -FOO or -FOO_END" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "print captured diff output" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base or named snapshot, including its own OSC table" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "base PBF variant" }
+params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, default = "all", help = "one OSC sequence (typed --osc-seq); omitted requires a sole entry" }
+params.type = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the element kind" }
+params.keep-cache = { choices = ["yes", "no"], default = "no", help = "yes refused: iteration outputs cannot persist as a merged cache" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "use O_DIRECT for the diff child only" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "refused by typed diff" }
+params.compression = { validated = true, help = "refused: diff writes no PBF; merge preparation uses defaults" }
+
+[bench.diff-pair]
+script_file = "../benches/diff/diff-pair.lua"
+description = "Diff two independent snapshots with text or OSC output"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed diff-snapshots: base or named inputs, shared variant, formats, jobs and profiling" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
+params.jobs = { validated = true, help = "unsigned 64-bit worker count; omitted uses the binary default" }
+params.stop = { validated = true, help = "diff marker: FOO_END, FOO, -FOO or -FOO_END" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "print captured diff output" }
+params.from = { from = "datasets.{dataset}.snapshot", required = true, help = "first snapshot key or base" }
+params.to = { from = "datasets.{dataset}.snapshot", required = true, help = "second snapshot key or base" }
+params.variant = { from = "datasets.{dataset}.snapshot.{from}.pbf", default = "indexed", help = "first variant; set to-variant to the same key" }
+
+params.to-variant = { from = "datasets.{dataset}.snapshot.{to}.pbf", default = "indexed", help = "second variant; must equal variant (set both explicitly for non-indexed pairs)" }
+
 [bench.diff-text]
 script_file = "../benches/diff/diff-text.lua"
 description = "Text diff without -c, optionally -v, of two indexed snapshots of one dataset, inputs warm"

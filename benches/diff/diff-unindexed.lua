@@ -2,9 +2,9 @@
 -- without indexdata, so the comparison takes the sequential element stream
 -- (the block-pair engine needs both inputs indexed). Registered in
 -- brokkr.d/benches.toml. The typed `brokkr diff` cannot reach this path: it
--- builds its new side with `apply-changes` on the chosen variant, which
--- refuses an unindexed base without apply-changes' own `--force`, and it
--- has no `--type`. `brokkr diff-snapshots` has no `--type` either.
+-- builds its new side with apply-changes, using --force for an unindexed
+-- base, so only the old side remains unindexed. Both typed diff and the
+-- general diff-applied bench support --type; typed diff-snapshots does not.
 --
 -- Both inputs are evicted from the page cache in the timed block and
 -- fincore checks that none of either is resident before the diff starts.

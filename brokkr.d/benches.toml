@@ -262,6 +262,34 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read 
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
+# -- extract
+
+[bench.region-extract]
+script_file = "../benches/extract/region-extract.lua"
+description = "Extract one bbox or polygon, or multiple longitude strips and dataset polygons"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed extract and multi-extract: bbox fallback, ordered polygons, all strategies, region counts, snapshots, compression, I/O modes and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset, including its default bbox" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.mode = { choices = ["single", "multi"], default = "single", help = "single: typed extract; multi: typed multi-extract" }
+params.strategy = { choices = ["simple", "complete", "smart", "all"], help = "omitted: all for single, simple for multi; all runs three children sequentially" }
+params.bbox = { validated = true, split = false, help = "lon_min,lat_min,lon_max,lat_max; omitted uses the dataset bbox" }
+params.polygon = { from = "datasets.{dataset}.polygon", many = true, split = false, help = "registered polygon name per flag, in order; single takes one instead of bbox, multi appends them after the strips" }
+params.regions = { validated = true, help = "positive longitude-strip count for multi, omitted means 5" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the CLI default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- getid
 
 [bench.id-select]
@@ -316,7 +344,7 @@ description = "Inspect metadata, extended metadata, node statistics or tag count
 version = 2
 date = 2026-11-09
 changelog = [
-  { version = 2, date = 2026-11-09, note = "Replaced hex expression encoding with readable comma-preserving params using split = false" },
+  { version = 2, date = 2026-11-09, note = "Replaced hex expression encoding with plain comma-preserving expr using split = false; removed redundant expr-json handling" },
   { date = 2026-11-09, note = "Moved expression decoding into the shared bench library without changing the workload" },
   { version = 1, date = 2026-11-09, note = "Ported typed inspect: all four modes, expressions, worker counts, snapshots, direct I/O and profiling with marker stops" },
 ]
@@ -330,7 +358,6 @@ params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default 
 params.mode = { choices = ["metadata", "extended", "nodes", "tags"], default = "metadata", help = "typed inspect's default, --extended, --nodes or --tags mode" }
 params.type = { choices = ["node", "way", "relation"], help = "restrict tag counts to one object type" }
 params.expr = { validated = true, many = true, split = false, help = "one tag expression per flag, in order, commas included" }
-params.expr-json = { validated = true, split = false, help = "ordered JSON string array, allowing duplicate expressions; conflicts with expr" }
 params.jobs = { validated = true, help = "worker threads for nodes or tags; 0 is auto, omitted uses pbfhogg's default" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }

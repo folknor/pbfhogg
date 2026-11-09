@@ -53,6 +53,32 @@ params.keep-untagged-nodes = { choices = ["yes", "no"], default = "no", help = "
 params.ignore-missing-nodes = { choices = ["yes", "no"], default = "no", help = "yes: write missing way vertices as (0, 0); requires a revision supporting this flag" }
 params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
 
+# -- apply-changes
+
+[bench.apply-diff]
+script_file = "../benches/apply-changes/apply-diff.lua"
+description = "Apply one OSC to a dataset or snapshot, optionally maintaining inline way locations"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed apply-changes: scoped OSC selection, locations-on-ways, jobs, compression, I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot's own OSC table" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the base PBF variant; use altw-keep-untagged for locations-on-ways" }
+params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, default = "all", help = "one OSC sequence; omitted selects the sole scoped entry and refuses zero or multiple entries" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.locations-on-ways = { choices = ["yes", "no"], default = "no", help = "yes: maintain inline way coordinates; select a suitable base explicitly with variant" }
+params.jobs = { validated = true, help = "unsigned 64-bit worker count; 0 is auto, omitted keeps the binary's default" }
+
 # -- build-geocode-index
 
 [bench.geocode-build]
@@ -407,6 +433,29 @@ params.expr = { validated = true, many = true, split = false, help = "one tag ex
 params.jobs = { validated = true, help = "worker threads for nodes or tags; 0 is auto, omitted uses pbfhogg's default" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
+
+# -- merge-changes
+
+[bench.merge-diffs]
+script_file = "../benches/merge-changes/merge-diffs.lua"
+description = "Merge configured OSC sequences or ranges, retaining all changes or simplifying per object"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed merge-changes: scoped sequences, lists and inclusive ranges, simplify, spill scratch and profiling with marker stops" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot's own OSC table" }
+params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, required = true, help = "OSC sequence, comma list, repeated flag, all or inclusive LO..HI range; kept in supplied order" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes is refused: merge-changes has no O_DIRECT path" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: merge-changes has no io_uring writer" }
+params.compression = { validated = true, help = "refused: merge-changes writes OSC, not PBF" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.simplify = { choices = ["yes", "no"], default = "no", help = "yes: keep only the last change per object" }
 
 # -- renumber
 

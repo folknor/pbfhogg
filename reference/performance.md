@@ -3638,6 +3638,36 @@ mmap would thrash (same as dense ALTW).
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany's
 interpolation counts are under "Interpolation ways as OSM tags them" below.
 
+### Records and lists decoded through the format codec (bygg, 2026-11-09, `d510bbd7` vs `067be2d8`)
+
+`64141296` gave the index's records and list framing one owner in
+`format.rs` (`record!`, `Table`, `ListCount`); `067be2d8` made the builder
+read its own pass 2 outputs through it (`Table::get` and `span_at` in pass 3
+stage A and interpolation resolve, `BucketRecord` in stage B). Index bytes
+unchanged. Planet reindexed input (`e7f431ab`), both arms as `--commit`
+worktrees (cancels the worktree build offset), untrimmed (`fstrim` was not
+available to the session). One discarded cell per arm first (`01d9d6cf`
+323.8 s, `9b2a3902` 310.4 s), so every measured cell follows a full geocode
+build; then A B B A, `--bench 1`:
+
+| Cell | Commit | Wall | Stage A streets | Stage B fine | Stage B coarse |
+|---|---|---|---|---|---|
+| `363d5fee` | `d510bbd7` | 311.8 s | 29.6 s | 21.2 s | 10.4 s |
+| `85f54bbd` | `067be2d8` | 314.1 s | 30.4 s | 20.9 s | 9.6 s |
+| `4dc8d348` | `067be2d8` | 313.8 s | 30.2 s | 20.7 s | 9.8 s |
+| `e0fb682f` | `d510bbd7` | 313.2 s | 29.5 s | 21.7 s | 10.2 s |
+
+Medians 312.5 s against 314.0 s (+0.5 %), both pairs the same sign
+(+0.7 %, +0.2 %): no material regression for the two commits combined on
+this workload. Stage A streets is consistently about 0.7 s (2-3 %) slower
+on `067be2d8`, offset by stage B; every other phase, Pass 2A/2B, flush,
+interpolation resolve and admin index included, is within noise. A screen of
+the pair, not a per-commit bound and nothing about HEAD (both arms predate
+`25172fc3`'s malloc change, hence about 313 s, not about 176 s). The build's
+wall includes reader-open validation and one smoke query; reader query
+throughput and latency across the pair remain unmeasured. The July 347 s
+figure (plantasjen, old input) was never a baseline for this pair.
+
 ### addr:place addresses and numeric steps, format 5 (bygg, 2026-11-08, against `fb5f05cc`)
 
 `AddrPoint` grows 20 to 24 bytes (`place_offset`), `InterpWay` 23 to 24

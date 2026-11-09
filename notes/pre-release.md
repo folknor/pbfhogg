@@ -291,11 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-101: build-geocode-index codec commits
-
-Planet, `d510bbd7` vs `067be2d8`, covering `64141296` and `067be2d8`; planet
-baseline 347 s.
-
 ### WRK-102: digest walk folded into the decode pass
 
 `c0f67d9e` (ADR-0009) touched the shared fused engine: `getid` or

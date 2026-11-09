@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use super::super::Result;
 use super::{
-    BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
+    BucketLayout, CLOSURE_FLAG, IdCodec, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
 };
 use crate::counters::record_max;
@@ -140,11 +140,25 @@ fn prepare_bucket(
     bucket_idx: usize,
     scratch: &RunScratch,
     num_shard_workers: usize,
+    codec: IdCodec,
+    expected_records: u64,
     loader: &mut LoaderScratch,
     invocation: &crate::host::Recorder,
 ) -> crate::Result<PreparedBucket> {
     loader.data_buf.clear();
     loader.records.clear();
+    // The bucket's exact logical record count, from pass A: wire bytes are
+    // not a record count once escaped records take two words.
+    let expected = usize::try_from(expected_records).map_err(|_| {
+        Error::internal(format!(
+            "stage2 bucket {bucket_idx}: {expected_records} records do not fit in memory"
+        ))
+    })?;
+    // `s2_prepare_parse_ms` has always covered the reserve as well as the
+    // decode, so the reserve is timed into it.
+    let t_reserve = crate::counters::Stopwatch::start();
+    loader.records.reserve(expected);
+    let mut parse_ns: u64 = t_reserve.elapsed_ns();
     let mut open_calls: u64 = 0;
     let mut stat_calls: u64 = 0;
     // Zero off Linux, where there is no advice to give.
@@ -169,38 +183,33 @@ fn prepare_bucket(
         if len == 0 {
             continue;
         }
-        let start = loader.data_buf.len();
-        loader.data_buf.resize(start + len, 0);
-        std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
+        // One shard at a time: each file is decoded and checked on its own
+        // (whole words, no dangling escape), so a truncated tail in one
+        // shard cannot borrow the next shard's first word.
+        loader.data_buf.clear();
+        loader.data_buf.resize(len, 0);
+        std::io::Read::read_exact(&mut &file, &mut loader.data_buf)
             .map_err(|e| named("read", e))?;
         if crate::fadvise::evict_scratch(&file, invocation) {
             fadvise_calls += 1;
             fadvise_bytes += len as u64;
         }
+        let t_parse = crate::counters::Stopwatch::start();
+        codec
+            .decode_into(&loader.data_buf, &mut loader.records)
+            .map_err(|e| e.context(format!("id shard {}", path.display())))?;
+        parse_ns += t_parse.elapsed_ns();
     }
+    let parse_ms = parse_ns / 1_000_000;
 
-    // Shard integrity: each id-shard must be a sequence of
-    // ID_RECORD_SIZE-byte records. A non-multiple length means a
-    // truncated write (kernel page cache loss, fs corruption, partial
-    // worker write that didn't flush). chunks_exact would silently
-    // drop the partial tail; error explicitly instead.
-    if !loader.data_buf.len().is_multiple_of(ID_RECORD_SIZE) {
+    // A partial worker write that did not flush, or a lost file, leaves
+    // whole words; only the count pass A recorded catches it.
+    if loader.records.len() != expected {
         return Err(Error::internal(format!(
-            "stage2 bucket {bucket_idx}: id shard total length {} is not \
-             a multiple of {ID_RECORD_SIZE}",
-            loader.data_buf.len(),
+            "stage2 bucket {bucket_idx}: id shards hold {} records, pass A wrote {expected}",
+            loader.records.len(),
         )));
     }
-
-    // Parse 12-byte chunks into IdRecords.
-    let t_parse = crate::counters::Stopwatch::start();
-    let count = loader.data_buf.len() / ID_RECORD_SIZE;
-    loader.records.reserve(count);
-    let (chunks, _rem) = loader.data_buf.as_chunks::<ID_RECORD_SIZE>();
-    for buf in chunks {
-        loader.records.push(IdRecord::read_from(buf));
-    }
-    let parse_ms = t_parse.elapsed_ms();
 
     // Sort by local_node_id so the merge walk against ID-sorted node
     // tuples advances both pointers monotonically.
@@ -337,6 +346,7 @@ pub(super) fn stage2_node_join(
     scratch: &RunScratch,
     id_bucket_counts: &[u64],
     num_shard_workers: usize,
+    id_codec: IdCodec,
     bucket_layout: &BucketLayout,
     way_slot_starts: &[u64],
     slot_buckets: &SharedSlotBuckets,
@@ -426,6 +436,8 @@ pub(super) fn stage2_node_join(
                             bucket_idx,
                             scratch,
                             num_shard_workers,
+                            id_codec,
+                            id_bucket_counts[bucket_idx],
                             &mut loader,
                             &host.invocation,
                         )?;
@@ -749,7 +761,10 @@ pub(super) fn stage2_node_join(
                         // Track max live buffer bytes for this worker.
                         {
                             let worker_bytes = loader.data_buf.capacity() as u64
-                                + (loader.records.capacity() * std::mem::size_of::<IdRecord>())
+                                // The bucket's records live in `bkt` until
+                                // they are recycled below; the loader's
+                                // vector is empty here.
+                                + (bkt.records.capacity() * std::mem::size_of::<IdRecord>())
                                     as u64
                                 + node_read_peak as u64
                                 + node_decompress_peak as u64

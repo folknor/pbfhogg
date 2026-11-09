@@ -17,7 +17,7 @@ use std::io::{BufWriter, Write as _};
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
+use super::{BucketLayout, ID_WORD_SIZE, IdCodec, IdRecord, NodeBlobInfo};
 use crate::error::Error;
 use crate::scratch::{RunScratch, ScratchPath};
 use crate::tunables::{
@@ -44,6 +44,9 @@ crate::counters::counter_set! {
         id_emit_ms => "s1a_id_emit_ms",
         id_records_emitted => "s1a_id_records_emitted",
         id_records_skipped => "s1a_id_records_skipped",
+        /// Records whose slot did not fit the packed word and took a second
+        /// one (see [`IdCodec`]); `s1a_id_shard_bytes_written` includes them.
+        id_records_escaped => "s1a_id_records_escaped",
         id_shard_bytes_written => "s1a_id_shard_bytes_written",
         id_shard_write_ns => "s1a_id_shard_write_ms" / 1_000_000,
         id_shard_write_calls => "s1a_id_shard_write_calls",
@@ -97,7 +100,7 @@ struct Stage1Shard<'a> {
     /// installed whole, because a partial set would be indexed past its end
     /// on the next blob.
     id_shard_writers: Vec<BufWriter<TimedShardWriter<'a>>>,
-    id_rec_buf: [u8; ID_RECORD_SIZE],
+    id_rec_buf: [u8; 2 * ID_WORD_SIZE],
     id_bucket_local_counts: Vec<u64>,
 }
 
@@ -221,6 +224,8 @@ pub(super) struct Stage1Output {
     /// reads it to skip empty buckets without a probe.
     pub id_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
+    /// The id-shard wire format pass A wrote, for stage 2 to read back.
+    pub id_codec: IdCodec,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
@@ -304,6 +309,7 @@ pub(super) fn stage1_pass_a(
     num_workers: usize,
     scratch: &RunScratch,
     layout: &BucketLayout,
+    codec: IdCodec,
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
@@ -329,7 +335,7 @@ pub(super) fn stage1_pass_a(
         .map(|worker_id| Stage1Shard {
             worker_id,
             id_shard_writers: Vec::new(),
-            id_rec_buf: [0u8; ID_RECORD_SIZE],
+            id_rec_buf: [0u8; 2 * ID_WORD_SIZE],
             id_bucket_local_counts: vec![0; NUM_BUCKETS],
         })
         .collect();
@@ -485,6 +491,7 @@ pub(super) fn stage1_pass_a(
                 }
                 let mut blob_emitted: u64 = 0;
                 let mut blob_skipped: u64 = 0;
+                let mut blob_escaped: u64 = 0;
                 let mut blob_bytes: u64 = 0;
                 for (i, &node_id) in blob_node_ids.iter().enumerate() {
                     let blob_local_slot = u32::try_from(i).map_err(|_| {
@@ -507,15 +514,16 @@ pub(super) fn stage1_pass_a(
                             blob_idx: task.seq,
                             blob_local_slot,
                         };
-                        rec.write_to(id_rec_buf);
+                        let len = codec.encode(&rec, id_rec_buf)?;
                         id_shard_writers[bucket_idx]
-                            .write_all(id_rec_buf.as_slice())
+                            .write_all(&id_rec_buf[..len])
                             .map_err(|e| {
                                 shard_error(e, "write", scratch_ref, worker_id, bucket_idx)
                             })?;
                         id_bucket_local_counts[bucket_idx] += 1;
                         blob_emitted += 1;
-                        blob_bytes += ID_RECORD_SIZE as u64;
+                        blob_escaped += u64::from(len > ID_WORD_SIZE);
+                        blob_bytes += len as u64;
                     } else {
                         blob_skipped += 1;
                     }
@@ -527,6 +535,9 @@ pub(super) fn stage1_pass_a(
                 counters_ref
                     .id_records_skipped
                     .fetch_add(blob_skipped, Relaxed);
+                counters_ref
+                    .id_records_escaped
+                    .fetch_add(blob_escaped, Relaxed);
                 counters_ref
                     .id_shard_bytes_written
                     .fetch_add(blob_bytes, Relaxed);
@@ -708,12 +719,18 @@ pub(super) fn stage1_way_pass(
     host.invocation.counter("extjoin_cpu_cap_workers", cpu_cap);
     host.invocation.counter("extjoin_fd_cap_workers", fd_cap);
 
+    let id_codec = IdCodec::new(layout.max_local, schedule.len() as u64)?;
+    host.invocation.counter(
+        "extjoin_id_codec_slot_bits",
+        u64::from(id_codec.slot_bits()),
+    );
     let (total_refs, id_bucket_counts) = stage1_pass_a(
         input,
         &schedule,
         num_workers,
         scratch,
         layout,
+        id_codec,
         ref_count_sidecar,
         per_way_refcount_sidecar,
         inject_prepass,
@@ -728,6 +745,7 @@ pub(super) fn stage1_way_pass(
         total_slots: total_refs,
         id_bucket_counts,
         num_shard_workers: num_workers,
+        id_codec,
         node_blob_mapping,
     })
 }

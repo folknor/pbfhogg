@@ -278,18 +278,15 @@ datasets.
 
 ### WRK-111: altw external pass A exposure to sustained-write state
 
-Stage 1 pass A runs 32 s on planet as the first cell after a trim or rest
-and 51-111 s after another scratch-heavy cell, on identical bytes (29.2 GB
-pread, 149.2 GB of id shards into 30 x 256 buffered streams);
-reference/performance.md, "altw external pass A swings with run history".
-Not input page cache. Open: which of trim debt, drive write cache, GC or
-inherited writeback is the mechanism (needs a trim between consecutive
-cells plus Dirty/Writeback and device stats, see the brokkr filing), and
-whether scratch bytes per reference, total scratch traffic across stages or
-the stream topology (stage1.rs already names decoupling shard ownership
-from worker count) make pass A more exposed than it must be. Fewer streams
-might help locality without fewer bytes; compression might cut bytes for
-CPU. Neither is an established remedy.
+Residue. Pass A's id shards are now packed 8-byte words (99.5 GB at
+planet, was 149.2 GB); in back-to-back cells the shard write rate fell
+from cell to cell whichever arm ran, and the packed arm's pass A was
+about a quarter shorter (reference/performance.md, "Packed id-shard
+records"). So the exposure scales with bytes. Left: which of trim debt,
+drive write cache, GC or inherited writeback is the mechanism. That needs
+a trim between consecutive cells (sudo was refused in every implementer
+session) plus per-cell Dirty/Writeback and device stats (brokkr#74). Stream topology (30 x 256 streams) is unchanged and
+untested.
 
 ### Campaign reference: how to measure
 

@@ -303,6 +303,15 @@ Ordered. Each item lists what it absorbs from the previous edition.
 
 ### N1. Pack IdRecord into one u64 (absorbs the stage-2 sort thread; enables radix retry)
 
+**Disk half landed 2026-11-09** without the linear slot: the shard word
+packs `(local_id, blob_idx, blob_local_slot, closure)` at per-run widths
+with a two-word escape for oversized slots (`IdCodec`), so no stage-1
+synchronisation and no N2 dependency. Shards 149.2 -> 99.5 GB
+(reference/performance.md, "Packed id-shard records"). Still open from
+this item: the in-memory side (stage 2 still parses into 12-byte
+`IdRecord` structs and sorts by key, so the u64 in-place sort and radix
+retry below need the linear-slot form).
+
 Layout: `local_node_id:27 | linear_slot_pos:36 | CLOSURE:1` - exactly 64
 bits. Constraints at planet today: bucket_width 53.09 M < 2^27 (134 M),
 total_slots 12.44 B < 2^36 (68.7 B). Put local id in the high bits and

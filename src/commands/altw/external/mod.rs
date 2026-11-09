@@ -96,6 +96,10 @@ pub(super) struct BucketLayout {
     pub(super) max_node_id: u64,
     pub(super) bucket_width: u64,
     pub(super) num_buckets: NonZeroUsize,
+    /// Largest bucket-local id [`Self::locate`] can return (the last bucket
+    /// absorbs the `div_ceil` remainder, so this can reach `bucket_width`).
+    /// Sizes the local-id field of the packed id-shard record ([`IdCodec`]).
+    pub(super) max_local: u64,
 }
 
 impl BucketLayout {
@@ -136,6 +140,7 @@ impl BucketLayout {
             max_node_id,
             bucket_width: bw,
             num_buckets,
+            max_local,
         })
     }
 
@@ -383,19 +388,6 @@ mod bucket_math_tests {
     }
 }
 
-// Field widths and offsets of an id-bucketed occurrence record
-// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)`.
-const ID_W_LOCAL_NODE_ID: usize = size_of::<u32>();
-const ID_W_BLOB_IDX: usize = size_of::<u32>();
-const ID_W_BLOB_LOCAL_SLOT: usize = size_of::<u32>();
-const ID_OFF_LOCAL_NODE_ID: usize = 0;
-const ID_OFF_BLOB_IDX: usize = ID_OFF_LOCAL_NODE_ID + ID_W_LOCAL_NODE_ID;
-const ID_OFF_BLOB_LOCAL_SLOT: usize = ID_OFF_BLOB_IDX + ID_W_BLOB_IDX;
-
-/// Size of an id-bucketed occurrence record.
-pub(super) const ID_RECORD_SIZE: usize = ID_OFF_BLOB_LOCAL_SLOT + ID_W_BLOB_LOCAL_SLOT;
-const _: () = assert!(ID_RECORD_SIZE == 12);
-
 // Field widths and offsets of a resolved entry
 // `(local_slot_pos: u32, lat: i32, lon: i32)`. Stage 3 decodes these
 // records by the same offsets.
@@ -470,93 +462,281 @@ pub(super) struct IdRecord {
 pub(super) const CLOSURE_FLAG: u32 = 0x8000_0000;
 pub(super) const LOCAL_ID_MASK: u32 = 0x7fff_ffff;
 
-impl IdRecord {
-    pub(super) fn write_to(&self, buf: &mut [u8; ID_RECORD_SIZE]) {
-        buf[ID_OFF_LOCAL_NODE_ID..][..ID_W_LOCAL_NODE_ID]
-            .copy_from_slice(&self.local_node_id.to_le_bytes());
-        buf[ID_OFF_BLOB_IDX..][..ID_W_BLOB_IDX].copy_from_slice(&self.blob_idx.to_le_bytes());
-        buf[ID_OFF_BLOB_LOCAL_SLOT..][..ID_W_BLOB_LOCAL_SLOT]
-            .copy_from_slice(&self.blob_local_slot.to_le_bytes());
+/// Size of one id-shard word. A record is one word, or two when its slot
+/// escapes (see [`IdCodec`]).
+pub(super) const ID_WORD_SIZE: usize = size_of::<u64>();
+
+/// The id-shard wire format, sized once per run.
+///
+/// Pass A is bound by scratch writes (149 GB of id shards at planet in the
+/// old 12-byte form, more than four times the bench host's RAM), so how
+/// long it takes under a degraded drive state scales with the bytes per
+/// reference. A record is packed into one little-endian `u64` word, high to
+/// low: `local_node_id` in `local_bits`, `blob_idx` in `blob_bits`,
+/// `blob_local_slot` in `slot_bits`, then the closure bit. The widths come
+/// from what the run can produce: `local_bits` from
+/// [`BucketLayout::max_local`], `blob_bits` from the way-blob count, and the
+/// slot gets what is left of the 63 bits. No synchronisation between pass A
+/// workers is needed, because each field is known to the worker decoding the
+/// blob.
+///
+/// The slot width is not a bound on refs per blob: a slot that does not fit
+/// (`slot >= 2^slot_bits - 1`, every slot when `slot_bits` is 0) writes an
+/// all-ones slot field and a second word holding the full `u32` slot. At
+/// planet the fields are 26, 18 and 19 bits, so a blob escapes only past
+/// 524,286 refs; any input stays decodable, at worst at 16 bytes a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IdCodec {
+    local_bits: u32,
+    blob_bits: u32,
+    slot_bits: u32,
+}
+
+/// Bits needed to hold every value in `0..=max` (at least 1, so no shift
+/// ever reaches 64).
+fn field_bits(max: u64) -> u32 {
+    (u64::BITS - max.leading_zeros()).max(1)
+}
+
+impl IdCodec {
+    /// The codec for local ids up to `max_local` and `way_blobs` way blobs.
+    pub(super) fn new(max_local: u64, way_blobs: u64) -> Result<Self> {
+        let local_bits = field_bits(max_local);
+        let blob_bits = field_bits(way_blobs.saturating_sub(1));
+        if local_bits > 31 || blob_bits > 32 {
+            return Err(crate::Error::internal(format!(
+                "external join id codec: local id max {max_local} or way blob count \
+                 {way_blobs} out of the range the layout and schedule admit"
+            )));
+        }
+        Ok(Self {
+            local_bits,
+            blob_bits,
+            slot_bits: 63 - local_bits - blob_bits,
+        })
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "each field is a four-byte subslice of a fixed-size record, so the conversion to [u8; 4] cannot fail"
-    )]
-    pub(super) fn read_from(buf: &[u8; ID_RECORD_SIZE]) -> Self {
-        let local_node_id = u32::from_le_bytes(
-            buf[ID_OFF_LOCAL_NODE_ID..][..ID_W_LOCAL_NODE_ID]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        let blob_idx = u32::from_le_bytes(
-            buf[ID_OFF_BLOB_IDX..][..ID_W_BLOB_IDX]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        let blob_local_slot = u32::from_le_bytes(
-            buf[ID_OFF_BLOB_LOCAL_SLOT..][..ID_W_BLOB_LOCAL_SLOT]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        Self {
-            local_node_id,
-            blob_idx,
-            blob_local_slot,
+    /// Width of the direct slot field.
+    pub(super) fn slot_bits(self) -> u32 {
+        self.slot_bits
+    }
+
+    /// The all-ones slot field marking an escaped record (0 when the slot
+    /// has no bits, where every record escapes).
+    fn slot_escape(self) -> u64 {
+        (1u64 << self.slot_bits) - 1
+    }
+
+    /// Encode `rec` into `out`, returning the bytes used (8 or 16).
+    ///
+    /// Pass A's ids come from [`BucketLayout::locate`] and its ordinals from
+    /// the schedule this codec was sized from, so neither can overflow its
+    /// field; a value that does is refused rather than written into a
+    /// neighbouring field.
+    pub(super) fn encode(self, rec: &IdRecord, out: &mut [u8; 2 * ID_WORD_SIZE]) -> Result<usize> {
+        let local = u64::from(rec.local_node_id & LOCAL_ID_MASK);
+        if local >> self.local_bits != 0 || u64::from(rec.blob_idx) >> self.blob_bits != 0 {
+            return Err(crate::Error::internal(format!(
+                "external join id codec: record {rec:?} does not fit {self:?}"
+            )));
         }
+        let closure = u64::from(rec.local_node_id & CLOSURE_FLAG != 0);
+        let slot = u64::from(rec.blob_local_slot);
+        let escape = self.slot_escape();
+        let escaped = slot >= escape;
+        let slot_field = if escaped { escape } else { slot };
+        let word = (local << (self.blob_bits + self.slot_bits + 1))
+            | (u64::from(rec.blob_idx) << (self.slot_bits + 1))
+            | (slot_field << 1)
+            | closure;
+        out[..ID_WORD_SIZE].copy_from_slice(&word.to_le_bytes());
+        if escaped {
+            out[ID_WORD_SIZE..].copy_from_slice(&slot.to_le_bytes());
+            Ok(2 * ID_WORD_SIZE)
+        } else {
+            Ok(ID_WORD_SIZE)
+        }
+    }
+
+    /// Decode one shard file's bytes, appending its records to `out`.
+    ///
+    /// Each file is checked on its own, so a truncated tail in one shard
+    /// cannot borrow the next shard's first word: the length must be whole
+    /// words and the last record must not be a dangling escape. An
+    /// extension word wider than `u32` is refused, never truncated.
+    pub(super) fn decode_into(self, bytes: &[u8], out: &mut Vec<IdRecord>) -> Result<()> {
+        let (words, rem) = bytes.as_chunks::<ID_WORD_SIZE>();
+        if !rem.is_empty() {
+            return Err(crate::Error::internal(format!(
+                "id shard length {} is not a multiple of {ID_WORD_SIZE}",
+                bytes.len()
+            )));
+        }
+        let local_shift = self.blob_bits + self.slot_bits + 1;
+        let blob_mask = (1u64 << self.blob_bits) - 1;
+        let escape = self.slot_escape();
+        let mut words = words.iter();
+        while let Some(w) = words.next() {
+            let word = u64::from_le_bytes(*w);
+            let slot_field = (word >> 1) & escape;
+            let slot = if slot_field == escape {
+                let Some(ext) = words.next() else {
+                    return Err(crate::Error::internal(
+                        "id shard ends inside an escaped record",
+                    ));
+                };
+                let ext = u64::from_le_bytes(*ext);
+                u32::try_from(ext).map_err(|_| {
+                    crate::Error::internal(format!("id shard escaped slot {ext} is wider than u32"))
+                })?
+            } else {
+                // A direct slot was written from a u32; a wider field
+                // (possible when slot_bits > 32) is a corrupt shard.
+                u32::try_from(slot_field).map_err(|_| {
+                    crate::Error::internal(format!("id shard slot {slot_field} is wider than u32"))
+                })?
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let local = (word >> local_shift) as u32;
+            #[allow(clippy::cast_possible_truncation)]
+            let blob_idx = ((word >> (self.slot_bits + 1)) & blob_mask) as u32;
+            out.push(IdRecord {
+                local_node_id: local | if word & 1 == 1 { CLOSURE_FLAG } else { 0 },
+                blob_idx,
+                blob_local_slot: slot,
+            });
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod id_record_tests {
-    use super::{ID_RECORD_SIZE, IdRecord};
+    use super::{BucketLayout, CLOSURE_FLAG, ID_WORD_SIZE, IdCodec, IdRecord};
+
+    fn rec(local_node_id: u32, blob_idx: u32, blob_local_slot: u32) -> IdRecord {
+        IdRecord {
+            local_node_id,
+            blob_idx,
+            blob_local_slot,
+        }
+    }
+
+    /// Encode `records` into one shard's bytes.
+    fn shard(codec: IdCodec, records: &[IdRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 2 * ID_WORD_SIZE];
+        for r in records {
+            let n = codec.encode(r, &mut buf).expect("fits");
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        bytes
+    }
+
+    fn round_trip(codec: IdCodec, records: &[IdRecord]) -> Vec<u8> {
+        let bytes = shard(codec, records);
+        let mut out = Vec::new();
+        codec.decode_into(&bytes, &mut out).expect("decode");
+        assert_eq!(out, records, "{codec:?}");
+        bytes
+    }
 
     #[test]
-    fn write_then_read_round_trips() {
-        let cases = [
-            IdRecord {
-                local_node_id: 0,
-                blob_idx: 0,
-                blob_local_slot: 0,
-            },
-            IdRecord {
-                local_node_id: 1,
-                blob_idx: 2,
-                blob_local_slot: 3,
-            },
-            IdRecord {
-                local_node_id: u32::MAX,
-                blob_idx: u32::MAX,
-                blob_local_slot: u32::MAX,
-            },
-            IdRecord {
-                local_node_id: 0xDEAD_BEEF,
-                blob_idx: 0xCAFE_F00D,
-                blob_local_slot: 0x1234_5678,
-            },
+    fn planet_widths_pack_one_word_per_record() {
+        let layout = BucketLayout::new(14_000_000_000, 256).expect("layout");
+        let codec = IdCodec::new(layout.max_local, 146_000).expect("codec");
+        assert_eq!(
+            codec,
+            IdCodec {
+                local_bits: 26,
+                blob_bits: 18,
+                slot_bits: 19
+            }
+        );
+        let max_local = u32::try_from(layout.max_local).expect("u32");
+        let records = [
+            rec(0, 0, 0),
+            rec(max_local, 145_999, 524_286),
+            rec(max_local | CLOSURE_FLAG, 7, 9),
         ];
-        let mut buf = [0u8; ID_RECORD_SIZE];
-        for r in cases {
-            r.write_to(&mut buf);
-            assert_eq!(IdRecord::read_from(&buf), r);
+        assert_eq!(round_trip(codec, &records).len(), 3 * ID_WORD_SIZE);
+    }
+
+    #[test]
+    fn slots_from_the_escape_value_up_take_a_second_word() {
+        let codec = IdCodec::new(1000, 4).expect("codec");
+        // slot_bits is 51 here, so every u32 slot fits directly.
+        assert_eq!(codec.slot_bits, 51);
+        let records = [rec(5, 3, u32::MAX - 1), rec(5 | CLOSURE_FLAG, 3, u32::MAX)];
+        assert_eq!(round_trip(codec, &records).len(), 2 * ID_WORD_SIZE);
+
+        let tight = IdCodec {
+            local_bits: 31,
+            blob_bits: 30,
+            slot_bits: 2,
+        };
+        let records = [
+            rec(1, 1, 0),
+            rec(1, 1, 2),
+            rec(1, 1, 3),
+            rec(0x7fff_ffff | CLOSURE_FLAG, (1 << 30) - 1, u32::MAX),
+        ];
+        assert_eq!(round_trip(tight, &records).len(), 6 * ID_WORD_SIZE);
+    }
+
+    #[test]
+    fn widest_admitted_fields_leave_no_slot_bits_and_escape_every_record() {
+        // max_id 2^38 is the largest the layout admits; its last bucket's
+        // local id is 2^30, which needs 31 bits.
+        let layout = BucketLayout::new(1 << 38, 256).expect("layout");
+        assert_eq!(layout.max_local, 1 << 30);
+        let codec = IdCodec::new(layout.max_local, 1 << 32).expect("codec");
+        assert_eq!(codec.slot_bits, 0);
+        let records = [rec(1 << 30, u32::MAX, 0), rec(0, 0, u32::MAX)];
+        assert_eq!(round_trip(codec, &records).len(), 4 * ID_WORD_SIZE);
+    }
+
+    #[test]
+    fn exact_bucket_boundary_and_tiny_schedules() {
+        // max_id 256 over 256 buckets: width 1, but node 256 is local id 1.
+        let layout = BucketLayout::new(256, 256).expect("layout");
+        assert_eq!(layout.max_local, 1);
+        for blobs in [0, 1, 2] {
+            let codec = IdCodec::new(layout.max_local, blobs).expect("codec");
+            round_trip(codec, &[rec(1, 0, 0), rec(CLOSURE_FLAG, 0, 70_000)]);
         }
     }
 
     #[test]
-    fn write_emits_little_endian() {
-        let r = IdRecord {
-            local_node_id: 0x0403_0201,
-            blob_idx: 0x0807_0605,
-            blob_local_slot: 0x0C0B_0A09,
+    fn a_field_past_its_width_is_refused() {
+        let codec = IdCodec::new(3, 2).expect("codec");
+        let mut buf = [0u8; 2 * ID_WORD_SIZE];
+        assert!(codec.encode(&rec(4, 0, 0), &mut buf).is_err());
+        assert!(codec.encode(&rec(0, 2, 0), &mut buf).is_err());
+        assert!(IdCodec::new(1 << 31, 1).is_err());
+        assert!(IdCodec::new(1, (1 << 32) + 1).is_err());
+    }
+
+    #[test]
+    fn a_shard_is_checked_on_its_own() {
+        let tight = IdCodec {
+            local_bits: 31,
+            blob_bits: 30,
+            slot_bits: 2,
         };
-        let mut buf = [0u8; ID_RECORD_SIZE];
-        r.write_to(&mut buf);
-        assert_eq!(
-            buf,
-            [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-            ]
+        let bytes = shard(tight, &[rec(1, 1, 0), rec(1, 1, 9)]);
+        let mut out = Vec::new();
+        // Whole words, but the escape's extension word is missing.
+        assert!(
+            tight
+                .decode_into(&bytes[..2 * ID_WORD_SIZE], &mut out)
+                .is_err()
         );
+        assert!(tight.decode_into(&bytes[..5], &mut out).is_err());
+        // An extension word wider than u32.
+        let mut wide = bytes.clone();
+        wide[2 * ID_WORD_SIZE..].copy_from_slice(&(1u64 << 32).to_le_bytes());
+        assert!(tight.decode_into(&wide, &mut out).is_err());
     }
 }
 
@@ -1009,6 +1189,7 @@ pub(crate) fn external_join_in(
     let total_slots = stage1_out.total_slots;
     let id_bucket_counts = stage1_out.id_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
+    let stage1_out_codec = stage1_out.id_codec;
     let node_blob_mapping = stage1_out.node_blob_mapping;
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
@@ -1085,6 +1266,7 @@ pub(crate) fn external_join_in(
         scratch,
         &id_bucket_counts,
         num_shard_workers,
+        stage1_out_codec,
         bucket_layout_ref,
         &way_slot_starts,
         &slot_buckets,

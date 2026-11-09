@@ -2695,9 +2695,46 @@ that follows a trim or rest (11.5 % of wall in the pair above). A matched A/B mu
 each arm (predecessor workload and first-after-trim position), not only
 alternate arms; when the arms write different scratch volumes, alternation
 alone does not balance it. Read pass A against the rest of the command
-before attributing a wall delta to code. Whether pass A's scratch volume
-and stream layout make it more exposed to this than it needs to be is an
-open question, not a finding.
+before attributing a wall delta to code. Pass A's scratch volume was more
+than it needed to be: the packed id-shard record below cuts it by a third.
+Which of trim debt, drive write cache, controller GC or inherited writeback
+is the mechanism is still not separated (no trim between cells, no
+Dirty/Writeback or device record per cell).
+
+### Packed id-shard records (bygg, 2026-11-09)
+
+Pass A's id-shard record went from three `u32` fields (12 bytes) to one
+`u64` word whose field widths are sized per run (`IdCodec` in
+`src/commands/altw/external/mod.rs`; planet: 26-bit local id, 18-bit blob
+ordinal, 19-bit slot, closure bit), with a second word only for a slot
+that does not fit. Planet: 12,435,459,911 records, zero escaped, id shards
+149.2 GB -> 99.5 GB written in pass A and read back in stage 2.
+
+`brokkr add-locations-to-ways --dataset planet --index-type external
+--bench 1`, baseline `0182566d` as a `--commit HEAD` worktree build
+(brokkr#105 applies to it), variant uncommitted `--force` on the main tree,
+five cells back to back, untrimmed (sudo refused in the session), in run
+order:
+
+| Cell | Wall | Pass A | Stage 2 | Shard write rate | ID |
+|---|---:|---:|---:|---:|---|
+| packed 1 (after unrelated cells) | 301.2 s | 22.3 s | 147.2 s | 4.5 GB/s | unstored |
+| 12-byte 1 | 336.2 s | 41.5 s | 163.8 s | 3.6 GB/s | `39608b9a` |
+| packed 2 | 335.9 s | 43.1 s | 159.2 s | 2.3 GB/s | unstored |
+| 12-byte 2 | 370.9 s | 65.6 s | 169.9 s | 2.3 GB/s | `a0259d8c` |
+| packed 3 | 367.0 s | 54.9 s | 164.3 s | 1.8 GB/s | unstored |
+
+(Shard write rate is bytes written over the pass A span.) Every cell ran
+slower than the one before it, by about 17 s, whichever arm it was: the
+run-history drift of the section above. Against the mean of its two
+neighbours, packed 2 is -17.6 s wall (-5.0 %) and -10.5 s in pass A;
+across all five, drift-corrected, packed is about -19 s wall and -13 s
+pass A (-25 %), and every adjacent pair has the packed cell faster or
+equal. Stage 2 also gains (one third fewer bytes to read, and it now reads
+and decodes one shard at a time). Peak anon 11.67 against 11.35 GB in the
+last pair (stage 4's peak, not shards). The wall figure carries the
+worktree-build confound; pass A, bound by scratch writes, is the clean
+part of the result.
 
 ### Packed varint count (bygg, 2026-10-31)
 

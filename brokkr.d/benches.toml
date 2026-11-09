@@ -235,3 +235,25 @@ changelog = [
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "raw", help = "the PBF variant sorted" }
 params.force = { choices = ["yes", "no"], default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }
+
+# -- time-filter
+
+[bench.time-snapshot]
+script_file = "../benches/time-filter/time-snapshot.lua"
+description = "Filter a dataset or snapshot at the typed runner's fixed 2024-01-01 UTC cutoff"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed time-filter: fixed cutoff, snapshots, compression, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }

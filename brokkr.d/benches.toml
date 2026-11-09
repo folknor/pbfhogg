@@ -270,6 +270,32 @@ params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the
 params.row = { validated = true, required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
 
+# -- degrade
+
+[bench.perturb-pbf]
+script_file = "../benches/degrade/perturb-pbf.lua"
+description = "Strip indexdata or inline locations and perturb blob ordering on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed degrade: command flags, compression, snapshots, I/O and profiling with marker stops; snapshot promotion awaits brokkr 145" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.strip-indexdata = { choices = ["yes", "no"], default = "no", help = "yes: clear every OsmData blob's indexdata" }
+params.strip-locations = { choices = ["yes", "no"], default = "no", help = "yes: drop LocationsOnWays and inline way coordinates" }
+params.unsort = { choices = ["yes", "no"], default = "no", help = "yes: clear Sort.Type_then_ID and overlap adjacent same-kind blob ID ranges" }
+
 # -- diff
 
 [bench.diff-applied]
@@ -553,6 +579,31 @@ params.compression = { validated = true, help = "refused: use compressions on wr
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print each child's captured output" }
 params.modes = { choices = ["sequential", "parallel", "pipelined", "blobreader"], default = "sequential,parallel,pipelined,blobreader", help = "reader modes; each value is a separate arm and child" }
+# -- repack
+
+[bench.reencode-pbf]
+script_file = "../benches/repack/reencode-pbf.lua"
+description = "Re-encode a dataset or snapshot with a configurable per-blob element cap"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed repack: command flags, compression, snapshots, I/O and profiling with marker stops; snapshot promotion awaits brokkr 145" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.elements-per-blob = { validated = true, help = "positive 32-bit element cap; omitted keeps the binary's default" }
+params.force-repack = { choices = ["yes", "no"], default = "no", help = "yes: forward --force to skip the indexdata requirement" }
+
 # -- renumber
 
 [bench.id-remap]

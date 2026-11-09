@@ -25,6 +25,32 @@ bench_lib = "../benches/lib"
 
 # -- cat
 
+[bench.copy-pbf]
+script_file = "../benches/cat/copy-pbf.lua"
+description = "Copy a dataset or snapshot with optional type filtering, version cleaning or self-deduplication"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed cat workloads, I/O modes, compression, snapshots and profiling with marker stops; snapshot promotion awaits a persistent-output API" },
+]
+profile = "release"
+features = ["linux-direct-io", "linux-io-uring"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.type = { choices = ["all", "way", "relation"], default = "all", help = "all: no type filter; way or relation: keep only that kind" }
+params.clean = { choices = ["yes", "no"], default = "no", help = "yes: decode and re-encode kept blobs, stripping version" }
+params.dedupe = { choices = ["yes", "no"], default = "no", help = "yes: merge the input with itself without cache preparation; conflicts with type filtering and cleaning" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output; requires dedupe yes" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the CLI default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.as-snapshot = { validated = true, help = "unsupported: snapshot promotion needs a persistent-output and dataset-registration API" }
+params.replace-snapshot = { choices = ["yes", "no"], default = "no", help = "unsupported: overwrite a promoted snapshot" }
+
 [bench.dedupe-self]
 script_file = "../benches/cat/dedupe-self.lua"
 description = "cat --dedupe of a dataset's file with itself, input cold or warm as the merge starts"

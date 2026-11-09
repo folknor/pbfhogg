@@ -3239,6 +3239,29 @@ blobs read for nothing); the peak gain is the duplicate way set. Relation
 expressions still walk the way blobs, and their peak moves by the size of
 their direct-way set only.
 
+### Single pass across the fused engine's transform seam (bygg, 2026-11-09, `2529f73f` vs `c0f67d9e`)
+
+`c0f67d9e` gave the fused engine a transform trait so digest could see each
+blob before its decode: the decode-worker closure now hands the transform a
+decode closure, and the per-thread string-table and group scratch borrows
+end before the transform runs rather than around it. `tags-filter -R` goes
+through that engine at both commits (block-only adapter, indexdata parsing
+unchanged). Planet (`planet-20260223-reindexed`), `-R w/highway=primary`,
+`--bench 1`, both arms as `--commit` worktrees, order A B B A:
+
+| Arm | Wall | UUID |
+|-----|-----:|------|
+| `2529f73f` | 31.58 s | `4c2ea16c` |
+| `c0f67d9e` | 31.54 s | `ff665e30` |
+| `c0f67d9e` | 31.52 s | `ab6ceb19` |
+| `2529f73f` | 31.60 s | `c44ad99a` |
+
+Medians 31.59 s against 31.53 s (-0.2 %), both pairs the same sign; the one
+scan phase runs about 11 cores in both arms. The filter skips 33,287 data
+blobs on tagdata, so this screens the seam on the blobs the expression
+decodes, not on every fused workload. A regression screen, not a bound;
+no re-measure without a change to the decode-worker closure.
+
 ## Merge-changes
 
 `pbfhogg merge-changes` squashes N OSC (gzip + XML) inputs into one OSC

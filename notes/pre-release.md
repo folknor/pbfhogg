@@ -291,11 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-102: digest walk folded into the decode pass
-
-`c0f67d9e` (ADR-0009) touched the shared fused engine: `getid` or
-`tags-filter -R` on planet, `c0f67d9e^` vs `c0f67d9e`. Expect noise.
-
 ### WRK-103: The Mutex Receiver dispatch question
 
 Read `classify_unordered_desc_lock_wait_ns` against
@@ -386,8 +381,7 @@ knows what it changed.
   across six commits").
 - Read side: `BlobReader::next` as `next_frame` plus `into_blob`, eviction
   before the envelope parse (`8881415e`); `OrderWatermark`'s mixed-sign
-  `min_id` (`8881415e`); one `statx` per direct open (`ea17fd86`); the
-  scratch borrows in the fused engine (`c0f67d9e`); the OSC arena reads
+  `min_id` (`8881415e`); one `statx` per direct open (`ea17fd86`); the OSC arena reads
   (`20d10610`); `BlobReader::leading_header` judging the first frame before
   its body on every `ElementReader` (`418739bd`).
 - Counters: one struct per altw stage (`9dcf53a7`); `record_max` on the two

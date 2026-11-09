@@ -4,17 +4,22 @@
 -- No cache preparation. Child wall matches the typed workload; iteration
 -- wall also includes Lua bookkeeping. Profiling and marker stops combine.
 --
--- --expr is an ordered collection. For commas or repeated expressions,
--- --expr-hex takes a hex-encoded ASCII JSON array of strings instead: bench param
--- binding splits every comma and rejects duplicate values before validate.
--- For example 5b22613d622c63225d encodes ["a=b,c"]. This escape hatch
--- preserves the typed runner's full expression domain and ordering.
+-- --expr takes one whole expression per flag, commas included, in order.
+-- Binding refuses duplicate values; --expr-json takes a readable JSON array
+-- instead when the ordered list contains repeated expressions.
 -- Features live in the registry; unsupported writer flags are refused.
 --
---   brokkr bench --dry-run file-info --mode metadata,extended,nodes,tags
---   brokkr bench --alloc file-info --mode tags --type way --expr '*=*'
+--   brokkr bench --dry-run file-info --mode tags --expr 'a=b,c'
+--   brokkr bench --alloc file-info --mode tags --expr-json '["a=b,c","a=b,c"]'
 
-local expression_params = require("expressions")
+local function expressions(params)
+    if not params["expr-json"] then return params.expr or {} end
+    local values = json.decode(params["expr-json"])
+    if type(values) ~= "table" or json.encode(values):sub(1, 1) ~= "[" then
+        fail("--expr-json must be a JSON array of strings")
+    end
+    return values
+end
 
 local function stop_marker(value)
     local marker = value:gsub("^-", "")
@@ -23,8 +28,8 @@ local function stop_marker(value)
 end
 
 function validate(params)
-    if params.expr and params["expr-hex"] then fail("choose --expr or --expr-hex") end
-    if params.mode ~= "tags" and (params.type or params.expr or params["expr-hex"]) then
+    if params.expr and params["expr-json"] then fail("choose --expr or --expr-json") end
+    if params.mode ~= "tags" and (params.type or params.expr or params["expr-json"]) then
         fail("--type and expressions require --mode tags")
     end
     if params.jobs then
@@ -39,12 +44,13 @@ function validate(params)
             fail("--jobs must be an unsigned 64-bit integer")
         end
     end
-    for _, expr in ipairs(expression_params.expressions(params)) do
+    for _, expr in ipairs(expressions(params)) do
         if type(expr) ~= "string" or expr:sub(1, 1) == "-" or expr:find("%z") then
             fail("expressions must be strings without NUL and must not start with '-'")
         end
     end
-    if params.stop and not params.stop:match("^%-?[%w_]+$") then
+    if params.stop and (not params.stop:match("^%-?[%w_]+$")
+        or stop_marker(params.stop) == "_END") then
         fail("--stop must be a marker name: FOO_END, FOO or -FOO")
     end
 end
@@ -54,7 +60,7 @@ function bench(params)
     if params.mode == "tags" then table.insert(args, "tags") end
     table.insert(args, params.variant.file)
     if params.mode == "tags" then
-        for _, expr in ipairs(expression_params.expressions(params)) do table.insert(args, expr) end
+        for _, expr in ipairs(expressions(params)) do table.insert(args, expr) end
         table.insert(args, { type = params.type, ["min-count"] = "999999999" })
     end
     table.insert(args, {

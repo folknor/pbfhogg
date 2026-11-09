@@ -14,14 +14,35 @@
 # alphabetical order, one comment line naming each family. script_file
 # resolves against this file's directory, hence the leading "../". Lua
 # shared by several benches goes in the bench_lib directory
-# (`brokkr man bench-config bench_lib`), benches/lib, set below; no bench
-# script goes there. A bench's description is one line saying what it
-# measures; what the script does
-# and why belongs in the script's header comment. version starts at 1
+# (`brokkr man bench-config bench_lib`), benches/lib, when needed; no bench
+# script goes there. No shared Lua modules are currently needed, so
+# bench_lib is unset. A bench's description is one line saying what it
+# measures; what the script does and why belongs in its header comment. version starts at 1
 # and goes up, with a changelog entry and a new date, whenever a change
 # makes its runs stop comparing with earlier ones.
 
-bench_lib = "../benches/lib"
+# -- build-geocode-index
+
+[bench.geocode-build]
+script_file = "../benches/build-geocode-index/geocode-build.lua"
+description = "Build a reverse geocoding index from a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed build-geocode-index: forced overwrite and unindexed fallback, snapshots, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: build-geocode-index has no io_uring writer" }
+params.compression = { validated = true, help = "refused: build-geocode-index writes no PBF" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
 # -- cat
 
@@ -292,9 +313,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.file-info]
 script_file = "../benches/inspect/file-info.lua"
 description = "Inspect metadata, extended metadata, node statistics or tag counts on a dataset or snapshot"
-version = 1
+version = 2
 date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Replaced hex expression encoding with readable comma-preserving params using split = false" },
   { date = 2026-11-09, note = "Moved expression decoding into the shared bench library without changing the workload" },
   { version = 1, date = 2026-11-09, note = "Ported typed inspect: all four modes, expressions, worker counts, snapshots, direct I/O and profiling with marker stops" },
 ]
@@ -307,8 +329,8 @@ params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
 params.mode = { choices = ["metadata", "extended", "nodes", "tags"], default = "metadata", help = "typed inspect's default, --extended, --nodes or --tags mode" }
 params.type = { choices = ["node", "way", "relation"], help = "restrict tag counts to one object type" }
-params.expr = { validated = true, many = true, help = "tag expressions in order; use expr-hex for commas or duplicates" }
-params.expr-hex = { validated = true, help = "hex-encoded ASCII JSON string array; JSON unicode escapes support non-ASCII; preserves commas and duplicates" }
+params.expr = { validated = true, many = true, split = false, help = "one tag expression per flag, in order, commas included" }
+params.expr-json = { validated = true, split = false, help = "ordered JSON string array, allowing duplicate expressions; conflicts with expr" }
 params.jobs = { validated = true, help = "worker threads for nodes or tags; 0 is auto, omitted uses pbfhogg's default" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
@@ -377,9 +399,10 @@ params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io
 [bench.tag-select]
 script_file = "../benches/tags-filter/tag-select.lua"
 description = "Filter PBF objects with optional references, or filter OSC changes, on a dataset or snapshot"
-version = 1
+version = 2
 date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Replaced hex expression encoding with readable comma-preserving params using split = false" },
   { version = 1, date = 2026-11-09, note = "Ported typed tags-filter: PBF and OSC inputs, expression encoding, reference modes, inversion, tag removal, jobs, compression, direct I/O and profiling with marker stops" },
 ]
 profile = "release"
@@ -390,8 +413,7 @@ params.dataset = { from = "datasets", default = "denmark", help = "the dataset" 
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.input-kind = { choices = ["pbf", "osc"], default = "pbf", help = "input file kind" }
 params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default = "indexed", help = "PBF variant (typed --variant), or OSC sequence (typed --osc-seq); give an explicit sequence for OSC" }
-params.filter = { validated = true, help = "one filter expression; omitted uses w/highway=primary; use expr-hex for commas" }
-params.expr-hex = { validated = true, help = "hex-encoded ASCII JSON array containing one filter string; JSON unicode escapes support non-ASCII" }
+params.filter = { validated = true, split = false, default = "w/highway=primary", help = "one filter expression, commas included" }
 params.omit-referenced = { choices = ["yes", "no"], default = "no", help = "yes: single-pass PBF filter, dropping referenced objects" }
 params.invert-match = { choices = ["yes", "no"], default = "no", help = "yes: keep non-matching PBF objects" }
 params.remove-tags = { choices = ["yes", "no"], default = "no", help = "yes: strip tags from referenced but unmatched PBF objects" }

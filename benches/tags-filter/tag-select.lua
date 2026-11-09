@@ -9,26 +9,12 @@
 -- bound under input-kind so only the actual file is reserved and hashed.
 -- OSC sequences are explicit, even when the host has only one registered.
 -- Snapshots use their own OSC table, just as the typed command does.
--- --filter is one string; for commas use --expr-hex, a hex-encoded ASCII
--- JSON array holding exactly one string (JSON unicode escapes are allowed).
--- For example 5b22613d622c63225d encodes ["a=b,c"]. No expression parsing
--- is duplicated here: the built revision remains the grammar authority.
--- io_uring is refused, matching the typed runner. Features, commit selection
--- and iteration counts belong to the bench runner.
+-- --filter takes one whole readable expression, commas included. The built
+-- revision remains the grammar authority. io_uring is refused, matching the
+-- typed runner. Features, commit selection and counts belong to the runner.
 --
---   brokkr bench --dry-run tag-select --omit-referenced yes --invert-match yes
+--   brokkr bench --dry-run tag-select --filter 'w/highway=primary,secondary'
 --   brokkr bench --alloc tag-select --input-kind osc --input 4705 --jobs 2
-
-local expression_params = require("expressions")
-
-local function filter_expression(params)
-    if params["expr-hex"] then
-        local values = expression_params.expressions(params)
-        if #values ~= 1 then fail("--expr-hex must contain exactly one filter string") end
-        return values[1]
-    end
-    return params.filter or "w/highway=primary"
-end
 
 local function stop_marker(value)
     local marker = value:gsub("^-", "")
@@ -37,8 +23,7 @@ local function stop_marker(value)
 end
 
 function validate(params)
-    if params.filter and params["expr-hex"] then fail("choose --filter or --expr-hex") end
-    local expr = filter_expression(params)
+    local expr = params.filter
     if type(expr) ~= "string" or expr:sub(1, 1) == "-" or expr:find("%z") then
         fail("filter must be a string without NUL and must not start with '-'")
     end
@@ -88,7 +73,7 @@ function bench(params)
     local options = { hotpath = "tags-filter" }
     if params.stop then options.stop_at = stop_marker(params.stop) end
     local osc = params["input-kind"] == "osc"
-    local r = binary_with(options, "tags-filter", params.input.file, filter_expression(params), {
+    local r = binary_with(options, "tags-filter", params.input.file, params.filter, {
         ["input-kind"] = osc and "osc" or nil,
         output = output(osc and "filtered.osc.gz" or "filtered.pbf"),
         ["omit-referenced"] = params["omit-referenced"] == "yes",

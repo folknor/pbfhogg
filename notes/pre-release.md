@@ -16,19 +16,6 @@ empty, delete it.
 
 ---
 
-## Status
-
-The library-use gate is certified (`brokkr library --all --dataset denmark`
-at `627883d7`: 12/12 scenarios, 17/17 capabilities). io_uring is exercised on
-real data and its writer fixed. Multi-region extract admits its descriptors.
-The planet regressions found by the 2026-10-30 planet RAM pass are resolved:
-`13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
-(merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
-(apply-changes). The release itself still needs WRK-001, WRK-005 and
-WRK-191.
-
----
-
 ## Release
 
 ### WRK-001: Version bump and CHANGELOG date
@@ -162,8 +149,13 @@ yet.
    `--all --dataset denmark`.
 
 About 80 min planet plus trims, 15 min osmium, 12 min library. It needs a
-clean tree. `brokkr bench` and `brokkr library` take no `--dry-run`
-(`run_nodry` lists them unvalidated). Optional planet rows:
+clean tree. Every line, `brokkr bench` and `brokkr library` included,
+goes through `run`, so `./overnight.sh --dry-run` validates all of them
+(brokkr#134, installed 2026-11-09): bench params are checked against
+each param's declared values and the bench's `validate` hook, without a
+build or the lock. `brokkr library --dry-run` builds the harness to learn
+its scenarios and has never run end to end before tonight. Optional
+planet rows:
 check-locations, repack, degrade --strip-locations, check-index, digest,
 merge-changes --simplify.
 
@@ -181,7 +173,12 @@ merge-changes --simplify.
 - diff-text denmark `--new 320k` x3, and germany `--new 20260420 --verbose
   yes --common no` x3: `3286a9c5` landed with no clean cell.
 
-Param spellings are not validated. `brokkr bench NAME --help` lists them.
+Dry-run these lines too (`brokkr bench --dry-run ...`); `brokkr bench
+NAME --help` lists each bench's params. dedupe-self, dedupe-pair,
+vs-osmium and diff-text are v2 since brokkr#134: cache warming and
+eviction moved from `preflight` into `bench()`, so their iteration wall
+now includes that preparation. Compare on the child walls, which are
+unchanged; v1 iteration walls do not compare with v2.
 
 **Before the run, in order:**
 1. Done: the classify read-advice fix (WILLNEED in honoured calls) has
@@ -190,11 +187,13 @@ Param spellings are not validated. `brokkr bench NAME --help` lists them.
    dirty tree, and `--force` cells are not stored. `overnight.sh` is
    gitignored and does not count. Never `git stash` with a dirty
    `results.db`; stashes have dropped stored cells.
-3. Settle the `20260411` decision below. To reindex: `cat --reindex` the
-   snapshot into a new file, point `snapshot.20260411.pbf.indexed` in
-   `brokkr.d/hosts/bygg.toml` at it, and take its xxhash from
-   `brokkr env`. Without that, cells 21 and 22 (the two diff rows) read
-   the old-indexdata file against the reindexed base.
+3. Done: the `20260411` snapshot needs no reindex. `cat --reindex` at
+   `f0b7728b` (2026-11-09, bygg) over `planet-20260411-with-indexdata`
+   reported 51,274 blobs with indexdata changed in 0 and tagdata changed
+   in 0. The copy was the same size and first differed at byte 134 (where
+   it stops differing was not checked; the reindex rewrites no payload),
+   so it was discarded and the registered file (`7facb638...`) stands.
+   Cells 21 and 22 read true indexdata on both sides.
 4. `brokkr --version`: a stale installed brokkr is the usual cause of
    brokkr misbehaving; `brokkr install` from `~/Programs/brokkr` fixes it.
 5. `./overnight.sh --dry-run` from the project root. The file has never
@@ -232,10 +231,6 @@ be.
 - altw defaults to `--index-type sparse` (`cli/src/lib.rs`), which
   undercuts the "every command on a 32 GB machine" headline. Make `auto`
   the default, or keep the README sentence.
-- bygg's `snapshot.20260411.pbf.indexed` is still
-  `planet-20260411-with-indexdata` (`7facb638...`), never reindexed. Both
-  diff rows read it. Reindex and re-register first if that disqualifies
-  them.
 - The README read-throughput table (Denmark, `90df51f`, plantasjen,
   osmpbf / Planetiler rows) is a fourth table, and brokkr cannot
   reproduce its competitor rows. Drop it, or keep it labelled plantasjen.
@@ -283,263 +278,3 @@ actually gives, not an assumption:
   (`bc689783...`) should give `check-ids = "violations"`, `test-no-index`
   should give `check-index = "violations"`. Confirm each with one run first;
   brokkr#71 notes `--unsort` breaks ID order only on large enough inputs.
-
----
-
-## The measurement campaign
-
-Matched A/B cells planned at the end of the hygiene drain to bisect what the
-drain changed. Today's regression fixes did not need them, but they remain
-the way to find any regression the planet cells cannot see. "A vs B" means
-matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
-bisect inside it. Prefer stored cells where they already answer the
-question.
-
-### WRK-111: altw external pass A exposure to sustained-write state
-
-Residue. A short trim before a cell restores pass A (about 23 s against
-36-41 s without one) and launch-time Dirty/Writeback is negligible
-(reference/performance.md, "pass A after a trim or after another cell",
-`098c89cb`); exposure scales with scratch bytes ("Packed id-shard
-records"). Left: an idle-only rest cell and no-trim gaps matched to the
-trim's duration (the harness refused `sleep`, so neither ran), so trim
-is not isolated from elapsed time; in-pass dirty throttling and
-device-side state need per-cell device stats (brokkr#74). Shared
-per-bucket shard files were built and refused (pass A +27 % trimmed,
-+55 % untrimmed, all in append-lock waits; reference/performance.md,
-"Shared per-bucket id shards, refused"). No implementation lever on the
-exposure is left in hand: the unbuilt shapes there (a bounded descriptor
-cache over private files, striped buckets) bound descriptors, not write
-exposure.
-
-### Campaign reference: how to measure
-
-- Baselines first from `brokkr results`: a recent stored cell on the same
-  host is the baseline; run only the variant. Variants run uncommitted with
-  `--force` and are not stored, so record their numbers in
-  `reference/performance.md`.
-- Interleave matched cells when both arms must run: `--bench N` is best-of-N
-  within one cell and cannot cancel drift between cells.
-- Noise floor: ignore differences below 2-3 %. Planet single-sample walls
-  carry a 5-8 % environmental band on the bench host, and a cold schedule
-  header walk adds about 6 s per walk (`notes/todo.md`).
-- Read the phase split before calling any delta: `brokkr sidecar <uuid>
-  --human`, and `--compare` for a pair (check its host-difference annotation
-  first). `brokkr sidecar <uuid> --stat anon` gives peak anon cheaply.
-- One cell at a time, never in parallel. Old commits build through
-  `--commit <ref>`; the first build per commit is a cold rebuild.
-- Numbers written into markdown carry commit hash and hostname.
-
-### Campaign reference: reading rows across these commits
-
-- Rows from `56a50e0d` up to `c2409c45` (the ordered pools' result channel
-  as deep as the window) do not compare on send-side counters (`s4_send_ms`,
-  `WAIT_S4_SEND`, `WAIT_P2_SEND`, `altw_pass2_send_ms`) or on consumer-bound
-  memory.
-- `6592af1f` (protohoggr 0.5.0) changed output bytes: `BlockBuilder` output
-  shrinks for dense uid / user_sid deltas of magnitude `2^30` or more.
-- `CAT_NODES_*` / `CAT_WAYS_*` / `CAT_RELATIONS_*` are absent from
-  `8da26b23` until `168e581a` and since then mean write-side kind
-  transitions, so per-kind rows against `f2315551` are approximate;
-  `SORT_OVERLAP_PARALLEL_*`, `DIGEST_ENVELOPE_*` and `writer_write_ns` are
-  gone for good.
-- Hotpath names moved: getparents, time-filter, repack, degrade and
-  multi-extract's writer report under `parallel_classify_phase_ordered`;
-  command pipelines under `run_pipeline` instead of `run_pipeline_fused`;
-  cat `--clean`'s walk under
-  `build_classify_schedule_blob_filtered_accepting_partial`.
-- Every ordered pool records `ordered_pool_*_wait_ns`, every unordered
-  classify pool `classify_unordered_*_wait_ns`: one process-wide running
-  total emitted after every pool run. The desc lock wait includes peers
-  queued behind a holder blocked in its receive (reference/
-  performance-history.md, "Mutex<Receiver> blob dispatch is not a
-  bottleneck", which records the planet reading).
-- The encode-storage change (2026-11-01, the commit after `5789830e`)
-  removed the writer's `Framed` chunk: every pipelined frame is now one
-  owned buffer, so `writer_frame_ns` gains the header-and-body copy the
-  writer thread used to do inside `writer_write_ns`, and multi-extract's
-  region frames are counted as raw items where they were raw chunks.
-  Writer counters split across it compare only with that in mind.
-- `5bfa37ab` changed decode-buffer sizing and pool retention everywhere:
-  peak anon of any pool command compares across it only with that in mind.
-- Exit codes: `854f9465` split them (1 an answer, 2 a failure; before, both
-  were 1); `50a9fc06` made `diff --format osc` exit 1 on differences (it
-  always exited 0 before). brokkr `39d0988` stores exit 1 as an answer on
-  builds with the split; read the stderr of a pre-split `--commit` cell that
-  exits 1.
-
-### Campaign reference: inputs
-
-- The planet `altw-keep-untagged` variant for `apply-changes -l`, passed by
-  brokkr's `--locations-on-ways` (the plain `pbf.altw` base is refused: OSC
-  4913 references about 4.2M nodes it dropped as untagged).
-- A Denmark unsorted snapshot (`unsorted` and `test-unsorted` are the same
-  file) and an unindexed europe or planet input (`pbf.raw`).
-
-### Campaign reference: unmeasured changes with no cell of their own
-
-Each was argued neutral or below noise. Listed so a bisect landing near one
-knows what it changed.
-
-- Write side: `frame_in_scratch` (`1db71d8a`, `f9625b94`); the permit taken
-  through `acquire_permit` before spawn (`1db71d8a`); `fadvise::advise` on
-  every `posix_fadvise` (`d510bbd7`); the copy loops made two (`bd2de78d`);
-  the `307982d7..52690f1e` writer cluster on the `pwrite` pool and io_uring
-  backends and on borrowed `write_primitive_block` calls (the buffered
-  backend measured neutral, reference/performance.md "Writer cluster
-  across six commits").
-- Read side: `BlobReader::next` as `next_frame` plus `into_blob`, eviction
-  before the envelope parse (`8881415e`); `OrderWatermark`'s mixed-sign
-  `min_id` (`8881415e`); one `statx` per direct open (`ea17fd86`); the OSC arena reads
-  (`20d10610`); `BlobReader::leading_header` judging the first frame before
-  its body on every `ElementReader` (`418739bd`).
-- Counters: one struct per altw stage (`9dcf53a7`); `record_max` on the two
-  production `fetch_max` sites; apply-changes' and renumber's sets
-  (`13dd02aa`); the unordered pools' gated stall helpers (`003fe717`); read
-  metrics emitted after the scope joins, plus the fsync funnel (`8384fa29`).
-  The `9dcf53a7` and `13dd02aa` name sets are checked (reference/
-  performance.md, "Counter names across the counter-machinery commits");
-  their wall cost is not.
-- Pools: the accumulate pool's stop flag (`95eea09b`); the unordered
-  classify pools on one driver (`00ed5044`); the altw way reframes' shared
-  block walk (`285df56d`).
-- Commands: the `apply-changes -l` node boundary on the drain channel
-  (`ff0b0a37`; reference/performance.md, "Node boundary on the drain
-  channel, not measured"); `apply-changes --force` reframing untouched unindexed blobs in
-  the worker (`f703b02b`); degrade's sort-preservation guard (`9cce24b3`);
-  the `expect_used` restructurings (`11becae7`); `check --ids`' extra
-  type-order comparison (`4c254750`); input pinning (`926d5183` onwards).
-
----
-
-## Handoff
-
-What a session picking this up needs that is not written elsewhere:
-
-- **brokkr state.** brokkr#65 landed (`39d0988`, exit 1 stored as an answer
-  on split builds) and #71 landed (`b68f3e3`, declared answers; WRK-005).
-  #64, #67, #68, #69 and #70 are answered. Stored short-run rows from before
-  brokkr `a8605c879` carry up to ~100 ms of wall error.
-- **io_uring on bygg** needs memlock raised for the session (the deferred
-  io_uring item in `notes/todo.md`); the writer tests skip and
-  `--io-uring` refuses at preflight otherwise (RLIMIT_MEMLOCK is 8 MB).
-  A `!` shell's `$PPID` is the `claude` process, so the user runs
-  `! sudo prlimit --pid $PPID --memlock=unlimited:unlimited`; shells and
-  brokkr runs started afterwards inherit it (`! ulimit -l` confirms).
-- **Running the binary directly:** only `./target/release/pbfhogg` (with
-  the `./`) is allowlisted. brokkr deletes its bench output after a run, so
-  comparing two outputs byte for byte needs direct runs into
-  `data/bench-tmp/`; `xxhsum` is not installed and `diff` is broken in
-  the tool shell, `git diff --no-index --stat A B` works (no output means
-  identical).
-- **Filing in brokkr's bz from here:** the Bash hook rejects a command that
-  names brokkr together with a redirect, a pipe or backticks, so pass the
-  body with `-b '...'` in single quotes and no backticks.
-- **`sudo fstrim -av`** runs without a password, but after heavy scratch
-  churn it can take over 2 minutes; give it a long Bash timeout.
-- **Never `brokkr verify` above germany** (AGENTS.md). `brokkr verify` has no
-  `inspect` or `merge-changes` subcommand.
-- **Do not `git stash` with a dirty `.brokkr/results.db`:** a stash dropped a
-  stored row on 2026-10-30.
-
-## What the maintainer has made clear
-
-- **Performance on normal input is what matters; corrupt input is not.** A
-  check that only refuses malformed input and costs per-byte or per-element
-  work on a hot path is the wrong trade (BUG-191's width check was reverted
-  on that ground). Such findings end as comments plus a reference-doc
-  correction.
-- **A silent wrong answer is worse than a refusal.** An empty user or role,
-  a default metadata block, fewer nodes: refuse instead. A broken
-  internal invariant fails in release builds (ADR-0021).
-- **Follow protobuf's specified decoding where it costs nothing**, with
-  osmium as the parity reference. Deviations are deliberate and recorded in
-  DEVIATIONS.md.
-- **Commands fail loudly and point at `cat`.** Every command refuses a
-  partially indexed input except `cat` (every mode), `check --index` (a
-  violation) and `inspect`'s descriptions. `cat` is the recovery command.
-  `notes/todo.md` holds the wider "`cat` as the universal cleaner" and
-  "refusals name both remedies" projects.
-- **Inputs are regular files in every mode**; FIFOs, sockets and devices are
-  refused at pinning.
-- **Indexdata is believed (ADR-0013)**, including the header's
-  `Sort.Type_then_ID` claim; `check --index --ids` is the admission test.
-- **Observability is a contract.** Counter names, units and the `WAIT_*`
-  spans survive refactors. `_ms` counters truncate per sample on purpose;
-  keep the unit and recording point when moving timing code. The durable
-  statement is the `src/counters.rs` module doc; check a refactor with
-  `scripts/counter_names_diff.py`.
-- **`reference/performance-history.md` is a record of numbers, not of
-  machinery.**
-- **Do not remove ignored `direct_io` parameters.** They are deliberate
-  plumbing for the deferred CLI-surface redesign.
-- **One engine over two.** A slow special case gets a better path inside the
-  one engine, not a second engine back.
-- **The record informs, it does not rule.** Memory moves rather than
-  vanishing, and several "obvious" wins measured as losses; but code,
-  toolchain and models have moved, so an old failure may have been its
-  execution, not its premise.
-- **Commits stay granular** so `--commit` bisects land on one decision.
-- **protohoggr is the maintainer's crate.** A defect there is fixed there.
-- **BUG-009** is the maintainer's own project.
-- **571 MB for `inspect --extended` at planet is fine** (2026-10-30): modest
-  memory at planet scale is not a reason to hold back a large wall win.
-
-## Facts learned the hard way
-
-- **The two-arena penalty was the string table** (2026-11-01): the block
-  string table's `Rc<str>` per unique string, freed in bulk at every block
-  end, carried about nine tenths of what `MALLOC_ARENA_MAX=2` cost the
-  re-encoding commands; per-blob buffers carried the rest. The earlier
-  claim here that a fresh `BlockBuilder` per blob was "deliberate and
-  measured" had no measurement behind it. Workers that re-encode every blob
-  now keep one builder for the run; getparents still builds one per hit
-  blob, because a query hits few blobs.
-- **glibc realloc** (`research/glibc/malloc/malloc.c`): an mmapped chunk
-  grows by `mremap`; an arena chunk grows in place or moves. Freeing an
-  mmapped chunk raises the process-wide `mmap_threshold` to its chunk size
-  (chunks up to 32 MiB; a larger free leaves it alone) and `trim_threshold`
-  to twice that, which is why buffers that stop
-  being freed can push later allocations onto mmap (time-filter paid 29 s of
-  kernel time for it before `5bfa37ab` pinned the threshold, but only under
-  the two-arena cap). Read the source rather than reasoning from memory.
-- **Two malloc arenas are two locks** (2026-11-01): `M_ARENA_MAX=2` makes
-  every allocation above the tcache limit from every pool thread take one
-  of two arena mutexes, and an arena-backed `realloc` that moves copies
-  under it. Every measured re-encoding command paid 10 to 82 % more planet
-  wall for it, apply-changes 20x; the memory it was added for had already
-  gone with the decode-side string tables.
-  The CLI sets no allocator policy; fixed mmap thresholds were measured
-  across commands at planet (reference/performance.md, "glibc's sliding
-  mmap threshold across commands") and none was a uniform win.
-- **brokkr does not see glibc tunables** (2026-11-04): a
-  `GLIBC_TUNABLES` arm is invisible to `results.db` (not captured, so not
-  greppable), and `--force` on a clean tree stores the cell as if it were
-  the default. Run such arms with the tree dirty so they stay unstored.
-- **Per-blob decode buffers at planet** (`5bfa37ab`): the old 4x-compressed
-  reservation plus the table append put every buffer over the pool's cap,
-  and glibc kept the freed memory resident. Raising the cap alone made it
-  worse; right-sizing had to come with it.
-- **`par_fold_blobs` budget rule** (`read/reader.rs`): a budget below a full
-  partial batch plus one maximum blob blocks forever. Compile-time asserted
-  for production constants.
-- **The claim-counter pools** (altw external stages 2 and 3, geocode pass
-  1.5) lock a first-error mutex on every claim.
-- **apply-changes `-l` barrier**: the node boundary is a
-  `DrainMessage::NodeBoundary` on the drain channel; the 25 ms
-  `DRAIN_RECV_TIMEOUT` only wakes the drain to notice failure or
-  cancellation. Fault-plan hooks cover every barrier ordering
-  (`tests/fault_apply_changes.rs`).
-- **Premises drift.** Research notes were wrong on several load-bearing
-  points when checked against code (the pool-RSS cause, the pwrite frame
-  size, apply-changes' real holder); read the code before building on any
-  claim here.
-- **Sparring found real bugs** each time codex was asked to look past the
-  proposal. `review` refuses stdin over 20,000 bytes, and a session idle for
-  about an hour is refused as cache-cold.
-- Shell here: `mv` is not allowlisted (`cp` then `rm -f`), and `rm` prompts
-  without `-f`. There is no `/usr/bin/time`; for the peak RSS of a run too
-  short for the sidecar's sampler, the user runs
-  `TIMEFMT='%M kB max RSS'; time <binary> ...` with `!`. Debug builds do not
-  tell you about release residency. A subagent working alongside reports
-  your own uncommitted edits as someone else's.

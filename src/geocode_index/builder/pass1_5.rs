@@ -97,6 +97,10 @@ fn record_way_refs(
 }
 
 /// Whether any worker has already reported an error.
+///
+/// Workers call this before every claim from the shared way-blob counter,
+/// so it locks the first-error mutex once per way blob. The altw external
+/// stage 2 and stage 3 bucket pools do the same once per bucket.
 fn has_first_err(slot: &Mutex<Option<Error>>) -> bool {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -175,6 +175,7 @@ pub(super) fn stage3_slot_reorder(
                 let tmp_file = router.worker_file(worker_id);
 
                 loop {
+                    // The first-error mutex is locked once per bucket claim.
                     if router.is_aborted()
                         || err_ref
                             .lock()

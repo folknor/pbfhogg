@@ -161,6 +161,38 @@ usually small.
   `*_send_ms` and `r1_scan_ms` gone, `*_window_wait_ns` and `*_reframe_ns`
   added): denmark cells before it (`6a8e9463`) do not compare with later
   ones on those counters.
+- **Rows across the late-October 2026 changes.** `6592af1f` (protohoggr
+  0.5.0) changed output bytes: `BlockBuilder` writes dense uid and
+  user_sid deltas of magnitude `2^30` or more five bytes shorter, so
+  output sizes and digests do not compare across it. `CAT_NODES_*`,
+  `CAT_WAYS_*` and `CAT_RELATIONS_*` are absent from `8da26b23` until
+  `168e581a` and since then mean write-side kind transitions nested in
+  `CAT_FILTERED_*`, not execution barriers, so per-kind rows against the
+  per-kind planet baseline (sidecar `f2315551`) are approximate and the
+  wall is the exact comparison; `SORT_OVERLAP_PARALLEL_*`,
+  `DIGEST_ENVELOPE_*` and `writer_write_ns` are gone for good. Hotpath
+  names moved: getparents, time-filter, repack, degrade and
+  multi-extract's writer report under `parallel_classify_phase_ordered`,
+  command pipelines under `run_pipeline` instead of `run_pipeline_fused`,
+  and cat `--clean`'s walk under
+  `build_classify_schedule_blob_filtered_accepting_partial`.
+- **`7feb4370` (encode storage kept across blocks) changed what the
+  writer counters cover.** The writer's framed output chunk is gone:
+  pipelined framing hands out one exactly sized frame, so
+  `writer_frame_ns` now includes the header-and-body copy the writer
+  thread used to do on the write side. Writer counters split across it
+  compare only with that in mind.
+- **`5bfa37ab` changed decode-buffer sizing and pool retention
+  everywhere,** so the peak anon of any pool command compares across it
+  only with that in mind ("Decode buffers sized from the blob and
+  recycled").
+- **Exit codes.** `854f9465` split them (1 an answer, 2 a failure;
+  before, both were 1); `50a9fc06` made `diff --format osc` exit 1 on
+  differences (it always exited 0 before). brokkr asks each build which
+  side of the split it is on and does not accept exit 1 from a build
+  before it (`brokkr man pbfhogg`, "Answer exit codes"); rows stored from
+  such a build before that gate keep an exit code of 1 that cannot say
+  whether it was an answer or a failure.
 
 ## Cat passthrough (indexdata generation)
 
@@ -5854,3 +5886,39 @@ consumer thread spends seven times longer in the syscall without the wall
 noticing, so it is still not what binds. Not measured: the other classify
 commands (tags-filter, getid, getparents, extract, altw pass 0) and europe;
 the extract simple neutral reading above predates the fix.
+
+## Changes with no cell of their own (2026-10-24 to 2026-10-30)
+
+Each was argued neutral or below noise and never measured alone. Listed
+so a bisect landing near one knows what it changed.
+
+- Write side: `frame_in_scratch` (`1db71d8a`, `f9625b94`); the permit
+  taken through `acquire_permit` before spawn (`1db71d8a`);
+  `fadvise::advise` on every `posix_fadvise` (`d510bbd7`); passthrough
+  copies on one copy loop and one read loop (`bd2de78d`); the
+  `307982d7..52690f1e` writer cluster on the `pwrite` pool and io_uring
+  backends and on borrowed `write_primitive_block` calls (the buffered
+  backend measured neutral, "Writer cluster across six commits").
+- Read side: `BlobReader::next` as `next_frame` plus `into_blob`, with
+  eviction before the envelope parse (`8881415e`); `OrderWatermark`'s
+  mixed-sign `min_id` (`8881415e`); one `statx` per direct open
+  (`ea17fd86`); the OSC arena reads (`20d10610`, see "Node boundary on
+  the drain channel, not measured"); `BlobReader::leading_header` judging
+  the first frame before its body on every `ElementReader` (`418739bd`).
+- Counters: one struct per altw stage (`9dcf53a7`); `record_max` on the
+  production `fetch_max` sites; apply-changes' and renumber's sets
+  (`13dd02aa`); the unordered pools' gated stall helpers (`003fe717`);
+  read metrics emitted after the scope joins, plus the fsync funnel
+  (`8384fa29`). The `9dcf53a7` and `13dd02aa` name sets are checked
+  ("Counter names across the counter-machinery commits" under Reading
+  rules); their wall cost is not.
+- Pools: the accumulate pool's stop flag (`95eea09b`); the unordered
+  classify pools on one driver (`00ed5044`); the altw way reframes'
+  shared block walk (`285df56d`).
+- Commands: the `apply-changes -l` node boundary on the drain channel
+  (`ff0b0a37`, "Node boundary on the drain channel, not measured");
+  `apply-changes --force` reframing untouched unindexed blobs in the
+  worker (`f703b02b`); degrade's sort-preservation guard (`9cce24b3`);
+  the `expect_used` restructurings (`11becae7`); `check --ids`' extra
+  type-order comparison (`4c254750`); input pinning (`926d5183`
+  onwards).

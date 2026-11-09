@@ -410,6 +410,7 @@ pub(super) fn stage2_node_join(
                 let mut slot_counts: Vec<u64> = vec![0; slot_bucket_count];
 
                 loop {
+                    // The first-error mutex is locked once per bucket claim.
                     if err_ref
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)

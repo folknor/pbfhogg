@@ -236,6 +236,15 @@ pub fn malloc_trim() -> i32 {
 /// 32 MB on 64-bit), and freezes the trim threshold where it is (128 KB
 /// unless something already raised it).
 ///
+/// The slide, from glibc's `malloc/malloc.c`: freeing a mapped chunk larger
+/// than the current threshold, and no larger than 32 MiB, raises the
+/// threshold to that chunk's size and the trim threshold to twice it; a
+/// larger free leaves both alone. So a run whose blob-scale buffers stop
+/// being freed keeps the low default, and later blob-scale allocations go
+/// to mmap. `realloc` grows a mapped chunk with `mremap` and an arena chunk
+/// in place or by moving it. Read the source rather than reasoning from
+/// memory.
+///
 /// Either direction is a trade. A low pin returns freed large chunks to
 /// the OS at once, against arena fragmentation when allocations interleave
 /// across threads (mallinfo2 growth in `arena` with `hblkhd` flat). A high

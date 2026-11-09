@@ -184,11 +184,17 @@ It answers "did anything actually change?" rather than "which version is newer?"
 
 ## Change stream: version precedence is enforced, not merely positional
 
-**osmium behavior:** `osmium apply-changes` and `osmium merge-changes`
-resolve conflicts positionally - the last change seen for an object wins,
-whatever version it claims. Feeding diffs out of sequence order downgrades
-objects to an older state and exits 0. osmium offers no check and no
-warning.
+**osmium behavior:** `osmium apply-changes` (on a data file) and `osmium
+merge-changes --simplify` resolve conflicts by version, not by position:
+both reverse the change list and stable-sort it with libosmium's
+`object_order_type_id_reverse_version` (type, ID, descending version, then
+descending timestamp when both timestamps are valid), and keep the first
+change per object. So osmium keeps the highest version, then the later
+timestamp, and only among full ties the later change in input order.
+`apply-changes` merges the sorted changes with the base under the same
+order, so a base object with a higher version than every change survives.
+Feeding diffs out of sequence order therefore does not downgrade objects;
+osmium silently keeps the highest version, with no check and no warning.
 
 **pbfhogg behavior:** An incoming change whose `version` is lower than the
 highest version ever claimed for that object, by any create, modify or
@@ -201,7 +207,8 @@ raises nor resets the floor, so an unversioned change between v9 and v8 does
 not let the v8 through.
 
 A change whose `version` equals that highest claim is admitted, and the
-later change wins by position, as in osmium; the floor does not move, so a
+later change wins by position, where osmium prefers the later timestamp
+and falls back to position only on equal timestamps; the floor does not move, so a
 lower claim after it is still refused. Equal versions are ordinary input,
 not a symptom: overlapping replication diffs repeat boundary changes, and
 regional extract diffs (Geofabrik's, and `diff --format osc` without
@@ -221,18 +228,19 @@ The default `merge-changes` mode is untouched - it preserves the full
 change stream in input order by design and resolves nothing, so there is
 nothing to regress.
 
-Opt back into osmium's behavior with
+Opt into a purely positional rule (the last change seen wins, whatever
+version it claims; osmium has no such mode) with
 `apply-changes --allow-version-regression`,
 `merge-changes --simplify --allow-version-regression` (the flag requires
 `--simplify`, the only merge-changes mode that compares versions), or
 `CompactDiffOverlay::allow_version_regression(true)`.
 
-**Rationale:** Positional precedence is defensible when the operator
-controls the order, and indefensible as a silent default when they do not.
-Regressing an object to an older version is data corruption that produces a
-plausible-looking output file and a success exit code, so nothing
-downstream can detect it; the overlay already stored the version, making
-the check nearly free. Rejecting by default rather than warning follows the
+**Rationale:** A change whose version is lower than one already seen means
+the inputs are out of order. osmium hides that by keeping the highest
+version; pbfhogg treats it as an operator error worth stopping for, since
+an out-of-order input set usually means a diff was missed or misnamed, and
+a success exit code on it lets nothing downstream notice. The overlay
+already stored the version, making the check nearly free. Rejecting by default rather than warning follows the
 project rule that a command must not report success having done something
 other than what was asked. The escape hatch exists because replaying a
 change stream backwards is a legitimate, if rare, thing to want.
@@ -474,19 +482,26 @@ meets them.
 
 ## check-refs: occurrence-counting vs unique-counting for missing references
 
-**osmium behavior:** For missing relation-to-relation members, osmium reports the
-total number of broken references (occurrences).
+**osmium behavior:** For missing node refs in ways (`Nodes in ways missing`)
+and for missing relation-to-relation members, osmium reports the total number
+of broken references (occurrences): every way node ref whose node is absent
+counts, however often the same node is referenced. For node and way members of
+relations it counts each missing ID once.
 
-**pbfhogg behavior:** Reports unique missing IDs as the primary count, with the
-occurrence count in parentheses when it differs from the unique count:
-`Missing relation members: 706 (777 references)`. Also reports
-`missing_relation_member_occurrences` in JSON output.
+**pbfhogg behavior:** Reports unique missing IDs as the primary count for every
+class. For relation-to-relation members the occurrence count follows in
+parentheses when it differs from the unique count:
+`Missing relation members: 706 (777 references)`, and JSON carries
+`missing_relation_member_occurrences`. For missing node refs in ways
+(`Missing node refs in ways`) neither the human report nor JSON carries an
+occurrence count; only the distinct count is printed.
 
-**Impact:** Both tools find the same set of missing IDs. The difference is
-presentational - pbfhogg distinguishes "how many distinct IDs are missing" from
-"how many references point to missing IDs." Users comparing numeric output between
-the two tools should be aware that osmium's count corresponds to pbfhogg's
-occurrence (parenthesized) count, not the primary count.
+**Impact:** Both tools find the same set of missing IDs. For relation members
+the difference is presentational: osmium's count corresponds to pbfhogg's
+occurrence (parenthesized) count, not the primary count. For node refs in ways
+the two numbers cannot be reconciled from pbfhogg's output on any input where a
+missing node is referenced more than once: osmium's figure is larger. Node and
+way members of relations agree.
 
 ## Negative input IDs rejected project-wide
 

@@ -73,6 +73,26 @@ params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default 
 params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type RoaringTreemap sets" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 
+# -- check-refs
+
+[bench.ref-integrity]
+script_file = "../benches/check-refs/ref-integrity.lua"
+description = "Check way-node references, optionally relation members, on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed check-refs: relation checks, direct I/O, snapshots, marker stops and declared verdicts" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.check-relations = { choices = ["yes", "no"], default = "no", help = "yes: also check relation member references" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; use timing mode, not --hotpath" }
+
 # -- compare
 
 [bench.vs-osmium]

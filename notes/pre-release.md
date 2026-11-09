@@ -291,13 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-099: apply-changes -l node boundary on the drain channel
-
-`-l` on the planet `altw-keep-untagged` base, `ff0b0a37^` vs `ff0b0a37`: the
-node boundary rides the shared 256-slot drain channel and publishes from one
-readiness check. Probably neutral. Ride along: the OSC arena's `str::get`
-instead of `from_utf8` per key, role and user (`20d10610`, argued cheaper).
-
 ### WRK-100: apply-changes -j 1 cost
 
 What `-j 1` (accepted since `9744a9fc`) costs in wall and memory; nothing is
@@ -414,7 +407,9 @@ knows what it changed.
 - Pools: the accumulate pool's stop flag (`95eea09b`); the unordered
   classify pools on one driver (`00ed5044`); the altw way reframes' shared
   block walk (`285df56d`).
-- Commands: `apply-changes --force` reframing untouched unindexed blobs in
+- Commands: the `apply-changes -l` node boundary on the drain channel
+  (`ff0b0a37`; reference/performance.md, "Node boundary on the drain
+  channel, not measured"); `apply-changes --force` reframing untouched unindexed blobs in
   the worker (`f703b02b`); degrade's sort-preservation guard (`9cce24b3`);
   the `expect_used` restructurings (`11becae7`); `check --ids`' extra
   type-order comparison (`4c254750`); input pinning (`926d5183` onwards).

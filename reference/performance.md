@@ -5053,6 +5053,45 @@ apply-changes now send pre-framed raw items in order from the producer
 (`writer_payload_framed_items` 0), so their reorder buffer holds one item
 at a time and the counter reads the largest single item.
 
+## Node boundary on the drain channel, not measured (2026-11-09, at `a5a9ba08`)
+
+`ff0b0a37` moved the `--locations-on-ways` node boundary from its own
+one-slot channel, which the drain polled with `try_recv` on every loop
+iteration, onto the shared drain channel as `DrainMessage::NodeBoundary`.
+The drain now checks once after each receive and contiguous advance. The
+planned planet pair, `ff0b0a37^` against `ff0b0a37`, was not run. This
+is an argument from the source, not a measurement:
+
+- Publication becomes ready once the boundary has been received and every
+  node seq below it is processed, in both arms. Before publication no way
+  or relation item exists, so every message queued ahead of the boundary
+  is node work the drain must process anyway. The cost is one extra
+  control-message receive. When the boundary is late, the new shape
+  publishes as soon as it is received, where the old one waited up to one
+  `DRAIN_RECV_TIMEOUT` to poll for it. This is not a numerical bound on
+  wall time.
+- At HEAD the scanner sends the boundary and then blocks on the barrier
+  signal (scanner.rs, `send_boundary` then `wait_for_barrier`).
+  Publication needs the boundary to have been received, so a send blocked
+  on a full channel finishes inside a barrier wait that happens anyway.
+  It adds no delay to the scanner.
+- At the pair the scanner went on to walk the way and relation headers
+  after sending the boundary, and under `-l` every node descriptor went
+  through the workers, so the boundary was the scanner's first send on
+  the drain channel. A blocked send could therefore lose overlap between
+  that tail walk and the remaining node work. That risk is unquantified,
+  and the tail walk itself was removed in `0f417a44`. The pair's verdict
+  would not describe HEAD.
+- Wrapping each item in the `DrainMessage` enum costs something on every
+  item. It is unmeasured and judged too small to show in a planet wall.
+
+The same goes for the ride-along `20d10610`, which moved the OSC
+interner's `resolve` from `from_utf8(..).unwrap_or("")` to `str::get` on
+the range. That drops validation proportional to string length, once per
+resolved key, role and user name; tag values are still checked with
+`from_utf8`. It is an ancestor of both arms of the pair above, so that
+pair could never have measured it. It has no cell of its own.
+
 ## Apply-changes sequence window (bygg, 2026-10-31)
 
 The apply-changes scanner admits each blob seq against a window

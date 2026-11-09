@@ -390,6 +390,13 @@ pub(super) fn run_drain(
         // boundary arrives after the drain has already processed every node
         // item, this check publishes on that receive, which is the case the
         // old separate boundary channel needed an idle re-poll for.
+        //
+        // Carrying the boundary on this shared channel was not given a
+        // planet A/B, by argument (reference/performance.md, "Node boundary
+        // on the drain channel, not measured"): every message ahead of it is
+        // node work this check waits for anyway, and the scanner blocks on
+        // the barrier right after sending it, so a full channel cannot
+        // delay the scanner past its barrier wait.
         if matches!(state.loc, Some(DrainLoc::Pending(_)))
             && node_end_seq.is_some_and(|end| state.next_seq >= end)
             && let Some(DrainLoc::Pending(pending)) = state.loc.take()

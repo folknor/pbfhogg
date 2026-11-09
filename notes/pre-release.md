@@ -195,26 +195,6 @@ total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
 
 ---
 
-## Memory and throughput: structural work
-
-### WRK-178: Same-ID groups in the overlap sweep are held whole
-
-The sweep still gathers every copy of one ID before writing any
-(`emit_group` in `src/commands/blob_merge/sweep.rs`), uncharged against
-`SWEEP_PINNED_BYTES`, because a cursor delivers an ID's copies in block
-order and `sort` accepts descending versions inside a blob. Output now
-ships block by block inside a group and the dedupe lookup is indexed past
-`SWEEP_GROUP_INDEX_THRESHOLD`, so only the hold remains. Removing it means
-a merge keyed on (ID, version, tie) with an eager (ID, version) pass over
-every overlap blob before its cursor opens (sorted views where it fails):
-a second pass over normal input, and live cursor blocks and views are
-still held. Only adversarial or many-version input reaches the hold.
-
----
-
-## Tooling
-
----
 
 ## The measurement campaign
 
@@ -224,31 +204,6 @@ the way to find any regression the RAM pass could not see. "A vs B" means
 matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
-
-### WRK-084: Ordered pools
-
-Residue. The gate now notifies only parked workers and passthrough runs
-ahead of its decode result (reference/performance.md, "Ordered pool:
-notify only parked workers"); the window did not bind in any cell of that
-measurement, so stage 1 parking is not a cost. It has bound elsewhere:
-planet `cat --clean` cell `a8a4384e` (bygg, `627883d7`, under the two-arena
-malloc cap removed in `25172fc3`) records 74.2 s of
-`ordered_pool_window_wait_ns`, 31 % of its wall, and germany cells
-`62ee147e` and `42a26ca1` about 3 s (18 %); the HEAD-era planet cell
-`6f9896db` records 0. The `60e1b691` against `c2409c45`
-attribution is superseded: the callers were reshaped since (`7e7ede73`,
-`9ebcfa97`, `44c62853`), so HEAD is the shape to measure. Left:
-
-- `WILLNEED` on the consumer thread (one `posix_fadvise` per consumed
-  item on the serial writer, further ahead than the old dispatcher; it can
-  enter reclaim at planet scale) is unmeasured against any alternative
-  placement. The descriptor advice under it is settled
-  (reference/performance.md, "Scheduled-read advice: RANDOM against
-  plain"); the dispatcher-side advice on extract simple's unordered pools measured neutral at HEAD
-  (reference/performance.md, "WILLNEED on simple's node and way classify").
-- Claim workers against a dispatcher: no cell isolates it.
-- altw external stage 4 under `--keep-untagged-nodes`, the case the eager
-  passthrough targets, is unmeasured: brokkr cannot forward the flag.
 
 ### WRK-086: cat --dedupe passthrough across the engine move
 

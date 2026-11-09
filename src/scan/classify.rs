@@ -365,6 +365,18 @@ impl WillneedPrefetch {
     }
 }
 
+/// Emits the invocation's `fadvise_willneed_wait_ns` total as the advising
+/// pass ends (every `WILLNEED` the library issues goes through this type), so
+/// the sidecar sees the time the advising thread spent in the syscall. The
+/// total only grows, so a later pass's emission supersedes this one.
+impl Drop for WillneedPrefetch {
+    fn drop(&mut self) {
+        if let Ok(call) = self.invocation.call() {
+            call.metrics().fadvise.emit_willneed(&call);
+        }
+    }
+}
+
 /// Resolve a caller-supplied `threads: Option<usize>` override into a
 /// concrete decode-thread count. `None` (the default for every existing
 /// caller) picks `host::sized_workers` over the host resources, the
@@ -1181,7 +1193,16 @@ struct ClassifyLocal<S> {
 
 /// The calling thread's side of [`parallel_classify_phase_ordered`]: the
 /// caller's merge, and the sliding `WILLNEED` advice, which follows the
-/// window's edge (the furthest position a worker may claim next).
+/// window's edge (the furthest position a worker may be admitted to next).
+///
+/// The advice stays on this thread, after each credit is published: on
+/// planet `cat --clean` (bygg) the thread spends about 1.4 % of the wall in
+/// the syscall (`fadvise_willneed_wait_ns`) and 90 % waiting on results, and
+/// moving the call before or after the credit made no difference on planet
+/// or on germany, where the window binds (`reference/performance.md`,
+/// "Read-ahead advice after the credit"). A worker-side cursor would put
+/// the syscall and a shared lock on the threads that are the bottleneck; a
+/// dedicated advisor thread has no measured cost to recover.
 struct ClassifyConsumer<'a, M> {
     merge: M,
     willneed: WillneedPrefetch,

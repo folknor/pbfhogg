@@ -2868,8 +2868,71 @@ pass A, which swings with run history ("altw external pass A swings with
 run history" above), not with this change. Peak anon 10.22 against 10.26
 GB. tags-filter is flat apart from one slow baseline cell. Verdict: no
 measurable cost or gain on the default paths. The `--keep-untagged-nodes`
-stage 4 prefix, the case the eager passthrough targets, is not measured:
-brokkr's `add-locations-to-ways` cannot forward that flag.
+case is measured in the next entry.
+
+### Eager passthrough under `--keep-untagged-nodes` (bygg, 2026-11-09, at `b58e8ef3`)
+
+The case the eager `before_item` above targets: altw external with
+`--keep-untagged-nodes`, where stage 4 copies 33,287 node and relation
+blobs (62.6 GB, `s4_passthrough_pread_ms` 51.4 s) between 17,529 decoded
+way blobs. Arms: the tree's eager hook against an uncommitted lazy
+variant that calls `before_item(k)` only once task `k`'s result is
+popped, before its error is unwrapped (the pre-`e91e5f11` placement).
+Both arms carry the read-ahead advice change of the next entry. Planet
+reindexed input, `--bench 1`, `--force` (unstored), `sudo fstrim -av`
+before every cell, order eager, lazy, lazy, eager. Seconds:
+
+| Cell | Arm | Wall | Pass A | Stage 2 | Streaming (stages 3+4) | `WAIT_S4_SEND` total |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | eager | 302.5 | 22.3 | 130.0 | 142.8 | 135.1 |
+| 2 | lazy | 302.6 | 22.1 | 130.9 | 142.3 | 136.8 |
+| 3 | lazy | 324.4 | 28.3 | 144.5 | 145.1 | 139.4 |
+| 4 | eager | 297.5 | 22.4 | 129.1 | 138.7 | 133.3 |
+
+`EXTJOIN_STAGE4` shares its START/END with `EXTJOIN_STAGE3`, so the
+streaming span is stage 3's: stage 4's workers spend about 135 s of it
+summed in `WAIT_S4_SEND`, and the consumer's own write time
+(`s4_consumer_write_ms` about 64 s in both arms) fits inside the span
+either way. Cell 3 is slow in every phase, pass A and stage 2 included,
+which no stage 4 change reaches: drive state. Verdict: no measurable
+effect; the passthrough copy is hidden behind stage 3 whether it runs
+ahead of the next result or not. The eager hook stays, for its error
+ordering and liveness contract, not for speed.
+
+### Read-ahead advice after the credit (bygg, 2026-11-09, at `b58e8ef3`)
+
+`ClassifyConsumer::on_advance` issues the sliding `POSIX_FADV_WILLNEED`
+on the ordered pool's consumer thread. It ran before the consumed
+result's credit was published, so a slow advice call held back workers
+parked at the window. It now runs after `gate.advance`. Every task newly
+admitted by a credit lies inside the byte window an earlier call already
+advised, unless the schedule jumps more than `WILLNEED_WINDOW_BYTES`
+between adjacent tasks, and advice issued in the instant before
+admission gives such a task no lead either way. New counter
+`fadvise_willneed_wait_ns`: the time the advising thread spends inside
+the syscall (not the read-ahead I/O, not reclaim alone), emitted once per
+advising pass. Variant (advice before credit, the old order) and tree
+both uncommitted with the counter, `--force`, `cat --clean`. Seconds;
+window and advice as % of wall:
+
+| Dataset | Arm | Wall | `ordered_pool_window` | `fadvise_willneed` |
+|---|---|---:|---:|---:|
+| planet reindexed | after credit | 142.7 | 0 | 1.96 (1.4 %) |
+| planet reindexed | before credit | 142.1 | 0 | 1.99 (1.4 %) |
+| germany | before credit (first after planet, cold) | 8.9 | 1.07 (12 %) | 0.21 |
+| germany | after credit | 7.0 | 0.91 (13 %) | 0.03 |
+| germany | before credit | 7.0 | 1.01 (15 %) | 0.03 |
+| germany | after credit | 7.1 | | |
+
+An earlier planet cell of the tree arm before the counter was wired
+measured 142.8 s. Verdict: no difference outside noise. The window binds
+on germany (12 to 15 % of wall) in both arms, while warm advice costs
+30 ms in total there, so what binds the window is the head blob's own
+work, not the advice. On planet the consumer spends 2 s of a 143 s wall
+in advice, 1.4 %, with `ordered_pool_result_recv` at 90 %: the consumer
+placement is not a cost, and neither a worker-side cursor nor a dedicated
+advisor thread has a cost to recover. Whether the advice pays at all on
+the ordered pools is not decided by these cells.
 
 ## Renumber (external mode)
 

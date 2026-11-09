@@ -100,7 +100,15 @@ pub(crate) fn advise(
     let Some(range) = off_t_range(offset, len) else {
         return false;
     };
-    if issue(file, range, Advice::Hint(hint)) != 0 {
+    let timed = (hint == Hint::WillNeed).then(crate::counters::Stopwatch::start);
+    let rc = issue(file, range, Advice::Hint(hint));
+    if let Some(t) = timed {
+        // Like the failure count below: a sealed invocation records nothing.
+        if let Ok(call) = invocation.call() {
+            t.record_ns(&call.metrics().fadvise.willneed_wait_ns);
+        }
+    }
+    if rc != 0 {
         // Cold: a nested entry under whatever admits the caller (a
         // command's call, a reader method's, a pipeline thread's permit), so
         // never refused there; a sealed invocation records nothing.
@@ -270,6 +278,13 @@ crate::counters::counter_set! {
         /// issued, on a failed or cancelled run too: it is what the run
         /// asked for, not what a command expected to ask for.
         scratch_evictions => "fadvise_scratch_evictions",
+        /// Nanoseconds spent inside `POSIX_FADV_WILLNEED` calls ([`advise`]
+        /// with [`Hint::WillNeed`]), summed over every thread that issued
+        /// one. Syscall elapsed time on the advising thread, which includes
+        /// any reclaim or scheduling delay the kernel spent there; it is not
+        /// the read-ahead I/O itself, which the call only queues, and not a
+        /// measure of what the advice cost or saved elsewhere.
+        willneed_wait_ns => "fadvise_willneed_wait_ns",
     }
     extra {
         /// Serializes a failure's increment with its emission (see
@@ -279,6 +294,17 @@ crate::counters::counter_set! {
 }
 
 impl FadviseMetrics {
+    /// Emit the invocation's `fadvise_willneed_wait_ns` total to its sidecar
+    /// stream. Called once per advising pass, not per call: the advice runs
+    /// once per consumed blob, and a line per call would flood the FIFO.
+    pub(crate) fn emit_willneed(&self, invocation: &crate::host::Recorder) {
+        invocation.counter(
+            "fadvise_willneed_wait_ns",
+            self.willneed_wait_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+
     /// Count one failed advice and emit the invocation's total. Cold: a hint
     /// that failed once on a descriptor usually fails on every call, but a
     /// run that sees it at all is the exception.

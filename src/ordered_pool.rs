@@ -462,9 +462,14 @@ pub(crate) trait OrderedConsumer<T> {
     /// Advisory: the window's edge moved to `edge` (the first task not yet
     /// admissible; `consumed + window`, clamped to the task count). Called
     /// once before the workers start and then after each consumed result,
-    /// before that result's credit is published, so read-ahead advice for
-    /// the newly admissible tasks is issued before they can be claimed. It
-    /// cannot control admission.
+    /// after that result's credit is published, so a hook that blocks (a
+    /// read-ahead advice call can enter reclaim) never holds back the
+    /// workers parked at the window. A task newly admitted by that credit
+    /// may therefore start before the hook runs for its edge: read-ahead
+    /// advice that reaches past the edge (as classify's does, by its byte
+    /// window) has normally covered it on an earlier call, and advice
+    /// issued only as a task is admitted would have given it no lead
+    /// either way. It cannot control admission.
     fn on_advance(&mut self, edge: usize) {
         let _ = edge;
     }
@@ -764,6 +769,12 @@ where
     }
     consumer.on_advance(window.get().min(n_tasks));
     let gate = OrderedGate::new();
+    // Workers claim from this counter rather than being fed by a dispatcher
+    // thread: a claim is one atomic add plus the gate's lock-free fast path,
+    // and a dispatcher would add a serial hop and a channel per task. The
+    // motive cited for one in this crate, a home for the read-ahead cursor,
+    // is met by `OrderedConsumer::on_advance`, and no ordered-pool cell has
+    // shown a claim cost or a problem a dispatcher would solve.
     let next = AtomicUsize::new(0);
     // Result-channel depth, kept only when its high-water is reported.
     let queue_depth = AtomicUsize::new(0);
@@ -869,8 +880,11 @@ fn deliver<T, C: OrderedConsumer<T>>(
             cancel.check()?;
             consumer.consume(consumed, result)?;
             consumed += 1;
-            consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
+            // Credit first: `on_advance` is advisory and may block in the
+            // kernel, so it must not stand between a consumed result and the
+            // workers waiting on its credit.
             gate.advance(consumed);
+            consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
             if consumed < n_tasks {
                 cancel.check()?;
                 consumer.before_item(consumed)?;

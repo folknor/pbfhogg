@@ -1167,6 +1167,15 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **cat --clean's window binds on germany (2026-11-09).** At
+  `b58e8ef3` on bygg, germany `cat --clean` parks workers at the ordered
+  pool's window for 12 to 15 % of the wall (`ordered_pool_window_wait_ns`)
+  while planet records 0; the read-ahead advice costs 30 ms there, so the
+  binding is the head blob's own work behind a 64-slot window
+  (`POOL_REORDER_CAPACITY_WIDE`). Whether a wider window or a different
+  germany blob mix explains it, and whether it moves the wall, is not
+  measured (reference/performance.md, "Read-ahead advice after the
+  credit").
 - [ ] **getid's full-scan arm reads every payload it then skips
   (2026-11-09).** `filter_by_id_streaming` uses `Frames::next_raw`, so a
   blob the indexdata prescreen rejects has its whole payload copied into
@@ -1183,6 +1192,19 @@ Known to work, no performance question open, but not in the results DB:
   engine move on unsorted Denmark"). Thread utilization and the critical
   path were not measured; this records the limit, not a defect or a
   remedy.
+- [ ] **Same-ID groups in the overlap sweep are held whole (moved from
+  the pre-release note 2026-11-09).** The sweep still gathers every copy
+  of one ID before writing any (`emit_group` in
+  `src/commands/blob_merge/sweep.rs`), uncharged against
+  `SWEEP_PINNED_BYTES`, because a cursor delivers an ID's copies in block
+  order and `sort` accepts descending versions inside a blob. Output
+  ships block by block inside a group and the dedupe lookup is indexed
+  past `SWEEP_GROUP_INDEX_THRESHOLD`, so only the hold remains. Removing
+  it means a merge keyed on (ID, version, tie) with an eager (ID,
+  version) pass over every overlap blob before its cursor opens (sorted
+  views where it fails): a second pass over normal input, and live
+  cursor blocks and views are still held. Only adversarial or
+  many-version input reaches the hold.
 - [ ] **Byte-budgeted fused task engine (moved from the pre-release
   note 2026-11-08).** One execution model for decode, transform, encode
   and frame under one byte budget, replacing the unordered classify pool,

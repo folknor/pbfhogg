@@ -591,8 +591,8 @@ impl Invocation {
     /// far, with the name it is emitted under on the sidecar stream and its
     /// current value: the read pipeline's `pipeline_*`, the worker pools'
     /// `classify_unordered_*` and `ordered_pool_*`, the writers' `writer_*`
-    /// and `fadvise_failures`, `fadvise_input_evictions` and
-    /// `fadvise_scratch_evictions`. Every pass of the invocation adds into the
+    /// and `fadvise_failures`, `fadvise_input_evictions`,
+    /// `fadvise_scratch_evictions` and `fadvise_willneed_wait_ns`. Every pass of the invocation adds into the
     /// same counters (sums for counts and waits, maxima for the high-water
     /// and peak counters), and nothing else does.
     ///

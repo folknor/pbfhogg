@@ -54,6 +54,25 @@ params.with_variant = { from = "datasets.{dataset}.snapshot.{with}.pbf", default
 params.cache = { choices = ["cold", "warm"], required = true, help = "both inputs' page-cache state as the merge starts" }
 params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the output against the first input after the merge (a correctness run, for a second input that is a subset of the first)" }
 
+# -- check-ids
+
+[bench.id-order]
+script_file = "../benches/check-ids/id-order.lua"
+description = "Check ID ordering, optionally detecting duplicate IDs, on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed check-ids: streaming/full checks, direct I/O, snapshots and declared verdicts" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type RoaringTreemap sets" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+
 # -- compare
 
 [bench.vs-osmium]

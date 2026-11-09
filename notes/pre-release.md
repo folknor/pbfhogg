@@ -270,18 +270,6 @@ but costs the text diff's no-scratch contract; a cut by an estimate of
 detail bytes would not. Unmeasured; no input of that shape exists in the
 datasets.
 
-### WRK-093: Unindexed sequential diff
-
-`brokkr diff --dataset denmark --variant raw` (europe if it shows), with and
-without `--type way`, `8881415e^` vs `8881415e` (per-element order check,
-per-block kind classification, excluded kinds dropped unmerged; expected
-faster under `--type`, slightly slower per element otherwise). Then
-`94743e65^` vs `94743e65` separately (borrowed elements instead of owned
-conversion, expected faster; the two sides' decoded-block peaks can now
-coincide) and `126cbce2` (one `DecompressPool` per merge). No measurement of
-the unindexed path exists at all. Check that brokkr's `diff` takes
-`--variant raw`.
-
 ### WRK-094: Plain cat across the one frame decoder
 
 Plain `brokkr cat --dataset planet`, `307982d7^` vs `307982d7`. The raw-frame

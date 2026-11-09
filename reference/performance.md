@@ -3890,6 +3890,45 @@ and decode pool are dropped before it, so it does not stack on the
 scan's working set. 0.36 s is three 100 ms samples, so 71 MB is a
 sampled peak, not the instantaneous one.
 
+### Unindexed text diff across its three reshapes (bygg, 2026-11-09)
+
+Script bench `diff-unindexed` (`benches/diff/diff-unindexed.lua`):
+`diff -c` of germany `pbf.raw` (base, seq 4704) against germany
+snapshot `20260420` `pbf.raw`, both without indexdata, so every arm
+takes the sequential element stream. Inputs evicted and fincore-checked
+at zero before each run (the 9.4 GB pair does not stay cached under the
+bench's memory limit, so warm cannot be held). One iteration per
+invocation, both arms `--commit` worktree builds, A B B A per pair;
+walls are the diff child's own. Every arm of a pair wrote the same
+output bytes and the same summary: type all 150641304 bytes, 7952543
+differences, 495644074 common; `--type way` 31301484 bytes, 1601349
+differences.
+
+| Pair | Type | Before (s) | After (s) | Change |
+|---|---|---|---|---:|
+| `8881415e^` vs `8881415e` | all | 152.9, 151.5 | 156.5, 161.9 | +5 % |
+| `8881415e^` vs `8881415e` | way | 153.6, 162.0 | 102.6, 103.5 | -34 % |
+| `94743e65^` vs `94743e65` | all | 151.3, 151.7 | 97.4, 100.0 | -35 % |
+| `126cbce2^` vs `126cbce2` | all | 98.5, 100.3 | 96.6, 96.6 | -3 % |
+
+Uuids in run order: `fb596e36` `96fe93aa` `0eb42526` `6a9853f6`;
+`214b4ee4` `f050f528` `ea2a5a3a` `2ae91082`; `5f2e009e` `e9d40917`
+`72230dd3` `d8eecbd8`; `e15b137d` `4d441144` `992273d3` `af661a0e`.
+
+- `8881415e` (per-element order check, blocks classified by their
+  elements, excluded kinds dropped instead of converted and merged):
+  slightly slower on the full diff, as expected; under `--type way` it
+  saves a third, the node and relation drains no longer converting
+  elements. The saving lies outside the `DIFF_PHASE_WAY` span, so judge
+  `--type` arms on the whole wall.
+- `94743e65` (borrowed elements instead of owned conversion): a third
+  off the full diff, and peak anon 102 MB -> 21 MB (`5f2e009e` vs
+  `e9d40917`); the two sides' block peaks coinciding costs nothing
+  visible.
+- `126cbce2` (one `DecompressPool` per merge): within the noise floor,
+  peak anon 21 MB -> 24 MB (sampled); `5bfa37ab` later changed the
+  pool's retention, so this is the change as landed, not as it is now.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

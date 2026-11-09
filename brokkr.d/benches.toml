@@ -53,6 +53,23 @@ params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the
 params.row = { required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
 
+# -- diff
+
+[bench.diff-unindexed]
+script_file = "../benches/diff/diff-unindexed.lua"
+description = "Text diff -c of two unindexed snapshots of one dataset, inputs cold, optional --type"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Added: reaches the unindexed element stream, which typed brokkr diff cannot" },
+]
+params.dataset = { from = "datasets", default = "germany", help = "the dataset" }
+params.old = { from = "datasets.{dataset}.snapshot", default = "base", help = "the old side's snapshot" }
+params.old_variant = { from = "datasets.{dataset}.snapshot.{old}.pbf", default = "raw", help = "the old side's PBF variant" }
+params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "the new side's snapshot" }
+params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
+params.type = { default = "all", help = "all, or node, way or relation: diff's --type" }
+
 # -- sort
 
 [bench.sort-cold]

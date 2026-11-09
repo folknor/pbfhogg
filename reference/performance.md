@@ -1092,7 +1092,42 @@ suite; the rest still carry their older commit in the Notes column.
 > 12-15 ms of fincore and eviction before the merge, about 1 % of the
 > fastest (denmark HEAD) cells and less elsewhere.
 > What this does not measure: the self-merge puts every blob in a two-blob
-> run, so passthrough and its coalesced `copy_file_range` never run.
+> run, so passthrough and its coalesced `copy_file_range` never run; the
+> next callout does.
+
+> **Denmark passthrough across the engine move (2026-11-09, bygg, kernel
+> 7.2.14, ext4, `sudo fstrim -av` first).** Script bench `dedupe-pair`
+> (`benches/cat/dedupe-pair.lua`): denmark base merged with snapshot
+> `one-relation`, a 436-byte file holding only base's highest-id relation
+> (`getid r20243795`). One overlap run of two relation blobs; the other
+> 7,395 base frames pass through, at HEAD as one coalesced copy (counters:
+> 1 copy call, 7,394 frames coalesced, 486,570,984 bytes, 0 fallback
+> ranges), at `dd312160` as a read and `write_raw` per frame. Same three
+> arms, HEAD now `f49dd460`, all `--commit` worktrees, one iteration per
+> cell, arm order rotated across three cold rounds and two warm ones.
+> Iteration walls in ms (the cat child is about 25 ms less):
+>
+> | Condition | `dd312160` | `79d2e923` | `f49dd460` |
+> |---|---|---|---|
+> | cold (3 cells) | 389, 327, 333 | 1069, 1073, 1045 | 513, 518, 460 |
+> | warm (2) | 215, 212 | 183, 200 | 193, 211 |
+>
+> Warm, the three arms overlap: the coalesced copy neither wins nor
+> loses wall on this file, as the sort coalescer `244c6ec` did not on
+> Europe. Cold, HEAD is about half again the old engine's wall (median
+> 513 against 333 ms) though far below the move's. The cat child of
+> HEAD cell `e4484a26` (435 ms) splits into pass 1 at 177 ms (the header
+> walk) and pass 2 at 253 ms, 244 of it the copy's flush; the old cell
+> `4f376168` (305 ms) is one span at 0.6 s user and 0.6 s kernel. The
+> suspected cause, an inference not shown by disk-read attribution: the
+> old pass 1 skipped payloads through a 256 KB `BufReader` with
+> sequential readahead, which prepared the cache for its pass 2, while
+> HEAD's header-only walk leaves the copy to fetch the file cold. Output
+> is 486,848,104 bytes on every arm, and `--check yes` cells on each arm
+> (HEAD `4f3830d1` dirty-tree, `e069805a`, `0900f601`) diff it against
+> base with no difference. `--with ways-only` is the mixed shape (every
+> way blob overlaps, nodes and relations pass through: 6,568 frames, 2
+> copy calls at HEAD); it is not timed here.
 
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**

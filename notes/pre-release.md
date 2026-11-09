@@ -205,18 +205,21 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-086: cat --dedupe passthrough across the engine move
+### WRK-112: cold passthrough-dominated cat --dedupe slower than the old engine
 
-Residue. The self-merge is measured on both datasets across `79d2e923^`,
-`79d2e923` and HEAD (reference/performance.md, "Denmark and Japan across
-the engine move": about 10x faster at the move, halved again since). A
-self-merge puts every blob in an overlap run, so the move's coalesced
-`copy_file_range` passthrough is unmeasured. Measuring it needs an input
-pair whose plan shows nonzero passthrough with adjacent ranges that
-coalesce (check `cat_dedupe_blobs_passthrough` and
-`cat_dedupe_copy_range_coalesced` at HEAD first), then the same pair on all
-three arms; `benches/cat/dedupe-self.lua` is the shape to extend with a
-second input.
+On denmark base merged with the `one-relation` snapshot (nearly every frame
+passes through as one coalesced copy), cold cells at `f49dd460` run about
+half again the old engine's wall (median 513 against 333 ms at `dd312160`);
+warm cells are at parity (reference/performance.md, "Denmark passthrough
+across the engine move"). HEAD's split is pass 1 177 ms, copy flush 244 ms.
+Suspected, not shown: the old pass 1's buffered sequential skip warmed the
+cache for its pass 2, and the header-only walk leaves the copy to read the
+file cold. Unmeasured beyond denmark; planet is all passthrough on a sorted
+`sort`, which shares this pass 2. Candidate designs, none established:
+sequential readahead advice over each passthrough stretch ahead of its
+copy, or a pass 1 that streams payloads when the plan will pass most of
+them through. Confirm the mechanism first (disk-read attribution per
+phase), then design.
 
 ### WRK-111: altw external pass A exposure to sustained-write state
 

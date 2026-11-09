@@ -36,6 +36,22 @@ params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = 
 params.cache = { required = true, help = "cold or warm: the input's page-cache state as the merge starts" }
 params.check = { default = "no", help = "yes: diff the output against the input after the merge (a correctness run, not a timing cell)" }
 
+[bench.dedupe-pair]
+script_file = "../benches/cat/dedupe-pair.lua"
+description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts, reaching passthrough"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Added: a second input, so disjoint stretches take passthrough and the coalesced copy" },
+]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.base = { from = "datasets.{dataset}.snapshot", default = "base", help = "the first input's snapshot" }
+params.base_variant = { from = "datasets.{dataset}.snapshot.{base}.pbf", default = "indexed", help = "the first input's PBF variant" }
+params.with = { from = "datasets.{dataset}.snapshot", required = true, help = "the second input's snapshot" }
+params.with_variant = { from = "datasets.{dataset}.snapshot.{with}.pbf", default = "indexed", help = "the second input's PBF variant" }
+params.cache = { required = true, help = "cold or warm: both inputs' page-cache state as the merge starts" }
+params.check = { default = "no", help = "yes: diff the output against the first input after the merge (a correctness run, for a second input that is a subset of the first)" }
+
 # -- compare
 
 [bench.vs-osmium]

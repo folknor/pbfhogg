@@ -94,6 +94,13 @@ download_date = "2026-10-27"
 file = "denmark-ways-only-with-indexdata.osm.pbf"
 xxhash = "222152d6a1093e27f40e87bbafbb1bb6"
 
+[bygg.datasets.denmark.snapshot.one-relation]
+download_date = "2026-11-09"
+
+[bygg.datasets.denmark.snapshot.one-relation.pbf.indexed]
+file = "denmark-one-relation-with-indexdata.osm.pbf"
+xxhash = "0319e3103e5c241a6d5ce7e4a7c2c368"
+
 [bygg.datasets.denmark.snapshot.grow-9001]
 download_date = "2026-11-08"
 

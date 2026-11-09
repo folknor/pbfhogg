@@ -315,6 +315,30 @@ table-row same-disk parallel pwrite zstd:1 (104.5 s) within noise -
 confirming the writer-pool ceiling at POOL_SIZE=16, not the scanner
 ceiling.
 
+### `-j 1` against the automatic count (commit `eda3b670`, bygg)
+
+What an explicit `-j 1` costs. The automatic count on bygg is 30
+workers (`merge_worker_count`). `-j` sizes only the worker pool, the `-l`
+coordinate slots and whether drain create runs use the executor (at
+`-j 1` they are encoded on the drain thread); the writer pool and the OSC
+parse are not sized by it. `--bench 1` cells, default first; peak anon
+from `brokkr sidecar <uuid> --stat anon` (100 ms samples).
+
+| Input | Default wall / peak anon | `-j 1` wall / peak anon | Ratio | UUIDs (default, `-j 1`) |
+|---|---|---|---:|---|
+| germany plain, OSC 4705, zlib (A B B A) | 3.09 / 3.06 s, 452 / 530 MB | 43.3 / 43.1 s, 52 / 49 MB | 14x | `ac887281` `08c6a51b`, `b784cb5a` `28c4596f` |
+| planet plain, OSC 4913, zstd:1 | 94.3 s, 1.90 GB | 1471 s, 474 MB | 15.6x | `87e8b13c`, `e19c644a` |
+| planet `-l` altw-keep-untagged, OSC 4913, zlib | 262 s, 2.82 GB | 5263 s, 824 MB | 20x | `41ba96ca`, `01fc3d66` |
+
+Every phase runs at 1.0-1.3 cores under `-j 1` against 23-30 at the
+default (`brokkr sidecar --compare`), so the wall is the one worker's
+decode, rewrite and compression; the create segments are not significant
+on either arm. On planet plain the `-j 1` peak is already reached before
+the pipeline starts (the OSC parse and diff index, 474 MB in the
+`CLI_COMMAND_START` segment on both arms), so what fewer workers save is
+the concurrent workers' buffers and queued results, not the floor. No
+code change followed: one sequential worker is what `-j 1` promises.
+
 ### Inline-location refresh (`--locations-on-ways`, commit `81f3fbe4`)
 
 Since `81f3fbe4` a surviving base way takes the OSC coordinate for every

@@ -271,7 +271,11 @@ rule:
   sequential element stream, with a `Note:`.
 
 `apply-changes -j 1` runs one worker beside the scanner and drain threads;
-its automatic sizing still starts at two. `merge-changes -j 1` and OSC-mode
+its automatic sizing still starts at two. Its single worker decodes,
+rewrites and compresses every blob that needs rewriting, and new
+elements are encoded on the drain thread, so the run has little
+parallelism: it can take far longer, while the memory concurrent workers
+would hold is saved. `merge-changes -j 1` and OSC-mode
 `tags-filter -j 1` run one worker beside the reader thread that frames each
 input.
 

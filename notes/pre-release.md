@@ -291,11 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-100: apply-changes -j 1 cost
-
-What `-j 1` (accepted since `9744a9fc`) costs in wall and memory; nothing is
-known.
-
 ### WRK-101: build-geocode-index codec commits
 
 Planet, `d510bbd7` vs `067be2d8`, covering `64141296` and `067be2d8`; planet

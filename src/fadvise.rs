@@ -25,7 +25,8 @@
 //! dropped without the count, so the split is in the types, not in a
 //! convention:
 //!
-//! - [`advise`] takes a [`Hint`], which has no variant that drops pages.
+//! - [`advise`] takes a [`Hint`], which has no variant that drops pages,
+//!   and [`will_need`] only ever asks for pages to be read.
 //! - [`evict_input`] is the only way to drop pages of an arbitrary `File`,
 //!   and it always counts. It fails closed: it holds a call on the invocation
 //!   across the syscall, and issues nothing when the invocation refuses one
@@ -63,8 +64,6 @@ pub(crate) enum Hint {
     Sequential,
     /// `POSIX_FADV_RANDOM`: no readahead for this open file description.
     Random,
-    /// `POSIX_FADV_WILLNEED`: start reading the range into the page cache.
-    WillNeed,
 }
 
 /// Every advice the syscall below is given, private so that the two
@@ -72,6 +71,9 @@ pub(crate) enum Hint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Advice {
     Hint(Hint),
+    /// `POSIX_FADV_WILLNEED`, issued only by [`will_need`] in calls no
+    /// longer than [`WILLNEED_CALL_BYTES`](crate::tunables::WILLNEED_CALL_BYTES).
+    WillNeed,
     /// `POSIX_FADV_DONTNEED` on an input, counted ([`evict_input`]).
     EvictInput,
     /// `POSIX_FADV_DONTNEED` on library scratch, counted apart from input
@@ -100,14 +102,7 @@ pub(crate) fn advise(
     let Some(range) = off_t_range(offset, len) else {
         return false;
     };
-    let timed = (hint == Hint::WillNeed).then(crate::counters::Stopwatch::start);
     let rc = issue(file, range, Advice::Hint(hint));
-    if let Some(t) = timed {
-        // Like the failure count below: a sealed invocation records nothing.
-        if let Ok(call) = invocation.call() {
-            t.record_ns(&call.metrics().fadvise.willneed_wait_ns);
-        }
-    }
     if rc != 0 {
         // Cold: a nested entry under whatever admits the caller (a
         // command's call, a reader method's, a pipeline thread's permit), so
@@ -117,6 +112,83 @@ pub(crate) fn advise(
         }
     }
     true
+}
+
+/// Ask the kernel to start reading `len` (nonzero) bytes of `file` from
+/// `offset` into the page cache, clipped to the file's current size.
+///
+/// Linux honours one `POSIX_FADV_WILLNEED` call only up to the larger of the
+/// device's optimal I/O size and the description's readahead window, and
+/// drops the rest of a longer range silently with a successful return. So the
+/// range is issued as consecutive calls, split at absolute multiples of
+/// [`WILLNEED_CALL_BYTES`](crate::tunables::WILLNEED_CALL_BYTES): the kernel
+/// rounds each call outward to whole pages, and a call inside one aligned
+/// block of that size rounds to at most the block (every page size up to it
+/// divides it), so no call reaches past the cap a chunk boundary assumes.
+/// `FADV_RANDOM` on the same description does not stop this advice; it only
+/// turns off the kernel's own readahead on demand reads.
+///
+/// Returns the bytes passed to advice calls, a contiguous prefix from
+/// `offset` (every call is made, whatever an earlier one returned): 0 when
+/// nothing was issued (off Linux, `len` zero, `offset` at or past the file's
+/// size, a size the descriptor cannot report, or a range `off_t` cannot
+/// express). Neither a nonzero return nor a successful call means any page
+/// was read. Each call's elapsed time is summed into the invocation's
+/// `fadvise_willneed_wait_ns`, and each failed call counts into
+/// `fadvise_failures`.
+#[cfg(target_os = "linux")]
+pub(crate) fn will_need(
+    file: &File,
+    offset: u64,
+    len: u64,
+    invocation: &crate::host::Invocation,
+) -> u64 {
+    use crate::tunables::WILLNEED_CALL_BYTES;
+    if len == 0 {
+        return 0;
+    }
+    let Ok(meta) = file.metadata() else {
+        return 0;
+    };
+    let Some(room) = meta.len().checked_sub(offset) else {
+        return 0;
+    };
+    let Some(off_t_room) = off_t_max().checked_sub(offset) else {
+        return 0;
+    };
+    let total = len.min(room).min(off_t_room);
+    let mut issued = 0_u64;
+    let mut wait_ns = 0_u64;
+    let mut failures = 0_u32;
+    while issued < total {
+        let at = offset + issued;
+        let chunk = (total - issued).min(WILLNEED_CALL_BYTES - at % WILLNEED_CALL_BYTES);
+        // In range by the clip above; a conversion failure ends the advice.
+        let (Ok(at_t), Ok(chunk_t)) = (libc::off_t::try_from(at), libc::off_t::try_from(chunk))
+        else {
+            break;
+        };
+        let timed = crate::counters::Stopwatch::start();
+        let rc = issue(file, (at_t, chunk_t), Advice::WillNeed);
+        wait_ns = wait_ns.saturating_add(timed.elapsed_ns());
+        if rc != 0 {
+            failures += 1;
+        }
+        issued += chunk;
+    }
+    // A sealed invocation records nothing.
+    if issued > 0
+        && let Ok(call) = invocation.call()
+    {
+        let fadvise = &call.metrics().fadvise;
+        fadvise
+            .willneed_wait_ns
+            .fetch_add(wait_ns, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..failures {
+            fadvise.record_failure(&call);
+        }
+    }
+    issued
 }
 
 /// Drop `len` bytes of input `file` from `offset` from the page cache (`len`
@@ -212,11 +284,11 @@ fn issue(file: &File, (offset, len): (libc::off_t, libc::off_t), advice: Advice)
     let flag = match advice {
         Advice::Hint(Hint::Sequential) => libc::POSIX_FADV_SEQUENTIAL,
         Advice::Hint(Hint::Random) => libc::POSIX_FADV_RANDOM,
-        Advice::Hint(Hint::WillNeed) => libc::POSIX_FADV_WILLNEED,
+        Advice::WillNeed => libc::POSIX_FADV_WILLNEED,
         Advice::EvictInput | Advice::EvictScratch => libc::POSIX_FADV_DONTNEED,
     };
     #[cfg(test)]
-    tests::record_attempt(advice);
+    tests::record_attempt(advice, (offset, len));
     // The crate's one `posix_fadvise`.
     #[allow(clippy::disallowed_methods)]
     // Safety: the borrow keeps the descriptor open for the call, and the
@@ -243,6 +315,17 @@ pub(crate) fn advise(
     _invocation: &crate::host::Invocation,
 ) -> bool {
     false
+}
+
+/// Off Linux there is no advice to give.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn will_need(
+    _file: &File,
+    _offset: u64,
+    _len: u64,
+    _invocation: &crate::host::Invocation,
+) -> u64 {
+    0
 }
 
 /// Off Linux there is no advice to give.
@@ -278,8 +361,8 @@ crate::counters::counter_set! {
         /// issued, on a failed or cancelled run too: it is what the run
         /// asked for, not what a command expected to ask for.
         scratch_evictions => "fadvise_scratch_evictions",
-        /// Nanoseconds spent inside `POSIX_FADV_WILLNEED` calls ([`advise`]
-        /// with [`Hint::WillNeed`]), summed over every thread that issued
+        /// Nanoseconds spent inside `POSIX_FADV_WILLNEED` calls
+        /// ([`will_need`]), summed over every thread that issued
         /// one. Syscall elapsed time on the advising thread, which includes
         /// any reclaim or scheduling delay the kernel spent there; it is not
         /// the read-ahead I/O itself, which the call only queues, and not a
@@ -330,26 +413,90 @@ impl FadviseMetrics {
 #[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
-    use super::{Advice, Hint, advise, evict_input, evict_scratch, off_t_max};
+    use super::{Advice, Hint, advise, evict_input, evict_scratch, off_t_max, will_need};
+    use crate::tunables::WILLNEED_CALL_BYTES;
     use std::cell::RefCell;
 
+    type Range = (libc::off_t, libc::off_t);
+
     thread_local! {
-        /// Advice attempted on this thread, in order. Thread-local so tests
-        /// running concurrently cannot see each other's calls.
-        static ATTEMPTS: RefCell<Vec<Advice>> = const { RefCell::new(Vec::new()) };
+        /// Advice attempted on this thread, in order, with its range.
+        /// Thread-local so tests running concurrently cannot see each other's
+        /// calls.
+        static ATTEMPTS: RefCell<Vec<(Advice, Range)>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub(super) fn record_attempt(advice: Advice) {
-        ATTEMPTS.with(|a| a.borrow_mut().push(advice));
+    pub(super) fn record_attempt(advice: Advice, range: Range) {
+        ATTEMPTS.with(|a| a.borrow_mut().push((advice, range)));
     }
 
     fn attempts(advice: Advice) -> usize {
-        ATTEMPTS.with(|a| a.borrow().iter().filter(|&&x| x == advice).count())
+        ATTEMPTS.with(|a| a.borrow().iter().filter(|x| x.0 == advice).count())
     }
 
     /// How many times `hint` has been attempted on this thread so far.
     pub(crate) fn hint_attempts(hint: Hint) -> usize {
         attempts(Advice::Hint(hint))
+    }
+
+    fn attempt_count() -> usize {
+        ATTEMPTS.with(|a| a.borrow().len())
+    }
+
+    /// The `WILLNEED` ranges attempted on this thread after the first `from`
+    /// attempts of any kind, as `(offset, len)`.
+    fn willneed_since(from: usize) -> Vec<(u64, u64)> {
+        ATTEMPTS.with(|a| {
+            a.borrow()[from..]
+                .iter()
+                .filter(|x| x.0 == Advice::WillNeed)
+                .map(|&(_, (at, len))| (u64::try_from(at).unwrap(), u64::try_from(len).unwrap()))
+                .collect()
+        })
+    }
+
+    /// Every `WILLNEED` call stays inside one aligned block of
+    /// `WILLNEED_CALL_BYTES` (so its page-rounded extent does too), the calls
+    /// tile the requested range clipped to the file without gap or overlap,
+    /// and the return is the bytes they covered.
+    #[test]
+    fn will_need_splits_at_aligned_blocks_and_clips_to_the_file() {
+        let c = WILLNEED_CALL_BYTES;
+        let size = 5 * c + 123;
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![0_u8; usize::try_from(size).unwrap()]).unwrap();
+        let file = crate::read::input::open(&path).unwrap();
+        let inv = crate::host::Invocation::new();
+
+        let check = |offset: u64, len: u64, want: u64| {
+            let from = attempt_count();
+            assert_eq!(will_need(&file, offset, len, &inv), want, "{offset}+{len}");
+            let calls = willneed_since(from);
+            let mut at = offset;
+            for &(o, l) in &calls {
+                assert_eq!(o, at, "contiguous");
+                assert!(l > 0);
+                assert_eq!(o / c, (o + l - 1) / c, "one aligned block: {o}+{l}");
+                at += l;
+            }
+            assert_eq!(at - offset, want);
+            calls.len()
+        };
+
+        // An unaligned range exactly one block long straddles two blocks.
+        assert_eq!(check(1, c, c), 2);
+        // A short range crossing one boundary.
+        assert_eq!(check(c - 10, 20, 20), 2);
+        // An aligned whole block is one call.
+        assert_eq!(check(c, c, c), 1);
+        // Clipped to the file's size; an unbounded length is the tail.
+        assert_eq!(check(4 * c, 10 * c, c + 123), 2);
+        assert_eq!(check(7, u64::MAX, size - 7), 6);
+        // Nothing to advise: zero length, at or past the end.
+        assert_eq!(check(0, 0, 0), 0);
+        assert_eq!(check(size, 1, 0), 0);
+        assert_eq!(check(off_t_max() + 1, 1, 0), 0);
     }
 
     fn counter(inv: &crate::host::Invocation, wanted: &str) -> u64 {
@@ -373,20 +520,20 @@ pub(crate) mod tests {
         std::fs::write(&path, b"x").unwrap();
         let file = crate::read::input::open(&path).unwrap();
         let max = off_t_max();
-        let before = hint_attempts(Hint::WillNeed);
+        let before = hint_attempts(Hint::Sequential);
         let inv = crate::host::Invocation::new();
-        assert!(!advise(&file, max + 1, 0, Hint::WillNeed, &inv));
+        assert!(!advise(&file, max + 1, 0, Hint::Sequential, &inv));
         // A finite request at the last offset has no room left: advising it
         // would mean "through EOF".
-        assert!(!advise(&file, max, 1, Hint::WillNeed, &inv));
+        assert!(!advise(&file, max, 1, Hint::Sequential, &inv));
         assert_eq!(
-            hint_attempts(Hint::WillNeed),
+            hint_attempts(Hint::Sequential),
             before,
             "nothing was attempted"
         );
-        assert!(advise(&file, 0, 0, Hint::WillNeed, &inv));
-        assert!(advise(&file, 1, u64::MAX, Hint::WillNeed, &inv));
-        assert_eq!(hint_attempts(Hint::WillNeed), before + 2);
+        assert!(advise(&file, 0, 0, Hint::Sequential, &inv));
+        assert!(advise(&file, 1, u64::MAX, Hint::Sequential, &inv));
+        assert_eq!(hint_attempts(Hint::Sequential), before + 2);
     }
 
     /// Every input eviction issued is counted, an unexpressible range is

@@ -352,21 +352,17 @@ impl WillneedPrefetch {
             }
 
             // `size` is never zero here (zero-sized bodies are not coalesced
-            // and the window end lies past `offset`), so this is never the
-            // through-EOF form.
-            crate::fadvise::advise(
-                shared_file,
-                offset,
-                size,
-                crate::fadvise::Hint::WillNeed,
-                &self.invocation,
-            );
+            // and the window end lies past `offset`). A coalesced range on a
+            // dense file spans many MB; `will_need` splits it into calls the
+            // kernel honours whole, where one call would be cut to its first
+            // readahead-cap's worth.
+            crate::fadvise::will_need(shared_file, offset, size, &self.invocation);
         }
     }
 }
 
 /// Emits the invocation's `fadvise_willneed_wait_ns` total as the advising
-/// pass ends (every `WILLNEED` the library issues goes through this type), so
+/// pass ends (the pools' `WILLNEED` all goes through this type), so
 /// the sidecar sees the time the advising thread spent in the syscall. The
 /// total only grows, so a later pass's emission supersedes this one.
 impl Drop for WillneedPrefetch {
@@ -1060,7 +1056,10 @@ struct DecodeLocal<S> {
 /// where the advice lives, and no dispatch cost has been shown to recover.
 /// For extract simple's node and way classify, removing the advice
 /// measured neutral on planet and europe (bygg, 2026-11-08, at `e91e5f11`,
-/// reference/performance.md): it is kept, not proven to pay there.
+/// reference/performance.md): it is kept, not proven to pay there. That
+/// reading predates the advice being issued in calls the kernel honours
+/// whole; with them, planet `check --refs` ran 15 % faster (2026-11-09,
+/// "Classify WILLNEED in honoured calls").
 ///
 /// Its four blocking points (dispatcher send, descriptor lock and receive,
 /// result send, consumer receive) record into `metrics`, which is emitted
@@ -1195,14 +1194,17 @@ struct ClassifyLocal<S> {
 /// caller's merge, and the sliding `WILLNEED` advice, which follows the
 /// window's edge (the furthest position a worker may be admitted to next).
 ///
-/// The advice stays on this thread, after each credit is published: on
-/// planet `cat --clean` (bygg) the thread spends about 1.4 % of the wall in
-/// the syscall (`fadvise_willneed_wait_ns`) and 90 % waiting on results, and
+/// The advice stays on this thread, after each credit is published. Since
+/// the advice is issued in calls the kernel honours whole, planet
+/// `cat --clean` (bygg) spends about 15 s of its 141 s wall in the syscall
+/// (`fadvise_willneed_wait_ns`, 2 s when each call was cut to its first
+/// 128 KiB) with no change in wall, so the thread is still not what binds;
 /// moving the call before or after the credit made no difference on planet
 /// or on germany, where the window binds (`reference/performance.md`,
-/// "Read-ahead advice after the credit"). A worker-side cursor would put
-/// the syscall and a shared lock on the threads that are the bottleneck; a
-/// dedicated advisor thread has no measured cost to recover.
+/// "Read-ahead advice after the credit", "Classify WILLNEED in honoured
+/// calls"). A worker-side cursor would put the syscall and a shared lock on
+/// the threads that are the bottleneck; a dedicated advisor thread has no
+/// measured cost to recover.
 struct ClassifyConsumer<'a, M> {
     merge: M,
     willneed: WillneedPrefetch,

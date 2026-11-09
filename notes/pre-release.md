@@ -21,11 +21,11 @@ empty, delete it.
 The library-use gate is certified (`brokkr library --all --dataset denmark`
 at `627883d7`: 12/12 scenarios, 17/17 capabilities). io_uring is exercised on
 real data and its writer fixed. Multi-region extract admits its descriptors.
-The planet regressions found by the RAM pass below are resolved:
+The planet regressions found by the 2026-10-30 planet RAM pass are resolved:
 `13ec0927` (cat --dedupe), `418739bd` (inspect --extended), `c97b9985`
 (merge-changes), `5bfa37ab` (pool-heavy decode buffers) and `b1f522f7`
-(apply-changes). The release itself still needs WRK-001 and WRK-003 to
-WRK-005.
+(apply-changes). The release itself still needs WRK-001, WRK-005 and
+WRK-191.
 
 ---
 
@@ -38,24 +38,216 @@ CHANGELOG.md's section is headed `## Unreleased`; retitle it
 exists. The 0.6.0 section was rewritten to net change against v0.5.0, one
 line per entry; keep it that terse.
 
-### WRK-003: Stored cells for the table's unstored and stale rows
+### WRK-191: README numbers moved to bygg (planet, vs osmium, library)
 
-Four rows cite `--force` cells that were never stored: `cat --dedupe`,
-`apply-changes` (4913, `zstd:1`), both `merge-changes` rows and
-`inspect --extended`. A stored HEAD cell each gives the table a UUID to cite.
-Done for all of them and for the two `diff` rows, at `179f1b7e`
-(2026-10-31, bygg); this item stays open only until WRK-004 consumes them.
+Decided: README ends up with three tables, in order: a planet CLI table of
+every command that runs within 28 GB, the vs-osmium table, and a new
+library-mode table, all on bygg. README is already restructured that way
+(at HEAD `6fdde3f4`). Every number in it is `pending`. The specifics
+around the tables were reworded too: the merge-changes "55 s" paragraph,
+the altw temp-file size, the host lines, and a sentence on altw's sparse
+default. The work left is to run the cells and fill the tables (commit and
+host on every row), then the open decisions below.
 
-### WRK-004: The README planet table
+**Where things stand.** The move had not been done: the planet table was
+the plantasjen one (5900X), and the osmium table (`b355badd`, bygg) was
+stale. No stored bygg cell is at or after `6fdde3f4`. So by the rule
+(fresh cell when the stored one predates a change that moved the command,
+the reindex, `25172fc3`, or `6fdde3f4`), every row needs a fresh cell. The
+2026-10-30 RAM-pass draft column (`627883d7`, pre-cap, pre-reindex input)
+and the `179f1b7e` cells for the formerly unstored rows are stale too.
+Planet never opens a header-walk prefetch episode (`69bb00b9` /
+`7766bd50`, 6.8 s both), so if the maintainer waives `6fdde3f4` for planet
+only, three cells stand: altw external `6bf4f504` (`098c89cb`, 276.4 s,
+11.6 GB, first after a trim), apply-changes zstd:1 `87e8b13c` (`eda3b670`,
+94.3 s, 1.90 GB, predecessor state unknown) and apply-changes `-l`
+`41ba96ca` (`eda3b670`, 262.2 s, 2.82 GB). Merge-changes 7-OSC
+`16d34181` (`6a9807d9`, 3.7 s, 137 MB) is fine on the evidence (OSC
+input), but it is cheap, so rerun it. Everything else fails a second test.
 
-The maintainer may move the README table to bygg; the bygg columns below are
-a draft of it. Its walls would need best-of-N cells on a quiet host first.
-Rows known wrong at HEAD regardless of host: both merge-changes rows (2 MB;
-no stored cell ever paired the 7-OSC "54 s" with "2 MB": the 54 s matches
-`b6e964cc` / `f4de3f8d`, both about 950 MB anon, and the 2 MB cells are the
-267-273 s serial era), `cat --dedupe` (the old serial engine on another
-host), `inspect --extended` (no commit or host on the row), and the rows
-whose README figure predates the fixes listed in Status.
+**Row verdicts** (reasons: A pre-cap build, R pre-reindex input
+`planet-20260223-with-indexdata`, C a later command-moving commit, W
+taken before the classify WILLNEED fix; worktree `--commit` cells carry the old commit's code):
+
+- geocode `82d91ad9` (C: format 5 landed after this baseline).
+- cat `dc7ccb05` / `907f94f4` (C: `b58e8ef3`, `f49dd460`).
+- cat --clean `55c10efb` (R, C, W).
+- cat --dedupe `33e06a0f` (C: `5432aac7`, `6fdde3f4` in the blob-merge engine).
+- cat --type way `3d4a36a8` (A, R).
+- check --ids `39471fc0` (R, W).
+- check --ids --full `bf61b8f6` (C: `4109d1c4`, 2.28 to 0.45 GB).
+- check --refs `7592610c` (R, W).
+- diff text `5e782b56` (A, R, C).
+- diff osc `d17d94db` (A; `307982d7` is the pre-spill engine, 255 s
+  against 156 s after it, not a regression).
+- extract complete `80089cbc`, smart `05bbc210` (C: `5903b4cd` cut peaks
+  to 2.76 / 2.87 GB, W).
+- extract simple `2bc9cc4a` (C, W).
+- getid `67d66e4e`, getid --invert `7ee6c776`, inspect `3ec07278` (A, R).
+- getparents `4ca09dc3` (R, C, W).
+- inspect --extended `5b8e6c29` (A, R).
+- inspect --nodes `c4ad8414` (R, C: projection).
+- inspect tags `97bd775a` (pairs; keys since `9c4d6c81`, 0.40 GB).
+- merge-changes 1-OSC `9d1e9170` (A).
+- multi-extract simple `a89f3c1e` (C: shared membership, 9.8 to 3.9 GB, W).
+- multi-extract smart `d4d8d0dc` (A, R, C, W).
+- renumber `cd477c21` (R).
+- sort `15393169` (R, C: `5432aac7`).
+- tags-filter two-pass `9406cf2a` (C, W).
+- tags-filter -i `9bf96ab2` (A, R, W).
+- tags-filter -R `55f84dee` (A, R).
+- time-filter `bb2517a3` (R, W).
+
+**Memory-safe under 28 GB.** Every README row qualifies on measured
+peaks. The highest are geocode 13.45 GB, altw external 11.6 GB, and
+`tags-filter -i` and multi-extract smart around 7 GB (old cells). Others
+qualify but are not in the table: check --locations (about 18 GB; the
+store follows available memory), merge-changes --simplify (12.0 GB),
+inspect tags `'*=*'` (10.8 GB), repack and degrade (about 0.8 GB), digest
+(1.42 GB RSS), check --index (334 MB), getid --add-referenced (about
+0.46 GB), the base-against-apply-output diff (1.81 GB) and tags-filter
+--input-kind osc (131 MB). altw with its default `sparse` at planet does
+not qualify; it was not measured on bygg and is expected to thrash. Not
+measured at planet: unsorted sort, dedupe of two different planets, and
+`degrade --unsort`.
+
+**Classify WILLNEED fix exposure.** The classify pools (every
+`parallel_classify_phase`, the unordered per-blob driver, the ordered
+classify consumer) cover extract (all three), multi-extract, getparents,
+time-filter, cat --clean, tags-filter two-pass and -i, check --refs and
+--ids, repack and degrade. inspect --nodes / --extended and getid --invert
+are possibly exposed. The fix moved planet check --refs 31 to 26 s and
+left cat --clean unchanged (reference/performance.md "Classify WILLNEED
+in honoured calls"); the rest are unmeasured.
+
+**vs-osmium method** (`110f0520`): script bench `vs-osmium`, denmark
+`pbf.indexed` read by both tools, `osc.4705`, osmium 1.19.1. The preflight
+evicts each arm's input and fincore-checks 0 bytes resident. osmium gets
+`--fsync` and `--keep-member-nodes`. Per row: three alternating
+single-iteration pairs, medians compared (`scripts/vs-osmium.sh 3`, 63
+invocations, 10-15 min). It needs a fresh campaign: `f20b2543` and
+`6fdde3f4` changed exactly the cold walk these rows pay (the prefetch
+fires on Denmark). README's old inspect-tags-way row was a dirty-tree
+number in a `b355badd` table.
+
+**Library table.** `brokkr library` builds `pbfhogg-harness` and runs its
+13 scenarios. `--bench N` stores a scenario row and per-call rows. Only
+`isolation-cat` times library against CLI: arms interleaved, inputs evicted
+and mincore-checked, CLI timed by its `CLI_COMMAND_*` interval, median
+paired ratio printed. The others give library walls only; most are
+correctness probes. Calls run on Keep with fixed parallelism, the CLI on
+Evict with probed sizing; say so in the caption. No library row is stored
+yet.
+
+**Run list.** It is queued in `overnight.sh` (gitignored), cells 1-40:
+1. One trim, then the read-only planet block: inspect and getid
+   (`--bench 3`, quote iteration 1 as cold), check-refs, check-ids,
+   `--full`, `--extended`, `--nodes`, `--tags`, getparents, getid
+   `--invert`, merge-changes 4913..4913 and 4914..4920 (`--bench 3`),
+   tags-filter -R highway=primary, tags-filter, extract x3
+   (`-25,34,45,72`), multi-extract simple and smart (`-10.0,35.0,32.0,72.0`),
+   geocode, diff-snapshots text and osc (`-j 16`, base against `20260411`).
+2. Then `sudo fstrim -av` before each of: cat, cat --type way, sort,
+   cat --clean, time-filter, renumber, tags-filter -i, cat --dedupe,
+   apply-changes zstd:1, apply-changes `-l` keep-untagged, altw external.
+3. Then the 63 vs-osmium lines.
+4. Then library: isolation-cat denmark `--bench 5` and planet `--bench 3`,
+   repeat-cat, concurrent-cat, fixed-resources-executor (`--bench 3`), and
+   `--all --dataset denmark`.
+
+About 80 min planet plus trims, 15 min osmium, 12 min library. It needs a
+clean tree. `brokkr bench` and `brokkr library` take no `--dry-run`
+(`run_nodry` lists them unvalidated). Optional planet rows:
+check-locations, repack, degrade --strip-locations, check-index, digest,
+merge-changes --simplify.
+
+**Script benches beside it** (no README table; all predate `6fdde3f4`;
+`--iterations 1`, three invocations per condition, after the planet suite):
+- dedupe-pair `--with one-relation`, cold x3, warm x2: `6fdde3f4` is the
+  dirty variant measured at `bd2408d5`, so there is no clean cell.
+- dedupe-self, denmark and `--dataset japan`, cold and warm x3, plus one
+  `--cache warm --check yes`: `5432aac7` and `6fdde3f4` changed the engine.
+- sort-cold `--dataset europe --force yes` x3 after a trim: `5432aac7`
+  was only ever an uncommitted variant, and europe is dense enough for the
+  prefetch. Add typed `brokkr sort --dataset europe --bench 1` x2.
+- diff-unindexed `--new 20260420`, all and `--type way`, x3:
+  `b58e8ef3` is on its read path.
+- diff-text denmark `--new 320k` x3, and germany `--new 20260420 --verbose
+  yes --common no` x3: `3286a9c5` landed with no clean cell.
+
+Param spellings are not validated. `brokkr bench NAME --help` lists them.
+
+**Before the run, in order:**
+1. Done: the classify read-advice fix (WILLNEED in honoured calls) has
+   landed, so every row marked W predates it and is rerun.
+2. Tree clean outside `*.md` and `.brokkr/results.db`: brokkr refuses a
+   dirty tree, and `--force` cells are not stored. `overnight.sh` is
+   gitignored and does not count. Never `git stash` with a dirty
+   `results.db`; stashes have dropped stored cells.
+3. Settle the `20260411` decision below. To reindex: `cat --reindex` the
+   snapshot into a new file, point `snapshot.20260411.pbf.indexed` in
+   `brokkr.d/hosts/bygg.toml` at it, and take its xxhash from
+   `brokkr env`. Without that, cells 21 and 22 (the two diff rows) read
+   the old-indexdata file against the reindexed base.
+4. `brokkr --version`: a stale installed brokkr is the usual cause of
+   brokkr misbehaving; `brokkr install` from `~/Programs/brokkr` fixes it.
+5. `./overnight.sh --dry-run` from the project root. The file has never
+   been syntax-checked (`bash -n` was refused in the tool shell).
+6. Free scratch space: an altw external planet cell writes about 360 GB
+   of scratch (shards alone 99.5 GB), and a trim after two untrimmed
+   cells freed 828 GiB and took over two minutes.
+7. memlock is not needed: no cell uses `--io-uring`. If one is added,
+   first run `! sudo prlimit --pid $PPID --memlock=unlimited:unlimited`
+   (RLIMIT_MEMLOCK is 8 MB on bygg; `--io-uring` refuses otherwise).
+
+`sudo fstrim -av` runs without a password (allowed 2026-11-09), so the
+script's trims need no one at the keyboard. The read-only block starts
+right after a trim so its first header walk is cold, as a user's would
+be.
+
+**After the run:**
+1. `brokkr history --failed --since <date>` for any cell that did not
+   complete; rerun those alone.
+2. Per cell, `brokkr results <uuid>`: read per-iteration walls, not the
+   best. For inspect and getid (`--bench 3`), iteration 1 is the cold
+   figure to publish; later iterations hit cached headers (cold about 6 s,
+   warm 0.1-0.2 s at planet). Peak anon from `brokkr sidecar <uuid>
+   --stat anon`.
+3. Before calling any row worse than its old figure, read `brokkr sidecar
+   --compare` (host annotations first) and the phase split.
+4. vs-osmium: medians of the three pairs per row. Library: `brokkr
+   results <uuid>` on the isolation-cat rows prints the CLI/library
+   ratio after the rows.
+5. Fill README's three tables, commit and host on every row; record the
+   cells in `reference/performance.md`; then run the script benches
+   below; then work the open decisions.
+
+**Open decisions for the maintainer:**
+- altw defaults to `--index-type sparse` (`cli/src/lib.rs`), which
+  undercuts the "every command on a 32 GB machine" headline. Make `auto`
+  the default, or keep the README sentence.
+- bygg's `snapshot.20260411.pbf.indexed` is still
+  `planet-20260411-with-indexdata` (`7facb638...`), never reindexed. Both
+  diff rows read it. Reindex and re-register first if that disqualifies
+  them.
+- The README read-throughput table (Denmark, `90df51f`, plantasjen,
+  osmpbf / Planetiler rows) is a fourth table, and brokkr cannot
+  reproduce its competitor rows. Drop it, or keep it labelled plantasjen.
+- vs-osmium has no extract row, so README's Tokyo extract line was
+  dropped. Add a row to `benches/compare/vs-osmium.lua` if it should
+  come back.
+- Which optional rows join the planet table (the list above, and inspect
+  tags `'*=*'`).
+- Stale figures under docs/: the guide's osmium, extract and apply-changes
+  tables and its System line, `docs/guide/indexdata.md` (planet cat
+  86.5 s, `aee7727`), and `docs/index.md` (0.31 s / 12 s).
+- `brokkr man library isolation-scenarios` still lists "the capped malloc
+  arenas" in the CLI interval (gone since `25172fc3`). That is a brokkr
+  doc fix.
+
+This item stands alone. The agent's working copy at
+`.plans/readme-refresh.md` (gitignored) adds the per-row stored walls and
+peaks, but nothing the run needs.
 
 ### WRK-005: Expect declarations in brokkr.toml (brokkr#71)
 
@@ -88,119 +280,11 @@ actually gives, not an assumption:
 
 ---
 
-## Planet RAM pass against the README table (2026-10-30)
-
-Reference material for WRK-003 and WRK-004, not an item. The blocker
-question was whether every command is still RAM-safe at planet on a 28-ish
-GB host. Answer: yes. The highest peak is `inspect --tags -j 16` at 17.5 GB,
-unchanged from the README. (Since superseded for `inspect --tags`: 36 s and
-10.8 GB peak anon at default `-j` on bygg, reference/performance.md
-"inspect tags counts into a sharded table"; `build-geocode-index` is now the
-highest row below. Also superseded: `extract --complete` 2.76 GB and
-`extract --smart` 2.87 GB, `tags-filter w/highway=primary` 2.27-2.31 GB and
-56 s, on the reindexed planet, reference/performance.md "ID sets that hold
-only what the writer does not already have" and "Direct and member ways kept
-apart".)
-
-Setup: host bygg (Ryzen 9 9950X3D2, 16c/32t, 30.5 GiB, 29.1 GiB available),
-pbfhogg `627883d7`, one `--bench 1` cell per command after `fstrim`, input
-`planet-20260223-with-indexdata.osm.pbf`. Peak anon RSS is the sidecar's
-`anon` max. The README table was measured on a Ryzen 9 5900X (12c/24t), so
-walls do not compare across the two columns (bygg is the faster host) and
-are listed for reference only.
-
-| Command | Peak anon, bygg | README | Wall, bygg | README wall | UUID |
-|---|---:|---:|---:|---:|---|
-| `inspect --tags -j 16` | 17.5 GB | 17.5 GB | 1m40s | 2m50s | `7855f2a4` |
-| `build-geocode-index` | 13.4 GB | ~25 GB | 5m20s | 5m47s | `c261bd3c` |
-| `add-locations-to-ways --index-type external` | 10.7 GB | 12.0 GB | 5m21s | 9m52s | `13668dda` |
-| `multi-extract --simple -c` (5 regions, `-10,35,32,72`) (n9) | 9.90 GB | 9.4 GB | 2m08s | 14m44s | `eded8718` |
-| `extract --smart` (`-25,34,45,72`) | 8.2 GB | 11.17 GB | 2m20s | 4m28s | `d015bbe4` |
-| `cat --dedupe` (n4) | 1.15 GB | 1.4 GB | 4m23s | 2h13m | `5faa7ff8` |
-| `multi-extract --smart -c` (5 regions, `-10,35,32,72`) | 6.9 GB | 22.9 GB | 8m04s | 13m58s | `d4d8d0dc` |
-| `extract --complete` (`-25,34,45,72`) (n9) | 4.87 GB | 4.7 GB | 2m02s | 3m42s | `b9dd077a` |
-| `apply-changes --locations-on-ways` (4913, keep-untagged base) (n2) | 3.9 GB | 3.8 GB | 4m57s | 5m05s | `6e9a63df` |
-| `extract --simple` (`-25,34,45,72`) (n7) | 3.09 GB | 3.0 GB | 1m52s | 3m42s | `6b3c88cc` |
-| `renumber` | 3.19 GB | 3.3 GB | 2m00s | 3m11s | `ce4acd6a` |
-| `apply-changes` (4913, `zstd:1`) (n8) | 2.34 GB | 2.4 GB | 2m08s | 4m29s | `fd30dcc9` |
-| `tags-filter w/highway=primary` (two-pass) (n7) | 2.57 GB | 2.6 GB | 1m01s | 1m55s | `b8491cfd` |
-| `check --ids --full` (n9) | 2.37 GB | 2.22 GB | 37s | 1m10s | `8c7a09a2` |
-| `check --refs` | 2.30 GB | 2.17 GB | 35s | 1m0s | `0accad98` |
-| `cat --clean version` (n7) | 994 MB | 750 MB | 4m01s | 5m34s | `a8a4384e` |
-| `time-filter` (cutoff 2024-01-01) (n7) | 841 MB | 812 MB | 2m27s | 4m24s | `c33e5ddd` |
-| `merge-changes` (4914..4920, 7 OSCs) (n6) | 137 MB | 2 MB | 3.0s | 54s | `bac3e736` |
-| `getparents` (n7) | 288 MB | 506 MB | 13s | 22s | `dd453b3f` |
-| `tags-filter -R highway=primary` | 659 MB | 688 MB | 38s | 52s | `55f84dee` |
-| `diff --format osc -j 16` (base vs 20260411) (n10) | 1.25 GB | 634 MB | 2m36s | 4m54s | `c55bebc9` |
-| `check --ids` (n7) | 566 MB | 504 MB | 31s | 57s | `4edab6b2` |
-| `inspect --nodes -j 16` | 425 MB | 410 MB | 31s | 56.8s | `b1fc3106` |
-| `getid --invert` | 58 MB | 102 MB | 56s | 1m31s | `7ee6c776` |
-| `inspect --extended` (n5) | 300 MB | 34 MB | 26s | 13m41s | `5b8e6c29` |
-| `getid` | ~13 MB (n1) | 27 MB | short (n1) | 6.1s | `67d66e4e` |
-| `sort` (sorted input) | 11 MB | 476 MB | 41s | 2m27s | `6bbe8ca4` |
-| `cat` (indexdata generation) | 10 MB | ~200 MB | 1m00s | 1m27s | `c7b51564` |
-| `cat --type way` | 10 MB | 10 MB | 30s | 45s | `3d4a36a8` |
-| `merge-changes` (4913, 1 OSC) (n6) | 19 MB | 2 MB | 2.0s | 44s | `9d1e9170` |
-| `inspect` | <1 MB (n1) | 5 MB | short (n1) | 6.5s | `3ec07278` |
-| `tags-filter -i w/highway=primary` (n3) | 7.49 GB | 7.0 GB | 5m16s | 7m57s | `9bf96ab2` |
-| `diff -j 16` (text, base vs 20260411) (n10) | 1.30 GB | 586 MB | 2m22s | 3m48s | `5e782b56` |
-
-- n1: Too short for the 100 ms sampler (three samples); approximate.
-- n2: The README row for this one was measured on a 9950X3D2 like bygg, so
-  it is the one row whose walls compare directly.
-- n3: Measured later the same day on brokkr `a8605c879`, after its fixes for
-  brokkr#67 and brokkr#68; every other row ran on the morning's brokkr build.
-- n4: Stored at `179f1b7e`; the `--force` cell before it measured 1.46 GB
-  and 5m10s. The RSS-pass cell was `d271f04f`, 7.57 GB and 53m43s.
-- n5: Stored at `179f1b7e` (the validator-projection scan); the RSS-pass
-  cell was `9b49e8fb`, 26 MB and 13m22s.
-- n6: Stored at `179f1b7e` (batch-deflated output; the 1-OSC peak is near
-  the sampler's floor). The RSS-pass cells were `f24c29af` (895 MB, 30 s) and `bf6db512` (1.6 MB,
-  24 s).
-- n7: Peak from a `--force` cell on `c97b9985` plus right-sized, recycled
-  decode buffers; walls unchanged per work phase and left as stored. The
-  RSS-pass peaks were cat 1.24 GB, time-filter 1.16 GB, getparents 705 MB,
-  check `--ids` 646 MB, extract `--simple` 3.52 GB, tags-filter two-pass
-  2.84 GB, inspect `--extended` 571 MB.
-- n8: Stored at `179f1b7e`; the RSS-pass
-  cell was `f2b8beed`, 3.12 GB and 2m07s, and 2.97 GB after the decode
-  buffer change.
-- n9: Re-measured at `179f1b7e` for WRK-002; the pre-`5bfa37ab` cells were
-  check `f6ba05d4` (2.47 GB, 34 s), extract `ce0bdcc0` (5.27 GB, 2m02s) and
-  multi-extract `4babae4d` (10.3 GB, 10m53s). The multi-extract row is
-  `eded8718` at `44c62853` (worker-side compression); at `179f1b7e` it
-  was `831424c0`, 9.86 GB and 10m58s.
-- n10: Stored at `179f1b7e` (the streaming work-unit diff, `587bfc12`).
-  Before it: text `f9fa4f6f` (605 MB, 3m04s), osc `607cd897` (653 MB,
-  4m11s). The osc row's peak and wall come from two `--force` cells of
-  the derive spill and worker-deflate change (1.25 GB; 156.3 s and
-  156.6 s), interleaved with stored `179f1b7e` cells `3660071f` and
-  `955da7f4` (240.7 s, 241.3 s, 5.00 GB); `c55bebc9` (5.00 GB, 4m03s) is
-  the stored cell before it. The text row's peak and wall likewise come
-  from two `--force` cells of the single-sided element cut (1.30 GB;
-  141.8 s and 142.3 s), interleaved with stored `c7eed182` cells
-  `258cbdc4` and `ed12c024` (145.6 s, 146.5 s, 1.57 GB); `5e782b56`
-  (1.56 GB, 2m28s) is the stored cell before it. Numbers in
-  reference/performance.md.
-
-Measurement artefacts in the RSS pass's percentages, settled: per-worker
-peak was the same on both hosts for getparents, check `--ids` and
-time-filter (23.5 vs 23.0, 21.5 vs 22.9, 38.6 vs 36.9 MB per worker at 30
-vs 22 workers), so those rows grew with bygg's worker count; the extract
-rows compare different bboxes (README `-10,35,32,72`, bygg `-25,34,45,72`);
-multi-extract is about 4 % in consistent units, not 10 %. RSS fell on
-`build-geocode-index` (the README's ~25 GB was probably total RSS; bygg's
-total including file-backed mmaps is 18.8 GB), `multi-extract --smart`,
-`extract --smart`, external altw, `sort` and `cat`.
-
----
-
-
 ## The measurement campaign
 
 Matched A/B cells planned at the end of the hygiene drain to bisect what the
 drain changed. Today's regression fixes did not need them, but they remain
-the way to find any regression the RAM pass could not see. "A vs B" means
+the way to find any regression the planet cells cannot see. "A vs B" means
 matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.

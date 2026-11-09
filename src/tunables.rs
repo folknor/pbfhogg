@@ -240,12 +240,13 @@ pub(crate) const HEADER_WINDOW_SIZE: usize = 1024 * 1024;
 /// walk prefetch on cold dense files").
 pub(crate) const HEADER_WALK_PREFETCH_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Length of each `WILLNEED` call of a header-walk prefetch episode. Linux
-/// caps one call at the larger of the device's optimal I/O size and the
-/// file's readahead window (128 KiB each on the bench host) and silently
-/// drops the rest of a longer range, so an episode is issued as consecutive
-/// calls no longer than this rather than as one range.
-pub(crate) const HEADER_WALK_PREFETCH_CHUNK: u64 = 128 * 1024;
+/// Block size of every `WILLNEED` call (`fadvise::will_need`). Linux caps
+/// one call at the larger of the device's optimal I/O size and the file's
+/// readahead window (128 KiB each on the bench host) and silently drops the
+/// rest of a longer range, so a range is issued as consecutive calls, each
+/// inside one block of this size aligned at a multiple of it. A host whose
+/// cap is smaller than this would still drop the tail of each call.
+pub(crate) const WILLNEED_CALL_BYTES: u64 = 128 * 1024;
 
 /// Mean frame size (prefix, header and payload) below which a header walk
 /// reads [`HEADER_WINDOW_SIZE`] windows instead of [`HEADER_PROBE_SIZE`]

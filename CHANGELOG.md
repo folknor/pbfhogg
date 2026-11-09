@@ -301,6 +301,10 @@ state.
   that copies nearly every blob through takes about 0.38 s instead of
   0.54 s, the old engine's wall. Walks whose headers are already cached,
   and files of large blobs such as the planet dump, read as before.
+- The read-ahead advice of the scheduled worker pools now reaches the
+  whole 256 MiB window it asks for; Linux had been reading only the first
+  128 KiB of each request. Planet `check --refs` takes about 26 s instead
+  of 31 s; `cat --clean` is unchanged.
 - `digest` reuses its per-block record buffers instead of growing a fresh
   one per blob: the default full form on planet about 63 s instead of
   107 s, `--form content` about 53 s instead of 60 s. The digests are

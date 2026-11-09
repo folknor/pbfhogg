@@ -37,9 +37,8 @@ use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::frame::Frames;
 use crate::tunables::{
-    HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WALK_PREFETCH_CHUNK,
-    HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES,
-    HEADER_WINDOW_SIZE, SAMPLE_CAP,
+    HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WINDOW_DENSE_FRAME_BYTES,
+    HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE, SAMPLE_CAP,
 };
 
 /// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
@@ -185,8 +184,9 @@ pub(crate) trait Positional {
 
     /// Advise that `len` (nonzero) bytes at `offset` will be read soon.
     /// Optional: whatever it does, the exact reads that follow decide every
-    /// byte, EOF and error. Returns whether advice was issued.
-    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> bool;
+    /// byte, EOF and error. Returns the bytes advised, a prefix from
+    /// `offset` (0 when no advice was issued), as `fadvise::will_need`.
+    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> u64;
 }
 
 /// What [`Positional::read_cached`] found.
@@ -250,14 +250,8 @@ impl Positional for std::fs::File {
         Cached::Unsupported
     }
 
-    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> bool {
-        crate::fadvise::advise(
-            self,
-            offset,
-            len,
-            crate::fadvise::Hint::WillNeed,
-            invocation,
-        )
+    fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> u64 {
+        crate::fadvise::will_need(self, offset, len, invocation)
     }
 }
 
@@ -274,8 +268,8 @@ impl Positional for crate::read::direct_reader::DirectPositional {
     }
 
     /// No advice: `O_DIRECT` reads never come from the page cache.
-    fn will_need(&self, _offset: u64, _len: u64, _invocation: &crate::host::Invocation) -> bool {
-        false
+    fn will_need(&self, _offset: u64, _len: u64, _invocation: &crate::host::Invocation) -> u64 {
+        0
     }
 }
 
@@ -317,8 +311,8 @@ impl Positional for crate::read::direct_reader::DirectPositional {
 /// walk a cold file at queue depth one. A window read at or past the end of
 /// the last prefetch episode opens the next: `WILLNEED` over the
 /// [`HEADER_WALK_PREFETCH_BYTES`] after the window, clipped to the captured
-/// extent, in [`HEADER_WALK_PREFETCH_CHUNK`] calls (the kernel drops what a
-/// longer call asks past its cap). Renewal needs fresh evidence: when the
+/// extent, which `fadvise::will_need` issues in calls the kernel honours
+/// whole (it drops what a longer call asks past its cap). Renewal needs fresh evidence: when the
 /// walk crosses the end of an episode the miss streak restarts, so misses on
 /// pages the walk's own advice put in flight never open the next episode,
 /// and a region whose headers are cached (hits) ends the prefetch within one
@@ -518,8 +512,7 @@ impl<P: Positional> PreadSource<P> {
     }
 
     /// Advise `WILLNEED` over the episode from `start` (the end of the
-    /// window being read), clipped to the captured extent, in chunks the
-    /// kernel honours whole.
+    /// window being read), clipped to the captured extent.
     fn open_episode(&mut self, start: u64) {
         let end = start
             .saturating_add(HEADER_WALK_PREFETCH_BYTES)
@@ -527,18 +520,9 @@ impl<P: Positional> PreadSource<P> {
         if end <= start {
             return;
         }
-        let mut issued = 0;
-        let mut at = start;
-        while at < end {
-            let len = (end - at).min(HEADER_WALK_PREFETCH_CHUNK);
-            if !self.file.will_need(at, len, &self.invocation) {
-                // A transport (or platform) that gives no advice: no episode,
-                // so the walk's window policy stays exactly what it was.
-                break;
-            }
-            issued += len;
-            at += len;
-        }
+        // A transport (or platform) that gives no advice advises 0 bytes: no
+        // episode, so the walk's window policy stays exactly what it was.
+        let issued = self.file.will_need(start, end - start, &self.invocation);
         if issued > 0 {
             self.in_episode = true;
             self.advised_to = start + issued;
@@ -1001,9 +985,9 @@ pub(crate) mod tests {
             super::Cached::Hit(n)
         }
 
-        fn will_need(&self, offset: u64, len: u64, _invocation: &crate::host::Invocation) -> bool {
+        fn will_need(&self, offset: u64, len: u64, _invocation: &crate::host::Invocation) -> u64 {
             self.advised.lock().expect("advised").push((offset, len));
-            true
+            len
         }
     }
 
@@ -1091,9 +1075,8 @@ pub(crate) mod tests {
     }
 
     use crate::tunables::{
-        HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WALK_PREFETCH_CHUNK,
-        HEADER_WINDOW_DENSE_FRAME_BYTES, HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES,
-        HEADER_WINDOW_SIZE,
+        HEADER_PROBE_SIZE, HEADER_WALK_PREFETCH_BYTES, HEADER_WINDOW_DENSE_FRAME_BYTES,
+        HEADER_WINDOW_MISS_STREAK, HEADER_WINDOW_SAMPLE_FRAMES, HEADER_WINDOW_SIZE,
     };
     use std::sync::Arc;
 
@@ -1116,8 +1099,9 @@ pub(crate) mod tests {
         out
     }
 
-    /// A cold dense walk advises ahead of its first window, in calls no
-    /// longer than the chunk, within the extent, each byte once, and opens
+    /// A cold dense walk advises ahead of its first window, one request per
+    /// episode within the extent (the split into calls the kernel honours is
+    /// `fadvise::will_need`'s, tested there), each byte once, and opens
     /// each later episode only from a window past the previous one's end:
     /// with advice that never lands, every episode is reached cold and renews.
     #[test]
@@ -1130,11 +1114,12 @@ pub(crate) mod tests {
         assert!(
             advised
                 .iter()
-                .all(|&(at, len)| len > 0 && len <= HEADER_WALK_PREFETCH_CHUNK && at + len <= size),
+                .all(|&(at, len)| len > 0 && len <= HEADER_WALK_PREFETCH_BYTES && at + len <= size),
             "{advised:?}"
         );
         let eps = episodes(&advised);
         assert!(eps.len() >= 3, "{eps:?}");
+        assert_eq!(eps.len(), advised.len(), "one request per episode");
         assert_eq!(stats.prefetch_episodes, eps.len() as u64);
         assert_eq!(
             stats.prefetch_bytes,
@@ -1189,8 +1174,8 @@ pub(crate) mod tests {
             fn read_cached(&self, buf: &mut [u8], offset: u64) -> super::Cached {
                 self.0.read_cached(buf, offset)
             }
-            fn will_need(&self, _: u64, _: u64, _: &crate::host::Invocation) -> bool {
-                false
+            fn will_need(&self, _: u64, _: u64, _: &crate::host::Invocation) -> u64 {
+                0
             }
         }
         let (bytes, starts) = prefetch_file();

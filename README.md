@@ -32,47 +32,52 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 ## Planet scale
 
-Every command listed below runs on the full planet on normal hardware. Measured on an AMD Ryzen 9 5900X, 32 GB DDR4 RAM, NVMe SSD, with ~28 GB available RAM. Input: 87 GB indexed planet PBF, 11.6B elements.
+Every command listed below runs on the full planet on normal hardware, within 28 GB of RAM. Measured on bygg: AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, one NVMe SSD for input, output and scratch. Input: the 2026-02-23 indexed planet PBF (87 GB, 11.6B elements). Each row is one stored brokkr cell; the commit is on the row.
 
-| Command | Wall | Peak anon RSS |
-|---------|------|---------------|
-| `add-locations-to-ways --index-type external` | 9m52s | 12.0 GB |
-| `apply-changes` (OSC-only daily diff, `zstd:1`) | 4m29s | 2.4 GB |
-| `apply-changes --locations-on-ways` (daily diff, base keeps untagged nodes) ¹ | 5m05s | 3.8 GB |
-| `build-geocode-index` | 5m47s | ~25 GB |
-| `cat` (indexdata generation) | 1m27s | ~200 MB |
-| `cat --clean version` | 5m34s | 750 MB |
-| `cat --dedupe` | 2h13m | 1.4 GB |
-| `cat --type way` (raw passthrough) | 45s | 10 MB |
-| `check --ids` (streaming, default) | 57s | 504 MB |
-| `check --ids --full` | 1m10s | 2.22 GB |
-| `check --refs` | 1m0s | 2.17 GB |
-| `diff -j 16` (two independent 47-day-apart planets, text) | 3m48s | 586 MB |
-| `diff --format osc -j 16` (two independent 47-day-apart planets) | 4m54s | 634 MB |
-| `extract --complete` (Europe bbox) | 3m42s | 4.7 GB |
-| `extract --simple` (Europe bbox) | 3m42s | 3.0 GB |
-| `extract --smart` (Europe bbox) | 4m28s | 11.17 GB |
-| `getid` | 6.1s | 27 MB |
-| `getid --invert` | 1m31s | 102 MB |
-| `getparents` | 22s | 506 MB |
-| `inspect` | 6.5s | 5 MB |
-| `inspect --extended` | 13m41s | 34 MB |
-| `inspect --nodes -j 16` | 56.8s | 410 MB |
-| `inspect --tags -j 16` | 2m50s | 17.5 GB |
-| `merge-changes --osc-seq N` (1-OSC daily) | 44s | 2 MB |
-| `merge-changes --osc-range A..B` (7-OSC, ~1 week of dailies) | 54s | 2 MB |
-| `multi-extract --simple -c` (5 regions, Europe bbox) | 14m44s | 9.4 GB |
-| `multi-extract --smart -c` (5 regions, Europe bbox) | 13m58s | 22.9 GB |
-| `renumber` | 3m11s | 3.3 GB |
-| `sort` (already-sorted input) | 2m27s | 476 MB |
-| `tags-filter` (default two-pass, `w/highway=primary`) | 1m55s | 2.6 GB |
-| `tags-filter -i w/highway=primary` (invert-match) | 7m57s | 7.0 GB |
-| `tags-filter -R highway=primary` | 52s | 688 MB |
-| `time-filter` (snapshot, cutoff 2024-01-01) | 4m24s | 812 MB |
+<!-- Rows marked "pending" await a fresh bygg cell; the cell list and the
+reasons are in .plans/readme-refresh.md. -->
 
-¹ Measured on a different host (Ryzen 9 9950X3D2, 30.5 GiB, commit `81f3fbe4`), on a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs. The earlier figure in this row came from a base without its untagged nodes, where most of the diff's way references went unresolved; see [reference/performance.md](reference/performance.md).
+| Command | Wall | Peak anon RSS | Commit |
+|---------|------|---------------|--------|
+| `add-locations-to-ways --index-type external` | pending | pending | pending |
+| `apply-changes` (OSC-only daily diff, `zstd:1`) | pending | pending | pending |
+| `apply-changes --locations-on-ways` (daily diff, base keeps untagged nodes) ¹ | pending | pending | pending |
+| `build-geocode-index` | pending | pending | pending |
+| `cat` (indexdata generation) | pending | pending | pending |
+| `cat --clean version` | pending | pending | pending |
+| `cat --dedupe` (the planet merged with itself) | pending | pending | pending |
+| `cat --type way` (raw passthrough) | pending | pending | pending |
+| `check --ids` (streaming, default) | pending | pending | pending |
+| `check --ids --full` | pending | pending | pending |
+| `check --refs` | pending | pending | pending |
+| `diff -j 16` (two independent 47-day-apart planets, text) | pending | pending | pending |
+| `diff --format osc -j 16` (two independent 47-day-apart planets) | pending | pending | pending |
+| `extract --complete` (Europe bbox) | pending | pending | pending |
+| `extract --simple` (Europe bbox) | pending | pending | pending |
+| `extract --smart` (Europe bbox) | pending | pending | pending |
+| `getid` | pending | pending | pending |
+| `getid --invert` | pending | pending | pending |
+| `getparents` | pending | pending | pending |
+| `inspect` | pending | pending | pending |
+| `inspect --extended` | pending | pending | pending |
+| `inspect --nodes` | pending | pending | pending |
+| `inspect tags` (key counts, as `osmium tags-count`) | pending | pending | pending |
+| `merge-changes` (1-OSC daily) | pending | pending | pending |
+| `merge-changes` (7-OSC, ~1 week of dailies) | pending | pending | pending |
+| `multi-extract --simple -c` (5 regions, Europe bbox) | pending | pending | pending |
+| `multi-extract --smart -c` (5 regions, Europe bbox) | pending | pending | pending |
+| `renumber` | pending | pending | pending |
+| `sort` (already-sorted input) | pending | pending | pending |
+| `tags-filter` (default two-pass, `w/highway=primary`) | pending | pending | pending |
+| `tags-filter -i w/highway=primary` (invert-match) | pending | pending | pending |
+| `tags-filter -R highway=primary` | pending | pending | pending |
+| `time-filter` (snapshot, cutoff 2024-01-01) | pending | pending | pending |
 
-The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (~246 GB) and `diff --format osc` (its change XML: compressed, about the output's size, for a `.osc.gz` from indexed inputs; plain and several times larger otherwise). A text `diff` writes none at any `-j`: its output goes out as it is produced.
+¹ On a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs; on a base without its untagged nodes most of the diff's way references go unresolved and the command refuses. See [reference/performance.md](reference/performance.md).
+
+`add-locations-to-ways` defaults to `--index-type sparse`, whose coordinate store at planet scale is larger than the page cache of a 28 GB host; the row above is `--index-type external`, the mode for planet on such a host.
+
+The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (hundreds of GB at planet) and `diff --format osc` (its change XML: compressed, about the output's size, for a `.osc.gz` from indexed inputs; plain and several times larger otherwise). A text `diff` writes none at any `-j`: its output goes out as it is produced.
 
 History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
 
@@ -179,7 +184,7 @@ pbfhogg merge-changes day1.osc.gz day2.osc.gz ... day7.osc.gz -o week.osc.gz
 pbfhogg apply-changes planet.osm.pbf week.osc.gz -o updated.osm.pbf
 ```
 
-One merge plus one apply is much cheaper than N applies: each `apply-changes` pass rewrites the whole base PBF, while the squash itself is cheap - 55 s at planet scale for 7 dailies (see the table above; down from 4m27s since the parallel merge drain, commit `99057fa`). Adding `--simplify` keeps only the last change per object across the merged diffs, so the single apply can also touch fewer elements than the individual applies would in sequence.
+One merge plus one apply is much cheaper than N applies: each `apply-changes` pass rewrites the whole base PBF, while the squash itself is cheap (see the 7-OSC `merge-changes` row in the table above). Adding `--simplify` keeps only the last change per object across the merged diffs, so the single apply can also touch fewer elements than the individual applies would in sequence.
 
 See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, index types and embedding the library (`Host`, scratch).
 
@@ -197,22 +202,40 @@ Read throughput - 59M elements in Denmark (461 MB), best of 3 (commit `90df51f`)
 | osmpbf 0.3 | sequential | 5.6s |
 | osmium 1.19 | cat → opl | 5.7s |
 
-CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed, commit `b355badd`, bygg, cold page cache on both sides; the full table and method are in the [performance guide](docs/guide/performance.md)):
+CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed), bygg, both tools starting with their inputs evicted from the page cache, median of three alternating single runs (brokkr script bench `vs-osmium`, run by `scripts/vs-osmium.sh 3`; the full table and method are in the [performance guide](docs/guide/performance.md)):
 
-| Command | pbfhogg | osmium | speedup |
-|---------|---------|--------|---------|
-| cat --type way (raw passthrough) | **0.17s** | 1.5s | **8.8x** |
-| sort (already sorted, indexdata) | **1.0s** | 7.5s | **7.5x** |
-| apply-changes (indexdata) | **0.77s** | 4.4s | **5.7x** |
-| add-locations-to-ways (sparse) | **1.9s** | 7.4s | **3.9x** |
-| tags-filter -R w/highway=primary | **0.16s** | 0.37s | **2.3x** |
-| inspect tags --type way (re-measured after the header-walk read-ahead) | **0.26s** | 0.39s | **1.5x** |
+<!-- pending: one vs-osmium campaign at a commit that carries the
+header-walk prefetch; see .plans/readme-refresh.md. -->
 
-extract --smart (Tokyo bbox, Japan, plantasjen, an older commit): **4.7s** against osmium's 13.4s, 2.9x.
+| Command | pbfhogg | osmium | speedup | Commit |
+|---------|---------|--------|---------|--------|
+| cat --type way (raw passthrough) | pending | pending | pending | pending |
+| sort (already sorted, indexdata) | pending | pending | pending | pending |
+| apply-changes (indexdata) | pending | pending | pending | pending |
+| add-locations-to-ways (sparse) | pending | pending | pending | pending |
+| add-locations-to-ways (external) | pending | pending | pending | pending |
+| tags-filter -R w/highway=primary | pending | pending | pending | pending |
+| tags-filter -R amenity=restaurant | pending | pending | pending | pending |
+| inspect tags (every key) | pending | pending | pending | pending |
+| inspect tags --type way | pending | pending | pending | pending |
+| getid (9 elements) | pending | pending | pending | pending |
+
+Library mode - the same work called through the library API from the `pbfhogg-harness` executable, against the CLI running the equivalent command, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified; the CLI arm timed from its command interval, inputs evicted before each arm):
+
+<!-- pending: no `brokkr library --bench` row is stored yet; see
+.plans/readme-refresh.md. -->
+
+| Scenario | Dataset | Library | CLI | Commit |
+|----------|---------|---------|-----|--------|
+| `isolation-cat` (one `cat` in a fresh process) | Denmark | pending | pending | pending |
+| `isolation-cat` | planet | pending | pending | pending |
+| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | pending | - | pending |
+| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | pending | - | pending |
+| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | pending | - | pending |
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
-System: the osmium table on bygg, AMD Ryzen 9 9950X3D2 (16c/32t); the rest on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18. Measured with brokkr.
+System: the planet, osmium and library tables on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), 30.5 GiB RAM, NVMe SSD; the read-throughput table on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD. Measured with brokkr.
 
 ## Acknowledgements
 

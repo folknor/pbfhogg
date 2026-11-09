@@ -133,13 +133,8 @@ mod tests {
             crate::read::header_walker::Cached::Unsupported
         }
 
-        fn will_need(
-            &self,
-            _offset: u64,
-            _len: u64,
-            _invocation: &crate::host::Invocation,
-        ) -> bool {
-            false
+        fn will_need(&self, _offset: u64, _len: u64, _invocation: &crate::host::Invocation) -> u64 {
+            0
         }
     }
 

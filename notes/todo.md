@@ -1167,17 +1167,6 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
-- [ ] **The classify pools' WILLNEED advises only the first 128 KiB of
-  each coalesced range (2026-11-09).** `WillneedPrefetch`
-  (`src/scan/classify.rs`) joins bodies separated by up to 4 KiB into one
-  `advise` call, so on a dense file a call can span many MB. Linux caps a
-  `WILLNEED` call at max(device optimal I/O size, readahead window), 128 KiB
-  on bygg's nvme0n1, and drops the rest silently. The header walk now issues
-  its prefetch in 128 KiB calls for this reason
-  (`HEADER_WALK_PREFETCH_CHUNK`, reference/performance.md "Header walk
-  prefetch on cold dense files"). Whether chunking the classify advice moves
-  any cold wall is not measured; the record that advice costs 1.4 % of planet
-  wall was taken with the truncated calls.
 - [ ] **cat --clean's window binds on germany (2026-11-09).** At
   `b58e8ef3` on bygg, germany `cat --clean` parks workers at the ordered
   pool's window for 12 to 15 % of the wall (`ordered_pool_window_wait_ns`)

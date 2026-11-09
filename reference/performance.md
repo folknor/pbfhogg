@@ -5774,3 +5774,40 @@ Unmeasured: apply-changes' pool, renumber's pools, extract's
 and the relation scan in isolation; planet, where stage 4 is
 readiness-bound (eb94af17: readiness waits sum 1622 s against pread
 552 s). Not to be re-measured without a code reason.
+
+## Classify WILLNEED in honoured calls (bygg, 2026-11-09, baseline `6fdde3f4`)
+
+Linux honours one `POSIX_FADV_WILLNEED` call only up to the larger of the
+device's optimal I/O size and the readahead window (128 KiB on bygg's
+nvme0n1) and drops the rest with a successful return. The classify pools'
+sliding advice issued each newly exposed slice of its 256 MiB window as
+one call, and on a file whose bodies coalesce into one range (planet,
+germany) each slice spans MB, so only its first 128 KiB was read ahead.
+Every measurement of the classify advice before this one, including the
+neutral extract simple cells and the 1.4 % consumer cost above, was taken
+with those truncated calls.
+
+Change: `fadvise::will_need` is the one way to issue `WILLNEED` and splits
+a range at absolute multiples of 128 KiB (`WILLNEED_CALL_BYTES`), so each
+call's page-rounded extent stays inside one block the kernel honours whole;
+the header walk's own chunk loop folded into it. Baseline = stored clean
+`6fdde3f4` cells; variant = the uncommitted change with `--force` (not
+stored, walls from the run output), after `sudo fstrim -av`, in A B B A
+order. Each germany cell ran straight after a planet cell, so its input
+was cold.
+
+| Row | Baseline | Variant |
+|---|---|---|
+| planet `cat --clean` (ordered pool) | 137.7 (`66490c43`), 144.4 (`1fd2a61a`) s | 141.5, 140.6 s |
+| germany `cat --clean`, cold | 8.34 (`e7250afc`), 8.39 (`ccc17685`) s | 8.27, 8.27 s |
+| planet `check --refs` (unordered pools) | 31.13 (`968e63b3`), 31.09 (`21f51836`) s | 26.40, 26.36 s |
+
+`fadvise_willneed_wait_ns`: planet `cat --clean` 2.2 / 2.1 s against
+15.0 s, germany 0.40 against 0.46 s, planet `check --refs` 2.3 against
+12.8 s. `check --refs` is 15 % faster, sign-consistent in both pairs: its
+per-blob dispatcher now keeps the 256 MiB ahead of the workers actually in
+flight. `cat --clean` moves within noise on planet and on cold germany; the
+consumer thread spends seven times longer in the syscall without the wall
+noticing, so it is still not what binds. Not measured: the other classify
+commands (tags-filter, getid, getparents, extract, altw pass 0) and europe;
+the extract simple neutral reading above predates the fix.

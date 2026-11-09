@@ -150,6 +150,12 @@ yet.
 2. Then `sudo fstrim -av` before each of: cat, cat --type way, sort,
    cat --clean, time-filter, renumber, tags-filter -i, cat --dedupe,
    apply-changes zstd:1, apply-changes `-l` keep-untagged, altw external.
+   Between the two blocks, WRK-005's answer runs (no README row):
+   check-refs, check-ids and check-index on every regional dataset
+   (denmark, germany, japan, north-america, norway, switzerland, malta,
+   greater-london, europe), then check-ids on denmark `unsorted` and
+   check-index on denmark `test-no-index`. Read each exit as WRK-005's
+   declaration input.
 3. Then the 63 vs-osmium lines.
 4. Then library: isolation-cat denmark `--bench 5` and planet `--bench 3`,
    repeat-cat, concurrent-cat, fixed-resources-executor (`--bench 3`), and
@@ -298,9 +304,13 @@ Residue. A short trim before a cell restores pass A (about 23 s against
 records"). Left: an idle-only rest cell and no-trim gaps matched to the
 trim's duration (the harness refused `sleep`, so neither ran), so trim
 is not isolated from elapsed time; in-pass dirty throttling and
-device-side state need per-cell device stats (brokkr#74). The per-worker
-x 256 stream topology is unchanged and untested; that is the one
-implementation lever left.
+device-side state need per-cell device stats (brokkr#74). Shared
+per-bucket shard files were built and refused (pass A +27 % trimmed,
++55 % untrimmed, all in append-lock waits; reference/performance.md,
+"Shared per-bucket id shards, refused"). No implementation lever on the
+exposure is left in hand: the unbuilt shapes there (a bounded descriptor
+cache over private files, striped buckets) bound descriptors, not write
+exposure.
 
 ### Campaign reference: how to measure
 

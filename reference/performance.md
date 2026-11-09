@@ -2811,9 +2811,52 @@ pass A. What this does and does not establish:
 No code change follows: the library cannot trim (FITRIM needs
 `CAP_SYS_ADMIN` and acts on the whole filesystem) and `discard` is host
 mount policy. Reducing scratch bytes does reduce the exposure (the
-packed records above); the per-worker x 256 shard stream topology is
-untested. Measurement consequence: trim before every altw external cell
-of a matched A/B on this host, not only before the suite.
+packed records above). Sharing the shard files instead of keeping them
+per worker was tried and refused (next section). Measurement consequence:
+trim before every altw external cell of a matched A/B on this host, not
+only before the suite.
+
+### Shared per-bucket id shards, refused (bygg, 2026-11-09, against `09c86a56`)
+
+The variant replaced pass A's per-worker x 256 id-shard files with one
+file per id bucket shared by every worker: 256 files and a fixed
+256 + 64 descriptor need whatever the worker count, worker-local batches
+of 128 KiB per bucket appended with `write_all` under a per-bucket
+mutex (wait counted as `s1a_id_shard_lock_wait_ns`), no `BufWriter`, and
+stage 2 streaming each bucket's one file in 8 MiB chunks. Its pass A
+batch RAM bound was 30 x 256 x 128 KiB = 960 MiB against about 1.9 GiB of
+`BufWriter`s. Gate green and `brokkr verify add-locations-to-ways
+--mode external` on denmark passed. Planet, `--bench 1`, 30 workers,
+99.5 GB of shard bytes in every cell, baseline as `--commit HEAD`
+(brokkr#105 applies to its CPU phases), variant uncommitted with
+`--force`, so its cells are unstored. Seconds; shard write and lock wait
+are summed over threads:
+
+| Cell | Arm | Before it | Pass A | Shard write | Write calls | Lock wait | Wall | UUID |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | baseline | trim (359 GiB), after check-refs | 22.2 | 225 | 383,414 | - | 282.6 | `c3ed0b50` |
+| 2 | shared | trim (529 GiB), after cell 1 | 28.2 | 27 | 762,897 | 241 | 289.1 | unstored |
+| 3 | baseline | no trim, after cell 2 | 22.6 | 232 | 383,362 | - | 288.3 | `ffdca8a8` |
+| 4 | shared | no trim, after cell 3 | 35.1 | 38 | 762,849 | 386 | 303.5 | unstored |
+
+Pass A lost 6.0 s (27 %) after a trim and 12.5 s (55 %) without one.
+Whole-command wall lost 2.3 % and 5.3 %. Summed pread time also rose,
+162 to 299 s in the trimmed pair. The time the baseline spent in shard
+writes moved into lock waits: workers queue on common buckets. Not
+separated: whether they queue because adjacent way blobs reference the
+same node-ID buckets, because a holder stalls (dirty throttling inside a
+write, being descheduled under the lock), or in the final drain, where
+every worker walks the buckets in the same order. A buffered ext4 write
+holds the inode lock for its copy, so appending at atomically reserved
+offsets to the same shared files without a mutex would queue the same
+way. Cell 3 also shows that untrimmed does not always mean slow: the
+baseline's pass A was 22.6 s untrimmed after a trimmed cell.
+
+Ruling: the shared-file topology is refused at this batch size and lock
+granularity. What stays open: bounding descriptors with private files
+opened on flush from a bounded descriptor cache, which keeps every inode
+single-writer, and striping a bucket across several files. Neither was
+built.
 
 ### Packed varint count (bygg, 2026-10-31)
 

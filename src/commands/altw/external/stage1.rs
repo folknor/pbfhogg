@@ -646,9 +646,22 @@ pub(super) fn stage1_way_pass(
     // Do not restore the process limit here: ADR-0016 leaves mutation and
     // its lifetime with the caller, and restoring a snapshot could undo a
     // concurrent host adjustment. Fixed host grants also make this arithmetic
-    // exercisable without mutating the test process. Private per-worker shards
-    // keep pass A writes independent; shared appenders would add synchronization
-    // to the measured external pipeline, not merely remove a limit probe.
+    // exercisable without mutating the test process.
+    //
+    // Private per-worker shards keep pass A's writes on independent inodes,
+    // and that is measured, not assumed. One shared file per id bucket (256
+    // files whatever the worker count, worker-local 128 KiB batches appended
+    // under a per-bucket mutex, stage 2 streaming one file per bucket) was
+    // built and run on planet: pass A went from 22.2 to 28.2 s after a trim
+    // and from 22.6 to 35.1 s untrimmed, with 241 and 386 summed thread-seconds
+    // of append-lock waiting while the summed write time fell to a tenth.
+    // Workers queue on common buckets; whether that is reference locality,
+    // holder stalls or the final drain was not separated. A buffered ext4
+    // write holds the inode lock for its copy, so lock-free appends at
+    // reserved offsets to one shared file would queue the same way. A shape
+    // that bounds descriptors without sharing inodes (private files opened
+    // on flush from a bounded descriptor cache) is untried. The run is in
+    // reference/performance.md, "Shared per-bucket id shards".
     //
     // Unlike stages 2 and 3, the CPU-side count carries no fixed cap, on
     // purpose. A cap of 8 (30 workers uncapped on a 32-CPU host) was tried
@@ -659,9 +672,7 @@ pub(super) fn stage1_way_pass(
     // deltas were mixed in sign and smaller than cell-to-cell drift. The
     // run is in reference/performance.md, "External stage 1 worker cap".
     // Descriptor exhaustion is handled by the fd cap below, not by a CPU
-    // cap. The real lever on file count and shard buffer RAM is decoupling
-    // them from the worker count (shared per-bucket appenders with bounded
-    // worker-local batching), not fewer workers.
+    // cap.
     let cpu_cap = crate::host::sized_workers(
         &*host.resources,
         DECODE_WORKERS_RESERVED,

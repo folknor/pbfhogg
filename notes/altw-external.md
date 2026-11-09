@@ -182,8 +182,9 @@ Shape (post-A1 rankless join, `--inject-prepass` capable):
    for node-blob filtering).
 2. Stage 1: single parallel way pass (host parallelism minus 2 workers,
    no fixed cap; 22 on plantasjen, 30 on bygg). Per ref, emits one
-   12-byte IdRecord `(local_node_id u32 | CLOSURE_FLAG, blob_idx u32,
-   blob_local_slot u32)` into 256 id-bucket shards (per-worker files),
+   IdRecord `(local_node_id | CLOSURE_FLAG, blob_idx, blob_local_slot)`
+   packed into one `u64` word by `IdCodec` (two words when the slot
+   escapes) into 256 id-bucket shards (per-worker files),
    plus the blob-order refcount sidecars. Relation scan (sequential,
    pread-only over relation blobs) runs concurrently in the same scope.
 3. Stage 2: 6 workers claim id buckets, read the bucket's shards back,
@@ -616,36 +617,25 @@ sub-second wall. A contiguous bucket assignment or one-blob decode cache
 would recover it. Park unless someone is already inside the stage-2
 dispatch loop.
 
-### S6. L6 consolidated shard writers (kept as fallback)
+### S6. L6 consolidated shard writers (built and refused, 2026-11-09)
 
-Stage 1 holds one 256 KiB BufWriter per id bucket per worker: workers x
-256 files and buffers (5,632 and ~1.4 GB at 22 workers on plantasjen;
-7,680 and ~1.9 GiB at 30 on bygg). Consolidating to 256 shared writers
-with batched flush trades that for lock traffic. N1 shrinks the byte
-volume through these writers by a third, which weakens the case further.
+256 shared per-bucket files with 128 KiB worker-local batches appended
+under a per-bucket mutex were built and run on planet against `09c86a56`
+(reference/performance.md, "Shared per-bucket id shards, refused"):
+pass A 22.2 to 28.2 s trimmed and 22.6 to 35.1 s untrimmed, with 241 and
+386 summed thread-seconds of lock wait while summed write time fell to a
+tenth. The convoy caution held. A lock-free reserved-offset variant would
+queue on the ext4 inode lock instead. Not retried as is.
 
-Since the 2026-10-28 cap experiment (reference/performance.md "External
-stage 1 worker cap"), this is the one remaining lever on stage 1's file
-count and buffer RAM: capping workers did not pay, so the count can only
-shrink by decoupling it from the worker count. Correctness holds (records
-carry blob and slot identity, stage 2 sorts by node id, worker-file order
-is unused) provided whole-record batches stay contiguous under the bucket
-lock, counts stay exact and everything flushes before stage 2. Two
-cautions before measuring: copying stage 2's per-worker per-bucket 256 KiB
-batching recreates about the same RAM in local vectors, so the worker-local
-batch budget must be bounded in aggregate; and a bucket mutex held across a
-throttled write can convoy workers on hot buckets, so emit a lock-wait
-`_wait_ns` counter. Not motivated by a failure: no recorded EMFILE or
-memory failure exists at 30 workers.
-
-A second motive, unmeasured (2026-10-28): a library caller at the default
-soft limit of 1024 (the library never raises it) gets
-`min(cpu_cap, (available - 64) / 256)` = three stage-1 workers on any
-host, and is refused below 320 available. Consolidated writers would make
-stage 1's descriptor need independent of the worker count, so a library
-caller would run at full width. Measure stage 1 at soft 1024 against the
-raised limit (the library harness, pbfhogg#34, can) before deciding whether this
-matters.
+Still open, neither built: private per-worker files opened on flush from
+a bounded descriptor cache (keeps one writer per inode and makes the
+descriptor need independent of the worker count), and striping each
+bucket across a few files. The motive is the library caller at soft 1024,
+which gets `min(cpu_cap, (available - 64) / 256)` = three stage-1
+workers on any host and is refused below 320 available; whether three
+workers cost that caller anything is unmeasured (the library harness,
+pbfhogg#34, can measure it). Not motivated by a failure: no recorded
+EMFILE or memory failure exists at 30 workers.
 
 ---
 

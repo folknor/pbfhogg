@@ -7,7 +7,7 @@
 //! (single-variant enum optimizes away).
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -192,6 +192,11 @@ impl FileReader {
     /// For `DirectReader`: consumes buffered bytes, then moves its read
     /// position. `DirectReader::skip` already validates EOF and errors on
     /// past-end, so no extra check is needed.
+    ///
+    /// Forward only, and it must stay so: [`Self::append_to`] reads past a
+    /// drained `BufReader` straight from the `File`, which leaves the
+    /// consumed buffer behind the real position, so a backward
+    /// `seek_relative` would land in stale bytes.
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
         if n == 0 {
             return Ok(());
@@ -208,6 +213,60 @@ impl FileReader {
             Self::Direct(r) => r.skip(n),
         }
     }
+}
+
+impl FileReader {
+    /// Append up to `n` bytes to `out` without zero-filling them, stopping
+    /// short only where the input ends; returns how many were appended (not
+    /// counting what `out` already held). The `Frames` append for this
+    /// reader (`Frames::over_file`).
+    ///
+    /// The generic route, a bounded `read_to_end` over this `Read`, goes
+    /// through std's default `read_buf`, which zero-fills every byte and
+    /// keeps reads at 8 KiB-and-doubling sizes. Here the buffered bytes are
+    /// copied out of the `BufReader`, a remainder of at least its capacity
+    /// is read by a bounded `read_to_end` on the `File` itself (whose native
+    /// `read_buf` reads into uninitialised capacity), and a smaller one is
+    /// refilled through the buffer. O_DIRECT copies from its aligned buffer
+    /// ([`DirectReader::append_to`]).
+    pub(crate) fn append_to(&mut self, n: usize, out: &mut Vec<u8>) -> io::Result<usize> {
+        out.reserve(n);
+        match self {
+            Self::Buffered(r) => append_buffered(r, n, out),
+            #[cfg(feature = "linux-direct-io")]
+            Self::Direct(r) => r.append_to(n, out),
+        }
+    }
+}
+
+/// [`FileReader::append_to`] for a buffered reader. Reading the `File`
+/// directly is sound only with the buffer drained, which the loop
+/// guarantees; it leaves the consumed buffer behind the file position,
+/// harmless because the reader never seeks backward ([`FileReader::skip`]).
+fn append_buffered(r: &mut BufReader<File>, n: usize, out: &mut Vec<u8>) -> io::Result<usize> {
+    let mut appended = 0;
+    while appended < n {
+        let want = n - appended;
+        let buffered = r.buffer();
+        if !buffered.is_empty() {
+            let take = want.min(buffered.len());
+            out.extend_from_slice(&buffered[..take]);
+            r.consume(take);
+            appended += take;
+            continue;
+        }
+        if want >= r.capacity() {
+            let got = r.get_mut().take(want as u64).read_to_end(out)?;
+            return Ok(appended + got);
+        }
+        match r.fill_buf() {
+            Ok([]) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(appended)
 }
 
 #[cfg(feature = "linux-direct-io")]
@@ -240,6 +299,67 @@ impl Read for FileReader {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::fadvise::{Hint, tests::hint_attempts};
+    use std::io::{BufReader, Read};
+
+    /// A buffered reader over `len` patterned bytes with a 16-byte buffer, so
+    /// every append transition is reachable with small sizes.
+    fn small_buffered(len: usize) -> (super::FileReader, Vec<u8>, tempfile::TempDir) {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("in.bin");
+        #[allow(clippy::cast_possible_truncation)]
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = super::FileReader::Buffered(BufReader::with_capacity(16, file));
+        (reader, bytes, dir)
+    }
+
+    /// Appends below, at and above the buffer capacity, after a partial
+    /// drain, into a non-empty vector, a zero-length append, a skip after a
+    /// direct read, and a short count at the end: each lands the right bytes
+    /// and leaves the reader at the right position.
+    #[test]
+    fn append_to_delivers_exact_bytes_across_every_transition() {
+        let (mut r, bytes, _dir) = small_buffered(200);
+        let mut out = vec![0xAA];
+        // 5 bytes: a fill, then a partial drain of the buffer.
+        assert_eq!(r.append_to(5, &mut out).unwrap(), 5);
+        // 0 bytes: nothing read, nothing appended.
+        assert_eq!(r.append_to(0, &mut out).unwrap(), 0);
+        // 11 left in the buffer, then 40 more past capacity read directly.
+        assert_eq!(r.append_to(51, &mut out).unwrap(), 51);
+        // Exactly the capacity, with the buffer empty: the direct read.
+        assert_eq!(r.append_to(16, &mut out).unwrap(), 16);
+        // Below the capacity: a refill through the buffer.
+        assert_eq!(r.append_to(15, &mut out).unwrap(), 15);
+        assert_eq!(out[0], 0xAA);
+        assert_eq!(&out[1..], &bytes[..87]);
+        // A forward skip after the direct reads, then the next bytes.
+        r.skip(13).unwrap();
+        let mut next = Vec::new();
+        assert_eq!(r.append_to(20, &mut next).unwrap(), 20);
+        assert_eq!(next, bytes[100..120]);
+        // A request past the end is a short count with every byte there.
+        let mut tail = Vec::new();
+        assert_eq!(r.append_to(500, &mut tail).unwrap(), 80);
+        assert_eq!(tail, bytes[120..]);
+        assert_eq!(r.append_to(4, &mut tail).unwrap(), 0);
+    }
+
+    /// The zero-free append agrees with the generic `Read` route it replaces.
+    #[test]
+    fn append_to_matches_the_read_route() {
+        let (mut a, bytes, _da) = small_buffered(300);
+        let (mut b, _, _db) = small_buffered(300);
+        for n in [1usize, 15, 16, 17, 64, 3, 100] {
+            let mut x = Vec::new();
+            let mut y = Vec::new();
+            let got_a = a.append_to(n, &mut x).unwrap();
+            let got_b = b.by_ref().take(n as u64).read_to_end(&mut y).unwrap();
+            assert_eq!((got_a, &x), (got_b, &y), "append of {n}");
+        }
+        assert!(!bytes.is_empty());
+    }
 
     /// Every Linux build hints sequential readahead on a buffered open. The
     /// hint used to compile only with the `O_DIRECT` or `io_uring` feature,

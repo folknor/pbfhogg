@@ -244,7 +244,7 @@ fn read_header(
     host: &crate::host::Entered<'_>,
 ) -> Result<crate::HeaderBlock> {
     let file = input.path();
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::open_in(input, direct_io, &host.invocation)?,
         file,
         host,
@@ -353,7 +353,7 @@ fn cat_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut frames = Frames::of_input(
+        let mut frames = Frames::of_file_input(
             FileReader::open_in(input, direct_io, &host.invocation)?,
             file,
             host,
@@ -722,7 +722,7 @@ fn cat_type_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut frames = Frames::of_input(
+        let mut frames = Frames::of_file_input(
             FileReader::open_in(input, direct_io, &host.invocation)?,
             file,
             host,

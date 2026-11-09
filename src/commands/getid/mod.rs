@@ -970,7 +970,7 @@ fn filter_by_id_streaming(
     let mut blobs_skipped: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
 
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::open_in(input, write.direct_reads, &host.invocation)?,
         input.path(),
         host,

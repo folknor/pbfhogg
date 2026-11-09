@@ -666,7 +666,7 @@ fn degrade_passthrough(
     // takes no pin of its own (a FIFO or stdin serves it, buffered) and the
     // decode path does; a caller's pin is opened as the file it pinned.
     let input = source.path();
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::open_in(source, write.direct_reads, &host.invocation)?,
         input,
         host,

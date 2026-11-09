@@ -197,7 +197,7 @@ fn run_skip(path: &Path) -> Outcome {
 /// with the refusal off, as on the public `BlobReader` sources.
 fn file_frames(path: &Path) -> Frames<FileReader> {
     let host = crate::host::Host::entered_for_tests();
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::buffered_in(path, &host.invocation).unwrap(),
         path,
         &host,

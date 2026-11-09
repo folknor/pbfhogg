@@ -591,7 +591,7 @@ fn check_index_inner(
     host: &crate::host::Entered<'_>,
 ) -> Result<IndexReport> {
     let path = input.path();
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::open_in(input, opts.direct_io, &host.invocation)?,
         path,
         host,

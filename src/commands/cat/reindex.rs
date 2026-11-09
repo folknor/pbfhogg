@@ -83,7 +83,7 @@ fn reindex_to(
     host: &crate::host::Entered<'_>,
 ) -> Result<ReindexStats> {
     let path = source.path();
-    let mut frames = Frames::of_input(
+    let mut frames = Frames::of_file_input(
         FileReader::open_in(source, write.direct_reads, &host.invocation)?,
         path,
         host,

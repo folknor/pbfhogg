@@ -766,7 +766,7 @@ pub(crate) fn front_frames(
     diagnostics: &crate::host::Diagnostics,
     cancel: &crate::host::Invocation,
 ) -> Frames<FileReader> {
-    let mut frames = Frames::new(reader, Some(0), HeaderFields::INDEXES);
+    let mut frames = Frames::over_file(reader, Some(0), HeaderFields::INDEXES);
     frames.set_path(Some(std::sync::Arc::from(path)));
     frames.set_diagnostics(diagnostics.clone());
     frames.set_cancel(cancel.clone());

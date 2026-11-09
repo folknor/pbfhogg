@@ -277,6 +277,43 @@ impl DirectReader {
         Ok(n)
     }
 
+    /// Append up to `n` bytes to `out` by copying from the aligned buffer,
+    /// refilling it as it empties, with no zero-fill of `out`; stops short
+    /// only at the end of the input. Returns the bytes appended. The
+    /// `FileReader::append_to` arm for O_DIRECT; `read` would serve the
+    /// same bytes, but through std's zero-filling `read_to_end`.
+    pub(crate) fn append_to(&mut self, n: usize, out: &mut Vec<u8>) -> io::Result<usize> {
+        self.append_with(n, out, &mut pread_file)
+    }
+
+    fn append_with<P>(&mut self, n: usize, out: &mut Vec<u8>, pread: &mut P) -> io::Result<usize>
+    where
+        P: FnMut(&File, &mut [u8], u64) -> io::Result<usize>,
+    {
+        let mut appended = 0;
+        while appended < n {
+            if self.buf.remaining() == 0 {
+                if self.eof {
+                    break;
+                }
+                match self.fill_with(pread) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            let take = (n - appended).min(self.buf.remaining());
+            out.extend_from_slice(&self.buf.unread()[..take]);
+            self.buf.consume(take);
+            appended += take;
+        }
+        Ok(appended)
+    }
+
     /// Open a file for reading with `O_DIRECT`.
     ///
     /// A filesystem that refuses `O_DIRECT` at open, or whose reported
@@ -800,9 +837,43 @@ mod tests {
                 .skip_with(n, &mut |_: &File, dst: &mut [u8], at| fake.pread(dst, at))
         }
 
+        fn append(&mut self, n: usize, out: &mut Vec<u8>) -> io::Result<usize> {
+            let fake = &mut self.fake;
+            self.reader
+                .append_with(n, out, &mut |_: &File, dst: &mut [u8], at| {
+                    fake.pread(dst, at)
+                })
+        }
+
         fn expect(&self, from: usize, len: usize) -> Vec<u8> {
             self.fake.data[from..from + len].to_vec()
         }
+    }
+
+    /// The zero-free append crosses buffer refills, short unaligned
+    /// transfers and interrupted fills, keeps what `out` held, interleaves
+    /// with skips, and is a short count at the end.
+    #[test]
+    fn appends_cross_refills_short_transfers_and_interruptions() {
+        let len = IO_BUF_BYTES * 2 + 1000;
+        let mut h = Harness::new(len, &[700, 0, IO_BUF_BYTES, 3 * ALIGN + 5]);
+        let mut out = vec![9_u8];
+        assert_eq!(h.append(0, &mut out).unwrap(), 0);
+        assert_eq!(
+            h.append(IO_BUF_BYTES + 10, &mut out).unwrap(),
+            IO_BUF_BYTES + 10
+        );
+        assert_eq!(out[0], 9);
+        assert_eq!(out[1..], h.expect(0, IO_BUF_BYTES + 10)[..]);
+        h.skip(17).unwrap();
+        let mut next = Vec::new();
+        assert_eq!(h.append(50, &mut next).unwrap(), 50);
+        assert_eq!(next, h.expect(IO_BUF_BYTES + 27, 50));
+        let mut tail = Vec::new();
+        let rest = len - (IO_BUF_BYTES + 77);
+        assert_eq!(h.append(rest + 99, &mut tail).unwrap(), rest);
+        assert_eq!(tail, h.expect(IO_BUF_BYTES + 77, rest));
+        assert_eq!(h.append(1, &mut tail).unwrap(), 0);
     }
 
     #[test]

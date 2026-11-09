@@ -798,7 +798,7 @@ impl BlobReader<FileReader> {
 
     /// A reader over `reader`, opened from `path`.
     fn from_reader(reader: FileReader, path: &Path) -> Self {
-        let mut frames = Frames::new(reader, Some(0), Self::DEFAULT_FIELDS);
+        let mut frames = Frames::over_file(reader, Some(0), Self::DEFAULT_FIELDS);
         frames.set_path(Some(Arc::from(path)));
         Self::with_frames(frames)
     }
@@ -850,10 +850,8 @@ impl<R: Read + Send> BlobReader<R> {
             Err(err) => return Some(Err(err)),
         };
         // Sized to the declared payload, so the bounded read fills it with
-        // no reallocation. It is not free of zero-fill: a reader that
-        // implements only `read` (`FileReader` does) gets std's default
-        // `read_buf`, which zero-fills the spare capacity before each read.
-        // One fresh allocation per blob, so under a glibc mmap threshold
+        // no reallocation (and, for a reader opened from a file, with no
+        // zero-fill: `Frames::over_file`). One fresh allocation per blob, so under a glibc mmap threshold
         // below the frame size every frame is mapped and unmapped: at
         // planet a 1 MiB threshold cost getid's second pass about 4 %
         // (reference/performance.md, "glibc's sliding mmap threshold across

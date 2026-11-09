@@ -5475,12 +5475,44 @@ more read syscalls and 12 us more user CPU per blob (0.6 s in all) on a
 reader thread that is not saturated. Both arms zero the payload, so the
 pair does not measure what removing the zeroing would gain.
 `FileReader::read_buf` is not writable on stable Rust, and `resize` plus
-`read_exact` keeps the zeroing; the code is unchanged, with the reasoning
-at `FrameSource::append` in `src/read/frame.rs`. The pair covers neither
+`read_exact` keeps the zeroing. The pair covers neither
 cat's descriptor admission (`56f8d9a9`, an ancestor of both arms, a
 per-run cost) nor the reframe's `MAX_BLOB_DATASIZE` compare (`f9625b94`,
 in neither arm, and plain cat on indexed input never reframes). Not to be
 re-measured without a change to the walk's read path.
+
+The zero-free append that followed (next section) is such a change and was
+measured there.
+
+## Zero-free FileReader append (bygg, 2026-11-09, `3286a9c5` vs uncommitted variant)
+
+Every `Frames` built over a `FileReader` now appends through
+`FileReader::append_to`: buffered bytes copied out of the `BufReader`, a
+remainder of at least its capacity read by a bounded `read_to_end` on the
+`File` (native `read_buf`, no zero-fill), O_DIRECT copied from its aligned
+buffer. Baseline cells stored at `3286a9c5`; variant cells `--force`
+(sidecar ids). Buffered, untrimmed, A B B A per command.
+
+| Cell | Arm | Wall | utime | read syscalls |
+|---|---|---:|---:|---:|
+| planet plain cat | base (`dc7ccb05`) | 42.2 s | 2.96 s | 351,017 |
+| planet plain cat | zero-free (`2605125d`) | 41.4 s | 0.45 s | 152,452 |
+| planet plain cat | zero-free (`2179f0ea`) | 57.7 s | - | - |
+| planet plain cat | base (`907f94f4`) | 59.0 s | - | - |
+| europe getid full-scan arm | base (`5eb33820`) | 8.96 s | - | - |
+| europe getid full-scan arm | zero-free (`66b28f09`) | 9.02 s | - | - |
+| europe getid full-scan arm | zero-free (`a752d494`) | 8.95 s | 0.30 s | 134,052 |
+| europe getid full-scan arm | base (`b983f104`) | 8.97 s | 0.44 s | 130,853 |
+
+The mechanism shows (planet: about 3.9 fewer read syscalls and 50 us less
+user CPU per blob; europe getid, 458k blobs under the 256 KiB buffer: a
+third less user CPU, syscalls unchanged), the walls do not: both commands
+are I/O bound (planet 0.4 cores with walls climbing per back-to-back 92 GB
+write, europe getid 0.2 cores at about 3.9 GB/s from disk). The
+warm-cache many-small-blob walk where the zeroing could reach the wall
+cannot be built on this 30 GB host (europe and planet 8k exceed RAM).
+Landed as a CPU reduction with no wall cost. Not to be re-measured
+without a change to the append or a host that can hold such a walk warm.
 
 ## Writer cluster across six commits (bygg, 2026-11-09, `307982d7` vs `52690f1e`)
 

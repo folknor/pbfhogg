@@ -94,28 +94,16 @@ impl<R: Read> FrameSource for R {
     /// A bounded `read_to_end` into the caller's buffer, reserved to `n`
     /// first: a caller that sized `out` exactly gets no reallocation. Whether
     /// the spare capacity is zero-filled is the reader's: one that implements
-    /// only `read` gets std's default `read_buf`, which zero-fills.
-    /// `Take` reports a short input as a short count.
+    /// only `read` gets std's default `read_buf`, which zero-fills and keeps
+    /// reads at 8 KiB-and-doubling sizes. `Take` reports a short input as a
+    /// short count.
     ///
-    /// `FileReader` is such a reader, so on every `Frames<FileReader>` walk
-    /// each payload byte is zeroed, and because a zeroing reader keeps
-    /// std's `read_to_end` at its 8 KiB-and-doubling read sizes, a 1.8 MB
-    /// planet payload takes about seven `read` calls, the small ones copied
-    /// through the 256 KiB `BufReader`. Measured on plain `cat` of planet
-    /// against the zeroed `vec!` plus `read_exact` this replaced (bygg,
-    /// `2c12a955` vs `307982d7`): about 4.9 more read syscalls and 12 us
-    /// more user CPU per blob, 0.6 s in all, and no wall difference above
-    /// the drive's drift on that I/O-bound run. Not changed, for these
-    /// reasons: `FileReader::read_buf` cannot be written on stable Rust
-    /// (`Read::read_buf` is unstable); `resize` plus `read_exact` keeps the
-    /// zeroing. A zero-free route on stable exists (drain the `BufReader`,
-    /// then a bounded `read_to_end` on the `File` itself for a large
-    /// remainder, installed as a `FileReader`-only append the way
-    /// `BlobReader` installs its eviction callback), but no measured path
-    /// has shown the cost on its wall; a sequential walk over many small
-    /// blobs (getid's full-read scan) is the shape where it could.
-    /// `reference/performance.md`, "Plain cat across the one frame
-    /// decoder", has the cells.
+    /// `FileReader` is such a reader, and `Read::read_buf` is unstable, so it
+    /// cannot opt out here. A `Frames` built over a `FileReader` by
+    /// [`Frames::over_file`] or [`Frames::of_file_input`] uses
+    /// `FileReader::append_to` instead, which is zero-free; this fallback
+    /// remains for every other reader, including a `FileReader` handed to
+    /// the public `BlobReader::new`, where it is slower but equally correct.
     fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
         out.reserve(n);
         self.by_ref().take(n as u64).read_to_end(out)
@@ -285,6 +273,11 @@ pub(crate) fn partial_index_error() -> Error {
 #[derive(Clone, Debug)]
 pub(crate) struct Frames<S> {
     pub(crate) src: S,
+    /// How header and payload bytes are appended from `src`: the source's
+    /// [`FrameSource::append`], or the zero-free `FileReader::append_to`
+    /// chosen by the `FileReader` constructors (a trait impl cannot pick it:
+    /// the blanket impl over `Read` already covers `FileReader`).
+    append: AppendFn<S>,
     /// The source's position: a frame boundary between frames, the payload
     /// start while one is pending. `None` when the source has no position or
     /// a failure left it unknown.
@@ -308,14 +301,22 @@ pub(crate) struct Frames<S> {
     partial_index: Option<PartialIndexGuard<FrameId>>,
 }
 
-impl<S> Frames<S> {
+/// The append a [`Frames`] reads header and payload bytes with.
+type AppendFn<S> = fn(&mut S, usize, &mut Vec<u8>) -> std::io::Result<usize>;
+
+impl<S: FrameSource> Frames<S> {
     /// A walk over `src`, whose position is `start` (`None` for a source
     /// with none). The ordinal counts from 0 when the walk starts at the
     /// beginning of the input or has no position to say otherwise, and is
     /// unknown for a walk that starts mid-input.
     pub(crate) fn new(src: S, start: Option<u64>, fields: HeaderFields) -> Self {
+        Self::with_append(src, start, fields, <S as FrameSource>::append)
+    }
+
+    fn with_append(src: S, start: Option<u64>, fields: HeaderFields, append: AppendFn<S>) -> Self {
         Frames {
             src,
+            append,
             pos: start,
             stream_start: start.unwrap_or(0),
             next_ordinal: matches!(start, None | Some(0)).then_some(0),
@@ -335,12 +336,37 @@ impl<S> Frames<S> {
     /// partially indexed input ([`Self::refuse_partial_index`]); a command
     /// exempt from that policy opts out with [`Self::accept_partial_index`].
     pub(crate) fn of_input(src: S, path: &Path, host: &crate::host::Entered<'_>) -> Self {
-        let mut frames = Self::new(src, Some(0), HeaderFields::INDEXES);
-        frames.path = Some(Arc::from(path));
-        frames.diagnostics = host.diagnostics.clone();
-        frames.cancel = host.invocation.clone();
-        frames.refuse_partial_index();
-        frames
+        Self::new(src, Some(0), HeaderFields::INDEXES).command_input(path, host)
+    }
+}
+
+impl Frames<FileReader> {
+    /// [`Frames::new`] over a `FileReader`, appending through the zero-free
+    /// `FileReader::append_to`. Every `Frames<FileReader>` the crate builds
+    /// goes through this or [`Self::of_file_input`].
+    pub(crate) fn over_file(src: FileReader, start: Option<u64>, fields: HeaderFields) -> Self {
+        Self::with_append(src, start, fields, FileReader::append_to)
+    }
+
+    /// [`Frames::of_input`] over a `FileReader`, as [`Self::over_file`].
+    pub(crate) fn of_file_input(
+        src: FileReader,
+        path: &Path,
+        host: &crate::host::Entered<'_>,
+    ) -> Self {
+        Self::over_file(src, Some(0), HeaderFields::INDEXES).command_input(path, host)
+    }
+}
+
+impl<S> Frames<S> {
+    /// Make this walk a command input's: `path`, the run's diagnostics and
+    /// cancellation, and the refusal of a partially indexed input.
+    fn command_input(mut self, path: &Path, host: &crate::host::Entered<'_>) -> Self {
+        self.path = Some(Arc::from(path));
+        self.diagnostics = host.diagnostics.clone();
+        self.cancel = host.invocation.clone();
+        self.refuse_partial_index();
+        self
     }
 
     /// Refuse a partially indexed input: data blobs with readable indexdata
@@ -554,7 +580,7 @@ impl<S: FrameSource> Frames<S> {
 
         self.header_buf.clear();
         let header_start = id.start.map(|s| s + 4);
-        let got = match self.src.append(header_len, &mut self.header_buf) {
+        let got = match (self.append)(&mut self.src, header_len, &mut self.header_buf) {
             Ok(got) => got,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
             Err(e) => return Err(e.into()),
@@ -638,7 +664,7 @@ impl<S: FrameSource> Frames<S> {
     /// Append the pending payload to `out`.
     pub(crate) fn read_payload(&mut self, out: &mut Vec<u8>) -> Result<()> {
         let pending = self.take_pending()?;
-        let got = match self.src.append(pending.data_size, out) {
+        let got = match (self.append)(&mut self.src, pending.data_size, out) {
             Ok(got) => got,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
             Err(e) => return Err(self.fail(pending.id, e.into())),

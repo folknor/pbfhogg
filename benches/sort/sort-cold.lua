@@ -14,19 +14,14 @@
 -- Eviction happens in the timed block, after brokkr hashes the inputs, and
 -- fincore checks it before the sort; the iteration wall therefore includes
 -- that preparation, so compare commits on the sort child's own wall
--- (`brokkr results UUID`).
+-- (`brokkr results UUID`). --force is checked by its choices in
+-- brokkr.d/benches.toml.
 
 local function resident(path)
     local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
     local res = tonumber(r.stdout:match("%d+"))
     if res == nil then fail("fincore gave no resident size for " .. path) end
     return res
-end
-
-function preflight(params)
-    if params.force ~= "yes" and params.force ~= "no" then
-        fail("--force takes yes or no, not " .. params.force)
-    end
 end
 
 function bench(params)

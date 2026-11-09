@@ -28,11 +28,8 @@ local function resident(path)
     return res
 end
 
-function preflight(params)
-    local t = params.type
-    if t ~= "all" and t ~= "node" and t ~= "way" and t ~= "relation" then
-        fail("--type takes all, node, way or relation, not " .. t)
-    end
+-- --type is checked by its choices in brokkr.d/benches.toml.
+function validate(params)
     if params.old_variant.file == params.new_variant.file then
         fail("--old and --new name the same file")
     end

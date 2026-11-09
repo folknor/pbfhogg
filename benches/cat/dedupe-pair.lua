@@ -29,9 +29,10 @@
 --
 --   brokkr bench --iterations 1 --commit REF dedupe-pair --with one-relation --cache cold
 --
--- Cache handling is dedupe-self's: warm reads both inputs in the
--- preflight, cold evicts both in the timed block, and fincore checks both
--- before the merge. Compare commits on the cat child's own wall.
+-- Cache handling is dedupe-self's: the timed block reads both inputs whole
+-- (warm) or evicts both (cold), and fincore checks both before the merge.
+-- Compare commits on the cat child's own wall. --cache and --check are
+-- checked by their choices in brokkr.d/benches.toml.
 
 local function resident(path)
     local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
@@ -40,32 +41,24 @@ local function resident(path)
     return res
 end
 
-function preflight(params)
-    -- The preflight sees each file as its path string; bench sees a handle.
+function validate(params)
+    -- validate() sees each file as its path string; bench sees a handle.
     if params.base_variant.file == params.with_variant.file then
         fail("--base and --with name the same file; dedupe-self is the self-merge")
-    end
-    if params.check ~= "yes" and params.check ~= "no" then
-        fail("--check takes yes or no, not " .. params.check)
-    end
-    if params.cache == "cold" then
-        return
-    elseif params.cache == "warm" then
-        for _, f in ipairs({ params.base_variant.file, params.with_variant.file }) do
-            binary_with({ program = "dd" }, "if=" .. f, "of=/dev/null", "bs=4M", "status=none"):ok()
-        end
-    else
-        fail("--cache takes cold or warm, not " .. params.cache)
     end
 end
 
 function bench(params)
     local base = params.base_variant.file
     local with = params.with_variant.file
-    for name, f in pairs({ base = base, with = with }) do
+    for _, f in ipairs({ base, with }) do
         if params.cache == "cold" then
             binary_with({ program = "dd" }, "if=" .. f.path, "iflag=nocache", "count=0", "status=none"):ok()
+        else
+            binary_with({ program = "dd" }, "if=" .. f.path, "of=/dev/null", "bs=4M", "status=none"):ok()
         end
+    end
+    for name, f in pairs({ base = base, with = with }) do
         local res = resident(f.path)
         local size = filesize(f)
         record[name .. "_resident_bytes"] = res

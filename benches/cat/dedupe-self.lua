@@ -12,14 +12,14 @@
 --
 --   brokkr bench --iterations 1 --commit REF dedupe-self --dataset japan --cache cold
 --
--- The preflight reads the input whole (warm). Eviction (cold) happens in the
--- timed block instead, since brokkr hashes the inputs after the preflight
--- and a digest it cannot reuse reads them back in. The timed block then
--- checks residency with fincore before the merge, records it, and fails a
--- cold run that finds any of the input resident or a warm run that finds
--- less than all of it. The iteration wall therefore includes that
--- preparation; compare commits on the pbfhogg child's own wall, which
--- brokkr records beside it (`brokkr results UUID`, the cat child).
+-- The timed block sets the cache state just before the merge, reading the
+-- input whole (warm) or evicting it (cold), then checks residency with
+-- fincore, records it, and fails a cold run that finds any of the input
+-- resident or a warm run that finds less than all of it. The iteration wall
+-- therefore includes that preparation; compare commits on the pbfhogg
+-- child's own wall, which brokkr records beside it (`brokkr results UUID`,
+-- the cat child). --cache and --check are checked by their choices in
+-- brokkr.d/benches.toml.
 
 local function resident(path)
     local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
@@ -28,21 +28,12 @@ local function resident(path)
     return res
 end
 
-function preflight(params)
-    local path = params.variant.file
-    if params.cache == "cold" then
-        return
-    elseif params.cache == "warm" then
-        binary_with({ program = "dd" }, "if=" .. path, "of=/dev/null", "bs=4M", "status=none"):ok()
-    else
-        fail("--cache takes cold or warm, not " .. params.cache)
-    end
-end
-
 function bench(params)
     local pbf = params.variant.file
     if params.cache == "cold" then
         binary_with({ program = "dd" }, "if=" .. pbf.path, "iflag=nocache", "count=0", "status=none"):ok()
+    else
+        binary_with({ program = "dd" }, "if=" .. pbf.path, "of=/dev/null", "bs=4M", "status=none"):ok()
     end
     local res = resident(pbf.path)
     local size = filesize(pbf)
@@ -65,7 +56,5 @@ function bench(params)
         local d = binary("diff", pbf, out)
         record.diff_exit = d.exit
         if d.exit ~= 0 then fail("the self-merge output differs from its input (diff exit " .. tostring(d.exit) .. ")") end
-    elseif params.check ~= "no" then
-        fail("--check takes yes or no, not " .. params.check)
     end
 end

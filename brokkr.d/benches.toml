@@ -26,22 +26,24 @@
 [bench.dedupe-self]
 script_file = "../benches/cat/dedupe-self.lua"
 description = "cat --dedupe of a dataset's file with itself, input cold or warm as the merge starts"
-version = 1
-date = 2026-11-08
+version = 2
+date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the cat child's wall is unchanged" },
   { version = 1, date = 2026-11-08, note = "Added: cache state fixed and checked with fincore inside the timed block" },
 ]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the PBF variant merged with itself" }
-params.cache = { required = true, help = "cold or warm: the input's page-cache state as the merge starts" }
-params.check = { default = "no", help = "yes: diff the output against the input after the merge (a correctness run, not a timing cell)" }
+params.cache = { choices = ["cold", "warm"], required = true, help = "the input's page-cache state as the merge starts" }
+params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the output against the input after the merge (a correctness run, not a timing cell)" }
 
 [bench.dedupe-pair]
 script_file = "../benches/cat/dedupe-pair.lua"
 description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts, reaching passthrough"
-version = 1
+version = 2
 date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the cat child's wall is unchanged" },
   { version = 1, date = 2026-11-09, note = "Added: a second input, so disjoint stretches take passthrough and the coalesced copy" },
 ]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
@@ -49,34 +51,36 @@ params.base = { from = "datasets.{dataset}.snapshot", default = "base", help = "
 params.base_variant = { from = "datasets.{dataset}.snapshot.{base}.pbf", default = "indexed", help = "the first input's PBF variant" }
 params.with = { from = "datasets.{dataset}.snapshot", required = true, help = "the second input's snapshot" }
 params.with_variant = { from = "datasets.{dataset}.snapshot.{with}.pbf", default = "indexed", help = "the second input's PBF variant" }
-params.cache = { required = true, help = "cold or warm: both inputs' page-cache state as the merge starts" }
-params.check = { default = "no", help = "yes: diff the output against the first input after the merge (a correctness run, for a second input that is a subset of the first)" }
+params.cache = { choices = ["cold", "warm"], required = true, help = "both inputs' page-cache state as the merge starts" }
+params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the output against the first input after the merge (a correctness run, for a second input that is a subset of the first)" }
 
 # -- compare
 
 [bench.vs-osmium]
 script_file = "../benches/compare/vs-osmium.lua"
 description = "One row of the guide's CLI command table, pbfhogg or osmium, inputs cold"
-version = 1
-date = 2026-11-08
+version = 2
+date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Eviction moved from the preflight into the timed block, before every iteration's child, so it holds whatever the hash cache does; the iteration wall includes it" },
   { date = 2026-11-08, note = "Script moved from inline to benches/compare/vs-osmium.lua, unchanged" },
   { version = 1, date = 2026-11-08, note = "Added: cold-cache preflight, osmium given --fsync and --keep-member-nodes" },
 ]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the PBF variant both tools read" }
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
-params.row = { required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
-params.tool = { default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
+params.row = { validated = true, required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
+params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
 
 # -- diff
 
 [bench.diff-text]
 script_file = "../benches/diff/diff-text.lua"
 description = "Text diff without -c, optionally -v, of two indexed snapshots of one dataset, inputs warm"
-version = 1
+version = 2
 date = 2026-11-09
 changelog = [
+  { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the diff child's wall is unchanged" },
   { version = 1, date = 2026-11-09, note = "Added: prints common lines, which the typed diff cells never do" },
 ]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
@@ -84,8 +88,8 @@ params.old = { from = "datasets.{dataset}.snapshot", default = "base", help = "t
 params.old_variant = { from = "datasets.{dataset}.snapshot.{old}.pbf", default = "indexed", help = "the old side's PBF variant" }
 params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "the new side's snapshot" }
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "indexed", help = "the new side's PBF variant" }
-params.verbose = { default = "no", help = "yes: pass diff's -v" }
-params.common = { default = "yes", help = "no: pass diff's -c, printing no common lines" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: pass diff's -v" }
+params.common = { choices = ["yes", "no"], default = "yes", help = "no: pass diff's -c, printing no common lines" }
 
 [bench.diff-unindexed]
 script_file = "../benches/diff/diff-unindexed.lua"
@@ -93,6 +97,7 @@ description = "Text diff -c of two unindexed snapshots of one dataset, inputs co
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-09, note = "--type checked by its choices and the same-file check moved to validate(), before anything is built; runs unchanged" },
   { version = 1, date = 2026-11-09, note = "Added: reaches the unindexed element stream, which typed brokkr diff cannot" },
 ]
 params.dataset = { from = "datasets", default = "germany", help = "the dataset" }
@@ -100,7 +105,7 @@ params.old = { from = "datasets.{dataset}.snapshot", default = "base", help = "t
 params.old_variant = { from = "datasets.{dataset}.snapshot.{old}.pbf", default = "raw", help = "the old side's PBF variant" }
 params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "the new side's snapshot" }
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
-params.type = { default = "all", help = "all, or node, way or relation: diff's --type" }
+params.type = { choices = ["all", "node", "way", "relation"], default = "all", help = "diff's --type, all for none" }
 
 # -- sort
 
@@ -110,8 +115,9 @@ description = "sort of a dataset's file into scratch, input evicted from the pag
 version = 1
 date = 2026-11-08
 changelog = [
+  { date = 2026-11-09, note = "--force checked by its choices before anything is built, its preflight gone; runs unchanged" },
   { version = 1, date = 2026-11-08, note = "Added: reaches unindexed inputs through sort's own --force" },
 ]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "raw", help = "the PBF variant sorted" }
-params.force = { default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }
+params.force = { choices = ["yes", "no"], default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }

@@ -9,10 +9,11 @@
 -- element a common line; the one-sided oversized frames are clipped at the
 -- other side's cuts, so units stay within their channel), and germany base
 -- against 20260420 with -c -v (real verbose details). Both inputs are read whole into
--- the page cache before the timed block and checked resident with fincore
--- there, so the cell times formatting and scheduling, not the drive. Take
--- one iteration per invocation, alternate the builds under comparison, and
--- compare the diff child's own wall (`brokkr results UUID`):
+-- the page cache in the timed block, before the diff, and checked resident
+-- with fincore there, so the diff times formatting and scheduling, not the
+-- drive; the iteration wall includes that read. Take one iteration per
+-- invocation, alternate the builds under comparison, and compare the diff
+-- child's own wall (`brokkr results UUID`):
 --
 --   brokkr bench --iterations 1 diff-text --new 320k
 --   brokkr bench --iterations 1 diff-text --dataset germany --new 20260420 --verbose yes --common no
@@ -31,24 +32,20 @@ local function resident(path)
     return res
 end
 
-function preflight(params)
+-- --verbose and --common are checked by their choices in
+-- brokkr.d/benches.toml.
+function validate(params)
     if params.old_variant.file == params.new_variant.file then
         fail("--old and --new name the same file")
-    end
-    if params.verbose ~= "yes" and params.verbose ~= "no" then
-        fail("--verbose takes yes or no, not " .. params.verbose)
-    end
-    if params.common ~= "yes" and params.common ~= "no" then
-        fail("--common takes yes or no, not " .. params.common)
-    end
-    for _, f in ipairs({ params.old_variant.file, params.new_variant.file }) do
-        binary_with({ program = "dd" }, "if=" .. f, "of=/dev/null", "bs=4M", "status=none"):ok()
     end
 end
 
 function bench(params)
     local old = params.old_variant.file
     local new = params.new_variant.file
+    for _, f in ipairs({ old, new }) do
+        binary_with({ program = "dd" }, "if=" .. f.path, "of=/dev/null", "bs=4M", "status=none"):ok()
+    end
     for _, f in ipairs({ old, new }) do
         local res = resident(f.path)
         if res < filesize(f) then

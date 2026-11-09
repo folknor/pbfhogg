@@ -9,10 +9,9 @@
 -- uses ancestry rather than the typed runner's binary capability probe;
 -- a backport of the exit split outside that ancestry can differ.
 -- A marker stop records a partial run, without claiming a full verdict.
--- stop_at cannot accompany a hotpath call (man bench, binary_with()), so
--- use --hotpath only without --stop. Typed --alloc and CLI --features
--- have no script-bench counterparts (man bench, The command line / The
--- build). Direct-I/O support is built for both read modes.
+-- The marked child supports --hotpath and --alloc, including marker stops.
+-- Build features belong in the registry. Direct-I/O support is built for
+-- both read modes.
 --
 --   brokkr bench --dry-run ref-integrity --check-relations yes,no
 --   brokkr bench --hotpath ref-integrity --direct-io yes
@@ -42,7 +41,7 @@ end
 
 function bench(params)
     local options = { hotpath = "check-refs" }
-    if params.stop then options = { stop_at = stop_marker(params.stop) } end
+    if params.stop then options.stop_at = stop_marker(params.stop) end
     local r = binary_with(options, "check", "--refs", params.variant.file, {
         ["check-relations"] = params["check-relations"] == "yes",
         ["direct-io"] = params["direct-io"] == "yes",

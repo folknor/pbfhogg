@@ -14,10 +14,9 @@
 -- ancestry can therefore differ. Probing inside bench() would add extra
 -- pbfhogg children to every measured iteration, changing the workload.
 -- The child wall is the matching measurement; the iteration wall also
--- includes Lua bookkeeping. The marked child supports bench --hotpath.
--- Script benches have no typed --alloc mode or arbitrary --features
--- override; build features belong in the registry. Direct-I/O support is
--- built for both arms so only the read mode changes between them.
+-- includes Lua bookkeeping. The marked child supports bench --hotpath
+-- and --alloc. Build features belong in the registry. Direct-I/O support
+-- is built for both arms so only the read mode changes between them.
 --
 --   brokkr bench --iterations 1 id-order --dataset denmark --full yes
 --   brokkr bench --dry-run id-order --full yes,no --direct-io yes,no

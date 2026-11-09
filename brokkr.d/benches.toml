@@ -62,11 +62,13 @@ description = "Check ID ordering, optionally detecting duplicate IDs, on a datas
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-ids: streaming/full checks, direct I/O, snapshots and declared verdicts" },
 ]
 profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -81,17 +83,19 @@ description = "Check way-node references, optionally relation members, on a data
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-refs: relation checks, direct I/O, snapshots, marker stops and declared verdicts" },
 ]
 profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
 params.check-relations = { choices = ["yes", "no"], default = "no", help = "yes: also check relation member references" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
-params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; use timing mode, not --hotpath" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO" }
 
 # -- compare
 
@@ -145,6 +149,31 @@ params.old_variant = { from = "datasets.{dataset}.snapshot.{old}.pbf", default =
 params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "the new side's snapshot" }
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
 params.type = { choices = ["all", "node", "way", "relation"], default = "all", help = "diff's --type, all for none" }
+
+# -- inspect
+
+[bench.file-info]
+script_file = "../benches/inspect/file-info.lua"
+description = "Inspect metadata, extended metadata, node statistics or tag counts on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed inspect: all four modes, expressions, worker counts, snapshots, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.mode = { choices = ["metadata", "extended", "nodes", "tags"], default = "metadata", help = "typed inspect's default, --extended, --nodes or --tags mode" }
+params.type = { choices = ["node", "way", "relation"], help = "restrict tag counts to one object type" }
+params.expr = { validated = true, many = true, help = "tag expressions in order; use expr-hex for commas or duplicates" }
+params.expr-hex = { validated = true, help = "hex-encoded ASCII JSON string array; JSON unicode escapes support non-ASCII; preserves commas and duplicates" }
+params.jobs = { validated = true, help = "worker threads for nodes or tags; 0 is auto, omitted uses pbfhogg's default" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
 
 # -- sort
 

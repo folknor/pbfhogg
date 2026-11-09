@@ -2732,9 +2732,8 @@ alternate arms; when the arms write different scratch volumes, alternation
 alone does not balance it. Read pass A against the rest of the command
 before attributing a wall delta to code. Pass A's scratch volume was more
 than it needed to be: the packed id-shard record below cuts it by a third.
-Which of trim debt, drive write cache, controller GC or inherited writeback
-is the mechanism is still not separated (no trim between cells, no
-Dirty/Writeback or device record per cell).
+The trim-between-cells chain further below ("pass A after a trim or after
+another cell") narrows the mechanism.
 
 ### Packed id-shard records (bygg, 2026-11-09)
 
@@ -2770,6 +2769,51 @@ and decodes one shard at a time). Peak anon 11.67 against 11.35 GB in the
 last pair (stage 4's peak, not shards). The wall figure carries the
 worktree-build confound; pass A, bound by scratch writes, is the clean
 part of the result.
+
+### altw external pass A after a trim or after another cell (bygg, 2026-11-09, at `098c89cb`)
+
+`brokkr add-locations-to-ways --dataset planet --index-type external
+--bench 1`, six stored cells in one chain, each preceded by the previous
+cell, no `sync`. "Trim" is `sudo fstrim -av` between the previous cell
+and launch; "no trim" launches a few seconds after the previous cell
+ends. Drive: WD_BLACK SN850X 4 TB, ext4 without `discard`, 55 % used.
+`/proc/meminfo` read at the boundaries showed about 12 MB Dirty and zero
+Writeback. Seconds (shard write is `s1a_id_shard_write_ms`, summed over
+threads):
+
+| Cell | Before it | Trimmed | Pass A | Shard write | Stage 2 | Wall | UUID |
+|---|---|---:|---:|---:|---:|---:|---|
+| 1 | trim | 13.6 GiB | 22.6 | 163 | 129.9 | 276.4 | `6bf4f504` |
+| 2 | no trim | - | 41.5 | 474 | 160.4 | 327.4 | `a2261b63` |
+| 3 | trim, a few s | 600 GiB | 23.2 | 246 | 139.7 | 284.3 | `3b0b7eac` |
+| 4 | no trim | - | 36.1 | 419 | 143.3 | 313.7 | `8bfccb49` |
+| 5 | no trim | - | 41.2 | 641 | 150.9 | 315.9 | `32bd503e` |
+| 6 | trim, over 120 s | 828 GiB | 29.3 | 349 | 145.0 | 290.4 | `6b7b97c5` |
+
+Every trimmed cell's pass A is faster than every untrimmed one's, and
+cell 5 shows the slow state persists through an untrimmed predecessor.
+Cell 3 is the strongest contrast: a trim of a few seconds took pass A
+from 41.5 to 23.2 s, where a few seconds without a trim left it at 36-41
+s. Stage 2 moves the same way but less, so not the whole wall delta is
+pass A. What this does and does not establish:
+
+- A large inherited kernel dirty-page backlog at launch is ruled out by
+  the boundary readings. Dirty throttling during pass A and outstanding
+  device-side work are not.
+- The no-trim arms were not given a gap matched to the trim's duration,
+  and no idle-only rest cell was run, so trim is not isolated from
+  elapsed time; cell 6 combines a trim with a gap over two minutes and
+  apportions nothing between them. The finding is a short-gap
+  trim-associated recovery, from one ordered chain.
+- Host counters cannot see inside the drive, so trim debt and
+  trim-enabled cache or GC recovery are not separated.
+
+No code change follows: the library cannot trim (FITRIM needs
+`CAP_SYS_ADMIN` and acts on the whole filesystem) and `discard` is host
+mount policy. Reducing scratch bytes does reduce the exposure (the
+packed records above); the per-worker x 256 shard stream topology is
+untested. Measurement consequence: trim before every altw external cell
+of a matched A/B on this host, not only before the suite.
 
 ### Packed varint count (bygg, 2026-10-31)
 

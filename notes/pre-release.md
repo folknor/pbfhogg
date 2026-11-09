@@ -205,7 +205,7 @@ matched, interleaved `--bench 1` cells with `--commit`; when a pair moves,
 bisect inside it. Prefer stored cells where they already answer the
 question.
 
-### WRK-112: cold passthrough-dominated cat --dedupe slower than the old engine
+### WRK-189: cold passthrough-dominated cat --dedupe slower than the old engine
 
 On denmark base merged with the `one-relation` snapshot (nearly every frame
 passes through as one coalesced copy), cold cells at `f49dd460` run about
@@ -223,15 +223,16 @@ phase), then design.
 
 ### WRK-111: altw external pass A exposure to sustained-write state
 
-Residue. Pass A's id shards are now packed 8-byte words (99.5 GB at
-planet, was 149.2 GB); in back-to-back cells the shard write rate fell
-from cell to cell whichever arm ran, and the packed arm's pass A was
-about a quarter shorter (reference/performance.md, "Packed id-shard
-records"). So the exposure scales with bytes. Left: which of trim debt,
-drive write cache, GC or inherited writeback is the mechanism. That needs
-a trim between consecutive cells (sudo was refused in every implementer
-session) plus per-cell Dirty/Writeback and device stats (brokkr#74). Stream topology (30 x 256 streams) is unchanged and
-untested.
+Residue. A short trim before a cell restores pass A (about 23 s against
+36-41 s without one) and launch-time Dirty/Writeback is negligible
+(reference/performance.md, "pass A after a trim or after another cell",
+`098c89cb`); exposure scales with scratch bytes ("Packed id-shard
+records"). Left: an idle-only rest cell and no-trim gaps matched to the
+trim's duration (the harness refused `sleep`, so neither ran), so trim
+is not isolated from elapsed time; in-pass dirty throttling and
+device-side state need per-cell device stats (brokkr#74). The per-worker
+x 256 stream topology is unchanged and untested; that is the one
+implementation lever left.
 
 ### Campaign reference: how to measure
 

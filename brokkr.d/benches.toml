@@ -77,6 +77,27 @@ params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default 
 params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type RoaringTreemap sets" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 
+# -- check-index
+
+[bench.index-integrity]
+script_file = "../benches/check-index/index-integrity.lua"
+description = "Check every blob's indexdata and tagdata against its payload on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed check-index: direct I/O, snapshots, declared verdicts and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- check-refs
 
 [bench.ref-integrity]

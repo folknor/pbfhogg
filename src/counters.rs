@@ -16,6 +16,20 @@
 //!   [`recv_recording_wait`] are the gated blocking operations behind a
 //!   `*_wait_ns` stall counter (see their section below).
 //! - [`StallGauge`] is the depth-gated `WAIT_*` marker span.
+//!
+//! # Names are a contract
+//!
+//! Stored brokkr results are compared by counter name across commits, so a
+//! refactor keeps every emitted counter's name, unit, recording point and
+//! aggregation, and the `WAIT_*` span names. That includes per-sample
+//! truncation where an existing `_ms` counter uses it (see [`Stopwatch`]); it
+//! does not ask new counters to truncate. A counter whose meaning has to
+//! change is retired and replaced under a new name rather than redefined, so
+//! a name-keyed comparison against old rows finds no counterpart instead of
+//! a false one; the retirement is recorded in `reference/performance.md`.
+//! `scripts/counter_names_diff.py <before> <after>` diffs two stored runs'
+//! counter and marker names; equal names do not prove equal units or
+//! recording, which the diff itself is read for.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError};

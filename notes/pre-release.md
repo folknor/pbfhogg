@@ -291,12 +291,6 @@ from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
 
-### WRK-104: Counter name sets survive the refactors
-
-Observability, not performance: compare `brokkr sidecar <uuid> --counters`
-name sets from an altw external Denmark run at HEAD and at `9dcf53a7^`, and
-an apply-changes and a renumber run for `13dd02aa`.
-
 ### Campaign reference: how to measure
 
 - Baselines first from `brokkr results`: a recent stored cell on the same
@@ -382,6 +376,9 @@ knows what it changed.
   production `fetch_max` sites; apply-changes' and renumber's sets
   (`13dd02aa`); the unordered pools' gated stall helpers (`003fe717`); read
   metrics emitted after the scope joins, plus the fsync funnel (`8384fa29`).
+  The `9dcf53a7` and `13dd02aa` name sets are checked (reference/
+  performance.md, "Counter names across the counter-machinery commits");
+  their wall cost is not.
 - Pools: the accumulate pool's stop flag (`95eea09b`); the unordered
   classify pools on one driver (`00ed5044`); the altw way reframes' shared
   block walk (`285df56d`).
@@ -448,7 +445,9 @@ What a session picking this up needs that is not written elsewhere:
   `Sort.Type_then_ID` claim; `check --index --ids` is the admission test.
 - **Observability is a contract.** Counter names, units and the `WAIT_*`
   spans survive refactors. `_ms` counters truncate per sample on purpose;
-  keep the unit and recording point when moving timing code.
+  keep the unit and recording point when moving timing code. The durable
+  statement is the `src/counters.rs` module doc; check a refactor with
+  `scripts/counter_names_diff.py`.
 - **`reference/performance-history.md` is a record of numbers, not of
   machinery.**
 - **Do not remove ignored `direct_io` parameters.** They are deliberate

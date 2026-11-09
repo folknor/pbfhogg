@@ -144,6 +144,23 @@ usually small.
   rather than a delta of the run's `writer_sync_all_*` totals; a CLI run
   never publishes concurrently, so the two definitions give the same values
   there.
+- **Counter names across the counter-machinery commits (bygg, 2026-11-09,
+  denmark, `--bench 1`, stored; `scripts/counter_names_diff.py`).**
+  add-locations-to-ways `--index-type external`, `9dcf53a7^` (`8aa10c65`,
+  cell `5dc8b38d`) against `a12fde41` (`91a4670b`): 193 names shared, only
+  the retired `writer_write_ns` gone, 22 added (`header_walk_*`,
+  `ordered_pool_*_wait_ns`, `s2_slot_fadvise_*`, `s2_slot_flush_lock_wait_ns`,
+  `s4_readiness_wait_ns`, the writer and `pipeline_read_buf_*` additions);
+  markers 30 shared, `CLI_COMMAND_START/END` added. Across `13dd02aa`:
+  apply-changes (`2d467fbc` / `4cc4b16e`) 89 counters and 12 markers,
+  apply-changes `-l` on `altw-keep-untagged` (`23477ae3` / `7a4ba6cf`) 94
+  and 16, renumber (`0f5d47bd` / `8dfc6d0a`) 81 and 12, all identical. The
+  verdict is bounded to these executions: names a path did not reach, and
+  units or recording points under unchanged names, are not covered.
+  Renumber's names changed earlier, in `fa69b667` (`_ms` timers to `_ns`,
+  `*_send_ms` and `r1_scan_ms` gone, `*_window_wait_ns` and `*_reframe_ns`
+  added): denmark cells before it (`6a8e9463`) do not compare with later
+  ones on those counters.
 
 ## Cat passthrough (indexdata generation)
 

@@ -14,21 +14,7 @@
 --   brokkr bench --dry-run file-info --mode metadata,extended,nodes,tags
 --   brokkr bench --alloc file-info --mode tags --type way --expr '*=*'
 
-local function expressions(params)
-    if not params["expr-hex"] then return params.expr or {} end
-    local value = params["expr-hex"]
-    if #value == 0 or #value % 2 ~= 0 or value:find("[^%x]") then
-        fail("--expr-hex must be hex-encoded JSON")
-    end
-    local decoded = value:gsub("%x%x", function(pair)
-        if tonumber(pair, 16) > 127 then
-            fail("--expr-hex must encode ASCII JSON; use JSON unicode escapes for non-ASCII")
-        end
-        return json.decode('"\\u00' .. pair .. '"')
-    end)
-    if not decoded:match("^%s*%[") then fail("--expr-hex must encode a JSON array") end
-    return json.decode(decoded)
-end
+local expression_params = require("expressions")
 
 local function stop_marker(value)
     local marker = value:gsub("^-", "")
@@ -53,7 +39,7 @@ function validate(params)
             fail("--jobs must be an unsigned 64-bit integer")
         end
     end
-    for _, expr in ipairs(expressions(params)) do
+    for _, expr in ipairs(expression_params.expressions(params)) do
         if type(expr) ~= "string" or expr:sub(1, 1) == "-" or expr:find("%z") then
             fail("expressions must be strings without NUL and must not start with '-'")
         end
@@ -68,7 +54,7 @@ function bench(params)
     if params.mode == "tags" then table.insert(args, "tags") end
     table.insert(args, params.variant.file)
     if params.mode == "tags" then
-        for _, expr in ipairs(expressions(params)) do table.insert(args, expr) end
+        for _, expr in ipairs(expression_params.expressions(params)) do table.insert(args, expr) end
         table.insert(args, { type = params.type, ["min-count"] = "999999999" })
     end
     table.insert(args, {

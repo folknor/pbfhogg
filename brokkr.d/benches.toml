@@ -13,13 +13,15 @@
 # lowercase words joined by '-', so `brokkr bench NAME` names one file. Tables here are grouped by family in
 # alphabetical order, one comment line naming each family. script_file
 # resolves against this file's directory, hence the leading "../". Lua
-# shared by several benches goes in a bench_lib directory
-# (`brokkr man bench-config bench_lib`), benches/lib, set here when the
-# first shared module lands; no bench script goes there. A bench's
-# description is one line saying what it measures; what the script does
+# shared by several benches goes in the bench_lib directory
+# (`brokkr man bench-config bench_lib`), benches/lib, set below; no bench
+# script goes there. A bench's description is one line saying what it
+# measures; what the script does
 # and why belongs in the script's header comment. version starts at 1
 # and goes up, with a changelog entry and a new date, whenever a change
 # makes its runs stop comparing with earlier ones.
+
+bench_lib = "../benches/lib"
 
 # -- cat
 
@@ -204,6 +206,7 @@ description = "Inspect metadata, extended metadata, node statistics or tag count
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-09, note = "Moved expression decoding into the shared bench library without changing the workload" },
   { version = 1, date = 2026-11-09, note = "Ported typed inspect: all four modes, expressions, worker counts, snapshots, direct I/O and profiling with marker stops" },
 ]
 profile = "release"
@@ -257,6 +260,36 @@ changelog = [
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "raw", help = "the PBF variant sorted" }
 params.force = { choices = ["yes", "no"], default = "no", help = "yes: pass sort's --force, needed for an input without indexdata" }
+
+# -- tags-filter
+
+[bench.tag-select]
+script_file = "../benches/tags-filter/tag-select.lua"
+description = "Filter PBF objects with optional references, or filter OSC changes, on a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed tags-filter: PBF and OSC inputs, expression encoding, reference modes, inversion, tag removal, jobs, compression, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.input-kind = { choices = ["pbf", "osc"], default = "pbf", help = "input file kind" }
+params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default = "indexed", help = "PBF variant (typed --variant), or OSC sequence (typed --osc-seq); give an explicit sequence for OSC" }
+params.filter = { validated = true, help = "one filter expression; omitted uses w/highway=primary; use expr-hex for commas" }
+params.expr-hex = { validated = true, help = "hex-encoded ASCII JSON array containing one filter string; JSON unicode escapes support non-ASCII" }
+params.omit-referenced = { choices = ["yes", "no"], default = "no", help = "yes: single-pass PBF filter, dropping referenced objects" }
+params.invert-match = { choices = ["yes", "no"], default = "no", help = "yes: keep non-matching PBF objects" }
+params.remove-tags = { choices = ["yes", "no"], default = "no", help = "yes: strip tags from referenced but unmatched PBF objects" }
+params.jobs = { validated = true, help = "worker threads for two-pass PBF or OSC; 0 is auto, omitted uses pbfhogg's default" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT on PBF input" }
+params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: tags-filter has no io_uring writer" }
+params.compression = { validated = true, help = "PBF only: none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
 # -- time-filter
 

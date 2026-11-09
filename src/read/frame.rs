@@ -96,6 +96,26 @@ impl<R: Read> FrameSource for R {
     /// the spare capacity is zero-filled is the reader's: one that implements
     /// only `read` gets std's default `read_buf`, which zero-fills.
     /// `Take` reports a short input as a short count.
+    ///
+    /// `FileReader` is such a reader, so on every `Frames<FileReader>` walk
+    /// each payload byte is zeroed, and because a zeroing reader keeps
+    /// std's `read_to_end` at its 8 KiB-and-doubling read sizes, a 1.8 MB
+    /// planet payload takes about seven `read` calls, the small ones copied
+    /// through the 256 KiB `BufReader`. Measured on plain `cat` of planet
+    /// against the zeroed `vec!` plus `read_exact` this replaced (bygg,
+    /// `2c12a955` vs `307982d7`): about 4.9 more read syscalls and 12 us
+    /// more user CPU per blob, 0.6 s in all, and no wall difference above
+    /// the drive's drift on that I/O-bound run. Not changed, for these
+    /// reasons: `FileReader::read_buf` cannot be written on stable Rust
+    /// (`Read::read_buf` is unstable); `resize` plus `read_exact` keeps the
+    /// zeroing. A zero-free route on stable exists (drain the `BufReader`,
+    /// then a bounded `read_to_end` on the `File` itself for a large
+    /// remainder, installed as a `FileReader`-only append the way
+    /// `BlobReader` installs its eviction callback), but no measured path
+    /// has shown the cost on its wall; a sequential walk over many small
+    /// blobs (getid's full-read scan) is the shape where it could.
+    /// `reference/performance.md`, "Plain cat across the one frame
+    /// decoder", has the cells.
     fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
         out.reserve(n);
         self.by_ref().take(n as u64).read_to_end(out)

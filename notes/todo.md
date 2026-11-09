@@ -1167,6 +1167,20 @@ Known to work, no performance question open, but not in the results DB:
 
 ## Performance
 
+- [ ] **Raw-frame walks over `FileReader` zero every payload
+  (2026-11-09).** `FrameSource::append`'s bounded `read_to_end` goes
+  through std's default `read_buf` (zeroing, 8 KiB-and-doubling reads,
+  small reads copied through the `BufReader`). On planet plain cat it is
+  about 4.9 extra read syscalls and 12 us user CPU per blob with no wall
+  cost (reference/performance.md, "Plain cat across the one frame
+  decoder"). Unmeasured where it could show: a sequential walk over many
+  small blobs on a warm cache, e.g. getid's full-read include scan on the
+  1.45 M-blob planet shape. A zero-free route on stable: a
+  `FileReader`-only append installed in `Frames` (as `BlobReader`
+  installs its eviction callback) that drains the `BufReader` and reads a
+  large remainder with a bounded `read_to_end` on the `File`, keeping
+  buffered reads for small remainders; O_DIRECT needs its own
+  buffer-to-Vec append. Measure that shape before building it.
 - [ ] **Sort pass 2 parallelism is bounded by overlap component count
   (2026-11-08).** One sweep per component: an input whose every kind is
   one connected component (the Denmark `chained` snapshot) sweeps in

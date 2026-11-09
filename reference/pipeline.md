@@ -194,9 +194,12 @@ Apply-changes uses its separate checked coordinate extractor in
 
 ### cat (passthrough)
 
-No `--type` filter: decompresses each blob to derive ID and tag metadata,
-then reframes the original compressed payload via `reframe_raw_with_index()`.
-The payload is not recompressed.
+No `--type` filter: one sequential frame walk (`Frames::next_raw`) on the
+calling thread. A data blob that already carries indexdata is copied raw,
+frame bytes as read, with no decompression. A blob without indexdata is
+decompressed to derive ID and tag metadata, then its original compressed
+payload is reframed via `reframe_raw_with_index()`, not recompressed; one
+no single index can describe is re-encoded into single-kind indexed blocks.
 
 ### cat --type
 

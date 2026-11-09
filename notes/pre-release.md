@@ -270,18 +270,6 @@ but costs the text diff's no-scratch contract; a cut by an estimate of
 detail bytes would not. Unmeasured; no input of that shape exists in the
 datasets.
 
-### WRK-094: Plain cat across the one frame decoder
-
-Plain `brokkr cat --dataset planet`, `307982d7^` vs `307982d7`. The raw-frame
-walks still zero-fill (`FileReader` implements only `read`, so std's default
-`read_buf` zero-initialises) and an unsized `Take::read_to_end` starts at
-8 KiB and doubles, about 4 read calls per 1.8 MB payload plus an extra copy
-through the BufReader; estimated 25 us per blob, probably hidden if
-I/O-bound. If it costs: implement `read_buf` on `FileReader` (which would
-also remove a memset of every payload on every `BlobReader` path) or go back
-to `resize` plus `read_exact`. The same cell covers cat's fd admission
-(`56f8d9a9`) and the reframe's `MAX_BLOB_DATASIZE` compare (`f9625b94`).
-
 ### WRK-095: cat --clean version across the single ordered pass
 
 `cat --clean version` on planet, `a05b3d25` vs `8da26b23` (one ordered pass

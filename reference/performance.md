@@ -5197,6 +5197,37 @@ slower than it under untrimmed back-to-back 92 GB writes, and the two pair
 deltas differ ninefold. Not re-measure-worthy without a trimmed suite and a
 reason in the code to expect a pass-2 difference.
 
+## Plain cat across the one frame decoder (bygg, 2026-11-09, `2c12a955` vs `307982d7`)
+
+`307982d7` moved the raw-frame walks from a zeroed `vec!` plus
+`read_exact` to a capacity-sized `Vec` filled by a bounded `read_to_end`.
+`FileReader` implements only `read`, so std's default `read_buf` still
+zeroes every payload byte, and a zeroing reader keeps `read_to_end` at
+8 KiB-and-doubling read sizes. Plain `brokkr cat --dataset planet --bench
+1`, `planet-20260223-reindexed`, both arms `--commit` worktrees, buffered,
+order A B B A, untrimmed:
+
+| Arm | Wall | utime | read syscalls | minflt | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `2c12a955` (`e304c6b0`) | 42.7 s | 2.32 s | 101,646 | 435k | 80 MB |
+| `307982d7` (`451494a3`) | 50.4 s | 2.95 s | 351,017 | 148k | 43 MB |
+| `307982d7` (`a124a95e`) | 78.5 s | 3.17 s | 351,017 | 181k | 52 MB |
+| `2c12a955` (`8b78f088`) | 84.6 s | 2.55 s | 101,646 | 583k | 79 MB |
+
+The walls climb with every back-to-back 92 GB write and the pair deltas
+change sign: no wall difference is detectable. The run is I/O bound
+(0.2-0.4 cores, stime flat at about 15 s); the new walk costs about 4.9
+more read syscalls and 12 us more user CPU per blob (0.6 s in all) on a
+reader thread that is not saturated. Both arms zero the payload, so the
+pair does not measure what removing the zeroing would gain.
+`FileReader::read_buf` is not writable on stable Rust, and `resize` plus
+`read_exact` keeps the zeroing; the code is unchanged, with the reasoning
+at `FrameSource::append` in `src/read/frame.rs`. The pair covers neither
+cat's descriptor admission (`56f8d9a9`, an ancestor of both arms, a
+per-run cost) nor the reframe's `MAX_BLOB_DATASIZE` compare (`f9625b94`,
+in neither arm, and plain cat on indexed input never reframes). Not to be
+re-measured without a change to the walk's read path.
+
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.

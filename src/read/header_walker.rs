@@ -14,7 +14,7 @@
 //!
 //! - Command paths that walk headers to build a per-blob plan and then
 //!   selectively read a subset of blob bodies (e.g. `getid` include mode,
-//!   `diff` parallel shard planner).
+//!   the `scan::classify` schedule builders).
 //! - Callers that want to pread each blob's body on a worker thread via
 //!   the shared `Arc<File>` rather than a single-threaded sequential
 //!   reader.
@@ -561,15 +561,10 @@ impl HeaderWalker {
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
-        let file = source.open()?;
+        // RANDOM (`InputSource::open_random_access` says why, and which
+        // pools that take this description over read under it).
+        let file = source.open_random_access(&host.invocation)?;
         let file_size = stat_size(&file, path)?;
-        // POSIX_FADV_RANDOM: suppresses readahead. Our pread pattern is
-        // header-at-a-time (tiny reads) with big gaps, plus occasional
-        // full-blob body preads that are also not in a sequential stream
-        // (workers may address disjoint shards). Sequential readahead
-        // would pull blob bodies adjacent to each header into the page
-        // cache and never be reused.
-        crate::fadvise::advise(&file, 0, 0, crate::fadvise::Hint::Random, &host.invocation);
         Ok(Self::over(Arc::new(file), file_size, path, host))
     }
 
@@ -581,9 +576,8 @@ impl HeaderWalker {
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.
     /// Used when the walker is handed off as a plan producer and the
-    /// actual body reads happen on rayon workers (e.g. the diff
-    /// parallel shard path, or the shared `scan::classify`
-    /// schedule builders). Single-threaded callers ignore this.
+    /// actual body reads happen on worker threads (e.g. altw sparse's
+    /// passthrough pool). Single-threaded callers ignore this.
     pub(crate) fn shared_file(&self) -> &Arc<std::fs::File> {
         &self.file
     }

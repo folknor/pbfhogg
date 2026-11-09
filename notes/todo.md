@@ -1315,22 +1315,6 @@ Known to work, no performance question open, but not in the results DB:
   rollout plan. No `probes` module or `tracing` usage exists in the
   tree today.
 
-- [ ] **Reclaim europe's lost prefetch win after scan-audit.** The
-  2026-04-20 scan-audit swap to `HeaderWalker` gave up ~14 s of
-  downstream decompression benefit at europe scale because the old
-  buffered header walk was accidentally warming blob-body pages via
-  the kernel's sequential readahead - pages the downstream phases
-  then reused. `posix_fadvise(POSIX_FADV_RANDOM)` deliberately skips
-  that. A deliberate `posix_fadvise(POSIX_FADV_WILLNEED)` over the
-  exact blob ranges that the scan result flagged for later pread
-  (`(data_offset, data_size)` for the schedule entries we're about
-  to hit) would reclaim the prefetch without re-introducing the old
-  walk's I/O waste. Only matters for mid-size workloads - planet is
-  larger than RAM so prefetched pages evict before reuse, and
-  germany is already fully cached. Measure on europe `check-refs` /
-  `tags-filter` / `extract --simple` where the phase-level win is
-  huge but the full-command wall is currently flat.
-
 ## Cross-pipeline optimization
 
 Cross-thread buffer retention is **solved** - `DecompressPool` (commit

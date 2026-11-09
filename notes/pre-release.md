@@ -242,8 +242,9 @@ attribution is superseded: the callers were reshaped since (`7e7ede73`,
 - `WILLNEED` on the consumer thread (one `posix_fadvise` per consumed
   item on the serial writer, further ahead than the old dispatcher; it can
   enter reclaim at planet scale) is unmeasured against any alternative
-  placement. Shares the footprint of WRK-098; the dispatcher-side
-  advice on extract simple's unordered pools measured neutral at HEAD
+  placement. The descriptor advice under it is settled
+  (reference/performance.md, "Scheduled-read advice: RANDOM against
+  plain"); the dispatcher-side advice on extract simple's unordered pools measured neutral at HEAD
   (reference/performance.md, "WILLNEED on simple's node and way classify").
 - Claim workers against a dispatcher: no cell isolates it.
 - altw external stage 4 under `--keep-untagged-nodes`, the case the eager
@@ -289,20 +290,6 @@ the stream topology (stage1.rs already names decoupling shard ownership
 from worker count) make pass A more exposed than it must be. Fewer streams
 might help locality without fewer bytes; compression might cut bytes for
 CPU. Neither is an established remedy.
-
-### WRK-098: Shared versus separate input descriptors
-
-About eight commands hand the `HeaderWalker`'s `FADV_RANDOM` descriptor to
-their pread workers (classify, tags-filter, extract smart and multi,
-getparents, geocode pass 1.5, altw sparse passthrough; diff's shard walk
-went with `587bfc12`),
-while altw external and apply-changes keep separate descriptors on an
-argument (`a3f1a1bc`) never measured. The split may track access pattern
-(selective readers with `FADV_RANDOM` plus `WILLNEED` against stage 4
-reading every blob), so measure both shapes: for example altw external
-stage 4 at europe scale with a variant handing the walker's descriptor to
-the workers. Renumber is not on the shared-walker side, and `InputFront` is
-a probe closed before any pass.
 
 ### WRK-099: apply-changes -l node boundary on the drain channel
 

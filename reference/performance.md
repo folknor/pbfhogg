@@ -5302,3 +5302,41 @@ the likely fix but was not bisected. Not to be re-measured without a code reason
 `--direct-io` only helps when page cache is a bottleneck (concurrent I/O on
 files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.
+
+## Scheduled-read advice: RANDOM against plain (bygg, 2026-11-09, at `3d980bee`)
+
+The header walker's description is advised `FADV_RANDOM`, and the pools a
+walk hands it to read under that advice; the other pools open plain
+descriptions. Neither choice had been measured. Variants were uncommitted
+(`--force`, not stored); `read_ahead_kb` is 128 on bygg's nvme. Europe
+`add-locations-to-ways --index-type external --bench 1`, consecutive cells:
+
+| Arm | Wall | Stage 1 pass A | Relation scan | Stage 2 | `s2_node_pread_ns` sum | Stage 4 | `s4_pread_ms` sum |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HEAD, all plain (`36c31139`) | 112.3 s | 12.14 s | 4.55 s | 47.90 s | 22.3 s | 44.90 s | 64.6 s |
+| stage 4 RANDOM (dirty `1f9fc4cb`) | 111.0 s | 12.16 s | 4.60 s | 46.93 s | 22.0 s | 44.63 s | 65.2 s |
+| stages 1, 2, 4 and the relation scan RANDOM (dirty `9c63619a`) | 118.3 s | 12.30 s | 4.69 s | 53.05 s | 68.1 s | 45.66 s | n/a |
+
+Stage 2 is the cost: each worker preads the contiguous run of node blobs
+for its id bucket in file order (464,702 preads, 21.3 GB, identical in all
+arms), a sequential stream that readahead pipelines and RANDOM turns into
+synchronous demand reads. Stage 4 dispatches blobs one at a time across 30
+workers, so no reader has a run and the advice does not matter there.
+
+The classify side, extract `--simple -b=-25,34,45,72` on europe with the
+three classify pools on a fresh RANDOM description against their usual
+fresh plain one (WILLNEED unchanged; both arms dirty, order V B V B):
+node classify 5.90 / 5.82 / 5.89 / 5.82 s, way classify 3.31 / 3.28 /
+3.29 / 3.28 s, walls 51.7 / 51.1 / 51.2 s and B's second cell not run.
+About 1 % against RANDOM, consistently, which is below noise.
+
+Ruling: advice follows how a pool's readers walk the file. Readers of
+contiguous runs keep a plain description (altw external stage 2,
+measured). Per-blob dispatched pools are indifferent (stage 4, extract
+simple's classify pools), so the walker handoff stays: it keeps the
+scheduled file's identity for a path source at no measured cost.
+Unmeasured: apply-changes' pool, renumber's pools, extract's
+`pread_execute` (its consumer reads passthrough frames in schedule order)
+and the relation scan in isolation; planet, where stage 4 is
+readiness-bound (eb94af17: readiness waits sum 1622 s against pread
+552 s). Not to be re-measured without a code reason.

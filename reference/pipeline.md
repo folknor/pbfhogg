@@ -656,8 +656,19 @@ A command that reads its input in several passes opens it once per pass or
 access pattern, and keeps those opens separate: `posix_fadvise` advice and
 readahead state belong to an open file description, so the header walker's
 `FADV_RANDOM` and a buffered pass's `FADV_SEQUENTIAL` stay on their own
-descriptions (a description shared today, such as the classify schedule's
-walker descriptor handed to its worker pool, stays shared). Opening the path
+descriptions. A pool handed the walker's description (the classify
+schedule builders, extract multi and smart pass 1, getparents, geocode
+pass 1.5, altw sparse passthrough) reads under `FADV_RANDOM`, and the
+handoff keeps the scheduled file's identity for a path source. Which advice
+a pool wants follows how its readers walk the file: altw external stage 2,
+whose workers each pread a contiguous run of node blobs, read three times
+slower under `FADV_RANDOM` than plain on europe, while stage 4, which
+dispatches blobs one at a time across the pool, and extract simple's
+classify pools (with their sliding `WILLNEED`) measured indifferent
+(`reference/performance.md`, "Scheduled-read advice: RANDOM against
+plain"). A reader of contiguous runs therefore keeps a plain description of
+its own; for the other plain pools (apply-changes, renumber, extract's
+`pread_execute`) advice sensitivity is unmeasured. Opening the path
 each time would resolve it each time, so a file renamed over the input
 mid-run would be read partly from each file.
 

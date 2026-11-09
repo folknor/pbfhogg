@@ -431,7 +431,11 @@ pub(super) fn stage4_assembly(
     }
     host.invocation.marker("EXTJOIN_S4_SCHEDULE_END");
 
-    // Open shared file for worker pread, a description of the pinned input.
+    // Open shared file for worker pread, a plain description of the pinned
+    // input. Its advice does not matter here: blobs are dispatched one at a
+    // time across the pool, and advising it RANDOM measured neutral on
+    // europe (bygg, 2026-11-09, at `3d980bee`: stage 4 44.9 s against
+    // 44.6 s, summed pread 64.6 s against 65.2 s).
     let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
     let input = input.path();
 

@@ -1076,6 +1076,10 @@ pub(crate) fn external_join_in(
     host.invocation.marker("EXTJOIN_STAGE2_START");
     let s2_faults_before = crate::debug::read_page_faults(&host.invocation);
     let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
+    // Plain, never RANDOM: each stage-2 worker preads its bucket's run of
+    // node blobs in file order, which kernel readahead pipelines; RANDOM
+    // tripled the summed pread time on europe (see
+    // `InputSource::open_random_access`).
     let input_pbf = crate::read::input::InputFile::open(input)?;
     let resolved_count = stage2_node_join(
         scratch,

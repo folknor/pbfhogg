@@ -14,9 +14,9 @@
 //! to an open file description, so the header walker's `FADV_RANDOM` and a
 //! buffered pass's `FADV_SEQUENTIAL` stay off the descriptions the other
 //! passes read through. Handing this reader's file down to them would merge
-//! that state. (Whether a merge would cost anything is unmeasured: the
-//! classify schedules hand the walker's own descriptor to their worker
-//! pools.) A command that pins its input opens this front, and every pass
+//! that state, and the wrong advice on a pool does cost: altw external's
+//! run-reading stage 2 reads three times slower under the walker's
+//! `RANDOM` (`InputSource::open_random_access`). A command that pins its input opens this front, and every pass
 //! after it, from the [`PinnedInput`](crate::read::input::PinnedInput), so
 //! the separate descriptions are all of one file.
 

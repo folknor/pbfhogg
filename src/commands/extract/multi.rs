@@ -188,8 +188,9 @@ pub(super) fn try_extract_multi_single_pass(
 
     // Build schedules by element type for parallel classification.
     // Walk via the pread-only HeaderWalker so blob bodies stay out of the
-    // page cache during the scan - the per-kind classification passes open
-    // fresh fds and pread only the blobs they need.
+    // page cache during the scan; every phase below then preads only the
+    // blobs it needs through the walker's own RANDOM description
+    // (`shared_file`), with the classify drivers' sliding WILLNEED.
     //
     // This second open is deliberate too: the probe above is the sole judge
     // of the leading header (it decides the decline contract, honouring

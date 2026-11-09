@@ -20,7 +20,11 @@
 //! and on purpose: `posix_fadvise` advice and readahead state belong to an
 //! open file description, so the header walker's `FADV_RANDOM`, a buffered
 //! pass's `FADV_SEQUENTIAL` and a worker pool's plain body preads each keep
-//! their own. Opening the path each time, though, resolves it each time, so
+//! their own. Which advice a pool wants follows how its readers walk the
+//! file, not which blobs it reads: a reader of contiguous runs needs plain
+//! readahead, a per-blob dispatched pool is indifferent, and a pool handed
+//! the walker's description reads under `RANDOM`
+//! ([`InputSource::open_random_access`] has the measurements). Opening the path each time, though, resolves it each time, so
 //! a file renamed over the input mid-run (an atomic replace by a downloader)
 //! would be read partly from each file, with no error. A [`PinnedInput`]
 //! closes that gap without merging any descriptions: it is taken once, at
@@ -137,6 +141,32 @@ impl<'a> InputSource<'a> {
             Self::Path(path) => open(path),
             Self::Pinned(pin) => pin.open(),
         }
+    }
+
+    /// A new buffered open file description of the input for positional
+    /// reads that skip, advised `posix_fadvise(RANDOM)` (attempted; a
+    /// refusal is counted, not fatal) and given no other prefetch. The
+    /// header walker opens here: it reads headers or windows with gaps, and
+    /// kernel readahead would pull in the bodies it skips. The pools a walk
+    /// hands its description to (`HeaderWalker::input`) read under this
+    /// advice too, which keeps the scheduled file's identity for a
+    /// [`Self::Path`] source; the generic `scan::classify` drivers add their
+    /// own sliding `WILLNEED`, and custom consumers of a handed-off
+    /// description may not.
+    ///
+    /// Not every scheduled read belongs here. A reader that walks a
+    /// contiguous run of blobs is a sequential stream to the kernel, and
+    /// this advice turns each of its reads into a synchronous demand read:
+    /// advising altw external stage 2's per-bucket node-blob runs `RANDOM`
+    /// tripled their summed pread time on europe (bygg, 2026-11-09, at
+    /// `3d980bee`: 22.3 s to 68.1 s, stage 2 47.9 s to 53.0 s), so those
+    /// pools keep a plain [`Self::open`]. Per-blob dispatched pools measured
+    /// indifferent (reference/performance.md, "Scheduled-read advice:
+    /// RANDOM against plain").
+    pub(crate) fn open_random_access(&self, invocation: &crate::host::Invocation) -> Result<File> {
+        let file = self.open()?;
+        crate::fadvise::advise(&file, 0, 0, crate::fadvise::Hint::Random, invocation);
+        Ok(file)
     }
 
     /// A new `O_DIRECT` open file description of the input and the

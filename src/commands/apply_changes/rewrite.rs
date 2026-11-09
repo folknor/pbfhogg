@@ -447,10 +447,12 @@ pub(crate) fn merge_to<'a>(
     // (`FADV_RANDOM`) and once for the whole worker pool (plain preads of
     // candidate bodies), besides this plain splice source. Separate open
     // file descriptions are kept here, so the walker's RANDOM advice and
-    // each reader's readahead state stay off the others' reads; whether
-    // sharing one would cost anything is unmeasured (the classify schedules
-    // hand their walker's descriptor to their worker pools). All of them
-    // derive from `base`, so they are descriptions of one file.
+    // each reader's readahead state stay off the others' reads. Whether the
+    // pool would read as fast under RANDOM is unmeasured here: altw
+    // external's per-blob dispatched stage 4 is indifferent to it, its
+    // run-reading stage 2 is three times slower under it
+    // (`InputSource::open_random_access`). All of them derive from `base`,
+    // so they are descriptions of one file.
     let splice = backend.supports_copy_range();
     // Test-only: exercise the owned route on any backend.
     #[cfg(feature = "test-hooks")]

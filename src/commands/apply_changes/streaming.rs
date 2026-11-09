@@ -302,8 +302,8 @@ pub(super) fn run_workers(
     // One plain description of the pinned base for the whole pool, kept
     // separate from the scanner walker's FADV_RANDOM one and the drain's
     // splice source (advice and readahead state are per description; see
-    // the copy-input comment in `rewrite::merge_to`, which also says what
-    // is unmeasured about it).
+    // the copy-input comment in `rewrite::merge_to`). Advice sensitivity is
+    // unmeasured for this pool.
     let shared_file = match crate::read::input::InputSource::from(&base).open() {
         Ok(file) => file,
         Err(e) => {

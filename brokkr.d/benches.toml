@@ -150,6 +150,30 @@ params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "th
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
 params.type = { choices = ["all", "node", "way", "relation"], default = "all", help = "diff's --type, all for none" }
 
+# -- getid
+
+[bench.id-select]
+script_file = "../benches/getid/id-select.lua"
+description = "Select IDs, their referenced objects or their complement from a dataset or snapshot"
+version = 1
+date = 2026-11-09
+changelog = [
+  { version = 1, date = 2026-11-09, note = "Ported typed getid: configured IDs, reference closure, inversion, snapshots, compression, direct I/O and profiling with marker stops" },
+]
+profile = "release"
+features = ["linux-direct-io"]
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset; uses its getid_ids or the typed runner's built-in Denmark IDs" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.add-referenced = { choices = ["yes", "no"], default = "no", help = "yes: include referenced objects recursively; conflicts with invert" }
+params.invert = { choices = ["yes", "no"], default = "no", help = "yes: select everything outside the ID set" }
+params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
+params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO; also works with profiling" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- inspect
 
 [bench.file-info]

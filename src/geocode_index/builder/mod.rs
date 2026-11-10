@@ -194,7 +194,7 @@ pub struct BuildStats {
 ///   the other intermediates (way geometry, admin polygons, interpolation
 ///   ways, admin cell entries) are held in RAM and grow with the input, so
 ///   peak memory scales with the extract. Planet builds have completed; their
-///   measured peak memory and host are recorded in `reference/performance.md`
+///   measured peak memory and host are recorded in `reference/performance/geocode.md`
 ///   ("build-geocode-index"). A host with less memory than that record shows
 ///   needs those intermediates moved to temp files.
 pub fn build_geocode_index(
@@ -525,7 +525,7 @@ fn build_generation(
 
     // `way_geom`, `admin_polygons`, `interp_ways`, and `admin_cell_entries`
     // remain input-sized in-memory intermediates. Their measured planet
-    // footprint is in reference/performance.md; externalizing them needs a
+    // footprint is in reference/performance/geocode.md; externalizing them needs a
     // coordinated streaming and external-merge design because later passes
     // consume each collection.
     host.invocation.marker("GEOCODE_PASS2_SCAN_START");
@@ -780,6 +780,12 @@ fn build_generation(
             coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
             coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
             executor: &host.executor,
+            stage_b_workers: crate::host::sized_workers(
+                &*host.resources,
+                crate::tunables::DECODE_WORKERS_RESERVED,
+                crate::tunables::DECODE_WORKERS_MIN,
+                crate::tunables::DECODE_WORKERS_FALLBACK,
+            ),
             cancel: &host.invocation,
         })?;
     host.invocation.marker("GEOCODE_PASS3_CELLS_END");

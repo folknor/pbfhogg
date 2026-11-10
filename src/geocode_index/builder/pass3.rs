@@ -191,23 +191,103 @@ fn bucket_write_error(
     ))
 }
 
-/// Append `record` to the bucket file its cell id selects, creating that
-/// file on first use.
-fn write_bucket_record(
-    writers: &mut [Option<BufWriter<ScratchFile>>],
-    bucket_dir: &ScratchSubdir,
-    record: BucketRecord,
+/// One contiguous run of a chunk's records, stably partitioned by bucket:
+/// bucket `b`'s records are `bytes[bounds[b] * SIZE..bounds[b + 1] * SIZE]`,
+/// in the order the run produced them.
+struct BucketSlices {
+    bytes: Vec<u8>,
+    bounds: Vec<usize>,
+}
+
+impl BucketSlices {
+    /// Counting sort by bucket. Stable: each record lands behind every
+    /// earlier record of its bucket, which Stage B depends on (see
+    /// [`append_chunk`]).
+    fn partition(records: impl Iterator<Item = BucketRecord> + Clone) -> Self {
+        let mut bounds = vec![0usize; GEOCODE_NUM_BUCKETS + 1];
+        for record in records.clone() {
+            bounds[bucket_for_cell(record.cell_id) + 1] += 1;
+        }
+        for b in 0..GEOCODE_NUM_BUCKETS {
+            bounds[b + 1] += bounds[b];
+        }
+        let mut bytes = vec![0u8; bounds[GEOCODE_NUM_BUCKETS] * BucketRecord::SIZE];
+        let mut cursor = bounds[..GEOCODE_NUM_BUCKETS].to_vec();
+        for record in records {
+            let slot = &mut cursor[bucket_for_cell(record.cell_id)];
+            let at = *slot * BucketRecord::SIZE;
+            bytes[at..at + BucketRecord::SIZE].copy_from_slice(&record.to_bytes());
+            *slot += 1;
+        }
+        Self { bytes, bounds }
+    }
+
+    fn bucket(&self, b: usize) -> &[u8] {
+        &self.bytes[self.bounds[b] * BucketRecord::SIZE..self.bounds[b + 1] * BucketRecord::SIZE]
+    }
+}
+
+/// Append one chunk's records to both bucket trees: each entry gives one fine
+/// record and at most one coarse record.
+///
+/// Byte identity of the index rests on the record order inside every bucket
+/// file: Stage B's `sort_unstable_by_key` decides the order of a cell's list
+/// entries from it. That order is the serial one, chunk by chunk, entry by
+/// entry, fine and coarse kept apart: the entries are cut into contiguous
+/// runs in order, each run is partitioned stably, and bucket `b` receives
+/// run 0's records for `b`, then run 1's, and so on. Distinct buckets are
+/// distinct files, so they are written in parallel. A bucket file is created
+/// only when a record selects it, as with one record at a time.
+fn append_chunk<E: Sync>(
+    entries: &[E],
+    fine: impl Fn(&E) -> BucketRecord + Sync,
+    coarse: impl Fn(&E) -> Option<BucketRecord> + Sync,
+    trees: [(&mut [Option<BufWriter<ScratchFile>>], &ScratchSubdir); 2],
+    executor: &crate::host::Executor,
 ) -> Result<()> {
-    let bucket = bucket_for_cell(record.cell_id);
-    let writer = match &mut writers[bucket] {
-        Some(writer) => writer,
-        slot => slot.insert(BufWriter::new(crate::scratch::create_file(&bucket_path(
-            bucket_dir, bucket,
-        )?)?)),
-    };
-    writer
-        .write_all(&record.to_bytes())
-        .map_err(|e| bucket_write_error(e, bucket_dir, bucket))
+    use rayon::prelude::*;
+
+    executor.install(|| {
+        // The run length only sizes the parallel work; any length gives the
+        // same bytes.
+        let run_len = entries
+            .len()
+            .div_ceil(rayon::current_num_threads().saturating_mul(4))
+            .max(1);
+        let runs: Vec<[BucketSlices; 2]> = entries
+            .par_chunks(run_len)
+            .map(|run| {
+                [
+                    BucketSlices::partition(run.iter().map(&fine)),
+                    BucketSlices::partition(run.iter().filter_map(&coarse)),
+                ]
+            })
+            .collect();
+        for (tree, (writers, bucket_dir)) in trees.into_iter().enumerate() {
+            writers
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(bucket, slot)| -> Result<()> {
+                    for run in &runs {
+                        let bytes = run[tree].bucket(bucket);
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let writer = match slot.take() {
+                            Some(writer) => slot.insert(writer),
+                            None => slot.insert(BufWriter::new(crate::scratch::create_file(
+                                &bucket_path(bucket_dir, bucket)?,
+                            )?)),
+                        };
+                        writer
+                            .write_all(bytes)
+                            .map_err(|e| bucket_write_error(e, bucket_dir, bucket))?;
+                    }
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    })
 }
 
 fn parse_bucket_file(data: &[u8]) -> Result<Vec<BucketRecord>> {
@@ -256,6 +336,10 @@ pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) coarse_addr_entries_file: &'a str,
     pub(super) coarse_interp_entries_file: &'a str,
     pub(super) executor: &'a crate::host::Executor,
+    /// Threads for Stage B's per-bucket workers, which run on their own
+    /// threads (`crate::ordered_pool`), not on `executor`. Capped at the
+    /// Stage B window, since no more buckets than that are ever admitted.
+    pub(super) stage_b_workers: usize,
     /// Checked once per Stage A chunk and per Stage B sort window: the
     /// chunk boundaries are where this pass already returns to one thread.
     pub(super) cancel: &'a crate::host::Recorder,
@@ -304,8 +388,10 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_addr_entries_file,
         coarse_interp_entries_file,
         executor,
+        stage_b_workers,
         cancel,
     } = p;
+    let stage_b_workers = *stage_b_workers;
     let invocation: &crate::host::Recorder = cancel;
     let (street_ways, street_nodes, addr_points, interp_nodes) =
         (*street_ways, *street_nodes, *addr_points, *interp_nodes);
@@ -419,18 +505,22 @@ pub(super) fn bucketed_cell_assignment_fused(
             )));
         }
 
-        for &(fine_cid, coarse_opt, wi, si) in &entries {
-            let record = |cell_id| BucketRecord {
-                cell_id,
-                entry_type: BUCKET_ENTRY_STREET,
-                index: wi,
-                segment: si,
-            };
-            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
-            if let Some(coarse_cid) = coarse_opt {
-                write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
-            }
-        }
+        let record = |cell_id, wi, si| BucketRecord {
+            cell_id,
+            entry_type: BUCKET_ENTRY_STREET,
+            index: wi,
+            segment: si,
+        };
+        append_chunk(
+            &entries,
+            |&(fine_cid, _, wi, si)| record(fine_cid, wi, si),
+            |&(_, coarse_opt, wi, si)| coarse_opt.map(|c| record(c, wi, si)),
+            [
+                (&mut fine_writers, &fine_bucket_dir),
+                (&mut coarse_writers, &coarse_bucket_dir),
+            ],
+            executor,
+        )?;
         chunk_start = chunk_end;
     }
     invocation.marker("GEOCODE_PASS3_STAGEA_STREETS_END");
@@ -476,16 +566,22 @@ pub(super) fn bucketed_cell_assignment_fused(
                 "geocode Stage A: address point {missing} is outside the file Pass 2 wrote"
             )));
         }
-        for &(fine_cid, coarse_cid, idx) in &addr_entries {
-            let record = |cell_id| BucketRecord {
-                cell_id,
-                entry_type: BUCKET_ENTRY_ADDR,
-                index: idx,
-                segment: 0,
-            };
-            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
-            write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
-        }
+        let record = |cell_id, idx| BucketRecord {
+            cell_id,
+            entry_type: BUCKET_ENTRY_ADDR,
+            index: idx,
+            segment: 0,
+        };
+        append_chunk(
+            &addr_entries,
+            |&(fine_cid, _, idx)| record(fine_cid, idx),
+            |&(_, coarse_cid, idx)| Some(record(coarse_cid, idx)),
+            [
+                (&mut fine_writers, &fine_bucket_dir),
+                (&mut coarse_writers, &coarse_bucket_dir),
+            ],
+            executor,
+        )?;
         chunk_start = chunk_end;
     }
     invocation.marker("GEOCODE_PASS3_STAGEA_ADDR_END");
@@ -532,18 +628,22 @@ pub(super) fn bucketed_cell_assignment_fused(
                 "geocode Stage A: interpolation way {missing} has a node outside the file Pass 2 wrote"
             )));
         }
-        for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
-            let record = |cell_id| BucketRecord {
-                cell_id,
-                entry_type: BUCKET_ENTRY_INTERP,
-                index: wi,
-                segment: si,
-            };
-            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
-            if let Some(coarse_cid) = coarse_opt {
-                write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
-            }
-        }
+        let record = |cell_id, wi, si| BucketRecord {
+            cell_id,
+            entry_type: BUCKET_ENTRY_INTERP,
+            index: wi,
+            segment: si,
+        };
+        append_chunk(
+            &interp_entries,
+            |&(fine_cid, _, wi, si)| record(fine_cid, wi, si),
+            |&(_, coarse_opt, wi, si)| coarse_opt.map(|c| record(c, wi, si)),
+            [
+                (&mut fine_writers, &fine_bucket_dir),
+                (&mut coarse_writers, &coarse_bucket_dir),
+            ],
+            executor,
+        )?;
         interp_chunk_start = interp_chunk_end;
     }
     invocation.marker("GEOCODE_PASS3_STAGEA_INTERP_END");
@@ -579,7 +679,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         fine_street_entries_file,
         fine_addr_entries_file,
         fine_interp_entries_file,
-        executor,
+        stage_b_workers,
         cancel,
     )?;
     scratch.remove_tree(&fine_bucket_dir);
@@ -594,7 +694,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_street_entries_file,
         coarse_addr_entries_file,
         coarse_interp_entries_file,
-        executor,
+        stage_b_workers,
         cancel,
     )?;
     scratch.remove_tree(&coarse_bucket_dir);
@@ -603,19 +703,204 @@ pub(super) fn bucketed_cell_assignment_fused(
     Ok((fine_count, coarse_count))
 }
 
-/// Stage B helper (plan item #3): parallel per-bucket read+parse+sort,
-/// serial group+write. Extracted so the fused fine+coarse driver
-/// (`bucketed_cell_assignment_fused`) can run it once per tree.
+/// Read one bucket file, free it, and sort its records by cell id. An absent
+/// file is a bucket no record selected.
 ///
-/// Runs byte-identically to the pre-parallel sequential Stage B because
-/// the serial group+write phase walks the bucket-ordered
-/// `sorted_buckets` Vec, so cell ids ascend across buckets; each cell is
-/// checked against the one before it before anything of it is written.
-#[allow(
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::too_many_arguments
-)]
+/// The sort is `sort_unstable_by_key` over the records in file order, and
+/// both are part of the index's bytes: the order of a cell's list entries
+/// is whatever this sort makes of the file order (see [`append_chunk`]).
+fn read_sorted_bucket(
+    scratch: &crate::scratch::RunScratch,
+    bucket_dir: &ScratchSubdir,
+    bucket_idx: usize,
+) -> Result<Vec<BucketRecord>> {
+    let bucket_path = bucket_path(bucket_dir, bucket_idx)?;
+    let mut file = match crate::scratch::open(&bucket_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(Error::from(e).context(format!(
+                "failed to open scratch bucket {}",
+                bucket_path.display()
+            )));
+        }
+    };
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut data).map_err(|e| {
+        Error::from(e).context(format!(
+            "failed to read scratch bucket {}",
+            bucket_path.display()
+        ))
+    })?;
+    drop(file);
+    // Freed as soon as it is read to give the space back; the tree itself is
+    // removed by the caller afterwards.
+    scratch.unlink(&bucket_path).map_err(|e| {
+        Error::from(e).context(format!(
+            "failed to remove scratch bucket {}",
+            bucket_path.display()
+        ))
+    })?;
+    let mut entries = parse_bucket_file(&data)?;
+    drop(data);
+    entries.sort_unstable_by_key(|e| e.cell_id);
+    Ok(entries)
+}
+
+/// One bucket's share of the four output files, with every list offset in
+/// `cells` relative to the start of this bucket's list bytes; the writer
+/// rebases them ([`rebase_cells`]).
+#[derive(Default)]
+struct EncodedBucket {
+    cells: Vec<u8>,
+    streets: Vec<u8>,
+    addrs: Vec<u8>,
+    interps: Vec<u8>,
+    cell_count: usize,
+    /// First and last cell id; `None` for an empty bucket.
+    span: Option<(u64, u64)>,
+}
+
+/// Append one list (count prefix, then items) to `out`, refusing a count
+/// over the on-disk `ListCount`.
+///
+/// INVARIANT: the on-disk list count is `ListCount` (u16), the framing
+/// `format::Table::list` reads. Hard-error if any cell's per-type entry count
+/// exceeds `u16::MAX`, rather than silently truncating. If this ever fires in
+/// practice, bump the on-disk count to u32 and increment `FORMAT_VERSION`. Do
+/// NOT restore a `.min(u16::MAX)` here - silent truncation made this a latent
+/// bug for a long time.
+fn encode_list<const N: usize>(
+    out: &mut Vec<u8>,
+    items: &[&BucketRecord],
+    kind: &str,
+    cell_id: u64,
+    item: impl Fn(&BucketRecord) -> [u8; N],
+) -> Result<u64> {
+    if items.is_empty() {
+        return Ok(NO_DATA_U64);
+    }
+    let offset = out.len() as u64;
+    let count = ListCount::try_from(items.len()).map_err(|_| {
+        Error::invalid_data(format!(
+            "geocode Stage B: cell {} ({cell_id}) has {} {kind} entries, exceeds u16::MAX. \
+             Bump on-disk count to u32 and increment FORMAT_VERSION.",
+            CellID(cell_id),
+            items.len()
+        ))
+    })?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for e in items {
+        out.extend_from_slice(&item(e));
+    }
+    Ok(offset)
+}
+
+/// Group one sorted bucket by cell and encode its cell records and lists.
+fn encode_bucket(entries: &[BucketRecord]) -> Result<EncodedBucket> {
+    let mut out = EncodedBucket::default();
+    let mut streets: Vec<&BucketRecord> = Vec::new();
+    let mut addrs: Vec<&BucketRecord> = Vec::new();
+    let mut interps: Vec<&BucketRecord> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let cell_id = entries[i].cell_id;
+        let group_start = i;
+        while i < entries.len() && entries[i].cell_id == cell_id {
+            i += 1;
+        }
+        // The reader binary-searches the cell table, so a cell not above
+        // the one before it would be silently misread. The sort makes this
+        // hold inside a bucket; the writer checks it across buckets.
+        if let Some((_, last)) = out.span
+            && cell_id <= last
+        {
+            return Err(Error::internal(format!(
+                "geocode Stage B: cell {} ({cell_id}) is not above the previous cell {} ({last})",
+                CellID(cell_id),
+                CellID(last)
+            )));
+        }
+
+        streets.clear();
+        addrs.clear();
+        interps.clear();
+        for e in &entries[group_start..i] {
+            match e.entry_type {
+                BUCKET_ENTRY_STREET => streets.push(e),
+                BUCKET_ENTRY_ADDR => addrs.push(e),
+                BUCKET_ENTRY_INTERP => interps.push(e),
+                other => {
+                    return Err(Error::internal(format!(
+                        "geocode Stage B: unknown bucket entry type {other} in cell {cell_id}"
+                    )));
+                }
+            }
+        }
+        let segment = |e: &BucketRecord| {
+            SegmentRef {
+                way_index: e.index,
+                segment_index: e.segment,
+            }
+            .to_bytes()
+        };
+        let gc = GeoCell {
+            cell_id,
+            street_offset: encode_list(&mut out.streets, &streets, "street", cell_id, segment)?,
+            addr_offset: encode_list(&mut out.addrs, &addrs, "addr", cell_id, |e| {
+                AddrEntry {
+                    addr_index: e.index,
+                }
+                .to_bytes()
+            })?,
+            interp_offset: encode_list(&mut out.interps, &interps, "interp", cell_id, segment)?,
+        };
+        out.cells.extend_from_slice(&gc.to_bytes());
+        out.cell_count += 1;
+        out.span = Some((out.span.map_or(cell_id, |(first, _)| first), cell_id));
+    }
+    Ok(out)
+}
+
+/// Byte position of `GeoCell`'s three list offsets (street, addr, interp),
+/// each a little-endian u64. Pinned against the record's own encoding by
+/// `rebase_cells_matches_absolute_encoding`.
+const GEO_CELL_OFFSET_FIELDS: [usize; 3] = [8, 16, 24];
+
+/// Add `bases` (street, addr, interp) to every present list offset of the
+/// encoded cells; `NO_DATA_U64` stays as it is.
+fn rebase_cells(cells: &mut [u8], bases: [u64; 3]) {
+    if bases == [0; 3] {
+        return;
+    }
+    for cell in cells.as_chunks_mut::<{ GeoCell::SIZE }>().0 {
+        for (&at, base) in GEO_CELL_OFFSET_FIELDS.iter().zip(bases) {
+            let field = &mut cell[at..at + 8];
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(field);
+            let offset = u64::from_le_bytes(raw);
+            if offset != NO_DATA_U64 {
+                field.copy_from_slice(&(offset + base).to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Stage B for one bucket tree: per-bucket read, sort and encode on
+/// `workers` threads through `crate::ordered_pool`, with the calling thread
+/// writing each bucket's bytes in bucket order. Run once per tree by
+/// [`bucketed_cell_assignment_fused`].
+///
+/// At most `GEOCODE_STAGE_B_SORT_WINDOW` buckets are admitted and not yet
+/// written; a slow bucket (the cell-id top byte is badly skewed at planet)
+/// holds back only the writer, while the buckets behind it are sorted and
+/// encoded. Each admitted bucket holds its records (16 bytes each) while it
+/// encodes and its encoded bytes after, so the bound is in buckets, not
+/// bytes. Bytes are the serial ones: bucket order makes cell ids ascend
+/// across buckets (checked at each bucket boundary), and each bucket's
+/// lists are rebased onto the bytes written before it. A failure surfaces
+/// for the lowest failing bucket.
+#[allow(clippy::too_many_arguments)]
 // Filenames are output roles; the fine/coarse caller also owns the matching
 // bucket directory. Keep those assignments together at each call site.
 fn run_stage_b(
@@ -626,218 +911,70 @@ fn run_stage_b(
     street_entries_file: &str,
     addr_entries_file: &str,
     interp_entries_file: &str,
-    executor: &crate::host::Executor,
+    workers: usize,
     cancel: &crate::host::Recorder,
 ) -> Result<u32> {
-    use rayon::prelude::*;
-
     let mut cells_out = super::create_data_file(&output_dir.join(cells_file))?;
     let mut street_out = super::create_data_file(&output_dir.join(street_entries_file))?;
     let mut addr_out = super::create_data_file(&output_dir.join(addr_entries_file))?;
     let mut interp_out = super::create_data_file(&output_dir.join(interp_entries_file))?;
 
-    let mut street_byte_offset: u64 = 0;
-    let mut addr_byte_offset: u64 = 0;
-    let mut interp_byte_offset: u64 = 0;
+    // Offsets of the next list in each entries file.
+    let mut bases = [0u64; 3];
     let mut total_cells: u32 = 0;
-    let mut prev_cell_id: u64 = 0;
+    let mut prev_cell_id: Option<u64> = None;
 
-    // Bound the parse/sort lookahead. Keeping every sorted bucket alive here
-    // defeats the external bucketing and costs more RAM than the 15-byte
-    // scratch records because a decoded BucketRecord is 16 bytes.
-    for window_start in (0..GEOCODE_NUM_BUCKETS).step_by(GEOCODE_STAGE_B_SORT_WINDOW) {
-        cancel.check()?;
-        let window_end = (window_start + GEOCODE_STAGE_B_SORT_WINDOW).min(GEOCODE_NUM_BUCKETS);
-        let sorted_buckets: Vec<Vec<BucketRecord>> = executor.install(|| {
-            (window_start..window_end)
-                .into_par_iter()
-                .map(|bucket_idx| -> Result<Vec<BucketRecord>> {
-                    let bucket_path = bucket_path(bucket_dir, bucket_idx)?;
-                    // A bucket no record selected was never created.
-                    let mut file = match crate::scratch::open(&bucket_path) {
-                        Ok(file) => file,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            return Ok(Vec::new());
-                        }
-                        Err(e) => {
-                            return Err(Error::from(e).context(format!(
-                                "failed to open scratch bucket {}",
-                                bucket_path.display()
-                            )));
-                        }
-                    };
-                    let mut data = Vec::new();
-                    std::io::Read::read_to_end(&mut file, &mut data).map_err(|e| {
-                        Error::from(e).context(format!(
-                            "failed to read scratch bucket {}",
-                            bucket_path.display()
-                        ))
-                    })?;
-                    drop(file);
-                    // Freed as soon as it is read to give the space back; the
-                    // tree itself is removed by the caller afterwards.
-                    scratch.unlink(&bucket_path).map_err(|e| {
-                        Error::from(e).context(format!(
-                            "failed to remove scratch bucket {}",
-                            bucket_path.display()
-                        ))
-                    })?;
-                    if data.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    let mut entries = parse_bucket_file(&data)?;
-                    drop(data);
-                    entries.sort_unstable_by_key(|e| e.cell_id);
-                    Ok(entries)
-                })
-                .collect::<Result<_>>()
-        })?;
-
-        for entries in &sorted_buckets {
-            if entries.is_empty() {
-                continue;
-            }
-
-            let mut i = 0;
-            let mut streets: Vec<&BucketRecord> = Vec::new();
-            let mut addrs: Vec<&BucketRecord> = Vec::new();
-            let mut interps: Vec<&BucketRecord> = Vec::new();
-            while i < entries.len() {
-                let cell_id = entries[i].cell_id;
-                let group_start = i;
-                while i < entries.len() && entries[i].cell_id == cell_id {
-                    i += 1;
-                }
-                let group = &entries[group_start..i];
-                let cell_token = CellID(cell_id);
-                // The reader binary-searches the cell table, so a cell not
-                // above the one before it would be silently misread. Bucket
-                // choice by the id's top byte plus the per-bucket sort make
-                // this hold; checked before any of the cell's lists is written.
-                if total_cells != 0 && cell_id <= prev_cell_id {
+    let window = std::num::NonZeroUsize::new(GEOCODE_STAGE_B_SORT_WINDOW)
+        .unwrap_or(std::num::NonZeroUsize::MIN);
+    let mut shards = vec![(); workers.clamp(1, window.get())];
+    crate::ordered_pool::run_ordered(
+        GEOCODE_NUM_BUCKETS,
+        &mut shards,
+        crate::ordered_pool::PoolConfig {
+            window,
+            cancel,
+            waits: crate::ordered_pool::Waits::default(),
+        },
+        |_| (),
+        |(), (), bucket_idx| {
+            let entries = read_sorted_bucket(scratch, bucket_dir, bucket_idx)?;
+            encode_bucket(&entries)
+        },
+        &mut crate::ordered_pool::ConsumeFn(
+            |_bucket: usize, mut out: EncodedBucket| -> Result<()> {
+                let Some((first, last)) = out.span else {
+                    return Ok(());
+                };
+                if let Some(prev) = prev_cell_id
+                    && first <= prev
+                {
                     return Err(Error::internal(format!(
-                        "geocode Stage B: cell {cell_token} ({cell_id}) is not above the \
-                         previous cell {} ({prev_cell_id})",
-                        CellID(prev_cell_id)
+                        "geocode Stage B: cell {} ({first}) is not above the previous cell {} ({prev})",
+                        CellID(first),
+                        CellID(prev)
                     )));
                 }
-
-                streets.clear();
-                addrs.clear();
-                interps.clear();
-                for e in group {
-                    match e.entry_type {
-                        BUCKET_ENTRY_STREET => streets.push(e),
-                        BUCKET_ENTRY_ADDR => addrs.push(e),
-                        BUCKET_ENTRY_INTERP => interps.push(e),
-                        other => {
-                            return Err(Error::internal(format!(
-                                "geocode Stage B: unknown bucket entry type {other} in cell {cell_id}"
-                            )));
-                        }
-                    }
-                }
-
-                // Write street entries.
-                // INVARIANT: the on-disk list count is `ListCount` (u16), the
-                // framing `format::Table::list` reads. Hard-error if any cell's
-                // per-type entry count exceeds `u16::MAX`, rather than silently truncating.
-                // If this ever fires in practice, bump the on-disk count to u32 and
-                // increment `FORMAT_VERSION`. Do NOT restore a `.min(u16::MAX)` here -
-                // silent truncation made this a latent bug for a long time.
-                let street_count = if streets.is_empty() {
-                    None
-                } else {
-                    let count = ListCount::try_from(streets.len()).map_err(|_| {
-                    Error::invalid_data(format!(
-                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} street entries, exceeds u16::MAX. \
-                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                        streets.len()
-                    ))
-                })?;
-                    street_out.write_all(&count.to_le_bytes())?;
-                    for e in &streets {
-                        street_out.write_all(
-                            &SegmentRef {
-                                way_index: e.index,
-                                segment_index: e.segment,
-                            }
-                            .to_bytes(),
-                        )?;
-                    }
-                    Some(count)
-                };
-
-                let addr_count = if addrs.is_empty() {
-                    None
-                } else {
-                    let count = ListCount::try_from(addrs.len()).map_err(|_| {
-                    Error::invalid_data(format!(
-                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} addr entries, exceeds u16::MAX. \
-                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                        addrs.len()
-                    ))
-                })?;
-                    addr_out.write_all(&count.to_le_bytes())?;
-                    for e in &addrs {
-                        addr_out.write_all(
-                            &AddrEntry {
-                                addr_index: e.index,
-                            }
-                            .to_bytes(),
-                        )?;
-                    }
-                    Some(count)
-                };
-
-                let interp_count = if interps.is_empty() {
-                    None
-                } else {
-                    let count = ListCount::try_from(interps.len()).map_err(|_| {
-                    Error::invalid_data(format!(
-                        "geocode Stage B: cell {cell_token} ({cell_id}) has {} interp entries, exceeds u16::MAX. \
-                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
-                        interps.len()
-                    ))
-                })?;
-                    interp_out.write_all(&count.to_le_bytes())?;
-                    for e in &interps {
-                        interp_out.write_all(
-                            &SegmentRef {
-                                way_index: e.index,
-                                segment_index: e.segment,
-                            }
-                            .to_bytes(),
-                        )?;
-                    }
-                    Some(count)
-                };
-
-                let gc = GeoCell {
-                    cell_id,
-                    street_offset: street_count.map_or(NO_DATA_U64, |_| street_byte_offset),
-                    addr_offset: addr_count.map_or(NO_DATA_U64, |_| addr_byte_offset),
-                    interp_offset: interp_count.map_or(NO_DATA_U64, |_| interp_byte_offset),
-                };
-                cells_out.write_all(&gc.to_bytes())?;
-                prev_cell_id = cell_id;
-                total_cells = total_cells.checked_add(1).ok_or_else(|| {
-                    Error::invalid_data("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")
-                })?;
-
-                if let Some(count) = street_count {
-                    street_byte_offset += list_byte_len::<SegmentRef>(count);
-                }
-                if let Some(count) = addr_count {
-                    addr_byte_offset += list_byte_len::<AddrEntry>(count);
-                }
-                if let Some(count) = interp_count {
-                    interp_byte_offset += list_byte_len::<SegmentRef>(count);
-                }
-            }
-        }
-        // `sorted_buckets` drops here before the next lookahead window.
-    }
+                rebase_cells(&mut out.cells, bases);
+                cells_out.write_all(&out.cells)?;
+                street_out.write_all(&out.streets)?;
+                addr_out.write_all(&out.addrs)?;
+                interp_out.write_all(&out.interps)?;
+                bases[0] += out.streets.len() as u64;
+                bases[1] += out.addrs.len() as u64;
+                bases[2] += out.interps.len() as u64;
+                total_cells = u32::try_from(out.cell_count)
+                    .ok()
+                    .and_then(|n| total_cells.checked_add(n))
+                    .ok_or_else(|| {
+                        Error::invalid_data(
+                            "geocode cell count exceeds u32::MAX; bump FORMAT_VERSION",
+                        )
+                    })?;
+                prev_cell_id = Some(last);
+                Ok(())
+            },
+        ),
+    )?;
 
     cells_out.flush()?;
     street_out.flush()?;
@@ -1017,6 +1154,106 @@ mod tests {
         assert!(window > 0);
         assert!(window <= 8);
         assert!(window < GEOCODE_NUM_BUCKETS);
+    }
+
+    /// Records with many equal cell ids across a few buckets and all three
+    /// entry types, in a fixed pseudo-random order.
+    fn mixed_records(n: u32) -> Vec<BucketRecord> {
+        let mut state = 0x9e37_79b9_u32;
+        (0..n)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let bucket = u64::from(state >> 29) * 37; // 8 buckets, spread out
+                let cell = u64::from((state >> 8) & 0x1f); // 32 cells per bucket
+                BucketRecord {
+                    cell_id: (bucket << 56) | (cell << 20) | 1,
+                    entry_type: [BUCKET_ENTRY_STREET, BUCKET_ENTRY_ADDR, BUCKET_ENTRY_INTERP]
+                        [(state % 3) as usize],
+                    index: i,
+                    segment: (state & 0xff) as u16,
+                }
+            })
+            .collect()
+    }
+
+    /// Concatenating each run's bucket slice, run by run, gives exactly the
+    /// records the serial writer would append to that bucket, in its order,
+    /// whatever the run length.
+    #[test]
+    fn partitioned_runs_keep_the_serial_bucket_order() {
+        let records = mixed_records(5_000);
+        for run_len in [1, 7, 333, 5_000] {
+            let runs: Vec<BucketSlices> = records
+                .chunks(run_len)
+                .map(|run| BucketSlices::partition(run.iter().copied()))
+                .collect();
+            for bucket in 0..GEOCODE_NUM_BUCKETS {
+                let serial: Vec<u8> = records
+                    .iter()
+                    .filter(|r| bucket_for_cell(r.cell_id) == bucket)
+                    .flat_map(|r| r.to_bytes())
+                    .collect();
+                let parted: Vec<u8> = runs
+                    .iter()
+                    .flat_map(|r| r.bucket(bucket).to_vec())
+                    .collect();
+                assert_eq!(parted, serial, "bucket {bucket}, run length {run_len}");
+            }
+        }
+    }
+
+    /// Encoding bucket by bucket and rebasing each onto the bytes before it
+    /// gives the bytes of one encode over all buckets in order, which is the
+    /// serial Stage B's output.
+    #[test]
+    fn rebased_bucket_encodings_equal_one_absolute_encoding() {
+        let mut records = mixed_records(5_000);
+        let mut sorted_buckets: Vec<Vec<BucketRecord>> = Vec::new();
+        for bucket in 0..GEOCODE_NUM_BUCKETS {
+            let mut entries: Vec<BucketRecord> = records
+                .iter()
+                .copied()
+                .filter(|r| bucket_for_cell(r.cell_id) == bucket)
+                .collect();
+            entries.sort_unstable_by_key(|e| e.cell_id);
+            sorted_buckets.push(entries);
+        }
+        records = sorted_buckets.concat();
+        let whole = encode_bucket(&records).expect("whole encode");
+
+        let mut joined = EncodedBucket::default();
+        let mut bases = [0u64; 3];
+        for entries in &sorted_buckets {
+            let mut part = encode_bucket(entries).expect("bucket encode");
+            rebase_cells(&mut part.cells, bases);
+            bases[0] += part.streets.len() as u64;
+            bases[1] += part.addrs.len() as u64;
+            bases[2] += part.interps.len() as u64;
+            joined.cells.extend_from_slice(&part.cells);
+            joined.streets.extend_from_slice(&part.streets);
+            joined.addrs.extend_from_slice(&part.addrs);
+            joined.interps.extend_from_slice(&part.interps);
+            joined.cell_count += part.cell_count;
+        }
+        assert!(whole.cell_count > 32, "fixture must span several buckets");
+        assert_eq!(joined.cell_count, whole.cell_count);
+        assert_eq!(joined.cells, whole.cells);
+        assert_eq!(joined.streets, whole.streets);
+        assert_eq!(joined.addrs, whole.addrs);
+        assert_eq!(joined.interps, whole.interps);
+    }
+
+    #[test]
+    fn rebase_cells_matches_absolute_encoding() {
+        let cell = |street, addr, interp| GeoCell {
+            cell_id: 0x0102_0304_0506_0708,
+            street_offset: street,
+            addr_offset: addr,
+            interp_offset: interp,
+        };
+        let mut bytes = cell(5, NO_DATA_U64, 0).to_bytes().to_vec();
+        rebase_cells(&mut bytes, [100, 200, 300]);
+        assert_eq!(bytes, cell(105, NO_DATA_U64, 300).to_bytes().to_vec());
     }
 
     #[test]

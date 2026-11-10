@@ -143,7 +143,7 @@ fn interpolation_parent<'t>(
 /// merges run this serially for every address, so it is one out-of-line
 /// loop rather than two inlined copies in the merge closures: inlined, the
 /// Pass 2a merge became the planet bottleneck (Pass 2a 21 s to 30 s on
-/// bygg; `reference/performance.md`, build-geocode-index).
+/// bygg; `reference/performance/geocode.md`, build-geocode-index).
 #[inline(never)]
 fn write_addr_points(
     points: &[FlatAddrPoint],

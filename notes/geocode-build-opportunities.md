@@ -165,6 +165,10 @@ than G1, but likely simpler to validate.
 
 ### G3. Full rewrite/local hybrid: relation wire scan + one metadata schedule
 
+**Status.** The relation-only schedule half landed in `da55488a`; Pass 1
+still uses the generic ordered classify path, so the relation wire scanner
+remains outstanding.
+
 **Bottleneck.** Pass 1 relations cost ~42 s and use the generic
 `ElementReader`/`Relation` abstraction. The command only needs a narrow slice
 of relation data: boundary/admin tags, names/postcodes/country code, way

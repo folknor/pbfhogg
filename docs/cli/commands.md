@@ -2196,7 +2196,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | apply-changes | Front read direct; scanner, body preads and passthrough reads buffered | All PBF writes direct | Yes |
 | diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
 | digest | All reads direct | - | - |
-| build-geocode-index | All PBF scans direct | Index output buffered, not PBF | - |
+| build-geocode-index | Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads buffered | Index output buffered, not PBF | - |
 | merge-changes | OSC only; no direct I/O flag | No PBF output | - |
 <!-- io-reach:end -->
 

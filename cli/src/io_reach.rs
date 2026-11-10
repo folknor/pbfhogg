@@ -124,7 +124,7 @@ pub(super) const REACH: &[Reach] = &[
     },
     Reach {
         path: &["build-geocode-index"],
-        reads: "All PBF scans direct",
+        reads: "Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads buffered",
         writes: "Index output buffered, not PBF",
         uring: "-",
     },

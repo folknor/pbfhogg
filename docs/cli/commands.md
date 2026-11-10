@@ -1216,6 +1216,28 @@ writer does, and refused if it still would. It takes exactly one input and
 is refused with `--type`, `--clean`, `--dedupe`, `--force`, `--generator` and
 `--output-header`. It accepts an unindexed and a partially indexed input.
 
+**`--repair`: rewrite what every reader refuses.** Every data blob is
+decompressed and validated as a reader decodes it, and a blob refused for a
+shape with a defined meaning is rewritten into it instead of failing the run.
+The one such shape today is a repeated data-bearing `Info` or `DenseInfo`
+(`Node.info appears twice with data` and its kin), merged as protobuf merges a
+repeated message field: a field set in a later occurrence overrides an earlier
+one, and `DenseInfo` columns concatenate (see DEVIATIONS.md). Each occurrence
+must frame cleanly on its own, and the merged block is validated like any
+other, so merged columns longer than their group are refused, as is every
+other refusal. Accepted blobs are written as plain `cat` writes them, so an
+indexed blob is copied whole with its indexdata unchecked (`--reindex` checks
+that); a repaired blob's payload is recompressed under `--compression` and
+keeps every `BlobHeader` field except indexdata, tagdata and datasize, which
+are replaced. A `Note:` line counts the merged elements, dense groups and
+input blobs, and the summary adds `Repaired N input blobs`. Without
+`--repair`, plain `cat` copies an indexed blob unread, so such a blob passes
+through it, and `--clean` and `--type` refuse it. With `--clean`, the clean
+pass repairs as it decodes; `--type` needs `--clean` alongside, since the
+type passthrough copies selected blobs unread. Refused with `--dedupe` and
+`--reindex`. A well-formed file costs a full validating decode under this
+flag and nothing without it.
+
 ```
 pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 ```
@@ -1229,6 +1251,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user). Not valid with `--dedupe`. (`-c` used to be its short; `-c` now refuses here, naming `--clean`.) |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither. |
 | `--reindex` | Rewrite every data blob's indexdata and tagdata from its payload, losslessly; one input. See above |
+| `--repair` | Validate every data blob and rewrite one refused for a repeated `Info` or `DenseInfo` into the merged message. With `--type` it needs `--clean`; not valid with `--dedupe` or `--reindex`. See above |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O. Only valid with `--dedupe` - the plain `cat` path has no io_uring writer, and passing it there is an error. |

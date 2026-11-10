@@ -567,17 +567,16 @@ the fastest one.
 
 ### Command surface
 
-- [ ] **`cat` as the universal cleaner** (raised 2026-10-26). Every other
-  command refuses malformed or incomplete input loudly and points at `cat`;
-  `cat` is the one command that turns such a file into a valid one, outside
-  its hot standard paths (plain passthrough and indexdata generation stay as
-  they are). It already plays that role for missing and partial indexdata,
-  and `cat --clean user` skips resolving a user index it drops (ruled
-  2026-10-26, `cat_clean_user_rescues_a_bad_user_string_index`). The
-  project: decide which refusals `cat` should recover from instead, under
-  which flags, and how each recovery is reported. First candidate: a repeated `Info` or
-  `DenseInfo` message, refused while the block is parsed, before any
-  `--clean` applies, so `cat --clean` cannot rescue that file today.
+- [ ] **More `cat --repair` cases.** `cat --repair` validates every blob and
+  rewrites what it can give a defined meaning, under one note; a repeated
+  Info or DenseInfo is merged as protobuf merges it. Next candidates, each
+  an extra refusal recognised in `cat/repair.rs`: a packed field split
+  across segments (the `DUP_*` "packed field split across segments"
+  refusals, including a lone DenseInfo with a split column), and a
+  repeated `DenseNodes` in one group (`DUP_GROUP_DENSE`). Open: whether
+  other commands' refusals should name `cat --repair` (CLI advice, since
+  library errors carry none); `--type --repair` without `--clean`;
+  `--dedupe --repair`.
 - [ ] Auto-selection: `--index-type auto` (sparse vs external) is the
   default since 0.6.0; blob-count dispatch landed for getid and getparents
   (ADR-0006) and `-j 0` sizes workers automatically. Extend to other

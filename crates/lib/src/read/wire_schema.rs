@@ -41,11 +41,14 @@ pub(crate) mod primitive_block {
     pub(crate) const STRING_TABLE: u32 = 1;
 }
 
-/// BlobHeader fields that the metadata-only degrade path can remove.
+/// BlobHeader fields a header-preserving reframe strips before writing its
+/// own (degrade's metadata-only path, `cat --reindex`, `cat --repair`).
 #[derive(Clone, Copy)]
 #[repr(u32)]
 pub(crate) enum BlobHeaderField {
     Indexdata = blob_header::INDEXDATA,
+    /// Replaced, never only removed: the frame gets a new body.
+    Datasize = blob_header::DATASIZE,
     Tagdata = blob_header::TAGDATA,
 }
 

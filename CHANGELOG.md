@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **`cat --repair`** rewrites a file every other command refuses for a
+  repeated `Info` or `DenseInfo` (`Node.info appears twice with data` and
+  its kin) into a valid one, merging each as protobuf merges a repeated
+  message. Every data blob is validated; well-formed ones are written as
+  plain `cat` writes them, repaired ones recompressed with their other
+  `BlobHeader` fields kept, and a `Note:` counts what was merged. Combines
+  with `--clean` (and `--type` with `--clean`). New library entry
+  `cat::repair` and `CatStats::blobs_repaired`. Plain `cat`, `--clean` and
+  `--type` are unchanged without the flag.
+
 ### Changed
 
 - **PBFs whose DenseInfo carries only some columns are read**, as osmium

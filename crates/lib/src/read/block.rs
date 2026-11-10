@@ -1197,6 +1197,54 @@ impl<'w> BlockBuffer<'w> {
         let (NoProjection, validated) = self.project(|_, _| NoProjection)?;
         Ok(validated.into_block())
     }
+
+    /// [`block`](Self::block) for a caller that can rewrite a refused block:
+    /// on a validation failure the still-owned bytes and the error go to
+    /// `rescue`. `Ok(None)` from it lets the refusal stand; `Ok(Some((bytes,
+    /// t)))` replaces the block with `bytes`, which are validated afresh (the
+    /// scratch rebuilt from them, the same kind claim applied) and refused
+    /// with `context` prefixed if they fail too. The original bytes go back
+    /// to their pool on every path. Returns the block and `t` when a rewrite
+    /// was used.
+    ///
+    /// An accepted block takes the same path [`block`](Self::block) takes;
+    /// `rescue` runs only after a refusal, so a well-formed block pays
+    /// nothing for it. `cat --repair` is the caller (`commands/cat/repair.rs`).
+    pub(crate) fn block_rescuing<T>(
+        self,
+        rescue: impl FnOnce(&crate::error::Error, &[u8]) -> Result<Option<(Vec<u8>, T)>>,
+        context: &'static str,
+    ) -> Result<(PrimitiveBlock, Option<T>)> {
+        let BlockBuffer {
+            buffer,
+            pool,
+            st,
+            groups,
+            claim,
+        } = self;
+        let err = match validate_in_place(&buffer, st, groups, claim, |_, _| NoProjection) {
+            Ok((NoProjection, scan)) => {
+                let validated = ValidatedBlock {
+                    buffer,
+                    pool,
+                    st,
+                    groups,
+                    scan,
+                };
+                return Ok((validated.into_block(), None));
+            }
+            Err(err) => err,
+        };
+        let rescued = rescue(&err, &buffer);
+        drop(crate::blob::pool_wrap(buffer, pool));
+        let Some((bytes, t)) = rescued? else {
+            return Err(err);
+        };
+        let block = BlockBuffer::new(bytes, None, st, groups, claim)
+            .block()
+            .map_err(|e| e.context(context))?;
+        Ok((block, Some(t)))
+    }
 }
 
 /// A block [`BlockBuffer::project`] accepted, still holding its bytes, the

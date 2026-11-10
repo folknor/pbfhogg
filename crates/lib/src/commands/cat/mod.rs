@@ -2,6 +2,7 @@
 
 pub mod dedupe;
 pub mod reindex;
+mod repair;
 
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -46,6 +47,9 @@ pub struct CatStats {
     /// "Decoded N blobs"), not output blobs written.
     pub blobs_decoded: u64,
     pub elements_written: u64,
+    /// Input blobs [`repair`] rewrote (each counted once, however many
+    /// output blobs it became); always 0 from [`cat`].
+    pub blobs_repaired: u64,
 }
 
 impl CatStats {
@@ -64,6 +68,9 @@ impl CatStats {
             )?;
         } else {
             writeln!(w, "{} blobs passed through", self.blobs_passthrough)?;
+        }
+        if self.blobs_repaired > 0 {
+            writeln!(w, "Repaired {} input blobs", self.blobs_repaired)?;
         }
 
         Ok(())
@@ -113,13 +120,69 @@ pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
+    let result = cat_to(
+        files,
+        &output,
+        type_filter,
+        clean,
+        write,
+        overrides,
+        false,
+        host,
+    )?;
     output.publish()?;
     Ok(result)
 }
 
-/// [`cat`] writing to a borrowed output it does not publish.
+/// [`cat`] that also repairs: every data blob it writes is validated as a
+/// reader decodes it, and a blob refused for a shape with a defined meaning
+/// is rewritten into the canonical encoding of that meaning instead of
+/// failing the run. The one such shape today is a repeated data-bearing
+/// `Info` or `DenseInfo`, merged as protobuf merges a repeated message field
+/// (DEVIATIONS.md, "a repeated Info or DenseInfo is refused, not merged").
+/// Any other refusal still fails the run, and so does a merge whose result
+/// is itself malformed (merged `DenseInfo` columns longer than their group).
+/// One note reports what was merged.
+///
+/// Without `clean`, accepted blobs are written as plain [`cat`] writes them
+/// (an indexed blob copied whole, its indexdata unchecked), at the cost of
+/// decoding every blob; a repaired blob is recompressed and keeps every
+/// `BlobHeader` field but its indexdata, tagdata and datasize. With `clean`
+/// the clean pass, which decodes every blob anyway, repairs as it goes.
+///
+/// # Errors
+/// As [`cat`], and a `type_filter` without `clean`: the type passthrough
+/// copies selected indexed blobs unread, and re-encoding them instead would
+/// normalise far more than the repair.
+pub fn repair<'a, S: Into<InputSource<'a>> + Copy>(
+    files: &[S],
+    output: impl crate::output::BindOutput,
+    type_filter: Option<TypeFilter>,
+    clean: &CleanAttrs,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<CatStats> {
+    let host = &host.enter()?;
+    let output = crate::output::bind_unissued(output, &host.invocation)?;
+    host.invocation.check()?;
+    let result = cat_to(
+        files,
+        &output,
+        type_filter,
+        clean,
+        write,
+        overrides,
+        true,
+        host,
+    )?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`cat`] or [`repair`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     files: &[S],
     output: &crate::output::BoundOutput,
@@ -127,11 +190,19 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    repair: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let (direct_io, force) = (write.direct_reads, write.force);
     if files.is_empty() {
         return Err(Error::invalid_argument("no input files specified"));
+    }
+    if repair && type_filter.is_some() && !clean.any() {
+        return Err(Error::invalid_argument(
+            "repair with a type filter needs clean: the type passthrough copies selected \
+             indexed blobs unread, and re-encoding them to read them would normalise every \
+             selected blob, not only the repaired ones",
+        ));
     }
 
     // Every input is read at least twice (its header, then its blobs, and
@@ -182,6 +253,7 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
 
     host.invocation.marker("CAT_SCAN_START");
     let result = match (type_filter, clean.any()) {
+        (None, false) if repair => repair_passthrough(files, output, write, overrides, host),
         (None, false) => cat_passthrough(files, output, write, overrides, host),
         (None, true) => cat_filtered(
             files,
@@ -190,14 +262,21 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
             clean,
             write,
             overrides,
+            repair,
             host,
         ),
         (Some(filter), false) => {
             cat_type_passthrough(files, output, filter, write, overrides, host)
         }
-        (Some(filter), true) => cat_filtered(files, output, filter, clean, write, overrides, host),
+        (Some(filter), true) => {
+            cat_filtered(files, output, filter, clean, write, overrides, repair, host)
+        }
     }?;
     host.invocation.marker("CAT_SCAN_END");
+    if repair {
+        host.invocation
+            .counter("cat_blobs_repaired", result.blobs_repaired);
+    }
     host.invocation
         .counter("cat_blobs_passthrough", result.blobs_passthrough);
     host.invocation
@@ -437,6 +516,85 @@ fn cat_passthrough(
         blobs_passthrough: blobs,
         blobs_decoded: blobs_reencoded,
         elements_written: elements_reencoded,
+        blobs_repaired: 0,
+    })
+}
+
+/// The passthrough path of [`repair`]: [`cat_passthrough`]'s output for
+/// every blob it accepts, with every data blob decoded and validated on a
+/// frame pool first, and a refused blob repaired where `repair.rs` can (its
+/// module doc gives the rules). A route of its own, chosen at dispatch, so
+/// plain `cat` keeps its sequential zero-decode loop.
+fn repair_passthrough(
+    files: &[PinnedInput],
+    output: &crate::output::BoundOutput,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Entered<'_>,
+) -> Result<CatStats> {
+    let direct_io = write.direct_reads;
+    let headers = read_headers(files, direct_io, host)?;
+    let ways = raw_copy_ways(files, &headers, direct_io, Ways::PayloadsCopied, host)?;
+    let header = cat_output_header(&headers, ways, overrides, host)?;
+    let declared = header.declared;
+    let mut writer = super::writer_from_header_bytes(
+        output,
+        write.compression,
+        &header.bytes,
+        write.backend,
+        host,
+    )?;
+    let compression = write.compression;
+    let metrics = &host.invocation.metrics().writer;
+
+    let mut copied: u64 = 0;
+    let mut rebuilt: u64 = 0;
+    let mut omitted: u64 = 0;
+    let mut elements_rebuilt: u64 = 0;
+    let mut tally = repair::RepairTally::default();
+    for input in files {
+        let mut frames = Frames::of_file_input(
+            FileReader::open_in(input, direct_io, &host.invocation)?,
+            input.path(),
+            host,
+        );
+        // As plain cat: the remedy for a partially indexed file.
+        frames.accept_partial_index();
+        crate::read::frame_pool::map_frames_ordered(
+            &mut frames,
+            host,
+            |frame| matches!(frame.blob_type, BlobKind::OsmData).then_some(frame),
+            repair::RepairScratch::default,
+            |scratch, frame| repair::repair_frame(frame, scratch, declared, compression, metrics),
+            |repaired: repair::Repaired| {
+                for frame in repaired.frames {
+                    writer.write_raw_owned(frame)?;
+                }
+                match repaired.outcome {
+                    repair::Outcome::Copied => copied += 1,
+                    // Counted by the tally, below.
+                    repair::Outcome::Rewritten => {}
+                    repair::Outcome::Rebuilt { blocks, elements } => {
+                        rebuilt += 1;
+                        omitted += u64::from(blocks == 0);
+                        elements_rebuilt += elements;
+                    }
+                }
+                if let Some(merged) = repaired.merged {
+                    tally.add(merged);
+                }
+                Ok(())
+            },
+        )?;
+    }
+    writer.flush()?;
+    note_reencoded(host, rebuilt - omitted, omitted);
+    tally.note(host);
+    Ok(CatStats {
+        blobs_passthrough: copied,
+        blobs_decoded: rebuilt,
+        elements_written: elements_rebuilt,
+        blobs_repaired: tally.blobs,
     })
 }
 
@@ -795,6 +953,7 @@ fn cat_type_passthrough(
         blobs_passthrough,
         blobs_decoded,
         elements_written,
+        blobs_repaired: 0,
     })
 }
 
@@ -946,6 +1105,7 @@ fn dense_meta<'a>(
 /// string-table entries inline into the pooled decompression buffer (see its
 /// "Memory: decoded-block working set" doc in `crates/lib/src/read/pipeline.rs`), so
 /// this history no longer describes a live hazard there.
+#[allow(clippy::too_many_arguments)]
 fn cat_filtered(
     files: &[PinnedInput],
     output: &crate::output::BoundOutput,
@@ -953,6 +1113,7 @@ fn cat_filtered(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    repair: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
     let (compression, direct_io) = (write.compression, write.direct_reads);
@@ -967,6 +1128,7 @@ fn cat_filtered(
 
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
+    let mut tally = repair::RepairTally::default();
 
     // Indexdata prunes only when a kind is unselected; with every kind
     // selected there is nothing to filter and no note to give.
@@ -994,6 +1156,7 @@ fn cat_filtered(
             clean,
             compression,
             &mut writer,
+            repair.then_some(&mut tally),
             host,
         );
         host.invocation.marker("CAT_FILTERED_END");
@@ -1003,11 +1166,13 @@ fn cat_filtered(
     }
 
     writer.flush()?;
+    tally.note(host);
 
     Ok(CatStats {
         blobs_passthrough: 0,
         blobs_decoded,
         elements_written: elements,
+        blobs_repaired: tally.blobs,
     })
 }
 
@@ -1024,6 +1189,7 @@ fn cat_filtered(
 /// end of its write, whatever the input size. Each result holds one
 /// input blob's rebuilt output; a block that switches kind often frames into
 /// several smaller blobs, still bounded by that one block.
+#[allow(clippy::too_many_arguments)]
 fn run_filtered_pass(
     input: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
@@ -1031,6 +1197,7 @@ fn run_filtered_pass(
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    repair: Option<&mut repair::RepairTally>,
     host: &crate::host::Entered<'_>,
 ) -> Result<(u64, u64)> {
     type PassResult = crate::Result<(Vec<(ElementKind, Vec<u8>)>, u64)>;
@@ -1052,38 +1219,67 @@ fn run_filtered_pass(
     // one per worker, and the peak is the workers' own working sets
     // (`reference/performance/cat.md`, "cat --clean's peak against the README
     // row").
-    let pass = crate::scan::classify::parallel_classify_phase_ordered(
-        input,
-        schedule,
-        None,
-        std::num::NonZeroUsize::new(crate::tunables::POOL_REORDER_CAPACITY_WIDE),
-        || {
-            (
-                super::WorkerBuilder::new(BlockBuilder::new()),
-                Vec::<i64>::new(),
-            )
-        },
-        |block, (worker, refs_buf)| -> PassResult {
-            let bb = worker.task()?;
-            let mut output =
-                super::FramedBlocks::new(compression, &host.invocation.metrics().writer);
-            let count = process_block(block, bb, &mut output, &tf, clean, refs_buf)?;
-            flush_local(bb, &mut output)?;
-            super::release_scratch(refs_buf);
-            Ok((output.frames, count))
-        },
-        |_position, (framed, count)| {
-            // Called in schedule order; a write error ends the pass at once.
-            blobs_decoded += 1;
-            for (kind, blob) in framed {
-                phase.enter(kind, &host.invocation);
-                writer.write_raw_owned(blob)?;
-            }
-            total_elements += count;
-            Ok(())
-        },
-        host,
-    );
+    let window = std::num::NonZeroUsize::new(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
+    let worker_init = || {
+        (
+            super::WorkerBuilder::new(BlockBuilder::new()),
+            Vec::<i64>::new(),
+        )
+    };
+    let work = |block: &PrimitiveBlock,
+                (worker, refs_buf): &mut (super::WorkerBuilder, Vec<i64>)|
+     -> PassResult {
+        let bb = worker.task()?;
+        let mut output = super::FramedBlocks::new(compression, &host.invocation.metrics().writer);
+        let count = process_block(block, bb, &mut output, &tf, clean, refs_buf)?;
+        flush_local(bb, &mut output)?;
+        super::release_scratch(refs_buf);
+        Ok((output.frames, count))
+    };
+    // Called in schedule order; a write error ends the pass at once.
+    let mut write_blob = |(framed, count): (Vec<(ElementKind, Vec<u8>)>, u64)| -> Result<()> {
+        blobs_decoded += 1;
+        for (kind, blob) in framed {
+            phase.enter(kind, &host.invocation);
+            writer.write_raw_owned(blob)?;
+        }
+        total_elements += count;
+        Ok(())
+    };
+    // The route is chosen here, once: without repair the pool runs exactly
+    // the closure it always ran.
+    let pass = match repair {
+        None => crate::scan::classify::parallel_classify_phase_ordered(
+            input,
+            schedule,
+            None,
+            window,
+            worker_init,
+            work,
+            |_position, result| write_blob(result),
+            host,
+        ),
+        Some(tally) => crate::scan::classify::parallel_project_phase_ordered(
+            input,
+            schedule,
+            None,
+            window,
+            worker_init,
+            |buffer, state| {
+                let (block, merged) =
+                    buffer.block_rescuing(repair::rescue, repair::MERGED_CONTEXT)?;
+                Ok((work(&block, state)?, merged))
+            },
+            |_position, (result, merged)| {
+                write_blob(result)?;
+                if let Some(merged) = merged {
+                    tally.add(merged);
+                }
+                Ok(())
+            },
+            host,
+        ),
+    };
     phase.close(&host.invocation);
     pass?;
 

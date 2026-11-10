@@ -110,6 +110,16 @@ lines and holes collapsed with them, so exclaves answered as their
 neighbour. The commit after `9e098409` reruns a collapsed ring at a
 floor of its own width; those cells are recorded below it.
 
+### Collapsed admin rings rerun at their own width (bygg, 2026-11-10, `1d982110` against `9e098409`)
+
+geocode-query, same box and seed as above, both arms `--commit`, A B B
+A on germany: measured call 34.2 s (`086e777b`) and 33.9 s
+(`96a355f3`) against 34.1 s (`53c57d19`) and 34.3 s (`e3b0c042`),
+neutral. Planet one pair: 105.51 us per query (`3bf32539`) against
+106.95 us (`f385f357`), neutral, with the same admin digest on the
+query box. The planet build restores 929,941 admin polygons and 2,742
+dropped relations, the vertex cap's counts, against 910,045 and 2,753.
+
 ### Pass 3 bucket writes in parallel, stage B on the ordered pool (bygg, 2026-11-10, `b9ccca65` against `9775b0e2`)
 
 Stage A groups each chunk's cover results by bucket and writes bucket

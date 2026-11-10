@@ -1442,6 +1442,12 @@ enum Command {
             conflicts_with_all = ["clean", "type_filter", "dedupe", "force", "generator", "output_headers"]
         )]
         reindex: bool,
+        /// Decode and validate every data blob, and rewrite a blob refused
+        /// for a repeated Info or DenseInfo into the message protobuf merges
+        /// it into, instead of failing. Accepted blobs are written as plain
+        /// cat writes them. With --type it needs --clean
+        #[arg(long, conflicts_with_all = ["dedupe", "reindex"])]
+        repair: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -2788,6 +2794,7 @@ pub fn run() -> process::ExitCode {
                 type_filter,
                 dedupe,
                 reindex,
+                repair,
                 compression,
                 io,
                 io_uring,
@@ -2816,6 +2823,13 @@ pub fn run() -> process::ExitCode {
                 } else if dedupe {
                     run_merge_pbf(&files, output.open(&host)?, &write, &overrides, &host)
                 } else {
+                    if repair && type_filter.is_some() && clean.is_empty() {
+                        return Err(usage(
+                            &["cat"],
+                            "--repair with --type needs --clean: the type passthrough copies \
+                             selected indexed blobs unread",
+                        ));
+                    }
                     run_cat(
                         &files,
                         output.open(&host)?,
@@ -2823,6 +2837,7 @@ pub fn run() -> process::ExitCode {
                         &clean_attrs(&clean),
                         &write,
                         &overrides,
+                        repair,
                         &host,
                     )
                 }
@@ -4137,6 +4152,7 @@ fn run_tags_count(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cat(
     files: &[PathBuf],
     output: pbfhogg::Output,
@@ -4144,10 +4160,15 @@ fn run_cat(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    repair: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, clean, write, overrides, host)?;
+    let stats = if repair {
+        pbfhogg::cat::repair(&paths, output, type_filter, clean, write, overrides, host)?
+    } else {
+        pbfhogg::cat::cat(&paths, output, type_filter, clean, write, overrides, host)?
+    };
     stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
     Ok(())
 }

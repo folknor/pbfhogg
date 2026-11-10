@@ -101,8 +101,11 @@ fn take_packed<'a>(
 /// The refusal is deliberate (ruled 2026-10-26), not a missing merge, and
 /// matches the `DenseNodes` duplicate refusal (`DUP_GROUP_DENSE`): no producer
 /// emits a repeated `Info` or `DenseInfo`; keep-last silently lost the earlier
-/// copy's fields; and a merge would be code for a case nobody produces. It
-/// deviates from protobuf's merge rule, so DEVIATIONS.md records it.
+/// copy's fields; and a merge here would put the shape on every read path. It
+/// deviates from protobuf's merge rule, so DEVIATIONS.md records it. The merge
+/// itself lives in `cat --repair` (`commands/cat/repair.rs`), which rewrites a
+/// block refused here into the canonical encoding of the merged message, on
+/// the refused blob only ([`is_repeated_metadata`]).
 #[inline]
 fn take_message<'a>(
     cursor: &mut Cursor<'a>,
@@ -164,6 +167,21 @@ const DUP_WAY_INFO: &str = "Way.info appears twice with data; message merge is u
 const DUP_REL_INFO: &str = "Relation.info appears twice with data; message merge is unsupported";
 const DUP_DENSE_INFO: &str =
     "DenseNodes.denseinfo appears twice with data; message merge is unsupported";
+/// Whether `err` is the refusal of a repeated data-bearing `Info` or
+/// `DenseInfo` ([`take_message`]), the one refusal `cat --repair` rewrites
+/// (`commands/cat/repair.rs`). Compared by message content against the four
+/// constants above, which name nothing else; `Error::context` keeps the kind,
+/// so a located or prefixed refusal still matches. Only called after a block
+/// has been refused.
+#[cold]
+pub(crate) fn is_repeated_metadata(err: &crate::error::Error) -> bool {
+    matches!(
+        err.kind(),
+        crate::error::ErrorKind::WireFormat { msg }
+            if [DUP_NODE_INFO, DUP_WAY_INFO, DUP_REL_INFO, DUP_DENSE_INFO].contains(msg)
+    )
+}
+
 const DUP_DI_VERSION: &str =
     "DenseInfo.version appears twice with data; packed field split across segments";
 const DUP_DI_TIMESTAMP: &str =

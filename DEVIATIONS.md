@@ -911,8 +911,19 @@ fields concatenate. pbfhogg does not implement that merge for an element's
 error naming the field; an empty occurrence merges to nothing and is ignored.
 This matches the refusal of a `PrimitiveGroup` carrying two `DenseNodes`
 messages. No producer emits either shape, keeping the last occurrence silently
-lost the earlier copy's fields, and a merge would be code for a case nobody
-produces.
+lost the earlier copy's fields, and a merge on the read paths would put a case
+nobody produces on every one of them.
+
+`cat --repair` is the one place the merge exists. It validates every data
+blob, and rewrites a block refused for this shape into the canonical encoding
+of the merged message: an `Info`'s non-empty bodies concatenated (a later
+field overrides, the Osmosis `-1` mapping applied to the merged value), and a
+`DenseInfo`'s columns joined one segment per column in occurrence order, its
+other fields kept after them. Each occurrence must frame cleanly on its own
+first, and the rewritten block is validated as any block is, so merged columns
+longer than their group are refused. libosmium merges differently and is not
+the reference here: its `Info` user comes from the last occurrence alone, and
+each `DenseInfo` column from its last segment.
 
 ## inspect --extended: metadata coverage at the edges of fileinfo
 

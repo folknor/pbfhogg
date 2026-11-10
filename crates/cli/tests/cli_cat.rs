@@ -2970,3 +2970,296 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// --repair: a repeated Info or DenseInfo merged as protobuf merges it
+// ---------------------------------------------------------------------------
+
+/// The three data blocks of the repair fixture: dense nodes 1 and 2, plain
+/// node 3 and way 10, every element carrying the full metadata of
+/// `pb::info(_, 8)`. `split` writes each element's `Info` (and the dense
+/// group's `DenseInfo`) as two occurrences, version and timestamp in the
+/// first and the rest in the second, which protobuf merges into exactly the
+/// unsplit message; unsplit, the blocks are the well-formed reference.
+fn repeated_info_blocks(split: bool) -> Vec<Vec<u8>> {
+    let emit = |msg: &mut Vec<u8>, field: u64, first: &[u8], second: &[u8]| {
+        if split {
+            pb::bytes(msg, field, first);
+            pb::bytes(msg, field, second);
+        } else {
+            pb::bytes(msg, field, &[first, second].concat());
+        }
+    };
+    let info_halves = |version: i32| {
+        let mut first = Vec::new();
+        pb::uint(&mut first, 1, u64::from(version.cast_unsigned()));
+        pb::uint(&mut first, 2, 1_600_000_000);
+        let mut second = Vec::new();
+        pb::uint(&mut second, 3, 77);
+        pb::uint(&mut second, 4, 5);
+        pb::uint(&mut second, 5, 8);
+        pb::uint(&mut second, 6, 1);
+        (first, second)
+    };
+
+    let ids = [1i64, 2];
+    let mut dense = Vec::new();
+    pb::deltas(&mut dense, 1, &ids);
+    let mut first = Vec::new();
+    pb::packed(&mut first, 1, [1, 1]);
+    pb::deltas(&mut first, 2, &[1_600_000_000; 2]);
+    let mut second = Vec::new();
+    pb::deltas(&mut second, 3, &[77; 2]);
+    pb::deltas(&mut second, 4, &[5; 2]);
+    pb::deltas(&mut second, 5, &[8; 2]);
+    pb::packed(&mut second, 6, [1, 1]);
+    emit(&mut dense, 5, &first, &second);
+    pb::deltas(&mut dense, 8, &[10, 20]);
+    pb::deltas(&mut dense, 9, &[20, 40]);
+    pb::packed(&mut dense, 10, [1, 2, 0, 0]);
+
+    let mut node = pb::node(3, None);
+    let (first, second) = info_halves(2);
+    emit(&mut node, 4, &first, &second);
+
+    let mut way = Vec::new();
+    pb::uint(&mut way, 1, 10);
+    pb::packed(&mut way, 2, [3]);
+    pb::packed(&mut way, 3, [4]);
+    let (first, second) = info_halves(3);
+    emit(&mut way, 4, &first, &second);
+    pb::deltas(&mut way, 8, &[1, 2]);
+
+    vec![
+        pb::block(&[vec![(2, dense)]]),
+        pb::block(&[vec![(1, node)]]),
+        pb::block(&[vec![(3, way)]]),
+    ]
+}
+
+/// The bytes of length-delimited `field` in frame `frame`'s `BlobHeader`.
+fn header_field_bytes(pbf: &[u8], frame: usize, wanted: u64) -> Vec<u8> {
+    use crate::common::adversarial::{locate_blobs, read_varint};
+
+    let target = locate_blobs(pbf)[frame];
+    let header = &pbf[target.header_start..target.header_end];
+    let mut pos = 0;
+    while pos < header.len() {
+        let (tag, n) = read_varint(&header[pos..]).expect("tag");
+        pos += n;
+        let (v, n) = read_varint(&header[pos..]).expect("value");
+        pos += n;
+        if tag & 7 == 2 {
+            let len = usize::try_from(v).expect("len");
+            if tag >> 3 == wanted {
+                return header[pos..pos + len].to_vec();
+            }
+            pos += len;
+        }
+    }
+    panic!("frame {frame} has no field {wanted}");
+}
+
+fn run_cat_args(input: &Path, output: &Path, flags: &[&str]) -> crate::invoker::CliOutput {
+    CliInvoker::new()
+        .arg("cat")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .args(flags)
+        .run()
+}
+
+/// Every reader refuses a repeated data-bearing `Info` or `DenseInfo`, and
+/// so does every cat mode that reads the blob, `--clean` included.
+/// `--repair` merges each as protobuf merges it, and the output holds
+/// exactly what the unsplit reference holds, indexed; one note counts the
+/// merges. A well-formed input goes through `--repair` with its payloads
+/// unchanged and no note.
+#[test]
+fn repair_merges_a_repeated_info_and_dense_info() {
+    let dir = crate::common::test_scratch();
+    let unindexed = |blocks: Vec<Vec<u8>>| -> Vec<(bool, Vec<u8>)> {
+        blocks.into_iter().map(|b| (false, b)).collect()
+    };
+    let broken = dir.path().join("repeated-info.osm.pbf");
+    write_raw_block_pbf(&broken, true, &[], &unindexed(repeated_info_blocks(true)));
+    let reference = dir.path().join("reference.osm.pbf");
+    write_raw_block_pbf(
+        &reference,
+        true,
+        &[],
+        &unindexed(repeated_info_blocks(false)),
+    );
+    let output = dir.path().join("out.osm.pbf");
+
+    for flags in [&[][..], &["--clean", "uid"]] {
+        let out = run_cat_args(&broken, &output, flags);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{flags:?}: {}",
+            out.stderr_str()
+        );
+        out.assert_stderr_contains("DenseNodes.denseinfo appears twice");
+        assert!(!output.exists(), "{flags:?}");
+    }
+
+    let out = run_cat_args(&broken, &output, &["--repair"]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains(
+        "merged repeated metadata in 2 elements and 1 dense groups across 3 input blobs",
+    );
+    out.assert_stderr_contains("Repaired 3 input blobs");
+    assert_eq!(ordered_elements(&output), ordered_elements(&reference));
+    assert_eq!(data_blob_indexdata(&output), vec![true, true, true]);
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&output)
+        .assert_success();
+
+    // `--clean --repair` repairs on the clean pass: the same output as
+    // cleaning the reference.
+    let cleaned = dir.path().join("cleaned.osm.pbf");
+    let out = run_cat_args(&broken, &cleaned, &["--clean", "uid", "--repair"]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains(
+        "merged repeated metadata in 2 elements and 1 dense groups across 3 input blobs",
+    );
+    let cleaned_reference = dir.path().join("cleaned-reference.osm.pbf");
+    let out = run_cat_args(&reference, &cleaned_reference, &["--clean", "uid"]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    assert_eq!(
+        ordered_elements(&cleaned),
+        ordered_elements(&cleaned_reference)
+    );
+
+    // A well-formed input: nothing merged, payloads as plain cat writes them.
+    let repaired_reference = dir.path().join("repaired-reference.osm.pbf");
+    let out = run_cat_args(&reference, &repaired_reference, &["--repair"]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    assert!(
+        !out.stderr_str().contains("merged repeated metadata"),
+        "{}",
+        out.stderr_str()
+    );
+    assert_eq!(
+        data_payloads(&repaired_reference),
+        data_payloads(&reference)
+    );
+}
+
+/// An indexed blob is copied unread by plain cat, so a repeated `Info`
+/// there passes through it; `--repair` reads every blob, merges it, and
+/// keeps every other field of the blob's header (an unknown one here),
+/// replacing only indexdata, tagdata and datasize.
+#[test]
+fn repair_reads_indexed_blobs_and_keeps_their_header_fields() {
+    let dir = crate::common::test_scratch();
+    let reference = dir.path().join("reference.osm.pbf");
+    let indexed = |blocks: Vec<Vec<u8>>| -> Vec<(bool, Vec<u8>)> {
+        blocks.into_iter().map(|b| (true, b)).collect()
+    };
+    write_raw_block_pbf(&reference, true, &[], &indexed(repeated_info_blocks(false)));
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    let blocks: Vec<(bool, Vec<u8>)> = repeated_info_blocks(true)
+        .into_iter()
+        .map(|b| (false, b))
+        .collect();
+    write_raw_block_pbf(&unindexed, true, &[], &blocks);
+
+    // Give each broken blob the reference's (true) indexdata, and the way
+    // blob an unknown header field 9.
+    let reference_bytes = std::fs::read(&reference).expect("read reference");
+    let mut bytes = std::fs::read(&unindexed).expect("read fixture");
+    for frame in 1..=3 {
+        let index = header_field_bytes(&reference_bytes, frame, 2);
+        bytes = with_header_field(&bytes, frame, 2, &index);
+    }
+    bytes = with_header_field(&bytes, 3, 9, b"keep");
+    let broken = dir.path().join("indexed-repeated-info.osm.pbf");
+    std::fs::write(&broken, bytes).expect("write fixture");
+    assert_eq!(data_blob_indexdata(&broken), vec![true, true, true]);
+
+    let output = dir.path().join("out.osm.pbf");
+    let out = run_cat_args(&broken, &output, &[]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    std::fs::remove_file(&output).expect("remove plain output");
+
+    let out = run_cat_args(&broken, &output, &["--repair"]);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("across 3 input blobs");
+    assert_eq!(ordered_elements(&output), ordered_elements(&reference));
+    assert_eq!(data_blob_header_field(&output, 9), vec![false, false, true]);
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&output)
+        .assert_success();
+}
+
+/// The merge is protobuf's, and its result is validated as every block is:
+/// two `DenseInfo`s that both carry a version column merge into a column
+/// longer than the group, which is refused, naming the merge and the input
+/// frame. A truncated `Info` occurrence is refused rather than letting
+/// concatenation swallow the next one. `--type` without `--clean` is refused
+/// under `--repair`, as are `--dedupe` and `--reindex`.
+#[test]
+fn repair_refuses_what_the_merge_cannot_make_valid() {
+    let dir = crate::common::test_scratch();
+    let output = dir.path().join("out.osm.pbf");
+
+    let mut dense = Vec::new();
+    pb::deltas(&mut dense, 1, &[1, 2]);
+    let mut versions = Vec::new();
+    pb::packed(&mut versions, 1, [1, 1]);
+    pb::bytes(&mut dense, 5, &versions);
+    pb::bytes(&mut dense, 5, &versions);
+    pb::deltas(&mut dense, 8, &[10, 20]);
+    pb::deltas(&mut dense, 9, &[20, 40]);
+    let overrun = dir.path().join("overrun.osm.pbf");
+    write_raw_block_pbf(
+        &overrun,
+        true,
+        &[],
+        &[(false, pb::block(&[vec![(2, dense)]]))],
+    );
+    let out = run_cat_args(&overrun, &output, &["--repair"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    out.assert_stderr_contains("after merging a repeated Info or DenseInfo");
+    out.assert_stderr_contains("at byte offset");
+    assert!(!output.exists());
+
+    // Unknown field 15 claiming two bytes it does not have, then version 1.
+    let mut node = pb::node(3, None);
+    pb::bytes(&mut node, 4, &[0x7a, 0x02]);
+    let mut version = Vec::new();
+    pb::uint(&mut version, 1, 1);
+    pb::bytes(&mut node, 4, &version);
+    let truncated = dir.path().join("truncated.osm.pbf");
+    write_raw_block_pbf(
+        &truncated,
+        true,
+        &[],
+        &[(false, pb::block(&[vec![(1, node)]]))],
+    );
+    let out = run_cat_args(&truncated, &output, &["--repair"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    assert!(!output.exists());
+
+    for flags in [
+        &["--repair", "--type", "node"][..],
+        &["--repair", "--type", "node,way,relation"],
+        &["--repair", "--dedupe"],
+        &["--repair", "--reindex"],
+    ] {
+        let out = run_cat_args(&overrun, &output, flags);
+        assert_eq!(
+            out.status.code(),
+            Some(crate::invoker::EXIT_USAGE),
+            "{flags:?}: {}",
+            out.stderr_str()
+        );
+    }
+}

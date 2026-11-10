@@ -218,11 +218,39 @@ pub(crate) fn reframe_preserving(
     tagdata: Option<&[u8]>,
     header_buf: &mut Vec<u8>,
 ) -> Result<(Vec<u8>, bool)> {
-    let mut rebuilt = rebuild_header(header, index, tagdata, header_buf)?;
+    reframe_with(header, blob, index, tagdata, None, header_buf)
+}
+
+/// [`reframe_preserving`] over a new `blob`, which replaces the frame's
+/// payload: `datasize` (field 3) is replaced by the new body's length as
+/// well, every other header field kept. `cat --repair`'s rewritten blobs
+/// are framed this way (`commands/cat/repair.rs`).
+pub(crate) fn reframe_replacing_body(
+    header: &[u8],
+    blob: &[u8],
+    index: &[u8],
+    tagdata: Option<&[u8]>,
+    header_buf: &mut Vec<u8>,
+) -> Result<(Vec<u8>, bool)> {
+    let datasize = i32::try_from(blob.len())
+        .map_err(|_| Error::internal("a framed blob body fits the datasize field"))?;
+    reframe_with(header, blob, index, tagdata, Some(datasize), header_buf)
+}
+
+/// The two reframes: `datasize` is `None` to keep the header's own.
+fn reframe_with(
+    header: &[u8],
+    blob: &[u8],
+    index: &[u8],
+    tagdata: Option<&[u8]>,
+    datasize: Option<i32>,
+    header_buf: &mut Vec<u8>,
+) -> Result<(Vec<u8>, bool)> {
+    let mut rebuilt = rebuild_header(header, index, tagdata, datasize, header_buf)?;
     let tagdata_kept = rebuilt && tagdata.is_some();
     if !rebuilt {
         // A blob without tagdata claims no key set.
-        rebuilt = rebuild_header(header, index, None, header_buf)?;
+        rebuilt = rebuild_header(header, index, None, datasize, header_buf)?;
     }
     if !rebuilt {
         return Err(crate::error::new_blob_too_large(
@@ -241,20 +269,34 @@ pub(crate) fn reframe_preserving(
 }
 
 /// `header` with every `indexdata` and `tagdata` field replaced by `index`
-/// and `tagdata`, into `out`. `false` when the result reaches the header-size
-/// limit.
+/// and `tagdata`, and with `datasize` replaced too when one is given, into
+/// `out`. `false` when the result reaches the header-size limit.
 fn rebuild_header(
     header: &[u8],
     index: &[u8],
     tagdata: Option<&[u8]>,
+    datasize: Option<i32>,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
     out.clear();
-    crate::writer::strip_blob_header_fields(
-        header,
-        &[BlobHeaderField::Indexdata, BlobHeaderField::Tagdata],
-        out,
-    )?;
+    let strip: &[BlobHeaderField] = if datasize.is_some() {
+        &[
+            BlobHeaderField::Indexdata,
+            BlobHeaderField::Tagdata,
+            BlobHeaderField::Datasize,
+        ]
+    } else {
+        &[BlobHeaderField::Indexdata, BlobHeaderField::Tagdata]
+    };
+    crate::writer::strip_blob_header_fields(header, strip, out)?;
+    if let Some(datasize) = datasize {
+        protohoggr::encode_tag(
+            out,
+            crate::read::wire_schema::blob_header::DATASIZE,
+            protohoggr::WIRE_VARINT,
+        );
+        protohoggr::encode_varint(out, u64::from(datasize.unsigned_abs()));
+    }
     protohoggr::encode_bytes_field(out, crate::read::wire_schema::blob_header::INDEXDATA, index);
     if let Some(tagdata) = tagdata {
         protohoggr::encode_bytes_field(

@@ -436,7 +436,7 @@ fn filter_block_parallel(
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn)?;
-                    bb.add_node(
+                    bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),
@@ -623,7 +623,7 @@ fn filter_block_pass2(
                         tags_buf.extend(dn.tags());
                     }
                     let meta = dense_node_metadata(dn)?;
-                    bb.add_node(
+                    bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),

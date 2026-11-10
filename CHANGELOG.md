@@ -4,6 +4,22 @@
 
 ### Changed
 
+- **PBFs whose DenseInfo carries only some columns are read**, as osmium
+  writes them under `add_metadata` (for example
+  `add_metadata=version+timestamp`, or a history file written without
+  metadata, which carries `visible` alone). They used to be refused.
+  Re-encoding commands write such nodes dense with the same columns. A
+  present column of the wrong length is still refused. New public
+  `DenseNodeInfo::columns()` and `DenseColumns`; an absent column reads as
+  0 (`visible` as true, the user as empty).
+- A dense node with the Osmosis version `-1` keeps its metadata: printing
+  outputs (`diff --format osc`, `inspect --show`, `export --metadata`,
+  `digest`) show its real timestamp, uid and user, and re-encoding writes it
+  with version 0 instead of dropping the whole slot. A versioned dense
+  node's changeset `-1` is read as 0 everywhere, as re-encoding already
+  wrote it. **`digest --form full` is now `v3`**: digests of files with
+  such nodes change, so stored `v2` reports do not compare.
+- `DenseNode::info` borrows from `&self` rather than `&'a self`.
 - **`build-geocode-index`: `--max-admin-vertices` is replaced by
   `--admin-tolerance <METERS>`** (default 20, `0` keeps every vertex), and
   the geocode index `FORMAT_VERSION` is bumped to 6: existing indexes must

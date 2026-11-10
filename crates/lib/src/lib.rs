@@ -253,7 +253,7 @@ pub use read::block::{
     HeaderBBox, HeaderBlock, PrimitiveBlock, PrimitiveGroup,
 };
 pub use read::dense::{
-    CheckedDenseTagIter, DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter,
+    CheckedDenseTagIter, DenseColumns, DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter,
     DenseRawTagIter, DenseTagIter,
 };
 pub use read::elements::{

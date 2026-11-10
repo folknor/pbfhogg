@@ -804,12 +804,13 @@ fn plain_node_group(truncated_info: bool) -> Vec<u8> {
 
 /// Node 1 at `(0, 0)` as a dense node, optionally with a `DenseInfo` that
 /// carries a version array and none of the other metadata arrays.
-fn dense_node_group(partial_info: bool) -> Vec<u8> {
+fn dense_node_group(long_column: bool) -> Vec<u8> {
     let mut dense = Vec::new();
     pb_packed_deltas(1, &[1], &mut dense);
-    if partial_info {
+    if long_column {
+        // A version column of two entries for one node.
         let mut info = Vec::new();
-        pb_len(1, &[1], &mut info);
+        pb_len(1, &[1, 1], &mut info);
         pb_len(5, &info, &mut dense);
     }
     pb_packed_deltas(8, &[0], &mut dense);
@@ -850,7 +851,7 @@ fn blobs_the_reader_refuses_are_refused() {
             block_with(&[b""], &plain_node_group(false)),
         ),
         (
-            "DenseInfo with some of its arrays",
+            "DenseInfo column longer than the id array",
             block_with(&[b""], &dense_node_group(true)),
             honest_way.clone(),
             block_with(&[b""], &dense_node_group(false)),

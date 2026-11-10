@@ -1395,7 +1395,7 @@ fn worker_decode_kind(
             (Element::DenseNode(dn), ElementKind::Node) => {
                 ensure_node_capacity_local(bb, &mut framed)?;
                 let meta = dense_node_metadata(dn)?;
-                bb.add_node(
+                bb.add_node_dense(
                     dn.id(),
                     dn.decimicro_lat(),
                     dn.decimicro_lon(),

@@ -9,6 +9,7 @@
 //! Callers that choose a different cap also provide a bound on pre-allocation
 //! through [`BlockBuilder::with_element_cap_prealloc`].
 
+use crate::DenseColumns;
 use crate::ElementKind;
 use crate::PrimitiveBlock;
 use crate::blob_meta::BlobIndex;
@@ -160,6 +161,7 @@ impl RawPartialMetadata {
             uid: self.uid?,
             user_sid: self.user_sid?,
             visible: self.visible.unwrap_or(true),
+            columns: DenseColumns::ALL,
         })
     }
 
@@ -192,6 +194,19 @@ pub(crate) struct RawMetadata {
     pub uid: i32,
     pub user_sid: i32,
     pub visible: bool,
+    /// The `DenseInfo` columns written for this node: [`DenseColumns::ALL`]
+    /// for complete metadata, a source group's partial set when re-encoding
+    /// one.
+    pub columns: DenseColumns,
+}
+
+/// Complete [`Metadata`] of a dense source node with the `DenseInfo`
+/// columns its group carried, for [`BlockBuilder::add_node_dense`]. Fields
+/// outside `columns` are ignored (they read as 0 at the source).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DenseMetadata<'a> {
+    pub meta: Metadata<'a>,
+    pub columns: DenseColumns,
 }
 
 /// Map a MemberType to its protobuf enum integer value.
@@ -267,7 +282,9 @@ pub struct BlockBuilder {
     dense_uids: Vec<i32>,
     dense_user_sids: Vec<i32>,
     dense_visibles: Vec<bool>,
-    has_dense_metadata: bool,
+    /// The pending dense run's `DenseInfo` columns; empty when its nodes
+    /// carry no metadata.
+    dense_columns: DenseColumns,
 
     // Dense node delta state
     last_dense_id: i64,
@@ -408,7 +425,7 @@ impl BlockBuilder {
             dense_uids: Vec::with_capacity(prealloc),
             dense_user_sids: Vec::with_capacity(prealloc),
             dense_visibles: Vec::with_capacity(prealloc),
-            has_dense_metadata: false,
+            dense_columns: DenseColumns::default(),
 
             last_dense_id: 0,
             last_dense_lat: 0,
@@ -590,7 +607,6 @@ impl BlockBuilder {
     ///
     /// Coordinates are in decimicrodegrees (10⁻⁷ degrees, i.e. 100 nanodegrees),
     /// matching the default PBF granularity of 100.
-    #[allow(clippy::cast_possible_wrap)]
     pub fn add_node<'t>(
         &mut self,
         id: i64,
@@ -599,12 +615,56 @@ impl BlockBuilder {
         tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&Metadata<'_>>,
     ) {
+        self.add_node_columns(
+            id,
+            decimicro_lat,
+            decimicro_lon,
+            tags,
+            metadata,
+            DenseColumns::ALL,
+        );
+    }
+
+    /// Add a dense node read from a dense source, writing exactly the
+    /// `DenseInfo` columns its metadata carries
+    /// ([`DenseMetadata::columns`]), so a partial-column source group is
+    /// re-encoded dense without inventing a column. Nodes with different
+    /// column sets never share a group.
+    pub(crate) fn add_node_dense<'t>(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+        metadata: Option<&DenseMetadata<'_>>,
+    ) {
+        let (meta, columns) = match metadata {
+            Some(m) => (Some(&m.meta), m.columns),
+            None => (None, DenseColumns::default()),
+        };
+        self.add_node_columns(id, decimicro_lat, decimicro_lon, tags, meta, columns);
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn add_node_columns<'t>(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+        metadata: Option<&Metadata<'_>>,
+        columns: DenseColumns,
+    ) {
         if !self.can_add_node() {
             self.refuse(BlockType::DenseNodes, id);
             return;
         }
         self.block_type = Some(BlockType::DenseNodes);
-        self.begin_dense_node(metadata.is_some());
+        self.begin_dense_node(if metadata.is_some() {
+            columns
+        } else {
+            DenseColumns::default()
+        });
 
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
@@ -717,8 +777,8 @@ impl BlockBuilder {
 
     #[allow(clippy::cast_possible_wrap)]
     fn add_dense_metadata(&mut self, meta: &Metadata<'_>) {
-        self.has_dense_metadata = true;
-
+        // Every column is accumulated whatever the run's column set (no
+        // per-node branch); `encode_dense_nodes_group` writes only the set.
         // Version is NOT delta-encoded
         self.dense_versions.push(meta.version);
 
@@ -747,21 +807,24 @@ impl BlockBuilder {
         self.dense_visibles.push(meta.visible);
     }
 
-    /// Prepare for one more dense node with (`has_metadata`) or without
-    /// metadata. A pending plain group is closed first, so groups keep
-    /// insertion order. A dense run is homogeneous in metadata presence: a
-    /// node that differs from the current run seals it into its own group
-    /// and starts a new one, so a node without metadata never gets
-    /// fabricated zero DenseInfo entries beside nodes that have it (nor the
-    /// reverse). On uniform input both conditions are one untaken branch.
+    /// Prepare for one more dense node whose metadata carries `columns`
+    /// (empty: no metadata). A pending plain group is closed first, so groups
+    /// keep insertion order. A dense run is homogeneous in its `DenseInfo`
+    /// column set: a node that differs from the current run seals it into
+    /// its own group and starts a new one, so a node without metadata never
+    /// gets fabricated zero DenseInfo entries beside nodes that have it (nor
+    /// the reverse), and a partial-column node never gains a column. On
+    /// uniform input both conditions are one untaken branch.
     #[inline]
-    fn begin_dense_node(&mut self, has_metadata: bool) {
+    fn begin_dense_node(&mut self, columns: DenseColumns) {
         if !self.plain_group.is_empty() {
             self.flush_plain_group();
         }
-        if has_metadata != self.has_dense_metadata && !self.dense_ids.is_empty() {
+        if columns != self.dense_columns && !self.dense_ids.is_empty() {
             self.seal_dense_run();
         }
+        // Set after the seal, which clears the run's state.
+        self.dense_columns = columns;
     }
 
     /// Close the pending plain node group into `node_groups`.
@@ -1144,7 +1207,7 @@ impl BlockBuilder {
             return Err(self.refuse_raw_index(e));
         }
         self.block_type = Some(BlockType::DenseNodes);
-        self.begin_dense_node(metadata.is_some());
+        self.begin_dense_node(metadata.map_or_else(DenseColumns::default, |m| m.columns));
 
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
@@ -1408,7 +1471,6 @@ impl BlockBuilder {
 
     #[allow(clippy::cast_possible_wrap)]
     fn add_dense_metadata_raw(&mut self, meta: &RawMetadata) {
-        self.has_dense_metadata = true;
         self.dense_versions.push(meta.version);
         // Raw signed metadata uses the same wrapping wire-delta convention as
         // values decoded and re-encoded through `add_dense_metadata`.
@@ -1674,48 +1736,61 @@ impl BlockBuilder {
         );
 
         // DenseNodes field 5: denseinfo (submessage)
-        if self.has_dense_metadata {
-            // Build DenseInfo into elem_scratch
+        let columns = self.dense_columns;
+        if !columns.is_empty() {
+            // Build DenseInfo into elem_scratch, the run's columns only.
             self.elem_scratch.clear();
             self.packed_scratch.clear();
 
             // DenseInfo field 1: version (packed int32)
-            encode_packed_int32(
-                &mut self.elem_scratch,
-                &mut self.packed_scratch,
-                1,
-                &self.dense_versions,
-            );
+            if columns.version() {
+                encode_packed_int32(
+                    &mut self.elem_scratch,
+                    &mut self.packed_scratch,
+                    1,
+                    &self.dense_versions,
+                );
+            }
             // DenseInfo field 2: timestamp (packed sint64)
-            encode_packed_sint64(
-                &mut self.elem_scratch,
-                &mut self.packed_scratch,
-                2,
-                &self.dense_timestamps,
-            );
+            if columns.timestamp() {
+                encode_packed_sint64(
+                    &mut self.elem_scratch,
+                    &mut self.packed_scratch,
+                    2,
+                    &self.dense_timestamps,
+                );
+            }
             // DenseInfo field 3: changeset (packed sint64)
-            encode_packed_sint64(
-                &mut self.elem_scratch,
-                &mut self.packed_scratch,
-                3,
-                &self.dense_changesets,
-            );
+            if columns.changeset() {
+                encode_packed_sint64(
+                    &mut self.elem_scratch,
+                    &mut self.packed_scratch,
+                    3,
+                    &self.dense_changesets,
+                );
+            }
             // DenseInfo field 4: uid (packed sint32)
-            encode_packed_sint32(
-                &mut self.elem_scratch,
-                &mut self.packed_scratch,
-                4,
-                &self.dense_uids,
-            );
+            if columns.uid() {
+                encode_packed_sint32(
+                    &mut self.elem_scratch,
+                    &mut self.packed_scratch,
+                    4,
+                    &self.dense_uids,
+                );
+            }
             // DenseInfo field 5: user_sid (packed sint32)
-            encode_packed_sint32(
-                &mut self.elem_scratch,
-                &mut self.packed_scratch,
-                5,
-                &self.dense_user_sids,
-            );
+            if columns.user() {
+                encode_packed_sint32(
+                    &mut self.elem_scratch,
+                    &mut self.packed_scratch,
+                    5,
+                    &self.dense_user_sids,
+                );
+            }
             // DenseInfo field 6: visible (packed bool)
-            encode_packed_bool(&mut self.elem_scratch, 6, &self.dense_visibles);
+            if columns.visible() {
+                encode_packed_bool(&mut self.elem_scratch, 6, &self.dense_visibles);
+            }
 
             encode_bytes_field(&mut self.group_buf, 5, &self.elem_scratch);
         }
@@ -1772,7 +1847,7 @@ impl BlockBuilder {
         self.min_lon = i32::MAX;
         self.max_lon = i32::MIN;
         self.tag_key_indices.clear();
-        self.has_dense_metadata = false;
+        self.dense_columns = DenseColumns::default();
         self.seeded = None;
 
         self.last_dense_id = 0;
@@ -1796,7 +1871,7 @@ impl BlockBuilder {
     }
 
     fn clear_dense_run(&mut self) {
-        self.has_dense_metadata = false;
+        self.dense_columns = DenseColumns::default();
         self.last_dense_id = 0;
         self.last_dense_lat = 0;
         self.last_dense_lon = 0;
@@ -2379,6 +2454,7 @@ mod tests {
             uid: 0,
             user_sid,
             visible: true,
+            columns: crate::DenseColumns::ALL,
         };
         let mut info = Vec::new();
         for (field, value) in [(1u32, 1u64), (5, 3)] {
@@ -2997,6 +3073,7 @@ mod tests {
             uid: i32::MAX,
             user_sid: i32::MAX,
             visible: true,
+            columns: crate::DenseColumns::ALL,
         };
         let next = RawMetadata {
             version: 1,
@@ -3005,6 +3082,7 @@ mod tests {
             uid: -1,
             user_sid: -1,
             visible: true,
+            columns: crate::DenseColumns::ALL,
         };
         bb.add_dense_metadata_raw(&first);
         bb.add_dense_metadata_raw(&next);

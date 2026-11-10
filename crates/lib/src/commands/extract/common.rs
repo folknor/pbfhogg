@@ -607,7 +607,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                    bb.add_node(
+                    bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),

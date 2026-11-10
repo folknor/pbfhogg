@@ -542,7 +542,7 @@ fn filter_block_snapshot(
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn)?;
-                bb.add_node(
+                bb.add_node_dense(
                     dn.id(),
                     dn.decimicro_lat(),
                     dn.decimicro_lon(),
@@ -813,11 +813,14 @@ fn version_violation(
 
 /// `None` means the element carries no timestamp at all.
 fn dense_timestamp(dn: &DenseNode<'_>) -> Option<i64> {
-    // `DenseNodeInfo::milli_timestamp` is infallible: DenseInfo carries a
-    // parallel timestamp array, so if the block has DenseInfo at all it
-    // has a timestamp for this node. Absence is `info()` returning None,
-    // which is exactly what a metadata-stripped dense block looks like.
-    Some(dn.info()?.milli_timestamp() / 1000)
+    // A timestamp column, when the group carries one, has a value for every
+    // node. Absence is `info()` returning None (a metadata-stripped dense
+    // block) or a DenseInfo without the timestamp column (libosmium writes
+    // any subset of columns), which reads 0 and must not pass as the epoch.
+    let info = dn.info()?;
+    info.columns()
+        .timestamp()
+        .then_some(info.milli_timestamp() / 1000)
 }
 
 fn node_timestamp(n: &Node<'_>) -> Option<i64> {

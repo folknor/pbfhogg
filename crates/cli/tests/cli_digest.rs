@@ -834,14 +834,14 @@ fn write_full(path: &Path, f: &FullFixture, indexed: bool, one_per_block: bool) 
     writer.flush().unwrap();
 }
 
-/// Plain `digest` is the full form, `v2`; `--form content` is `v1`.
+/// Plain `digest` is the full form, `v3`; `--form content` is `v1`.
 #[test]
-fn the_default_form_is_full_v2() {
+fn the_default_form_is_full_v3() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("full.osm.pbf");
     write_full(&path, &full_fixture(), true, false);
     let full = full_ok(&path);
-    assert!(full[0].starts_with("xxh128 v2 "), "{}", full[0]);
+    assert!(full[0].starts_with("xxh128 v3 "), "{}", full[0]);
     assert_eq!(full, digest_ok_in(&path, Some("full")));
     let content = digest_ok(&path);
     assert!(content[0].starts_with("xxh128 v1 "), "{}", content[0]);

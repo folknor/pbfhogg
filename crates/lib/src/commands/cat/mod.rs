@@ -577,7 +577,7 @@ fn reencode_unclassifiable(
                 check_tags(dn.tags_checked())?;
                 let meta = dense_node_metadata(dn)?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
-                bb.add_node(
+                bb.add_node_dense(
                     dn.id(),
                     dn.decimicro_lat(),
                     dn.decimicro_lon(),
@@ -828,7 +828,7 @@ fn process_block(
             Element::DenseNode(dn) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
                 let meta = clean_metadata(dense_meta(dn, clean)?, clean);
-                bb.add_node(
+                bb.add_node_dense(
                     dn.id(),
                     dn.decimicro_lat(),
                     dn.decimicro_lon(),
@@ -904,7 +904,7 @@ fn element_meta<'a>(
 fn dense_meta<'a>(
     dn: &'a crate::DenseNode<'a>,
     clean: &CleanAttrs,
-) -> crate::Result<Option<crate::block_builder::Metadata<'a>>> {
+) -> crate::Result<Option<crate::block_builder::DenseMetadata<'a>>> {
     if clean.user {
         crate::owned::dense_node_metadata_dropping_user(dn)
     } else {

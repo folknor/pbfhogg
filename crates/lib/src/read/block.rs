@@ -1290,8 +1290,8 @@ pub(crate) trait GroupProjection {
     fn way(&mut self, _way: &WireWay<'_>, _info: Option<&super::wire::WireInfo>) {}
     fn relation(&mut self, _relation: &WireRelation<'_>, _info: Option<&super::wire::WireInfo>) {}
     /// A dense message that passed every check, holding `ids` nodes, and
-    /// its `denseinfo` when that carries metadata for them (all five core
-    /// arrays at full length; `None` when absent or empty).
+    /// its `denseinfo` when that carries any column (each present one at
+    /// full length, any subset; `None` when absent or empty).
     fn dense(
         &mut self,
         _dense: &WireDenseNodes<'_>,
@@ -1593,13 +1593,13 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
 /// reports success. Each array must therefore be either absent (length 0) or
 /// exactly `node_count` long.
 ///
-/// libosmium tolerates an individually absent array - it tests each for
-/// emptiness per node - so absence alone is not corruption. What it cannot
-/// express, and what this additionally rejects, is a `denseinfo` that carries
-/// *some* of the five core arrays and not the others: our iterator yields
-/// `None` for every node in that case, which is the same silent metadata loss
-/// as a short array. Either all five core arrays are present at full length or
-/// none of them is.
+/// Any subset of the six columns may be present, as libosmium writes and
+/// reads them (`add_metadata=version+timestamp` writes two columns; a history
+/// file written without metadata carries `visible` alone). The dense iterator
+/// takes column presence once per group (`DenseColumns`) and reads an absent
+/// column as 0. A present column shorter than the id array is still refused:
+/// libosmium tests each column for emptiness per node, so it would silently
+/// read the tail as absent.
 ///
 /// Values are not width-checked, deliberately: `version` (int32) and the
 /// `uid` / `user_sid` deltas (sint32) narrow as protobuf specifies, a cast and
@@ -1613,8 +1613,8 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
 /// carry. See
 /// `reference/truncation-handling.md`, "Which varints count as complete".
 ///
-/// Returns the parsed `denseinfo` when it carries metadata (all five core
-/// arrays, at full length), `None` when it carries none.
+/// Returns the parsed `denseinfo` when it carries any column, `None` when it
+/// carries none.
 fn validate_dense_info_arrays<'a>(
     info_data: &'a [u8],
     node_count: usize,
@@ -1642,8 +1642,6 @@ fn validate_dense_info_arrays<'a>(
         present += 1;
     }
 
-    // `visible` is genuinely optional - it only appears in history files - so
-    // it is length-checked but never required.
     let visible = packed_varint_count(info.visible_data)?;
     if visible != 0 && visible != node_count {
         return Err(new_wire_error(
@@ -1651,17 +1649,7 @@ fn validate_dense_info_arrays<'a>(
         ));
     }
 
-    if present != 0 && present != core.len() {
-        return Err(new_wire_error(
-            "dense denseinfo has some but not all of its parallel arrays",
-        ));
-    }
-    if present == 0 && visible != 0 {
-        return Err(new_wire_error(
-            "dense denseinfo has a visible array but no metadata arrays",
-        ));
-    }
-    Ok((present == core.len()).then_some(info))
+    Ok((present != 0 || visible != 0).then_some(info))
 }
 
 /// Validate a way's packed `refs` array and its optional `LocationsOnWays`
@@ -3129,19 +3117,49 @@ mod strict_validation_tests {
             "the denseinfo length check must be what rejects this, got: {err}"
         );
 
-        // Some but not all of the five core arrays: our iterator yields None
-        // for every node, which is the same silent loss as a short array.
+        // Some but not all of the columns, as libosmium writes under
+        // `add_metadata`: legal, but each present one must still be full.
         let partial: Vec<u8> = (1u8..=2).flat_map(|f| packed(f, 2)).collect();
-        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+        let block = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
             2,
             &[],
             Some(&partial),
         )]))
-        .expect_err("a partially populated denseinfo must be rejected");
+        .expect("a partial-column denseinfo must parse");
+        // Every node keeps its metadata: version 2 (int32 varint 2) and the
+        // timestamps 1 then 2 (sint64 deltas, zigzag 2 = +1).
+        let read: Vec<_> = block
+            .elements()
+            .map(|e| match e {
+                crate::Element::DenseNode(n) => {
+                    let info = n.info().expect("partial-column node keeps its info");
+                    let columns = info.columns();
+                    assert!(columns.version() && columns.timestamp());
+                    assert!(!columns.changeset() && !columns.uid() && !columns.user());
+                    (info.version(), info.milli_timestamp(), info.uid())
+                }
+                other => panic!("dense only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, [(2, 1000, 0), (2, 2000, 0)]);
+        let mut partial_short = packed(1, 2);
+        partial_short.extend(packed(2, 1));
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[],
+            Some(&partial_short),
+        )]))
+        .expect_err("a short column in a partial denseinfo must be rejected");
         assert!(
-            format!("{err}").contains("some but not all"),
-            "the all-or-nothing check must be what rejects this, got: {err}"
+            format!("{err}").contains("denseinfo array length does not match"),
+            "the denseinfo length check must be what rejects this, got: {err}"
         );
+        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+            2,
+            &[],
+            Some(&packed(6, 2)),
+        )]))
+        .expect("a visible-only denseinfo must parse");
 
         // `visible` (field 6) is optional but must be full length when present.
         let mut with_visible = full.clone();

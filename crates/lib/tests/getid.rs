@@ -693,8 +693,11 @@ fn getid_preserves_tags() {
     );
 }
 
+/// The Osmosis -1 version no longer drops the slot: it is written as
+/// version 0 (libosmium's reading) with the other fields kept, so a real
+/// timestamp, uid or user beside it survives.
 #[test]
-fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
+fn getid_keeps_a_dense_version_minus_one_slot_as_version_zero() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -710,8 +713,8 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
                 version: -1,
                 timestamp: 0,
                 changeset: -1,
-                uid: 0,
-                user: "",
+                uid: 17,
+                user: "osmosis",
                 visible: true,
             }),
         }],
@@ -737,11 +740,11 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
         nodes[0],
         RawNodeMeta {
             id: 1,
-            version: None,
-            changeset: None,
-            uid: None,
-            user: None,
-            visible: None,
+            version: Some(0),
+            changeset: Some(0),
+            uid: Some(17),
+            user: Some("osmosis".to_string()),
+            visible: Some(true),
         }
     );
 }

@@ -2018,19 +2018,21 @@ fn ordered_elements(path: &Path) -> Vec<String> {
             out.push(match element {
                 Element::DenseNode(n) => {
                     // The product's presence rule (`DenseNodeInfo::claims`):
-                    // a padding slot (version 0, all zeros) is no metadata.
+                    // a padding slot (versionless, all zeros) is no
+                    // metadata, and a version below 1 is no version claim.
                     let claims = |i: &pbfhogg::DenseNodeInfo<'_>| {
                         i.claimed_version().is_some()
-                            || (i.version() == 0
-                                && (i.milli_timestamp() != 0
-                                    || i.changeset() > 0
-                                    || i.uid() > 0
-                                    || !i.user().unwrap_or("").is_empty()
-                                    || !i.visible()))
+                            || (i.milli_timestamp() != 0
+                                || i.changeset() > 0
+                                || i.uid() > 0
+                                || !i.user().unwrap_or("").is_empty()
+                                || !i.visible())
                     };
                     let meta = n.info().filter(|i| claims(i)).map(|i| {
                         (
-                            i.version(),
+                            // -1 and 0 are both "no version" (re-encoding
+                            // writes -1 as 0).
+                            i.claimed_version().unwrap_or(0),
                             i.milli_timestamp(),
                             i.changeset(),
                             i.uid(),
@@ -2223,9 +2225,10 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
     writer
         .write_primitive_block_no_indexdata(&bytes)
         .expect("write ordinary block");
-    // 4. Kinds mixed across groups: node 6 without metadata, then 8001
-    //    nodes with it (a None -> Some flip, and a run over the 8000 cap),
-    //    then two ways.
+    // 4. Kinds mixed across groups: node 6 with the Osmosis -1 version,
+    //    whose slot is kept (as version 0, its other fields intact), then
+    //    8001 nodes with metadata (one run over the 8000 cap), then two
+    //    ways.
     let mut nodes = vec![(6, -1), (7, 3)];
     nodes.extend((100..8100).map(|id| (id, 3)));
     writer
@@ -2284,16 +2287,15 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
 
     // Every data blob is indexed, and the splits are the expected ones. The
     // empty block is gone.
-    assert_eq!(data_blob_indexdata(&output), [true; 10]);
+    assert_eq!(data_blob_indexdata(&output), [true; 9]);
     assert_eq!(
         block_layout(&output),
         [
             ("node", 1, 2, 2),
             ("node", 3, 3, 1),
             ("node", 4, 5, 2),
-            ("node", 6, 6, 1),
-            ("node", 7, 8098, 8000),
-            ("node", 8099, 8099, 1),
+            ("node", 6, 8097, 8000),
+            ("node", 8098, 8099, 2),
             ("way", 10, 11, 2),
             ("way", 12, 12, 1),
             ("way", 13, 13, 1),

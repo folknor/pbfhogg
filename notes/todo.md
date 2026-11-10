@@ -337,13 +337,11 @@ Remaining open findings from the closed hunt.
 
 ### Change stream (`crates/lib/src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **Read partial-column DenseInfo.** libosmium writes and reads any
-  subset of DenseInfo columns; `validate_dense_info_arrays` refuses one
-  (DEVIATIONS.md, a DenseInfo with only some columns is refused). Choose
-  column presence once per group, keep the existing complete iterator for
-  normal input, and re-encode partial-column nodes without inventing
-  columns. Fix the dense whole-slot drop on version below 0 in the same
-  pass.
+- [ ] **Route uniform partial metadata into partial-column dense groups.**
+  Plain nodes whose partial metadata is uniform, such as apply-changes
+  output, are still written as plain nodes; `BlockBuilder::add_node_partial`
+  could put them in a dense group carrying exactly their columns when that
+  keeps what they claim.
 
 ### Core infrastructure and CLI
 
@@ -379,41 +377,12 @@ Remaining open findings from the closed hunt.
 
 ### Spatial and node-location resolution
 
-- [ ] **Ring simplification can change polygon topology.** Douglas-Peucker can
-  introduce self-intersections that flip containment near a boundary. The
-  recursion / stack-overflow defect is fixed (explicit stacks); the topology
-  sub-point is open because no topology-preserving replacement and no biting
-  real caller-order fixture was established. Precise scope so it is not
-  rediscovered:
-  - **Producer.** `crates/lib/src/geo.rs` Douglas-Peucker, called from
-    `geocode_index/builder/admin.rs::assemble_one_relation`, which simplifies
-    every outer and inner ring of every admin relation.
-  - **Knob.** `--max-admin-vertices`, default 500. `admin_vertex_cap` now reads
-    it as the *local-boundary* budget and multiplies by admin level (16x at
-    levels 0-2, 8x at 3, 4x at 4, 2x at 5, 1x below), so a country gets a
-    much larger budget than a municipality. That removed the worst disparity,
-    and stopped under-covering Denmark's own coarse ring, but does NOT close
-    this. The knob
-    is still a vertex count, not a distance tolerance: the effective epsilon is
-    whatever it takes to reach the budget, so the error stays unbounded in
-    metres and a topology flip remains possible on any ring long enough to be
-    simplified at all.
-  - **Consumer, and why it matters most.** `geocode_index/reader.rs` runs
-    `admin_polygon_contains` (point-in-polygon) against the simplified rings for every admin result.
-    A self-intersection near the boundary makes the even-odd crossing count
-    wrong on one side of the fold, so a query resolves to the *wrong*
-    administrative area - a wrong answer, not a missing one, and undetectable in
-    the reader because the ring is well-formed as a byte sequence.
-  - **Blast radius.** Points within the simplification error of a boundary,
-    which at a country-scale ring and 500 vertices can be kilometres.
-  - **What a fix needs.** Either a topology-preserving simplifier (reject a
-    candidate removal whose new segment crosses another segment of the same or a
-    sibling ring), or a metric tolerance in place of the vertex cap so the error
-    is bounded in metres. Nothing in the admin cell cover forces a vertex
-    count: its work is linear in the stored edges.
-  - **What is missing to act.** A fixture: a ring whose DP simplification at a
-    given cap provably self-intersects, plus a query point whose containment
-    flips. Without it any fix is unfalsifiable.
+- [ ] **Admin tolerance default (20 m) has no query-latency cell.** Since
+  `9470143c` admin rings are simplified to a metric tolerance. Build time
+  and stored vertices are measured (reference/performance/geocode.md: germany
+  admin vertices 103 MB to 42 MB); admin point-in-polygon query cost at
+  20 m against the former cap is not. The interior-flags item below is the
+  way to make small tolerances cheap at query time.
 
 ### Geocode index
 

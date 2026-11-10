@@ -34,7 +34,9 @@ pub mod time_filter;
 use std::path::Path;
 
 use crate::blob::BlobKind;
-use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, PartialMetadata};
+use crate::block_builder::{
+    BlockBuilder, DenseMetadata, HeaderBuilder, OwnedBlock, PartialMetadata,
+};
 use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -535,33 +537,39 @@ pub(crate) fn writer_from_header_bytes(
     output.pbf_writer_unissued(compression, header_bytes, backend, host)
 }
 
-/// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
-/// are cleaned or if the input has no metadata.
+/// Apply per-attribute cleaning to a dense node's metadata. A cleaned field
+/// becomes its zero value; the node's `DenseInfo` column set is kept, so
+/// cleaning neither adds nor drops a column.
 pub(crate) fn clean_metadata<'a>(
-    meta: Option<Metadata<'a>>,
+    meta: Option<DenseMetadata<'a>>,
     clean: &cat::CleanAttrs,
-) -> Option<Metadata<'a>> {
+) -> Option<DenseMetadata<'a>> {
     if !clean.any() {
         return meta;
     }
-    meta.map(|mut m| {
-        if clean.version {
-            m.version = 0;
-        }
-        if clean.changeset {
-            m.changeset = 0;
-        }
-        if clean.timestamp {
-            m.timestamp = 0;
-        }
-        if clean.uid {
-            m.uid = 0;
-        }
-        if clean.user {
-            m.user = "";
-        }
-        m
-    })
+    meta.map(
+        |DenseMetadata {
+             meta: mut m,
+             columns,
+         }| {
+            if clean.version {
+                m.version = 0;
+            }
+            if clean.changeset {
+                m.changeset = 0;
+            }
+            if clean.timestamp {
+                m.timestamp = 0;
+            }
+            if clean.uid {
+                m.uid = 0;
+            }
+            if clean.user {
+                m.user = "";
+            }
+            DenseMetadata { meta: m, columns }
+        },
+    )
 }
 
 /// [`clean_metadata`] for a plain element's partial metadata: a cleaned

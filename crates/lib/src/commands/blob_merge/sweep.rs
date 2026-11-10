@@ -464,7 +464,7 @@ impl Output<'_> {
                 Element::DenseNode(dn) => {
                     crate::commands::ensure_node_capacity_local(&mut self.bb, &mut self.filled)?;
                     let meta = dense_node_metadata(dn)?;
-                    self.bb.add_node(
+                    self.bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),

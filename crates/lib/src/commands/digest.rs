@@ -8,7 +8,7 @@
 //!   and indexdata presence all leave it unchanged. What it covers is
 //!   defined in one place, [`crate::content`], which is also what every
 //!   `diff` path compares with.
-//! - **[`Form::Full`] (`v2`).** Content plus everything a writer states
+//! - **[`Form::Full`] (`v3`).** Content plus everything a writer states
 //!   about it: metadata with its presence, `visible`, exact coordinates,
 //!   `LocationsOnWays` way coordinates, the declared prepass fields and the
 //!   header fields (folded into the first line). Two accepted files get the
@@ -108,7 +108,7 @@ pub const ALGORITHM: &str = "xxh128";
 
 /// The bytes the full form's first-line hash starts with, so it can never
 /// be mistaken for a hash over a record stream.
-pub const FULL_DOMAIN: &[u8] = b"pbfhogg-digest-v2\0";
+pub const FULL_DOMAIN: &[u8] = b"pbfhogg-digest-v3\0";
 
 /// A canonical form of the digest: what it covers and how it is
 /// serialized. Each form has its own version number, printed on the first
@@ -119,7 +119,9 @@ pub enum Form {
     /// (`v1`).
     Content,
     /// Content, metadata, way coordinates, declared prepass fields and the
-    /// header (`v2`).
+    /// header (`v3`; `v2` read a negative-version dense slot as no
+    /// metadata, a dense changeset of -1 as a claim of -1 (now 0), and refused
+    /// partial-column `DenseInfo`).
     Full,
 }
 
@@ -130,7 +132,7 @@ impl Form {
     pub const fn version(self) -> u32 {
         match self {
             Form::Content => 1,
-            Form::Full => 2,
+            Form::Full => 3,
         }
     }
 

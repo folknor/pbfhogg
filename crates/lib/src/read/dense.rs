@@ -34,7 +34,7 @@ impl<'a> DenseNode<'a> {
 
     /// return optional metadata about the node
     #[inline]
-    pub fn info(&'a self) -> Option<&'a DenseNodeInfo<'a>> {
+    pub fn info(&self) -> Option<&DenseNodeInfo<'a>> {
         self.info.as_ref()
     }
 
@@ -121,7 +121,10 @@ impl<'a> DenseNodeIter<'a> {
         let info_iter = dense
             .info_data
             .map(|data| validated(WireDenseInfo::parse(data), "DenseInfo"))
-            .map(|info| DenseNodeInfoIter::new(block, info));
+            .and_then(|info| {
+                let columns = DenseColumns::of(&info);
+                (!columns.is_empty()).then(|| DenseNodeInfoIter::new(block, info, columns))
+            });
         DenseNodeIter {
             block,
             dids: PackedSint64Iter::new(dense.id_data),
@@ -266,7 +269,9 @@ impl<'a> Iterator for DenseNodeIter<'a> {
     }
 
     /// `info_iter` is left out: it is optional, has no hint of its own, and
-    /// never limits iteration (a node without info still yields).
+    /// never limits iteration (a node without info still yields). The id
+    /// array bounds it: a group whose only column is `visible` would yield
+    /// past its end if driven alone, and here it never is.
     fn size_hint(&self) -> (usize, Option<usize>) {
         zip_hint(&[
             self.dids.size_hint(),
@@ -282,16 +287,24 @@ impl<'a> Iterator for DenseNodeIter<'a> {
 /// when metadata is absent. These fields use plain `i32`/`i64` (not `Option`)
 /// because they are decoded from packed arrays in the dense node hot path -
 /// changing to `Option` would add overhead to the tightest loop in the library.
-/// The -1 sentinel is instead normalized at write/conversion boundaries
-/// (see `dense_node_metadata`, `dense_node_raw_metadata`, sort's
-/// `read_dense_node`, and the OSC writer's use of `claims`). Non-dense elements
-/// normalize -1 → None directly in `WireInfo::parse`. See CORRECTNESS.md.
+/// The -1 sentinel is instead read at the boundaries that print or rewrite
+/// metadata (the crate's `claims`, and `dense_node_metadata`,
+/// `dense_node_raw_metadata` and `read_dense_node`, which write a version of
+/// -1 as 0). Non-dense elements normalize -1 to None directly in
+/// `WireInfo::parse`. See CORRECTNESS.md.
 ///
 /// A version of 0 is not a claim either: it is how pbfhogg's `BlockBuilder`
 /// and libosmium spell "no version", including the padding slot of a node
 /// without metadata in a block whose other nodes carry it. Outputs that
 /// print metadata go through [`claimed_version`](Self::claimed_version) and
 /// the crate's `claims`, which read 0 and -1 accordingly.
+///
+/// **Partial columns:** a `DenseInfo` may carry any subset of its six
+/// columns (libosmium's `add_metadata=version+timestamp` writes two).
+/// [`columns`](Self::columns) says which this node's group carries; a getter
+/// of an absent column returns 0, as libosmium reads it, except
+/// [`visible`](Self::visible), which returns `true`, and
+/// [`user`](Self::user), which returns the empty name.
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfo<'a> {
     block: &'a WireBlock<'static>,
@@ -301,7 +314,107 @@ pub struct DenseNodeInfo<'a> {
     uid: i32,
     user_sid: i32,
     visible: bool,
+    columns: DenseColumns,
     date_granularity: i64,
+}
+
+/// Which columns a dense group's `DenseInfo` carries, fixed for the group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DenseColumns(u8);
+
+impl DenseColumns {
+    const VERSION: u8 = 1;
+    const TIMESTAMP: u8 = 1 << 1;
+    const CHANGESET: u8 = 1 << 2;
+    const UID: u8 = 1 << 3;
+    const USER: u8 = 1 << 4;
+    const VISIBLE: u8 = 1 << 5;
+    const CORE: u8 = Self::VERSION | Self::TIMESTAMP | Self::CHANGESET | Self::UID | Self::USER;
+
+    /// Every column, `visible` included: what `BlockBuilder` writes for a
+    /// node added with complete metadata.
+    pub const ALL: Self = Self(Self::CORE | Self::VISIBLE);
+
+    /// The columns a parsed `DenseInfo` carries: those with any bytes.
+    /// Validation made every non-empty column exactly as long as the id
+    /// array, so non-empty is present.
+    pub(crate) fn of(info: &WireDenseInfo<'_>) -> Self {
+        let mut bits = 0;
+        for (data, bit) in [
+            (info.version_data, Self::VERSION),
+            (info.timestamp_data, Self::TIMESTAMP),
+            (info.changeset_data, Self::CHANGESET),
+            (info.uid_data, Self::UID),
+            (info.user_sid_data, Self::USER),
+            (info.visible_data, Self::VISIBLE),
+        ] {
+            if !data.is_empty() {
+                bits |= bit;
+            }
+        }
+        Self(bits)
+    }
+
+    /// The columns a re-encode writes for a slot read with these columns:
+    /// all six when the five core columns are present (the builder's
+    /// complete-metadata shape, with absent `visible` written as the
+    /// `true` it reads as), otherwise exactly these.
+    #[must_use]
+    pub(crate) fn for_reencode(self) -> Self {
+        if self.0 & Self::CORE == Self::CORE {
+            Self::ALL
+        } else {
+            self
+        }
+    }
+
+    /// No column at all.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// All five of version, timestamp, changeset, uid and user.
+    #[must_use]
+    pub fn has_core(self) -> bool {
+        self.0 & Self::CORE == Self::CORE
+    }
+
+    /// The version column is present.
+    #[must_use]
+    pub fn version(self) -> bool {
+        self.0 & Self::VERSION != 0
+    }
+
+    /// The timestamp column is present.
+    #[must_use]
+    pub fn timestamp(self) -> bool {
+        self.0 & Self::TIMESTAMP != 0
+    }
+
+    /// The changeset column is present.
+    #[must_use]
+    pub fn changeset(self) -> bool {
+        self.0 & Self::CHANGESET != 0
+    }
+
+    /// The uid column is present.
+    #[must_use]
+    pub fn uid(self) -> bool {
+        self.0 & Self::UID != 0
+    }
+
+    /// The user name column is present.
+    #[must_use]
+    pub fn user(self) -> bool {
+        self.0 & Self::USER != 0
+    }
+
+    /// The visible column is present.
+    #[must_use]
+    pub fn visible(self) -> bool {
+        self.0 & Self::VISIBLE != 0
+    }
 }
 
 impl<'a> DenseNodeInfo<'a> {
@@ -309,6 +422,12 @@ impl<'a> DenseNodeInfo<'a> {
     #[inline]
     pub fn version(&self) -> i32 {
         self.version
+    }
+
+    /// The `DenseInfo` columns this node's group carries.
+    #[inline]
+    pub fn columns(&self) -> DenseColumns {
+        self.columns
     }
 
     /// Returns the changeset id.
@@ -329,13 +448,17 @@ impl<'a> DenseNodeInfo<'a> {
         self.user_sid
     }
 
-    /// Returns the user name.
+    /// Returns the user name; the empty name when the group has no user
+    /// column, without a string-table lookup.
     ///
     /// A string index past the block's string table is
     /// `StringtableIndexOutOfBounds`; a negative one is a wire-format error,
     /// as for `RelMember::role`.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Result<&'a str> {
+        if !self.columns.user() {
+            return Ok("");
+        }
         if self.user_sid < 0 {
             return Err(crate::error::new_wire_error(
                 "dense node info has negative user string index",
@@ -384,11 +507,16 @@ impl<'a> DenseNodeInfo<'a> {
     /// The metadata fields this slot claims, for outputs that print them;
     /// `None` when it claims nothing.
     ///
-    /// The packed columns decode a value for every field of every slot, so
-    /// presence has to be read from the values:
+    /// A field whose column the group lacks is never claimed, except
+    /// `visible` on a versioned slot (below). A present column decodes a
+    /// value for every slot, so presence has to be read from the values:
     ///
-    /// - version >= 1: every field is claimed as decoded, zeros included.
-    /// - version 0: no version claim, and a zero in any other column is
+    /// - version >= 1: every present field is claimed as decoded, zeros
+    ///   included, except that a changeset of -1, the Osmosis sentinel, is
+    ///   claimed as 0, as libosmium reads it. `visible` is claimed as
+    ///   decoded, `true` when its column is absent.
+    /// - version below 1 (0, the Osmosis -1, or any other negative value):
+    ///   no version claim, and a zero in any other column is
     ///   indistinguishable from the padding a writer stores for a node
     ///   without metadata (pbfhogg's `BlockBuilder` and libosmium store all
     ///   zeros there). So each other field is claimed only by a value no
@@ -407,25 +535,37 @@ impl<'a> DenseNodeInfo<'a> {
     ///   Non-zero fields survive, which is what an apply-changes element
     ///   with a timestamp but no version, or `osmium cat --clean version`
     ///   output, carries.
-    /// - version < 0: no metadata. -1 is the Osmosis "absent" sentinel, and
-    ///   the conversions that re-encode a dense node drop such a slot too,
-    ///   so printing and rewriting agree.
+    ///   A negative version used to drop the whole slot; it no longer does,
+    ///   as libosmium reads -1 as "no version" and keeps the other fields.
+    ///   An absent column decodes as 0 (`visible` as true), which no value
+    ///   test claims, so the column rule needs no extra check here.
     ///
+    /// The re-encoding conversions (`dense_node_metadata` and its kin) write
+    /// what this reads back the same, apart from the sub-second part of a
+    /// timestamp, which they truncate to whole seconds.
+    ///
+    /// Always `Some` today; the `Option` stays for the callers' shape.
     /// Computed only where an output reads metadata; the dense iterator
     /// and the re-encoding conversions do not call it.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn claims(&self) -> Option<DenseClaims<'a>> {
         if self.version >= 1 {
+            let columns = self.columns;
             return Some(DenseClaims {
+                // An absent version column reads 0, so this one is present.
                 version: Some(self.version),
-                milli_timestamp: Some(self.milli_timestamp()),
-                changeset: Some(self.changeset),
-                uid: Some(self.uid),
-                user: Some(self.user()),
+                milli_timestamp: columns.timestamp().then(|| self.milli_timestamp()),
+                // libosmium reads the Osmosis -1 as 0, and the re-encoding
+                // conversions write it so.
+                changeset: columns.changeset().then_some(if self.changeset == -1 {
+                    0
+                } else {
+                    self.changeset
+                }),
+                uid: columns.uid().then_some(self.uid),
+                user: columns.user().then(|| self.user()),
                 visible: Some(self.visible),
             });
-        }
-        if self.version < 0 {
-            return None;
         }
         let milli_timestamp = self.milli_timestamp();
         let user = match self.user_sid {
@@ -462,14 +602,19 @@ pub(crate) struct DenseClaims<'a> {
 
 /// An iterator over dense nodes info. It decodes the delta encoded values.
 ///
-/// `next` returns `None` as soon as any of the five core arrays runs out,
-/// which on a short array would silently blank the metadata of every remaining
+/// `next` returns `None` as soon as any present core column runs out, which
+/// on a short array would silently blank the metadata of every remaining
 /// node in the group rather than reporting corruption. `Iterator::next` cannot
 /// report anything, so the invariant is enforced one layer up instead:
 /// `validate_dense_info_arrays` in `block.rs` runs at every `PrimitiveBlock`
 /// constructor and rejects a `denseinfo` whose arrays are neither absent nor
-/// exactly as long as the id array. By the time this iterator exists, the only
-/// way to run out early is to have had nothing to begin with.
+/// exactly as long as the id array.
+///
+/// Column presence is chosen once per group ([`DenseColumns`]). A column
+/// read keeps the single `None` test of a complete group; only on `None` does
+/// the cold `absent` step tell the end of a present column (stop) from a
+/// column the group lacks (read 0). So a complete-column group does no more
+/// work per node than before partial columns were read.
 pub struct DenseNodeInfoIter<'a> {
     block: &'a WireBlock<'static>,
     versions: PackedInt32Iter<'a>,
@@ -482,12 +627,31 @@ pub struct DenseNodeInfoIter<'a> {
     duser_sids: PackedSint32Iter<'a>,
     cuser_sid: i32,
     visible: PackedBoolIter<'a>,
+    columns: DenseColumns,
     date_granularity: i64,
 }
 
+/// The value of a column read that returned `None`: the end of iteration
+/// (`None`) when the group carries `column`, else the 0 an absent column
+/// reads as. Cold: on a complete group it runs once, at the end.
+#[cold]
+#[inline(never)]
+fn absent<T: Default>(columns: DenseColumns, column: fn(DenseColumns) -> bool) -> Option<T> {
+    if column(columns) {
+        None
+    } else {
+        Some(T::default())
+    }
+}
+
 impl<'a> DenseNodeInfoIter<'a> {
-    fn new(block: &'a WireBlock<'static>, info: WireDenseInfo<'a>) -> DenseNodeInfoIter<'a> {
+    fn new(
+        block: &'a WireBlock<'static>,
+        info: WireDenseInfo<'a>,
+        columns: DenseColumns,
+    ) -> DenseNodeInfoIter<'a> {
         DenseNodeInfoIter {
+            columns,
             block,
             versions: PackedInt32Iter::new(info.version_data),
             dtimestamps: PackedSint64Iter::new(info.timestamp_data),
@@ -508,11 +672,27 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
     type Item = DenseNodeInfo<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let version = self.versions.next()?;
-        let dtimestamp = self.dtimestamps.next()?;
-        let dchangeset = self.dchangesets.next()?;
-        let duid = self.duids.next()?;
-        let duser_sid = self.duser_sids.next()?;
+        let columns = self.columns;
+        let version = match self.versions.next() {
+            Some(v) => v,
+            None => absent(columns, DenseColumns::version)?,
+        };
+        let dtimestamp = match self.dtimestamps.next() {
+            Some(v) => v,
+            None => absent(columns, DenseColumns::timestamp)?,
+        };
+        let dchangeset = match self.dchangesets.next() {
+            Some(v) => v,
+            None => absent(columns, DenseColumns::changeset)?,
+        };
+        let duid = match self.duids.next() {
+            Some(v) => v,
+            None => absent(columns, DenseColumns::uid)?,
+        };
+        let duser_sid = match self.duser_sids.next() {
+            Some(v) => v,
+            None => absent(columns, DenseColumns::user)?,
+        };
         let visible_opt = self.visible.next();
 
         // DenseInfo deltas are modular too, including the signed int32 arrays.
@@ -529,6 +709,7 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
             uid: self.cuid,
             user_sid: self.cuser_sid,
             visible: visible_opt.unwrap_or(true),
+            columns,
             date_granularity: self.date_granularity,
         })
     }
@@ -709,6 +890,182 @@ mod tests {
             assert_eq!(checked.size_hint(), (0, Some(0)));
             assert!(checked.next().is_none());
         }
+    }
+
+    fn meta(version: i32, timestamp: i64, changeset: i64, uid: i32, user: &str) -> Metadata<'_> {
+        Metadata {
+            version,
+            timestamp,
+            changeset,
+            uid,
+            user,
+            visible: true,
+        }
+    }
+
+    fn dense_infos(block: &PrimitiveBlock) -> Vec<(i64, Option<DenseNodeInfo<'_>>)> {
+        block
+            .elements()
+            .map(|element| match element {
+                Element::DenseNode(node) => (node.id(), node.info().cloned()),
+                _ => panic!("the fixture contains dense nodes only"),
+            })
+            .collect()
+    }
+
+    const VERSION_TIMESTAMP: DenseColumns =
+        DenseColumns(DenseColumns::VERSION | DenseColumns::TIMESTAMP);
+
+    /// libosmium's `add_metadata=version+timestamp` shape: a group carrying
+    /// two columns reads both, reads the others as absent (0, visible true,
+    /// empty user without a lookup), claims only what it carries, and
+    /// re-encodes dense with the same two columns, not with invented ones.
+    #[test]
+    fn partial_columns_read_claim_and_reencode_without_inventing_columns() {
+        use crate::block_builder::DenseMetadata;
+        let mut builder = BlockBuilder::new();
+        for (id, version, ts) in [(1, 3, 100), (2, 4, 200)] {
+            builder.add_node_dense(
+                id,
+                0,
+                0,
+                [],
+                Some(&DenseMetadata {
+                    meta: Metadata {
+                        visible: false,
+                        ..meta(version, ts, 9, 7, "u")
+                    },
+                    columns: VERSION_TIMESTAMP,
+                }),
+            );
+        }
+        // A complete node after them goes into a group of its own.
+        builder.add_node(3, 0, 0, [], Some(&meta(5, 300, 11, 13, "v")));
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+
+        let infos = dense_infos(&block);
+        assert_eq!(infos.len(), 3);
+        for ((id, info), (want_version, want_ts)) in infos[..2].iter().zip([(3, 100), (4, 200)]) {
+            let info = info
+                .as_ref()
+                .unwrap_or_else(|| panic!("node {id} has info"));
+            assert_eq!(info.columns(), VERSION_TIMESTAMP);
+            assert_eq!(info.version(), want_version);
+            assert_eq!(info.milli_timestamp(), want_ts * 1000);
+            assert_eq!((info.changeset(), info.uid()), (0, 0));
+            assert_eq!(info.user().unwrap(), "");
+            assert!(info.visible(), "absent visible reads true");
+            let claims = info.claims().unwrap();
+            assert_eq!(claims.version, Some(want_version));
+            assert_eq!(claims.milli_timestamp, Some(want_ts * 1000));
+            assert_eq!((claims.changeset, claims.uid), (None, None));
+            assert!(claims.user.is_none());
+            assert_eq!(claims.visible, Some(true));
+        }
+        let complete = infos[2].1.as_ref().unwrap();
+        assert_eq!(complete.columns(), DenseColumns::ALL);
+        assert_eq!((complete.version(), complete.uid()), (5, 13));
+
+        // Re-encode every node through the conversion the commands use.
+        let mut out = BlockBuilder::new();
+        for element in block.elements() {
+            let Element::DenseNode(node) = element else {
+                panic!("dense only");
+            };
+            let meta = crate::owned::dense_node_metadata(&node).unwrap();
+            out.add_node_dense(node.id(), 0, 0, [], meta.as_ref());
+        }
+        let bytes = out.take().unwrap().unwrap().to_vec();
+        let back = PrimitiveBlock::from_vec(bytes).unwrap();
+        let back = dense_infos(&back);
+        let columns: Vec<_> = back
+            .iter()
+            .map(|(_, i)| i.as_ref().unwrap().columns())
+            .collect();
+        assert_eq!(
+            columns,
+            [VERSION_TIMESTAMP, VERSION_TIMESTAMP, DenseColumns::ALL]
+        );
+        let values: Vec<_> = back
+            .iter()
+            .map(|(id, i)| {
+                let i = i.as_ref().unwrap();
+                (*id, i.version(), i.milli_timestamp())
+            })
+            .collect();
+        assert_eq!(values, [(1, 3, 100_000), (2, 4, 200_000), (3, 5, 300_000)]);
+    }
+
+    /// A history file written without metadata carries `visible` alone.
+    #[test]
+    fn a_visible_only_group_reads_and_claims_only_visibility() {
+        use crate::block_builder::DenseMetadata;
+        let mut builder = BlockBuilder::new();
+        for (id, visible) in [(1, false), (2, true)] {
+            builder.add_node_dense(
+                id,
+                0,
+                0,
+                [],
+                Some(&DenseMetadata {
+                    meta: Metadata {
+                        visible,
+                        ..meta(0, 0, 0, 0, "")
+                    },
+                    columns: DenseColumns(DenseColumns::VISIBLE),
+                }),
+            );
+        }
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let infos = dense_infos(&block);
+        assert_eq!(infos.len(), 2, "the id array bounds a visible-only group");
+        let first = infos[0].1.as_ref().unwrap();
+        assert!(!first.visible());
+        let claims = first.claims().unwrap();
+        assert_eq!(claims.version, None);
+        assert_eq!(claims.visible, Some(false));
+        assert!(infos[1].1.as_ref().unwrap().visible());
+    }
+
+    /// The Osmosis -1 version no longer blanks the slot: printing claims its
+    /// real fields by value, and the re-encode keeps them with version 0 and
+    /// the -1 changeset as 0.
+    #[test]
+    fn a_minus_one_version_keeps_its_other_fields() {
+        let mut builder = BlockBuilder::new();
+        builder.add_node(1, 0, 0, [], Some(&meta(-1, 5, -1, 9, "bob")));
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let Some(Element::DenseNode(node)) = block.elements().next() else {
+            panic!("dense node");
+        };
+        let claims = node.info().unwrap().claims().unwrap();
+        assert_eq!(claims.version, None);
+        assert_eq!(claims.milli_timestamp, Some(5000));
+        assert_eq!((claims.changeset, claims.uid), (None, Some(9)));
+        assert_eq!(claims.user.unwrap().unwrap(), "bob");
+
+        let converted = crate::owned::dense_node_metadata(&node).unwrap().unwrap();
+        assert_eq!(converted.meta, meta(0, 5, 0, 9, "bob"));
+        assert_eq!(converted.columns, DenseColumns::ALL);
+    }
+
+    /// A versioned slot's -1 changeset claims 0, which is what re-encoding
+    /// writes, so the output claims what the input did.
+    #[test]
+    fn a_versioned_minus_one_changeset_claims_zero() {
+        let mut builder = BlockBuilder::new();
+        builder.add_node(1, 0, 0, [], Some(&meta(2, 5, -1, 9, "bob")));
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let Some(Element::DenseNode(node)) = block.elements().next() else {
+            panic!("dense node");
+        };
+        assert_eq!(node.info().unwrap().claims().unwrap().changeset, Some(0));
+        let converted = crate::owned::dense_node_metadata(&node).unwrap().unwrap();
+        assert_eq!(converted.meta.changeset, 0);
     }
 
     // MIN then MAX makes every second delta -1, so each running sum (ID,

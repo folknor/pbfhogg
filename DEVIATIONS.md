@@ -942,15 +942,20 @@ whose metadata is complete with a version of at least 1 is written dense; any
 other node with metadata is written as a plain `Node` (a DenseInfo column
 cannot leave one node's field out, and a version-0 dense slot does not claim
 its zero fields). Absent visibility on a node written dense becomes visible,
-the PBF default. Dense input nodes are re-encoded dense as decoded.
+the PBF default. Dense input nodes are re-encoded dense as decoded, with the
+DenseInfo columns their group carried (a group with all five core columns
+is written with all six); the Osmosis `-1` version and changeset are
+written as 0, which is how libosmium reads them and how pbfhogg's metadata
+outputs read them.
 
-## PBF decoding: a DenseInfo with only some columns is refused
+## PBF decoding: a short DenseInfo column is refused
 
 libosmium's PBF writer emits each DenseInfo column independently under
-`add_metadata` (for example `add_metadata=version+timestamp` writes only the
-version and timestamp columns), and its reader accepts any subset. pbfhogg
-refuses a DenseInfo that carries some but not all of the version, timestamp,
-changeset, uid and user columns, so such an osmium output cannot be read.
-This is a refusal, not a silent loss: the dense iterator decodes a slot only
-while every column yields, so accepting the shape without per-group column
-presence would blank the metadata of every node in the group.
+`add_metadata` (`add_metadata=version+timestamp` writes two columns; a
+history file written without metadata carries `visible` alone), and pbfhogg
+reads any such subset as libosmium does: an absent column reads as 0, absent
+`visible` as true, an absent user as the empty name. Where they differ is a
+present column shorter or longer than the id array: libosmium tests each
+column for emptiness per node, so it reads the missing tail as absent, while
+pbfhogg refuses the block. Re-encoding keeps a partial-column group's
+columns, dense, without adding any.

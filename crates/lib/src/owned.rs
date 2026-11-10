@@ -3,8 +3,9 @@
 //! Used by the blob-level merge (sort, cat --dedupe) and time_filter for
 //! overlap-run and sweep-merge operations.
 
+use crate::DenseColumns;
 use crate::block_builder::{
-    BlockBuilder, MemberData, Metadata, OwnedBlock, PartialMetadata, RawMetadata,
+    BlockBuilder, DenseMetadata, MemberData, Metadata, OwnedBlock, PartialMetadata, RawMetadata,
     RawPartialMetadata,
 };
 
@@ -170,6 +171,9 @@ pub(crate) enum OwnedMetadata {
         uid: i32,
         user: String,
         visible: bool,
+        /// The columns the node is written with (`DenseColumns::for_reencode`
+        /// of its source group); a field outside them is 0 and unwritten.
+        columns: DenseColumns,
     },
     Plain {
         version: Option<i32>,
@@ -290,7 +294,8 @@ impl OwnedMetadata {
     /// Own a dense node's [`Metadata`] from [`dense_node_metadata`], so an
     /// owned element and a borrowed re-encode of the same input write the
     /// same metadata.
-    fn from_dense(meta: Metadata<'_>) -> Self {
+    fn from_dense(dense: DenseMetadata<'_>) -> Self {
+        let meta = dense.meta;
         Self::Dense {
             version: meta.version,
             timestamp: meta.timestamp,
@@ -298,6 +303,7 @@ impl OwnedMetadata {
             uid: meta.uid,
             user: meta.user.to_owned(),
             visible: meta.visible,
+            columns: dense.columns,
         }
     }
 
@@ -330,9 +336,11 @@ impl OwnedMetadata {
         }
     }
 
-    /// The metadata as the builder takes it: `Ok` complete metadata for a
-    /// dense node, `Err` partial metadata for a plain element.
-    pub(crate) fn as_borrowed(&self) -> std::result::Result<Metadata<'_>, PartialMetadata<'_>> {
+    /// The metadata as the builder takes it: `Ok` dense metadata with its
+    /// columns for a dense node, `Err` partial metadata for a plain element.
+    pub(crate) fn as_borrowed(
+        &self,
+    ) -> std::result::Result<DenseMetadata<'_>, PartialMetadata<'_>> {
         match self {
             Self::Dense {
                 version,
@@ -341,13 +349,17 @@ impl OwnedMetadata {
                 uid,
                 user,
                 visible,
-            } => Ok(Metadata {
-                version: *version,
-                timestamp: *timestamp,
-                changeset: *changeset,
-                uid: *uid,
-                user,
-                visible: *visible,
+                columns,
+            } => Ok(DenseMetadata {
+                meta: Metadata {
+                    version: *version,
+                    timestamp: *timestamp,
+                    changeset: *changeset,
+                    uid: *uid,
+                    user,
+                    visible: *visible,
+                },
+                columns: *columns,
             }),
             Self::Plain {
                 version,
@@ -368,16 +380,20 @@ impl OwnedMetadata {
     }
 
     /// The metadata as partial metadata, for a way or relation (which never
-    /// carries dense metadata; a dense value converts field for field).
+    /// carries dense metadata; a dense value converts field for field, each
+    /// present when its column is).
     fn as_partial(&self) -> PartialMetadata<'_> {
         match self.as_borrowed() {
-            Ok(m) => PartialMetadata {
-                version: Some(m.version),
-                timestamp: Some(m.timestamp),
-                changeset: Some(m.changeset),
-                uid: Some(m.uid),
-                user: Some(m.user),
-                visible: Some(m.visible),
+            Ok(DenseMetadata {
+                meta: m,
+                columns: c,
+            }) => PartialMetadata {
+                version: c.version().then_some(m.version),
+                timestamp: c.timestamp().then_some(m.timestamp),
+                changeset: c.changeset().then_some(m.changeset),
+                uid: c.uid().then_some(m.uid),
+                user: c.user().then_some(m.user),
+                visible: c.visible().then_some(m.visible),
             },
             Err(p) => p,
         }
@@ -411,7 +427,7 @@ pub(crate) fn add_owned_node(bb: &mut BlockBuilder, node: &OwnedNode) {
     let tags = node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     match node.metadata.as_ref().map(OwnedMetadata::as_borrowed) {
         None => bb.add_node(node.id, node.decimicro_lat, node.decimicro_lon, tags, None),
-        Some(Ok(full)) => bb.add_node(
+        Some(Ok(full)) => bb.add_node_dense(
             node.id,
             node.decimicro_lat,
             node.decimicro_lon,
@@ -462,9 +478,17 @@ pub(crate) fn add_owned_relation(bb: &mut BlockBuilder, rel: &OwnedRelation) {
 // Borrowed-element to Metadata extraction
 // ---------------------------------------------------------------------------
 
-/// Map sentinel value -1 to 0 for `dense_node_metadata` and
-/// `dense_node_raw_metadata`. The PBF spec uses -1 in DenseInfo
-/// fields where the type is plain `i64` rather than `Option`.
+/// The version a dense slot is re-encoded with: the Osmosis -1 "absent"
+/// sentinel becomes 0, as libosmium reads it. Both are "no version" to
+/// `DenseNodeInfo::claims`, so the slot claims the same; any other value,
+/// a version below -1 included, is written as decoded.
+#[inline]
+fn reencoded_version(version: i32) -> i32 {
+    if version == -1 { 0 } else { version }
+}
+
+/// The changeset a dense slot is re-encoded with: the Osmosis -1 becomes 0,
+/// as libosmium reads it and as `DenseNodeInfo::claims` claims it.
 #[inline]
 fn map_sentinel(value: i64) -> i64 {
     if value == -1 { 0 } else { value }
@@ -526,16 +550,22 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
     Ok((meta != PartialMetadata::default()).then_some(meta))
 }
 
-/// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode), for
-/// re-encoding.
+/// Extract [`DenseMetadata`] from a [`DenseNode`](crate::DenseNode), for
+/// re-encoding it dense through `BlockBuilder::add_node_dense`.
 ///
-/// Returns `None` if the node has no info block, or carries the Osmosis -1
-/// "absent" version. A version of 0 keeps its metadata. The user name is
-/// resolved as in [`element_metadata`]: a bad user string index is an error,
-/// not an empty user.
+/// Returns `None` only if the node's group has no `DenseInfo` column. The
+/// slot is kept as decoded, columns included
+/// ([`DenseColumns::for_reencode`]: a partial-column group keeps its
+/// columns, a complete one gains `visible`, read as `true`), except that a
+/// version of -1 is written as 0 (both claim no version) and a changeset of
+/// -1 as 0 (which `claims` reads it as). So
+/// `DenseNodeInfo::claims` reads the output as it read the input, apart
+/// from sub-second timestamps, which are truncated to whole seconds. The
+/// user name is resolved as in [`element_metadata`]: a bad user string index
+/// is an error, not an empty user.
 pub(crate) fn dense_node_metadata<'a>(
     dn: &'a crate::DenseNode<'a>,
-) -> Result<Option<Metadata<'a>>> {
+) -> Result<Option<DenseMetadata<'a>>> {
     dense_node_metadata_impl::<true>(dn)
 }
 
@@ -549,15 +579,15 @@ pub(crate) fn dense_node_metadata<'a>(
 /// on the user. Roles have no `--clean` and stay refused.
 pub(crate) fn dense_node_metadata_dropping_user<'a>(
     dn: &'a crate::DenseNode<'a>,
-) -> Result<Option<Metadata<'a>>> {
+) -> Result<Option<DenseMetadata<'a>>> {
     dense_node_metadata_impl::<false>(dn)
 }
 
 #[inline]
 fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
     dn: &'a crate::DenseNode<'a>,
-) -> Result<Option<Metadata<'a>>> {
-    let Some(info) = dn.info().filter(|info| info.version() != -1) else {
+) -> Result<Option<DenseMetadata<'a>>> {
+    let Some(info) = dn.info() else {
         return Ok(None);
     };
     let user = if RESOLVE_USER {
@@ -572,13 +602,16 @@ fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
     } else {
         ""
     };
-    Ok(Some(Metadata {
-        version: info.version(),
-        timestamp: info.milli_timestamp() / 1000,
-        changeset: map_sentinel(info.changeset()),
-        uid: info.uid(),
-        user,
-        visible: info.visible(),
+    Ok(Some(DenseMetadata {
+        meta: Metadata {
+            version: reencoded_version(info.version()),
+            timestamp: info.milli_timestamp() / 1000,
+            changeset: map_sentinel(info.changeset()),
+            uid: info.uid(),
+            user,
+            visible: info.visible(),
+        },
+        columns: info.columns().for_reencode(),
     }))
 }
 
@@ -641,18 +674,18 @@ pub(crate) fn element_raw_partial_metadata(info: &crate::Info<'_>) -> Option<Raw
 }
 
 /// Extract [`RawMetadata`] from a [`DenseNode`](crate::DenseNode), preserving
-/// the raw string table index for the user name.
+/// the raw string table index for the user name, under
+/// [`dense_node_metadata`]'s rules.
 pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMetadata> {
-    dn.info()
-        .filter(|info| info.version() != -1)
-        .map(|info| RawMetadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: map_sentinel(info.changeset()),
-            uid: info.uid(),
-            user_sid: info.raw_user_sid(),
-            visible: info.visible(),
-        })
+    dn.info().map(|info| RawMetadata {
+        version: reencoded_version(info.version()),
+        timestamp: info.milli_timestamp() / 1000,
+        changeset: map_sentinel(info.changeset()),
+        uid: info.uid(),
+        user_sid: info.raw_user_sid(),
+        visible: info.visible(),
+        columns: info.columns().for_reencode(),
+    })
 }
 
 // ---------------------------------------------------------------------------

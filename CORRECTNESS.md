@@ -145,16 +145,17 @@ historical version.
    and all command paths with zero additional overhead - the parse loop is already
    branchy, and two comparisons on values in registers are invisible.
 
-2. **Dense nodes:** Normalized at write/conversion boundaries only. `DenseNodeInfo`
+2. **Dense nodes:** Read at the claim and conversion boundaries only. `DenseNodeInfo`
    stores `version: i32` and `changeset: i64` as plain non-optional values decoded
    from packed arrays in the dense node iterator - the tightest loop in the library
    (~8 billion iterations for planet). Changing these to `Option` would add per-element
    overhead on a path where every nanosecond matters. Instead, the sites that
-   bridge dense reads to writes guard against -1:
+   bridge dense reads to outputs read -1 as libosmium does (version -1 is no
+   version, changeset -1 is 0), and keep the slot's other fields:
    - `dense_node_metadata`, `dense_node_raw_metadata` and `read_dense_node` in
-     `crates/lib/src/owned.rs`
-   - the derive OSC writer in `crates/lib/src/osc/write.rs`, through
-     `DenseNodeInfo::claims`
+     `crates/lib/src/owned.rs` write both as 0 (a slot is never dropped for
+     its version)
+   - every printing output, through `DenseNodeInfo::claims`
 
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
 directly (not through pbfhogg's commands) will still observe raw `-1` values from
@@ -183,9 +184,12 @@ encoding is left alone; outputs that print metadata read it instead:
   `DenseNodeInfo::claimed_version()` are the public form of the rule; `version()`
   still returns the raw value.
 - **The other fields of an `Info`** keep their own presence, zeros included.
-- **The other fields of a `DenseInfo` slot** depend on its version, because a
-  packed column cannot mark one slot absent. Version 1 or more: every field is
-  present as decoded. Negative: no metadata (the Osmosis rule above). Version 0:
+- **The other fields of a `DenseInfo` slot** depend on the group's columns and
+  the slot's version, because a packed column cannot mark one slot absent. A
+  column the group lacks is never claimed (libosmium writes any subset of
+  columns); `visible` reads true without its column. Version 1 or more: every
+  present field is claimed as decoded, a changeset of -1 as 0. Below 1 (0, the
+  Osmosis -1, or any other negative value; the slot is never dropped):
   a field counts only with a value no padding slot holds - non-zero timestamp,
   positive changeset and uid, a non-empty user, `visible` false (the first four
   are the value tests of libosmium's `detect_available_metadata`). So the
@@ -193,8 +197,11 @@ encoding is left alone; outputs that print metadata read it instead:
   fields. A zero field in such a slot (an anonymous `uid` 0, say) is dropped: on
   the wire it cannot be told apart from padding.
 
-Re-encoding is unaffected: the conversions that feed a rewrite keep a version-0
-slot and its fields as they are, and drop only `-1` slots. A plain `Info` is
+Re-encoding keeps what these rules read: the conversions that feed a rewrite
+keep every dense slot, its fields and its group's columns (a complete group is
+written with all six), writing a `-1` version or changeset as 0, so the
+output claims what the input did, apart from sub-second timestamps, which are
+truncated to whole seconds. A plain `Info` is
 re-encoded with each field present exactly when it was decoded present
 (`element_metadata` in `crates/lib/src/owned.rs`): the `-1` version or
 changeset stays absent, the other fields stay as carried, and a node is

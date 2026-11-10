@@ -533,7 +533,7 @@ pub(super) fn try_extract_multi_single_pass(
                         let meta = dense_node_metadata(dn)?;
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_node(
+                            bbs[i].add_node_dense(
                                 id,
                                 dn.decimicro_lat(),
                                 dn.decimicro_lon(),

@@ -1286,7 +1286,7 @@ fn process_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn)?;
-                    bb.add_node(
+                    bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),

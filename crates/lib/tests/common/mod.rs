@@ -1305,18 +1305,18 @@ fn meta_from_dense_node(dn: &pbfhogg::DenseNode<'_>) -> Option<NormalizedMeta> {
     dn.info()
         .filter(|i| {
             // The product's presence rule (`DenseNodeInfo::claims`): version
-            // >= 1 claims metadata; version 0 only through a value padding
-            // never holds; below 0 is the "absent" sentinel.
+            // >= 1 claims metadata; a version below 1 (0 or the Osmosis -1)
+            // only through a value padding never holds.
             i.claimed_version().is_some()
-                || (i.version() == 0
-                    && (i.milli_timestamp() != 0
-                        || i.changeset() > 0
-                        || i.uid() > 0
-                        || !i.user().unwrap_or("").is_empty()
-                        || !i.visible()))
+                || i.milli_timestamp() != 0
+                || i.changeset() > 0
+                || i.uid() > 0
+                || !i.user().unwrap_or("").is_empty()
+                || !i.visible()
         })
         .map(|i| NormalizedMeta {
-            version: i.version(),
+            // -1 and 0 are both "no version"; re-encoding writes -1 as 0.
+            version: i.claimed_version().unwrap_or(0),
             timestamp: i.milli_timestamp() / 1000,
             changeset: i.changeset(),
             uid: i.uid(),

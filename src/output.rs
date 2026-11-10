@@ -1186,6 +1186,17 @@ fn inspect(
             // Replacing a directory deletes the old one whole once the new
             // one is in place.
             if shape == Shape::Dir {
+                // Linux checks MAY_WRITE on a directory moved to a new
+                // parent. Our backup container is a new parent even when
+                // it lives beside the destination. Check effective access,
+                // not mode bits: ACLs and privileges can grant it too.
+                #[cfg(target_os = "linux")]
+                writable_dir(dest).map_err(|e| {
+                    Error::from(e).context(format!(
+                        "output directory {} is not writable; replacing it requires moving it into a backup container",
+                        dest.display()
+                    ))
+                })?;
                 refuse_leftovers_inside(dest)?;
             }
         }
@@ -3240,7 +3251,8 @@ impl OutputDir {
     /// [`OutputError::MountPoint`] in place of `NotAFile`;
     /// [`OutputError::HoldsLeftovers`] for an existing directory to be
     /// replaced that holds anything pbfhogg never deletes; plus whatever
-    /// `validator` refuses.
+    /// `validator` refuses. On Linux an existing directory must be writable
+    /// by the effective user so it can be moved into its backup container.
     pub fn new(
         destination: impl AsRef<Path>,
         overwrite: Overwrite,
@@ -3979,6 +3991,55 @@ mod tests {
 
         let err = OutputDir::new(&dest, Overwrite::Refuse, None, &discard()).unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Exists { .. }));
+    }
+
+    /// All backup placements change the old directory's parent. Refuse
+    /// before reserving staging, and recheck if permissions change later.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_directory_output_is_refused_before_work() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can move the directory despite these mode bits.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = scratch();
+        let dest = dir.path().join("index");
+        let staging = dir.path().join("staging");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(dest.join("old.bin"), b"old").unwrap();
+        for placement in [
+            Staging::Beside,
+            Staging::Dir(&staging),
+            Staging::DirWithBackups(&staging),
+        ] {
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o555)).unwrap();
+            let refused =
+                OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard());
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+            let err = refused.unwrap_err();
+            assert!(err.report().contains("output directory"), "{err}");
+            assert!(err.report().contains("is not writable"), "{err}");
+            assert!(err.report().contains(&dest.display().to_string()), "{err}");
+            assert!(others(dir.path(), &["index", "staging"]).is_empty());
+            assert!(others(&staging, &[]).is_empty());
+
+            let out =
+                OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard())
+                    .unwrap();
+            stage_dir(&out, "new.bin", b"new");
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o555)).unwrap();
+            let result = out.publish(run_token());
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+            let err = result.unwrap_err();
+            assert!(err.report().contains("is not writable"), "{err}");
+            assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
+            assert!(!dest.join("new.bin").exists());
+            assert!(others(dir.path(), &["index", "staging"]).is_empty());
+            assert!(others(&staging, &[]).is_empty());
+        }
     }
 
     #[test]

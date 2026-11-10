@@ -63,31 +63,24 @@ The largest speedups come from blob passthrough (sort, apply-changes, cat --type
 
 ## Extract benchmarks
 
-Japan (2.4 GB, 344M elements, Tokyo bbox), on plantasjen; these figures predate the CLI command table above and the commit they were taken at is not recorded here:
+Japan (2.4 GB, Tokyo bbox), indexed PBFs, on plantasjen at commit
+`cadc3e6`. Best of three runs (or single-sample where noted in the source):
+[reference/performance.md, Extract](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md#extract).
 
-| Strategy | pbfhogg | osmium | ratio |
-|----------|---------|--------|-------|
-| simple | **4.4s** | 7.2s | **1.6x faster** |
-| complete-ways | **4.4s** | 11.0s | **2.5x faster** |
-| smart | **5.2s** | 13.4s | **2.6x faster** |
+| Strategy | pbfhogg |
+|----------|---------|
+| simple | **3.8s** |
+| complete-ways | **3.7s** |
+| smart | **4.7s** |
 
 Simple extract uses a 3-phase barrier pipeline with parallel classification and raw frame passthrough. Complete-ways and smart use multi-pass parallel pread classification. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
 
 ## Apply-changes at scale
 
-Single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing, on plantasjen at commit `a6ebbfe`:
-
-| Dataset | Config | Time | vs osmium |
-|---------|--------|------|-----------|
-| Japan (2.4 GB, 43K diff) | indexdata + zlib | **3.0s** | **15x** faster |
-| Germany (4.5 GB, 146K diff) | buffered + zlib | **5.3s** | -- |
-| Germany (4.5 GB, 146K diff) | buffered + none | **3.4s** | -- |
-| N. America (18.8 GB, 645K diff) | buffered + zlib | **17.3s** | -- |
-| N. America (18.8 GB, 645K diff) | buffered + none | **14.9s** | -- |
-| N. America (18.8 GB, 645K diff) | io_uring + zlib | **15.2s** | -- |
-| N. America (18.8 GB, 645K diff) | io_uring + none | **11.9s** | -- |
-
-At Japan scale, osmium takes 36.6s for the same operation. pbfhogg passes ~92% of blobs through as raw bytes without decompression, using blob-level indexdata for O(1) classification. RSS stays under 600 MB even at North America scale (18.8 GB).
+`apply-changes` uses blob-level indexdata to classify blobs and passes
+unmodified blobs through without decompression. Runtime and memory depend
+on the input and change set; see the commit- and host-pinned measurements in
+[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
 ## Apply-changes with LocationsOnWays
 
@@ -136,7 +129,8 @@ O_DIRECT wins for concurrent read/write patterns (merge). For sequential single-
 
 ### io_uring for large writes
 
-The `--io-uring` flag replaces the synchronous writer thread with io_uring `WriteFixed`. At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up.
+The `--io-uring` flag replaces the synchronous writer thread with io_uring `WriteFixed`. Compare it with buffered writes on the intended workload; see the commit- and host-pinned measurements in
+[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
 ### Compression choice
 
@@ -148,4 +142,4 @@ With pipelined writes (the production path), compression is dispatched to rayon 
 
 ## System
 
-The CLI command table was measured on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), at commit `53360af4`. The read throughput, write throughput, extract, apply-changes at scale and apply-changes with LocationsOnWays tables, and the io_uring figures under Performance tips, were measured on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, at the older commits each table names; they have not been re-measured since. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).
+The CLI command table was measured on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), at commit `53360af4`. The read throughput, write throughput, extract and apply-changes with LocationsOnWays tables were measured on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, at the older commits each table names; they have not been re-measured since. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).

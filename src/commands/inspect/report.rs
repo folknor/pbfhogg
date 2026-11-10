@@ -156,6 +156,7 @@ impl InspectReport {
             (BlockKind::Ways.label(), &self.accum.way_type),
             (BlockKind::Relations.label(), &self.accum.relation_type),
             (BlockKind::Mixed.label(), &self.accum.mixed_type),
+            (BlockKind::Empty.label(), &self.accum.empty_type),
         ] {
             if stats.block_count > 0 {
                 writeln!(
@@ -255,6 +256,7 @@ impl InspectReport {
             BlockKind::Ways,
             BlockKind::Relations,
             BlockKind::Mixed,
+            BlockKind::Empty,
         ] {
             let mut elements: Vec<u64> = infos
                 .iter()
@@ -559,15 +561,7 @@ impl InspectReport {
             without_pct
         )?;
 
-        if !stats.coord_counts.is_empty() {
-            stats.coord_counts.sort_unstable();
-            let len = stats.coord_counts.len();
-            let min = stats.coord_counts[0];
-            let max = stats.coord_counts[len - 1];
-            let median = stats.coord_counts[len / 2];
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
-            let p99 = stats.coord_counts[p99_idx.min(len - 1)];
+        if let Some((min, max, median, p99)) = stats.distribution() {
             writeln!(
                 out,
                 "Coords per way:         min {min}, max {max}, median {median}, p99 {p99}"

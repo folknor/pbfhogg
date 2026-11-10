@@ -15,6 +15,7 @@ pub(super) enum BlockKind {
     Ways,
     Relations,
     Mixed,
+    Empty,
 }
 
 impl BlockKind {
@@ -24,6 +25,7 @@ impl BlockKind {
             Self::Ways => "Ways:",
             Self::Relations => "Relations:",
             Self::Mixed => "Mixed:",
+            Self::Empty => "Empty:",
         }
     }
 
@@ -33,6 +35,7 @@ impl BlockKind {
             Self::Ways => "ways",
             Self::Relations => "relations",
             Self::Mixed => "mixed",
+            Self::Empty => "empty",
         }
     }
 
@@ -50,6 +53,7 @@ impl BlockKind {
             Self::Nodes => 1,
             Self::Ways => 2,
             Self::Relations => 3,
+            Self::Empty => 0,
             Self::Mixed => 0, // always non-standard
         }
     }
@@ -113,6 +117,10 @@ impl OrderingSummary {
 
     /// Record data blob `block` (1-based, in file order) of kind `kind`.
     pub(super) fn observe(&mut self, kind: BlockKind, block: u64) {
+        // Empty payloads contain no element ordering information.
+        if kind == BlockKind::Empty {
+            return;
+        }
         if self.current == Some(kind) {
             if self.segment_count <= INSPECT_ORDERING_HEAD_SEGMENTS as u64
                 && let Some(last) = self.head.last_mut()
@@ -291,7 +299,31 @@ impl TypeIdRange {
 pub(super) struct LocationStats {
     pub(super) with_locations: u64,
     pub(super) without_locations: u64,
-    pub(super) coord_counts: Vec<u32>,
+    pub(super) coord_counts: std::collections::BTreeMap<u32, u64>,
+}
+
+impl LocationStats {
+    /// Exact order statistics without retaining one entry per way. Memory
+    /// follows distinct coordinate counts, including unusually long ways.
+    pub(super) fn distribution(&self) -> Option<(u32, u32, u32, u32)> {
+        let (&min, _) = self.coord_counts.first_key_value()?;
+        let (&max, _) = self.coord_counts.last_key_value()?;
+        let len: u64 = self.coord_counts.values().sum();
+        let at = |rank| {
+            let mut cumulative = 0;
+            for (&count, &frequency) in &self.coord_counts {
+                cumulative += frequency;
+                if cumulative > rank {
+                    return count;
+                }
+            }
+            max
+        };
+        // floor((len - 1) * 99 / 100), without overflowing.
+        let n = len - 1;
+        let p99_rank = n / 100 * 99 + n % 100 * 99 / 100;
+        Some((min, max, at(len / 2), at(p99_rank)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +474,7 @@ impl ScanState {
                 Some(LocationStats {
                     with_locations: 0,
                     without_locations: 0,
-                    coord_counts: Vec::new(),
+                    coord_counts: std::collections::BTreeMap::new(),
                 })
             } else {
                 None
@@ -475,7 +507,9 @@ impl ScanState {
         if let (Some(acc), Some(p)) = (&mut self.loc_stats, part.loc_stats) {
             acc.with_locations += p.with_locations;
             acc.without_locations += p.without_locations;
-            acc.coord_counts.extend_from_slice(&p.coord_counts);
+            for (count, frequency) in p.coord_counts {
+                *acc.coord_counts.entry(count).or_default() += frequency;
+            }
         }
         if let (Some(acc), Some(p)) = (&mut self.extended, &part.extended) {
             acc.append(p);
@@ -518,7 +552,7 @@ impl ScanState {
                     let count = w.node_locations().count() as u32;
                     if count > 0 {
                         stats.with_locations += 1;
-                        stats.coord_counts.push(count);
+                        *stats.coord_counts.entry(count).or_default() += 1;
                     } else {
                         stats.without_locations += 1;
                     }
@@ -690,6 +724,7 @@ pub(super) struct BlockAccum {
     pub(super) way_type: TypeStats,
     pub(super) relation_type: TypeStats,
     pub(super) mixed_type: TypeStats,
+    pub(super) empty_type: TypeStats,
     pub(super) ordering: OrderingSummary,
     pub(super) block_infos: Option<Vec<BlockInfo>>,
 }
@@ -701,6 +736,7 @@ impl BlockAccum {
             way_type: TypeStats::default(),
             relation_type: TypeStats::default(),
             mixed_type: TypeStats::default(),
+            empty_type: TypeStats::default(),
             ordering: OrderingSummary::new(),
             block_infos: if show_blocks { Some(Vec::new()) } else { None },
         }
@@ -742,6 +778,7 @@ pub struct InspectReport {
 
 pub(super) fn classify_block(has_nodes: bool, has_ways: bool, has_relations: bool) -> BlockKind {
     match (has_nodes, has_ways, has_relations) {
+        (false, false, false) => BlockKind::Empty,
         (true, false, false) => BlockKind::Nodes,
         (false, true, false) => BlockKind::Ways,
         (false, false, true) => BlockKind::Relations,
@@ -757,6 +794,9 @@ pub(super) fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<(&BlockInfo, &'static s
     infos
         .iter()
         .filter_map(|info| {
+            if info.kind == BlockKind::Empty {
+                return Some((info, "empty"));
+            }
             if info.kind == BlockKind::Mixed {
                 return Some((info, "mixed"));
             }
@@ -764,7 +804,7 @@ pub(super) fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<(&BlockInfo, &'static s
                 BlockKind::Nodes => nodes,
                 BlockKind::Ways => ways,
                 BlockKind::Relations => relations,
-                BlockKind::Mixed => None,
+                BlockKind::Mixed | BlockKind::Empty => None,
             };
             let median = median?;
             // Keep the displayed threshold and these comparisons tied to the
@@ -929,6 +969,60 @@ mod census_tests {
 #[cfg(test)]
 mod tests {
     use super::{BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, OrderingSummary, TypeIdRange};
+
+    #[test]
+    fn empty_blobs_are_neutral_and_reported_as_anomalies() {
+        assert_eq!(super::classify_block(false, false, false), BlockKind::Empty);
+        let summary = summarise(&[
+            BlockKind::Empty,
+            BlockKind::Nodes,
+            BlockKind::Empty,
+            BlockKind::Ways,
+            BlockKind::Empty,
+            BlockKind::Relations,
+        ]);
+        assert!(summary.is_standard());
+        assert_eq!(summary.segment_count(), 3);
+        assert!(summarise(&[BlockKind::Empty]).is_standard());
+        assert!(!summarise(&[BlockKind::Ways, BlockKind::Empty, BlockKind::Nodes]).is_standard());
+        let infos = [super::BlockInfo {
+            number: 1,
+            kind: BlockKind::Empty,
+            elements: 0,
+            compressed: 1,
+            raw: Some(1),
+        }];
+        assert_eq!(super::anomaly_blocks(&infos)[0].1, "empty");
+    }
+
+    #[test]
+    fn location_histogram_matches_sorted_order_statistics() {
+        for len in [0, 1, 2, 99, 100, 101, 1000] {
+            let mut values: Vec<u32> = (0..len).map(|i| (i * 37) % 19).collect();
+            let mut stats = super::LocationStats {
+                with_locations: u64::from(len),
+                without_locations: 0,
+                coord_counts: std::collections::BTreeMap::new(),
+            };
+            for &value in &values {
+                *stats.coord_counts.entry(value).or_default() += 1;
+            }
+            values.sort_unstable();
+            let expected = if values.is_empty() {
+                None
+            } else {
+                let n = values.len();
+                Some((
+                    values[0],
+                    values[n - 1],
+                    values[n / 2],
+                    values[(n - 1) * 99 / 100],
+                ))
+            };
+            assert_eq!(stats.distribution(), expected);
+            assert!(stats.coord_counts.len() <= 19);
+        }
+    }
 
     fn fields(r: &TypeIdRange) -> (i64, i64, bool, i64, u64) {
         (r.min_id, r.max_id, r.monotonic, r.prev_id, r.count)

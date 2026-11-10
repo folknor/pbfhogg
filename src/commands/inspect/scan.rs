@@ -302,6 +302,7 @@ fn accumulate_from_index(
         BlockKind::Ways => &mut accum.way_type,
         BlockKind::Relations => &mut accum.relation_type,
         BlockKind::Mixed => &mut accum.mixed_type,
+        BlockKind::Empty => &mut accum.empty_type,
     };
     stats.block_count += 1;
     stats.frame_bytes += frame_size as u64;
@@ -402,6 +403,7 @@ fn full_decode_scan(
             BlockKind::Ways => &mut accum.way_type,
             BlockKind::Relations => &mut accum.relation_type,
             BlockKind::Mixed => &mut accum.mixed_type,
+            BlockKind::Empty => &mut accum.empty_type,
         };
         stats.block_count += 1;
         stats.frame_bytes += summary.frame_size as u64;

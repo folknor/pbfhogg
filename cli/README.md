@@ -64,7 +64,7 @@ Benchmarked on Denmark (487 MB, 59M elements):
 | tags-filter | 0.24s | 0.56s | 2.3x |
 | add-locations-to-ways | 6.5s | 12.1s | 1.9x |
 
-At North America scale (18.8 GB, 645K-change daily diff), `apply-changes` runs in 17.3s (buffered+zlib) or 11.9s (io_uring+none), under 600 MB RSS.
+For `apply-changes` measurements at larger scales, including commit and host, see [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
 
 ## License
 

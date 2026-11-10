@@ -69,6 +69,7 @@ impl InspectReport {
                 "ways": type_stats_json(&self.accum.way_type),
                 "relations": type_stats_json(&self.accum.relation_type),
                 "mixed": type_stats_json(&self.accum.mixed_type),
+                "empty": type_stats_json(&self.accum.empty_type),
             },
             "elements": {
                 "nodes": self.state.node_count,
@@ -204,17 +205,15 @@ fn blocks_detail_json(
             .collect();
         return serde_json::Value::Array(arr);
     }
-    let selected: Vec<&BlockInfo> = infos.iter().collect();
-    let truncate = limit > 0 && limit * 2 < selected.len();
+    let truncate = limit > 0 && limit < infos.len().div_ceil(2);
     let iter: Box<dyn Iterator<Item = &BlockInfo>> = if truncate {
         Box::new(
-            selected[..limit]
+            infos[..limit]
                 .iter()
-                .copied()
-                .chain(selected[selected.len() - limit..].iter().copied()),
+                .chain(infos[infos.len() - limit..].iter()),
         )
     } else {
-        Box::new(selected.iter().copied())
+        Box::new(infos.iter())
     };
     let arr: Vec<serde_json::Value> = iter
         .map(|info| {
@@ -240,20 +239,9 @@ fn locations_json(loc_stats: &Option<LocationStats>) -> serde_json::Value {
     let Some(stats) = loc_stats else {
         return serde_json::Value::Null;
     };
-    let coords_per_way = if stats.coord_counts.is_empty() {
-        serde_json::Value::Null
-    } else {
-        let mut sorted = stats.coord_counts.clone();
-        sorted.sort_unstable();
-        let len = sorted.len();
-        let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
-        serde_json::json!({
-            "min": sorted[0],
-            "max": sorted[len - 1],
-            "median": sorted[len / 2],
-            "p99": sorted[p99_idx.min(len - 1)],
-        })
-    };
+    let coords_per_way = stats.distribution().map_or(serde_json::Value::Null, |(min, max, median, p99)| {
+        serde_json::json!({ "min": min, "max": max, "median": median, "p99": p99 })
+    });
     serde_json::json!({
         "with_locations": stats.with_locations,
         "without_locations": stats.without_locations,

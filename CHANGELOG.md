@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Replacing an existing directory output that the caller cannot write is
+  refused before any work starts, instead of failing at publication after
+  the whole run.
+- `inspect` reports a decoded data blob with no elements as `empty`, with
+  its own stats and anomaly reason, instead of counting it as mixed; it no
+  longer makes the file read as unordered.
+
 ## 0.6.0 - 2026-11-09
 
 This release makes pbfhogg safe to embed as a library and strict about its

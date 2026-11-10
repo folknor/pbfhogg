@@ -1118,3 +1118,41 @@ fn full_decode_judges_id_order_across_blob_boundaries() {
         }
     }
 }
+
+#[test]
+fn inspect_empty_payload_is_visible_but_neutral_to_ordering() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("empty-block.osm.pbf");
+    let header = block_builder::HeaderBuilder::new().build().expect("header");
+    let mut writer = PbfWriter::to_path(
+        &path,
+        Compression::default(),
+        &header,
+        pbfhogg::host::Executor::Ambient,
+    )
+    .expect("writer");
+    // A string table with its required empty entry, and no primitive groups.
+    writer
+        .write_primitive_block_no_indexdata(&[0x0a, 2, 0x0a, 0])
+        .expect("empty block");
+    writer.flush().expect("flush");
+    for mode in 0..3 {
+        let mut opts = inspect_opts(true, mode == 0);
+        opts.extended = mode == 1;
+        opts.show_locations = mode == 2;
+        opts.show_blocks = true;
+        let report =
+            pbfhogg::inspect::inspect(&path, &opts, &crate::common::test_host()).expect("inspect");
+        let json = report.to_json_filtered(Some(0), true);
+        assert_eq!(json["blocks"]["total"], 1);
+        assert_eq!(json["blocks"]["empty"]["count"], 1);
+        assert_eq!(json["blocks"]["mixed"]["count"], 0);
+        assert_eq!(json["ordering"]["standard"], true);
+        assert_eq!(json["ordering"]["segment_count"], 0);
+        assert_eq!(json["blocks_detail"][0]["type"], "empty");
+        assert_eq!(json["blocks_detail"][0]["anomaly"], "empty");
+        if opts.extended {
+            assert_eq!(json["data"]["objects_ordered"], true);
+        }
+    }
+}

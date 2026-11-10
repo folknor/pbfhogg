@@ -217,7 +217,7 @@ impl GroupProjection for InspectProjection {
             let count = PackedSint64Iter::new(way.lat_data).count() as u32;
             if count > 0 {
                 stats.with_locations += 1;
-                stats.coord_counts.push(count);
+                *stats.coord_counts.entry(count).or_default() += 1;
             } else {
                 stats.without_locations += 1;
             }

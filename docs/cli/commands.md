@@ -176,7 +176,7 @@ These flags appear on most commands that produce PBF output:
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression <COMPRESSION>` | Compression of the blobs the command encodes: `none`, `zlib` (level 6), `zstd` (level 3), or with a level, `zlib:0` to `zlib:9`, `zstd:-7` to `zstd:22`. The default is `zlib` everywhere except `renumber`, which defaults to `zlib:1` and also writes level 1 for an explicit `zlib` or `zlib:6` (see its section). Blobs a command passes through (plain `cat`, the blobs `apply-changes` leaves alone) keep the compression they had; `repack` re-encodes every blob |
-| `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) (requires `linux-direct-io`) |
 | `--force` | On a command that would refuse unindexed input: proceed with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
 | `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. An empty value (`KEY=`) omits the field |
@@ -734,7 +734,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--json` | Machine-readable JSON output. Not combinable with `--nodes` (node stats have no JSON form) or `--get`. |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `--extended`, `--get`, `--json`, `--force`), which it used to accept and discard. |
 | `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own `indexdata`. Nothing validates indexdata against the payload it describes, so on a file you are inspecting *because* you suspect it, the default fast path reports the file's claims rather than its contents. Applies to the scanning report only: rejected alongside `--indexed`, `--nodes` and a `file.*` or `header.*` `--get` key, none of which consult indexdata contents. |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower fallback. **Requires `--nodes`**: only the node-stats scan refuses unindexed input, so passing it to another mode is an error rather than a no-op. |
 
 The ordering analysis splits the data blobs into segments, runs of
@@ -789,7 +789,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Count one element type: exactly one of node, way, or relation (a list is refused) |
 | `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)) |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)). Only with `--type` or expressions that together leave some element type out: any other run schedules every blob whether or not it is indexed, does not refuse unindexed input, and refuses `--force` as ineffective |
 
 What is counted follows `osmium tags-count`. With no expression, every key
@@ -1218,7 +1218,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither. |
 | `--reindex` | Rewrite every data blob's indexdata and tagdata from its payload, losslessly; one input. See above |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O. Only valid with `--dedupe` - the plain `cat` path has no io_uring writer, and passing it there is an error. |
 | `--force` | Proceed on unindexed input with the slower fallback. Requires `--type` or `--dedupe`: plain `cat` adds the indexdata and `--clean` without `--type` decodes every blob once either way, so neither refuses and `--force` with only those is an error. `--type node,way,relation --clean` is the clean pass, which does not refuse; `--force` there is accepted and does nothing. |
 | `--generator` | Override writing program name |
@@ -1277,7 +1277,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
 | `--distrust-metadata` | Believe no claim the input makes about itself: decode every blob in pass 1 as for a header without `Sort.Type_then_ID` (below), and also scan each blob's tag keys, so a blob whose indexdata or tagdata (compared as a key set) its payload contradicts is reframed under scanned ones. Needs no indexdata (`--force` is not needed alongside it) and accepts a partially indexed input. The repair every `Unsorted` refusal names: under a sorted header the default fast path copies an internally unsorted blob unchanged, because it believes the claim and the blob's indexdata |
@@ -1311,7 +1311,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--elements-per-blob <N>` | Per-blob element cap [default: 8000]. `8000` matches the osmium / Geofabrik convention; pass a larger value to approximate `planet.openstreetmap.org`-style packing. Must be > 0. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
 | `--generator` | Override writing program name |
@@ -1345,7 +1345,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--elements-per-blob <N>` | Most elements in any output data blob on the decode path [default: 8000]. Output blobs follow the input's blob boundaries, except under `--unsort`, which packs each kind continuously to the cap, so the cap also places the `--unsort` swap. Must be > 0, and at least 2 with `--unsort-intra`. Requires `--unsort`, `--unsort-intra`, `--strip-locations` or `--drop-ids`; the header-only flags encode no data blob (a usage error otherwise, exit 64). |
 | `--force` | Proceed on unindexed input on the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`), which falls back to scanning every blob for every kind; slower. The header-only flags never refuse, so `--force` without a decode-path flag is an error. |
 | `--compression` | Compression of the blobs the run encodes [default: zlib]. The header-only flags encode only the OSMHeader blob; every data blob is copied with the compression it has |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -1386,7 +1386,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
 | `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md)). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -1470,7 +1470,7 @@ pbfhogg extract [OPTIONS] <FILE>
 | `--set-bounds` | Write the extract region bounding box, each edge at the decimicrodegree it selects, to the output header instead of the input's. complete_ways and smart exceed it by design with the out-of-region nodes of selected ways |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower fallback (complete-ways and `--smart`; not with `--simple`, which never refuses) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -1531,7 +1531,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `-j, --jobs <N>` | Worker threads for the two-pass mode's classify passes and its decode-and-filter pool, or in OSC mode for the workers filtering the document's batches (see [Worker threads](#worker-threads)). Refused with `-R`, whose single pass decodes on the read pipeline's own pool, sized from the machine, which `-j` does not set |
 | `--distrust-metadata` | Do not skip blobs on their `indexdata` or tag index; decode every blob. Blob-level tag-index skipping is a trust boundary with nothing on the other side of it - nothing validates a blob's tag index against its payload - so a file whose index omits a key its elements carry silently loses those elements from the output. This flag trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition (`--force` is not needed alongside it). Not valid in OSC mode, which has no blobs. `degrade --corrupt-tagdata` produces the file this flag exists for. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower fallback. Not with `--invert-match` or `--distrust-metadata`, which never refuse, nor with `-R` when the expressions together name every element type (`highway`, not `w/highway`): that single pass skips no blob on indexdata and takes unindexed input as it is |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -1596,7 +1596,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there, removed on completion: for a `.osc.gz` output from indexed inputs that XML is already gzip-compressed (about the output's size), otherwise it is plain XML several times larger. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
-| `--direct-io` | Use O_DIRECT to bypass page cache when reading the inputs |
+| `--direct-io` | Use O_DIRECT when reading the PBF inputs; see the [I/O capability matrix](#io-capability-matrix) |
 
 With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
 
@@ -1618,7 +1618,7 @@ pbfhogg digest [OPTIONS] <FILE>
 | Flag | Description |
 |------|-------------|
 | `--form <FORM>` | Canonical form: `full` (default, `v2`) or `content` (`v1`, diff's equality) |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 
 Output, on stdout:
 
@@ -1676,7 +1676,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower fallback (see [Proceeding without indexdata](#proceeding-without-indexdata)) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -1711,7 +1711,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -1756,7 +1756,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata into the output header, readable back via `Blob::way_members` / `Way::shared_node_pins` |
 | `--ignore-missing-nodes` | Accept ways whose node references are absent from the input, writing those vertices as `(0, 0)`. Without it the run fails and no output is written: `(0, 0)` is Null Island, a real coordinate, so a placeholder vertex cannot be told apart from genuine data by any reader. Matches osmium in name and in default. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--force` | Proceed on unindexed input with the slower (sparse, decode-all) fallback. Not with `--index-type external` or `--inject-prepass`, which need indexdata whatever `--force` says; both are refused before any input is opened |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read, after the output is checked. Default: the output's directory |
 | `--generator` | Override writing program name |
@@ -1793,7 +1793,7 @@ is refused once a read has met both kinds of data blob.
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -1845,7 +1845,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
 | `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline (see [Worker threads](#worker-threads)). `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum 2). An explicit `-j N` runs exactly `N` workers, `1` included. |
 | `--compression` | Blob compression [default: zlib] |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed on an unindexed base with the slower fallback, which decodes every blob. The output is indexed on every blob, as plain `cat`'s is: a blob the diff leaves alone keeps its compressed payload under a header carrying indexdata derived from it, a blob no single index describes is re-encoded, and one holding no element is left out. A blob whose elements span more than one kind is refused (exit 2, nothing published), since it cannot be placed in type order; plain `cat` splits such blobs. Not with `--locations-on-ways`, which needs an indexed base whatever `--force` says; the combination is refused before any input is opened |
 | `--allow-version-regression` | Accept a change whose `version` is lower than the version already held for that object. Off by default: precedence is by version, not by position, so feeding diffs out of sequence order is an error naming both versions rather than a silent downgrade. An equal version is always accepted and the later change wins by position (overlapping diffs, regional-extract deletes at the held version). Deletes count -- a delete leaves a versioned tombstone, so a later stale create or modify is refused too. Elements claiming no `version` are unaffected. See DEVIATIONS.md. |
@@ -1973,7 +1973,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value. Default comes from the builder configuration |
 | `--search-radius <M>` | Fine-level search distance in meters: a query answers the nearest street, address and interpolation closer than this. At most a fixed number of smallest cell widths at `--street-level` (see [Search radius bounds](#search-radius-bounds)). Default comes from the builder configuration |
 | `--coarse-search-radius <M>` | Coarse-level search distance in meters: the fallback for a class with nothing closer than `--search-radius`. At most a fixed number of smallest cell widths at `--coarse-level`. Default comes from the builder configuration |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `-O, --overwrite` | Replace an existing index (or empty directory) at `--output-dir` after the new build succeeds. Without it an existing `--output-dir` is refused before any work. Does not bypass the indexdata requirement |
 | `--staging-dir <DIR>` | Stage the new index in `DIR` instead of beside `--output-dir`; `DIR` must not lie inside `--output-dir` (see [Staging directory](#staging-directory)) |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
@@ -2168,40 +2168,46 @@ pbfhogg bench-merge [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 
 ---
 
+<a id="io-capability-matrix"></a>
+
 ## I/O capability matrix
 
-Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring`
+Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring`
 (io_uring async writes), and which paths are affected.
 
-| Command | Reads PBF | Writes PBF | `--direct-io` | `--io-uring` | Notes |
-|---------|:---------:|:----------:|:-------------:|:------------:|-------|
-| inspect | Yes | - | Yes | - | Read-only |
-| inspect tags | Yes | - | Yes | - | Read-only |
-| inspect --nodes | Yes | - | Yes | - | Read-only |
-| check --ids | Yes | - | Partly | - | Read-only; `--direct-io` covers only the front read (header and first blob header); the blob reads are parallel unaligned preads without it |
-| check --refs | Yes | - | No | - | Read-only; parallel unaligned preads. `--direct-io` is refused unless `--ids` or `--index` (or the default pair) is selected too |
-| check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
-| check --locations | Yes | - | No | - | Read-only; parallel unaligned preads. `--direct-io` is refused unless `--ids` or `--index` is selected too |
-| cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
-| cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path; with `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |
-| sort | Yes | Yes | Yes (R+W) | Yes | With `--io-uring` too, pass 2 reads buffered whenever some input blob is copied through unchanged (the copy splices from the input) |
-| repack | Yes | Yes | Yes (R+W) | Yes | Re-encode at configurable elements-per-blob cap |
-| degrade | Yes | Yes | Yes (R+W) | Yes | Adversarial PBF generator (--unsort / --strip-locations / --strip-indexdata / --drop-ids) |
-| renumber | Yes | Yes | Yes (R+W) | - | |
-| extract | Yes | Yes | Yes (R+W) | - | All strategies |
-| tags-filter | Yes | Yes | Yes (R+W) | - | Both single-pass and two-pass |
-| export | Yes | No | No | - | GeoJSON output to stdout or a regular file |
-| getid | Yes | Yes | Yes (R+W) | - | Including --add-referenced |
-| getid --invert | Yes | Yes | Yes (R+W) | - | |
-| getparents | Yes | Yes | Yes (R+W) | - | |
-| time-filter | Yes | Yes | Yes (R+W) | - | |
-| add-locations-to-ways | Yes | Yes | Yes (R+W) | - | All index types |
-| apply-changes | Yes | Yes | Yes (R+W) | Yes | Production merge path |
-| diff | Yes | - | Partly | - | Read-only (text output); indexed inputs read `O_DIRECT` at every `-j` |
-| diff --format osc | Yes | - | Partly | - | Read-only (OSC XML output); as for text diff |
-| derive-changes (via `diff --format osc`) | Yes | - | Partly | - | Read-only (OSC XML output); as for text diff |
-| build-geocode-index | Yes | - | Yes | - | Binary index output, not PBF |
-| merge-changes | - | - | - | - | OSC-only, no PBF I/O |
+<!-- io-reach:start -->
+| Command | Direct reads | Direct writes | `--io-uring` |
+|---------|--------------|---------------|--------------|
+| inspect | Index scan buffered; header probes, --show and full-decode fallback direct; --nodes front probe direct with buffered classify preads | - | - |
+| inspect tags | Kind-restricting type/expression probe direct; unfiltered counting, schedule and classify preads buffered | - | - |
+| check | ID front read and index check direct; refs, locations and ID body preads buffered | - | - |
+| cat | Front reads, passthrough and dedupe direct; clean classify preads buffered | All PBF writes direct | Dedupe only |
+| sort | All reads direct, including copied ranges | All PBF writes direct | Yes |
+| repack | Front read direct; classify preads buffered | All PBF writes direct | Yes |
+| degrade | Front read and raw frames direct; decode classify preads buffered | All PBF writes direct | Yes |
+| renumber | Header read direct; bulk reads buffered | All PBF writes direct | - |
+| extract | Front reads direct; pread passes buffered; fallback streams direct | Single output direct; config single-pass outputs buffered | - |
+| tags-filter | Front read and -R stream direct; two-pass preads and dependency scans buffered | All PBF writes direct; OSC refuses flag | - |
+| export | No direct I/O flag | No PBF output | - |
+| getid | Front reads and sequential fallback direct; scheduled and ID-file preads buffered | All PBF writes direct | - |
+| getparents | Dispatch probe and fallback stream direct; scheduled preads buffered | All PBF writes direct | - |
+| time-filter | Header and history stream direct; snapshot classify preads buffered | All PBF writes direct | - |
+| add-locations-to-ways | Front reads direct; index, dependency and external-stage preads buffered | All PBF writes direct | - |
+| apply-changes | Front read direct; scanner, body preads and passthrough reads buffered | All PBF writes direct | Yes |
+| diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
+| digest | All reads direct | - | - |
+| build-geocode-index | All PBF scans direct | Index output buffered, not PBF | - |
+| merge-changes | OSC only; no direct I/O flag | No PBF output | - |
+<!-- io-reach:end -->
 
-**R+W** = `--direct-io` affects both PBF reads (via `BlobReader`) and PBF writes (via `PbfWriter`).
+Only the listed paths bypass the page cache. A front read means the header
+and first-blob indexdata probe, not the bulk scan. `check --refs` and
+`check --locations` alone refuse `--direct-io`; select `--ids` or `--index`
+too to give it work. Input-dependent fallbacks keep accepting the flag. The flag remains accepted
+on paths that currently ignore it, including unfiltered `inspect tags`.
+A filesystem can also buffer an O_DIRECT open: when `statx` explicitly reports
+zero alignment, one `Note:` per run explains that bypass is not guaranteed.
+Unavailable alignment information uses the compatibility floor without this
+note. `--quiet` suppresses notes.
+
 **`--io-uring`** requires the `linux-io-uring` compile-time feature and sufficient `RLIMIT_MEMLOCK`.

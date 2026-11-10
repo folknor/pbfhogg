@@ -181,6 +181,8 @@ impl<T> std::ops::Deref for Padded<T> {
 /// they were always locals of their run.
 #[derive(Default)]
 pub(crate) struct InvocationMetrics {
+    /// An explicit zero STATX_DIOALIGN report on a direct open in this run.
+    pub(crate) direct_io_zero_alignment: std::sync::atomic::AtomicBool,
     pub(crate) pipeline: Padded<crate::read::pipeline_metrics::PipelineMetrics>,
     pub(crate) decompress: Padded<crate::read::pipeline_metrics::DecompressPoolMetrics>,
     pub(crate) unordered: Padded<crate::scan::classify::UnorderedPoolMetrics>,

@@ -681,7 +681,7 @@ fn uring_init_and_run(
     // Step 3: Open file with O_DIRECT, after the ring refusals above so they
     // precede file creation, then allocate the pool at the alignment the
     // file reported.
-    let (file, align) = crate::direct_io::create_for_write(path)?;
+    let (file, align) = crate::direct_io::create_for_write(path, Some(cancel))?;
     pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES, align)?;
     let iovecs = pool.iovecs();
 

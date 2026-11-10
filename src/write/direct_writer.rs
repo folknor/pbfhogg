@@ -132,7 +132,14 @@ impl DirectWriter {
     /// A file whose reported alignment the buffers cannot keep is refused the
     /// same way.
     pub fn create(path: &Path) -> crate::Result<Self> {
-        let (file, align) = crate::direct_io::create_for_write(path)?;
+        Self::create_in(path, None)
+    }
+
+    pub(crate) fn create_in(
+        path: &Path,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> crate::Result<Self> {
+        let (file, align) = crate::direct_io::create_for_write(path, invocation)?;
         let buf = AlignedBuffer::new(IO_BUF_BYTES, align)?;
         Ok(Self {
             file,

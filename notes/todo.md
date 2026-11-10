@@ -110,6 +110,12 @@ Planned as one coherent CLI-surface cleanup for 0.6.0, then pushed back a
 release. Every item here is a breaking or user-visible CLI change; do them
 together so the surface changes once.
 
+- [ ] **Refuse `--direct-io` where it reaches nothing.** Defer any new
+  no-op-flag refusals to this 0.7.0 batch: they break existing command lines.
+  Use the reach table and selected mode; keep existing check/OSC and
+  compile-time-feature refusals. Until then, describe ignored paths in help
+  and the capability matrix, without adding refusals.
+
 - [ ] **CLI UX: scratch placement residue + mode naming** (raised
   2026-04-23). Both should be applied uniformly across every command
   that carries the pattern, not one-off per command.
@@ -232,63 +238,19 @@ together so the surface changes once.
   - `Developer` events (`[altw external] ...`, the geocode hotpath
     counters) carry `key=value` text or a bracketed prefix of their own.
 
-- [ ] **`--direct-io` is accepted and ignored on many paths.** The parameter
-  is taken and discarded in altw `stage1_way_pass`,
-  `build_node_index_sparse`, `collect_way_referenced_node_ids`,
-  `collect_relation_member_ids` (every pread path, so the flag does nothing
-  to reads in passes 0 and 1, stage 1 or stage 2),
-  `getid::parse_ids_from_pbf`, tags-filter's `collect_relation_member_closure`
-  and `collect_way_node_dependencies` (both scans pread through the walker's
-  buffered descriptor), and `check --refs` / `check --locations` (both
-  parallel unaligned preads; the CLI refuses the flag where neither the
-  ID nor the index check is selected, and beside them it reaches only those).
-  Extract's pread passes open buffered regardless (a comment explains
-  alignment), multi-extract's single-pass path writes through
-  `PbfWriter::new(BufWriter)` regardless, `export` has no I/O flag, and
-  `inspect` prints that it ignored the flag. An operator who chose
-  O_DIRECT to protect the page cache still fills it, with nothing logged.
-
-  Where the flag is honoured it is often only for the header read and the
-  first-blob indexdata probe. Sort and `cat --dedupe` are the exception
-  that honours it throughout (the pass 1 header walk through
-  `HeaderWalker::open_direct`, pass 2 through direct sources whose copied
-  frames `src/write/copy_range.rs` reads in aligned chunks).
-  Apply-changes (the front read only: the scanner's header walk, the
-  worker pool's body preads, and the splice or owned-route passthrough
-  reads all go through buffered descriptors), renumber (header only), repack and degrade's
-  decode path (the classify pools pread through a buffered shared fd),
-  time-filter's snapshot path, tags-filter's two-pass mode (pass 1, the
-  relation closure, the way dependencies and pass 2 pread through walker
-  descriptors; `-R`'s pipelined reader does honour it), and getparents'
-  dispatch probe all read their bulk data buffered. Writes are
-  honoured by every PBF writer that goes through `Output::pbf_writer`,
-  except multi-extract's single-pass path.
-
-  Two consequences are visible to a user. The "I/O capability matrix" in
-  `docs/cli/commands.md` marks most of these commands "Yes (R+W)" or
-  "Yes" and has no row for `digest`: it describes the flag's presence, not
-  its reach. (A build without the `linux-direct-io` feature already refuses
-  `--direct-io` while parsing on every command, through `DirectIoArg`'s
-  value parser.) Even an honoured open can be silently buffered:
-  `statx(STATX_DIOALIGN)` reports zero alignment where the filesystem
-  falls back to buffered I/O (ext4 `data=journal`, inline-data or verity
-  files; f2fs files whose writes are forced buffered), and
-  `src/direct_io.rs` keeps the 4096 floor since the run stays correct.
-
-  Shape suggested so far: do NOT remove the ignored `direct_io`
-  parameters - an earlier drain removed the parallel diff's and it was put
-  back as deliberate plumbing; they are where the flag reaches once those
-  passes honour it. A walk can already honour it single-threaded
-  (`HeaderWalker::open_direct` over `direct_reader::DirectPositional`);
-  the classify and shard pools that pread the walker's descriptor from
-  worker threads would each need a direct transport per worker, since that
-  one shares a single aligned scratch buffer. For the surface, a per-command reach table in the CLI (read
-  passes honoured, write honoured) that generates both the capability
-  matrix and the `--direct-io` help text; refuse the flag where it reaches
-  nothing (done for `check`, under the existing no-op-flag rule); one `Note:` per run when
-  statx reports zero alignment. Enforce with one contract test per command
-  that a no-feature build refuses `--direct-io` before opening any input,
-  and a unit test of the table against the capability matrix.
+- [x] **Describe `--direct-io`'s actual reach.** CLI help and the I/O
+  capability matrix now come from `cli/src/io_reach.rs`, checked against the
+  command tree and the reference document. Includes digest and the buffered
+  classify/dependency paths, unfiltered `inspect tags` (no direct reads),
+  multi-extract's buffered single-pass outputs, and direct range copies in
+  sort/cat dedupe, including with io_uring. Existing flag acceptance is
+  unchanged. Host-bound direct opens record explicit zero `statx` alignment;
+  the CLI reports one Note per invocation after workers join, including on
+  failure. An unavailable query does not trigger it; the compatibility floor
+  remains. No bulk read transport changed and ignored `direct_io` parameters
+  stay as plumbing. Worker pools need their own aligned transport per worker;
+  the walker's shared scratch cannot cross threads. This is separate read-path
+  work, not a promise made by accepting the flag.
 
 ## Lint exemptions (moved out of the hygiene drain 2026-10-26)
 

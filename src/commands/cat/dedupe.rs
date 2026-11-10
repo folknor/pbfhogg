@@ -297,6 +297,7 @@ fn write_merge(
         inputs,
         opts.direct_reads,
         opts.backend.supports_copy_range(),
+        &host.invocation,
     )?;
     host.invocation.marker("MERGEPBF_WRITE_LOOP_START");
     let counts =
@@ -648,8 +649,13 @@ mod tests {
         std::fs::write(&b, &bytes).expect("corrupt B");
 
         for direct in pass2_transports(dir.path()) {
-            let sources =
-                blob_merge::open_sources(merge.inputs.clone(), direct, false).expect("open inputs");
+            let sources = blob_merge::open_sources(
+                merge.inputs.clone(),
+                direct,
+                false,
+                &crate::host::Call::detached(),
+            )
+            .expect("open inputs");
             assert_eq!(sources.direct(), direct);
             let mut buf = blob_merge::FrameBuf::default();
             let call = crate::host::Call::detached();
@@ -704,12 +710,22 @@ mod tests {
             // The transport is the request's, whether or not the output
             // splices the frames this plan copies through.
             for splice in [false, true] {
-                let opened = blob_merge::open_sources(merge.inputs.clone(), direct, splice)
-                    .expect("open inputs");
+                let opened = blob_merge::open_sources(
+                    merge.inputs.clone(),
+                    direct,
+                    splice,
+                    &crate::host::Call::detached(),
+                )
+                .expect("open inputs");
                 assert_eq!(opened.direct(), direct, "splice {splice}");
             }
-            let sources =
-                blob_merge::open_sources(merge.inputs.clone(), direct, false).expect("open inputs");
+            let sources = blob_merge::open_sources(
+                merge.inputs.clone(),
+                direct,
+                false,
+                &crate::host::Call::detached(),
+            )
+            .expect("open inputs");
             let mut buf = blob_merge::FrameBuf::default();
             let err = match buf.read(&sources[entry.source], entry) {
                 Ok(_) => panic!("a missing frame must fail pass 2"),

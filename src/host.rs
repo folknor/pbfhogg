@@ -1149,6 +1149,31 @@ impl std::ops::Deref for Entered<'_> {
 }
 
 impl Host {
+    /// Report a zero direct-I/O alignment discovered by this invocation, once.
+    /// Call after the run's workers join, on success or failure. A zero report
+    /// can mean buffered fallback; it is not proof that every transfer buffered.
+    /// An unavailable statx query does not trigger this note. Sealed invocations
+    /// are inert, as for other end-of-run reporting.
+    pub fn report_io_degradations(&self) {
+        let Ok(host) = self.enter() else {
+            return;
+        };
+        if host
+            .invocation
+            .metrics()
+            .direct_io_zero_alignment
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            crate::host::diag_once!(
+                host.diagnostics,
+                &host.invocation,
+                Note,
+                "direct_io.zero_alignment",
+                "statx reported zero direct I/O alignment for a file; the filesystem may use buffered I/O despite O_DIRECT. The compatibility alignment is retained; page-cache bypass is not guaranteed."
+            );
+        }
+    }
+
     /// Admit a public command under this host's invocation: refused with
     /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) once it has been
     /// sealed.

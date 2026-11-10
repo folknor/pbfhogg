@@ -18,7 +18,7 @@ Which commands need indexdata, and what each does without it, is in [Indexdata](
 
 ## O_DIRECT for planet-scale I/O
 
-Planet-scale operations read and write 80 GB+, polluting the entire page cache and evicting useful data from co-resident processes. The `linux-direct-io` feature bypasses the page cache entirely.
+Planet-scale operations read and write 80 GB+, polluting the entire page cache and evicting useful data from co-resident processes. The `linux-direct-io` feature enables `--direct-io` to bypass the page cache on supported paths. The [I/O capability matrix](../cli/commands.md#io-capability-matrix) lists which reads and writes use it; several bulk read paths remain buffered.
 
 ```sh
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io

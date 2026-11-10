@@ -110,17 +110,20 @@ impl FileReader {
     /// direct I/O alignment.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> Result<Self> {
-        Self::direct_from(InputSource::Path(path))
+        Self::direct_from(InputSource::Path(path), None)
     }
 
     #[cfg(feature = "linux-direct-io")]
-    fn direct_from(source: InputSource<'_>) -> Result<Self> {
+    fn direct_from(
+        source: InputSource<'_>,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> Result<Self> {
         let path = source.path();
         // A platform refusal already names the path inside its source, so
         // it stays the outermost text, and a replaced pinned input is its
         // own refusal; any other failure gets the context.
         let opened = source
-            .open_direct()
+            .open_direct(invocation)
             .and_then(|(file, align)| DirectReader::from_opened(file, align, path));
         Ok(Self::Direct(opened.map_err(|e| {
             if matches!(
@@ -152,7 +155,7 @@ impl FileReader {
         if direct {
             #[cfg(feature = "linux-direct-io")]
             {
-                return Self::direct_from(source);
+                return Self::direct_from(source, Some(&_call));
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {

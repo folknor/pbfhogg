@@ -22,7 +22,10 @@
 //! inline-data files that a write may later convert to extents. The floor is
 //! the compatibility answer for those, not a guarantee; one query per open
 //! cannot follow a file whose eligibility changes as it grows, and querying
-//! per transfer would put a syscall on the measured write path.
+//! per transfer would put a syscall on the measured write path. Host-bound
+//! opens latch explicit zero reports in the invocation; the caller reports
+//! them once through `Host::report_io_degradations` after workers join. An
+//! unavailable query is not an explicit zero report.
 //!
 //! A reported requirement this design cannot keep - not a power of two, or
 //! larger than the [`IO_BUF_BYTES`] transfer buffer every backend reads and
@@ -101,7 +104,10 @@ mod imp {
     /// first look can still block the open, and a device put there sees the
     /// open. A path constructor's caller owns its destination; outputs that
     /// need more go through `Output`, whose staging file is created fresh.
-    pub(crate) fn create_for_write(path: &Path) -> Result<(File, usize)> {
+    pub(crate) fn create_for_write(
+        path: &Path,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> Result<(File, usize)> {
         refuse_non_regular(path)?;
         #[allow(clippy::disallowed_methods)]
         let opened = std::fs::OpenOptions::new()
@@ -123,7 +129,8 @@ mod imp {
         if !file.metadata()?.is_file() {
             return Err(not_a_file(path));
         }
-        let align = resolve(query(&file, Access::Write)).map_err(|r| refusal(None, r))?;
+        let align = resolve(observed(query(&file, Access::Write), invocation))
+            .map_err(|r| refusal(None, r))?;
         Ok((file, align))
     }
 
@@ -154,7 +161,7 @@ mod imp {
     /// failure is an ordinary I/O error the caller names.
     #[cfg(feature = "linux-direct-io")]
     pub(crate) fn open_for_read(path: &Path) -> Result<(File, usize)> {
-        open_for_read_verified(path, path, 0, |_| Ok(()))
+        open_for_read_verified(path, path, 0, |_| Ok(()), None)
     }
 
     /// [`open_for_read`] of `open_path` with `extra_flags` added to
@@ -170,6 +177,7 @@ mod imp {
         display: &Path,
         extra_flags: i32,
         verify: impl FnOnce(&File) -> Result<()>,
+        invocation: Option<&crate::host::Recorder>,
     ) -> Result<(File, usize)> {
         #[allow(clippy::disallowed_methods)]
         let opened = std::fs::OpenOptions::new()
@@ -178,8 +186,26 @@ mod imp {
             .open(open_path);
         let file = opened.map_err(|e| crate::error::direct_io_open_error_at(display, e))?;
         verify(&file)?;
-        let align = resolve(query(&file, Access::Read)).map_err(|r| refusal(Some(display), r))?;
+        let align = resolve(observed(query(&file, Access::Read), invocation))
+            .map_err(|r| refusal(Some(display), r))?;
         Ok((file, align))
+    }
+
+    /// Preserve an explicit zero report separately from an unavailable query.
+    /// The compatibility floor keeps transfers correct, but cannot promise cache bypass.
+    pub(super) fn observed(
+        reported: Option<Reported>,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> Option<Reported> {
+        if reported.is_some_and(|r| r.mem == 0 || r.offset == 0)
+            && let Some(invocation) = invocation
+        {
+            invocation
+                .metrics()
+                .direct_io_zero_alignment
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        reported
     }
 
     /// The alignment to use for what a file reported, or the report back
@@ -331,6 +357,48 @@ mod tests {
 
     fn reported(mem: u32, offset: u32) -> Option<Reported> {
         Some(Reported { mem, offset })
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn zero_alignment_note_is_once_per_invocation() {
+        use crate::host::{DiagnosticSink, Diagnostics, Event, EventKind, Host};
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Sink(Mutex<Vec<(EventKind, &'static str)>>);
+        impl DiagnosticSink for Sink {
+            fn event(&self, event: &Event<'_>) {
+                self.0.lock().unwrap().push((event.kind, event.key));
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let mut host = Host::for_tests();
+        host.diagnostics = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        {
+            let call = host.invocation.call().unwrap();
+            assert_eq!(super::imp::observed(None, Some(&call)), None);
+            super::imp::observed(reported(512, 512), Some(&call));
+        }
+        host.report_io_degradations();
+        assert!(sink.0.lock().unwrap().is_empty());
+        for report in [reported(0, 0), reported(0, 512), reported(512, 0)] {
+            let call = host.invocation.call().unwrap();
+            assert_eq!(super::imp::observed(report, Some(&call)), report);
+        }
+        host.clone().report_io_degradations();
+        host.report_io_degradations();
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![(EventKind::Note, "direct_io.zero_alignment")]
+        );
+        // An independent invocation gets its own note even with the same sink.
+        host.invocation = crate::host::Invocation::new();
+        {
+            let call = host.invocation.call().unwrap();
+            super::imp::observed(reported(0, 0), Some(&call));
+        }
+        host.report_io_degradations();
+        assert_eq!(sink.0.lock().unwrap().len(), 2);
     }
 
     #[test]

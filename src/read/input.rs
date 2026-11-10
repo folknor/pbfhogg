@@ -174,10 +174,15 @@ impl<'a> InputSource<'a> {
     /// returns them: a platform refusal names the input, an ordinary open
     /// failure is left for the caller to name.
     #[cfg(feature = "linux-direct-io")]
-    pub(crate) fn open_direct(&self) -> Result<(File, usize)> {
+    pub(crate) fn open_direct(
+        &self,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> Result<(File, usize)> {
         match *self {
-            Self::Path(path) => crate::direct_io::open_for_read(path),
-            Self::Pinned(pin) => pin.open_direct(),
+            Self::Path(path) => {
+                crate::direct_io::open_for_read_verified(path, path, 0, |_| Ok(()), invocation)
+            }
+            Self::Pinned(pin) => pin.open_direct(invocation),
         }
     }
 
@@ -441,13 +446,17 @@ impl PinnedInput {
 
     /// See [`InputSource::open_direct`].
     #[cfg(feature = "linux-direct-io")]
-    pub(crate) fn open_direct(&self) -> Result<(File, usize)> {
+    pub(crate) fn open_direct(
+        &self,
+        invocation: Option<&crate::host::Recorder>,
+    ) -> Result<(File, usize)> {
         self.hooked(|| {
             crate::direct_io::open_for_read_verified(
                 &self.open_path(),
                 &self.0.path,
                 libc::O_NONBLOCK,
                 |file| self.verify(file),
+                invocation,
             )
         })
     }
@@ -649,8 +658,8 @@ impl InputFile {
 
     /// `pin` opened `O_DIRECT`, carrying the alignment its reads keep.
     #[cfg(feature = "linux-direct-io")]
-    pub(crate) fn direct(pin: &PinnedInput) -> Result<Self> {
-        let (file, align) = pin.open_direct()?;
+    pub(crate) fn direct(pin: &PinnedInput, invocation: &crate::host::Recorder) -> Result<Self> {
+        let (file, align) = pin.open_direct(Some(invocation))?;
         Ok(Self {
             file: Arc::new(file),
             path: Arc::from(pin.path()),

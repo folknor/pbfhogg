@@ -1206,11 +1206,12 @@ pub(crate) fn open_sources(
     inputs: Vec<PinnedInput>,
     direct_reads: bool,
     splice: bool,
+    invocation: &crate::host::Recorder,
 ) -> Result<Sources> {
     let direct = direct_reads && cfg!(feature = "linux-direct-io");
     let mut files = Vec::with_capacity(inputs.len());
     for pin in inputs {
-        files.push(Source::open(&pin, direct)?);
+        files.push(Source::open(&pin, direct, invocation)?);
     }
     Ok(Sources {
         files,
@@ -1247,11 +1248,11 @@ pub(crate) struct Source {
 }
 
 impl Source {
-    fn open(pin: &PinnedInput, direct: bool) -> Result<Self> {
+    fn open(pin: &PinnedInput, direct: bool, _invocation: &crate::host::Recorder) -> Result<Self> {
         #[cfg(feature = "linux-direct-io")]
         if direct {
             return Ok(Self {
-                input: InputFile::direct(pin)?,
+                input: InputFile::direct(pin, _invocation)?,
             });
         }
         let _ = direct;

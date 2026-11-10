@@ -65,7 +65,7 @@ impl FileWriter {
         invocation: &crate::host::Recorder,
     ) -> crate::Result<Self> {
         Ok(Self {
-            inner: Inner::Direct(DirectWriter::create(path)?),
+            inner: Inner::Direct(DirectWriter::create_in(path, Some(invocation))?),
             invocation: invocation.permit(),
         })
     }

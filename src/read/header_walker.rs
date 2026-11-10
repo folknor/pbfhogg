@@ -682,7 +682,7 @@ impl HeaderWalker<crate::read::direct_reader::DirectPositional> {
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
-        let (file, align) = source.open_direct().map_err(|e| {
+        let (file, align) = source.open_direct(Some(&host.invocation)).map_err(|e| {
             if matches!(
                 e.kind(),
                 crate::ErrorKind::PlatformUnsupported { .. } | crate::ErrorKind::InputReplaced

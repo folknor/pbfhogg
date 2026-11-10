@@ -11,6 +11,7 @@
 mod command_paths;
 mod exit_code;
 mod host;
+mod io_reach;
 #[cfg(test)]
 mod library_text_rule;
 mod output;
@@ -497,6 +498,15 @@ pub fn cli_command() -> clap::Command {
     }
     for retired in RETIRED_SHORTS {
         cmd = mut_subcommand_at(cmd, retired.path, &|sub| sub.arg(retired.arg()));
+    }
+    for reach in io_reach::REACH {
+        cmd = mut_subcommand_at(cmd, reach.path, &|sub| {
+            if sub.get_arguments().any(|arg| arg.get_id() == "direct_io") {
+                sub.mut_arg("direct_io", |arg| arg.help(reach.help()))
+            } else {
+                sub
+            }
+        });
     }
     cmd
 }
@@ -3548,6 +3558,7 @@ pub fn run() -> process::ExitCode {
     pbfhogg::write::emit_writer_counters(&host.invocation);
     pbfhogg::read::emit_read_counters(&host.invocation);
     pbfhogg::write::report_writer_degradations(&host);
+    host.report_io_degradations();
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::write_count(&host.invocation);
     #[cfg(feature = "test-hooks")]

@@ -421,12 +421,14 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   truncating literals or presenting a partial keyed diff as complete; the
   -v contract in the CLI reference records the distinction from range summaries.
 
-- [ ] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` is unmeasured.** Its doc in
-  `src/tunables.rs` says "sized so one call stays in the low milliseconds;
-  not measured". With `VERBOSE_SEQUENCE_DIFF_MAX_EDITS` (1000) now stopping
-  the search past layer 1000, the work cap mostly matters for long snakes.
-  A unit-level timing of a worst-case call (two ~30k sequences differing
-  near the cap) would settle whether 1 << 20 is right. Low priority.
+- [x] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` measured (2026-11-10).** Keep
+  `1 << 20`. Release-mode unit timings on bygg, commit 0e42bba3 plus these
+  diff changes, 11 calls per 30k-integer case: disjoint median 1.18 ms,
+  max 2.54 ms; 500 scattered replacements (exactly 1000 edits) median
+  1.43 ms, max 1.46 ms. This supports the low-millisecond rationale;
+  the budget bounds search work, not wall time for arbitrary lengths or
+  expensive equality. The ignored `verbose_sequence_budget_timing` unit
+  test retains the probe; there is no host-dependent timing assertion.
 
 - [ ] **`diff -v` keyed tag lines carry no positions.** Unique-key tag lists
   print keyed `-"k"="v"`/`+"k"="v"`/`~"k"` plus `tags: order changed`, so
@@ -445,20 +447,21 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   back by range, or an index-only first pass plus a re-parse into key-range
   buckets; both add a full payload write and read.
 
-- [ ] **Absent-versus-zero survives in the PBF metadata representation.**
-  `osc::compact::ArenaMeta` carries presence only for version and user;
-  uid, changeset and timestamp there, and every field of
-  `write::block_builder::Metadata`, still share absence and zero, so an OSC
-  element with `version="4"` and nothing else
-  is written with `uid = 0`, `changeset = 0`, `timestamp = 0` - indistinguishable
-  from a genuine user 0 or a genuine epoch timestamp. Same collapse already
-  fixed for coordinates, for `push_info_attrs` and for OSC `version`; it
-  survives here because absence and zero share one representation through the
-  whole PBF write path. `cli/tests/cli_apply_changes.rs::merge_metadata_preservation`
-  currently asserts the bug - it is documented to record the collapse rather
-  than endorse it, and its assertion message says what must change. The fix is
-  per-field presence for the remaining fields in both types plus `Option`-shaped fields through
-  `BlockBuilder`: a write-path change, wide enough to deserve its own round.
+- [x] **Preserve absent-versus-zero in OSC-to-PBF metadata.**
+  `osc::compact::ArenaMeta` now records presence for every metadata field in
+  its existing flag byte (the record stays 29 bytes). `PartialMetadata` carries
+  `Option` fields through dedicated `BlockBuilder::add_*_partial` methods;
+  apply-changes uses these instead of fabricating zero values. The existing
+  complete `Metadata` API and ordinary dense-node write loop remain intact.
+  Partial nodes use plain PBF Node/Info groups because DenseInfo cannot express
+  per-node field absence. Mixed plain/dense groups preserve input order.
+  This adds presence checks and plain-node encoding work on OSC writes, plus
+  buffering/copying those groups; ordinary full-metadata element writes gain
+  no per-element presence work. `merge_metadata_preservation` now requires
+  absent uid, changeset and timestamp, and builder tests distinguish missing
+  fields from explicit zeros for nodes, ways (including locations) and relations.
+  General PBF metadata extraction/re-encoding outside this OSC path still has
+  its existing defaulting policy; that broader API migration is outside this item.
 
 ### Core infrastructure and CLI
 

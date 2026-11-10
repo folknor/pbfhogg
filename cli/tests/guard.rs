@@ -15,29 +15,35 @@
 //! - process creation: `fork`, `vfork`, and `clone` without `CLONE_THREAD`.
 //!   `clone3` passes its flags in memory a filter cannot read, so it fails
 //!   with `ENOSYS`; glibc then creates threads through `clone`, and a caller
-//!   creating a process through it falls back to `clone` too and dies.
+//!   creating a process through that fallback dies. A raw caller need not
+//!   fall back: see the limitation below.
 //! - the lease: `close`, `close_range` over it, `dup`/`dup2`/`dup3` from or
 //!   onto it, `fcntl` with `F_SETFD`, `F_SETFL`, `F_DUPFD` or
 //!   `F_DUPFD_CLOEXEC`, `ioctl` with `FIOCLEX`, `FIONCLEX`, `FIONBIO` or
 //!   `FIOASYNC`.
 //! - descriptor passing: `sendmsg`, `sendmmsg` and `pidfd_getfd`, anywhere.
+//! - io_uring: `io_uring_setup` is killed unless the command arguments contain
+//!   `--io-uring` before the positional-only `--` separator. Ordinary runs
+//!   cannot create a ring whose submissions would bypass the syscall rules.
 //!
-//! The filter is stricter than the promise in two places, because a filter
-//! sees only syscall numbers and register arguments and cannot follow an
+//! For descriptors, the filter is stricter than the promise in two places:
+//! it sees only syscall numbers and register arguments and cannot follow an
 //! alias: any duplicate of the lease is refused (a duplicate shares the open
 //! file description, so its file-status flags are the lease's), and so is
 //! every `sendmsg`, `sendmmsg` and `pidfd_getfd` (each can make such a
 //! duplicate, or hand the lease to a process that outlives pbfhogg).
 //! pbfhogg needs none of them.
 //!
-//! What it does not prove: an io_uring submission (`IORING_OP_CLOSE` and the
-//! like) is not a syscall the filter sees, so closing the lease through a
-//! ring would pass; pbfhogg uses io_uring only for its own `--io-uring`
-//! output writer, and the brokkr.toml textlint rules stay the tripwire
-//! there. A caller that tries `clone3`, gets `ENOSYS`, ignores it and
-//! carries on would pass as well: the guard proves that no process creation
-//! succeeded, not that none was attempted. And it covers the runs the tests
-//! make, not every command and flag combination, built with the test
+//! What it does not prove: on explicit `--io-uring` runs, ring submissions
+//! (`IORING_OP_CLOSE` and the like) can still touch the lease unseen. The
+//! brokkr.toml textlint rules remain the tripwire for that writer. Restricting
+//! its operations would require cooperation from the ring creator, beyond
+//! this test-only filter. A raw caller that tries `clone3`, gets `ENOSYS`,
+//! ignores it and carries on also passes: the guard proves no process was
+//! created, not that none was attempted. Killing `clone3` would kill glibc's
+//! legitimate thread creation too; seccomp cannot read its flags in memory.
+//! The control probes preserve both limitations explicitly. The guard covers
+//! the runs the tests make, not every command and flag combination, with test
 //! features, never hotpath's: the `no-hotpath-cpu` script check in
 //! brokkr.toml keeps hotpath's process-starting CPU profiler out of every
 //! workspace build instead.
@@ -182,7 +188,7 @@ fn op_on(lease: u32, ops: &[u32]) -> Vec<libc::sock_filter> {
     clippy::cast_possible_truncation,
     reason = "small positive constants"
 )]
-fn program(lease: u32) -> Vec<libc::sock_filter> {
+fn program(lease: u32, io_uring: bool) -> Vec<libc::sock_filter> {
     let kill = [stmt(RET_K, KILL)];
     let mut prog = vec![
         stmt(LD_W_ABS, OFF_ARCH),
@@ -210,6 +216,9 @@ fn program(lease: u32) -> Vec<libc::sock_filter> {
         ],
     );
     block(&mut prog, libc::SYS_clone3, &[stmt(RET_K, ENOSYS_RET)]);
+    if !io_uring {
+        block(&mut prog, libc::SYS_io_uring_setup, &kill);
+    }
     block(&mut prog, libc::SYS_sendmsg, &kill);
     block(&mut prog, libc::SYS_sendmmsg, &kill);
     block(&mut prog, libc::SYS_pidfd_getfd, &kill);
@@ -259,6 +268,13 @@ fn program(lease: u32) -> Vec<libc::sock_filter> {
     prog
 }
 
+/// Only an explicit switch before the positional separator permits ring setup.
+fn allows_io_uring(cmd: &Command) -> bool {
+    cmd.get_args()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--io-uring")
+}
+
 /// Put `cmd` under the guard, when the host supports it. Register this after
 /// every other `pre_exec` hook: hooks run in order, and nothing may run in
 /// the child after the filter but the exec.
@@ -274,7 +290,7 @@ pub fn apply(cmd: &mut Command) {
     let lease: RawFd = writer.as_raw_fd();
     assert!(lease > 2, "the lease must not be a stdio descriptor");
     let lease_k = u32::try_from(lease).expect("descriptor numbers are non-negative");
-    let filter = program(lease_k);
+    let filter = program(lease_k, allows_io_uring(cmd));
     cmd.env(LEASE_FD_ENV, lease.to_string());
     // SAFETY: the closure runs between fork and exec, calls only
     // async-signal-safe syscalls (`fcntl`, `prctl`, `seccomp`) and allocates
@@ -321,6 +337,20 @@ mod tests {
     use super::{LEASE_FD_ENV, apply, killed_by_guard, supported};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ring_exception_requires_an_explicit_switch() {
+        for (args, allowed) in [
+            (vec!["cat", "input.pbf"], false),
+            (vec!["cat", "--io-uring", "input.pbf"], true),
+            (vec!["cat", "--", "--io-uring"], false),
+            (vec!["cat", "--io-uring=false"], false),
+        ] {
+            let mut cmd = Command::new("pbfhogg");
+            cmd.args(&args);
+            assert_eq!(super::allows_io_uring(&cmd), allowed, "{args:?}");
+        }
+    }
 
     const PROBE_ENV: &str = "PBFHOGG_TEST_GUARD_PROBE";
     const PROBE_NAME: &str = "guard::tests::probe";
@@ -501,11 +531,39 @@ mod tests {
                 "pidfd_getfd" => {
                     libc::syscall(libc::SYS_pidfd_getfd, -1, n_long, 0);
                 }
+                "io_uring_setup" | "io_uring_setup_allowed" => {
+                    // Invalid arguments: exercise entry to the syscall without
+                    // needing ring support, permissions, or locked memory.
+                    let rc = libc::syscall(libc::SYS_io_uring_setup, 0, std::ptr::null::<u8>());
+                    assert_eq!(rc, -1, "invalid setup must not create a ring");
+                }
+                "clone3_ignored" => clone3_ignored(),
                 "allowed" => allowed(n),
                 other => panic!("unknown probe case {other}"),
             }
         }
         println!("probe {case} survived");
+    }
+
+    fn clone3_ignored() {
+        // A real process request (zero flags), deliberately ignoring the
+        // refusal. Keep this surviving limitation visible.
+        let args = [0_u64; 11];
+        // SAFETY: args holds the clone_args fields, all zero. The guard
+        // refuses the call before the kernel reads them.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                args.as_ptr(),
+                std::mem::size_of_val(&args),
+            )
+        };
+        forked(rc);
+        assert_eq!(rc, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS)
+        );
     }
 
     /// Everything the guard must leave alone: the lease as inherited, reads
@@ -628,6 +686,11 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out_path).expect("stdout file"))
             .stderr(std::fs::File::create(&err_path).expect("stderr file"));
+        if case == "io_uring_setup_allowed" {
+            // libtest consumes this as a skip pattern, so the probe binary
+            // accepts the same literal switch the guard sees on CLI runs.
+            cmd.args(["--skip", "--io-uring"]);
+        }
         apply(&mut cmd);
         let mut child = cmd.spawn().expect("spawn the probe");
         let start = Instant::now();
@@ -676,6 +739,7 @@ mod tests {
             "sendmsg",
             "sendmmsg",
             "pidfd_getfd",
+            "io_uring_setup",
         ];
         if cfg!(target_arch = "x86_64") {
             killing.extend(["raw_fork", "raw_vfork", "dup2_from", "dup2_onto"]);
@@ -692,9 +756,11 @@ mod tests {
                 ));
             }
         }
-        let ran = run_probe("allowed");
-        if !(ran.status.success() && ran.out.contains("probe allowed survived")) {
-            failures.push(format!("allowed: {}\n{}", ran.status, ran.out));
+        for case in ["allowed", "io_uring_setup_allowed", "clone3_ignored"] {
+            let ran = run_probe(case);
+            if !(ran.status.success() && ran.out.contains(&format!("probe {case} survived"))) {
+                failures.push(format!("{case}: {}\n{}", ran.status, ran.out));
+            }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     }

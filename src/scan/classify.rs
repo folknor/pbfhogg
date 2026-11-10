@@ -1986,55 +1986,83 @@ mod tests {
         .unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
-        let run = |fail: &(dyn Fn(usize) + Sync)| {
+        // On an error the failing worker drops its accumulator after raising
+        // the stop flag. Hold its peer in its first callback until that drop,
+        // so the assertion measures work after the stop, not how long the
+        // scheduler takes to resume the worker that is about to fail.
+        struct State<'a> {
+            failing: bool,
+            exited: &'a (std::sync::Mutex<bool>, std::sync::Condvar),
+        }
+        impl Drop for State<'_> {
+            fn drop(&mut self) {
+                if self.failing {
+                    *self.exited.0.lock().unwrap() = true;
+                    self.exited.1.notify_all();
+                }
+            }
+        }
+
+        let run = |panic: bool| {
             let classified = AtomicUsize::new(0);
-            let merged = AtomicUsize::new(0);
+            let exited = (std::sync::Mutex::new(false), std::sync::Condvar::new());
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::parallel_classify_accumulate(
                     &shared_file,
                     &schedule,
                     Some(2),
-                    || (),
-                    |_block, ()| {
+                    || State {
+                        failing: false,
+                        exited: &exited,
+                    },
+                    |_block, state| {
                         let n = classified.fetch_add(1, Ordering::Relaxed);
-                        fail(n);
                         if n == 0 {
+                            state.failing = true;
+                            assert!(!panic, "first blob panics");
                             return Err(crate::Error::invalid_data("first blob fails"));
+                        }
+                        if !panic {
+                            drop(
+                                exited
+                                    .1
+                                    .wait_while(exited.0.lock().unwrap(), |done| !*done)
+                                    .unwrap(),
+                            );
                         }
                         Ok(())
                     },
-                    |()| {
-                        merged.fetch_add(1, Ordering::Relaxed);
-                    },
+                    |_| {},
                     &crate::host::Host::entered_for_tests(),
                 )
             }));
             (outcome, classified.into_inner())
         };
 
-        // An error on the first blob. The bound is wide (the descriptor
-        // channel holds 16, and each peer finishes the blob in hand) and
-        // still fails decisively against the old full drain.
-        let (outcome, classified) = run(&|_| {});
+        let (outcome, classified) = run(false);
         let err = outcome
             .expect("an error is returned, not raised")
             .unwrap_err();
         assert!(err.to_string().contains("first blob fails"), "{err}");
         assert!(
-            classified < BLOBS / 2,
-            "an early error must stop the peers; {classified} of {BLOBS} blobs \
-             were classified"
+            classified <= 2,
+            "only the failing blob and a peer's in-flight blob may run; \
+             {classified} of {BLOBS} blobs were classified"
         );
 
-        // A panic on the first blob stops the peers the same way, and is
-        // still re-raised.
-        let (outcome, classified) = run(&|n| assert_ne!(n, 0, "first blob panics"));
+        // A panic still propagates through the pool. Do not bound work here:
+        // the failing thread may be descheduled or spend time in the panic
+        // hook before unwinding raises the stop flag. Test that guard directly
+        // below, independently of thread scheduling and panic reporting.
+        let (outcome, _) = run(true);
         assert!(outcome.is_err(), "the panic must still propagate");
-        assert!(
-            classified < BLOBS / 2,
-            "an early panic must stop the peers; {classified} of {BLOBS} blobs \
-             were classified"
-        );
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = super::StopOnUnwind(&stop);
+            panic!("worker unwinds");
+        });
+        assert!(outcome.is_err());
+        assert!(stop.load(Ordering::Relaxed), "unwinding must stop peers");
 
         // Paired counterpart: a run that never fails is exhaustive.
         let all = AtomicUsize::new(0);

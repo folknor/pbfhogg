@@ -927,15 +927,14 @@ fn filter_by_id_walker(
     Ok(stats)
 }
 
-/// Sequential full-read include scan: stream every frame with
-/// `Frames::next_raw` (one buffered, readahead-friendly pass), skip
-/// non-matching OSMData blobs via the indexdata kind + ID-range prescreen
-/// before decompression, and decode + filter only intersecting blobs.
+/// Sequential include scan: read frame headers, skip non-matching OSMData
+/// payloads via the indexdata kind + ID-range prescreen, and read + decode
+/// only intersecting blobs. Payload skips retain buffered bytes when possible.
 ///
 /// This is the measured high-blob-count arm for getid include mode
 /// (ADR-0006). It deliberately does NOT use the pipelined reader: with a
 /// sparse query nearly every blob is skipped, so the run is bounded by
-/// moving bytes past the prescreen, and per-frame pipeline overhead
+/// walking headers and skipping payloads, and per-frame pipeline overhead
 /// (permit accounting, rayon dispatch, channel hops) times millions of
 /// small blobs loses to a plain sequential read loop.
 #[allow(clippy::too_many_lines)]
@@ -981,15 +980,17 @@ fn filter_by_id_streaming(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = frames.next_raw()? {
+    while let Some(frame) = frames.next_header()? {
         // The frame loop owns the provenance of failures on this frame.
         let id = frame.id;
-        let locate = |e: Error| frames.locate(id, e);
-        match frame.blob_type {
+        match frame.header.blob_type {
             // The frame walk refuses a second OSMHeader, so this is the only
             // one.
             BlobKind::OsmHeader => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(locate)?;
+                let mut payload = Vec::with_capacity(frame.data_size);
+                frames.read_payload(&mut payload)?;
+                let header =
+                    decode_blob_to_headerblock(&payload).map_err(|e| frames.locate(id, e))?;
                 let header_bytes = super::output_header::build_one(
                     &header,
                     &super::output_header::OutputFacts::carry(
@@ -1012,7 +1013,12 @@ fn filter_by_id_streaming(
                 let w = writer
                     .as_mut()
                     .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
-                if let Some(ref idx) = frame.index {
+                let index = frame
+                    .header
+                    .indexdata
+                    .as_ref()
+                    .and_then(|data| crate::blob_meta::BlobIndex::deserialize(data));
+                if let Some(ref idx) = index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
                             ids.node_ids.any_in_range(idx.min_id, idx.max_id)
@@ -1023,14 +1029,18 @@ fn filter_by_id_streaming(
                         }
                     };
                     if !blob_filter.wants_index(idx) || !has_match {
+                        frames.skip_payload()?;
                         blobs_skipped += 1;
                         continue;
                     }
                 }
                 // Blob might contain matching IDs, or carries no indexdata
                 // and must be decoded to check.
+                let mut payload = Vec::with_capacity(frame.data_size);
+                frames.read_payload(&mut payload)?;
+                let locate = |e: Error| frames.locate(id, e);
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)
+                crate::blob::decompress_blob_data_into(&payload, &mut decompress_buf)
                     .map_err(locate)?;
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
@@ -1042,7 +1052,7 @@ fn filter_by_id_streaming(
                     None,
                     &mut st_scratch,
                     &mut gr_scratch,
-                    frame.index.as_ref().map(|idx| idx.kind),
+                    index.as_ref().map(|idx| idx.kind),
                 );
                 let Some(block) = included_block(buffer, ids, None).map_err(locate)? else {
                     continue;
@@ -1072,7 +1082,7 @@ fn filter_by_id_streaming(
                     }
                 }
             }
-            _ => {}
+            _ => frames.skip_payload()?,
         }
     }
 
@@ -2179,6 +2189,21 @@ mod tests {
             ),
             vec![1, 10]
         );
+    }
+
+    #[test]
+    fn include_arms_skip_rejected_payloads_before_a_match() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("input.pbf");
+        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+        let host = crate::host::Host::entered_for_tests();
+        // Reject the node blob by kind, then by ID range while still asking
+        // for nodes. In both cases the following way payload must be read.
+        for query in [&["w10"][..], &["n999", "w10"][..]] {
+            assert_eq!(ids_from_both_arms(&input, query, &host), vec![10]);
+        }
+        // Also skip the final payload after reading a matching node blob.
+        assert_eq!(ids_from_both_arms(&input, &["n1"], &host), vec![1]);
     }
 
     #[test]

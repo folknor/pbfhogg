@@ -4027,6 +4027,22 @@ reading 2.6 GB to 31 ms, as the walk no longer runs after a full
 sequential read of the file. The germany index is byte-identical
 across the change, all 19 files by md5.
 
+### Advice off the merge thread, 2b lookups on workers (bygg, 2026-11-10, `9775b0e2` against `da55488a`)
+
+Read-ahead advice in the ordered classify pool moves to its own thread,
+Phase 2a's output takes 2b's packed form, and 2b's workers look strings
+up in a read-only snapshot of the pool so the merge interns only misses.
+
+After a trim, `--iterations 1`, both arms `--commit`, A B then B A.
+Planet geocode-build: A 127 s (`974180ac`) and 126 s (`d2cc07db`), B
+123 s (`c8aeda0b`) and 123 s (`63ddabda`), about 3 % faster. Against
+`d2cc07db`, GEOCODE_PASS2A 21.9 to 19.0 s and GEOCODE_PASS2B 8.2 to
+7.2 s; every other phase unchanged. The germany index is byte-identical
+across the change, all 19 files by md5. Guard on the other ordered
+classify users, planet `copy-pbf --clean yes`: A 142 s (`3be27943`) and
+142 s (`eddd7768`), B 143 s (`67d379e5`) and 143 s (`39ddb8ac`),
+neutral. Kept.
+
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
 
 | Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |

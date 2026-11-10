@@ -4,8 +4,8 @@
 -- Both variant params must match; supply both for non-indexed input because
 -- param defaults cannot depend on another param. Binding both files keeps
 -- their reservations, digests and pairing in brokkr's input machinery.
--- Compare the marked diff child's wall. Profiling and stops apply only to
--- it. Outputs live under host scratch's bench-iterations.
+-- measured = true ranks iterations by the diff child. Profiling and stops
+-- apply only to it. Outputs live under host scratch's bench-iterations.
 -- Existing diff-text and diff-unindexed retain their fixed cache workloads.
 --
 --   brokkr bench --dry-run diff-pair --from base --to twin --format default,osc

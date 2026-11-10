@@ -6,63 +6,16 @@ local M = {}
 
 function M.validate(params)
     stops.resolve(params.stop)
-    if params.jobs then
-        local digits = params.jobs:gsub("^%+", "")
-        local n = digits:gsub("^0+", "")
-        if n == "" then n = "0" end
-        if not digits:match("^%d+$") or #n > 20
-            or (#n == 20 and n > "18446744073709551615") then
-            fail("--jobs must be an unsigned 64-bit integer")
-        end
-    end
 end
 
--- Match the typed runner's first-OsmData-BlobHeader probe, rather than
--- guessing from the variant name or scanning every blob with inspect.
+-- Scan all data blobs: inspect --indexed only probes the first one.
 function M.unindexed(input)
-    local r = binary_with({ program = "python3" }, "-c", "\n"
-        .. "import sys\n"
-        .. "\n"
-        .. "def varint(data, pos):\n"
-        .. "    value = shift = 0\n"
-        .. "    while True:\n"
-        .. "        b = data[pos]; pos += 1\n"
-        .. "        value |= (b & 127) << shift\n"
-        .. "        if b < 128: return value, pos\n"
-        .. "        shift += 7\n"
-        .. "\n"
-        .. "def fields(data):\n"
-        .. "    pos = 0\n"
-        .. "    result = {}\n"
-        .. "    while pos < len(data):\n"
-        .. "        tag, pos = varint(data, pos)\n"
-        .. "        wire = tag & 7\n"
-        .. "        if wire == 0:\n"
-        .. "            value, pos = varint(data, pos)\n"
-        .. "        elif wire == 2:\n"
-        .. "            size, pos = varint(data, pos)\n"
-        .. "            value = data[pos:pos+size]; pos += size\n"
-        .. "        elif wire in (1, 5):\n"
-        .. "            pos += 8 if wire == 1 else 4\n"
-        .. "            continue\n"
-        .. "        else:\n"
-        .. "            raise ValueError(\"invalid BlobHeader wire type\")\n"
-        .. "        result[tag >> 3] = value\n"
-        .. "    return result\n"
-        .. "\n"
-        .. "with open(sys.argv[1], \"rb\") as f:\n"
-        .. "    while True:\n"
-        .. "        size = f.read(4)\n"
-        .. "        if not size:\n"
-        .. "            print(\"indexed\"); break\n"
-        .. "        n = int.from_bytes(size, \"big\")\n"
-        .. "        if len(size) != 4 or not 0 < n <= 65536:\n"
-        .. "            raise ValueError(\"invalid BlobHeader length\")\n"
-        .. "        header = fields(f.read(n))\n"
-        .. "        if header[1] == b\"OSMData\":\n"
-        .. "            print(\"indexed\" if 2 in header else \"raw\"); break\n"
-        .. "        f.seek(header[3], 1)\n", input):ok()
-    return r.stdout:match("^raw") ~= nil
+    local r = binary("inspect", input, { get = "indexed" }):ok()
+    local indexed = r.stdout:match("^%s*(%a+)%s*$")
+    if indexed ~= "true" and indexed ~= "false" then
+        fail("inspect --get indexed returned an unexpected answer: " .. r.stdout)
+    end
+    return indexed == "false"
 end
 
 function M.run(params, old, new, want)
@@ -75,7 +28,9 @@ function M.run(params, old, new, want)
     else
         flags["suppress-common"] = true
     end
-    local r = binary_with(profiling.options("diff", params.stop), "diff", old, new, flags)
+    local options = profiling.options("diff", params.stop)
+    options.measured = true
+    local r = binary_with(options, "diff", old, new, flags)
     record.summary = r.stderr
     if params.verbose == "yes" then print(r.stdout); print(r.stderr) end
     if r.stopped_at then

@@ -301,9 +301,10 @@ params.unsort = { choices = ["yes", "no"], default = "no", help = "yes: clear So
 [bench.diff-applied]
 script_file = "../benches/diff/diff-applied.lua"
 description = "Diff a base PBF against its applied OSC, measuring the diff child"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-10
 changelog = [
+  { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child; probe every blob with inspect --get indexed and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff two-step workload, raw-vs-indexed pairs, formats, jobs, type, snapshots and profiling" },
 ]
 profile = "release"
@@ -312,7 +313,7 @@ hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
-params.jobs = { validated = true, help = "unsigned 64-bit worker count; omitted uses the binary default" }
+params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
 params.stop = { validated = true, help = "diff marker: FOO_END, FOO, -FOO or -FOO_END" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "print captured diff output" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base or named snapshot, including its own OSC table" }
@@ -327,9 +328,10 @@ params.compression = { validated = true, help = "refused: diff writes no PBF; me
 [bench.diff-pair]
 script_file = "../benches/diff/diff-pair.lua"
 description = "Diff two independent snapshots with text or OSC output"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-10
 changelog = [
+  { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff-snapshots: base or named inputs, shared variant, formats, jobs and profiling" },
 ]
 profile = "release"
@@ -337,7 +339,7 @@ hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
-params.jobs = { validated = true, help = "unsigned 64-bit worker count; omitted uses the binary default" }
+params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
 params.stop = { validated = true, help = "diff marker: FOO_END, FOO, -FOO or -FOO_END" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "print captured diff output" }
 params.from = { from = "datasets.{dataset}.snapshot", required = true, help = "first snapshot key or base" }

@@ -1,8 +1,8 @@
 -- diff-applied: typed diff's apply-changes preparation then base vs merged
 -- comparison. Only the diff child is marked for hotpath/alloc and stops;
--- compare that child's wall, since iteration wall includes preparation.
+-- measured = true ranks iterations by that child, excluding preparation.
 -- Merge uses default compression, jobs and I/O, as the typed runner does.
--- Probe actual indexdata, not the variant key; raw bases get --force and
+-- Scan every blob for indexdata; raw or partially indexed bases get --force and
 -- record.meta.diff_pair = raw-vs-indexed. Text always suppresses common
 -- lines. For fixed warm/cold text paths use diff-text or diff-unindexed.
 -- Files live under host scratch's bench-iterations and are reclaimed after

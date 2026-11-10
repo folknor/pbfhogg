@@ -83,6 +83,23 @@ reading 2.6 GB to 31 ms, as the walk no longer runs after a full
 sequential read of the file. The germany index is byte-identical
 across the change, all 19 files by md5.
 
+### Pass 3 bucket writes in parallel, stage B on the ordered pool (bygg, 2026-11-10, `b9ccca65` against `9775b0e2`)
+
+Stage A groups each chunk's cover results by bucket and writes bucket
+files in parallel; stage B runs on `run_ordered` over the 256 buckets,
+window 8, each task sorting and encoding its bucket.
+
+After a trim, `--iterations 1`, both arms `--commit`, A B B A. Planet:
+A 123 s (`b057fb63`) and 122 s (`7e604c68`), B 109 s (`67b764ef`) and
+110 s (`4236420d`), about 10 % faster. Against `7e604c68`:
+GEOCODE_PASS3_STAGEA_STREETS 17.0 to 10.4 s, STAGEA_ADDR 4.3 to 2.6 s,
+STAGEB_FINE 21.0 to 18.1 s, STAGEB_COARSE 9.6 to 8.1 s; stage B peak
+anon 10.6 to 11.0 GB. Stage B still averages only 2 cores: one heavy
+bucket's single-threaded sort is the floor, as the design predicted.
+Germany pair: 6.8 s (`e119064b`) against 6.4 s (`7ff304fc`). The
+germany index is byte-identical across the change, all 19 files by
+md5. Kept.
+
 ### Advice off the merge thread, 2b lookups on workers (bygg, 2026-11-10, `9775b0e2` against `da55488a`)
 
 Read-ahead advice in the ordered classify pool moves to its own thread,

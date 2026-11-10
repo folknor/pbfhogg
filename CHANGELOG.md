@@ -32,8 +32,9 @@
   in a blob's string table no longer loses the way's coordinates. Planet
   builds need about 7 GB of extra scratch for the way store. Pass 1 now
   reads only the relation blobs instead of the whole file. Together with
-  cheaper Pass 2 merges, a planet build goes from 177 to 123 s on bygg
-  and a germany build from 10.6 to 6.9 s.
+  cheaper Pass 2 merges and parallel Pass 3 bucket writing, a planet
+  build goes from 177 to 110 s on bygg and a germany build from 10.6 to
+  6.4 s.
 - `diff -v` caps keyed tag lines with the other edit lines at 1000 per
   element; past the cap the element's tag detail is one line giving the
   tag counts and saying details were omitted.

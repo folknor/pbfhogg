@@ -401,7 +401,7 @@ use pbfhogg::write::block_builder::{HeaderBuilder, BlockBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
 use pbfhogg::host::Executor;
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 
 let mut header = HeaderBuilder::new().sorted();
 if let Some(b) = reader.header().bbox() {

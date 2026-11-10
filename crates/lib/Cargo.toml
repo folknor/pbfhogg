@@ -1,0 +1,93 @@
+[package]
+name = "pbfhogg"
+version.workspace = true
+authors.workspace = true
+description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "LIBRARY.md"
+keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
+categories = ["parser-implementations", "encoding", "science::geo"]
+# An allowlist, so a new file stays out of the published crate unless it is
+# named here. It ships the sources, the doc examples' input, the readme, the
+# changelog and the licenses. LIBRARY.md, CHANGELOG.md and the licenses are
+# symlinks to the repository-root files, which cargo packages as the target's
+# content. The repository's other documents (reference/, decisions/, docs/,
+# DEVIATIONS.md, CORRECTNESS.md, LLM.md) sit outside the package and do not
+# ship: citations of them read as repository paths.
+include = [
+    "/src/**/*.rs",
+    "/examples/*.rs",
+    "/tests/test.osm.pbf",
+    "/Cargo.toml",
+    "/LIBRARY.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
+# Integration tests are declared below rather than discovered: one binary
+# per file made every check sweep link ~50 harnesses and a focused
+# `brokkr test` list every one of them to find one test. A file in tests/
+# that is neither a module of tests/all.rs nor a [[test]] below is never
+# compiled, and nothing reports it.
+autotests = false
+
+[features]
+default = ["commands"]
+geocode-reader = ["dep:s2"]
+commands = ["dep:serde_json", "geocode-reader"]
+# Function-level profiling for brokkr's `--hotpath` / `--alloc` modes. Unlike
+# the per-invocation counters and sink, the hotpath crate's state is
+# process-wide (static queues, one guard per process, and under
+# `hotpath-alloc` a global allocator the CLI installs), so concurrent runs in
+# one process share their figures. Meaningful for one run per process only.
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+linux-direct-io = []
+linux-io-uring = ["dep:io-uring"]
+# Test-only fault injection (`pbfhogg::test_hooks`): a fault plan carried by
+# each invocation's cancellation token, plus a few per-object hooks. Nothing
+# is process-global, so an armed fault cannot fire in a sibling test and any
+# test harness may use them. Product builds never enable it; the hook state
+# and checks then compile out entirely.
+test-hooks = []
+
+[dependencies]
+protohoggr = "0.5.0"
+bytes = "1.12.1"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+rustc-hash = "2.1.3"
+# `HashTable` for the block string table's slot index, keyed by bytes in
+# one arena rather than by an allocation per string.
+hashbrown = { version = "0.17.1", default-features = false }
+zstd = "0.14.0"
+hotpath = "0.31.0"
+quick-xml = "0.42.0"
+# XXH3-128 for `digest`; pure Rust, xxh3 only.
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+serde_json = { workspace = true, optional = true }
+s2 = { version = "0.2.0", default-features = false, optional = true }
+io-uring = { version = "0.7.16", optional = true }
+libc = "0.2.191"
+
+
+[dev-dependencies]
+tempfile = "3.27.0"
+proptest = "1"
+
+# Every integration test that can share a process, as modules of one binary.
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[lints]
+workspace = true
+
+# Own process because it lowers its own soft RLIMIT_NOFILE.
+[[test]]
+name = "process_nofile"
+path = "tests/process_nofile.rs"

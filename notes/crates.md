@@ -247,6 +247,45 @@ Gates, all required:
 - `git status` shows nothing untracked under `crates/` (catches a
   scratch dir landing in the wrong place).
 
+**Step 2 done 2026-11-10 (uncommitted at time of writing).** Coverage
+re-recorded first (unchanged: 38 rules, 6951 paths), `git mv` of the three
+members and of `Cargo.toml` to `crates/lib/Cargo.toml`, then
+`rewrite_citations.py apply --base 5f1ec763` (409 rewritten, 0 by hand)
+before any hand edit, then the hand spots. Gates passed: `brokkr check
+--gate` (`check complete`), `--audit` 0 findings, `textlint_coverage.py
+check ... --moved` unchanged, `rewrite_citations.py check` clean, all 31
+benches `--dry-run` ok, `copy-pbf` on denmark ran, `brokkr library --all`
+certified 12/12, nothing untracked or ignored under `crates/`.
+**Not run: the `cargo package --list` / archive-build gate.** The
+permission policy denies `cargo package` and brokkr has no packaging
+command; the maintainer runs it (the "before" side is commit 5f1ec763).
+Corrections to the plan, decided while doing it:
+- `rewrite_citations.py check` was blind after the move: its scan matched
+  only the old member prefixes, so it read no `.rs` file under `crates/`.
+  It now matches both layouts, derives a `crates/<member>` package dir for
+  the package-relative test, and skips the dated records (CHANGELOG.md
+  kept its `src/geocode_index/reader.rs` on purpose and failed the check).
+  `list --base 5f1ec763` totals are unchanged by these fixes.
+- Beyond `src/read/frame.rs`, three more rendered relative links climbed
+  out of the member (`src/read/file_reader.rs`,
+  `src/commands/repack/mod.rs`, `cli/tests/cli_truncation_sweep.rs`); all
+  became plain repository-path citations.
+- The `crates/lib` packaging symlinks (`LIBRARY.md`, `CHANGELOG.md`) are
+  tracked files under a directory, so `check_doc_links.py` would treat them
+  as durable documents whose links resolve from `crates/lib`; it now skips
+  symlinks. Its line-number rule moved to `crates/lib/src/`.
+- `README.md` dropped out of the library's `include` too (the readme is
+  `LIBRARY.md`; the root README never was the crate's).
+- Config and script path tokens were rewritten with
+  `scripts/move_config_paths.py`, a one-off (`lints.toml`, `checks.toml`
+  comments, `brokkr.toml` comment, `check_source_invariants.py`,
+  `counter_names_diff.py`); keep or delete it.
+- Left for step 3: `check_doc_links.py` derives claimed top-level
+  directories from tracked files, so a stale backticked `src/...` in a doc
+  is no longer claimed as a repository path and would dangle silently;
+  AGENTS.md's "root clippy lints only the root package" sentence and
+  `reference/testing.md`'s "root package" wording are now false.
+
 ### Step 3: prose
 
 `AGENTS.md` Workspace and Conventions sections and `reference/testing.md`

@@ -188,7 +188,7 @@ suite; the rest still carry their older commit in the Notes column.
 > overlap group and the whole file is decoded, heap-merged and
 > re-encoded on one thread; it never was a `BTreeMap` pass, as this
 > callout used to say. Since that run, `cat --dedupe` shares `sort`'s
-> engine (`src/commands/blob_merge.rs`): pass 1 is the `HeaderWalker`
+> engine (`crates/lib/src/commands/blob_merge.rs`): pass 1 is the `HeaderWalker`
 > walk, passthrough is coalesced `copy_file_range`, and each overlap
 > group is swept on a worker thread with bounded streaming. The 133-minute
 > row predates all three; the callouts below hold the cells measured since.
@@ -216,7 +216,7 @@ suite; the rest still carry their older commit in the Notes column.
 
 > **What the planet self-merge sweeps hold (2026-11-04, bygg, `fda05956`
 > plus the change that added the `overlap_run_*` counters, measured
-> uncommitted with `--force`).** The counters (`src/commands/blob_merge/sweep.rs`,
+> uncommitted with `--force`).** The counters (`crates/lib/src/commands/blob_merge/sweep.rs`,
 > "Resource counters") on `cat --dedupe` planet with itself, cell
 > `10f5ec37` (dirty sidecar): largest run charge
 > `overlap_run_pinned_high_water_bytes` **12.5 MB** (two twin blobs, about a

@@ -7,7 +7,7 @@ cannot be textlint rules:
 - The CLI's exit path must call both counter-emission hooks. The library's
   textlint rules forbid emitting from anywhere else, which a program that
   emits nothing at all would satisfy, so the call itself is required here.
-- `probe_lock` in src/scratch.rs must open the lock read-write and must never
+- `probe_lock` in crates/lib/src/scratch.rs must open the lock read-write and must never
   create it. The property is scoped to one function body.
 - No `as i64` cast inside the arguments of a `.counter(...)` call.
   `Invocation::counter` takes unsigned integers directly and saturates them
@@ -17,10 +17,10 @@ cannot be textlint rules:
   sees the call's arguments only, not casts made upstream of a local.
 - No `static` item gated on the `test-hooks` feature anywhere in the
   library. Test pause and fault state rides the run's Invocation token
-  (src/test_hooks.rs, reference/testing.md); a gated static is process-global
+  (crates/lib/src/test_hooks.rs, reference/testing.md); a gated static is process-global
   hook state that reaches every concurrent test. The textlint rule
-  `no-static-fault-hook-state` covers src/test_hooks.rs whole, but test-hook
-  items also live with the code they reach (src/output.rs, src/host.rs), and
+  `no-static-fault-hook-state` covers crates/lib/src/test_hooks.rs whole, but test-hook
+  items also live with the code they reach (crates/lib/src/output.rs, crates/lib/src/host.rs), and
   the gate sits on the line above the item, which a one-line rule cannot
   read. The scan reads each static's own attribute block, so a static
   nested inside a gated module or macro body is not seen.
@@ -167,7 +167,7 @@ def matching(pattern):
     return paths
 
 
-for pattern in ("src/**/*.rs", "cli/src/**/*.rs"):
+for pattern in ("crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"):
     for path in matching(pattern):
         for line, args in counter_casts(path.read_text()):
             errors.append(
@@ -225,7 +225,7 @@ for source, expected in GATED_STATIC_SELF_TEST:
             f"static(s), got {got}, in {source!r}"
         )
 
-for path in matching("src/**/*.rs"):
+for path in matching("crates/lib/src/**/*.rs"):
     for line in gated_statics(path.read_text()):
         errors.append(
             f"{path.relative_to(root)}:{line}: a static gated on the test-hooks "
@@ -238,25 +238,25 @@ def code_only(source):
     return "\n".join(line.split("//")[0] for line in source.splitlines())
 
 
-cli = re.sub(r"\s+", "", code_only((root / "cli/src/lib.rs").read_text()))
+cli = re.sub(r"\s+", "", code_only((root / "crates/cli/src/lib.rs").read_text()))
 for hook in ("write::emit_writer_counters", "read::emit_read_counters"):
     call = f"pbfhogg::{hook}(&host.invocation)"
     if call not in cli:
         errors.append(
-            f"cli/src/lib.rs: the CLI must call {call} on its exit path, "
+            f"crates/cli/src/lib.rs: the CLI must call {call} on its exit path, "
             "or no run emits those counters"
         )
 
-scratch = code_only((root / "src/scratch.rs").read_text())
+scratch = code_only((root / "crates/lib/src/scratch.rs").read_text())
 parts = scratch.split("fn probe_lock(")
 if len(parts) < 2:
-    errors.append("src/scratch.rs: fn probe_lock not found")
+    errors.append("crates/lib/src/scratch.rs: fn probe_lock not found")
 else:
     probe = parts[1].split("\n}\n")[0]
     if ".write(true)" not in probe:
-        errors.append("src/scratch.rs: probe_lock must open the lock read-write")
+        errors.append("crates/lib/src/scratch.rs: probe_lock must open the lock read-write")
     if ".create(" in probe:
-        errors.append("src/scratch.rs: probe_lock must never create LOCK")
+        errors.append("crates/lib/src/scratch.rs: probe_lock must never create LOCK")
 
 if errors:
     print("\n".join(errors), file=sys.stderr)

@@ -114,7 +114,7 @@ data.
 Every command that reads PBF input adheres to the same contract -
 there is no per-command relaxation. The contract sites are:
 
-- `read::frame::Frames` (`src/read/frame.rs`) - the one frame
+- `read::frame::Frames` (`crates/lib/src/read/frame.rs`) - the one frame
   walk. It owns the length prefix, the shape-1 EOF policy, both size
   guards (zero-length and `MAX_BLOB_HEADER_SIZE`), the header parse,
   the header-position rule, the declared-datasize guards, shapes 2-4
@@ -141,7 +141,7 @@ the file size it captured at `open()`.
 The sources agree on every frame-layer outcome and report it in the
 same words at the same location. The full matrix, every truncation
 shape and size guard through every source, is
-`src/read/frame_conformance_tests.rs`, one expectation per case,
+`crates/lib/src/read/frame_conformance_tests.rs`, one expectation per case,
 with the error text compared across sources; a change to it is a
 behaviour change at every source. Two things are outside the frame
 layer and so differ by reader:
@@ -159,14 +159,14 @@ layer and so differ by reader:
 The other contract sites are:
 
 - `zlib_decompress_into` / `zstd_decompress_into`
-  (`src/read/decompress.rs`) for shape 5 - the actual
+  (`crates/lib/src/read/decompress.rs`) for shape 5 - the actual
   decompressors, reached by every `decompress_*` entry point
-- `WireBlob::parse` (`src/read/blob_wire.rs`) and
-  `decompress_blob_raw` (`src/read/decompress.rs`) - the two Blob
+- `WireBlob::parse` (`crates/lib/src/read/blob_wire.rs`) and
+  `decompress_blob_raw` (`crates/lib/src/read/decompress.rs`) - the two Blob
   envelope parsers. Both reject a blob carrying more than one of
   `raw` / `zlib_data` / `zstd_data`, and both cross-check a
   declared `Blob.raw_size` against the payload they produced.
-- `validate_block` (`src/read/block.rs`) for the
+- `validate_block` (`crates/lib/src/read/block.rs`) for the
   block-layer contract below. Every `PrimitiveBlock` constructor -
   `from_vec`, `from_vec_with_scratch`,
   `from_vec_pooled_with_scratch` and the decode pools - funnels
@@ -278,7 +278,7 @@ bytes, `validate_in_place`, which is the check `project` runs), the
 same `validate_block` call, in the same order, that block
 construction runs with its empty projection, followed by the same
 kind-claim refusal. Lookups and specialised scanners (`inspect --show`,
-`src/scan/node.rs`) are not bound by this paragraph; their own docs
+`crates/lib/src/scan/node.rs`) are not bound by this paragraph; their own docs
 state what they check.
 
 The two dense-node arrays that array-length equality could not
@@ -376,7 +376,7 @@ OSM writer emits) or varint (individually tagged, unpacked
 values), and lets it appear more than once, with concatenation
 semantics.
 
-Until 2026-08-20 `src/read/wire.rs` matched only the
+Until 2026-08-20 `crates/lib/src/read/wire.rs` matched only the
 length-delimited form on every packed field of `Node`, `Way`,
 `Relation`, `DenseNodes` and `DenseInfo`. An unpacked field fell
 through to `skip_field` and left the slot empty, which meant an
@@ -422,17 +422,17 @@ they answer the same way `wire.rs` does, by two different routes.
 **Routed through `wire.rs`** - the scanner no longer has a message
 parser of its own, so the policy cannot drift again:
 
-- `src/scan/way.rs` parses each Way via `WireWay::parse`. It had
+- `crates/lib/src/scan/way.rs` parses each Way via `WireWay::parse`. It had
   matched `WIRE_LEN` only on `refs`, `keys` and `vals`; an unpacked
   `refs` invoked no callback at all and the caller concluded the way
   referenced no nodes - a silently short node index. It decodes
   `refs` with the fallible `read_varint` and propagates its error,
   since no block construction validated the array first.
-- `src/blob_meta/scan.rs` parses every element message (`Node`,
+- `crates/lib/src/blob_meta/scan.rs` parses every element message (`Node`,
   `DenseNodes`, `Way`, `Relation`) via the `wire.rs` parsers. Its
   predecessor read an unpacked `id` array as empty, so the blob
   silently got no indexdata.
-- `src/scan/node.rs` already routed through `WireDenseNodes::parse`
+- `crates/lib/src/scan/node.rs` already routed through `WireDenseNodes::parse`
   and never had the defect; its own top-level matcher touches only
   submessages and scalar fields, neither of which can be packed.
   Because it never constructs a `PrimitiveBlock`, it makes the
@@ -447,7 +447,7 @@ parser of its own, so the policy cannot drift again:
 
 **Handled locally, because routing is impossible:**
 
-- `src/commands/renumber/wire_rewrite.rs` is a byte-level splicer.
+- `crates/lib/src/commands/renumber/wire_rewrite.rs` is a byte-level splicer.
   It needs a field's *byte range* inside the enclosing message so
   every other field can be copied verbatim; `wire.rs` yields the
   *value* as a borrowed slice and deliberately does not expose
@@ -457,7 +457,7 @@ parser of its own, so the policy cannot drift again:
   range unset, so the relation took the "zero-member" branch and its
   member IDs were copied through **un-renumbered** into output that
   claims to be renumbered.
-- `src/commands/altw/reframe.rs` accepts both forms for `Way.refs`
+- `crates/lib/src/commands/altw/reframe.rs` accepts both forms for `Way.refs`
   and normalizes the unpacked spelling to the packed one on output;
   it re-emits that field itself, so it can. Matching `WIRE_LEN` only
   meant an unpacked `refs` fell to the verbatim copy arm, no
@@ -564,7 +564,7 @@ Shape 5 is enforced during decompression, not after it:
 
 The contract is pinned at several layers:
 
-**Frame conformance** (`src/read/frame_conformance_tests.rs`): every
+**Frame conformance** (`crates/lib/src/read/frame_conformance_tests.rs`): every
 truncation shape, size guard and boundary case driven through every
 frame source (`BlobReader`'s read and skip paths, the raw-frame walk,
 the front probes' header-then-skip walk and `HeaderWalker`), each
@@ -572,7 +572,7 @@ case held to one outcome, error kind, file, blob index and byte offset
 for all of them, and the error text compared across sources. The
 envelope difference has its own test beside it.
 
-**Reader layer** (`tests/read_paths.rs`): unit tests on
+**Reader layer** (`crates/lib/tests/read_paths.rs`): unit tests on
 `BlobReader::next` directly, independent of any command's policy
 on partial input.
 
@@ -583,13 +583,13 @@ on partial input.
   4 trailing bytes (a complete length prefix declaring header
   bytes that don't follow) is shape 2, must hard-error.
 - `truncated_header_size`, `truncated_header_data` in
-  `tests/corrupt_input.rs` - shapes 1 and 3 at the BlobReader
+  `crates/lib/tests/corrupt_input.rs` - shapes 1 and 3 at the BlobReader
   level.
-- `tests/proptests.rs::blob_reader_truncated_fixture_never_panics` -
+- `crates/lib/tests/proptests.rs::blob_reader_truncated_fixture_never_panics` -
   property-based: arbitrary truncation length is finite Ok/Err,
   never panics.
 
-**Command layer** (`cli/tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
+**Command layer** (`crates/cli/tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
 drives `cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
 and `renumber` through truncation offsets inside every blob's
 length prefix, header and payload, plus uniformly spaced offsets
@@ -609,7 +609,7 @@ and inherits the contract.
 
 **Block and decompression layer** (unit tests beside the code):
 
-- `src/read/block.rs::strict_validation_tests` - hand-encoded
+- `crates/lib/src/read/block.rs::strict_validation_tests` - hand-encoded
   blocks pinning each check, each paired with a well-formed
   counterpart so the test cannot pass against a constructor that
   rejects everything. The mid-varint fixtures additionally keep
@@ -617,22 +617,22 @@ and inherits the contract.
   what rejects them; an earlier fixture did not, and passed with
   the truncation check disabled because the length-equality check
   fired instead.
-- `src/read/decompress.rs::tests::truncated_zlib_stream_errors_instead_of_hanging` -
+- `crates/lib/src/read/decompress.rs::tests::truncated_zlib_stream_errors_instead_of_hanging` -
   runs the decompression on a worker thread behind a 5 s watchdog,
   so the hang regression surfaces as a bounded failure rather than
   as a hung suite.
-- `src/read/decompress.rs::tests::decompression_bomb_is_bounded_during_inflation`
+- `crates/lib/src/read/decompress.rs::tests::decompression_bomb_is_bounded_during_inflation`
   and `raw_size_capacity_hint_is_clamped_to_the_cap` - pin the
   during-inflation bound and the capacity-hint clamp separately.
-- `src/read/frame.rs::tests` - the size guards and the shape-1
+- `crates/lib/src/read/frame.rs::tests` - the size guards and the shape-1
   EOF policy at their boundaries: a 0-3 byte tail is `Ok(None)`, a
   complete prefix never is, and a prefix of `0xFFFFFFFF` is
   refused by the size guard rather than by the allocator; and the
   walk protocol (a header, then its payload; a failure ends the
   walk until it is repositioned). The pread source decides how short
   a tail is from the captured file size, so it has its own test,
-  `src/read/header_walker.rs::tests::the_walk_tolerates_a_short_tail_but_not_a_complete_prefix`.
-- `tests/merge_pbf.rs::merge_rejects_a_corrupt_frame_prefix_without_allocating` -
+  `crates/lib/src/read/header_walker.rs::tests::the_walk_tolerates_a_short_tail_but_not_a_complete_prefix`.
+- `crates/lib/tests/merge_pbf.rs::merge_rejects_a_corrupt_frame_prefix_without_allocating` -
   both guards end to end through `cat --dedupe`, whose pass 1 once
   had its own frame loop with neither guard and no test of either
   (it now walks with `HeaderWalker`, and so the shared frame walk).
@@ -642,15 +642,15 @@ and inherits the contract.
   zero-length guard disabled, because an empty `BlobHeader` is then
   caught one layer down by the no-type-field rejection, whose
   message also says "header".
-- `src/read/decompress.rs::tests::a_blob_with_two_payload_fields_is_rejected_by_both_parsers`
+- `crates/lib/src/read/decompress.rs::tests::a_blob_with_two_payload_fields_is_rejected_by_both_parsers`
   and `a_lying_raw_size_is_rejected` - the Blob-envelope checks,
   driven through both parsers and in both field orders.
-- `tests/corrupt_input.rs::zero_length_blob_header_is_rejected`
+- `crates/lib/tests/corrupt_input.rs::zero_length_blob_header_is_rejected`
   and `trailing_zero_run_after_valid_blobs_is_rejected` - a
   `header_len` of 0 is a committed frame that must error, and a
   zero run appended to a real file must not read as extra empty
   blobs.
-- `src/read/columnar.rs::tests::short_coordinate_columns_do_not_panic_any_pass` -
+- `crates/lib/src/read/columnar.rs::tests::short_coordinate_columns_do_not_panic_any_pass` -
   the classification passes run before any assertion about
   `len()`, so a regression reproduces the index-out-of-bounds
   panic rather than tripping a cheaper structural assert first.
@@ -698,5 +698,5 @@ lives in `decompress.rs`, which the list did not mention until
 the decompressors were added on 2026-08-20.
 
 `mutate_blob_payload`-based regression tests
-(`cli/tests/cli_defensive_input.rs`) exercise shape 5 (decompression
+(`crates/cli/tests/cli_defensive_input.rs`) exercise shape 5 (decompression
 failure on a byte-valid frame whose inner protobuf is corrupt).

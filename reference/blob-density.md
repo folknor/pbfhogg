@@ -71,13 +71,13 @@ payload work; on a 50 k-blob planet PBF it is ~40x cheaper. These are
 the commands that win on planet primary and lose on Geofabrik / 8k
 encodings:
 
-- `getid` include mode (`src/commands/getid/mod.rs`) - **dispatched**
-- `getparents` (`src/commands/getparents/mod.rs`) - **dispatched**
+- `getid` include mode (`crates/lib/src/commands/getid/mod.rs`) - **dispatched**
+- `getparents` (`crates/lib/src/commands/getparents/mod.rs`) - **dispatched**
 - `removeid` raw-frame passthrough - walker-only (unmeasured full-scan;
   see ADR-0006)
-- `sort` and `cat --dedupe` pass 1 (`src/commands/blob_merge.rs::index_inputs`) - **not
+- `sort` and `cat --dedupe` pass 1 (`crates/lib/src/commands/blob_merge.rs::index_inputs`) - **not
   dispatched**, separate seek-skip mechanism (see below)
-- `inspect` index-only (`src/commands/inspect/scan.rs::try_index_only_scan`)
+- `inspect` index-only (`crates/lib/src/commands/inspect/scan.rs::try_index_only_scan`)
 
 **Shape 2 - pure parallel classify (decompression-bound, IMPROVES or
 stays flat on density).** Build a per-kind schedule cheaply, then
@@ -89,7 +89,7 @@ needed:
 
 - `tags-filter` (its own schedule scan) - **measured faster on 8k**
   (see below)
-- `apply-changes` scanner (`src/commands/apply_changes/scanner.rs`)
+- `apply-changes` scanner (`crates/lib/src/commands/apply_changes/scanner.rs`)
 - `build-geocode-index`
 - `renumber_external`
 
@@ -101,17 +101,17 @@ phase (shape-2 throughput). The serial walk is invisible at 50 k blobs
 (~3.5 s) but dominant at 1.45 M (~102 s of a 153 s wall - see the
 check-refs cell below), so these **regress on high blob count** via the
 walk term even though their payload phase is shape-2. Callers of
-`build_classify_schedules_split` (`src/scan/classify.rs`):
+`build_classify_schedules_split` (`crates/lib/src/scan/classify.rs`):
 
-- `check --refs` (`src/commands/check/refs.rs`)
-- `check --ids` (`src/commands/check/verify_ids.rs`)
-- `cat --clean` (`src/commands/cat/mod.rs`), which now walks through
+- `check --refs` (`crates/lib/src/commands/check/refs.rs`)
+- `check --ids` (`crates/lib/src/commands/check/verify_ids.rs`)
+- `cat --clean` (`crates/lib/src/commands/cat/mod.rs`), which now walks through
   `build_classify_schedule_blob_filtered` into one schedule, the same
   serial walk
-- `repack` (`src/commands/repack/mod.rs`)
-- `degrade` (`src/commands/degrade/mod.rs`)
+- `repack` (`crates/lib/src/commands/repack/mod.rs`)
+- `degrade` (`crates/lib/src/commands/degrade/mod.rs`)
 - `extract --smart` shares the pattern
-  (`src/commands/extract/common.rs::pread_execute`)
+  (`crates/lib/src/commands/extract/common.rs::pread_execute`)
 
 The serial walk cannot be trivially parallelized: PBF has no top-level
 blob index, so blob N+1's offset is only known after reading blob N's
@@ -214,7 +214,7 @@ list. Current status:
 
 The dispatch rule for the resolved commands: `if blob_count >
 150_000 { full_scan } else { header_walk }`, from a bounded head-of-
-file estimate (`estimate_blob_count`, `src/read/header_walker.rs`).
+file estimate (`estimate_blob_count`, `crates/lib/src/read/header_walker.rs`).
 
 ## Measured evidence (2026-07-10, plantasjen)
 
@@ -263,7 +263,7 @@ header per device latency is to read bytes before knowing they hold a
 header.
 
 That is what the walk does now (`PreadSource` in
-`src/read/header_walker.rs`): it keeps its read window across payload
+`crates/lib/src/read/header_walker.rs`): it keeps its read window across payload
 skips and, on a cold file of small frames, reads 1 MiB windows covering
 many frames instead of a 4 KiB probe per frame. Two gates keep it from
 reading payloads for nothing: density (a mean recent frame size below
@@ -472,5 +472,5 @@ accumulation at 28.6x blob count is implicated. Uninvestigated.
 - [`reference/pipelined-reader-paths.md`](pipelined-reader-paths.md) -
   existing callers of `into_blocks_pipelined`, candidates for
   threshold dispatch.
-- [`src/read/header_walker.rs`](../src/read/header_walker.rs) - the
+- [`crates/lib/src/read/header_walker.rs`](../crates/lib/src/read/header_walker.rs) - the
   primitive whose per-blob cost is the source of the asymmetry.

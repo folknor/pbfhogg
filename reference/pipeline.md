@@ -11,7 +11,7 @@ This document has two parts:
 
 ### Pipelined Read
 
-**3-stage pipeline** - `src/read/pipeline.rs`, driven by `ElementReader`
+**3-stage pipeline** - `crates/lib/src/read/pipeline.rs`, driven by `ElementReader`
 
 | Stage | Thread | Work | Buffer |
 |-------|--------|------|--------|
@@ -49,7 +49,7 @@ thread merges.
 ### Ordered pread pool
 
 **Workers in any order, results in schedule order, bounded** -
-`src/ordered_pool.rs`
+`crates/lib/src/ordered_pool.rs`
 
 Every pool that hands results to its caller in schedule order runs on one
 engine, `ordered_pool::run_ordered`: classify's ordered phase
@@ -130,7 +130,7 @@ Only the pipelined iteration methods honour it; the sequential `for_each` and
 
 ### Pipelined Write
 
-**Parallel compression with sequential output** - `src/write/writer.rs`
+**Parallel compression with sequential output** - `crates/lib/src/write/writer.rs`
 
 | Stage | Thread | Work |
 |-------|--------|------|
@@ -163,7 +163,7 @@ Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chu
 
 ### io_uring Writer
 
-`src/write/uring_writer.rs` - replaces the buffered writer thread when `--io-uring` is set.
+`crates/lib/src/write/uring_writer.rs` - replaces the buffered writer thread when `--io-uring` is set.
 
 64 × 256 KB page-aligned registered buffers. Accumulates data, submits `WriteFixed` SQEs when a buffer fills, reaps CQEs to recycle buffers. Supports `CopyRange` for passthrough blobs.
 
@@ -171,7 +171,7 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 
 ### Block Builder
 
-`src/write/block_builder.rs` - accumulates elements into PBF blocks.
+`crates/lib/src/write/block_builder.rs` - accumulates elements into PBF blocks.
 
 - Default element cap from `block_builder::DEFAULT_ELEMENT_CAP`, one element type per block
 - `StringTable` over one byte arena, deduplicated with FxHash
@@ -182,11 +182,11 @@ Used by all commands that produce PBF output.
 
 ### Node-Only Wire Scanner
 
-`src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
+`crates/lib/src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
 
 Used internally by external join (stage 2) and ALTW sparse (pass 1).
 Apply-changes uses its separate checked coordinate extractor in
-`src/commands/apply_changes/node_coords.rs`.
+`crates/lib/src/commands/apply_changes/node_coords.rs`.
 
 ---
 
@@ -220,11 +220,11 @@ phases: one `CAT_FILTERED_*` pair per input, with `CAT_NODES_*`,
 transitions, not barriers (see `reference/performance/README.md` before comparing
 them with the per-kind shape). Migrated
 off the earlier `into_blocks_pipelined` + batch-budget path, then off one
-phase per kind (see `src/commands/cat/mod.rs`).
+phase per kind (see `crates/lib/src/commands/cat/mod.rs`).
 
 ### cat --dedupe
 
-K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `src/commands/blob_merge.rs`), over several inputs, keeping one element per (type, id, version), the copy from the earliest input, then frame, then position; an absent version is 0.
+K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `crates/lib/src/commands/blob_merge.rs`), over several inputs, keeping one element per (type, id, version), the copy from the earliest input, then frame, then position; an absent version is 0.
 Sidecar phases: `MERGEPBF_*` spans both passes (from after the input pins
 and indexdata probes to the writer's flush, before publication), with
 `MERGEPBF_PASS1_*` (index walk and plan) and `MERGEPBF_PASS2_*` inside it,
@@ -235,7 +235,7 @@ draining) inside pass 2, as `sort`'s `SORT_*` phases nest.
 ### sort
 
 Two-pass blob-level permutation sort, through the engine `cat --dedupe`
-shares (`src/commands/blob_merge.rs`).
+shares (`crates/lib/src/commands/blob_merge.rs`).
 1. Walk all blob headers (`HeaderWalker`, pread only), build index of
    (element_type, min_id, max_id). For
    inputs whose header does not declare `Sort.Type_then_ID` (including
@@ -265,7 +265,7 @@ shares (`src/commands/blob_merge.rs`).
    `SWEEP_PINNED_BYTES`; past it mostly consumed cursors are demoted to owned
    tails, and bounding a dense overlap would take an external merge. What
    the sweeps held is reported in the `overlap_run_*` counters
-   (`src/commands/blob_merge/sweep.rs`, "Resource counters").
+   (`crates/lib/src/commands/blob_merge/sweep.rs`, "Resource counters").
 
 Under `--direct-io` both passes read `O_DIRECT`: pass 1 through
 `HeaderWalker::open_direct`, pass 2 through one direct descriptor per
@@ -274,7 +274,7 @@ whatever the output: the transport rides on the opened input
 (`InputFile::direct_align`), and a frame the output copies through
 (`--io-uring`, whose copy is a positioned read into its registered
 buffers, or a library backend that supports copy-range) is read by
-`src/write/copy_range.rs` in aligned chunks of `IO_BUF_BYTES` and copied
+`crates/lib/src/write/copy_range.rs` in aligned chunks of `IO_BUF_BYTES` and copied
 into the output, never handed to `copy_file_range`. So a splicing run
 holds no second descriptor and reads nothing buffered. A self-merge reads
 every frame twice, which a buffered pass 2 serves the second time from the
@@ -292,7 +292,7 @@ ways with invalid geometry are skipped and counted, not errored.
 
 ### apply-changes (merge)
 
-Descriptor-first streaming pipeline applying an OSC diff to a sorted PBF (`src/commands/apply_changes/`). OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index, defined in `src/osc/parse.rs`), which is then turned into `SortedDiff` (`src/osc/sorted.rs`) for the run: per kind the upserted IDs sorted in OSM order with their record offsets, and the deleted IDs sorted, beside the unchanged arenas. The parse-time hash indexes, deleted sets, version floors and interner lookup are dropped there; every stage reads the diff in ID order (binary search for overlap, forward cursors in the workers and the drain), except the `--locations-on-ways` refresh probe below, whose lookups follow way refs and so binary-search the sorted node lists.
+Descriptor-first streaming pipeline applying an OSC diff to a sorted PBF (`crates/lib/src/commands/apply_changes/`). OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index, defined in `crates/lib/src/osc/parse.rs`), which is then turned into `SortedDiff` (`crates/lib/src/osc/sorted.rs`) for the run: per kind the upserted IDs sorted in OSM order with their record offsets, and the deleted IDs sorted, beside the unchanged arenas. The parse-time hash indexes, deleted sets, version floors and interner lookup are dropped there; every stage reads the diff in ID order (binary search for overlap, forward cursors in the workers and the drain), except the `--locations-on-ways` refresh probe below, whose lookups follow way refs and so binary-search the sorted node lists.
 
 Stages:
 1. **Scanner** (`scanner.rs`) - walks blob headers, emits a `BlobDescriptor` per blob classified as `Passthrough` or `Candidate` using indexdata + `SortedDiff::range_overlaps`. Indexdata fast-path skips ~92% of blobs at Denmark scale.
@@ -303,7 +303,7 @@ Sequence admission (`window.rs`): the scanner takes one token from a window of `
 
 The drain channel (`DRAIN_CHANNEL_CAPACITY`, 32 messages) is what bounds the results queued into a drain that is busy writing: a rewritten blob's item carries every frame its rewrite produced, and while the drain is writer-bound (the node phase at planet) the workers block sending once it is full, each holding at most its one finished result. That backlog is therefore about the capacity plus the worker count times a rewrite result, not a ceiling on the run's memory: the item the drain is writing, the reorder map (bounded in count by the window), worker scratch and the frames already handed to the writer are outside it.
 
-Worker scratch (`WorkerScratch` in `streaming.rs`) follows the release rule once per blob, after its handler returns: every buffer a worker keeps across blobs is dropped if one blob grew it past `MAX_RETAINED_SCRATCH_CAPACITY`, except the decode buffer, which follows the decode pool's own limit (`release_decode_outlier`, the check every worker-kept plain decode buffer in the crate takes, counted in `pipeline_decompress_pool_oversize_drops`). The base-read buffer is the crate's worker read buffer (`ReadBuf` in `src/read/read_buf.rs`: exact growth, a fresh allocation, never a doubling) but is held to the common scratch limit rather than the read buffers' 16 MiB line, although ordinary `--locations-on-ways` way frames exceed it, so under `-l` it is released and regrown on about every way blob; at planet that cost no measurable wall and lowered the peak (`reference/performance/apply-changes.md`, "apply-changes' worker scratch follows the release rule"), while the same limit on `check --locations` cost wall time ("Worker read buffers follow a retention limit"), which is why the stricter line stays this command's own. Counters: `merge_streaming_read_buf_peak_bytes`, `merge_streaming_read_buf_allocs`, `merge_streaming_scratch_peak_bytes`, and the invocation totals `pipeline_read_buf_releases` / `pipeline_read_buf_release_capacity_bytes` (allocations freed and their capacity, across every read buffer of the run).
+Worker scratch (`WorkerScratch` in `streaming.rs`) follows the release rule once per blob, after its handler returns: every buffer a worker keeps across blobs is dropped if one blob grew it past `MAX_RETAINED_SCRATCH_CAPACITY`, except the decode buffer, which follows the decode pool's own limit (`release_decode_outlier`, the check every worker-kept plain decode buffer in the crate takes, counted in `pipeline_decompress_pool_oversize_drops`). The base-read buffer is the crate's worker read buffer (`ReadBuf` in `crates/lib/src/read/read_buf.rs`: exact growth, a fresh allocation, never a doubling) but is held to the common scratch limit rather than the read buffers' 16 MiB line, although ordinary `--locations-on-ways` way frames exceed it, so under `-l` it is released and regrown on about every way blob; at planet that cost no measurable wall and lowered the peak (`reference/performance/apply-changes.md`, "apply-changes' worker scratch follows the release rule"), while the same limit on `check --locations` cost wall time ("Worker read buffers follow a retention limit"), which is why the stricter line stays this command's own. Counters: `merge_streaming_read_buf_peak_bytes`, `merge_streaming_read_buf_allocs`, `merge_streaming_scratch_peak_bytes`, and the invocation totals `pipeline_read_buf_releases` / `pipeline_read_buf_release_capacity_bytes` (allocations freed and their capacity, across every read buffer of the run).
 
 Optional `--locations-on-ways` keeps inline way-node coordinates current through the merge, from two separate sources:
 
@@ -338,7 +338,7 @@ one box.
 
 Multi-extract via `--config` JSON: single pass producing multiple output files.
 Node classification against N regions prunes candidates with a CSR grid
-(`RegionGrid`, `src/read/region_grid.rs`; 3600x1800 cells of 0.1 degree over
+(`RegionGrid`, `crates/lib/src/read/region_grid.rs`; 3600x1800 cells of 0.1 degree over
 the region bboxes) once `N >= 16` and the grid fits a 256 MiB coverage
 budget; below either threshold it falls back to the linear per-region scan.
 Output is identical either way - the grid only narrows which regions get
@@ -502,14 +502,14 @@ Limits of the rule, both accepted with auto as the default:
 
 ### renumber
 
-Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) for old→new ID mapping (`src/commands/renumber/`):
+Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) for old→new ID mapping (`crates/lib/src/commands/renumber/`):
 1. **Pass 1** (`pass1.rs`) - parallel wire-format node rewriter across work-stealing workers; each shard populates an `IdSet` of seen node IDs.
 2. **Stage 2** (`stage2.rs`, `wire_rewrite.rs`) - parallel way assembly; builds a separate `IdSet` for ways and remaps node refs via rank-indexed lookup.
 3. **Relations** (`relations.rs`) - sequential collect of relation IDs, then parallel rewrite remapping member refs across all three kinds.
 
 ### time-filter
 
-Two paths, picked from the header's `HistoricalInformation` (`src/commands/time_filter/mod.rs`):
+Two paths, picked from the header's `HistoricalInformation` (`crates/lib/src/commands/time_filter/mod.rs`):
 - **History input**: single-pass grouped snapshot on the pipelined reader that read the header: maintains `PendingGroup` per object, emits latest version with `timestamp <= cutoff`, skips deleted (`visible=false`).
 - **Snapshot input**: each object appears once, so blocks are independent: a classify schedule walk feeds `parallel_classify_phase_ordered`, each worker filters and frames one blob, and the ordered pool delivers them in file order within its window.
 
@@ -524,9 +524,9 @@ Pinning (see "One input, one file, across passes") is decided per library entry:
 ### check
 
 - `--ids`: per-kind parallel scan checking ID ordering, the blobs merged in file order; an unindexed file is read in one parallel pass judging every kind, its type order taken from the decoded group kinds. `--full` adds duplicate detection: a kind the scan finds in strict `osm_id_cmp` order holds no duplicate and is final; each kind found out of order is read again with an ID bitmap.
-- `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`), one parallel phase per kind. Optional `--check-relations`.
+- `--refs`: referential integrity via `IdSet` (custom chunked bitset, `crates/lib/src/idset.rs`), one parallel phase per kind. Optional `--check-relations`.
 
-Both read each blob through a projection on the block validator (`src/read/project_ids.rs`), not a built block, so they refuse exactly the blobs block construction refuses.
+Both read each blob through a projection on the block validator (`crates/lib/src/read/project_ids.rs`), not a built block, so they refuse exactly the blobs block construction refuses.
 
 Pinning (see "One input, one file, across passes"): `verify_ids` pins (header and indexdata probe, then schedule walk) and takes its `--full` allocation size from the pin. `check_index` reads front to back through one open and `check_refs` opens once (its schedule walk, sizing its allocation from an fstat of that descriptor), so neither pins of its own; `check_index` alone still reads a FIFO, while `check_refs` reads by position and cannot. All three take an `InputSource`. The CLI pins once itself when two or more checks run (a bare `check` is `--ids` then `--refs`), and hands the pin to every check.
 
@@ -538,7 +538,7 @@ Pinning (see "One input, one file, across passes"): `verify_ids` pins (header an
 3. Nodes + ways fused scan (compact rank-indexed coord array, streaming data files)
 4. Bucketed S2 cell assignment (256 temp-file buckets per level)
 
-Outputs 19 binary files. Self-contained module in `src/geocode_index/`.
+Outputs 19 binary files. Self-contained module in `crates/lib/src/geocode_index/`.
 
 ### merge-changes
 
@@ -832,7 +832,7 @@ its own, reads a FIFO, and opens a caller's pin as it is.
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
-**3-stage pipeline** - `src/read/pipeline.rs`
+**3-stage pipeline** - `crates/lib/src/read/pipeline.rs`
 1. **I/O thread**: reads raw compressed blobs (~32KB each) sequentially, sends via channel (READ_AHEAD=16 slots)
 2. **Rayon decode pool**: parallel decompress + parse. A dedicated per-read rayon pool, not the host's `Executor`. Thread count = `host::sized_workers` over the reader's resources, reserving threads for the I/O reader and the consumer (`ElementReader::decode_threads` overrides). Built as a `joined_pool::JoinedPool` on the dispatcher thread, which joins every worker (thread-local destructors included, so the per-thread decompressor and scratch below are freed) before the read returns
    - `decompress_blob()` - thread-local `flate2::Decompress` with `reset(true)`, reused per thread
@@ -840,7 +840,7 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
    - `PooledBuffer` wrapper - custom Drop via `Bytes::from_owner`
 3. **Reorder buffer**: `VecDeque<Option<PrimitiveBlock>>` restores file order
 
-**PrimitiveBlock ownership** - `src/read/block.rs`:
+**PrimitiveBlock ownership** - `crates/lib/src/read/block.rs`:
 - Owns `Bytes` buffer (decompressed ~1.4 MB) + `WireBlock<'static>` (self-referential, unsafe transmute)
 - Every block is built through `BlockBuffer` (`block.rs`): `validate_block` scans the block (`wire::scan_block_fields`) into the worker's reused `(u32, u32)` scratch for the string-table entries and group ranges, then `ValidatedBlock::into_block` appends both lists as LE bytes after the protobuf payload (`WireBlock::inline_tables`), so the block's tables live in its own buffer - no separate allocation. A projection reader (`BlockBuffer::project` without `into_block`) reads the tables from scratch and never appends. A caller holding the payload borrowed that needs only the verdict, the scan or a projection calls `validate_in_place`, the same check `BlockBuffer::project` runs, on the bytes where they lie; it never copies them into a `Vec` to build a block it would drop. A caller that needs the block hands its buffer over instead of copying it
 - The append reserves exactly the tables' size. A buffer that arrives full (a fresh one) grows once and may move; a recycled pooled buffer grows only when payload plus tables exceed the most it has held. The pool's retained-capacity limits charge the tables too. `decompressed_size()` reports the payload alone
@@ -872,7 +872,7 @@ full file per step: passthrough saves little there.
 
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 
-**BlockBuilder** - `src/write/block_builder.rs`:
+**BlockBuilder** - `crates/lib/src/write/block_builder.rs`:
 - Dense node vectors pre-allocated up to the requested cap and preallocation budget
 - String table: one byte arena plus `(start, end)` slots, deduplicated through a `hashbrown::HashTable` of slot numbers keyed by the slot's bytes - no allocation per string; `clear()` keeps the capacity
 - Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
@@ -896,7 +896,7 @@ that coalesce across input blobs, hand each completed block to
 `PbfWriter::write_primitive_block_owned`, which frames it on the writer's
 executor in sequence order with the raw frames around it.
 
-**PbfWriter** - `src/write/writer.rs`:
+**PbfWriter** - `crates/lib/src/write/writer.rs`:
 - `FrameScratch` - `body_head` (the Blob body's few bytes ahead of its payload), `header_buf`, `compress_buf` (the compressed payload), lazy-init `Compress`/`zstd::Compressor`
 - Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
 - `frame_in_scratch()` - the one framing implementation (size guards, header encoding, metrics); frames in place as four borrowed parts (prefix, header, body head, payload), the payload left in `compress_buf` or, uncompressed, in the caller's block, never copied into the scratch
@@ -952,9 +952,9 @@ first-failure slot or a cross-thread channel carries the error itself.
   kind it is. The `brokkr.toml` textlint rules `no-io-error-other`,
   `no-io-error-new-other`, `no-io-error-restringing`, `no-map-err-to-string`,
   `no-string-error-result`, `no-box-dyn-error`, `no-error-kind-construction`
-  and `no-error-interpolated-into-message` are guardrails over `src/` against
+  and `no-error-interpolated-into-message` are guardrails over `crates/lib/src/` against
   the common flattening shapes (the interpolation rule sees single-line
-  constructors only); they cannot catch every flattening. `src/error.rs` is the
+  constructors only); they cannot catch every flattening. `crates/lib/src/error.rs` is the
   one file exempt, because it owns the constructors and the `io::Error`
   carrier.
 - Decisions that depend on an OS error (both `copy_file_range` loops falling

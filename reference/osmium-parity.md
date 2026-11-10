@@ -35,7 +35,7 @@ osmium's `export` reads a user-supplied JSON config that can override
 per-element geometry type, property inclusion, and area classification.
 pbfhogg's `export` has no config file - the rules are fixed:
 
-- **Area detection** (`src/commands/export/geometry.rs::is_area_way`,
+- **Area detection** (`crates/lib/src/commands/export/geometry.rs::is_area_way`,
   `is_area_tags`): a way becomes a `Polygon` only if it is closed
   (`first ref == last ref`, at least 4 refs) AND its tags pass the area
   heuristic - `area=no` always disqualifies; otherwise `area=yes` or the
@@ -48,7 +48,7 @@ pbfhogg's `export` has no config file - the rules are fixed:
   its first node ID. A closed way with fewer than 3 geometrically
   distinct positions is rejected as invalid geometry, not silently
   emitted as a degenerate polygon.
-- **Property model** (`src/commands/export/properties.rs::write_properties`):
+- **Property model** (`crates/lib/src/commands/export/properties.rs::write_properties`):
   every feature gets `@id` and `@type`. `--metadata` adds `@version`,
   `@timestamp` (RFC 3339 UTC), `@changeset`, `@uid`, `@user`, `@visible`
   when present on the source element. Remaining OSM tags are emitted as
@@ -299,7 +299,7 @@ writes its undefined location.
 
 **pbfhogg implementation anchors:**
 
-- Upsert semantics: `src/commands/apply_changes/rewrite_block.rs`
+- Upsert semantics: `crates/lib/src/commands/apply_changes/rewrite_block.rs`
   (the walker treats `diff.get_node/way/relation(id)` hits as
   replacements regardless of whether the ID was in base).
 - Delete no-ops: arise naturally - the `deleted_nodes` /
@@ -307,11 +307,11 @@ writes its undefined location.
   walking base elements, so a delete of an absent ID has nothing to
   skip.
 - `(0, 0)` fallback under `--locations-on-ways`:
-  `src/commands/apply_changes/element_writes.rs` (search
+  `crates/lib/src/commands/apply_changes/element_writes.rs` (search
   `unwrap_or((0, 0))`).
 - `loc_missing` counter: defined in
-  `src/commands/apply_changes/stats.rs`, computed in
-  `src/commands/apply_changes/rewrite.rs` as the required-id total minus
+  `crates/lib/src/commands/apply_changes/stats.rs`, computed in
+  `crates/lib/src/commands/apply_changes/rewrite.rs` as the required-id total minus
   the merged coordinate map's unique key count
   (`barrier_loc_map_size`), and reported in the summary line by
   `MergeStats::write_summary`. Unique keys, not extracted-tuple counts:
@@ -337,14 +337,14 @@ writes its undefined location.
 No `throw`, `std::cerr` warning, or validation is raised on any of
 the four scenarios in the osmium apply-changes code path.
 
-**Test coverage (pbfhogg):** `cli/tests/cli_apply_changes_invariants.rs`
+**Test coverage (pbfhogg):** `crates/cli/tests/cli_apply_changes_invariants.rs`
 pins the three non-ALTW scenarios as regression anchors:
 `modify_on_missing_id_silently_inserts`,
 `delete_on_missing_id_is_noop`,
 `create_on_existing_id_overwrites_base`. The refusal and the `(0, 0)`
 fallback are pinned by
 `merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored`
-in `cli/tests/cli_apply_changes.rs`. The fallback cannot match osmium
+in `crates/cli/tests/cli_apply_changes.rs`. The fallback cannot match osmium
 byte for byte, since osmium writes its undefined location there.
 
 ## Indexdata

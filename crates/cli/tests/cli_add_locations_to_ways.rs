@@ -1,0 +1,1874 @@
+//! CLI-driven integration tests for `pbfhogg add-locations-to-ways`.
+//!
+//! Replaces the removed library-API `add_locations_to_ways.rs` test. Fixture
+//! PBFs are built with the stable-allowlist writers (including
+//! `common::write_indexed_pbf`, which wraps `PbfWriter::to_path` for
+//! indexdata-bearing inputs); `add-locations-to-ways` runs through
+//! `CliInvoker`; output
+//! is verified by reading the resulting PBF with `BlobReader` +
+//! `Element` (allowlist). No imports from `pbfhogg::altw::*` - a
+//! rewrite of `crates/lib/src/commands/altw/` cannot break these tests by type
+//! changes alone.
+//!
+//! ALTW is the motivating example for the CLI-decoupled test layout
+//! (`reference/testing.md` > "Test placement"): the sparse / external /
+//! auto index backends are internal types that change shape during
+//! ongoing external-join optimization work. This file's only knob
+//! into "which backend" is the `--index-type` CLI flag, so backend renames or
+//! splits don't ripple in.
+
+#![allow(clippy::unwrap_used)]
+
+use std::path::Path;
+
+use crate::common::{
+    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, generate_nodes,
+    generate_ways, write_indexed_pbf, write_multi_block_test_pbf, write_test_pbf,
+    write_test_pbf_non_indexed,
+};
+use crate::invoker::{CliInvoker, CliOutput};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn test_nodes() -> Vec<TestNode> {
+    vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged_node")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 552_000_000,
+            lon: 122_000_000,
+            tags: vec![("amenity", "cafe")],
+            meta: None,
+        },
+    ]
+}
+
+fn test_ways() -> Vec<TestWay> {
+    vec![TestWay {
+        id: 10,
+        refs: vec![1, 2, 3],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }]
+}
+
+#[derive(Clone, Copy)]
+enum IndexBackend {
+    // No --index-type: the CLI default, auto. Tests use it on unsorted
+    // input, where auto routes sparse without consulting host memory; a
+    // test that means sparse on sorted input asks for Sparse.
+    Default,
+    Sparse,
+    External,
+    Auto,
+}
+
+impl IndexBackend {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            IndexBackend::Default => None,
+            IndexBackend::Sparse => Some("sparse"),
+            IndexBackend::External => Some("external"),
+            IndexBackend::Auto => Some("auto"),
+        }
+    }
+}
+
+/// Invoke `pbfhogg add-locations-to-ways <input> -o <output>
+/// [--keep-untagged-nodes] [--index-type T] [--direct-io] [--force]`.
+/// Returns the captured output.
+fn run_altw(
+    input: &Path,
+    output: &Path,
+    keep_untagged_nodes: bool,
+    backend: IndexBackend,
+    direct_io: bool,
+) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    if keep_untagged_nodes {
+        cli = cli.arg("--keep-untagged-nodes");
+    }
+    cli = backend_args(cli, backend);
+    if direct_io {
+        cli = cli.arg("--direct-io");
+    }
+    cli.run()
+}
+
+/// `--index-type T`, plus `--force` on the backends that take it: external
+/// requires indexed input whatever `--force` says, so it refuses the flag.
+fn backend_args(mut cli: CliInvoker, backend: IndexBackend) -> CliInvoker {
+    if let Some(name) = backend.flag() {
+        cli = cli.arg("--index-type").arg(name);
+    }
+    if backend.flag() == Some("external") {
+        cli
+    } else {
+        cli.arg("--force")
+    }
+}
+
+/// Same as [`run_altw`] but adds `--ignore-missing-nodes`, which is what a
+/// caller must now pass to accept `(0, 0)` placeholders for unresolvable
+/// way refs. Without it the run fails.
+fn run_altw_ignoring_missing(
+    input: &Path,
+    output: &Path,
+    keep_untagged_nodes: bool,
+    backend: IndexBackend,
+) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--ignore-missing-nodes");
+    if keep_untagged_nodes {
+        cli = cli.arg("--keep-untagged-nodes");
+    }
+    backend_args(cli, backend).run()
+}
+
+/// Assert a run refused because of unresolvable node references, on that
+/// guard's own wording rather than on "it failed somehow".
+fn assert_refused_for_missing_nodes(out: &CliOutput, context: &str) {
+    assert!(
+        !out.status.success(),
+        "{context}: unresolvable way node refs must fail the run; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str()
+            .contains("could not be resolved to a node location"),
+        "{context}: expected the missing-locations guard specifically; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+/// A referenced node whose coordinates are outside the geographic domain
+/// must be refused by BOTH backends, on the same guard.
+///
+/// Backend selection is a performance choice: all four geographic limits
+/// must have the same refusal behavior for the same referenced node.
+#[test]
+fn out_of_domain_node_coordinates_are_refused_by_both_backends() {
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    for (lat, lon) in [
+        (900_000_001, 0),
+        (-900_000_001, 0),
+        (0, 1_800_000_001),
+        (0, -1_800_000_001),
+    ] {
+        for backend in [IndexBackend::Sparse, IndexBackend::External] {
+            let nodes = vec![TestNode {
+                id: 1,
+                lat,
+                lon,
+                tags: vec![],
+                meta: None,
+            }];
+            let dir = crate::common::test_scratch();
+            let input = dir.path().join("input.osm.pbf");
+            let output = dir.path().join("output.osm.pbf");
+            write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+            let out = run_altw(&input, &output, true, backend, false);
+            assert!(
+                !out.status.success(),
+                "an out-of-domain referenced node must fail the run; stderr:\n{}",
+                out.stderr_str(),
+            );
+            assert!(
+                out.stderr_str().contains("outside the geographic domain"),
+                "expected the domain guard specifically; stderr:\n{}",
+                out.stderr_str(),
+            );
+            assert!(
+                !output.exists(),
+                "a refused run must publish no output file"
+            );
+        }
+    }
+}
+
+/// Convenience: run with default index, assert success.
+fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
+    let out = run_altw(
+        input,
+        output,
+        keep_untagged_nodes,
+        IndexBackend::Default,
+        false,
+    );
+    assert!(
+        out.status.success(),
+        "add-locations-to-ways failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    out
+}
+
+/// Read every way in the output and return their node-location lists.
+fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut out = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    out.push((w.id(), locs));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_node_ids(path: &Path) -> Vec<i64> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut ids = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => ids.push(dn.id()),
+                    Element::Node(n) => ids.push(n.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn read_relation_ids(path: &Path) -> Vec<i64> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut ids = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Relation(r) = element {
+                    ids.push(r.id());
+                }
+            }
+        }
+    }
+    ids
+}
+
+// ---------------------------------------------------------------------------
+// Basic tests (default backend, auto routing to sparse on unsorted input)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basic_locations_added_to_ways() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    run_altw_ok(&input, &output, true);
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn header_has_locations_on_ways_feature() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    run_altw_ok(&input, &output, true);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmHeader(header) = blob.decode().expect("decode") {
+            let features: Vec<&str> = header
+                .optional_features()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                features.contains(&"LocationsOnWays"),
+                "LocationsOnWays not in optional features: {features:?}"
+            );
+            return;
+        }
+    }
+    panic!("no header found in output");
+}
+
+#[test]
+fn drop_untagged_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, false);
+
+    // Stats line: pin the read/written/dropped counters (the test's
+    // entire point is "untagged nodes are dropped").
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 2 written, 1 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    // Node 2 has no tags -> dropped.
+    assert_eq!(read_node_ids(&output), vec![1, 3]);
+}
+
+#[test]
+fn keep_untagged_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 3 written, 0 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(read_node_ids(&output), vec![1, 2, 3]);
+}
+
+/// Unresolvable refs are refused by default and filled with `(0, 0)` only
+/// when the caller says so.
+///
+/// The default half is the one that bites: `(0, 0)` is Null Island, a real
+/// coordinate off the coast of Ghana, so a placeholder vertex written into a
+/// well-formed PBF is indistinguishable from genuine data to every reader.
+/// The opt-in half pins that the escape hatch still produces exactly the old
+/// geometry, so the guard is a policy change and not a capability loss.
+#[test]
+fn missing_node_refs_get_zero_coordinates() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 99], // 99 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &[]);
+
+    let refused = run_altw(&input, &output, true, IndexBackend::Default, false);
+    assert_refused_for_missing_nodes(&refused, "default policy");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::Default);
+    assert!(
+        out.status.success(),
+        "--ignore-missing-nodes must accept the input; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(ways, vec![(10, vec![(550_000_000, 120_000_000), (0, 0)])]);
+}
+
+#[test]
+fn relations_preserved() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+    run_altw_ok(&input, &output, true);
+
+    assert_eq!(read_relation_ids(&output), vec![100]);
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough tests (indexed input)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn passthrough_basic_with_indexdata() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    // Indexed input enables passthrough; the optional second stats
+    // line ("Blobs: ... passthrough, ... decoded") fires when at least
+    // one blob took the raw path.
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn passthrough_relations_preserved() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &relations);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert_eq!(read_relation_ids(&output), vec![100]);
+}
+
+#[test]
+fn passthrough_drop_untagged_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, false);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 2 written, 1 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn passthrough_keep_untagged_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw_ok(&input, &output, true);
+
+    assert!(
+        out.stderr_str()
+            .contains("3 nodes read, 3 written, 0 dropped"),
+        "stats counters mismatch; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn drop_untagged_keeps_relation_member_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Node(2),
+            role: "label",
+        }],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &relations);
+    run_altw_ok(&input, &output, false);
+
+    let ids = read_node_ids(&output);
+    assert!(ids.contains(&1));
+    assert!(
+        ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
+}
+
+#[test]
+fn passthrough_drop_untagged_keeps_relation_member_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Node(2),
+            role: "label",
+        }],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_indexed_pbf(&input, &nodes, &ways, &relations);
+    run_altw_ok(&input, &output, false);
+
+    let ids = read_node_ids(&output);
+    assert!(ids.contains(&1));
+    assert!(
+        ids.contains(&2),
+        "untagged relation-member node was dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sparse and external backends
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basic_locations_added_sparse() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn passthrough_basic_with_indexdata_sparse() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let out = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse + indexed failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert!(
+        out.stderr_str().contains("passthrough"),
+        "expected passthrough blobs reported; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (551_000_000, 121_000_000),
+                (552_000_000, 122_000_000),
+            ]
+        )],
+    );
+}
+
+#[test]
+fn missing_node_refs_get_zero_coordinates_sparse() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 999, 3], // 999 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &ways, &[]);
+
+    let refused = run_altw(&input, &output, true, IndexBackend::Sparse, false);
+    assert_refused_for_missing_nodes(&refused, "sparse");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::Sparse);
+    assert!(
+        out.status.success(),
+        "sparse missing-refs failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_wrap)]
+fn backend_parity_sparse_external_auto() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let out_sparse = dir.path().join("out_sparse.osm.pbf");
+    let out_external = dir.path().join("out_external.osm.pbf");
+    let out_auto = dir.path().join("out_auto.osm.pbf");
+
+    let mut nodes = generate_nodes(18, 1);
+    for idx in [0_usize, 3, 6, 9, 12, 15] {
+        nodes[idx].tags = vec![("name", "kept")];
+    }
+
+    let mut ways = generate_ways(5, 1_000, 3, 1);
+    for (i, way) in ways.iter_mut().enumerate() {
+        let start = 1 + i as i64 * 3;
+        way.refs = vec![start, start + 1, start + 2];
+        way.tags = if i % 2 == 0 {
+            vec![("highway", "primary")]
+        } else {
+            vec![("highway", "service")]
+        };
+    }
+
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(1_000),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(18),
+                role: "label",
+            },
+        ],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+
+    write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 5);
+
+    for (output, backend, label) in [
+        (&out_sparse, IndexBackend::Sparse, "sparse"),
+        (&out_external, IndexBackend::External, "external"),
+        (&out_auto, IndexBackend::Auto, "auto"),
+    ] {
+        let out = run_altw(&input, output, false, backend, false);
+        assert!(
+            out.status.success(),
+            "{label} backend failed; stderr:\n{}",
+            out.stderr_str(),
+        );
+    }
+
+    assert_elements_equivalent(&out_sparse, &out_external);
+    assert_elements_equivalent(&out_external, &out_auto);
+}
+
+#[test]
+fn zero_ref_ways_survive_sparse_and_external_assembly() {
+    // Mixed blobs exercise refcount alignment on both sides of a nonempty
+    // way; all-empty blobs exercise the router's pre-populated Empty slot.
+    for all_empty in [false, true] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let sparse = dir.path().join("sparse.osm.pbf");
+        let external = dir.path().join("external.osm.pbf");
+        let mut ways = generate_ways(3, 10, 1, 1);
+        ways[0].refs.clear();
+        ways[1].refs = if all_empty { vec![] } else { vec![1, 2, 3] };
+        ways[2].refs.clear();
+        write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
+        for (output, backend) in [
+            (&sparse, IndexBackend::Sparse),
+            (&external, IndexBackend::External),
+        ] {
+            let out = run_altw(&input, output, true, backend, false);
+            assert!(
+                out.status.success(),
+                "all_empty={all_empty} output={}: {}",
+                output.display(),
+                out.stderr_str().replace('\n', " | ")
+            );
+        }
+        assert_elements_equivalent(&sparse, &external);
+        let locations = read_way_locations(&external);
+        assert_eq!(locations.len(), 3);
+        assert_eq!(locations[0], (10, vec![]));
+        assert_eq!(locations[2], (12, vec![]));
+        assert_eq!(locations[1].0, 11);
+        assert_eq!(locations[1].1.len(), if all_empty { 0 } else { 3 });
+    }
+}
+
+/// Auto on a sorted + indexed input runs and names the backend it chose.
+/// Which backend depends on the runner's memory, so that choice is pinned
+/// by `host_contract::fixed_memory_routes_auto`, which supplies the memory.
+#[test]
+fn auto_on_sorted_indexed_input_reports_its_choice() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Auto, false);
+    assert!(
+        out.status.success(),
+        "auto backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected index type"),
+        "auto must report its choice; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("Note: this sorted indexed PBF is eligible"),
+        "an auto-resolved backend must not be second-guessed by the \
+         explicit-sparse hint; stderr:\n{stderr}",
+    );
+}
+
+/// Omitting `--index-type` runs auto: the default reports an auto choice
+/// (sparse on this unsorted input, whatever the runner's memory).
+#[test]
+fn default_index_type_is_auto() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Default, false);
+    assert!(
+        out.status.success(),
+        "default backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected index type sparse (sorted="),
+        "the default must be auto; stderr:\n{stderr}",
+    );
+}
+
+/// Inputs external cannot handle (no indexdata) skip the scale estimate
+/// entirely and route to sparse via the eligibility check.
+#[test]
+fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, false, IndexBackend::Auto, false);
+    assert!(
+        out.status.success(),
+        "auto backend failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("auto-selected index type sparse (sorted="),
+        "non-indexed input must route sparse via eligibility; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("store estimate"),
+        "no scale estimate should run when external is ineligible; \
+         stderr:\n{stderr}",
+    );
+}
+
+/// `--index-type external --force` can never take effect: external join
+/// depends on per-blob indexdata to compute rank-based bucket ranges, so an
+/// unindexed input is refused whatever `--force` says and on an indexed one
+/// `--force` does nothing. The combination is refused as a usage error,
+/// before any input is opened.
+#[test]
+fn altw_external_refuses_force_before_any_input() {
+    let dir = crate::common::test_scratch();
+    let out = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(dir.path().join("no-such-input.osm.pbf"))
+        .arg("-o")
+        .arg(dir.path().join("out.osm.pbf"))
+        .args(["--index-type", "external", "--force"])
+        .run();
+    assert_eq!(
+        out.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
+        "stderr:\n{}",
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--force")
+            && stderr.contains("external")
+            && !stderr.contains("no-such-input"),
+        "expected the argument refusal, not an input error; stderr:\n{stderr}",
+    );
+}
+
+/// Without `--force`, an unindexed input on the external path is refused by
+/// the indexdata gate, which points at the indexed-generation workflow.
+#[test]
+fn altw_external_refuses_non_indexed_input() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 550_000_000,
+                lon: 120_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 551_000_000,
+                lon: 121_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 552_000_000,
+                lon: 122_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "residential")],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert!(
+        !out.status.success(),
+        "expected external-join to refuse a non-indexed PBF, but it succeeded; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("external") && stderr.contains("indexed"),
+        "expected setup-time rejection mentioning external + indexed, got stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("pbfhogg cat"),
+        "error should point at the indexed-generation workflow, got stderr:\n{stderr}",
+    );
+}
+
+/// An indexed input whose header does not claim Sort.Type_then_ID is refused
+/// by the external join as unsorted input: the file named, and the sort
+/// advice the CLI gives every unsorted refusal, not a bare invalid-data
+/// error.
+#[test]
+fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unsorted-header.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("does not declare Sort.Type_then_ID"),
+        "expected the unsorted refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&input.display().to_string()),
+        "the refusal must name the file; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pbfhogg sort"),
+        "expected the sort advice; stderr:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+}
+
+/// `--index-type dense` was removed (commit `b70dd8c`) after the
+/// rank-indexed flat sparse layout dominated dense at every measured
+/// scale. The parser must surface a clear migration hint pointing at
+/// `sparse` rather than a generic "unknown index type" error, so users
+/// upgrading from older releases see *why* their flag stopped working
+/// and what to switch to.
+#[test]
+fn altw_dense_index_type_rejected_with_migration_hint() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--index-type")
+        .arg("dense")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !out.status.success(),
+        "expected --index-type dense to be rejected, but it succeeded; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("dense") && stderr.contains("sparse"),
+        "expected migration hint mentioning both 'dense' (the removed type) and 'sparse' (the replacement), got stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("removed"),
+        "expected error to state dense was removed, got stderr:\n{stderr}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output backends (tier 1: cheap, skip on the typed platform refusal; the
+// module only carries the feature gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-direct-io")]
+mod backends {
+    use super::*;
+
+    #[test]
+    fn basic_locations_added_direct_io() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+
+        write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+        let out = run_altw(&input, &output, true, IndexBackend::Default, true);
+        if out.is_o_direct_unsupported() {
+            crate::common::skip("O_DIRECT not supported on this filesystem");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "add-locations-to-ways --direct-io failed unexpectedly; stderr:\n{}",
+            out.stderr_str(),
+        );
+
+        let ways = read_way_locations(&output);
+        assert_eq!(
+            ways,
+            vec![(
+                10,
+                vec![
+                    (550_000_000, 120_000_000),
+                    (551_000_000, 121_000_000),
+                    (552_000_000, 122_000_000),
+                ]
+            )],
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier B contract gaps from 2026-04-26 review
+// ---------------------------------------------------------------------------
+
+/// B1 - a real node at Null Island is present, not missing.
+///
+/// The coordinate stores used to spell "absent" as `(0, 0)`, which is a real
+/// place in the Gulf of Guinea. That made a genuine node at exactly `0, 0`
+/// report as a missing location, and it made a missing reference come out of
+/// the writer as if the node were there. Absence is now a flag bit in the
+/// sparse slot encoding, and the external backend counts on presence rather
+/// than on the coordinate being non-zero.
+///
+/// Both backends are exercised on the same fixture: they answer the same
+/// question and must not disagree about it. The run must also SUCCEED, since
+/// the missing-locations guard now fails any run with a nonzero count - so a
+/// regression to the old sentinel shows up twice over.
+#[test]
+fn null_island_real_node_is_not_reported_missing() {
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 0,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        // External needs indexdata to build its I/O schedule; sparse is
+        // happy either way, so the indexed fixture serves both.
+        write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+        let out = run_altw(&input, &output, true, backend, false);
+        assert!(
+            out.status.success(),
+            "a node at Null Island is present; the run must not fail. \
+             stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(
+            out.stderr_str().contains("0 missing locations"),
+            "a real node at (0, 0) must not be reported missing; stderr:\n{}",
+            out.stderr_str(),
+        );
+        // And the coordinate itself survives, so this is not satisfied by a
+        // backend that merely stopped counting.
+        assert_eq!(read_way_locations(&output), vec![(10, vec![(0, 0)])]);
+    }
+}
+
+/// A way ref (and a relation node member) near `i64::MAX` used to
+/// make sparse pass 0 and the relation-member scan grow the ID set's chunk
+/// directory to ~2^38 entries and abort. It is now an ordinary reference to
+/// a node the file does not contain: refused by the missing-locations guard,
+/// and written as `(0, 0)` under `--ignore-missing-nodes`.
+///
+/// `keep_untagged_nodes = false` is what routes the relation through the
+/// relation-member scan, so both input-fed sets are exercised.
+#[test]
+fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
+    let far = i64::MAX - 1;
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, far, 3],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![TestMember {
+            id: MemberId::Node(far),
+            role: "label",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &ways, &relations);
+
+    let refused = run_altw(&input, &output, false, IndexBackend::Sparse, false);
+    assert_refused_for_missing_nodes(&refused, "sparse, ref near i64::MAX");
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+
+    let out = run_altw_ignoring_missing(&input, &output, false, IndexBackend::Sparse);
+    assert!(
+        out.status.success(),
+        "sparse with a ref near i64::MAX failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(
+        read_way_locations(&output),
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
+    );
+}
+
+/// The external backend sizes its id buckets from the node blobs'
+/// indexdata `max_id`, and used to assert (panic) when that exceeded what its
+/// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an
+/// error that points at the sparse index - and that pointer must be true, so
+/// the same file has to succeed under sparse.
+#[test]
+fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
+    let big = 1_i64 << 39;
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: big,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, big],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+    let external_out = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &external_out, true, IndexBackend::External, false);
+    assert!(
+        !out.status.success(),
+        "external must refuse a node max_id it cannot encode; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("the sparse index has no such limit") && !stderr.contains("panicked"),
+        "expected the encoding-limit error, not a panic; stderr:\n{stderr}",
+    );
+    assert!(
+        !external_out.exists(),
+        "a refused run must publish no output file"
+    );
+
+    let sparse_out = dir.path().join("sparse.osm.pbf");
+    let out = run_altw(&input, &sparse_out, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse must handle the node id external cannot; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(
+        read_way_locations(&sparse_out),
+        vec![(
+            10,
+            vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
+        )],
+    );
+}
+
+/// B2 - missing-node handling for `--index-type external`.
+///
+/// Missing refs are refused by default and substituted with `(0, 0)` under
+/// `--ignore-missing-nodes`. Pre-batch tests pinned this for sparse
+/// (`missing_node_refs_get_zero_coordinates_sparse`); the external variant
+/// was unpinned. Same fixture, same expected output - this test makes the
+/// contract uniform across both backends, which is exactly where they used
+/// to disagree.
+#[test]
+fn missing_node_refs_get_zero_coordinates_external() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 999, 3], // 999 doesn't exist
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    // External requires indexed input (HeaderWalker fast-path scans
+    // BlobHeader.indexdata to drive its I/O schedule). The sparse
+    // twin uses `write_test_pbf` because its code path falls back
+    // to full-decode without indexdata; external does not.
+    write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
+
+    let refused = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert_refused_for_missing_nodes(&refused, "external");
+
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::External);
+    assert!(
+        out.status.success(),
+        "external missing-refs failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("1 missing locations"),
+        "expected '1 missing locations' under --index-type external; \
+         stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let ways = read_way_locations(&output);
+    assert_eq!(
+        ways,
+        vec![(
+            10,
+            vec![
+                (550_000_000, 120_000_000),
+                (0, 0),
+                (552_000_000, 122_000_000)
+            ]
+        )],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External join: indexdata ranges under a sorted header
+// ---------------------------------------------------------------------------
+
+/// The external join's metadata scan refuses ranges that contradict the
+/// sorted header. Its stage 2 partitions node blobs by range and walks
+/// records forward through them, so out-of-order or overlapping node blobs
+/// used to come out as "missing locations" for nodes that are in the file
+/// (zeroed under `--ignore-missing-nodes`). Every fixture here declares
+/// Sort.Type_then_ID and carries exact indexdata, three elements per blob.
+fn node_at(id: i64) -> TestNode {
+    TestNode {
+        id,
+        lat: 550_000_000 + i32::try_from(id).unwrap() * 1_000,
+        lon: 120_000_000 + i32::try_from(id).unwrap() * 1_000,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+fn way_over(id: i64, refs: &[i64]) -> TestWay {
+    TestWay {
+        id,
+        refs: refs.to_vec(),
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }
+}
+
+fn write_three_per_blob(path: &Path, node_ids: &[i64], ways: &[TestWay]) {
+    let nodes: Vec<TestNode> = node_ids.iter().copied().map(node_at).collect();
+    write_multi_block_test_pbf(path, &nodes, ways, &[], 3);
+}
+
+/// Both external runs (refusing and `--ignore-missing-nodes`) fail on
+/// `needle`, name the file and the blob, and publish nothing; sparse joins
+/// the same file with every referenced node's real coordinates.
+fn assert_external_refuses_and_sparse_joins(input: &Path, needle: &str, way_refs: &[i64]) {
+    let dir = input.parent().unwrap();
+    let output = dir.join("external.osm.pbf");
+    for out in [
+        run_altw(input, &output, true, IndexBackend::External, false),
+        run_altw_ignoring_missing(input, &output, true, IndexBackend::External),
+    ] {
+        let stderr = out.stderr_str();
+        assert!(
+            !out.status.success(),
+            "external must refuse; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "wanted {needle:?}; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&input.display().to_string()) && stderr.contains("blob "),
+            "the refusal must name the file and the blob; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("could not be resolved"),
+            "refused as missing locations instead; stderr:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "a refused run must publish no output file"
+        );
+    }
+
+    let sparse_out = dir.join("sparse.osm.pbf");
+    let out = run_altw(input, &sparse_out, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse must join the same file; stderr:\n{}",
+        out.stderr_str()
+    );
+    let expected: Vec<(i32, i32)> = way_refs
+        .iter()
+        .map(|&id| {
+            let n = node_at(id);
+            (n.lat, n.lon)
+        })
+        .collect();
+    assert_eq!(read_way_locations(&sparse_out), vec![(10, expected)]);
+}
+
+#[test]
+fn external_refuses_node_blobs_in_descending_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("descending.osm.pbf");
+    let refs = [1, 4];
+    write_three_per_blob(&input, &[4, 5, 6, 1, 2, 3], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "contradict the sorted header", &refs);
+}
+
+/// Ranges [1, 5] then [2, 6]: both bounds rise, so a check on monotone
+/// minima and maxima alone passes it, yet node 2 sits in the second blob
+/// while the walk over the first already consumed its record.
+#[test]
+fn external_refuses_interleaved_overlapping_node_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("interleaved.osm.pbf");
+    let refs = [2, 5];
+    write_three_per_blob(&input, &[1, 3, 5, 2, 4, 6], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "contradict the sorted header", &refs);
+}
+
+/// The order checked is the header's whole claim, not just the node blobs':
+/// the external join writes blobs in input order under that header.
+#[test]
+fn external_refuses_way_blobs_in_descending_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("ways-descending.osm.pbf");
+    let ways: Vec<TestWay> = [14, 15, 16, 11, 12, 10]
+        .iter()
+        .map(|&id| way_over(id, &[1, 2]))
+        .collect();
+    write_three_per_blob(&input, &[1, 2, 3], &ways);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("contradict the sorted header") && stderr.contains("a way blob"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+}
+
+/// A node blob whose range spans zero: stage 2 compares node ids unsigned,
+/// so the external index refuses it outright rather than losing nodes.
+#[test]
+fn external_refuses_a_node_blob_reaching_below_zero() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("mixed-sign.osm.pbf");
+    let refs = [1, 2];
+    write_three_per_blob(&input, &[-1, 1, 2], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "negative node ids", &refs);
+}
+
+/// Equal boundaries are in order: a node id may end one blob and start the
+/// next, as `OrderWatermark` allows everywhere else.
+#[test]
+fn external_accepts_node_blobs_sharing_a_boundary_id() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("shared-boundary.osm.pbf");
+    write_three_per_blob(&input, &[1, 2, 3, 3, 4, 5], &[way_over(10, &[1, 3, 5])]);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert!(
+        out.status.success(),
+        "equal boundaries are in order; stderr:\n{}",
+        out.stderr_str()
+    );
+    let expected: Vec<(i32, i32)> = [1, 3, 5]
+        .iter()
+        .map(|&id| {
+            let n = node_at(id);
+            (n.lat, n.lon)
+        })
+        .collect();
+    assert_eq!(read_way_locations(&output), vec![(10, expected)]);
+}
+
+#[test]
+fn plain_nodes_supply_coordinates_to_both_backends() {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push(u8::try_from(value & 127).expect("seven bits") | 128);
+            value >>= 7;
+        }
+        out.push(u8::try_from(value).expect("seven bits"));
+    }
+    fn message(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+        varint(field * 8 + 2, out);
+        varint(u64::try_from(bytes.len()).expect("message length"), out);
+        out.extend_from_slice(bytes);
+    }
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain.osm.pbf");
+    let mut writer = pbfhogg::writer::PbfWriter::new(
+        std::fs::File::create(&input).expect("create input"),
+        pbfhogg::writer::Compression::default(),
+    );
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    let mut group = Vec::new();
+    for (id, lat, lon) in [
+        (1_u64, 550_000_000_u64, 120_000_000_u64),
+        (2, 551_000_000, 121_000_000),
+    ] {
+        let mut node = Vec::new();
+        for (field, value) in [(1, id), (8, lat), (9, lon)] {
+            varint(field * 8, &mut node);
+            varint(value * 2, &mut node);
+        }
+        message(1, &node, &mut group);
+    }
+    let mut block = Vec::new();
+    message(1, &[10, 0], &mut block); // StringTable with empty entry 0
+    message(2, &group, &mut block);
+    writer
+        .write_primitive_block(&block)
+        .expect("write plain nodes");
+    let mut builder = pbfhogg::block_builder::BlockBuilder::new();
+    builder.add_way(10, [("highway", "primary")], &[1, 2], None);
+    writer
+        .write_primitive_block(builder.take().expect("take").expect("way block"))
+        .expect("write way");
+    writer.flush().expect("flush");
+    drop(writer);
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = dir.path().join(format!(
+            "{}.osm.pbf",
+            backend.flag().expect("explicit backend")
+        ));
+        let result = run_altw(&input, &output, true, backend, false);
+        assert!(result.status.success(), "{}", result.stderr_str());
+        assert_eq!(
+            read_way_locations(&output),
+            vec![(
+                10,
+                vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
+            )]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Indexdata claims held to what each decoded blob holds
+// ---------------------------------------------------------------------------
+
+/// Frames of [`write_claims_fixture`]'s file: the header, two node blobs
+/// (nodes 1 to 3 and 4 to 6), one way blob (ways 10 to 12) and one relation
+/// blob (relation 100).
+const NODE_BLOB: usize = 1;
+const SECOND_NODE_BLOB: usize = 2;
+const WAY_BLOB: usize = 3;
+const RELATION_BLOB: usize = 4;
+
+/// A sorted, honestly indexed input, three elements per blob.
+fn write_claims_fixture(path: &Path) {
+    let nodes: Vec<TestNode> = (1..=6).map(node_at).collect();
+    let ways = vec![
+        way_over(10, &[1, 4]),
+        way_over(11, &[2, 5]),
+        way_over(12, &[3, 6]),
+    ];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    write_multi_block_test_pbf(path, &nodes, &ways, &relations, 3);
+}
+
+/// The fixture with `forge` applied to it, written beside it as `name`.
+fn forged_claims_fixture(
+    dir: &Path,
+    name: &str,
+    forge: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> std::path::PathBuf {
+    let honest = dir.join("honest.osm.pbf");
+    write_claims_fixture(&honest);
+    let bytes = std::fs::read(&honest).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, forge(&bytes)).unwrap();
+    path
+}
+
+/// The fixture with frame `frame`'s claimed kind byte set to `kind` (0 node,
+/// 1 way, 2 relation), range and count left as they were.
+fn relabelled(bytes: &[u8], frame: usize, kind: u8) -> Vec<u8> {
+    crate::common::adversarial::mutate_blob_header_indexdata(bytes, frame, |index| {
+        assert_ne!(index[1], kind, "frame {frame} already claims kind {kind}");
+        index[1] = kind;
+    })
+}
+
+/// Run both backends on `input` with `--ignore-missing-nodes` (so a lie that
+/// only loses node locations could not hide behind the missing-location
+/// refusal), and assert each refuses with `needle` and publishes nothing.
+fn assert_both_backends_refuse(input: &Path, needle: &str) {
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = input.with_extension(format!("{}.out.pbf", backend.flag().unwrap()));
+        let out = run_altw_ignoring_missing(input, &output, false, backend);
+        let stderr = out.stderr_str();
+        assert!(
+            !out.status.success(),
+            "{}: must refuse; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(
+            stderr.contains(needle),
+            "{}: wanted {needle:?}; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(
+            stderr.contains("check --index"),
+            "{}: the indexdata hint must reach the refusal; stderr:\n{stderr}",
+            backend.flag().unwrap()
+        );
+        assert!(!output.exists(), "a refused run publishes nothing");
+    }
+}
+
+/// A way blob whose indexdata claims nodes or relations used to be read by
+/// that kind's phase only: under a node claim sparse wrote its ways without
+/// their refs ever collected (zeros under `--ignore-missing-nodes`) and
+/// external refused with an untyped error; under a relation claim both
+/// copied it through without locations. Both backends now refuse it the
+/// same way.
+#[test]
+fn both_backends_refuse_a_way_blob_claiming_another_kind() {
+    let dir = crate::common::test_scratch();
+    for (kind, claimed) in [(0, "node"), (2, "relation")] {
+        let input = forged_claims_fixture(dir.path(), &format!("way-as-{claimed}.osm.pbf"), |b| {
+            relabelled(b, WAY_BLOB, kind)
+        });
+        assert_both_backends_refuse(
+            &input,
+            &format!("blob indexdata claims {claimed} elements but the blob holds way elements"),
+        );
+    }
+}
+
+/// A node blob claiming ways was reframed as a way blob: its nodes were
+/// copied through unindexed and the blob was re-indexed as Way, count 0,
+/// IDs 0..0, a false claim pbfhogg wrote and the next run believed. The
+/// second node blob is relabelled, so the claimed kinds still follow type
+/// order and the lie is visible only in the payload.
+#[test]
+fn both_backends_refuse_a_node_blob_claiming_ways() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claims_fixture(dir.path(), "node-as-way.osm.pbf", |b| {
+        relabelled(b, SECOND_NODE_BLOB, 1)
+    });
+    assert_both_backends_refuse(
+        &input,
+        "blob indexdata claims way elements but the blob holds node elements",
+    );
+}
+
+/// A way blob holding no way under a way claim: the reframe used to write
+/// it back as Way, count 0, IDs 0..0, whatever the claim said. No index
+/// describes a blob without elements, so even a claim of exactly that is
+/// refused, and nothing writes that index.
+#[test]
+fn both_backends_refuse_a_way_claim_over_no_way() {
+    let dir = crate::common::test_scratch();
+    let input = forged_claims_fixture(dir.path(), "empty-way-blob.osm.pbf", |b| {
+        // An empty StringTable and one empty PrimitiveGroup.
+        let emptied = crate::common::adversarial::mutate_blob_payload(b, WAY_BLOB, |payload| {
+            *payload = vec![0x0A, 0x00, 0x12, 0x00];
+        });
+        crate::common::adversarial::forge_indexdata_range(&emptied, WAY_BLOB, 0, 0, Some(0))
+    });
+    assert_both_backends_refuse(&input, "no element");
+}
+
+/// Ranges and counts no decoded blob matches: the backends re-index what
+/// they reframe, so these used to pass, carrying a passed-through blob's
+/// false claim and count into the output and its statistics. External
+/// partitions node blobs by range, where an understated one loses present
+/// nodes. Every blob either backend decodes is now held to its claim.
+#[test]
+fn both_backends_refuse_inexact_ranges_and_counts() {
+    let dir = crate::common::test_scratch();
+    for (name, frame, min, max, count) in [
+        ("node-overstated", SECOND_NODE_BLOB, 4, 7, Some(3)),
+        ("node-understated", SECOND_NODE_BLOB, 4, 5, None),
+        ("node-count", NODE_BLOB, 1, 3, Some(4)),
+        ("way-understated", WAY_BLOB, 10, 11, None),
+        ("relation-count", RELATION_BLOB, 100, 100, Some(2)),
+    ] {
+        let input = forged_claims_fixture(dir.path(), &format!("{name}.osm.pbf"), |b| {
+            crate::common::adversarial::forge_indexdata_range(b, frame, min, max, count)
+        });
+        assert_both_backends_refuse(&input, "but the decoded blob holds");
+    }
+}
+
+/// The honest fixture joins on both backends: the claim checks refuse lies
+/// only.
+#[test]
+fn both_backends_join_the_honest_claims_fixture() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("honest.osm.pbf");
+    write_claims_fixture(&input);
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = dir
+            .path()
+            .join(format!("{}.osm.pbf", backend.flag().unwrap()));
+        let out = run_altw(&input, &output, false, backend, false);
+        assert!(out.status.success(), "{}", out.stderr_str());
+        let located = read_way_locations(&output);
+        assert_eq!(located.len(), 3);
+        let first = node_at(1);
+        assert_eq!(located[0].1[0], (first.lat, first.lon));
+    }
+}
+
+/// Way blobs `[-1, -2, -3]` then `[0, -4, 1]`: each is in canonical order
+/// inside, and the second's mixed-sign range `[-4, 1]` cannot show its
+/// leading 0, which sorts before -3, so the metadata scan's range watermark
+/// passed the pair and external wrote the descent under the sorted header.
+/// Stage 1 now holds each blob's decoded first way to the one before.
+#[test]
+fn external_refuses_a_way_blob_descending_behind_a_mixed_sign_range() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("mixed-sign-ways.osm.pbf");
+    let ways: Vec<TestWay> = [-1, -2, -3, 0, -4, 1]
+        .iter()
+        .map(|&id| way_over(id, &[1, 2]))
+        .collect();
+    write_three_per_blob(&input, &[1, 2, 3], &ways);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a way blob starting at way 0"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!output.exists(), "a refused run publishes nothing");
+}
+
+/// A node blob whose elements are out of order under the sorted header
+/// (honest range, payload 2, 1, 3): external's stage 2 merge walk passed
+/// node 1 and wrote it as a missing location, zeroed under
+/// `--ignore-missing-nodes`. It now refuses the file as unsorted. Sparse
+/// takes nodes in any order and joins it.
+#[test]
+fn external_refuses_a_node_blob_out_of_order_inside() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra-unsorted.osm.pbf");
+    write_three_per_blob(&input, &[2, 1, 3, 4, 5, 6], &[way_over(10, &[1, 4])]);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::External);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("out of the order its header declares")
+            && stderr.contains("sort --distrust-metadata"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!output.exists(), "a refused run publishes nothing");
+
+    let sparse = dir.path().join("sparse.osm.pbf");
+    let out = run_altw(&input, &sparse, true, IndexBackend::Sparse, false);
+    assert!(out.status.success(), "{}", out.stderr_str());
+    let (one, four) = (node_at(1), node_at(4));
+    assert_eq!(
+        read_way_locations(&sparse),
+        vec![(10, vec![(one.lat, one.lon), (four.lat, four.lon)])]
+    );
+}

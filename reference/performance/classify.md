@@ -211,7 +211,7 @@ nodes and ways phases identical in duration, cores and peak RSS (about
 2.1 GB sampled), as expected since planet writes every page anyway. Malta
 sampled only a start and an end row, so no RSS comparison exists.
 
-Release builds gain nothing: `check --refs tests/test.osm.pbf` peaks at
+Release builds gain nothing: `check --refs crates/lib/tests/test.osm.pbf` peaks at
 7012 kB on `03e3792d` and 7052 kB on the parent (zsh `time` `%M`), so the
 optimizer was already lowering the parent's `collect()` of zeros to a
 zeroed allocation, and the floor pre-allocation was never resident there.
@@ -224,7 +224,7 @@ either.
 
 ### Ordered pool: notify only parked workers, passthrough ahead of its result (bygg, 2026-11-08, against `141bb4c4`)
 
-Two changes in `src/ordered_pool.rs`. The admission gate's `consumed` is an
+Two changes in `crates/lib/src/ordered_pool.rs`. The admission gate's `consumed` is an
 atomic: `advance` stores it and takes the mutex and `notify_all`s only when
 a worker is registered as parked, where it used to lock and notify on every
 consumed result (std's futex condvar makes a wake syscall even with no
@@ -345,7 +345,7 @@ per-command state lives in `reference/performance/README.md`; this is the "how w
 
 #### Columnar dense-node decode (prototype `e0b0780`)
 
-`DenseNodeColumns` (`src/read/columnar.rs`) batch-decodes IDs, lats, lons
+`DenseNodeColumns` (`crates/lib/src/read/columnar.rs`) batch-decodes IDs, lats, lons
 into contiguous arrays. `collect_matching_ids_bbox` (single region) and
 `collect_matching_ids_multi_bbox` (N regions) test each node against the
 bbox set in one pass and push matches to a `Vec`. Shipped in single- and
@@ -416,7 +416,7 @@ the Extract section above and the `reference/performance/extract.md` Extract pla
 #### Mutex<Receiver> blob dispatch is not a bottleneck (do-not-reattempt)
 
 The shared `Mutex<Receiver>` single-recv-per-lock dispatch used by the
-`src/scan/classify.rs` worker pools, tags-filter pass 2, and multi-extract
+`crates/lib/src/scan/classify.rs` worker pools, tags-filter pass 2, and multi-extract
 write workers was flagged by 4/6 reviewers (2026-03-29) as a suspected
 ~8 s regression in the pipelined-reader -> pread-worker conversion. Closed
 2026-07-13 without a batch-drain: the arithmetic bounds total mutex time at
@@ -473,7 +473,7 @@ measured, recorded so a fourth starts from them.
   `025a8b07`): two copies with different payloads and stats types, judged
   harder to read generic, "only after the pread API shape stabilizes".
 - **October 2026, done in part.** Every pool that delivers in schedule
-  order runs on `src/ordered_pool.rs`, and sort and `cat --dedupe` on one
+  order runs on `crates/lib/src/ordered_pool.rs`, and sort and `cat --dedupe` on one
   blob-merge engine. Of the unordered pools, the two per-blob classify
   pools share one driver (`run_unordered_per_blob`, `scan/classify.rs`),
   keeping their dispatcher thread because the measured `WILLNEED` advice
@@ -493,7 +493,7 @@ measured, recorded so a fourth starts from them.
   itself). Of the claim-counter pools only altw stage 2 blocks on another
   thread, on its shared slot-bucket writers (`s2_slot_flush_lock_wait_ns`);
   stage 3 and pass 1.5 say at the pool why they have no counter. Every
-  such wait goes through the gated helpers in `src/counters.rs`, which
+  such wait goes through the gated helpers in `crates/lib/src/counters.rs`, which
   touch no clock unless the `try_*` attempt fails. All unmeasured; each
   step is its own commit.
 - **The last silent pools (2026-10-26).** Two kinds of pool still recorded

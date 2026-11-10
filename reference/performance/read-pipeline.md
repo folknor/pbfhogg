@@ -131,7 +131,7 @@ Planet (`planet-20260223-with-indexdata`), the default `w/highway=primary`
 expression, `--bench 1`. Its way passes skip no blob on tagdata
 (`tagsfilter_single_pass_tagidx_skipped_blobs=0`), so every way's tags are
 walked through `TagIter`, twice. The A arm is the stored main-tree cell of
-the previous entry, whose `src/read/elements.rs` and `dense.rs` are
+the previous entry, whose `crates/lib/src/read/elements.rs` and `dense.rs` are
 identical to the variant's base `9c4d6c81`; the variant is `9c4d6c81`
 plus the change, built in the main tree. No trim of its own.
 
@@ -151,7 +151,7 @@ altw external): `e28fdf69` (`take_message` refuses a second data-bearing
 broken invariant instead of defaulting), `9c85d37e` (the block iterators
 and the per-node dense `keys_vals` walk go through `validated`, an inlined
 branch onto a cold panic, instead of skipping or reading less) and
-`85c1428c` (the re-encoding paths in `src/owned.rs` return a `Result` per
+`85c1428c` (the re-encoding paths in `crates/lib/src/owned.rs` return a `Result` per
 element for the user lookup and per member for the role, through
 `relation_members_into`).
 
@@ -436,14 +436,14 @@ The pool sum is allocated capacity, 11 % of the read's peak anon at most
 (an upper bound on what is resident). This run's scan is a projection,
 which reads the tables from scratch, so building the tables straight into
 the payload tail would remove none of it; the reasoning for not building
-that is at the thread-locals in `src/read/pipeline.rs`. The wall is in
+that is at the thread-locals in `crates/lib/src/read/pipeline.rs`. The wall is in
 line with the stored 26.80 s cell `5b8e6c29` (`179f1b7e`, not a matched
 pair); the counters record only when a list grows, a few dozen times per
 worker at most, instead of on every blob.
 
 ## Header walk read-ahead on cold dense files (bygg, 2026-11-08, baseline `bb414882`)
 
-`PreadSource` (`src/read/header_walker.rs`) keeps its read window across
+`PreadSource` (`crates/lib/src/read/header_walker.rs`) keeps its read window across
 payload skips and, on a refill, reads a 1 MiB window instead of the 4 KiB
 probe when two gates pass: density (mean of the last 8 completed frames
 below 128 KiB, so the planet dump's ~1.8 MB frames never qualify) and

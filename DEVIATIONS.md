@@ -279,12 +279,12 @@ change.
 
 **pbfhogg behavior:** `diff --format osc` decides by content - coordinates,
 tags, way refs and relation members, exactly what `diff` compares (defined in
-`src/content.rs`) - and ignores metadata. Applying the derived OSC to the old
+`crates/lib/src/content.rs`) - and ignores metadata. Applying the derived OSC to the old
 PBF therefore gives a file whose content equals the new PBF's, so a `diff` of
 the result against the new PBF reports no differences. Creates and modifies
 carry each element's metadata (version, timestamp, changeset, uid, user) and
 deletes carry its version, the same whether or not the inputs have indexdata;
-`derive_then_apply_preserves_metadata` in `tests/roundtrip_invariants.rs`
+`derive_then_apply_preserves_metadata` in `crates/lib/tests/roundtrip_invariants.rs`
 pins that the metadata of a changed element survives the roundtrip.
 
 What that check cannot see is metadata, and anything else outside the content
@@ -528,13 +528,13 @@ positive-only, and several code paths rely on that invariant.
 
 `diff` and `diff --format osc` are not among the sites below: they
 accept negative IDs and order them by the canonical `id_order`, which
-their work-unit planner also cuts by (`src/commands/diff/units.rs`).
+their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
 
 **Sites enforcing the invariant:**
 
 - `renumber` - **hard reject** of any negative node, way or relation
   id, and of any negative way ref or relation member ref, in the
-  rewriters of `src/commands/renumber/wire_rewrite.rs`
+  rewriters of `crates/lib/src/commands/renumber/wire_rewrite.rs`
   (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
   `reframe_relations_with_new_ids`). Each returns an error naming
   the offending id. The check is unconditional, not
@@ -543,7 +543,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
   cleanly rather than panicking in `chunk_for_atomic` or silently
   dropping bits.
 - `getid` - **hard reject** at parse time. `parse_id_spec` in
-  `src/commands/getid/mod.rs` rejects any negative id parsed from a
+  `crates/lib/src/commands/getid/mod.rs` rejects any negative id parsed from a
   CLI argument or `--id-file` text spec, returning an error naming
   the offending id and its kind (node/way/relation). osmium's
   `getid` rejects identically; its man page is explicit that the
@@ -554,7 +554,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
   commands do not police element values such as ID sign; structural
   checks on decoded blocks are a separate matter, see
   `reference/truncation-handling.md`). The blob-prefilter (`IdSet::any_in_range` at
-  `src/idset.rs`) clamps `min_id < 0` to 0 so a *target* PBF whose
+  `crates/lib/src/idset.rs`) clamps `min_id < 0` to 0 so a *target* PBF whose
   indexdata range straddles zero correctly screens in its positive
   portion - without the clamp the unsigned cast wraps and the blob
   is silently skipped, dropping legitimate positive matches.
@@ -564,7 +564,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
 - `add-locations-to-ways --index-type external` - **hard reject** of
   any node blob whose indexdata range holds a negative ID, in its
   metadata scan (`check_range` in
-  `src/commands/altw/external/blob_meta.rs`), before any join work.
+  `crates/lib/src/commands/altw/external/blob_meta.rs`), before any join work.
   Stage 2 partitions and walks node IDs as unsigned values, so a
   mixed-sign range would silently turn present nodes, positive ones
   included, into missing locations. The error names the sparse index,
@@ -578,7 +578,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
 - `check --refs` - **hard reject** of a negative ID the check would
   compare: a node, a way under `--check-relations` (way IDs are
   tracked only there), a relation, and every checked way ref and
-  relation member (`src/commands/check/refs.rs`). Its tracking sets
+  relation member (`crates/lib/src/commands/check/refs.rs`). Its tracking sets
   are `IdSet`s, so before the reject a negative element was counted
   as untrackable and every reference to it reported as missing.
   osmium's `check-refs` keeps a second `IdSetDense` for negatives and
@@ -587,7 +587,7 @@ their work-unit planner also cuts by (`src/commands/diff/units.rs`).
 - `check --ids --full` - **verdict**, not a refusal: every negative
   element ID is reported as an `IdOutOfRange` violation and the check
   exits 1, even in a file whose negatives are in canonical `id_order`
-  (`src/commands/check/verify_ids.rs`). The streaming `check --ids`
+  (`crates/lib/src/commands/check/verify_ids.rs`). The streaming `check --ids`
   orders negatives canonically by `osm_id_cmp` and does not fail on
   them, as libosmium's `CheckOrder` and `osmium fileinfo` do not.
 - `add-locations-to-ways` (both backends) - **silent**, by
@@ -606,14 +606,14 @@ PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
 preserves the sign and `getid` applies its own rejection afterward.
 
 **Residual divergence (tags-filter, add-locations-to-ways, getid -r):**
-The shared root is `IdSet::set` in `src/idset.rs`, a silent
+The shared root is `IdSet::set` in `crates/lib/src/idset.rs`, a silent
 no-op on negative ids, where osmium's equivalent paths abs-fold via
 `object.positive_id()` to collapse `-N` and `+N` into a single bit.
 
 - `tags-filter`'s parallel-classify path silently **drops**
   negative-id ways from the output, where osmium's `tags-filter`
   silently **abs-converts** them. Pinned as the current state by
-  `cli/tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
+  `crates/cli/tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
 - `add-locations-to-ways` silently **omits** relation-member
   retention for any relation member whose id is negative (the member
   id is dropped at `IdSet::set` time, so the write pass doesn't know
@@ -650,7 +650,7 @@ for JOSM-staged input, and the canonical workflow for such data is
 JOSM-interop, the work is:
 
 1. Route every ordering decision through `osm_id_cmp` in
-   `src/osm_id.rs` (canonical `id_order`: 0 → negatives by abs value
+   `crates/lib/src/osm_id.rs` (canonical `id_order`: 0 → negatives by abs value
    → positives by abs value), which sort, dedupe, merge-join and diff
    already use; the remaining raw `<` / `>` / `!=` on `i64` ids
    audited and switched.
@@ -685,7 +685,7 @@ in command arguments or an ID text file is rejected unless the caller selects
 node, way or relation explicitly. This is deliberate. A bare number carries
 no element kind, and silently assigning it to node can select a different
 object than the caller intended. The same parser serves both commands.
-`parse_id_spec_inner` in `src/commands/getid/mod.rs` owns this rule; the CLI
+`parse_id_spec_inner` in `crates/lib/src/commands/getid/mod.rs` owns this rule; the CLI
 leaves `default_type` unset unless the user supplies `--default-type`.
 
 pbfhogg also accepts named typed forms such as `node/123`, `way/456` and
@@ -783,7 +783,7 @@ Thus `w/highway` counts only `highway` tags on ways, subject to any additional
 expression to `get_tag_matcher` and has no type-prefix syntax; there,
 `w/highway` is treated as a tag-key pattern. Use `--type way` for the
 equivalent kind restriction in osmium. The pbfhogg parser is shared from
-`src/tag_expr.rs` by `src/commands/tags_count/mod.rs`; the behavior is
+`crates/lib/src/tag_expr.rs` by `crates/lib/src/commands/tags_count/mod.rs`; the behavior is
 described in the CLI reference.
 
 `inspect tags` otherwise counts what osmium's `tags-count` counts, by its two
@@ -874,8 +874,8 @@ extract therefore fails the run.
 **pbfhogg behavior:** `getid` exits 0 whenever it wrote its output, found
 or not. `-v, --verbose` reports the requested IDs that were not written,
 requested ones only: an object `-r` reached that the file lacks is not a
-miss (`print_missing_ids` in `cli/src/lib.rs`, fed by `record_found` in
-`src/commands/getid/mod.rs`, which records requested IDs of every kind).
+miss (`print_missing_ids` in `crates/cli/src/lib.rs`, fed by `record_found` in
+`crates/lib/src/commands/getid/mod.rs`, which records requested IDs of every kind).
 
 **Rationale:** on any extract, members cut off at the border are the normal
 case, so an exit status that fails on them reports the extract, not the

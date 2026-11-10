@@ -323,7 +323,7 @@ parallelized)" below.
 
 ### Interpolation endpoint CSR (interp resolve parallelized)
 
-`resolve_interpolation_endpoints_mmap` (`src/geocode_index/builder/interp.rs`)
+`resolve_interpolation_endpoints_mmap` (`crates/lib/src/geocode_index/builder/interp.rs`)
 replaced its transient `FxHashMap<u64, Vec<u32>>` spatial index with a
 sorted CSR (compressed-sparse-row) built in parallel, and parallelized
 endpoint resolution over interpolation ways. Single-run, dirty-tree

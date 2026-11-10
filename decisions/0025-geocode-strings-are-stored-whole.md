@@ -13,7 +13,7 @@ entry that every absent optional field names. A PBF tag value may hold a NUL
 byte (PBF strings are length-delimited; only OSM XML cannot carry one), so a
 NUL-terminated pool published such a value as its prefix: `10\0a` answered
 as `10`, with nothing in the index to say so. The encoding is defined once,
-in `src/geocode_index/format.rs`, and the builder's pool, the interpolation
+in `crates/lib/src/geocode_index/format.rs`, and the builder's pool, the interpolation
 resolver and the reader all go through it. Open checks that each referenced
 offset frames a whole UTF-8 entry inside the pool and that the sentinel is
 present; it does not check that an offset is the start of an entry the

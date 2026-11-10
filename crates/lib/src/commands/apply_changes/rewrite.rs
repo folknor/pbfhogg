@@ -1,0 +1,784 @@
+//! Apply-changes entry point: build the descriptor-first streaming
+//! pipeline, join scanner and workers with the drain, and surface stats.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+
+use rustc_hash::FxHashMap;
+
+use crate::write::WriteOptions;
+
+use crate::commands::input_front::InputFront;
+use crate::commands::output_header::{Bbox, OutputFacts, Replication, Ways};
+use crate::commands::{HeaderOverrides, writer_from_header_bytes};
+use crate::read::input::InputSource;
+
+use super::descriptor::{DrainMessage, Route};
+use super::drain::{self, DrainChannels, DrainConfig, DrainCounters, DrainLocations, LocMapHandle};
+use super::failure::FailureSlot;
+use super::node_locations::NodeLocationIndex;
+use super::refresh::StaleProbe;
+use super::scanner::{self, ScannerChannels, ScannerConfig, ScannerLocations};
+use super::stats::MergeStats;
+use super::streaming::{
+    self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters, WorkerLocations,
+};
+
+use super::Result;
+
+use crate::tunables::{
+    APPLY_CHANGES_WORKERS_FALLBACK, APPLY_CHANGES_WORKERS_MIN, APPLY_CHANGES_WORKERS_RESERVED,
+    CANDIDATE_CHANNEL_CAPACITY, DRAIN_CHANNEL_CAPACITY,
+};
+
+/// The `LocationsOnWays` mode of [`merge`]: the base declares way-node
+/// coordinates and the output keeps them current, with the setting that
+/// means something only there.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocationsOnWays {
+    /// Write `(0, 0)` for a way-node reference neither the OSC nor the base
+    /// supplies, instead of failing the run with `MissingNodeLocations`.
+    pub ignore_missing_nodes: bool,
+}
+
+/// Public command options.
+#[derive(Default)]
+pub struct MergeOptions {
+    /// Output compression, backend and the shared input flags. The parallel
+    /// writer is this command's default backend, so a `Buffered` backend
+    /// here builds `PbfWriter::to_path_parallel`.
+    pub write: WriteOptions,
+    /// `Some` requires a base declaring `LocationsOnWays`, refreshes the
+    /// inline coordinates of its surviving ways and writes them on created and
+    /// modified ones; the output declares the feature too. `None` (the
+    /// default) writes ways without coordinates.
+    pub locations_on_ways: Option<LocationsOnWays>,
+    /// Worker-pool size for the descriptor-first pipeline. `Auto` keeps the
+    /// `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum
+    /// 2 workers). `Fixed(n)` runs exactly `n`, one included: the scanner,
+    /// the workers and the drain are separate threads, and nothing in the
+    /// node-to-way barrier or its failure shutdown depends on a second
+    /// worker (the barrier fault tests run at one worker too).
+    pub parallelism: crate::host::Parallelism,
+    /// Accept a change whose `version` is lower than the version already
+    /// held for that object in the overlay. Off by default; see
+    /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
+    pub allow_version_regression: bool,
+}
+
+impl MergeOptions {
+    /// Refuse option values and combinations the pipeline cannot honour,
+    /// before any input is opened. [`merge`] calls it first; a caller can
+    /// call it earlier to refuse before reserving an output.
+    ///
+    /// - `force` with `locations_on_ways`: on an indexed base `force` does
+    ///   nothing, and on an unindexed one the combination is unsound (the
+    ///   scanner cannot tell node blobs from way blobs, which defeats the
+    ///   node-to-way barrier), so `force` can never take effect there.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` naming the refused option.
+    pub fn validate(&self) -> Result<()> {
+        if self.write.force && self.locations_on_ways.is_some() {
+            return Err(crate::Error::invalid_argument(
+                "apply-changes: force has no effect with locations_on_ways, which \
+                 requires an indexed base (an unindexed base would silently lose \
+                 LocationsOnWays on base ways)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn build_header_bytes(
+    header: &crate::HeaderBlock,
+    locations_on_ways: bool,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Entered<'_>,
+) -> Result<Vec<u8>> {
+    // apply-changes requires Sort.Type_then_ID on the base PBF
+    // regardless of --locations-on-ways: the upsert slicing in
+    // `streaming::upsert_slice` computes per-block `osm_id_key`
+    // bounds that assume canonical ordering, and
+    // `rewrite_block.rs::rewrite_block` advances its `upsert_cursor`
+    // using `osm_id_cmp` against the iterating element, which only
+    // produces correct output if elements arrive in canonical order.
+    // Previously the check only fired for --locations-on-ways; the
+    // general path silently dropped creates on malformed unsorted
+    // input.
+    if !header.is_sorted() {
+        return Err(crate::error::new_unsorted(
+            "apply-changes requires a sorted base PBF (Sort.Type_then_ID). \
+             All nodes must precede all ways, and elements within a kind \
+             must be ordered by ID.",
+        ));
+    }
+    if locations_on_ways && !header.has_locations_on_ways() {
+        return Err(crate::Error::invalid_data(
+            "apply-changes with locations_on_ways requires the base PBF to have LocationsOnWays. \
+             Run add-locations-to-ways first to bootstrap coordinates, with its \
+             keep_untagged_nodes option set: later runs need the node records of \
+             untagged nodes that changed ways reference.",
+        ));
+    }
+    // Sorted by construction. Under -l every OSC way gets inline
+    // coordinates, and every surviving base way keeps the ones it carries
+    // (one written without coordinate arrays stays without them), refreshed
+    // wherever the OSC moves a node it uses (`refresh.rs`); the prepass fields of spliced blobs are stale against the
+    // changed relations and ways, so they are not declared. Without -l a
+    // rewritten way blob loses its coordinates. An OSC can create or move a
+    // node outside the base's bbox, so no bbox is declared. The output is
+    // past the base's replication position, at one the OSC cannot name (it
+    // has no sequence number, nor proof it follows the base without a gap),
+    // so only the feed's base URL is kept; the caller stamps the new
+    // position with `HeaderOverrides` when it knows it. osmium apply-changes
+    // drops all three fields; keeping the URL keeps pyosmium-up-to-date and
+    // osm2pgsql-replication on the base's feed instead of their planet
+    // default when they fall back to the newest object timestamp.
+    let facts = OutputFacts {
+        bbox: Bbox::Drop,
+        replication: Replication::FeedOnly,
+        ..OutputFacts::sorted(if locations_on_ways {
+            Ways::ReencodedWithLocations
+        } else {
+            Ways::Reencoded
+        })
+    };
+    Ok(crate::commands::output_header::build_one(header, &facts, overrides, host)?.bytes)
+}
+
+/// What `--locations-on-ways` derives from the diff before the pipeline
+/// exists: the coordinate index and the refresh probe.
+struct LocationsSetup {
+    mode: LocationsOnWays,
+    index: NodeLocationIndex,
+    probe: StaleProbe,
+}
+
+/// Split one run's `--locations-on-ways` resources into the three stages'
+/// shares. The barrier channel's two ends, the coordinate slots (one per
+/// worker, the drain holding clones) and the map handle are created here
+/// together, so no stage can hold part of the mode without the rest. The
+/// caller moves each share into its stage before any thread starts and keeps
+/// none of them: the scanner's boundary sender and the drain's barrier sender
+/// signal by dropping with their stage.
+fn wire_locations(
+    setup: LocationsSetup,
+    worker_count: usize,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
+) -> (ScannerLocations, WorkerLocations, DrainLocations) {
+    let LocationsSetup { mode, index, probe } = setup;
+    let (barrier_tx, barrier_rx) = mpsc::sync_channel::<()>(1);
+    let coord_slots: CoordSlots = (0..worker_count)
+        .map(|_| Arc::new(Mutex::new(FxHashMap::default())))
+        .collect();
+    let loc_map: LocMapHandle = Arc::new(OnceLock::new());
+    let scanner = ScannerLocations {
+        refresh_ways: probe.has_upserts(),
+        barrier_rx,
+        boundary_tx: drain_tx.clone(),
+    };
+    let drain = DrainLocations {
+        coord_slots: coord_slots.iter().map(Arc::clone).collect(),
+        seeded: index.locations,
+        barrier_tx,
+        loc_map_out: Arc::clone(&loc_map),
+        nodes_needed: index.total_referenced,
+        ignore_missing_nodes: mode.ignore_missing_nodes,
+    };
+    let workers = WorkerLocations {
+        coord_slots,
+        loc_map,
+        needed: Arc::new(index.needed_set),
+        probe: Arc::new(probe),
+    };
+    (scanner, workers, drain)
+}
+
+/// Apply an OSC diff to a base PBF, producing an updated sorted PBF.
+///
+/// Descriptor-first streaming pipeline: scanner walks blob headers via
+/// `HeaderWalker` and emits `DrainItem::CopyRange` (splice fast-path)
+/// or `ScannedBlob::Candidate` (overlap candidates, routed to workers).
+/// Workers pread bodies, decompress, precise-check, and either rewrite
+/// inline (`DrainItem::Rewritten`) or convert false positives to
+/// `DrainItem::CopyRange`. The drain reorders the unified stream by seq
+/// and writes the output PBF, coalescing contiguous `copy_file_range`
+/// runs.
+///
+/// Under `--locations-on-ways`, workers extract node coords during the
+/// node phase into per-worker `Arc<Mutex<FxHashMap>>` slots; the drain
+/// merges them at the node→way barrier and publishes the
+/// `Arc<FxHashMap>` for way-phase workers via `LocMapHandle`.
+///
+/// # Errors
+///
+/// Returns an error if the base PBF or OSC file cannot be read, the
+/// output path aliases the base PBF, the output file cannot be written, or
+/// any PBF parsing/encoding fails. The base is read in several passes, so
+/// it must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see
+/// [`InputSource::pin`](crate::read::input::InputSource::pin)): a path is
+/// pinned here, a caller's [`PinnedInput`] is used as it is. Where a later
+/// open cannot reach the pinned file, a base replaced mid-run fails with
+/// `InputReplaced`. Under `locations_on_ways` without
+/// `ignore_missing_nodes`, a node that a created or modified way references
+/// and neither the OSC nor the base supplies fails the run with
+/// `MissingNodeLocations` once the base's node blobs are read, before any
+/// way is written.
+pub fn merge<'a>(
+    base_pbf: impl Into<InputSource<'a>>,
+    osc_file: &Path,
+    output_pbf: impl crate::output::BindOutput,
+    opts: &MergeOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<MergeStats> {
+    let host = &host.enter()?;
+    let output_pbf = crate::output::bind_unissued(output_pbf, &host.invocation)?;
+    host.invocation.check()?;
+    let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
+    output_pbf.publish()?;
+    Ok(result)
+}
+
+/// [`merge`] writing to a borrowed output it does not publish.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::cast_precision_loss
+)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn merge_to<'a>(
+    base_pbf: impl Into<InputSource<'a>>,
+    osc_file: &Path,
+    output_pbf: &crate::output::BoundOutput,
+    opts: &MergeOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Entered<'_>,
+) -> Result<MergeStats> {
+    // Option refusals first: none of them needs the input.
+    opts.validate()?;
+    let base_source: InputSource<'_> = base_pbf.into();
+    let base_pbf = base_source.path();
+
+    // `merge` is public library API, so direct callers need the same refusal
+    // as CLI callers. Writing goes to a staging file, so the base is never
+    // truncated, but publication would replace the base the run read from.
+    // Identity is the destination's, never the staging file's. A
+    // not-yet-created output cannot be the base, so the CLI's extra
+    // planned-path check is not needed here.
+    if crate::path_guard::same_file(base_pbf, output_pbf.destination())? {
+        return Err(crate::Error::invalid_argument(format!(
+            "apply-changes output '{}' aliases base input '{}'",
+            output_pbf.destination().display(),
+            base_pbf.display()
+        )));
+    }
+
+    let MergeOptions {
+        write:
+            WriteOptions {
+                compression,
+                backend,
+                direct_reads: direct_io,
+                force,
+            },
+        locations_on_ways: locations,
+        parallelism,
+        allow_version_regression,
+    } = *opts;
+    // The header and the stats read the mode as this flag; the stages get
+    // their shares of it from `wire_locations`.
+    let locations_on_ways = locations.is_some();
+    // `validate` refused `force` with `locations_on_ways`: under force the
+    // scanner tags every unindexed blob as a placeholder `Node` (its real
+    // kind is not known until decompress), which defeats the node-to-way
+    // barrier that gates the worker pool until the node-coord loc_map is
+    // published. So with `-l` an unindexed base is always refused here.
+    //
+    // The base is read through several open file descriptions (the front
+    // read here, the splice source, the scanner's header walker and the
+    // worker pool's), and each is derived from this one pin, so a file
+    // renamed over the base mid-run cannot be read partly from each: where
+    // `/proc/self/fd` reopens the pin every open reaches the pinned file,
+    // otherwise on Unix a replaced base fails the run (`PinnedInput` says
+    // what it does off Unix). Taken before any other open of it.
+    let base = base_source.pin(host)?;
+
+    // One open answers both the indexdata question and the header, in that
+    // order, so a forced run's Note and the missing-indexdata refusal still
+    // precede a header decode failure. `merge_header_read_ms` therefore
+    // times the whole front read: the open, the header frame, the probe to
+    // the first data blob's header (one pread) and the decode, not the header
+    // alone. The wider span is deliberate: the front read is one step that
+    // answers both the indexdata question and the header, so timing the
+    // header alone would time a fragment of it. Values recorded before
+    // `a3f1a1bc` exclude the probe and are not comparable with later ones.
+    let header_start = crate::counters::Stopwatch::start();
+    let mut front = InputFront::open(&base, direct_io, host)?;
+    front.require_indexdata(
+        force,
+        "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
+         decompressed to classify elements (significantly slower).",
+        host,
+    )?;
+
+    // The base header's refusals (unsorted base, `-l` without
+    // LocationsOnWays) come before the OSC is parsed: the header read
+    // happens either way, so ordering it first costs nothing and keeps a
+    // multi-minute OSC parse from preceding a refusal it cannot change.
+    let header_bytes = build_header_bytes(front.header()?, locations_on_ways, overrides, host)
+        .map_err(|e| e.locate(crate::error::Location::in_file(base_pbf)))?;
+    drop(front);
+    let header_read_ms = header_start.elapsed_ms();
+
+    let osc_start = crate::counters::Stopwatch::start();
+    crate::host::diag!(
+        host.diagnostics,
+        Progress,
+        "apply_changes.parse_osc",
+        "Parsing OSC diff: {}",
+        osc_file.display()
+    );
+    let overlay = {
+        let mut overlay = crate::osc::CompactDiffOverlay::new();
+        overlay.allow_version_regression(allow_version_regression);
+        // The shared parser also emits merge_changes_decompress_ns once per
+        // file: input-reader time (file reads, plus decompression for gzip),
+        // not the full parse wall measured by osc_start here. Its owner,
+        // TimedRead in osc/xml_parse.rs, documents the attribution.
+        crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.invocation)?;
+        overlay
+    };
+    let osc_parse_ms = osc_start.elapsed_ms();
+
+    // The pipeline reads the diff only in ID order and parses nothing more,
+    // so the parse-time hash indexes, deleted sets, version floors and
+    // interner lookup go here; `SortedDiff` (osc/sorted.rs) is the sorted
+    // view every stage reads. `merge_diffranges_ms` keeps its name for the
+    // sort.
+    let diffranges_start = crate::counters::Stopwatch::start();
+    let diff = Arc::new(overlay.into_sorted());
+    let diffranges_ms = diffranges_start.elapsed_ms();
+    let diff_heap_bytes = diff.heap_bytes() as u64;
+    {
+        use crate::ElementKind::{Node, Relation, Way};
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.diff_counts",
+            "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
+            diff.upserts(Node).len(),
+            diff.upserts(Way).len(),
+            diff.upserts(Relation).len(),
+            diff.deleted(Node).len(),
+            diff.deleted(Way).len(),
+            diff.deleted(Relation).len(),
+        );
+    }
+    host.invocation
+        .counter("merge_diff_arena_len_bytes", diff.arena_len_bytes());
+
+    // --locations-on-ways setup. The descriptor-first pipeline fuses
+    // prefill into the worker pool, so we no longer call
+    // `prefill_from_base` here. Build_from_diff still produces the
+    // OSC-pre-seeded coords (`locations`) and the still-needed-from-base
+    // ID set (`needed_set`).
+    let loc_setup = locations.map(|mode| {
+        let index = NodeLocationIndex::build_from_diff(&diff);
+        // Counted separately from the two maps: a referenced node the diff
+        // deletes is in neither, and must still count as needed so that it
+        // shows up as missing.
+        let total_needed = index.total_referenced;
+        let seeded = index.locations.len();
+        let still_needed = index.needed_set.len();
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.low_needed",
+            "  locations on ways: {total_needed} node IDs needed, {seeded} from diff, {still_needed} from base"
+        );
+        // The refresh probe for surviving base ways (`refresh.rs`): every
+        // node the OSC upserts or deletes, a filter over the diff's sorted
+        // node lists, kept apart from the coordinate map published at the
+        // barrier, whose size `loc_missing` is computed from.
+        let probe = StaleProbe::from_diff(&diff);
+        let probe_bytes = probe.heap_bytes();
+        host.invocation
+            .counter("merge_loc_refresh_probe_bytes", probe_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        let probe_mb = probe_bytes as f64 / (1024.0 * 1024.0);
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.refresh_probe",
+            "  inline location refresh probe: {probe_mb:.1} MB"
+        );
+        LocationsSetup {
+            mode,
+            index,
+            probe,
+        }
+    });
+    let loc_stats_pre = loc_setup.as_ref().map_or((0, 0, 0), |s| {
+        (
+            s.index.total_referenced,
+            s.index.locations.len() as u64,
+            s.index.needed_set.len() as u64,
+        )
+    });
+
+    let writer_setup_start = crate::counters::Stopwatch::start();
+    // Apply-changes' output pass is writer-bound at default compression, so
+    // an unspecified (buffered) backend becomes the parallel writer.
+    let backend = backend.parallel_by_default();
+    let mut writer =
+        writer_from_header_bytes(output_pbf, compression, &header_bytes, backend, host)?;
+    let writer_setup_ms = writer_setup_start.elapsed_ms();
+
+    // copy_file_range input setup, opened only on the splice route (the
+    // drain is its one reader; a `--direct-io` output takes no CopyRange).
+    // The handle is shared rather than borrowed: `write_raw_copy` queues the
+    // splice into the writer thread, so the input has to stay open past the
+    // point this function returns from the call.
+    //
+    // The base is opened again by the scanner's header walker
+    // (`FADV_RANDOM`) and once for the whole worker pool (plain preads of
+    // candidate bodies), besides this plain splice source. Separate open
+    // file descriptions are kept here, so the walker's RANDOM advice and
+    // each reader's readahead state stay off the others' reads. Whether the
+    // pool would read as fast under RANDOM is unmeasured here: altw
+    // external's per-blob dispatched stage 4 is indifferent to it, its
+    // run-reading stage 2 is three times slower under it
+    // (`InputSource::open_random_access`). All of them derive from `base`,
+    // so they are descriptions of one file.
+    let splice = backend.supports_copy_range();
+    // Test-only: exercise the owned route on any backend.
+    #[cfg(feature = "test-hooks")]
+    let splice = splice
+        && !host
+            .invocation
+            .faults()
+            .apply_changes_force_owned_route
+            .load(std::sync::atomic::Ordering::Relaxed);
+    let splice_source = if splice {
+        Some(crate::read::input::InputFile::open(&base)?)
+    } else {
+        None
+    };
+
+    // Worker count: a fixed parallelism if supplied, one included, else the
+    // default `nproc - 2` heuristic (leaves two cores for the scanner and
+    // drain threads; its minimum of two is a sizing choice, separate from
+    // what an explicit count may be).
+    //
+    // A single worker is safe through the barrier and its shutdown: worker
+    // panics are caught and published to FailureSlot, the drain sees them
+    // within one receive timeout, drops its receiver and barrier sender,
+    // and merge joins both producers; a failed worker's pool leaves its
+    // scope and drops the candidate receiver, releasing a scanner blocked in
+    // send. Barrier progress rests on the scanner's boundary message, the
+    // drain's barrier check after each receive, and workers flushing coord
+    // slots before sending node outputs, none of which needs a second
+    // worker. `crates/lib/tests/fault_apply_changes.rs` runs a late boundary, empty,
+    // node-only and way-only inputs, and failures while dispatch or the
+    // barrier wait is blocked, on both routes, at one worker and more.
+    let worker_count = parallelism.resolve(|| {
+        crate::host::sized_workers(
+            &*host.resources,
+            APPLY_CHANGES_WORKERS_RESERVED,
+            APPLY_CHANGES_WORKERS_MIN,
+            APPLY_CHANGES_WORKERS_FALLBACK,
+        )
+    });
+    host.invocation.counter("merge_worker_count", worker_count);
+
+    // Channels.
+    let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainMessage>(DRAIN_CHANNEL_CAPACITY);
+    let (candidate_tx, candidate_rx) =
+        mpsc::sync_channel::<super::descriptor::ScannedBlob>(CANDIDATE_CHANNEL_CAPACITY);
+    // Sequence admission: bounds seqs reserved and not yet processed, the
+    // reorder map included. The drain owns the only token sender.
+    let (window_admit, window_return) =
+        super::window::seq_window(crate::tunables::APPLY_CHANGES_SEQ_WINDOW);
+    // One decision, three views of it: the scanner holds a passthrough drain
+    // sender only on the splice route (its node-boundary sender under
+    // `--locations-on-ways`, below, is separate), the workers learn which route false positives
+    // take, and the drain gets the input file to splice from. Only clone the
+    // sender for the scanner if we're going to use it: otherwise the unused
+    // clone keeps `drain_rx` alive past worker exit and the drain thread
+    // deadlocks waiting for a sender that will never drop until merge()
+    // returns - which only happens after the drain joins.
+    let (scanner_route, worker_route, drain_route) = match splice_source {
+        Some(input_file) => (
+            Route::Splice(drain_tx.clone()),
+            Route::Splice(()),
+            Route::Splice(input_file),
+        ),
+        None => (Route::Owned, Route::Owned, Route::Owned),
+    };
+
+    // --locations-on-ways: each stage's share, built together and moved into
+    // the stage configs below, so nothing here keeps a channel end alive.
+    let (scanner_locations, worker_locations, drain_locations) = match loc_setup {
+        Some(setup) => {
+            let (scanner, workers, drain) = wire_locations(setup, worker_count, &drain_tx);
+            (Some(scanner), Some(workers), Some(drain))
+        }
+        None => (None, None, None),
+    };
+
+    let worker_counters = Arc::new(WorkerCounters::new());
+    let drain_counters = Arc::new(DrainCounters::new());
+    let failure = Arc::new(FailureSlot::new());
+
+    let scanner_cfg = ScannerConfig {
+        base: &base,
+        diff: &diff,
+        locations: scanner_locations,
+        channels: ScannerChannels {
+            candidate_tx,
+            route: scanner_route,
+        },
+        window: window_admit,
+    };
+
+    let streaming_cfg = StreamingConfig {
+        base: base.clone(),
+        diff: Arc::clone(&diff),
+        worker_count,
+        locations: worker_locations,
+        compression,
+        route: worker_route,
+        failure: Arc::clone(&failure),
+        cancel: host.invocation.permit(),
+    };
+    let streaming_channels = StreamingChannels {
+        candidate_rx,
+        drain_tx,
+    };
+
+    let drain_cfg = DrainConfig {
+        diff: &diff,
+        // A single worker comes only from an explicit `-j 1` (the automatic
+        // sizing starts at two), which runs sequentially: its create runs
+        // are encoded on the drain thread too.
+        create_executor: (worker_count > 1).then_some(&host.executor),
+        compression,
+        route: drain_route,
+        failure: Arc::clone(&failure),
+    };
+    let drain_channels = DrainChannels {
+        drain_rx,
+        window: window_return,
+    };
+
+    host.invocation.marker("MERGE_LOOP_START");
+    let pipeline_start = crate::counters::Stopwatch::start();
+
+    // Drain runs in this (the merge() caller's) thread because it owns
+    // `&mut writer`. Scanner and worker pool run in scoped threads.
+    //
+    // Producers publish failures before releasing their last drain sender.
+    // A drain error drops its receiver and barrier sender before we join,
+    // unblocking scanner dispatch, barrier waits and worker sends. Join both
+    // threads on every path so an implicit scope join cannot discard a cause.
+    let scanner_failure = Arc::clone(&failure);
+    let scanner_sender_guard = streaming_channels.drain_tx.clone();
+    let stats = std::thread::scope(|scope| -> Result<MergeStats> {
+        let scanner_handle = scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner::run_scanner(scanner_cfg, host)
+            }));
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => scanner_failure.publish(e),
+                Err(payload) => scanner_failure.publish_panic("scanner", &*payload),
+            }
+            // Keep the channel connected until publication, even though
+            // run_scanner has already dropped its own channels on return.
+            drop(scanner_sender_guard);
+        });
+        let workers_counters_inner = Arc::clone(&worker_counters);
+        let workers_handle = scope.spawn(move || {
+            streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
+        });
+
+        let drain_stats = drain::run_drain(
+            drain_cfg,
+            drain_channels,
+            drain_locations,
+            &mut writer,
+            &drain_counters,
+        );
+        // Test-only: the drain has returned, so its config, channels and
+        // locations state, the barrier sender included, are dropped by now.
+        #[cfg(feature = "test-hooks")]
+        host.invocation
+            .faults()
+            .apply_changes_drain_returned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let scanner_join = scanner_handle.join();
+        let workers_join = workers_handle.join();
+        if let Err(payload) = scanner_join {
+            failure.publish_panic("scanner", &*payload);
+        }
+        if let Err(payload) = workers_join {
+            failure.publish_panic("worker pool", &*payload);
+        }
+        // The drain checks producer failures before reporting a seq gap.
+        // Keep its error: a later scanner send failure can be a consequence
+        // of the drain dropping its receiver after an output write failed.
+        let stats = drain_stats?;
+        if let Some(e) = failure.take() {
+            return Err(e);
+        }
+        Ok(stats)
+    })?;
+
+    let pipeline_ms = pipeline_start.elapsed_ms();
+    host.invocation.marker("MERGE_LOOP_END");
+
+    let mut final_stats = stats;
+    final_stats.diff_heap_bytes = diff_heap_bytes;
+    final_stats.locations_on_ways = locations_on_ways;
+    if locations_on_ways {
+        final_stats.loc_nodes_needed = loc_stats_pre.0;
+        final_stats.loc_nodes_from_diff = loc_stats_pre.1;
+        // Resolution is counted from the merged map's UNIQUE KEYS, never
+        // from the worker tuple counter. `coord_pairs_extracted` increments
+        // once per extracted tuple, including when `local_coords.insert`
+        // replaces an id already seen - so a base PBF carrying two records
+        // for one required node would inflate the count and let it cover a
+        // genuinely absent id, silently reinstating the (0,0) fallback that
+        // the drain's barrier refusal exists to refuse. Reaching here with a
+        // nonzero `loc_missing` means `ignore_missing_nodes` let it through.
+        let resolved = drain_counters
+            .barrier_loc_map_size
+            .load(std::sync::atomic::Ordering::Relaxed);
+        final_stats.loc_nodes_from_base = resolved.saturating_sub(loc_stats_pre.1);
+        final_stats.loc_missing = loc_stats_pre.0.saturating_sub(resolved);
+        final_stats.loc_node_blobs_scanned = worker_counters
+            .loc_node_blobs_scanned
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        final_stats.loc_refresh_blobs_scanned = load(&worker_counters.loc_refresh_blobs_scanned);
+        final_stats.loc_refresh_only_blobs = load(&worker_counters.loc_refresh_only_blobs);
+        final_stats.loc_refreshed_ways = load(&worker_counters.loc_refreshed_ways);
+        final_stats.loc_refreshed_refs = load(&worker_counters.loc_refreshed_refs);
+        final_stats.loc_deleted_node_refs = load(&worker_counters.loc_deleted_node_refs);
+    }
+
+    // No summary here: the caller renders the returned stats, as for every
+    // other command. Writing it here too printed it twice on the CLI.
+
+    // Surface phase counters that callers expect from the legacy shape.
+    host.invocation.counter("merge_osc_parse_ms", osc_parse_ms);
+    host.invocation
+        .counter("merge_diffranges_ms", diffranges_ms);
+    host.invocation
+        .counter("merge_header_read_ms", header_read_ms);
+    host.invocation
+        .counter("merge_writer_setup_ms", writer_setup_ms);
+    host.invocation.counter("merge_pipeline_ms", pipeline_ms);
+
+    host.invocation
+        .counter("merge_blobs_passthrough", final_stats.blobs_passthrough);
+    host.invocation
+        .counter("merge_blobs_rewritten", final_stats.blobs_rewritten);
+    host.invocation
+        .counter("merge_blobs_index_hit", final_stats.blobs_index_hit);
+    host.invocation
+        .counter("merge_total_elements", final_stats.total_elements());
+    host.invocation
+        .counter("merge_deleted", final_stats.deleted);
+    host.invocation
+        .counter("merge_diff_nodes", final_stats.diff_nodes);
+    host.invocation
+        .counter("merge_diff_ways", final_stats.diff_ways);
+    host.invocation
+        .counter("merge_diff_relations", final_stats.diff_relations);
+    host.invocation
+        .counter("merge_bytes_passthrough", final_stats.bytes_passthrough);
+    host.invocation
+        .counter("merge_bytes_rewritten", final_stats.bytes_rewritten);
+    host.invocation
+        .counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes);
+    if locations_on_ways {
+        host.invocation
+            .counter("merge_loc_needed", final_stats.loc_nodes_needed);
+        host.invocation
+            .counter("merge_loc_from_diff", final_stats.loc_nodes_from_diff);
+        host.invocation
+            .counter("merge_loc_from_base", final_stats.loc_nodes_from_base);
+        host.invocation
+            .counter("merge_loc_missing", final_stats.loc_missing);
+        host.invocation.counter(
+            "merge_loc_node_blobs_scanned",
+            final_stats.loc_node_blobs_scanned,
+        );
+        host.invocation.counter(
+            "merge_loc_refresh_blobs_scanned",
+            final_stats.loc_refresh_blobs_scanned,
+        );
+        host.invocation.counter(
+            "merge_loc_refresh_only_blobs",
+            final_stats.loc_refresh_only_blobs,
+        );
+        host.invocation
+            .counter("merge_loc_refreshed_ways", final_stats.loc_refreshed_ways);
+        host.invocation
+            .counter("merge_loc_refreshed_refs", final_stats.loc_refreshed_refs);
+        host.invocation.counter(
+            "merge_loc_deleted_node_refs",
+            final_stats.loc_deleted_node_refs,
+        );
+    }
+
+    Ok(final_stats)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_refuses_output_equal_to_base_before_reading_inputs() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let original: &[u8] = b"base file must survive";
+        std::fs::write(&base, original).expect("write base sentinel");
+
+        // Overwrite permission granted, so the alias refusal itself is
+        // what stops the run (without it the existing base is refused as an
+        // existing output first).
+        let error = merge(
+            &base,
+            &osc,
+            crate::output::Output::new(
+                &base,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
+            &MergeOptions::default(),
+            &HeaderOverrides::default(),
+            &crate::host::Host::entered_for_tests(),
+        )
+        .err()
+        .expect("the base input must not also be the output");
+
+        assert!(
+            error.to_string().contains("aliases base input"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&base).expect("read base sentinel").as_slice(),
+            original
+        );
+    }
+}

@@ -14,7 +14,7 @@ actually emitted. Enforce via a shared RAII primitive plus a
 counter-ordering rule. No hot-path cost; every future command with
 scratch inherits the pattern by following the checklist below.
 
-**Primitive:** `src/path_guard.rs::PathGuard`. Wraps a `PathBuf` and
+**Primitive:** `crates/lib/src/path_guard.rs::PathGuard`. Wraps a `PathBuf` and
 removes the pointed-at file or directory on Drop, unless `commit()`
 was called first. Separate constructors for files
 (`PathGuard::file` -> `remove_file` on drop) and directories

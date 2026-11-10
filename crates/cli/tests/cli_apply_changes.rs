@@ -1,0 +1,3869 @@
+//! CLI-driven integration tests for `pbfhogg apply-changes` (merge).
+//!
+//! Replaces the removed library-API `merge.rs` test. Fixture PBFs are written via the
+//! stable-allowlist writers (`write_test_pbf_sorted`,
+//! `write_multi_block_test_pbf`, plus inline `BlockBuilder` helpers
+//! for tests that need explicit metadata / multi-block layouts /
+//! LocationsOnWays); `apply-changes` runs through `CliInvoker`;
+//! output is verified by reading the resulting PBF with the
+//! stable-allowlist readers. No imports from
+//! `pbfhogg::apply_changes::*` - a rewrite of
+//! `crates/lib/src/commands/apply_changes/` cannot break these tests by type
+//! changes alone.
+//!
+//! Apply-changes is a high-traffic rewrite surface. The
+//! descriptor-first streaming rewrite (landed 2026-04) moved large
+//! parts of the internal API around; the CLI surface (`pbfhogg apply-changes
+//! <base> <changes> -o <output> [--locations-on-ways] [-j N]
+//! [--direct-io] [--io-uring] [--force]`) is the only thing this file
+//! pins.
+//!
+//! Per-test stats assertions on `MergeStats` counters survive via
+//! stderr substring matching against `MergeStats::write_summary`.
+//! Where a stats assertion is redundant with an element-set
+//! assertion it is dropped.
+//!
+//! Cross-validation against osmium on real data is `brokkr verify
+//! merge`, not a test here.
+
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::too_many_lines)]
+
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+
+use crate::common::{
+    TestMember, TestNode, TestRelation, TestWay, node_ids_with_coords as node_ids,
+    read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,
+    way_ids_with_coords as way_ids, write_test_pbf_sorted,
+};
+use crate::invoker::{CliInvoker, CliOutput};
+use flate2::write::GzEncoder;
+use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::writer::{Compression, PbfWriter};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn write_osc(path: &Path, xml: &str) {
+    let file = File::create(path).expect("create osc file");
+    let mut enc = GzEncoder::new(file, flate2::Compression::fast());
+    enc.write_all(xml.as_bytes()).expect("write xml");
+    enc.finish().expect("finish gz");
+}
+
+pub(crate) const CRUD_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="4" lat="55.0" lon="12.0" version="1">
+      <tag k="name" v="four"/>
+    </node>
+  </create>
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="2">
+      <tag k="name" v="two-modified"/>
+    </node>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#;
+
+pub(crate) fn write_crud_base(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "one")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![("name", "two")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 500_000_000,
+                lon: 600_000_000,
+                tags: vec![("name", "three")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2, 3],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
+}
+
+#[derive(Default, Clone, Copy)]
+struct ApplyOpts {
+    locations_on_ways: bool,
+    ignore_missing_nodes: bool,
+    jobs: Option<usize>,
+    direct_io: bool,
+    io_uring: bool,
+}
+
+fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(base)
+        .arg(osc)
+        .arg("-o")
+        .arg(output)
+        // Several tests run more than one apply against one output path;
+        // the replacement itself is not what they test.
+        .arg("--overwrite");
+    if opts.locations_on_ways {
+        cli = cli.arg("--locations-on-ways");
+    }
+    if opts.ignore_missing_nodes {
+        cli = cli.arg("--ignore-missing-nodes");
+    }
+    if let Some(j) = opts.jobs {
+        cli = cli.arg("-j").arg(j.to_string());
+    }
+    if opts.direct_io {
+        cli = cli.arg("--direct-io");
+    }
+    if opts.io_uring {
+        cli = cli.arg("--io-uring");
+    }
+    // `--locations-on-ways` needs an indexed base whatever `--force` says,
+    // so it refuses the flag.
+    if !opts.locations_on_ways {
+        cli = cli.arg("--force");
+    }
+    cli.run()
+}
+
+fn run_apply_ok(base: &Path, osc: &Path, output: &Path) -> CliOutput {
+    let out = run_apply_changes(base, osc, output, ApplyOpts::default());
+    assert!(
+        out.status.success(),
+        "apply-changes failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Basic CRUD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_basic_create_modify_delete() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_crud_base(&base);
+    write_osc(&osc, CRUD_OSC);
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 2, 4]);
+    assert_eq!(c.nodes[0].1, 100_000_000);
+    assert_eq!(c.nodes[0].2, 200_000_000);
+    assert_eq!(c.nodes[0].3, vec![("name".to_string(), "one".to_string())]);
+    assert_eq!(c.nodes[1].1, 350_000_000);
+    assert_eq!(c.nodes[1].2, 450_000_000);
+    assert_eq!(
+        c.nodes[1].3,
+        vec![("name".to_string(), "two-modified".to_string())]
+    );
+    assert_eq!(c.nodes[2].1, 550_000_000);
+    assert_eq!(c.nodes[2].2, 120_000_000);
+    assert_eq!(c.nodes[2].3, vec![("name".to_string(), "four".to_string())]);
+
+    assert_eq!(way_ids(&c), vec![10]);
+    assert_eq!(c.ways[0].1, vec![1, 2]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "primary".to_string())]
+    );
+
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert_eq!(
+        c.relations[0].2,
+        vec![("type".to_string(), "multipolygon".to_string())]
+    );
+
+    assert!(
+        out.stderr_str().contains("Deleted: 1"),
+        "stats line missing 'Deleted: 1'; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn merge_create_between_existing_ids() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 10,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 20,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 30,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="15" lat="1.0" lon="2.0" version="1"/>
+    <node id="25" lat="3.0" lon="4.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    let ids = node_ids(&c);
+    assert_eq!(ids.len(), 5);
+    assert!(ids.contains(&10));
+    assert!(ids.contains(&15));
+    assert!(ids.contains(&20));
+    assert!(ids.contains(&25));
+    assert!(ids.contains(&30));
+}
+
+#[test]
+fn merge_create_beyond_max_id() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="100" lat="10.0" lon="20.0" version="1">
+      <tag k="name" v="far"/>
+    </node>
+    <node id="200" lat="30.0" lon="40.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 2, 3, 100, 200]);
+    assert_eq!(c.nodes[3].3, vec![("name".to_string(), "far".to_string())]);
+}
+
+/// Multi-block base PBF where the diff only affects the middle block.
+/// Exercises block 1 passthrough, block 2 rewritten, block 3 passthrough.
+#[test]
+fn merge_multi_block_partial_rewrite() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    {
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(1, 100_000_000, 100_000_000, [("block", "1")], None);
+        bb.add_node(
+            2,
+            200_000_000,
+            200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            3,
+            300_000_000,
+            300_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_node(10, 100_000_000, 100_000_000, [("name", "old")], None);
+        bb.add_node(
+            11,
+            110_000_000,
+            110_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            12,
+            120_000_000,
+            120_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_node(20, 200_000_000, 200_000_000, [("block", "3")], None);
+        bb.add_node(
+            21,
+            210_000_000,
+            210_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            22,
+            220_000_000,
+            220_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        writer.flush().expect("flush");
+    }
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="10" lat="89.0" lon="99.0" version="2">
+      <tag k="name" v="new"/>
+    </node>
+  </modify>
+  <delete>
+    <node id="11" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(
+        c.nodes[0],
+        (
+            1,
+            100_000_000,
+            100_000_000,
+            vec![("block".to_string(), "1".to_string())]
+        )
+    );
+    assert_eq!(c.nodes[1].0, 2);
+    assert_eq!(c.nodes[2].0, 3);
+    assert_eq!(c.nodes[3].0, 10);
+    // 89 degrees, not 99: a latitude past 90 is not a place, and the OSC
+    // parser now refuses it rather than storing it as an ordinary node.
+    assert_eq!(c.nodes[3].1, 890_000_000);
+    assert_eq!(c.nodes[3].3, vec![("name".to_string(), "new".to_string())]);
+    assert_eq!(c.nodes[4].0, 12);
+    assert_eq!(
+        c.nodes[5],
+        (
+            20,
+            200_000_000,
+            200_000_000,
+            vec![("block".to_string(), "3".to_string())]
+        )
+    );
+    assert_eq!(c.nodes[6].0, 21);
+    assert_eq!(c.nodes[7].0, 22);
+    assert_eq!(c.nodes.len(), 8);
+
+    let stderr = out.stderr_str();
+    assert!(stderr.contains("Deleted: 1"), "stats: {stderr}");
+    // "1 rewritten" appears in the Blobs line; blocks 1 and 3 land
+    // in the "passthrough" count.
+    assert!(stderr.contains("1 rewritten"), "stats: {stderr}");
+}
+
+#[test]
+fn merge_nodes_only_diff_ways_passthrough() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![("old", "tag")],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2, 3],
+                tags: vec![("highway", "path")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![3, 2, 1],
+                tags: vec![("building", "yes")],
+                meta: None,
+            },
+        ],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="11.0" lon="22.0" version="2">
+      <tag k="new" v="tag"/>
+    </node>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(c.nodes[1].0, 2);
+    assert_eq!(c.nodes[1].1, 110_000_000);
+    assert_eq!(c.nodes[1].3, vec![("new".to_string(), "tag".to_string())]);
+    assert_eq!(way_ids(&c), vec![10, 20]);
+    assert_eq!(c.ways[0].1, vec![1, 2, 3]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "path".to_string())]
+    );
+    assert_eq!(c.ways[1].1, vec![3, 2, 1]);
+    assert_eq!(
+        c.ways[1].2,
+        vec![("building".to_string(), "yes".to_string())]
+    );
+}
+
+#[test]
+fn merge_ways_only_diff() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("highway", "road")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![2, 1],
+                tags: vec![("name", "delete me")],
+                meta: None,
+            },
+            TestWay {
+                id: 30,
+                refs: vec![1, 2, 1],
+                tags: vec![("building", "yes")],
+                meta: None,
+            },
+        ],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <way id="15" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="new" v="way"/>
+    </way>
+  </create>
+  <delete>
+    <way id="20" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 2]);
+    assert_eq!(way_ids(&c), vec![10, 15, 30]);
+    assert_eq!(
+        c.ways[0].2,
+        vec![("highway".to_string(), "road".to_string())]
+    );
+    assert_eq!(c.ways[1].2, vec![("new".to_string(), "way".to_string())]);
+    assert_eq!(
+        c.ways[2].2,
+        vec![("building".to_string(), "yes".to_string())]
+    );
+}
+
+#[test]
+fn merge_relations_only_diff() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 10,
+            refs: vec![1],
+            tags: vec![],
+            meta: None,
+        }],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            },
+            TestRelation {
+                id: 200,
+                members: vec![TestMember {
+                    id: MemberId::Node(1),
+                    role: "stop",
+                }],
+                tags: vec![("type", "route")],
+                meta: None,
+            },
+        ],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <relation id="150" version="1">
+      <member type="way" ref="10" role="inner"/>
+      <tag k="type" v="boundary"/>
+    </relation>
+  </create>
+  <modify>
+    <relation id="200" version="2">
+      <member type="node" ref="1" role="platform"/>
+      <member type="way" ref="10" role=""/>
+      <tag k="type" v="public_transport"/>
+    </relation>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1]);
+    assert_eq!(way_ids(&c), vec![10]);
+    assert_eq!(relation_ids(&c), vec![100, 150, 200]);
+    assert_eq!(
+        c.relations[0].2,
+        vec![("type".to_string(), "multipolygon".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].1,
+        vec![(10, "way".to_string(), "inner".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].2,
+        vec![("type".to_string(), "boundary".to_string())]
+    );
+    assert_eq!(c.relations[2].1.len(), 2);
+    assert_eq!(
+        c.relations[2].1[0],
+        (1, "node".to_string(), "platform".to_string())
+    );
+    assert_eq!(c.relations[2].1[1], (10, "way".to_string(), String::new()));
+    assert_eq!(
+        c.relations[2].2,
+        vec![("type".to_string(), "public_transport".to_string())]
+    );
+}
+
+#[test]
+fn merge_all_types() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 10,
+                refs: vec![1, 2],
+                tags: vec![("delete", "me")],
+                meta: None,
+            },
+            TestWay {
+                id: 20,
+                refs: vec![2, 1],
+                tags: vec![("keep", "me")],
+                meta: None,
+            },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
+                tags: vec![("old", "tags")],
+                meta: None,
+            },
+            TestRelation {
+                id: 200,
+                members: vec![],
+                tags: vec![("type", "site")],
+                meta: None,
+            },
+        ],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="3" lat="1.0" lon="2.0" version="1">
+      <tag k="new" v="node"/>
+    </node>
+  </create>
+  <delete>
+    <way id="10" version="2"/>
+  </delete>
+  <modify>
+    <relation id="200" version="2">
+      <member type="node" ref="3" role="label"/>
+      <tag k="type" v="site"/>
+      <tag k="name" v="updated"/>
+    </relation>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+    assert_eq!(way_ids(&c), vec![20]);
+    assert_eq!(relation_ids(&c), vec![100, 200]);
+    assert_eq!(c.nodes[2].3, vec![("new".to_string(), "node".to_string())]);
+    assert_eq!(c.ways[0].2, vec![("keep".to_string(), "me".to_string())]);
+    assert_eq!(
+        c.relations[0].2,
+        vec![("old".to_string(), "tags".to_string())]
+    );
+    assert_eq!(
+        c.relations[1].1,
+        vec![(3, "node".to_string(), "label".to_string())]
+    );
+    assert!(
+        c.relations[1]
+            .2
+            .contains(&("name".to_string(), "updated".to_string()))
+    );
+}
+
+/// Diff deletes every element in a block. The rewrite should produce
+/// no output for that block.
+#[test]
+fn merge_delete_entire_block() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    {
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(
+            1,
+            100_000_000,
+            100_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            2,
+            200_000_000,
+            200_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        bb.add_node(
+            3,
+            300_000_000,
+            300_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_node(10, 100_000_000, 100_000_000, [("survivor", "yes")], None);
+        bb.add_node(
+            11,
+            110_000_000,
+            110_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_way(100, [("highway", "path")], &[10, 11], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        writer.flush().expect("flush");
+    }
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete>
+    <node id="1" version="2"/>
+    <node id="2" version="2"/>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![10, 11]);
+    assert_eq!(
+        c.nodes[0].3,
+        vec![("survivor".to_string(), "yes".to_string())]
+    );
+    assert_eq!(way_ids(&c), vec![100]);
+    assert_eq!(c.ways[0].1, vec![10, 11]);
+    assert!(
+        out.stderr_str().contains("Deleted: 3"),
+        "stats: {}",
+        out.stderr_str(),
+    );
+}
+
+/// A blob the diff deletes whole, rewritten on the same worker as the next
+/// touched blob, must not leave its string table behind for that blob.
+///
+/// The fully deleted blob's rewrite adds no element, so its final flush
+/// encodes nothing; the builder still held that blob's pre-seeded table
+/// when the next rewrite on the worker pre-seeded its own, and the second
+/// table was appended behind the first: every copied string index of the
+/// next blob then named the deleted blob's strings. One worker forces both
+/// blobs onto the same builder.
+#[test]
+fn merge_delete_entire_block_keeps_the_next_rewrites_strings() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    {
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(1, 100_000_000, 100_000_000, [("gone", "one")], None);
+        bb.add_node(2, 200_000_000, 200_000_000, [("gone", "two")], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        bb.add_node(10, 100_000_000, 100_000_000, [("survivor", "yes")], None);
+        bb.add_node(11, 110_000_000, 110_000_000, [("edited", "no")], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+
+        writer.flush().expect("flush");
+    }
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="11" lat="11.0" lon="11.0" version="2">
+      <tag k="edited" v="yes"/>
+    </node>
+  </modify>
+  <delete>
+    <node id="1" version="2"/>
+    <node id="2" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            jobs: Some(1),
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        out.status.success(),
+        "apply-changes failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![10, 11]);
+    assert_eq!(
+        c.nodes[0].3,
+        vec![("survivor".to_string(), "yes".to_string())]
+    );
+    assert_eq!(
+        c.nodes[1].3,
+        vec![("edited".to_string(), "yes".to_string())]
+    );
+}
+
+#[test]
+fn merge_stats_accuracy() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![],
+            meta: None,
+        }],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="4" lat="1.0" lon="2.0" version="1"/>
+  </create>
+  <modify>
+    <node id="2" lat="5.0" lon="6.0" version="2"/>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="4"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let stderr = out.stderr_str();
+    // Format: "  Base: {nodes} nodes, {ways} ways, {relations} relations"
+    //         "  Diff: {nodes} nodes, {ways} ways, {relations} relations"
+    //         "  Deleted: {N}"
+    assert!(
+        stderr.contains("Base: 1 nodes, 0 ways, 1 relations"),
+        "stats: {stderr}"
+    );
+    assert!(
+        stderr.contains("Diff: 2 nodes, 1 ways, 0 relations"),
+        "stats: {stderr}"
+    );
+    assert!(stderr.contains("Deleted: 1"), "stats: {stderr}");
+}
+
+/// Metadata (version/timestamp/changeset/uid/user) from base PBF nodes
+/// survives a merge, and OSC replacements carry the metadata attributes
+/// from the OSC element (node 2's `version="4"` below).
+///
+/// Partial OSC metadata must retain absence rather than fabricate zeros.
+#[test]
+fn merge_metadata_preservation() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    {
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(
+            1,
+            100_000_000,
+            200_000_000,
+            [("name", "one")],
+            Some(&block_builder::Metadata {
+                version: 5,
+                timestamp: 1_700_000_000,
+                changeset: 12345,
+                uid: 42,
+                user: "mapper",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            2,
+            300_000_000,
+            400_000_000,
+            [("name", "two")],
+            Some(&block_builder::Metadata {
+                version: 3,
+                timestamp: 1_600_000_000,
+                changeset: 67890,
+                uid: 7,
+                user: "editor",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            3,
+            500_000_000,
+            600_000_000,
+            [("name", "three")],
+            Some(&block_builder::Metadata {
+                version: 1,
+                timestamp: 1_500_000_000,
+                changeset: 11111,
+                uid: 99,
+                user: "creator",
+                visible: true,
+            }),
+        );
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
+            .expect("write");
+        writer.flush().expect("flush");
+    }
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="4">
+      <tag k="name" v="two-modified"/>
+    </node>
+  </modify>
+</osmChange>"#,
+    );
+
+    run_apply_ok(&base, &osc, &output);
+
+    let reader = BlobReader::from_path(&output).expect("open pbf");
+    let mut node_meta = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info().expect("base node metadata");
+                        node_meta.push((
+                            dn.id(),
+                            Some(info.version()),
+                            Some(info.uid()),
+                            Some(info.changeset()),
+                            Some(info.milli_timestamp() / 1000),
+                        ));
+                    }
+                    Element::Node(node) => {
+                        let info = node.info();
+                        node_meta.push((
+                            node.id(),
+                            info.version(),
+                            info.uid(),
+                            info.changeset(),
+                            info.milli_timestamp().map(|v| v / 1000),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        node_meta,
+        vec![
+            (1, Some(5), Some(42), Some(12345), Some(1_700_000_000)),
+            (2, Some(4), None, None, None),
+            (3, Some(1), Some(99), Some(11111), Some(1_500_000_000)),
+        ]
+    );
+}
+
+/// A later diff must re-encode a surviving partial plain node without
+/// inventing metadata or losing its tags when the dense run closes.
+#[test]
+fn chained_apply_preserves_partial_node_metadata() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let first = dir.path().join("first.osm.pbf");
+    let second = dir.path().join("second.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let nodes: Vec<_> = (1..=3)
+        .map(|id| TestNode {
+            id,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "base")],
+            meta: None,
+        })
+        .collect();
+    write_test_pbf_sorted(&base, &nodes, &[], &[]);
+    write_osc(
+        &osc,
+        r#"<osmChange version="0.6"><modify>
+<node id="2" lat="35" lon="45" version="4"><tag k="name" v="partial"/></node>
+</modify></osmChange>"#,
+    );
+    run_apply_ok(&base, &osc, &first);
+
+    // Node 1 shares the first output's blob with node 2. Editing it
+    // prevents passthrough from hiding a broken plain-node rewrite.
+    write_osc(
+        &osc,
+        r#"<osmChange version="0.6"><modify>
+<node id="1" lat="11" lon="21"><tag k="name" v="changed"/></node>
+</modify></osmChange>"#,
+    );
+    run_apply_ok(&first, &osc, &second);
+
+    for path in [&first, &second] {
+        let mut ids = Vec::new();
+        let mut data_blocks = 0;
+        let mut partial_count = 0;
+        for blob in BlobReader::from_path(path).expect("open output") {
+            if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+                data_blocks += 1;
+                for element in block.elements() {
+                    match element {
+                        Element::DenseNode(node) => ids.push(node.id()),
+                        Element::Node(node) => {
+                            ids.push(node.id());
+                            partial_count += 1;
+                            assert_eq!(node.id(), 2);
+                            assert_eq!((node.lat(), node.lon()), (35.0, 45.0));
+                            assert_eq!(node.tags().collect::<Vec<_>>(), vec![("name", "partial")]);
+                            let info = node.info();
+                            assert_eq!(info.version(), Some(4));
+                            assert_eq!(info.milli_timestamp(), None);
+                            assert_eq!(info.changeset(), None);
+                            assert_eq!(info.uid(), None);
+                            assert!(info.user().is_none());
+                            assert!(info.visible());
+                        }
+                        _ => panic!("unexpected non-node"),
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            data_blocks, 1,
+            "the second diff must touch the partial node's blob"
+        );
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(partial_count, 1);
+    }
+    let elements = read_all_elements(&second);
+    assert_eq!(
+        elements.nodes,
+        vec![
+            (
+                1,
+                110_000_000,
+                210_000_000,
+                vec![("name".into(), "changed".into())]
+            ),
+            (
+                2,
+                350_000_000,
+                450_000_000,
+                vec![("name".into(), "partial".into())]
+            ),
+            (
+                3,
+                100_000_000,
+                200_000_000,
+                vec![("name".into(), "base".into())]
+            ),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LocationsOnWays
+// ---------------------------------------------------------------------------
+
+/// Helper: write a PBF with LocationsOnWays header feature and sorted
+/// flag. Ways are written with inline node coordinates via
+/// `add_way_with_locations`.
+#[allow(clippy::type_complexity)]
+fn write_test_pbf_with_locations(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[(i64, Vec<i64>, Vec<(i32, i32)>, Vec<(&str, &str)>)],
+    relations: &[TestRelation],
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for &(id, ref refs, ref locations, ref tags) in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let tag_refs: Vec<(&str, &str)> = tags.iter().map(|&(k, v)| (k, v)).collect();
+        bb.add_way_with_locations(id, tag_refs.iter().copied(), refs, locations, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<block_builder::MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| block_builder::MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut result = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    result.push((w.id(), locs));
+                }
+            }
+        }
+    }
+    result
+}
+
+#[test]
+fn merge_locations_on_ways_basic() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 500_000_000,
+                lon: 600_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            (
+                10,
+                vec![1, 2],
+                vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+                vec![("highway", "road")],
+            ),
+            (
+                20,
+                vec![2, 3],
+                vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)],
+                vec![("highway", "path")],
+            ),
+        ],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="3"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <create>
+    <way id="30" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <nd ref="3"/>
+      <tag k="highway" v="footway"/>
+    </way>
+  </create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        out.status.success(),
+        "apply-changes --locations-on-ways failed; stderr:\n{}",
+        out.stderr_str(),
+    );
+
+    let stderr = out.stderr_str();
+    assert!(stderr.contains("nodes needed"), "loc stats: {stderr}");
+    assert!(stderr.contains("0 missing"), "loc stats: {stderr}");
+    // One node blob and one (rewritten) way blob: only the node blob is
+    // scanned for coordinates. This counter used to report every blob a
+    // worker touched, of any kind.
+    assert!(
+        stderr.contains(" 1 node blobs scanned"),
+        "loc stats: {stderr}"
+    );
+
+    let header = crate::common::read_header(&output);
+    assert!(
+        header.has_locations_on_ways(),
+        "output must have LocationsOnWays"
+    );
+
+    let locs = read_way_locations(&output);
+    assert_eq!(locs.len(), 3);
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (500_000_000, 600_000_000)]
+    );
+    let way20 = locs.iter().find(|(id, _)| *id == 20).expect("way 20");
+    assert_eq!(
+        way20.1,
+        vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)]
+    );
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(
+        way30.1,
+        vec![
+            (100_000_000, 200_000_000),
+            (300_000_000, 400_000_000),
+            (500_000_000, 600_000_000)
+        ]
+    );
+}
+
+#[test]
+fn merge_locations_on_ways_osc_node_coords() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+            vec![],
+        )],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="55.0" lon="12.0" version="2"/>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    let locs = read_way_locations(&output);
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (550_000_000, 120_000_000)]
+    );
+}
+
+#[test]
+fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"><create><way id="10" version="1"><nd ref="999"/></way></create></osmChange>"#,
+    );
+
+    let rejected = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    rejected.assert_stderr_contains("could not be resolved for 1 distinct nodes");
+    rejected.assert_stderr_contains("--keep-untagged-nodes");
+    rejected.assert_stderr_contains("--ignore-missing-nodes");
+    assert!(
+        !output.exists(),
+        "guarded output must discard the failed merge"
+    );
+
+    let accepted = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ignore_missing_nodes: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        accepted.status.success(),
+        "stderr:\n{}",
+        accepted.stderr_str()
+    );
+    let locations = read_way_locations(&output);
+    let way = locations.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(way.1, vec![(0, 0)]);
+}
+
+/// A duplicate node record in the base must not conceal a genuinely
+/// missing one.
+///
+/// The guard above compares "required" against "resolved". Resolution used
+/// to be counted per extracted tuple, and the per-worker coordinate map is
+/// keyed by id - so a base carrying node 1 twice contributed two to the
+/// count while adding one key. Two required ids, one of them absent, and
+/// the arithmetic balanced: the guard passed and the missing node silently
+/// took the (0,0) fallback that `--ignore-missing-nodes` is supposed to be
+/// the only way to get.
+///
+/// The fixture therefore needs BOTH a duplicated present id and a genuinely
+/// absent one; either alone leaves the counting bug invisible.
+#[test]
+fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let dup = || TestNode {
+        id: 1,
+        lat: 100_000_000,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_with_locations(
+        &base,
+        &[dup(), dup()],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"><create><way id="10" version="1"><nd ref="1"/><nd ref="999"/></way></create></osmChange>"#,
+    );
+
+    let rejected = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "the duplicate record must not pay for node 999. stderr:\n{}",
+        rejected.stderr_str()
+    );
+    rejected.assert_stderr_contains("could not be resolved for 1 distinct nodes");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+/// Merge with --locations-on-ways requires LocationsOnWays in base PBF.
+#[test]
+fn merge_locations_on_ways_requires_base_feature() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="2" lat="1.0" lon="2.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        !out.status.success(),
+        "should fail without LocationsOnWays in base; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("LocationsOnWays"),
+        "error should mention LocationsOnWays; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        #[allow(clippy::cast_possible_truncation)]
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn pb_len_delimited(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+    pb_varint(u64::from((field << 3) | 2), out);
+    pb_varint(payload.len() as u64, out);
+    out.extend_from_slice(payload);
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn pb_sint(field: u32, value: i64, out: &mut Vec<u8>) {
+    pb_varint(u64::from(field << 3), out);
+    pb_varint(((value << 1) ^ (value >> 63)) as u64, out);
+}
+
+/// A serialized PrimitiveBlock holding one group of plain (non-dense)
+/// `Node` messages, `(id, lat, lon)` in decimicrodegrees (the default
+/// granularity of 100 nanodegrees makes the raw value the decimicro value).
+/// `BlockBuilder` only writes DenseNodes, so this is built by hand.
+fn plain_node_block(nodes: &[(i64, i64, i64)]) -> Vec<u8> {
+    let mut group = Vec::new();
+    for &(id, lat, lon) in nodes {
+        let mut node = Vec::new();
+        pb_sint(1, id, &mut node);
+        pb_sint(8, lat, &mut node);
+        pb_sint(9, lon, &mut node);
+        pb_len_delimited(1, &node, &mut group);
+    }
+    let mut block = Vec::new();
+    // String table with the mandatory empty entry 0.
+    pb_len_delimited(1, &[0x0A, 0x00], &mut block);
+    pb_len_delimited(2, &group, &mut block);
+    block
+}
+
+/// A sorted LocationsOnWays PBF whose node blob is `node_block` (raw
+/// PrimitiveBlock bytes) and whose ways are one BlockBuilder blob, written
+/// with or without indexdata.
+#[allow(clippy::type_complexity)]
+fn write_low_pbf_raw_nodes(
+    path: &Path,
+    node_block: &[u8],
+    ways: &[(i64, Vec<i64>, Vec<(i32, i32)>)],
+    index_way_blob: bool,
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    writer.write_primitive_block(node_block).expect("node blob");
+
+    let mut bb = BlockBuilder::new();
+    for (id, refs, locations) in ways {
+        bb.add_way_with_locations(*id, std::iter::empty(), refs, locations, None);
+    }
+    let bytes = bb.take().expect("take").expect("way block");
+    if index_way_blob {
+        writer.write_primitive_block(bytes).expect("way blob");
+    } else {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("way blob");
+    }
+    writer.flush().expect("flush");
+}
+
+const LOW_WAY_EDIT_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+  <create>
+    <way id="30" version="1"><nd ref="2"/></way>
+  </create>
+</osmChange>"#;
+
+fn low_opts() -> ApplyOpts {
+    ApplyOpts {
+        locations_on_ways: true,
+        ..ApplyOpts::default()
+    }
+}
+
+/// Plain (non-dense) `Node` messages are a legal node encoding. Under
+/// --locations-on-ways their coordinates used to be dropped wholesale: the
+/// dense-only extractor rejected the blob and the error was swallowed, so
+/// the run failed later with a cause-less "N referenced node(s) could not
+/// be resolved".
+#[test]
+fn merge_locations_on_ways_resolves_plain_node_messages() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_low_pbf_raw_nodes(
+        &base,
+        &plain_node_block(&[
+            (1, 100_000_000, 200_000_000),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+        ]),
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+        )],
+        true,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("0 missing");
+
+    let locs = read_way_locations(&output);
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(
+        way10.1,
+        vec![(100_000_000, 200_000_000), (500_000_000, 600_000_000)]
+    );
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(way30.1, vec![(300_000_000, 400_000_000)]);
+}
+
+/// A node coordinate that cannot be decoded is a hard error naming the
+/// blob, not a silently empty coordinate table. It also must not hang:
+/// under --locations-on-ways a node blob that never reaches the drain
+/// used to leave the node-to-way barrier unfired forever.
+#[test]
+fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_low_pbf_raw_nodes(
+        &base,
+        // Node 4 is referenced by no way: validation must not depend on
+        // whether a node is needed.
+        &plain_node_block(&[
+            (1, 100_000_000, 200_000_000),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+            (4, i64::from(i32::MAX) + 1, 0),
+        ]),
+        &[(10, vec![1, 3], vec![(0, 0), (0, 0)])],
+        true,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("apply-changes: base blob");
+    // The location is the walker's true blob ordinal (the header is blob 0),
+    // not the pipeline's data-blob sequence number.
+    out.assert_stderr_contains("base.osm.pbf, blob 1, at byte offset");
+    out.assert_stderr_contains("does not fit in an i32");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+/// A base node an OSC way references becomes an inline way location, so
+/// under --locations-on-ways it must lie in the geographic domain, the rule
+/// add-locations-to-ways applies to the nodes it joins. Only joined nodes
+/// are judged: an unreferenced out-of-domain node passes through, and an
+/// OSC coordinate that replaces an out-of-domain base node is used.
+#[test]
+fn merge_locations_on_ways_refuses_a_joined_node_outside_the_domain() {
+    let dir = crate::common::test_scratch();
+    let osc = dir.path().join("diff.osc.gz");
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+    let ways = [(
+        10,
+        vec![1, 2],
+        vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+    )];
+    let run = |name: &str, nodes: &[(i64, i64, i64)], osc: &Path| {
+        let base = dir.path().join(format!("{name}.osm.pbf"));
+        let output = dir.path().join(format!("{name}-out.osm.pbf"));
+        write_low_pbf_raw_nodes(&base, &plain_node_block(nodes), &ways, true);
+        (run_apply_changes(&base, osc, &output, low_opts()), output)
+    };
+
+    // Way 30 joins node 2, one decimicrodegree past 90 degrees latitude
+    // (and, separately, past 180 degrees longitude).
+    for bad in [(2, 900_000_001, 0), (2, 0, -1_800_000_001)] {
+        let (out, output) = run(
+            "joined",
+            &[(1, 0, 0), bad, (3, 500_000_000, 600_000_000)],
+            &osc,
+        );
+        assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+        out.assert_stderr_contains("node 2 has coordinates outside the geographic domain");
+        assert!(!output.exists(), "failed merge must leave no output");
+    }
+
+    // Node 4 is out of domain but referenced by no way: accepted.
+    let (out, _) = run(
+        "unreferenced",
+        &[
+            (1, 0, 0),
+            (2, 300_000_000, 400_000_000),
+            (3, 500_000_000, 600_000_000),
+            (4, 900_000_001, 0),
+        ],
+        &osc,
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    // The OSC moves the out-of-domain node 2 back into the domain: the
+    // join takes the OSC coordinate and never sees the base one.
+    let moved = dir.path().join("moved.osc.gz");
+    write_osc(
+        &moved,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" version="2" lat="1.5" lon="2.5"/>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+  <create>
+    <way id="30" version="1"><nd ref="2"/></way>
+  </create>
+</osmChange>"#,
+    );
+    let (out, output) = run(
+        "moved",
+        &[
+            (1, 0, 0),
+            (2, 900_000_001, 0),
+            (3, 500_000_000, 600_000_000),
+        ],
+        &moved,
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let locs = read_way_locations(&output);
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(way30.1, vec![(15_000_000, 25_000_000)]);
+}
+
+/// A base whose way blob lacks indexdata while its node blob carries it is
+/// partially indexed, and the scanner's header walk refuses it at the way
+/// blob. Without that refusal the scanner would route the unindexed way blob
+/// with the node blobs, ahead of the node-to-way barrier, where the rewrite
+/// used to write every way in it without coordinates under a header that
+/// still claims LocationsOnWays (the worker now refuses that too, as a
+/// backstop this fixture can no longer reach).
+#[test]
+fn merge_locations_on_ways_refuses_a_partially_indexed_base() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut nodes = BlockBuilder::new();
+    nodes.add_node(1, 100_000_000, 200_000_000, std::iter::empty(), None);
+    nodes.add_node(2, 300_000_000, 400_000_000, std::iter::empty(), None);
+    nodes.add_node(3, 500_000_000, 600_000_000, std::iter::empty(), None);
+    let node_block = nodes.take().expect("take").expect("node block").to_vec();
+
+    write_low_pbf_raw_nodes(
+        &base,
+        &node_block,
+        &[
+            (
+                10,
+                vec![1, 2],
+                vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)],
+            ),
+            (
+                20,
+                vec![2, 3],
+                vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)],
+            ),
+        ],
+        false,
+    );
+    write_osc(&osc, LOW_WAY_EDIT_OSC);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a partially indexed base must be refused; stderr:\n{}",
+        out.stderr_str()
+    );
+    out.assert_stderr_contains("the file is partially indexed");
+    // Located at the way blob: the header is blob 0, the node blob blob 1.
+    out.assert_stderr_contains("base.osm.pbf, blob 2, at byte offset");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+/// A way referencing a node the same diff deletes has an unresolved
+/// reference: the node is gone from the output. Its pre-deletion base
+/// coordinates used to satisfy the missing-node guard.
+#[test]
+fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[(1, vec![1], vec![(100_000_000, 200_000_000)], vec![])],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="2" version="2"/></delete>
+  <create><way id="10" version="1"><nd ref="1"/><nd ref="2"/></way></create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("could not be resolved for 1 distinct nodes");
+    // The library names no flag; the CLI adds the switch that allows it.
+    out.assert_stderr_contains("--ignore-missing-nodes");
+    assert!(!output.exists(), "failed merge must leave no output");
+}
+
+// ---------------------------------------------------------------------------
+// LocationsOnWays: refreshing surviving base ways
+// ---------------------------------------------------------------------------
+//
+// An OSC that moves a node without touching the ways using it must still
+// refresh those ways' inline coordinates, whether their blob is passed
+// through (its range misses the diff) or rewritten for other edits.
+
+type LowWay = (i64, Vec<i64>, Vec<(i32, i32)>);
+
+/// A sorted LocationsOnWays base: one node blob, then one way blob per entry
+/// of `way_blobs`, so each group's range is its own blob's.
+fn write_low_blobs(path: &Path, nodes: &[(i64, i32, i32)], way_blobs: &[Vec<LowWay>]) {
+    let mut blocks = Vec::new();
+    for blob in way_blobs {
+        let mut bb = BlockBuilder::new();
+        for (id, refs, coords) in blob {
+            bb.add_way_with_locations(*id, [("highway", "path")], refs, coords, None);
+        }
+        blocks.push(bb.take().expect("take").expect("way block").to_vec());
+    }
+    write_low_raw_way_blocks(path, nodes, &blocks);
+}
+
+/// Like [`write_low_blobs`], with the way blobs (and any relation blobs
+/// after them) given as serialized PrimitiveBlocks.
+fn write_low_raw_way_blocks(path: &Path, nodes: &[(i64, i32, i32)], way_blocks: &[Vec<u8>]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    if !nodes.is_empty() {
+        let mut bb = BlockBuilder::new();
+        for &(id, lat, lon) in nodes {
+            bb.add_node(id, lat, lon, std::iter::empty(), None);
+        }
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("node block"))
+            .expect("node blob");
+    }
+    for block in way_blocks {
+        writer.write_primitive_block(block).expect("way blob");
+    }
+    writer.flush().expect("flush");
+}
+
+/// Every blob frame of a PBF, header blob included, as raw bytes.
+fn raw_frames(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read pbf");
+    let mut offsets: Vec<usize> = BlobReader::from_path(path)
+        .expect("open pbf")
+        .map(|blob| {
+            let offset = blob.expect("blob").offset().expect("offset").0;
+            usize::try_from(offset).expect("offset fits usize")
+        })
+        .collect();
+    offsets.push(bytes.len());
+    offsets
+        .windows(2)
+        .map(|w| bytes[w[0]..w[1]].to_vec())
+        .collect()
+}
+
+/// True when `frame` appears byte for byte in the file at `path`: the merge
+/// passed that input blob through untouched.
+fn passed_through(path: &Path, frame: &[u8]) -> bool {
+    std::fs::read(path)
+        .expect("read output")
+        .windows(frame.len())
+        .any(|w| w == frame)
+}
+
+/// `pbfhogg check --locations` on an output: every inline coordinate
+/// agrees with its node record.
+fn assert_locations_check_passes(path: &Path) {
+    let out = CliInvoker::new()
+        .arg("check")
+        .arg("--locations")
+        .arg(path)
+        .run();
+    assert!(
+        out.status.success(),
+        "check --locations failed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str()
+    );
+}
+
+fn way_coords(path: &Path, id: i64) -> Vec<(i32, i32)> {
+    read_way_locations(path)
+        .into_iter()
+        .find(|(way, _)| *way == id)
+        .unwrap_or_else(|| panic!("way {id} missing"))
+        .1
+}
+
+const REFRESH_NODES: [(i64, i32, i32); 4] = [
+    (1, 100_000_000, 200_000_000),
+    (2, 300_000_000, 400_000_000),
+    (3, 500_000_000, 600_000_000),
+    (4, 700_000_000, 800_000_000),
+];
+
+fn at(id: i64) -> (i32, i32) {
+    let (_, lat, lon) = REFRESH_NODES[usize::try_from(id - 1).unwrap()];
+    (lat, lon)
+}
+
+fn honest_way(id: i64, refs: &[i64]) -> LowWay {
+    (id, refs.to_vec(), refs.iter().map(|&r| at(r)).collect())
+}
+
+/// Way blobs: [10, 11] (rewritten when the OSC edits way 11) and [20] and
+/// [30] (their ranges miss every OSC way).
+fn refresh_base(path: &Path) {
+    write_low_blobs(
+        path,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 3]), honest_way(11, &[1, 2])],
+            vec![honest_way(20, &[2, 3, 4, 2])],
+            vec![honest_way(30, &[4])],
+        ],
+    );
+}
+
+/// Node 3 moves and way 11 is edited; ways 10 and 20 use node 3 and are
+/// left alone by the OSC. Way 10 sits in a blob the merge rewrites for way
+/// 11, way 20 in one it would otherwise pass through.
+#[test]
+fn merge_locations_on_ways_refreshes_untouched_ways_on_both_blob_routes() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.2345678" lon="61.8765432" version="2"/>
+    <way id="11" version="2"><nd ref="1"/><nd ref="4"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let frames = raw_frames(&base);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (512_345_678, 618_765_432);
+    assert_eq!(way_coords(&output, 10), vec![at(1), moved]);
+    assert_eq!(way_coords(&output, 11), vec![at(1), at(4)]);
+    assert_eq!(way_coords(&output, 20), vec![at(2), moved, at(4), at(2)]);
+    assert_eq!(way_coords(&output, 30), vec![at(4)]);
+    assert_locations_check_passes(&output);
+
+    // Way 30's blob holds no stale way: still passed through untouched.
+    assert!(
+        passed_through(&output, &frames[4]),
+        "way 30's blob was rewritten"
+    );
+    assert!(
+        !passed_through(&output, &frames[3]),
+        "way 20's blob was not refreshed"
+    );
+    out.assert_stderr_contains("Inline locations refreshed: 2 refs in 2 ways");
+    out.assert_stderr_contains("2 way blobs scanned, 1 rewritten only for this");
+}
+
+/// A tag-only node edit moves nothing: the way blob using the node is still
+/// passed through byte for byte.
+#[test]
+fn merge_locations_on_ways_tag_only_node_edit_keeps_the_splice() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="50.0" lon="60.0" version="2"><tag k="name" v="x"/></node>
+  </modify>
+</osmChange>"#,
+    );
+    let frames = raw_frames(&base);
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    for (blob, frame) in frames.iter().enumerate().skip(2) {
+        assert!(
+            passed_through(&output, frame),
+            "way blob {blob} was rewritten"
+        );
+    }
+    out.assert_stderr_contains("Inline locations refreshed: 0 refs in 0 ways");
+    assert_locations_check_passes(&output);
+}
+
+/// A base without the moved node's record (as a default add-locations-to-ways
+/// output drops untagged nodes): the way's old position lives only inline,
+/// and it is still refreshed.
+#[test]
+fn merge_locations_on_ways_refreshes_a_way_whose_node_the_base_lacks() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(&base, &[REFRESH_NODES[0]], &[vec![honest_way(20, &[1, 3])]]);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="-10.5" lon="-20.25" version="2"/></modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_eq!(
+        way_coords(&output, 20),
+        vec![at(1), (-105_000_000, -202_500_000)]
+    );
+}
+
+/// An untouched way using a node the OSC deletes keeps the old coordinate,
+/// is counted, and its blob is not rewritten for that alone.
+#[test]
+fn merge_locations_on_ways_counts_a_deleted_node_under_an_untouched_way() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    let frames = raw_frames(&base);
+    // With a node modify the way blobs are searched, and the refs counted;
+    // a delete-only diff cannot make a way stale, so they are not searched.
+    for (body, searched) in [
+        (
+            r#"<delete><node id="4" version="2"/></delete>
+  <modify><node id="1" lat="10.0" lon="20.0" version="2"/></modify>"#,
+            true,
+        ),
+        (r#"<delete><node id="4" version="2"/></delete>"#, false),
+    ] {
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <osmChange version=\"0.6\">{body}</osmChange>"
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(way_coords(&output, 20), vec![at(2), at(3), at(4), at(2)]);
+        assert_eq!(way_coords(&output, 30), vec![at(4)]);
+        for (blob, frame) in frames.iter().enumerate().skip(2) {
+            assert!(
+                passed_through(&output, frame),
+                "searched={searched}: way blob {blob} was rewritten"
+            );
+        }
+        if searched {
+            out.assert_stderr_contains(
+                "3 way blobs scanned, 0 rewritten only for this, 2 refs to deleted nodes kept",
+            );
+        } else {
+            out.assert_stderr_contains(
+                "0 way blobs scanned, 0 rewritten only for this, 0 refs to deleted nodes kept \
+                 (in rewritten or searched blobs only)",
+            );
+        }
+    }
+}
+
+/// A blob whose range meets the diff but holds none of its elements (the
+/// OSC deletes way 20, which the base lacks) is a precise-check false
+/// positive. It is searched on its parsed block: rewritten when it holds a
+/// stale way, passed through when it does not.
+#[test]
+fn merge_locations_on_ways_searches_precise_check_false_positives() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 3]), honest_way(30, &[4])],
+            vec![honest_way(40, &[2])],
+        ],
+    );
+    let frames = raw_frames(&base);
+    for (node3, stale) in [("51.0\" lon=\"61.0", true), ("50.0\" lon=\"60.0", false)] {
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_osc(
+            &osc,
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="{node3}" version="2"/></modify>
+  <delete><way id="20" version="2"/></delete>
+</osmChange>"#
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(passed_through(&output, &frames[2]), !stale, "stale={stale}");
+        assert!(passed_through(&output, &frames[3]), "stale={stale}");
+        let rewritten = usize::from(stale);
+        out.assert_stderr_contains(&format!(
+            "2 way blobs scanned, {rewritten} rewritten only for this"
+        ));
+        if stale {
+            assert_eq!(
+                way_coords(&output, 10),
+                vec![at(1), (510_000_000, 610_000_000)]
+            );
+        }
+        assert_locations_check_passes(&output);
+    }
+}
+
+/// A blob found stale by detection is counted by the rewrite alone. In
+/// each stale blob below, a way using a deleted node precedes the stale way,
+/// so detection has already counted that ref when it stops; adding its
+/// partial count as well would count the ref twice. Blob [19, 20] takes the
+/// unparsed search (its range misses the diff), blob [50, 52] the parsed one
+/// (the OSC deletes way 51, which it lacks, so its range meets the diff).
+#[test]
+fn merge_locations_on_ways_counts_each_reference_once() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(19, &[4]), honest_way(20, &[3])],
+            vec![honest_way(50, &[4]), honest_way(52, &[3])],
+            vec![honest_way(60, &[1])],
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="51.0" lon="61.0" version="2"/></modify>
+  <delete><node id="4" version="2"/><way id="51" version="2"/></delete>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (510_000_000, 610_000_000);
+    assert_eq!(way_coords(&output, 19), vec![at(4)]);
+    assert_eq!(way_coords(&output, 20), vec![moved]);
+    assert_eq!(way_coords(&output, 50), vec![at(4)]);
+    assert_eq!(way_coords(&output, 52), vec![moved]);
+    out.assert_stderr_contains(
+        "Inline locations refreshed: 2 refs in 2 ways, 3 way blobs scanned, \
+         2 rewritten only for this, 2 refs to deleted nodes kept",
+    );
+}
+
+/// The refresh maintains, it does not repair: an inline coordinate already
+/// stale for a node the OSC does not carry stays as it is, though the base's
+/// node record disagrees, both in a blob rewritten for another way and in one
+/// rewritten only to refresh a different ref.
+#[test]
+fn merge_locations_on_ways_leaves_stale_coordinates_of_unchanged_nodes() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    let wrong = (1, 2);
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![(10, vec![1, 2], vec![wrong, at(2)]), honest_way(11, &[3])],
+            vec![(20, vec![1, 3], vec![wrong, at(3)])],
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.0" lon="61.0" version="2"/>
+    <way id="11" version="2"><nd ref="3"/><nd ref="4"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (510_000_000, 610_000_000);
+    assert_eq!(way_coords(&output, 10), vec![wrong, at(2)]);
+    assert_eq!(way_coords(&output, 20), vec![wrong, moved]);
+}
+
+/// One Way message (no tags) for a hand-built block: raw refs, raw
+/// coordinate values (under the block's framing) and a raw Info timestamp.
+fn raw_way(id: i64, refs: &[i64], raw_coords: &[(i64, i64)], raw_timestamp: i64) -> Vec<u8> {
+    fn packed_deltas(values: impl Iterator<Item = i64>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last = 0i64;
+        for v in values {
+            let d = v - last;
+            last = v;
+            #[allow(clippy::cast_sign_loss)]
+            pb_varint(((d << 1) ^ (d >> 63)) as u64, &mut out);
+        }
+        out
+    }
+    let mut way = Vec::new();
+    pb_varint(0x08, &mut way);
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(id as u64, &mut way);
+    let mut info = Vec::new();
+    pb_varint(0x08, &mut info); // version 1
+    pb_varint(1, &mut info);
+    pb_varint(0x10, &mut info); // timestamp
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(raw_timestamp as u64, &mut info);
+    pb_len_delimited(4, &info, &mut way);
+    pb_len_delimited(8, &packed_deltas(refs.iter().copied()), &mut way);
+    pb_len_delimited(9, &packed_deltas(raw_coords.iter().map(|c| c.0)), &mut way);
+    pb_len_delimited(10, &packed_deltas(raw_coords.iter().map(|c| c.1)), &mut way);
+    way
+}
+
+/// A way block with granularity 1000 nanodegrees, lat_offset 500
+/// nanodegrees and date_granularity 100 milliseconds.
+fn framed_way_block(ways: &[Vec<u8>]) -> Vec<u8> {
+    let mut group = Vec::new();
+    for way in ways {
+        pb_len_delimited(3, way, &mut group);
+    }
+    let mut block = Vec::new();
+    pb_len_delimited(1, &[0x0A, 0x00], &mut block);
+    pb_len_delimited(2, &group, &mut block);
+    for (field, value) in [(17u32, 1000u64), (18, 100), (19, 500)] {
+        pb_varint(u64::from(field << 3), &mut block);
+        pb_varint(value, &mut block);
+    }
+    block
+}
+
+fn way_timestamps(path: &Path) -> Vec<(i64, Option<i64>)> {
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    out.push((w.id(), w.info().milli_timestamp()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ways in blocks with a non-default coordinate and date framing. A raw copy
+/// into a default-framed output block used to rescale both: every surviving
+/// way of a rewritten blob came out with moved coordinates and timestamps.
+/// Coordinates compare and are written in decimicrodegrees under the
+/// source framing; timestamps keep their whole seconds.
+#[test]
+fn merge_locations_on_ways_honours_non_default_block_framing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // decimicro = (500 + 1000 * raw) / 100 = 5 + 10 * raw for latitudes,
+    // 10 * raw for longitudes.
+    let nodes = [
+        (1, 100_000_005, 200_000_000),
+        (2, 300_000_005, 400_000_000),
+        (3, 500_000_005, 600_000_000),
+    ];
+    let raw = |n: usize| (i64::from(nodes[n].1 - 5) / 10, i64::from(nodes[n].2) / 10);
+    write_low_raw_way_blocks(
+        &base,
+        &nodes,
+        &[
+            // Rewritten by the merge for way 11.
+            framed_way_block(&[
+                raw_way(10, &[1, 2], &[raw(0), raw(1)], 20),
+                raw_way(11, &[1, 3], &[raw(0), raw(2)], 20),
+            ]),
+            // Rewritten only to refresh way 20.
+            framed_way_block(&[raw_way(20, &[2, 3], &[raw(1), raw(2)], 35)]),
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.0" lon="61.0" version="2"/>
+    <way id="11" version="2"><nd ref="1"/><nd ref="2"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    let coord = |n: usize| (nodes[n].1, nodes[n].2);
+    assert_eq!(way_coords(&output, 10), vec![coord(0), coord(1)]);
+    assert_eq!(way_coords(&output, 11), vec![coord(0), coord(1)]);
+    assert_eq!(
+        way_coords(&output, 20),
+        vec![coord(1), (510_000_000, 610_000_000)]
+    );
+    // Raw 20 and 35 at 100 ms are 2.0 s and 3.5 s; the default-framed
+    // output keeps whole seconds. Way 11 is the OSC's.
+    let timestamps: Vec<_> = way_timestamps(&output)
+        .into_iter()
+        .filter(|(id, _)| *id != 11)
+        .collect();
+    assert_eq!(timestamps, vec![(10, Some(2000)), (20, Some(3000))]);
+    assert_locations_check_passes(&output);
+}
+
+/// A non-default-framed way blob outside every OSC range is searched
+/// without a full parse, and its framing decides the answer: an OSC
+/// coordinate equal to the raw value but not the scaled one is a move (the
+/// way is refreshed), and one equal to the scaled value is a tag-only edit
+/// (the blob is passed through byte for byte). A detector that ignored the
+/// framing would answer both the other way round.
+#[test]
+fn merge_locations_on_ways_searches_framed_blobs_under_their_framing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let nodes = [(1, 100_000_005, 200_000_000), (2, 300_000_005, 400_000_000)];
+    write_low_raw_way_blocks(
+        &base,
+        &nodes,
+        &[framed_way_block(&[raw_way(
+            20,
+            &[1, 2],
+            &[(10_000_000, 20_000_000), (30_000_000, 40_000_000)],
+            20,
+        )])],
+    );
+    let frames = raw_frames(&base);
+    for (node2, moved) in [
+        ("lat=\"3.0\" lon=\"4.0\"", true),
+        ("lat=\"30.0000005\" lon=\"40.0\"", false),
+    ] {
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\
+                 <modify><node id=\"2\" {node2} version=\"2\"/></modify></osmChange>"
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(passed_through(&output, &frames[2]), !moved, "moved={moved}");
+        let node2_now = if moved {
+            (30_000_000, 40_000_000)
+        } else {
+            (300_000_005, 400_000_000)
+        };
+        assert_eq!(
+            way_coords(&output, 20),
+            vec![(100_000_005, 200_000_000), node2_now],
+            "moved={moved}"
+        );
+        assert_locations_check_passes(&output);
+    }
+}
+
+/// One Relation message with a single way member and the given raw Info
+/// timestamp, or none.
+fn raw_relation(id: i64, member: i64, raw_timestamp: Option<i64>) -> Vec<u8> {
+    let mut rel = Vec::new();
+    pb_varint(0x08, &mut rel);
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(id as u64, &mut rel);
+    let mut info = Vec::new();
+    pb_varint(0x08, &mut info); // version 1
+    pb_varint(1, &mut info);
+    if let Some(ts) = raw_timestamp {
+        pb_varint(0x10, &mut info);
+        #[allow(clippy::cast_sign_loss)]
+        pb_varint(ts as u64, &mut info);
+    }
+    pb_len_delimited(4, &info, &mut rel);
+    pb_len_delimited(8, &[0x00], &mut rel); // roles_sid: ""
+    let mut memids = Vec::new();
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(((member << 1) ^ (member >> 63)) as u64, &mut memids);
+    pb_len_delimited(9, &memids, &mut rel);
+    pb_len_delimited(10, &[0x01], &mut rel); // types: way
+    rel
+}
+
+/// Without `--locations-on-ways` too, surviving ways and relations in a
+/// rewritten blob whose `date_granularity` is not the default keep their
+/// timestamps (in whole seconds); absent stays absent, zero and negative
+/// values scale like any other.
+#[test]
+fn merge_keeps_timestamps_under_a_non_default_date_granularity() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut rel_group = Vec::new();
+    for (id, ts) in [(50, Some(-35)), (51, Some(20)), (52, None), (53, Some(0))] {
+        pb_len_delimited(4, &raw_relation(id, 10, ts), &mut rel_group);
+    }
+    let mut rel_block = Vec::new();
+    pb_len_delimited(1, &[0x0A, 0x00], &mut rel_block);
+    pb_len_delimited(2, &rel_group, &mut rel_block);
+    pb_varint(18 << 3, &mut rel_block);
+    pb_varint(100, &mut rel_block);
+
+    write_low_raw_way_blocks(
+        &base,
+        &REFRESH_NODES,
+        &[
+            framed_way_block(&[
+                raw_way(10, &[1, 2], &[(1, 1), (2, 2)], 47),
+                raw_way(11, &[1, 3], &[(1, 1), (3, 3)], 20),
+            ]),
+            rel_block,
+        ],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="11" version="2"><nd ref="1"/><nd ref="2"/></way>
+    <relation id="51" version="2"><member type="way" ref="10" role=""/></relation>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    let mut ways = Vec::new();
+    let mut relations = Vec::new();
+    for blob in BlobReader::from_path(&output).expect("open output") {
+        if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::Way(w) => ways.push((w.id(), w.info().milli_timestamp())),
+                    Element::Relation(r) => {
+                        relations.push((r.id(), r.info().milli_timestamp()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Raw 47 at 100 ms is 4.7 s: whole seconds, 4 s. Raw -35 is -3.5 s,
+    // truncated toward zero like the node path.
+    assert_eq!(ways[0], (10, Some(4000)));
+    let surviving: Vec<_> = relations.into_iter().filter(|(id, _)| *id != 51).collect();
+    assert_eq!(
+        surviving,
+        vec![(50, Some(-3000)), (52, None), (53, Some(0))]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases
+// ---------------------------------------------------------------------------
+
+/// Create elements with IDs that fall in gaps between base blobs.
+#[test]
+fn merge_gap_creates_between_blobs() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 10,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 20,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 30,
+                lat: 120_000_000,
+                lon: 220_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[
+            TestWay {
+                id: 100,
+                refs: vec![10, 20],
+                tags: vec![("highway", "road")],
+                meta: None,
+            },
+            TestWay {
+                id: 200,
+                refs: vec![20, 30],
+                tags: vec![("highway", "path")],
+                meta: None,
+            },
+        ],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="5" lat="50.0" lon="10.0" version="1"/>
+    <node id="15" lat="51.0" lon="11.0" version="1"/>
+    <node id="35" lat="52.0" lon="12.0" version="1"/>
+    <way id="50" version="1">
+      <nd ref="10"/>
+      <nd ref="20"/>
+    </way>
+    <way id="150" version="1">
+      <nd ref="20"/>
+      <nd ref="30"/>
+    </way>
+  </create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    let nids = node_ids(&c);
+    assert_eq!(nids, vec![5, 10, 15, 20, 30, 35], "node order");
+    let wids = way_ids(&c);
+    assert_eq!(wids, vec![50, 100, 150, 200], "way order");
+
+    let stderr = out.stderr_str();
+    assert!(stderr.contains("Base: 3 nodes, 2 ways"), "stats: {stderr}");
+    assert!(stderr.contains("Diff: 3 nodes, 2 ways"), "stats: {stderr}");
+}
+
+/// Base has only nodes and relations (no ways). Diff creates ways.
+#[test]
+fn merge_type_transition_node_to_relation_skipping_ways() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Node(1),
+                role: "label",
+            }],
+            tags: vec![("type", "boundary")],
+            meta: None,
+        }],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <way id="50" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="residential"/>
+    </way>
+    <way id="51" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </create>
+</osmChange>"#,
+    );
+
+    let out = run_apply_ok(&base, &osc, &output);
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 2]);
+    assert_eq!(way_ids(&c), vec![50, 51]);
+    assert_eq!(relation_ids(&c), vec![100]);
+
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Base: 2 nodes, 0 ways, 1 relations"),
+        "stats: {stderr}"
+    );
+    assert!(
+        stderr.contains("Diff: 0 nodes, 2 ways, 0 relations"),
+        "stats: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Error paths
+// ---------------------------------------------------------------------------
+
+/// The version-precedence gate, and its escape hatch, reaching
+/// `apply-changes` through the CLI.
+///
+/// The gate lives in two places - `CompactDiffOverlay` for this command
+/// and the `--simplify` dedupe for `merge-changes` - and only the second
+/// half had a CLI test. So `apply-changes --allow-version-regression`
+/// existed as a flag with nothing at all asserting that it reached
+/// `CompactDiffOverlay::allow_version_regression`: unwiring the call in
+/// `rewrite.rs` broke no test. Every arm is pinned here - the refusal,
+/// the escape hatch, and a genuine advance - because a gate that is
+/// merely inert also passes "the flag parsed".
+#[test]
+fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+
+    // A delete followed by a stale modify: before the versioned
+    // tombstone the delete erased the stored version and version 8 was
+    // resurrected past a gate meant to stop exactly that.
+    let osc = dir.path().join("regress.osc.gz");
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert!(
+        !out.status.success(),
+        "a stale change after a delete must be refused"
+    );
+    assert!(
+        out.stderr_str().contains("is lower than version 9"),
+        "error must name the regression; stderr:\n{}",
+        out.stderr_str()
+    );
+
+    // The escape hatch restores the old positional rule.
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(&output)
+        .arg("--overwrite")
+        .arg("--allow-version-regression")
+        .arg("--force")
+        .run();
+    assert!(
+        out.status.success(),
+        "--allow-version-regression must accept it; stderr:\n{}",
+        out.stderr_str()
+    );
+
+    // And a genuine advance was never in question.
+    let forward = dir.path().join("forward.osc.gz");
+    write_osc(
+        &forward,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete><node id="1" version="9"/></delete>
+  <create><node id="1" lat="8.0" lon="8.0" version="10"/></create>
+</osmChange>"#,
+    );
+    run_apply_ok(&base, &forward, &output);
+}
+
+/// Two overlapping diffs, concatenated by `merge-changes` in its default
+/// full-stream mode and applied in one run: equal versions are admitted
+/// and the later change wins. The overlap is the real germany 4705/4706
+/// shape - a node modified at version 12, then deleted at version 12 as
+/// it leaves the extract - plus a verbatim repeat and an equal version
+/// with different content. Each used to fail the whole apply.
+#[test]
+fn merge_admits_equal_versions_from_overlapping_diffs() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let first = dir.path().join("4705.osc.gz");
+    let second = dir.path().join("4706.osc.gz");
+    let combined = dir.path().join("combined.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 200_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+    write_osc(
+        &first,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+    <node id="2" lat="21.0" lon="21.0" version="3"/>
+    <node id="3" lat="31.0" lon="31.0" version="5"/>
+  </modify>
+</osmChange>"#,
+    );
+    write_osc(
+        &second,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="21.0" lon="21.0" version="3"/>
+    <node id="3" lat="32.0" lon="32.0" version="5"/>
+  </modify>
+  <delete>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+  </delete>
+</osmChange>"#,
+    );
+    CliInvoker::new()
+        .arg("merge-changes")
+        .arg(&first)
+        .arg(&second)
+        .arg("-o")
+        .arg(&combined)
+        .assert_success();
+
+    run_apply_ok(&base, &combined, &output);
+    let c = read_all_elements(&output);
+    assert_eq!(
+        node_ids(&c),
+        vec![2, 3],
+        "the equal-version delete must win"
+    );
+    assert_eq!(
+        c.nodes[0].1, 210_000_000,
+        "the verbatim repeat applies once"
+    );
+    assert_eq!(
+        c.nodes[1].1, 320_000_000,
+        "an equal version with different content is won by the later change"
+    );
+
+    // A lower version after the equal ones is still refused, and the
+    // escape hatch still admits it.
+    let stale = dir.path().join("stale.osc.gz");
+    write_osc(
+        &stale,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="33.0" lon="33.0" version="4"/></modify>
+</osmChange>"#,
+    );
+    let combined_stale = dir.path().join("combined-stale.osc.gz");
+    CliInvoker::new()
+        .arg("merge-changes")
+        .arg(&first)
+        .arg(&second)
+        .arg(&stale)
+        .arg("-o")
+        .arg(&combined_stale)
+        .assert_success();
+    let out = run_apply_changes(&base, &combined_stale, &output, ApplyOpts::default());
+    assert!(!out.status.success(), "a lower claim must still be refused");
+    assert!(
+        out.stderr_str().contains("is lower than version 5"),
+        "error must name the regression; stderr:\n{}",
+        out.stderr_str()
+    );
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&combined_stale)
+        .arg("-o")
+        .arg(&output)
+        .arg("--overwrite")
+        .arg("--allow-version-regression")
+        .arg("--force")
+        .run();
+    assert!(
+        out.status.success(),
+        "--allow-version-regression must accept it; stderr:\n{}",
+        out.stderr_str()
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(c.nodes[1].1, 330_000_000, "the escape hatch is positional");
+}
+
+/// `apply-changes --force --locations-on-ways` can never take effect (an
+/// indexed base makes `--force` a no-op, an unindexed one is unsound under
+/// `-l`), so the combination is a usage error, before any input is opened.
+#[test]
+fn merge_refuses_force_with_locations_on_ways_before_any_input() {
+    let dir = crate::common::test_scratch();
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(dir.path().join("no-such-base.osm.pbf"))
+        .arg(dir.path().join("no-such-diff.osc.gz"))
+        .arg("-o")
+        .arg(dir.path().join("out.osm.pbf"))
+        .args(["--locations-on-ways", "--force"])
+        .run();
+    assert_eq!(
+        out.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
+        "stderr:\n{}",
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--force")
+            && stderr.contains("--locations-on-ways")
+            && !stderr.contains("no-such-base"),
+        "expected the argument refusal, not an input error; stderr:\n{stderr}",
+    );
+}
+
+/// Without `--force`, a non-indexed base under `--locations-on-ways` is
+/// refused by the indexdata gate, which points at the indexed-generation
+/// workflow.
+#[test]
+fn merge_refuses_locations_on_ways_on_non_indexed() {
+    use crate::common::write_test_pbf_non_indexed;
+
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 300_000_000,
+                lon: 400_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
+        &[],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(
+        !out.status.success(),
+        "must refuse --locations-on-ways on a non-indexed base; stderr:\n{}",
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("pbfhogg cat"),
+        "error should point at the indexed-generation workflow; stderr:\n{stderr}",
+    );
+}
+
+/// `-j 1` runs, through the node-to-way barrier too, and writes what
+/// `-j 2` writes. It used to be refused as an unvalidated configuration;
+/// the barrier fault tests (`crates/lib/tests/fault_apply_changes.rs`) now run every
+/// ordering at one worker.
+#[test]
+fn merge_runs_at_one_worker() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+
+    let node = |id: i32| TestNode {
+        id: i64::from(id),
+        lat: 100_000_000 + id,
+        lon: 200_000_000 + id,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_with_locations(
+        &base,
+        &[node(1), node(2), node(3)],
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_001, 200_000_001), (100_000_002, 200_000_002)],
+            vec![("highway", "road")],
+        )],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+</osmChange>"#,
+    );
+
+    let run = |jobs: usize| {
+        let output = dir.path().join(format!("out-{jobs}.osm.pbf"));
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                jobs: Some(jobs),
+                locations_on_ways: true,
+                ..ApplyOpts::default()
+            },
+        );
+        assert!(
+            out.status.success(),
+            "-j {jobs} must run; stderr:\n{}",
+            out.stderr_str(),
+        );
+        std::fs::read(&output).expect("read output")
+    };
+    let one = run(1);
+    assert_eq!(one, run(2), "-j 1 output differs from -j 2");
+    let locs = read_way_locations(&dir.path().join("out-1.osm.pbf"));
+    assert_eq!(
+        locs,
+        vec![(
+            10,
+            vec![(100_000_001, 200_000_001), (100_000_003, 200_000_003)]
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Claims a decoded candidate contradicts
+// ---------------------------------------------------------------------------
+
+/// A sorted, indexed, node-only base with one blob per entry of `blobs`,
+/// each holding its IDs in the order given (so a blob can be internally out
+/// of order under the sorted header). Frame 0 is the header, blob `i` is
+/// frame `i + 1`.
+fn write_node_blobs(path: &Path, blobs: &[&[i64]]) {
+    write_node_blobs_indexed(path, blobs, true);
+}
+
+/// [`write_node_blobs`], with indexdata on every blob or on none.
+fn write_node_blobs_indexed(path: &Path, blobs: &[&[i64]], indexed: bool) {
+    let file = File::create(path).expect("create base");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for ids in blobs {
+        for &id in *ids {
+            let coord = i32::try_from(id.rem_euclid(1000)).unwrap() * 1000;
+            bb.add_node(id, coord, coord, std::iter::empty(), None);
+        }
+        let block = bb.take().expect("take").expect("block");
+        if indexed {
+            writer.write_primitive_block(block).expect("write block");
+        } else {
+            writer
+                .write_primitive_block_no_indexdata(block)
+                .expect("write block");
+        }
+    }
+    writer.flush().expect("flush base");
+}
+
+/// `path` rewritten with frame `frame` claiming `min_id..=max_id` (and
+/// `count`, when given).
+fn forge_range(path: &Path, frame: usize, min_id: i64, max_id: i64, count: Option<u64>) {
+    let bytes = std::fs::read(path).expect("read base");
+    let forged =
+        crate::common::adversarial::forge_indexdata_range(&bytes, frame, min_id, max_id, count);
+    std::fs::write(path, forged).expect("write forged base");
+}
+
+fn node_osc(path: &Path, body: &str) {
+    write_osc(
+        path,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n{body}\n</osmChange>"
+        ),
+    );
+}
+
+/// The run failed (exit 2), said `needle`, and published nothing.
+fn assert_refused(out: &CliOutput, output: &Path, needle: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "apply-changes must fail, not publish a wrong answer; stderr:\n{}",
+        out.stderr_str()
+    );
+    out.assert_stderr_contains(needle);
+    assert!(!output.exists(), "a refused apply-changes published output");
+}
+
+/// An `IndexdataMismatch`: its message, and the advice the CLI gives only
+/// for that kind.
+fn assert_claim_refused(out: &CliOutput, output: &Path) {
+    assert_refused(out, output, "blob indexdata claims");
+    out.assert_stderr_contains("check --index");
+}
+
+/// An `Unsorted` refusal of the header's sort claim, with the CLI's advice
+/// for that kind.
+fn assert_order_refused(out: &CliOutput, output: &Path, needle: &str) {
+    assert_refused(out, output, needle);
+    out.assert_stderr_contains("Sort the input first");
+}
+
+const ORDER_REFUSAL: &str = "out of the order its header declares";
+
+/// A blob whose claimed range stops short of what it holds: node 25 sits
+/// past the claimed 10..=20. The diff modifies 15 (so the blob is decoded
+/// and rewritten) and 25, which the rewrite writes at its element and the
+/// drain then wrote again as a gap create before the next blob. Refused.
+#[test]
+fn merge_refuses_a_decoded_blob_holding_ids_past_its_claimed_range() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15, 25], &[40, 50]]);
+    forge_range(&base, 1, 10, 20, None);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="15" lat="1.0" lon="1.0" version="2"/>
+  <node id="25" lat="2.0" lon="2.0" version="2"/>
+</modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// An overstated range: blob A claims 5..=40 holding 10 and 20, blob B
+/// holds 40 and 50. A's inline slice took the modify of 40 too and wrote it
+/// as a trailing create, and B modified its own 40: written twice. The
+/// drain's order guard lets the shared bound 40 through, so only the
+/// decoded claim can refuse it.
+#[test]
+fn merge_refuses_a_decoded_blob_whose_claimed_range_overstates_it() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 20], &[40, 50]]);
+    forge_range(&base, 1, 5, 40, None);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="20" lat="1.0" lon="1.0" version="2"/>
+  <node id="40" lat="2.0" lon="2.0" version="2"/>
+</modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// A false count on a blob the precise check passes through: the claim
+/// would be copied forward and credited to the base statistics. The diff
+/// deletes an ID the blob's range covers but it does not hold, so the blob
+/// is decoded, every element walked, and nothing edited.
+#[test]
+fn merge_refuses_a_false_count_on_a_decoded_passthrough() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15], &[40, 50]]);
+    forge_range(&base, 1, 10, 15, Some(7));
+    node_osc(&osc, r#"<delete><node id="12" version="2"/></delete>"#);
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+}
+
+/// A blob internally out of order under the sorted header, its range
+/// honest. A modify of 3 was written twice (as an early create before 5 and
+/// at its element), and a delete of 3 was missed by the precise check's
+/// forward cursor, so the blob passed through with 3 in it. Both refused.
+#[test]
+fn merge_refuses_a_decoded_blob_out_of_header_order() {
+    for (label, change) in [
+        (
+            "modify",
+            r#"<modify><node id="3" lat="1.0" lon="1.0" version="2"/></modify>"#,
+        ),
+        ("delete", r#"<delete><node id="3" version="2"/></delete>"#),
+    ] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs(&base, &[&[5, 3], &[40]]);
+        node_osc(&osc, change);
+        let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+        eprintln!("case: {label}");
+        assert_order_refused(&out, &output, ORDER_REFUSAL);
+    }
+}
+
+/// An ID outside the claimed range met before the walk breaks order is a
+/// false claim, not disorder: `[10, 30, 20]` claiming 10..=20.
+#[test]
+fn merge_refuses_an_escaping_id_before_disorder_as_a_false_claim() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 30, 20], &[40]]);
+    forge_range(&base, 1, 10, 20, None);
+    node_osc(
+        &osc,
+        r#"<modify><node id="20" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_claim_refused(&out, &output);
+    out.assert_stderr_contains("first elements include 3 node elements with ids 10..=30");
+}
+
+/// A way blob claiming nodes, its claimed range past the node blob's so
+/// the drain's order guard passes it. The diff creates node 30, so the
+/// blob is decoded; its way was written in node position and the create
+/// consumed as a modification of the way, dropped. Refused.
+#[test]
+fn merge_refuses_a_decoded_blob_holding_another_kind_than_claimed() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    {
+        let file = File::create(&base).expect("create base");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 10, 10, std::iter::empty(), None);
+        bb.add_node(2, 20, 20, std::iter::empty(), None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("block"))
+            .expect("nodes");
+        bb.add_way(30, [("highway", "path")], &[1, 2], None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("block"))
+            .expect("ways");
+        writer.flush().expect("flush");
+    }
+    let bytes = std::fs::read(&base).expect("read base");
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix[1], 1, "frame 2 is the way blob");
+        ix[1] = 0;
+    });
+    std::fs::write(&base, lying).expect("write forged base");
+    node_osc(
+        &osc,
+        r#"<create><node id="30" lat="3.0" lon="3.0" version="1"/></create>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_refused(
+        &out,
+        &output,
+        "claims node elements but the blob holds way elements",
+    );
+    out.assert_stderr_contains("check --index");
+}
+
+/// Under --locations-on-ways a way blob whose claimed range misses the
+/// diff is searched for stale ways without a parse and passed through
+/// when clean. Here it holds way 25 past its claimed 20..=22, and the diff
+/// modifies way 25: the base 25 was passed through and the OSC 25 written
+/// as well. The search walks every way, so the claim is refused.
+#[test]
+fn merge_locations_on_ways_refuses_a_searched_way_blob_past_its_claimed_range() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 2])],
+            vec![honest_way(20, &[1, 2]), honest_way(25, &[2, 4])],
+        ],
+    );
+    forge_range(&base, 3, 20, 22, None);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.2345678" lon="61.8765432" version="2"/>
+    <way id="25" version="2"><nd ref="2"/><nd ref="1"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert_claim_refused(&out, &output);
+}
+
+/// Honest mixed-sign blobs `[-1]` and `[-2, 1]` (canonical order -1, -2,
+/// 1), the diff modifying -1. The second blob's range cannot name its
+/// first element, so its inline slice used to start at key 0, which reaches
+/// back over -1: the modify was written by both blobs. It is written once.
+#[test]
+fn merge_writes_an_upsert_once_beside_a_mixed_sign_blob() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[-1], &[-2, 1]]);
+    node_osc(
+        &osc,
+        r#"<modify><node id="-1" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    run_apply_ok(&base, &osc, &output);
+    assert_eq!(node_ids(&read_all_elements(&output)), vec![-1, -2, 1]);
+}
+
+/// A base holding an ID more than once, within a blob and across a blob
+/// boundary: `[3, 5, 5]`, `[5, 7, 7]`, `[9]`. Every copy of the modified 5
+/// is replaced where it stands and every copy of the deleted 7 dropped,
+/// while the creates 4, 6 and 10 land once at their sorted positions. The
+/// rewrite finds each base element's change by forward cursors over the
+/// diff's sorted lists, which must not step past an ID on its first match.
+/// Indexed, and unindexed under `--force`.
+#[test]
+fn merge_replaces_and_deletes_every_copy_of_a_repeated_id() {
+    for indexed in [true, false] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs_indexed(&base, &[&[3, 5, 5], &[5, 7, 7], &[9]], indexed);
+        node_osc(
+            &osc,
+            r#"<create><node id="4" lat="4.0" lon="4.0" version="1"/><node id="6" lat="6.0" lon="6.0" version="1"/><node id="10" lat="7.0" lon="7.0" version="1"/></create>
+<modify><node id="5" lat="1.0" lon="1.0" version="2"/></modify>
+<delete><node id="7" version="2"/></delete>"#,
+        );
+        run_apply_ok(&base, &osc, &output);
+        let c = read_all_elements(&output);
+        assert_eq!(
+            node_ids(&c),
+            vec![3, 4, 5, 5, 5, 6, 9, 10],
+            "indexed: {indexed}"
+        );
+        for n in c.nodes.iter().filter(|n| n.0 == 5) {
+            assert_eq!((n.1, n.2), (10_000_000, 10_000_000), "indexed: {indexed}");
+        }
+    }
+}
+
+/// A create between a blob and a mixed-sign blob's first element: `[-1]`
+/// then `[-3, 1]` (canonical -1, -3, 1), the diff creating -2. The second
+/// blob's slice starts at its first element, -3, so -2 is the drain's gap
+/// create, bounded by that same element, and lands between them. Indexed,
+/// and unindexed under `--force`, where the scanner knows no range at all.
+#[test]
+fn merge_gap_creates_up_to_a_mixed_sign_blob_first_element() {
+    for indexed in [true, false] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_node_blobs_indexed(&base, &[&[-1], &[-3, 1]], indexed);
+        node_osc(
+            &osc,
+            r#"<create><node id="-2" lat="1.0" lon="1.0" version="1"/></create>"#,
+        );
+        run_apply_ok(&base, &osc, &output);
+        assert_eq!(
+            node_ids(&read_all_elements(&output)),
+            vec![-1, -2, -3, 1],
+            "indexed: {indexed}"
+        );
+    }
+}
+
+/// Disorder across blobs that only the decoded first element shows: `[-2,
+/// -3]` then a blob claiming `[-5, 1]` whose first element is -1, which
+/// sorts before -3. Each blob is internally in order and its range exact,
+/// and the range's smallest present key (-5) follows -3, so the drain's
+/// guard on ranges passed it. The diff modifies 1 so the second blob is
+/// decoded; its observed first element is refused.
+#[test]
+fn merge_refuses_disorder_a_mixed_sign_range_hides() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[-2, -3], &[-1, -5, 1]]);
+    node_osc(
+        &osc,
+        r#"<modify><node id="1" lat="1.0" lon="1.0" version="2"/></modify>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert_order_refused(&out, &output, "the base is not in the order its header");
+}
+
+/// The honest counterparts of the refusals above merge as before.
+#[test]
+fn merge_keeps_honest_claims_on_decoded_blobs() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_node_blobs(&base, &[&[10, 15, 25], &[40, 50]]);
+    node_osc(
+        &osc,
+        r#"<modify>
+  <node id="15" lat="1.0" lon="1.0" version="2"/>
+  <node id="25" lat="2.0" lon="2.0" version="2"/>
+</modify>
+<create><node id="30" lat="3.0" lon="3.0" version="1"/></create>
+<delete><node id="12" version="2"/></delete>"#,
+    );
+    run_apply_ok(&base, &osc, &output);
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        vec![10, 15, 25, 30, 40, 50]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output backends (tier 1: cheap, skip on the typed platform refusal; the
+// module only carries the feature gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+mod backends {
+    use super::*;
+
+    fn basic_fixture(base: &Path, osc: &Path) {
+        write_crud_base(base);
+        write_osc(osc, CRUD_OSC);
+    }
+
+    fn check_basic_output(output: &Path) {
+        let c = read_all_elements(output);
+        assert_eq!(node_ids(&c), vec![1, 2, 4]);
+        assert_eq!(c.nodes[0].1, 100_000_000);
+        assert_eq!(c.nodes[0].2, 200_000_000);
+        assert_eq!(c.nodes[1].1, 350_000_000);
+        assert_eq!(c.nodes[1].2, 450_000_000);
+        assert_eq!(c.nodes[2].1, 550_000_000);
+        assert_eq!(c.nodes[2].2, 120_000_000);
+        assert_eq!(way_ids(&c), vec![10]);
+        assert_eq!(c.ways[0].1, vec![1, 2]);
+        assert_eq!(relation_ids(&c), vec![100]);
+    }
+
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn merge_basic_create_modify_delete_direct_io() {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+
+        basic_fixture(&base, &osc);
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                direct_io: true,
+                ..ApplyOpts::default()
+            },
+        );
+        if out.is_o_direct_unsupported() {
+            crate::common::skip("O_DIRECT not supported on this filesystem");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "apply-changes --direct-io failed; stderr:\n{}",
+            out.stderr_str(),
+        );
+        check_basic_output(&output);
+        assert!(
+            out.stderr_str().contains("Deleted: 1"),
+            "stats: {}",
+            out.stderr_str(),
+        );
+    }
+
+    #[cfg(feature = "linux-io-uring")]
+    #[test]
+    fn merge_basic_create_modify_delete_uring() {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+
+        basic_fixture(&base, &osc);
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                io_uring: true,
+                ..ApplyOpts::default()
+            },
+        );
+        if out.is_uring_unsupported() {
+            crate::common::skip("io_uring not available");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "apply-changes --io-uring failed; stderr:\n{}",
+            out.stderr_str(),
+        );
+        check_basic_output(&output);
+        assert!(
+            out.stderr_str().contains("Deleted: 1"),
+            "stats: {}",
+            out.stderr_str(),
+        );
+    }
+}

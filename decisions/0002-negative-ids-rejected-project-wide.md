@@ -64,7 +64,7 @@ invariant. Enforcement is layered by site:
   and take one sign compare each.
 - **Neither enforcement nor routing** in `diff` and `derive-changes`
   (amended 2026-10-31). Their work-unit planner
-  (`src/commands/diff/units.rs`) cuts and clips in canonical
+  (`crates/lib/src/commands/diff/units.rs`) cuts and clips in canonical
   `id_order` keys, so negative IDs window like any other. It replaced
   a shard planner whose raw `i64` thresholds forced any comparison
   holding a negative ID onto one shard (amended 2026-10-22, itself

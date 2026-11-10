@@ -319,7 +319,7 @@ another cell") narrows the mechanism.
 
 Pass A's id-shard record went from three `u32` fields (12 bytes) to one
 `u64` word whose field widths are sized per run (`IdCodec` in
-`src/commands/altw/external/mod.rs`; planet: 26-bit local id, 18-bit blob
+`crates/lib/src/commands/altw/external/mod.rs`; planet: 26-bit local id, 18-bit blob
 ordinal, 19-bit slot, closure bit), with a second word only for a slot
 that does not fit. Planet: 12,435,459,911 records, zero escaped, id shards
 149.2 GB -> 99.5 GB written in pass A and read back in stage 2.

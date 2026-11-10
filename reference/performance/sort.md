@@ -95,7 +95,7 @@ passthrough, none overlapping, rewritten or restructured.
   with no fixed bound (it scales with reframed passthrough content, so the
   Europe ratio of 2.6 % of input is an observation, not an envelope).
   Accepted on this path; the rationale and the spill remedy are at
-  `Reindex` in `src/commands/blob_merge.rs`. Planet `pbf.raw` (50,816
+  `Reindex` in `crates/lib/src/commands/blob_merge.rs`. Planet `pbf.raw` (50,816
   blobs) was not measured.
 
 ### Pass 1 scans on a worker pool (bygg, 2026-11-09, against `252ad27a`)
@@ -189,7 +189,7 @@ the cargo `target/` dir, not the sort scratch path).
   **Superseded 2026-10-25** (measured afterwards, 2026-11-08, see
   reference/performance/sort.md "Sort across the blob-merge engine move on
   unsorted Denmark"): sort and `cat --dedupe` became one
-  engine (`src/commands/blob_merge.rs`), whose overlap runs are swept on
+  engine (`crates/lib/src/commands/blob_merge.rs`), whose overlap runs are swept on
   dedicated worker threads and stream their blocks to the write loop in run
   order (a bounded channel per run, an admission window of two runs per
   worker), so buffered overlap output is bounded and the write loop overlaps
@@ -236,7 +236,7 @@ and stamped `Sort.Type_then_ID` - silent corruption. Fixed by
 `scan_block_ids_checked` (tracks intra-blob monotonicity during the min/max
 scan), keyed on the header's `Sort.Type_then_ID` claim rather than
 indexdata presence; any out-of-order blob is folded into pass 2's decode +
-re-encode. Full ruling in CORRECTNESS.md; tests in `cli/tests/cli_sort.rs`.
+re-encode. Full ruling in CORRECTNESS.md; tests in `crates/cli/tests/cli_sort.rs`.
 
 ---
 

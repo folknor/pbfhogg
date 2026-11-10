@@ -29,7 +29,7 @@ Sidecar phases across the two shapes: the per-kind shape's `CAT_NODES_*`,
 `CAT_WAYS_*` and `CAT_RELATIONS_*` pairs bracketed execution barriers. The
 one-pass shape at `8da26b23` replaced them with a single `CAT_FILTERED_*`
 pair; a later change (2026-10-26) brought the per-kind names back inside it,
-as write-side kind transitions (`KindPhase` in `src/commands/cat/mod.rs`).
+as write-side kind transitions (`KindPhase` in `crates/lib/src/commands/cat/mod.rs`).
 Decode of the next kind overlaps a row by up to the pool's admission window
 of tasks, and the wait for the first next-kind result lands in the row
 before, with no time bound the code enforces. So a per-kind row compared

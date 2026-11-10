@@ -4,7 +4,7 @@
 Usage: scripts/counter_names_diff.py <uuid-before> <uuid-after>
 
 The tool for checking that a refactor kept sidecar counter names (the
-contract in the src/counters.rs module doc). Reads `brokkr sidecar <uuid>
+contract in the crates/lib/src/counters.rs module doc). Reads `brokkr sidecar <uuid>
 --counters` and `--markers` (JSONL on stdout). Prints, for counters and then
 markers, the names only in the first run, only in the second, and how many are
 shared.

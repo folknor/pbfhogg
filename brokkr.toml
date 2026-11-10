@@ -30,7 +30,7 @@ default = "pbfhogg"
 install = ["pbfhogg-cli"]
 
 # The library harness `brokkr library` builds and runs (`brokkr man
-# library`): the workspace member harness/.
+# library`): the workspace member crates/harness/.
 [pbfhogg.library.harness]
 package = "pbfhogg-harness"
 

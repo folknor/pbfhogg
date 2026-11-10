@@ -157,7 +157,7 @@ Zlib uses `zlib-rs` (pure Rust, no C compiler needed). With pipelined writes (`t
 
 ## Correctness
 
-See [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases and data representation limits accepted by design, and [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences from osmium.
+See [CORRECTNESS.md](https://github.com/folknor/pbfhogg/blob/main/CORRECTNESS.md) for parser/encoder edge cases and data representation limits accepted by design, and [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md) for intentional behavioral differences from osmium.
 
 ## Acknowledgements
 

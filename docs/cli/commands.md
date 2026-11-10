@@ -4,7 +4,7 @@ Every command, flag and output contract of the `pbfhogg` binary, as it
 stands on the main branch (unreleased changes included; `CHANGELOG.md` says
 which release brought what). This page is written by hand, not generated:
 `pbfhogg <command> --help` gives the short form of each flag, and a test
-(`cli/src/lib.rs`, `doc_coverage_tests`) fails when a visible command,
+(`crates/cli/src/lib.rs`, `doc_coverage_tests`) fails when a visible command,
 flag or enumerated value of the CLI has no place here.
 
 Every enumerated flag value (`--compression`, `--type`, `--index-type`,
@@ -338,7 +338,7 @@ present, and what a partially indexed file meets, is in
 ## Output header
 
 Every PBF-writing command derives its `OSMHeader` from one rule
-(`src/commands/output_header.rs`): a header never claims more than the output
+(`crates/lib/src/commands/output_header.rs`): a header never claims more than the output
 contains. Each command states facts about its output - its order, what it did
 to way payloads and way blob headers, its bbox and replication state - and the
 header follows from them.
@@ -1127,7 +1127,7 @@ the key set and its rank index (`IdSet::ranked_bytes_upper_bound`: 4 MiB
 and its block prefixes per allocated chunk, plus the chunk directory and its
 rank vectors); 4 GiB
 when the host reports none; never below 64 MiB (`CHECK_LOCATIONS_*` in
-`src/tunables.rs`). It is read before the passes because a host that charges
+`crates/lib/src/tunables.rs`). It is read before the passes because a host that charges
 page cache to the process (a cgroup v2 limit) reports far less available
 once the file has streamed through; for the same reason `check` runs
 `--locations` before any other selected check (the report order is
@@ -1609,7 +1609,7 @@ A comparison whose ID ranges give no point to cut a work unit within 1 GiB of bl
 Print a digest of a PBF, in one of two canonical forms. Both are independent of compression, blob boundaries, string-table order, granularity and offsets, and indexdata presence. They differ in what they cover, and so in the equality they answer:
 
 - **`--form full` (the default, `v2`).** Two files the command accepts get the same digest exactly when they have the same header and the same elements field for field (barring a 128-bit hash collision). It covers element content as below, with coordinates as exact nanodegrees, plus each element's metadata claims (version, millisecond timestamp, changeset, uid, user and `visible`, each claimed or not, as every metadata printing output reads them (the `inspect --extended` coverage census counts available values instead, see [inspect](#inspect)): a plain element's field is claimed when present on the wire, so an absent timestamp, uid or user differs from a present zero or empty one and an absent `visible` from an explicit `true`; a version of 0 or below is never a claim; a dense node's versionless slot claims only values padding cannot hold, a non-zero timestamp, a positive changeset or uid, a non-empty user, `visible` false), `LocationsOnWays` way coordinates wherever a way carries them, the `pbfhogg.SharedNodePins-v1` pins and `pbfhogg.WayMembers-v1` membership of each way where the header declares those features (and only there: they are authoritative nowhere else), and the header: bbox, required and optional features (each as a set, so order and repetition do not matter), writing program, source and the three replication fields, each with its presence. It is no `diff` relation: it is for checking that two writers of one operation agree, metadata and header included. A dense node and a plain one with the same metadata digest alike, except where the two encodings cannot say the same thing (a dense versioned node claims every metadata field).
-- **`--form content` (`v1`).** Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical: element content only (node coordinates in decimicrodegrees and tags, way tags and refs, relation tags and members), so dense or plain nodes, header fields, metadata and way coordinates do not change it, as diff ignores them. Element content is defined once, in `src/content.rs`, for both commands.
+- **`--form content` (`v1`).** Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical: element content only (node coordinates in decimicrodegrees and tags, way tags and refs, relation tags and members), so dense or plain nodes, header fields, metadata and way coordinates do not change it, as diff ignores them. Element content is defined once, in `crates/lib/src/content.rs`, for both commands.
 
 ```
 pbfhogg digest [OPTIONS] <FILE>

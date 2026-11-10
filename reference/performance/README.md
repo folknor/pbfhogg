@@ -101,7 +101,7 @@ usually small.
   chunk, the same definition on every backend, the pool's dispatch
   included) and `writer_pool_write_ns` (the pool's summed execution time,
   pool backend only); the definitions are on the counters in
-  `src/write/metrics.rs`. An old `writer_write_ns` compares with
+  `crates/lib/src/write/metrics.rs`. An old `writer_write_ns` compares with
   `writer_pool_write_ns` on a pool-backend command (the pool's timer did not
   move) and roughly with `writer_handoff_ns` on every other backend, whose
   timer now also covers flattening a framed chunk, dropping the payload and
@@ -309,7 +309,7 @@ old commit messages. By topic:
   ships; multi-pass commands cannot consume streams).
 - The reverse-geocoding spec (deleted 2026-07-13; original
   implementation spec for `build-geocode-index` - the shipped
-  implementation deviated, format truth is `src/geocode_index/format.rs`
+  implementation deviated, format truth is `crates/lib/src/geocode_index/format.rs`
   doc comments).
 - Spatial index in PBF and way-blob bbox speculation (deleted
   2026-07-13; speculative research, no measurements; conclusions

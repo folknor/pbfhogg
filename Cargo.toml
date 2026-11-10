@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "harness"]
+members = ["crates/lib", "crates/cli", "crates/harness"]
 # Explicit: edition 2024 implies resolver 3 only for a root package, and a
 # virtual manifest has no edition, so without this it would drop to 1.
 resolver = "3"
@@ -57,110 +57,11 @@ unwrap_used = "deny"
 expect_used = "deny"
 too_many_lines = "deny"
 # Configured in clippy.toml and enabled only where the output choke point is
-# the rule: src/commands/mod.rs and cli/src/lib.rs deny it at module level.
+# the rule: crates/lib/src/commands/mod.rs and crates/cli/src/lib.rs deny it
+# at module level.
 disallowed_methods = "allow"
-
-[package]
-name = "pbfhogg"
-version.workspace = true
-authors.workspace = true
-description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
-license.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-readme = "LIBRARY.md"
-keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
-categories = ["parser-implementations", "encoding", "science::geo"]
-# An allowlist, so a new top-level file stays out of the published crate
-# unless it is named here. It ships the sources, the durable documents the
-# sources and README cite (reference/, decisions/, the docs pages,
-# DEVIATIONS.md, CORRECTNESS.md, LLM.md) and the doc examples' input; the
-# bench database, docs-site assets, host configs, notes, scripts and test
-# suite serve development, not library users.
-include = [
-    "/src/**/*.rs",
-    "/examples/*.rs",
-    "/tests/test.osm.pbf",
-    "/reference/*.md",
-    "/decisions/*.md",
-    "/docs/**/*.md",
-    "/Cargo.toml",
-    "/README.md",
-    "/LIBRARY.md",
-    "/CHANGELOG.md",
-    "/DEVIATIONS.md",
-    "/CORRECTNESS.md",
-    "/LLM.md",
-    "/LICENSE-APACHE",
-    "/LICENSE-MIT",
-]
-# Integration tests are declared below rather than discovered: one binary
-# per file made every check sweep link ~50 harnesses and a focused
-# `brokkr test` list every one of them to find one test. A file in tests/
-# that is neither a module of tests/all.rs nor a [[test]] below is never
-# compiled, and nothing reports it.
-autotests = false
-
-[features]
-default = ["commands"]
-geocode-reader = ["dep:s2"]
-commands = ["dep:serde_json", "geocode-reader"]
-# Function-level profiling for brokkr's `--hotpath` / `--alloc` modes. Unlike
-# the per-invocation counters and sink, the hotpath crate's state is
-# process-wide (static queues, one guard per process, and under
-# `hotpath-alloc` a global allocator the CLI installs), so concurrent runs in
-# one process share their figures. Meaningful for one run per process only.
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-linux-direct-io = []
-linux-io-uring = ["dep:io-uring"]
-# Test-only fault injection (`pbfhogg::test_hooks`): a fault plan carried by
-# each invocation's cancellation token, plus a few per-object hooks. Nothing
-# is process-global, so an armed fault cannot fire in a sibling test and any
-# test harness may use them. Product builds never enable it; the hook state
-# and checks then compile out entirely.
-test-hooks = []
-
-[dependencies]
-protohoggr = "0.5.0"
-bytes = "1.12.1"
-flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
-memmap2 = "0.9.11"
-rayon = "1.12.0"
-rustc-hash = "2.1.3"
-# `HashTable` for the block string table's slot index, keyed by bytes in
-# one arena rather than by an allocation per string.
-hashbrown = { version = "0.17.1", default-features = false }
-zstd = "0.14.0"
-hotpath = "0.31.0"
-quick-xml = "0.42.0"
-# XXH3-128 for `digest`; pure Rust, xxh3 only.
-xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
-serde_json = { workspace = true, optional = true }
-s2 = { version = "0.2.0", default-features = false, optional = true }
-io-uring = { version = "0.7.16", optional = true }
-libc = "0.2.191"
-
-
-[dev-dependencies]
-tempfile = "3.27.0"
-proptest = "1"
-
-# Every integration test that can share a process, as modules of one binary.
-[[test]]
-name = "all"
-path = "tests/all.rs"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-
-[lints]
-workspace = true
-
-# Own process because it lowers its own soft RLIMIT_NOFILE.
-[[test]]
-name = "process_nofile"
-path = "tests/process_nofile.rs"

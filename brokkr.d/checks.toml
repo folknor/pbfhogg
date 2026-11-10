@@ -30,8 +30,8 @@
 #
 # The sweeps that test the CLI select the CLI and the library harness
 # too. Every test that drives the `pbfhogg` binary lives in pbfhogg-cli
-# (cli/tests/all.rs), and every test that drives the harness in
-# pbfhogg-harness (harness/tests/all.rs), where cargo builds the binary
+# (crates/cli/tests/all.rs), and every test that drives the harness in
+# pbfhogg-harness (crates/harness/tests/all.rs), where cargo builds the binary
 # with that test build's features and hands its path as
 # CARGO_BIN_EXE_<name> - so there is no build_packages pre-build and no
 # binary from another sweep to pick up. Every package declares test-hooks,
@@ -78,7 +78,7 @@ parallel = {}
 #
 # Integration tests that reach into the feature-gated modules
 # (`check`, `export`, `extract`, `inspect::json`, `geocode_index`) carry
-# a `#[cfg(feature = "commands")]` on their `mod` line in tests/all.rs so
+# a `#[cfg(feature = "commands")]` on their `mod` line in crates/lib/tests/all.rs so
 # they drop out here and still run in full under `all` and `consumer`.
 #
 # Named explicitly rather than left to the workspace's default selection,
@@ -178,7 +178,7 @@ only = ["serial::"]
 include_ignored = true
 test_threads = 1
 
-# Tier 2 command-slice precedent. cli/tests/cli_sort.rs is already split into
+# Tier 2 command-slice precedent. crates/cli/tests/cli_sort.rs is already split into
 # root (tier 1) + mod backends (also tier 1); once it grows a mod tier2 (many-blob
 # boundary fixtures, scratch-leak sweeps), this profile picks them up.
 # Add similar entries for other commands as their tier-2 matrices

@@ -3,7 +3,7 @@
 ## check --refs and getid read through projections (bygg, 2026-11-01)
 
 check `--refs` and `getid --add-referenced` read each blob through a
-projection on the block validator (`src/read/project_ids.rs`, and getid's
+projection on the block validator (`crates/lib/src/read/project_ids.rs`, and getid's
 include probe) instead of building a `PrimitiveBlock` and walking its
 elements, as check `--ids` and getparents already did.
 

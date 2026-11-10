@@ -9,7 +9,7 @@ DEVIATIONS.md.
 **Status:** Packed encoding and a single unpacked value are supported.
 Multiple data-bearing occurrences of the same field are rejected.
 
-**Context:** `take_packed` in `src/read/wire.rs` accepts both a
+**Context:** `take_packed` in `crates/lib/src/read/wire.rs` accepts both a
 length-delimited packed segment and an individually tagged varint. A single
 unpacked value is retained as its original varint byte slice, so accepting it
 requires no per-element allocation or change to the packed iterators. This
@@ -23,7 +23,7 @@ segments are ignored in either position. A field written as several
 unpacked values therefore errors rather than silently dropping values.
 
 The singular embedded metadata messages follow the same rule
-(`take_message` in `src/read/wire.rs`): an element's `Info` and a dense
+(`take_message` in `crates/lib/src/read/wire.rs`): an element's `Info` and a dense
 group's `DenseInfo` may appear once with data, plus any number of empty
 occurrences. Protobuf merges repeated occurrences of a singular message, which
 one borrowed slice cannot express; keeping the last occurrence, as the parsers
@@ -47,10 +47,10 @@ these forms, are described in
 `diff`, `diff --format osc` and `digest` use them.
 
 **Context:** Tags and relation member roles are indices into the block's
-string table. `str_from_stringtable` (`src/read/block.rs`) bounds-checks every
+string table. `str_from_stringtable` (`crates/lib/src/read/block.rs`) bounds-checks every
 lookup and returns `StringtableIndexOutOfBounds` on a miss, but the infallible
-tag iterators cannot surface it: `TagIter` (`src/read/elements.rs`) and
-`DenseTagIter` (`src/read/dense.rs`) implement
+tag iterators cannot surface it: `TagIter` (`crates/lib/src/read/elements.rs`) and
+`DenseTagIter` (`crates/lib/src/read/dense.rs`) implement
 `Iterator<Item = (&str, &str)>`, and `get_stringtable_key_value` discards the
 error as `None`. A tag with an out-of-range key or value index therefore ends
 the element's tag list early, silently dropping it and every tag after it.
@@ -61,7 +61,7 @@ since the early end cannot be predicted without resolving every index.
 `tags_checked()` on `Node`, `Way`, `Relation` and `DenseNode` returns the
 fallible sibling (`CheckedTagIter`, `CheckedDenseTagIter`), which yields an
 `Err` for the bad tag instead. Element content for `diff` and `digest` is
-defined once, in `src/content.rs`, on these checked iterators and on
+defined once, in `crates/lib/src/content.rs`, on these checked iterators and on
 `RelMember::role`'s `Result`. A corrupt element there is never silently equal
 to anything: the block-pair paths compare it as unequal ("modified"), the
 streaming path's owned conversion errors, and `digest` refuses the file. The
@@ -71,7 +71,7 @@ byte-identical blobs as common without decoding either.
 Member roles and user names are not covered by this gap. `RelMember::role`
 and the `user` accessors return a `Result`, and every path that writes them
 propagates it: the re-encoding commands (through `relation_members_into`,
-`element_metadata` and `dense_node_metadata` in `src/owned.rs`, which the
+`element_metadata` and `dense_node_metadata` in `crates/lib/src/owned.rs`, which the
 owned-element conversions share) and the OSC writer refuse a bad role or user
 index with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
@@ -89,14 +89,14 @@ Blobs it copies unchanged are not decoded and not checked.
 
 `inspect tags` does not go through these iterators: it reads the raw index
 arrays through a projection on the block validator
-(`src/commands/tags_count/tally.rs`) and counts each element's tags by the
+(`crates/lib/src/commands/tags_count/tally.rs`) and counts each element's tags by the
 same rule, up to the first pair whose key or value index lies past the
 table, for key rows (which still check the value index) as for pair rows.
 Its unit tests hold its counts to the element walk's on every fixture and
 mutation, under key, pair and mixed selections, so the two cannot drift
 apart silently.
 
-`validate_block` (`src/read/block.rs`) does not close the gap: it is a
+`validate_block` (`crates/lib/src/read/block.rs`) does not close the gap: it is a
 structural pass that checks array framing and parallel-array lengths without
 resolving any string index, because resolving them would mean decoding every
 packed tag array up front. A tag array that ends mid-varint, or whose keys
@@ -140,7 +140,7 @@ historical version.
 **Fix strategy - two-tier normalization:**
 
 1. **Non-dense elements (Node, Way, Relation):** Normalized at parse time in
-   `WireInfo::parse` (`src/read/wire.rs`). After the field loop, `version == Some(-1)`
+   `WireInfo::parse` (`crates/lib/src/read/wire.rs`). After the field loop, `version == Some(-1)`
    and `changeset == Some(-1)` are mapped to `None`. This covers both the library API
    and all command paths with zero additional overhead - the parse loop is already
    branchy, and two comparisons on values in registers are invisible.
@@ -152,8 +152,8 @@ historical version.
    overhead on a path where every nanosecond matters. Instead, the sites that
    bridge dense reads to writes guard against -1:
    - `dense_node_metadata`, `dense_node_raw_metadata` and `read_dense_node` in
-     `src/owned.rs`
-   - the derive OSC writer in `src/osc/write.rs`, through
+     `crates/lib/src/owned.rs`
+   - the derive OSC writer in `crates/lib/src/osc/write.rs`, through
      `DenseNodeInfo::claims`
 
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
@@ -243,7 +243,7 @@ there.
 
 Every flat, rank-indexed coordinate store in the crate (the
 `add-locations-to-ways` sparse store and the geocode builder's Pass 2 store
-among them) shares one slot encoding, defined once in `src/coord_pack.rs`:
+among them) shares one slot encoding, defined once in `crates/lib/src/coord_pack.rs`:
 latitude biased by 90 degrees, which puts every legal latitude below `2^31`
 and leaves bit 31 of the low word free as an explicit presence flag, with
 longitude verbatim in the high word. An untouched slot still reads as absent
@@ -261,9 +261,9 @@ backends disagreed about the same input.
 
 The end-to-end behaviour is pinned by
 `null_island_real_node_is_not_reported_missing` in
-`cli/tests/cli_add_locations_to_ways.rs`, which runs on both backends, and by
+`crates/cli/tests/cli_add_locations_to_ways.rs`, which runs on both backends, and by
 `null_island_street_vertex_is_not_treated_as_absent` in
-`tests/geocode_index.rs`.
+`crates/lib/tests/geocode_index.rs`.
 
 The one remaining all-zero sentinel of this shape, the blob index's "no
 bbox", was also retired: `(0, 0, 0, 0)` is the legal bbox of a single-node
@@ -289,7 +289,7 @@ and the second added one - see `DEVIATIONS.md`.
 **Context:** `SlimInterpWay` (the in-memory staging struct that flushes to
 `interp_ways.bin` as `InterpWay`) stores resolved interpolation house
 numbers in `start_number: u32, end_number: u32`. The resolver
-(`resolve_interpolation_ways_mmap` in `src/geocode_index/builder/interp.rs`)
+(`resolve_interpolation_ways_mmap` in `crates/lib/src/geocode_index/builder/interp.rs`)
 runs after Pass 2 and takes each node's number from the addr points on
 the way's street or place at exactly that node's coordinate (ADR-0024), splitting
 the way into one record per section between address nodes.
@@ -303,7 +303,7 @@ mode).
 
 **Impact:** A 0 at either end means unresolved, so the way yields no
 interpolated number
-(`InterpolationType::answers` in `src/geocode_index/format.rs`, which
+(`InterpolationType::answers` in `crates/lib/src/geocode_index/format.rs`, which
 the reader's `interpolation_total_length` and `number_at` both apply). House number 0 is therefore unsupported as
 an interpolation endpoint. "0" as a house number is rare but exists in
 some regions.
@@ -325,12 +325,12 @@ places:
 - Per-cell entry counts for street / addr / interp segments
   (`street_entries.bin`, `addr_entries.bin`, `interp_entries.bin`) and
   for admin polygons (`admin_entries.bin`). Every entry list shares one
-  framing, owned by `src/geocode_index/format.rs`: a `ListCount` (u16)
+  framing, owned by `crates/lib/src/geocode_index/format.rs`: a `ListCount` (u16)
   prefix read by `Table::list`, with list sizes from `list_byte_len`.
 - Per-way node counts in `StreetWay.node_count` and
-  `InterpWay.node_count` (`src/geocode_index/format.rs`).
+  `InterpWay.node_count` (`crates/lib/src/geocode_index/format.rs`).
 
-The builder (`src/geocode_index/builder/`) used to silently truncate
+The builder (`crates/lib/src/geocode_index/builder/`) used to silently truncate
 oversized cells/ways to `u16::MAX`, producing silently-incomplete output.
 It now hard-errors at the write site via `u16::try_from(...)`, naming the
 offending cell or way in the error message.
@@ -349,7 +349,7 @@ costs on-disk growth and forces regeneration of existing indexes; a
 hard error is a strictly better signal than silent truncation until a
 real workload actually hits the cap. If that happens, the error message
 names the exact field and the migration path: bump the count to `u32`
-and increment `FORMAT_VERSION` in `src/geocode_index/format.rs`.
+and increment `FORMAT_VERSION` in `crates/lib/src/geocode_index/format.rs`.
 
 ## `BlobHeader.datasize` cap (hard error before allocation)
 
@@ -367,7 +367,7 @@ body allocation (`Vec::with_capacity(datasize)` in `BlobReader::next`,
 against `HeaderWalker` metadata) to an arbitrary size ahead of the 32 MiB
 guard - a memory-amplification vector on every command that reads PBF input.
 
-**Fix:** `MAX_BLOB_DATASIZE` (`src/read/blob_wire.rs`), set to 32 MiB (defined
+**Fix:** `MAX_BLOB_DATASIZE` (`crates/lib/src/read/blob_wire.rs`), set to 32 MiB (defined
 as an alias of `MAX_BLOB_MESSAGE_SIZE` to keep the relationship explicit),
 rejects the declared size at the boundary with the typed
 `BlobError::DataSizeTooBig` before any allocation. This is **not** a written
@@ -435,7 +435,7 @@ order (`-1, -2, -3, ...`) are not false-flagged.
 **Which blobs get the payload check - keyed on the header claim, not on
 indexdata:** Indexdata presence does NOT imply an internally sorted payload.
 `cat` attaches indexdata to arbitrary third-party blobs without reordering
-them (`src/commands/cat/mod.rs`, reframe path), and
+them (`crates/lib/src/commands/cat/mod.rs`, reframe path), and
 `PbfWriter::write_primitive_block` indexes caller-provided blocks as-is - so
 "indexdata is pbfhogg-written, hence sorted" is false: an unsorted
 non-indexed file piped through `cat` yields indexed-but-unsorted blobs. Pass
@@ -455,7 +455,7 @@ on:
   sorted claim, so their output - indexed or not - is detected and repaired,
   not passed through.
 
-**`cat --dedupe` shares this pass 1** (`src/commands/blob_merge.rs`). Every
+**`cat --dedupe` shares this pass 1** (`crates/lib/src/commands/blob_merge.rs`). Every
 dedupe input must claim `Sort.Type_then_ID`, so only its blobs without
 indexdata take the checked scan, and one found internally out of order is
 rewritten through the sweep like an overlapping blob - which also drops any
@@ -463,7 +463,7 @@ exact duplicates inside it - rather than copied through under the sorted
 stamp.
 
 **The sweep reads a believed blob in order and refuses a descent.** The
-overlap sweep (`src/commands/blob_merge/sweep.rs`) merges borrowed cursors
+overlap sweep (`crates/lib/src/commands/blob_merge/sweep.rs`) merges borrowed cursors
 and emits each blob's elements in the order it reads them, so a blob placed
 in an overlap run on its believed claim whose IDs descend internally is
 refused as `Unsorted` when the descent is read, where the earlier owned-heap

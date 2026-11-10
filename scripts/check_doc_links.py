@@ -56,7 +56,7 @@ other ignored trees never matter:
      site, or a GitHub URL naming a site page, is reported even when the
      file exists.
 
-  3. source-comment-citations: comments under ``src/`` do not cite a Rust
+  3. source-comment-citations: comments under ``crates/lib/src/`` do not cite a Rust
      source line number. It loses its context as code moves; the comment must
      carry the needed context inline. (The work-item list lives in ``notes/``,
      so check 1 refuses a citation of it.)
@@ -610,6 +610,11 @@ def main():
     for rel in FILES:
         if not is_durable(rel):
             continue
+        # A packaging symlink (crates/lib/LIBRARY.md and its kin) is the root
+        # file it points at, read through another directory: its relative
+        # links resolve against the root, not against the link.
+        if (ROOT / rel).is_symlink():
+            continue
         suffix = pathlib.PurePosixPath(rel).suffix
         if suffix not in MARKDOWN | RUST | COMMENTED:
             continue
@@ -635,7 +640,7 @@ def main():
                 for cite in notes_citations(rel, scope):
                     transient_cites.append(f"{rel}:{num}: {cite}")
             if comment is not None:
-                if rel.startswith("src/") and suffix == ".rs":
+                if rel.startswith("crates/lib/src/") and suffix == ".rs":
                     for match in SOURCE_COMMENT_CITATION_RE.finditer(comment):
                         source_comment_cites.append(
                             f"{rel}:{num}: {match.group(0)}"

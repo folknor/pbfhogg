@@ -111,7 +111,7 @@ Same axis points re-measured at europe scale on the fixed writer
 Pool-size sweep at cross-disk zstd:1 (plantasjen, Samsung 990 PRO):
 4 → 89.2 s, 8 → 83.4 s, 16 → **80.9-82.1 s** (two runs), 32 → 82.2 s.
 POOL_SIZE=16 is hard-coded in
-[`src/write/parallel_writer.rs`](../../src/write/parallel_writer.rs); the
+[`crates/lib/src/write/parallel_writer.rs`](../../crates/lib/src/write/parallel_writer.rs); the
 comment explains the measurement. Over-contends above 16.
 
 ### Same-disk `-j N` sweep (LOW + zstd:1, planet, commit `16e3694`)
@@ -429,7 +429,7 @@ framed in parallel on the invocation's executor when it spans more than one
 block (`stream_output::CreateEncoder`), and written raw in order. The
 node-to-way transition went from 335 ms to 66 ms, and the live growth over
 it from +0.71 GB to +0.13 GB. Output blocks are unchanged
-(`tests/apply_changes_create_runs.rs` pins the cuts).
+(`crates/lib/tests/apply_changes_create_runs.rs` pins the cuts).
 
 Interleaved cells, in run order change, HEAD, HEAD, change, change, HEAD,
 HEAD, change:
@@ -800,7 +800,7 @@ cell was run, since the dense hot path's work is unchanged.
 ### apply-changes' create-run loop lifted into a function its tests drive (bygg, 2026-11-04, against `3c5b8d3a`)
 
 `CreateEncoder::emit`'s batching and ordered-write loop moved, unchanged,
-into `write_run` (`src/commands/apply_changes/stream_output.rs`), which
+into `write_run` (`crates/lib/src/commands/apply_changes/stream_output.rs`), which
 takes the block encoder and the frame writer as closures so unit tests can
 fail chosen blocks and record what is written. The closures are
 monomorphized; no change was expected, and one cell checks that.
@@ -907,7 +907,7 @@ overlay (the next section counts each part). Across a week,
 `merge-changes --simplify` over seq 4914-4920 (cell `0df5c0ad`, `44c62853`)
 reduced 26,261,540 changes to 25,417,990, 3.2 % by count. Compacting the
 overlay was declined on these numbers; the reasoning sits on
-`CompactDiffOverlay` in `src/osc/parse.rs`.
+`CompactDiffOverlay` in `crates/lib/src/osc/parse.rs`.
 
 ## Apply-changes retained lookup storage (bygg, 2026-11-02)
 
@@ -931,7 +931,7 @@ agreed (`mallinfo2` after the ID ranges: 610 MB in mapped chunks plus 40 MB
 in the heap). After the parse nothing reads the hash indexes, deleted
 sets, floors or lookup map except through lookups the sorted vectors could
 answer, so apply-changes now turns the overlay into `SortedDiff`
-(`src/osc/sorted.rs`): per kind sorted upsert IDs, parallel record
+(`crates/lib/src/osc/sorted.rs`): per kind sorted upsert IDs, parallel record
 offsets and sorted deletes, 60 MB, the same as `DiffRanges` alone. Retained
 allocation 650 MB to 530 MB (`merge_diff_heap_bytes` 574,583,740 estimated
 to 530,454,912 exact); anon at the end of setup about 570 MB to about
@@ -1009,7 +1009,7 @@ little coordinate work, and the current code refuses them.
 leaving ways that use a moved node stale. The fix searches those blobs
 (wire-level scan, clean ones still spliced) and refreshes surviving ways
 in rewritten blobs. Before it landed, a read-only measurement
-(`examples/stale_way_blobs.rs`) put the cost at about 5% more way blobs
+(`crates/lib/examples/stale_way_blobs.rs`) put the cost at about 5% more way blobs
 rewritten at europe and 4% at planet, with detection, not recompression,
 the work to manage. On europe the added worker time (about +137 s summed
 over 22 workers: decompress, scan, rewrite, frame) was mostly offset by
@@ -1019,7 +1019,7 @@ noise. Figures in `reference/performance/apply-changes.md` "Inline-location refr
 
 Pool-size sweep at cross-disk zstd:1 (plantasjen, Samsung 990 PRO):
 4 → 89.2 s, 8 → 83.4 s, 16 → 80.9-82.1 s (two runs), 32 → 82.2 s.
-POOL_SIZE=16 is hard-coded in `src/write/parallel_writer.rs`. Over-contends
+POOL_SIZE=16 is hard-coded in `crates/lib/src/write/parallel_writer.rs`. Over-contends
 above 16.
 
 ---

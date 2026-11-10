@@ -29,7 +29,7 @@ From any `Read + Send` implementation:
 ```rust
 use pbfhogg::ElementReader;
 
-let f = std::fs::File::open("tests/test.osm.pbf")?;
+let f = std::fs::File::open("crates/lib/tests/test.osm.pbf")?;
 let buf_reader = std::io::BufReader::new(f);
 let reader = ElementReader::new(buf_reader)?;
 # Ok::<(), std::io::Error>(())
@@ -42,7 +42,7 @@ Readers leave the page cache alone by default: a file you read stays warm for a 
 ```rust
 use pbfhogg::ElementReader;
 
-let reader = ElementReader::from_path_with_eviction("tests/test.osm.pbf", true)?;
+let reader = ElementReader::from_path_with_eviction("crates/lib/tests/test.osm.pbf", true)?;
 # drop(reader);
 # Ok::<(), std::io::Error>(())
 ```
@@ -54,7 +54,7 @@ The PBF header is available immediately after construction:
 ```rust
 use pbfhogg::ElementReader;
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 
 if reader.header().is_sorted() {
     println!("PBF is sorted by type then ID");
@@ -85,7 +85,7 @@ Decodes on the calling thread with no background I/O. Simplest interface, but 6x
 ```rust
 use pbfhogg::{ElementReader, Element};
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 let mut ways = 0_u64;
 
 reader.for_each(|element| {
@@ -105,7 +105,7 @@ Uses a 3-stage pipeline (I/O thread, rayon decode pool, reorder buffer) to overl
 ```rust
 use pbfhogg::{ElementReader, Element};
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 let mut node_count = 0_u64;
 
 reader.for_each_pipelined(|element| {
@@ -126,7 +126,7 @@ Distributes blobs across dedicated worker threads (not the host's `Executor`) in
 ```rust
 use pbfhogg::{ElementReader, Element};
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 let ways = reader.par_map_reduce(
     |element| match element {
         Element::Way(_) => 1_u64,
@@ -147,7 +147,7 @@ Delivers owned `PrimitiveBlock`s in file order. The consumer can send blocks to 
 ```rust
 use pbfhogg::{ElementReader, Element};
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 let mut total = 0_u64;
 
 reader.for_each_block_pipelined(|block| {
@@ -170,7 +170,7 @@ Dropping the iterator early closes its channel and joins the background thread, 
 ```rust
 use pbfhogg::ElementReader;
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 
 for block_result in reader.into_blocks_pipelined()? {
     let block = block_result?;
@@ -186,7 +186,7 @@ The pipelined methods accept optional tuning via builder methods:
 ```rust
 use pbfhogg::ElementReader;
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?
     .decode_threads(4)    // override decode pool size (default: sized from the host's resources)
     .read_ahead(32)       // raw blobs buffered between I/O and decode (default: 16)
     .decode_ahead(64);    // decoded blocks buffered before consumer (default: 32)
@@ -214,7 +214,7 @@ In practice, most PBF files use dense nodes exclusively. When matching nodes, al
 ```rust
 use pbfhogg::{ElementReader, Element};
 
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
+let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?;
 reader.for_each(|element| {
     match element {
         Element::Node(node) => {
@@ -297,7 +297,7 @@ wraps the same way. Range-check the values if your input is untrusted.
 ```rust
 use pbfhogg::{BlobReader, BlobType};
 
-let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
+let mut reader = BlobReader::from_path("crates/lib/tests/test.osm.pbf")?;
 
 for blob in &mut reader {
     let blob = blob?;
@@ -323,7 +323,7 @@ reads:
 ```rust
 use pbfhogg::{BlobReader, BlobDecode, Element};
 
-let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
+let mut reader = BlobReader::from_path("crates/lib/tests/test.osm.pbf")?;
 reader.set_parse_waymembers(true);
 
 for blob in &mut reader {

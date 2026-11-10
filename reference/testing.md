@@ -9,7 +9,7 @@ that skip or compile out by default.
 
 Tests go where they couple least.
 
-- **Inline unit tests** in `src/**/*.rs` `#[cfg(test)] mod tests` -
+- **Inline unit tests** in `crates/lib/src/**/*.rs` `#[cfg(test)] mod tests` -
   module internals; die with the module on rewrite, which is the
   point.
 - **Platform-dependent tests** (O_DIRECT, io_uring) sit with the code
@@ -27,10 +27,10 @@ Tests go where they couple least.
   skip line included. There is no platform module or profile;
   a platform test with a known bug is `#[ignore]`d and skipped by name
   in the `full` profile.
-- **Stable-API integration tests** in `tests/<topic>.rs` (e.g.
-  `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
+- **Stable-API integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
+  `crates/lib/tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
-- **CLI integration tests** in `cli/tests/cli_*.rs`, in the
+- **CLI integration tests** in `crates/cli/tests/cli_*.rs`, in the
   `pbfhogg-cli` package - drive the `pbfhogg` binary via `CliInvoker`;
   internal modules are invisible. Every test that spawns the binary
   lives there and nowhere else: cargo builds the binary for that
@@ -38,7 +38,7 @@ Tests go where they couple least.
   profile and target, and hands its path as `CARGO_BIN_EXE_pbfhogg`.
   The root package's tests get no such path, so they have no way to
   reach the binary at all.
-- **Fault-injection tests** in `tests/fault_*.rs`, modules of `all`
+- **Fault-injection tests** in `crates/lib/tests/fault_*.rs`, modules of `all`
   like every other library test (plus a few unit tests beside the
   code they fault, such as `write::parallel_gzip`'s). Coupled to the
   `pbfhogg::test_hooks` surface by design.
@@ -55,26 +55,26 @@ declared in its `Cargo.toml`. One binary per file made every check
 sweep link and start one harness per file, and a focused `brokkr test
 NAME` list each harness in turn to find one test.
 
-- **`tests/all.rs`** (the library package) mounts every integration
+- **`crates/lib/tests/all.rs`** (the library package) mounts every integration
   test file that can share a process as a module, and mounts
-  `tests/common/` once. **`cli/tests/all.rs`** (the `pbfhogg-cli`
+  `crates/lib/tests/common/` once. **`crates/cli/tests/all.rs`** (the `pbfhogg-cli`
   package) is its twin for every CLI-driving test: the `cli_*.rs`
   files, `cli.rs`, and `invoker.rs` (the `CliInvoker`), with
-  `tests/common/` mounted by `#[path]`. A test's full libtest name is
+  `crates/lib/tests/common/` mounted by `#[path]`. A test's full libtest name is
   `<file>::<path in file>` (`cli_sort::backends::...`) and carries no
   package, so tier filters (`tier2::`, `serial::`, ...) and leaf-name
   filters match in both binaries; a brokkr profile names the target
   `all` plus an `only` filter on the module (`cli_sort::`). Library
   test files gated on a feature carry the `#[cfg]` on their `mod` line
-  in `tests/all.rs`, so it alone shows what drops out of the `minimal`
+  in `crates/lib/tests/all.rs`, so it alone shows what drops out of the `minimal`
   sweep; the CLI binary has no such gates, since `pbfhogg-cli` always
-  links the library with `commands`. **`harness/tests/all.rs`** (the
+  links the library with `commands`. **`crates/harness/tests/all.rs`** (the
   `pbfhogg-harness` package) is the third: the tests that drive the
-  library harness executable (`exe.rs`), with `tests/common/` and the
-  promise guard (`cli/tests/guard.rs`, mounted at the crate root so its
+  library harness executable (`exe.rs`), with `crates/lib/tests/common/` and the
+  promise guard (`crates/cli/tests/guard.rs`, mounted at the crate root so its
   control test keeps the name `guard::tests::probe`) mounted by path.
   The harness's own unit tests live in its bin target.
-- **`tests/common/` is shared by path, not by a crate.** Each package
+- **`crates/lib/tests/common/` is shared by path, not by a crate.** Each package
   compiles it with its own features, which carry the same names
   (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
   on those means the same thing in both. `commands` does not: in
@@ -83,12 +83,12 @@ NAME` list each harness in turn to find one test.
   `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
   helper would therefore silently drop CLI tests out of those sweeps, so
   the `no-library-feature-gates-in-tests-common` textlint rule in
-  `brokkr.toml` bans both gates under `tests/common/`; gate the `mod`
-  line in `tests/all.rs` instead. A helper crate would see only its
+  `brokkr.toml` bans both gates under `crates/lib/tests/common/`; gate the `mod`
+  line in `crates/lib/tests/all.rs` instead. A helper crate would see only its
   own features, and its dependency on the library would have to keep
-  `commands` off for the `minimal` sweep. `tests/common/` holds fixtures
+  `commands` off for the `minimal` sweep. `crates/lib/tests/common/` holds fixtures
   only; nothing in it spawns the binary.
-- **A new test file not declared in its package's `tests/all.rs` (or as
+- **A new test file not declared in its package's `crates/lib/tests/all.rs` (or as
   its own `[[test]]`) is never compiled, and no test or coverage audit
   reports it.** Add the `mod` line with the file.
 - **A test that must own its process** gets its own `[[test]]` target
@@ -128,12 +128,12 @@ NAME` list each harness in turn to find one test.
   in `brokkr.toml` keep it that way (`no-static-fault-hook-state`,
   `fault-hooks-only-in-test-hooks`).
 
-The `pbfhogg-cli` program is its library target (`cli/src/lib.rs`,
+The `pbfhogg-cli` program is its library target (`crates/cli/src/lib.rs`,
 `pbfhogg_cli`); the `pbfhogg` bin is only `main` calling
 `pbfhogg_cli::run` and sets `test = false`. The library target exists
 so the package's tests reach the command tree production parses,
-`pbfhogg_cli::cli_command()`: the unit tests in `cli/src/` walk it, and
-the command-table tests in `cli/tests/` take their subcommand lists
+`pbfhogg_cli::cli_command()`: the unit tests in `crates/cli/src/` walk it, and
+the command-table tests in `crates/cli/tests/` take their subcommand lists
 from it (`invoker::subcommands`, `invoker::subcommand_paths`), never
 from `--help` text. It is not an API and sets `doctest = false`.
 
@@ -150,7 +150,7 @@ and `geocode-reader` sweeps stay root-only: the CLI's lib dep would turn
 Every `pbfhogg` child the CLI tests start goes through `CliInvoker`, and
 on Linux (little-endian x86_64 or aarch64, with
 `SECCOMP_RET_KILL_PROCESS`) runs under the promise guard
-(`cli/tests/guard.rs`): it inherits a pipe descriptor as a caller's
+(`crates/cli/tests/guard.rs`): it inherits a pipe descriptor as a caller's
 lease, and a seccomp filter kills it with `SIGSYS` if it starts a
 process or closes, duplicates, passes or reflags that descriptor, at
 any point in its run. `CliInvoker` turns such a death into a failure
@@ -167,8 +167,8 @@ enables hotpath's process-starting CPU profiler. `guard::tests` re-runs the test
 rule to prove each one fires and that the allowed neighbours do not. A
 test that starts the binary some other way escapes the guard: do not.
 The library harness inherits brokkr's lease the same way and keeps the
-same promise; every child `harness/tests/exe.rs` starts runs under the
-same guard, mounted from `cli/tests/guard.rs`.
+same promise; every child `crates/harness/tests/exe.rs` starts runs under the
+same guard, mounted from `crates/cli/tests/guard.rs`.
 
 ## Validation tiers
 
@@ -204,7 +204,7 @@ with an empty `data/`.
 
 **No test depends on the host.** No goldens blessed on one machine, no
 core-count, memory or rlimit preconditions. `common::test_host()` and,
-for unit tests under `src/`, `Host::for_tests()` hand the library a
+for unit tests under `crates/lib/src/`, `Host::for_tests()` hand the library a
 `host::Fixed` (a fixed core count and memory budget), so library
 tests see the same machine everywhere; a test that needs a
 different machine sets its own `host::Fixed`. Tests may still skip where
@@ -212,7 +212,7 @@ the host lacks a feature (O_DIRECT, io_uring, osmium in PATH,
 unprivileged user namespaces).
 
 **Small configurations come through existing seams, not tunable
-overrides.** The constants in `src/tunables.rs` get no runtime or
+overrides.** The constants in `crates/lib/src/tunables.rs` get no runtime or
 test-only override by default. A test that needs a small configuration
 uses the host's resources and `-j` for worker counts, the engine's own
 parameters (the ordered pool's `PoolConfig`, the parallel reader's
@@ -220,17 +220,17 @@ private budget and batch sizes) or a crate-private dispatch function; a
 constant that blocks a named test gets a narrow private parameter at the
 mechanism that owns it. A cross-crate test instrument (getparents'
 full-scan threshold) is hidden and unsupported. The module doc of
-`src/tunables.rs` gives the reasons.
+`crates/lib/src/tunables.rs` gives the reasons.
 
 **No checked-in input data.** Fixture PBFs are built at test time into
-scratch by the `tests/common` writers (`write_test_pbf*`,
+scratch by the `crates/lib/tests/common` writers (`write_test_pbf*`,
 `write_multi_block_test_pbf`, `write_base_pbf` and its `changed` and
 `bad_indexdata` variants) from the `generate_*` element generators, with
 `common::adversarial` for byte-level damage. One exception:
-`tests/test.osm.pbf` is the input the library's doc examples and guide pages
+`crates/lib/tests/test.osm.pbf` is the input the library's doc examples and guide pages
 open by name, so an example a reader copies stays short and real, and a few
-unit tests in `src/read/` read it too. It is small, host-independent and
-regenerated by `examples/gen_test_pbf.rs`; nothing else may be checked in,
+unit tests in `crates/lib/src/read/` read it too. It is small, host-independent and
+regenerated by `crates/lib/examples/gen_test_pbf.rs`; nothing else may be checked in,
 and new tests build their own input.
 
 `mod serial` is an orthogonal config overlay, not a tier. Same for `#[ignore = "external"]` (escape hatch for in-tree
@@ -252,7 +252,7 @@ fault hook).
 
 Tiers 2-5 are by construction internal-refactor-immune: every test
 goes through the stable allowlist or the CLI surface, so a rewrite
-of `src/commands/<X>/` cannot break them by type changes alone.
+of `crates/lib/src/commands/<X>/` cannot break them by type changes alone.
 That is the load-bearing property of the test reorg.
 
 ### Stable allowlist
@@ -268,7 +268,7 @@ Everything else is non-stable and requires CLI conversion.
 
 ### Per-command CLI test split
 
-Each `cli/tests/cli_<command>.rs` splits intent inside the file:
+Each `crates/cli/tests/cli_<command>.rs` splits intent inside the file:
 
 - **Root or `tier1` module**: small CLI contracts; runs in
   `brokkr check`.
@@ -281,7 +281,7 @@ Each `cli/tests/cli_<command>.rs` splits intent inside the file:
 - **`serial`**: requires `--test-threads=1`. Fault injection is not a
   `serial` case: its state is per run.
 
-`cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
+`crates/cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
 
 ### Tests that do not run everywhere
@@ -319,16 +319,16 @@ Lives in `brokkr verify`, not the in-tree test crate:
 `#[ignore = "external"]`, skips where osmium is absent, and exists
 because its handcrafted fixture reaches a path a dataset run does not:
 
-- `cli/tests/cli_sort.rs::sort_cross_validate_osmium` - overlapping-blob
+- `crates/cli/tests/cli_sort.rs::sort_cross_validate_osmium` - overlapping-blob
   fixture; `brokkr verify sort` on a configured dataset runs against
   real data only and doesn't exercise the streaming sweep merge's
   overlap-run path. `brokkr verify <command> --input <path>` already
   accepts a handcrafted PBF; the missing piece is an overlapping-fixture
-  builder under `examples/`, after which the comparison moves to
+  builder under `crates/lib/examples/`, after which the comparison moves to
   `brokkr verify sort --input`.
-- `cli/tests/cli_digest.rs::osmium_reencodings_digest_equal` - pins the
+- `crates/cli/tests/cli_digest.rs::osmium_reencodings_digest_equal` - pins the
   encodings a real dataset run does not vary.
-- `cli/tests/cli_apply_changes_osmium.rs` - `apply-changes
+- `crates/cli/tests/cli_apply_changes_osmium.rs` - `apply-changes
   --locations-on-ways` against osmium on a base and change file built so
   that both tools' documented semantics coincide (osmium's location
   index has ordering defects that decide its output otherwise; the
@@ -373,14 +373,14 @@ exception, not a tier - should not survive across many PRs.
 - **Cancellation hooks.** `Invocation::on_check` (per-instance, `test-hooks`)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from
-  the callback (`tests/cancel.rs`). The CLI, built with `test-hooks`, reads
+  the callback (`crates/lib/tests/cancel.rs`). The CLI, built with `test-hooks`, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and
   `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
   reaching checkpoint `k`, writes the ready file, and waits for the token;
   `stuck` writes `<ready file>.ack` once tripped and never returns, so only
   a second signal ends the run. The interruption tests in
-  `cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
+  `crates/cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
   sampled ordinals (tier 1) or at every ordinal of the counting run (its
   `tier3` shards, run by `--profile full` and the gate), signal it, and
   assert the exit code and an empty directory, with no sleeps. Ordinals are
@@ -405,22 +405,22 @@ exception, not a tier - should not survive across many PRs.
   cannot pass unarmed. `--simplify` is not affected. The CLI, built with
   `test-hooks`, arms it from `PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST=<n>`
   (a value that does not parse exits 101); the two-input merge-changes
-  row of the interruption sweeps runs under `1`, and `tests/cancel.rs`
+  row of the interruption sweeps runs under `1`, and `crates/lib/tests/cancel.rs`
   arms it for its merge-changes entry.
 - **Capability accounting.** `Invocation::capabilities` (`test-hooks`,
   doc-hidden) reads the invocation's transition word (live call guards and
   permits, and whether a count saturated) and its census (issued block
-  iterators, writers, bound outputs and blocks). `tests/cancel.rs` asserts it
+  iterators, writers, bound outputs and blocks). `crates/lib/tests/cancel.rs` asserts it
   is back to all zero after every command at every tripped checkpoint, that
   no command issues its own values, and that a nested public entry mints its
-  own guard; `tests/capabilities.rs` parks a block iterator's pipeline in the
+  own guard; `crates/lib/tests/capabilities.rs` parks a block iterator's pipeline in the
   caller's `Read` (a stream whose reads off the building thread wait on a
   channel) and checks the values a caller holds at rest are accounted for.
-  The word's saturation arithmetic is a unit test in `src/host.rs`, on the
+  The word's saturation arithmetic is a unit test in `crates/lib/src/host.rs`, on the
   field helpers with forced boundary values, beside the seal's
   classification and a threaded race of the seal's exchange against
   retirements and nested mints.
-- **Sealing.** `tests/seal.rs` (`test-hooks`, Unix) seals invocations that
+- **Sealing.** `crates/lib/tests/seal.rs` (`test-hooks`, Unix) seals invocations that
   own a call sink on a real FIFO drained on a thread, and reads the stream
   back. `FaultPlan::on_seal_step` parks or unwinds the finalizing thread at
   a `SealStep` (`Snapshot`, before the commit point; `Stream`, after the
@@ -429,7 +429,7 @@ exception, not a tier - should not survive across many PRs.
   deterministic; a tap parked inside an emission shows a seal refused while
   a callback is in flight. The sink's own endings (a terminal record a full
   FIFO turned away, a reader gone, an unwind before the terminal) are unit
-  tests in `src/debug.rs`, on a FIFO whose reader never reads.
+  tests in `crates/lib/src/debug.rs`, on a FIFO whose reader never reads.
 - **Publication hooks.** Publication is not cancellable, so no checkpoint
   lies inside it and the pauses above never land there. Instead it
   announces each namespace step that succeeded (`PublishStep`: a backup
@@ -442,7 +442,7 @@ exception, not a tier - should not survive across many PRs.
   observer that panics still leaves a truthful publication row. The
   publication log's own contract (ordinals, decisions, cancel outcomes,
   effects through every fault, re-entry, an unwinding observer) is tested
-  through the public API in `tests/publication.rs`, parking at a
+  through the public API in `crates/lib/tests/publication.rs`, parking at a
   `before_publish` hook or an `on_check` checkpoint and releasing over a
   channel within a bounded wait. The CLI, built with `test-hooks`, reads
   `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>,...` (faults spelled as
@@ -452,7 +452,7 @@ exception, not a tier - should not survive across many PRs.
   and `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` with
   `PBFHOGG_TEST_PUBLISH_READY=<file>` (writes the ready file after that
   step and never returns, so only a kill ends the run). The
-  `killed_in_publication` tests in `cli/tests/cli_output_contract.rs`
+  `killed_in_publication` tests in `crates/cli/tests/cli_output_contract.rs`
   record each scenario's steps with a counting run under the same faults,
   SIGKILL a run after every one, check the leftovers against the recorded
   steps replayed through a per-output model, remove `--staging-dir` and
@@ -469,8 +469,8 @@ exception, not a tier - should not survive across many PRs.
   output once moved), then checks what each destination and kept backup
   holds at the end. It walks the step prefixes a kill would leave, without
   killing anything.
-- **CliInvoker for CLI-driven tests.** `cli/tests/invoker.rs`. Every
-  new `cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
+- **CliInvoker for CLI-driven tests.** `crates/cli/tests/invoker.rs`. Every
+  new `crates/cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via
   `.timeout(Duration)`. Platform-skip
   predicates `is_o_direct_unsupported`, `is_uring_unsupported` require
@@ -485,39 +485,39 @@ exception, not a tier - should not survive across many PRs.
 - **Skips.** A test that cannot run on this host (no O_DIRECT, no
   io_uring, no osmium in PATH, no unprivileged user namespaces) calls
   `common::skip(reason)` (`test_support::skip` in a unit test under
-  `src/`) and returns, or names the portion it drops when the rest of
+  `crates/lib/src/`) and returns, or names the portion it drops when the rest of
   the test still runs.
-- **Adversarial fixtures.** `tests/common/adversarial.rs` provides
+- **Adversarial fixtures.** `crates/lib/tests/common/adversarial.rs` provides
   byte-level mutation primitives: `locate_blobs`,
   `mutate_blob_header_indexdata`, `mutate_blob_payload`,
   `truncate_to`. Hand-rolled varint reader, no internal pbfhogg
   imports.
-- **Negative-id generators.** `tests/common/mod.rs` provides
+- **Negative-id generators.** `crates/lib/tests/common/mod.rs` provides
   `generate_nodes_with_negatives`, `generate_ways_with_negatives`,
   `generate_relations_with_negatives` for mixed-sign fixtures (per
   `decisions/0002-negative-ids-rejected-project-wide.md`).
-- **Test scratch.** `tests/common/scratch.rs` owns random, RAII-cleaned
+- **Test scratch.** `crates/lib/tests/common/scratch.rs` owns random, RAII-cleaned
   directories under the workspace's `data/test-scratch/` (also when the
-  CLI package mounts it, whose manifest directory is `cli/`). It is the
+  CLI package mounts it, whose manifest directory is `crates/cli/`). It is the
   one implementation for every harness: integration tests reach it as
-  `common::test_scratch()`, and unit tests under `src/` as
+  `common::test_scratch()`, and unit tests under `crates/lib/src/` as
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
   so the library's unit tests never link the integration harness. The CLI
-  crate's own unit tests use `test_scratch::scratch()` (`cli/src/test_scratch.rs`),
+  crate's own unit tests use `test_scratch::scratch()` (`crates/cli/src/test_scratch.rs`),
   which cannot mount the integration file but has the same body, as does
-  the library harness's (`harness/src/test_scratch.rs`). Every
+  the library harness's (`crates/harness/src/test_scratch.rs`). Every
   test scratch site goes through one of these (enforced by the
   `unit-test-scratch-via-path-guard` textlint in `brokkr.toml`, which covers
-  `src/`, `tests/`, `cli/tests/`, `cli/src/`, `harness/src/` and
-  `harness/tests/`). Keep the guard
+  `crates/lib/src/`, `crates/lib/tests/`, `crates/cli/tests/`, `crates/cli/src/`, `crates/harness/src/` and
+  `crates/harness/tests/`). Keep the guard
   alive for the fixture lifetime (the `TempDir` drop is the cleanup, so no
   manual `remove_dir_all` is needed). Never use benchmark scratch or
   fixed shared names.
-- **Scratch tracking.** `tests/common/mod.rs` exports `snapshot_dir`
+- **Scratch tracking.** `crates/lib/tests/common/mod.rs` exports `snapshot_dir`
   and `assert_scratch_unchanged` for before/after comparisons
   around error paths, plus `with_tracked_scratch_dir(scratch_root,
   expected_new_paths, f)` wrapper.
-- **Property tests.** `tests/proptests.rs`, 64 cases per property.
+- **Property tests.** `crates/lib/tests/proptests.rs`, 64 cases per property.
   `proptest-regressions/` is gitignored to avoid committing
   case-specific reproducers.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline
@@ -549,10 +549,10 @@ label it may skip on, never errno or message text. `is_uring_unavailable`
 accepts `direct-io` as well (the io_uring writer opens its output
 `O_DIRECT`), so `roundtrip::uring_writer_refuses_non_regular_targets`
 skips only on `io-uring`: a `direct-io` label on a non-regular target is
-the misclassification it pins. The library's unit tests under `src/` cannot
-reach `tests/common`; they use `test_support` (`src/test_support.rs`),
+the misclassification it pins. The library's unit tests under `crates/lib/src/` cannot
+reach `crates/lib/tests/common`; they use `test_support` (`crates/lib/src/test_support.rs`),
 whose `is_direct_io_refusal` requires the `direct-io` label and whose
-`skip` is `tests/common/skip.rs` mounted by `#[path]`, so their skips
+`skip` is `crates/lib/tests/common/skip.rs` mounted by `#[path]`, so their skips
 announce `Skipping:` like any other.
 
 The default CLI timeout leaves diagnostics time before check's 20 s watchdog.

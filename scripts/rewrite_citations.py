@@ -68,7 +68,10 @@ EXTERNAL_HINTS = re.compile(
     r"planetiler|research/|osmpbf|protobuf|geoparquet|codex",
     re.IGNORECASE,
 )
-MEMBER_RS = tuple(old for old, _ in MOVE)
+# Old and new member prefixes: `list` and `apply` read the pre-move tree,
+# `check` the moved one, and a scan that matched only one layout would pass
+# blind on the other.
+MEMBER_RS = tuple(old for old, _ in MOVE) + tuple(new for _, new in MOVE)
 
 
 def git_lines(*args):
@@ -78,7 +81,7 @@ def git_lines(*args):
 
 def scanned(files):
     for f in files:
-        if f in DOC_ROOT_FILES or f == "cli/README.md":
+        if f in DOC_ROOT_FILES or f in ("cli/README.md", "crates/cli/README.md"):
             yield f
         elif f.endswith(".md") and f.split("/")[0] in ("docs", "reference", "decisions"):
             yield f
@@ -156,7 +159,12 @@ def classify(index, citing, line, col, token):
         if start is None or col < start:
             # Code, not a comment: a string a test prints (an assertion
             # message) reads against the package, cargo's cwd for tests.
-            package = citing.split("/")[0] if citing.startswith(("cli/", "harness/")) else ""
+            if citing.startswith("crates/"):
+                package = "/".join(citing.split("/")[:2])
+            elif citing.startswith(("cli/", "harness/")):
+                package = citing.split("/")[0]
+            else:
+                package = ""
             if not token.startswith("../") and index.exists(os.path.join(package, token)):
                 return "package-relative", None
             return "unclassified", None
@@ -233,6 +241,8 @@ def check_mode():
     index = Index()
     stale = []
     for citing, n, _, token, cls, _ in occurrences(index):
+        if citing in DATED:
+            continue  # a dated record names the layout of its date, on purpose
         if cls in ("repo-root", "repo-root-link", "unclassified", "historical") and not token.startswith("../"):
             target = moved(token)
             if target is not None and not index.exists(token) and index.exists(target):

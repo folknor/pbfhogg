@@ -1,0 +1,2405 @@
+//! CLI-driven integration tests for `pbfhogg extract`.
+//!
+//! Replaces the removed library-API `extract.rs` test. Fixture PBFs are
+//! built with the stable-allowlist writers; `extract` runs through
+//! `CliInvoker`; output is verified by reading the resulting PBF
+//! with the stable-allowlist readers. No imports from
+//! `pbfhogg::extract::*` or `pbfhogg::cat::CleanAttrs` - a rewrite
+//! of `crates/lib/src/commands/extract/` cannot break these tests by type
+//! changes alone.
+//!
+//! Region types map onto CLI flags:
+//!
+//! - `Region::Bbox(...)` -> `--bbox <minlon,minlat,maxlon,maxlat>`
+//! - `Region::Polygon(...)` -> `--polygon <geojson_path>` (the
+//!   polygon, including any holes, is written to a temp geojson file)
+//! - Multi-extract slots -> `--config <json_path>` with the same
+//!   schema the original `parse_extract_config` accepted.
+//!
+//! Per-test `ExtractStats` assertions are mostly redundant with
+//! element-set assertions and dropped here. The two tests that
+//! exist precisely to pin a counter (`smart_includes_boundary_node_members`
+//! pinning `nodes_from_relations > 0`, and the tags-preserved test)
+//! retain stderr substring assertions.
+
+#![allow(clippy::unwrap_used)]
+
+use std::path::Path;
+
+use crate::common::{
+    TestMember, TestNode, TestRelation, TestWay, node_ids_id_only as node_ids,
+    read_all_elements_id_only as read_all_elements, read_all_elements_with_coords, read_header,
+    relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,
+    write_test_pbf, write_test_pbf_sorted,
+};
+use crate::invoker::{CliInvoker, CliOutput};
+use pbfhogg::MemberId;
+use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::writer::{Compression, PbfWriter};
+
+const BBOX_STR: &str = "12.4,55.6,12.7,55.8";
+
+/// Triangle covering nodes 1 and 3 but excluding 2 and 4.
+const TRIANGLE_GEOJSON: &str = r#"{
+    "type": "Polygon",
+    "coordinates": [
+        [[12.3, 55.5], [12.8, 55.5], [12.55, 55.9], [12.3, 55.5]]
+    ]
+}"#;
+
+/// Square exterior with a square hole around node 1.
+const SQUARE_WITH_HOLE_GEOJSON: &str = r#"{
+    "type": "Polygon",
+    "coordinates": [
+        [[12.0, 55.0], [13.0, 55.0], [13.0, 56.0], [12.0, 56.0], [12.0, 55.0]],
+        [[12.45, 55.68], [12.55, 55.68], [12.55, 55.72], [12.45, 55.72], [12.45, 55.68]]
+    ]
+}"#;
+
+#[derive(Clone, Copy)]
+enum Strategy {
+    Simple,
+    CompleteWays,
+    Smart,
+}
+
+enum RegionArg<'a> {
+    Bbox(&'a str),
+    Polygon(&'a Path),
+}
+
+fn test_nodes() -> Vec<TestNode> {
+    vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "inside1")],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 540_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "outside_south")],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 556_500_000,
+            lon: 125_500_000,
+            tags: vec![("name", "inside2")],
+            meta: None,
+        },
+        TestNode {
+            id: 4,
+            lat: 557_000_000,
+            lon: 140_000_000,
+            tags: vec![("name", "outside_east")],
+            meta: None,
+        },
+    ]
+}
+
+fn test_ways() -> Vec<TestWay> {
+    vec![
+        TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "primary")],
+            meta: None,
+        },
+        TestWay {
+            id: 11,
+            refs: vec![2, 4],
+            tags: vec![("highway", "secondary")],
+            meta: None,
+        },
+        TestWay {
+            id: 12,
+            refs: vec![1, 3],
+            tags: vec![("highway", "tertiary")],
+            meta: None,
+        },
+    ]
+}
+
+fn test_relations() -> Vec<TestRelation> {
+    vec![
+        TestRelation {
+            id: 100,
+            members: vec![TestMember {
+                id: MemberId::Node(1),
+                role: "stop",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+        TestRelation {
+            id: 101,
+            members: vec![TestMember {
+                id: MemberId::Node(4),
+                role: "stop",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+    ]
+}
+
+/// The strategy flag, plus `--force` for the strategies that refuse an
+/// unindexed input (`--simple` never refuses, so it refuses `--force`).
+fn strategy_args(cli: CliInvoker, strategy: Strategy) -> CliInvoker {
+    match strategy {
+        Strategy::Simple => cli.arg("--simple"),
+        Strategy::CompleteWays => cli.arg("--force"),
+        Strategy::Smart => cli.arg("--smart").arg("--force"),
+    }
+}
+
+/// Invoke `pbfhogg extract <input> -o <output> [--bbox|--polygon]
+/// [--simple|--smart] --set-bounds [--force]` and assert success.
+fn run_extract(
+    input: &Path,
+    output: &Path,
+    region: &RegionArg<'_>,
+    strategy: Strategy,
+) -> CliOutput {
+    let mut cli = CliInvoker::new()
+        .arg("extract")
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    match region {
+        RegionArg::Bbox(s) => cli = cli.arg("--bbox").arg(*s),
+        RegionArg::Polygon(p) => cli = cli.arg("--polygon").arg(*p),
+    }
+    strategy_args(cli, strategy)
+        .arg("--set-bounds")
+        .assert_success()
+}
+
+/// Invoke `pbfhogg extract <input> --config <config>
+/// [--simple|--smart] --set-bounds [--force]` and assert success.
+fn run_extract_multi(input: &Path, config: &Path, strategy: Strategy) -> CliOutput {
+    let cli = CliInvoker::new()
+        .arg("extract")
+        .arg(input)
+        .arg("--config")
+        .arg(config);
+    strategy_args(cli, strategy)
+        .arg("--set-bounds")
+        .assert_success()
+}
+
+fn write_geojson(path: &Path, content: &str) {
+    std::fs::write(path, content).expect("write geojson");
+}
+
+// ---------------------------------------------------------------------------
+// Bbox tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn simple_filters_nodes_by_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+#[test]
+fn simple_includes_ways_with_nodes_in_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    // Ways 10 and 12 have at least one node in bbox; way 11 does not.
+    assert_eq!(way_ids(&c), vec![10, 12]);
+}
+
+#[test]
+fn simple_does_not_add_extra_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    // Simple mode: only nodes actually in bbox, not way dependencies.
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+#[test]
+fn complete_ways_includes_all_way_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
+    let c = read_all_elements(&output);
+    // Way 10 [1,2]: node 1 in bbox -> way matches -> node 2 pulled in
+    // Way 12 [1,3]: both in bbox -> no extra deps
+    // Way 11 [2,4]: no nodes in bbox -> excluded
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+}
+
+#[test]
+fn complete_ways_includes_relations() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
+    let c = read_all_elements(&output);
+    // Relation 100 has member node 1 (in bbox) -> included
+    // Relation 101 has member node 4 (outside bbox) -> excluded
+    assert_eq!(relation_ids(&c), vec![100]);
+}
+
+#[test]
+fn simple_includes_relations_with_matched_ways() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 200,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    // Way 10 matched -> relation 200 should be included.
+    assert_eq!(relation_ids(&c), vec![200]);
+}
+
+#[test]
+fn empty_extract() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    // Bbox far away from all test data.
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("0.0,0.0,1.0,1.0"),
+        Strategy::CompleteWays,
+    );
+    let c = read_all_elements(&output);
+    assert!(c.nodes.is_empty());
+    assert!(c.ways.is_empty());
+    assert!(c.relations.is_empty());
+}
+
+#[test]
+fn tags_preserved_in_extract() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::CompleteWays,
+    );
+    let c = read_all_elements_with_coords(&output);
+
+    // Check node 1 tags.
+    let node1 = c
+        .nodes
+        .iter()
+        .find(|(id, _, _, _)| *id == 1)
+        .expect("node 1");
+    assert_eq!(node1.3, vec![("name".to_string(), "inside1".to_string())]);
+
+    // Check way 10 tags.
+    let way10 = c.ways.iter().find(|(id, _, _)| *id == 10).expect("way 10");
+    assert_eq!(
+        way10.2,
+        vec![("highway".to_string(), "primary".to_string())]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Polygon tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn polygon_simple_filters_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+#[test]
+fn polygon_complete_ways_includes_all_way_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::CompleteWays,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+}
+
+#[test]
+fn polygon_with_hole_excludes_interior() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+    write_geojson(&geojson, SQUARE_WITH_HOLE_GEOJSON);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    // Node 1 is inside the hole -> excluded.
+    // Node 3 is inside exterior, outside hole -> included.
+    // Nodes 2 and 4 are outside the exterior square.
+    assert_eq!(node_ids(&c), vec![3]);
+}
+
+#[test]
+fn polygon_from_geojson_file() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+/// A node on a polygon vertex is inside, as in osmium, under every strategy
+/// and through `--config`: a boundary exported from OSM has every vertex on a
+/// node. Node 2 sits on the triangle's apex, node 3 on its horizontal base
+/// (inside: the region lies above it), node 4 one column above the apex,
+/// outside.
+#[test]
+fn polygon_vertex_and_edge_nodes_follow_osmium() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        node(1, 557_000_000, 125_000_000),
+        node(2, 559_000_000, 125_500_000),
+        node(3, 555_000_000, 126_000_000),
+        node(4, 559_000_001, 125_500_000),
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+    for (name, strategy) in [
+        ("simple", Strategy::Simple),
+        ("complete", Strategy::CompleteWays),
+        ("smart", Strategy::Smart),
+    ] {
+        let out = dir.path().join(format!("{name}.osm.pbf"));
+        run_extract(&input, &out, &RegionArg::Polygon(&geojson), strategy);
+        assert_eq!(node_ids(&read_all_elements(&out)), vec![1, 2, 3], "{name}");
+    }
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"m.osm.pbf","polygon_file":"region.geojson"}}]}}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn polygon_rejects_degenerate_exterior_without_publishing_output() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+    write_geojson(
+        &geojson,
+        r#"{"type":"Polygon","coordinates":[[[12.0,55.0],[13.0,56.0]]] }"#,
+    );
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--polygon")
+        .arg(&geojson)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .assert_failure();
+    result.assert_stderr_contains("at least 3");
+    assert!(
+        !output.exists(),
+        "invalid polygon input must not produce an empty output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Smart strategy tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn smart_includes_multipolygon_way_members() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "inner",
+            },
+        ],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
+    let c = read_all_elements(&output);
+    // Way 10 matched (has bbox node 1). Way 11 pulled in via smart deps.
+    // Way 12 matched normally (both refs in bbox).
+    assert_eq!(way_ids(&c), vec![10, 11, 12]);
+    // Nodes 1, 3 in bbox. Node 2 from way deps. Node 4 from way 11 smart deps.
+    assert_eq!(node_ids(&c), vec![1, 2, 3, 4]);
+    assert_eq!(relation_ids(&c), vec![300]);
+}
+
+#[test]
+fn smart_includes_boundary_node_members() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 301,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(12),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(4),
+                role: "admin_centre",
+            },
+        ],
+        tags: vec![("type", "boundary"), ("boundary", "administrative")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    let out = run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
+    let c = read_all_elements(&output);
+    // Node 4 should be pulled in via smart boundary deps.
+    assert!(
+        node_ids(&c).contains(&4),
+        "node 4 (admin_centre) should be included"
+    );
+    assert_eq!(relation_ids(&c), vec![301]);
+
+    // The smart-contribution branch of `ExtractStats::write_summary`
+    // fires precisely when at least one node or way came from a
+    // relation. Confirm the summary used that branch.
+    assert!(
+        out.stderr_str().contains("from relations"),
+        "expected smart summary form mentioning 'from relations'; stderr:\n{}",
+        out.stderr_str(),
+    );
+}
+
+#[test]
+fn smart_ignores_non_qualifying_relations() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 302,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(10),
+                role: "forward",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "backward",
+            },
+        ],
+        tags: vec![("type", "route")],
+        meta: None,
+    }];
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
+    let c = read_all_elements(&output);
+    // type=route should NOT trigger smart behavior - way 11 stays excluded.
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    // Relation 302 is still included (it has way 10 as member, which is matched).
+    assert_eq!(relation_ids(&c), vec![302]);
+    // Nodes: 1,3 in bbox + 2 from way 10 deps. Node 4 NOT included.
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+}
+
+/// Smart judges a relation by its first `type` tag, as osmium does.
+#[test]
+fn smart_completion_follows_the_first_type_tag() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let relations = vec![TestRelation {
+        id: 310,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(10),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "outer",
+            },
+        ],
+        tags: vec![("type", "route"), ("type", "multipolygon")],
+        meta: None,
+    }];
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+    run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), Strategy::Smart);
+    let c = read_all_elements(&output);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    assert_eq!(relation_ids(&c), vec![310]);
+}
+
+fn member_relation(id: i64) -> TestMember {
+    TestMember {
+        id: MemberId::Relation(id),
+        role: "",
+    }
+}
+
+/// Relations around the matched route 100 (member node 1, in the region):
+/// a parent, a grandparent, a parent stored before its child, a cycle
+/// through a self-member, a multipolygon parent that also lists way 11, a
+/// parent of the unmatched route 101, and a parent of an absent relation.
+fn parent_relations() -> Vec<TestRelation> {
+    let rel = |id: i64, members: Vec<TestMember>, kind: &'static str| TestRelation {
+        id,
+        members,
+        tags: vec![("type", kind)],
+        meta: None,
+    };
+    let mut relations = test_relations();
+    relations.extend([
+        rel(50, vec![member_relation(401)], "superroute"),
+        rel(400, vec![member_relation(100)], "route_master"),
+        rel(401, vec![member_relation(400)], "superroute"),
+        rel(402, vec![member_relation(101)], "route_master"),
+        rel(
+            403,
+            vec![member_relation(403), member_relation(401)],
+            "network",
+        ),
+        rel(
+            404,
+            vec![
+                member_relation(100),
+                TestMember {
+                    id: MemberId::Way(11),
+                    role: "outer",
+                },
+            ],
+            "multipolygon",
+        ),
+        rel(405, vec![member_relation(999)], "collection"),
+    ]);
+    relations.sort_by_key(|r| r.id);
+    relations
+}
+
+/// complete-ways and smart include every relation that has an included
+/// relation as a member, recursively and regardless of file order, as
+/// osmium's do; a parent pulls in nothing else, and smart does not complete
+/// a parent. Simple has no relation-to-relation step, also as osmium.
+#[test]
+fn complete_and_smart_include_parent_relations_recursively() {
+    let dir = crate::common::test_scratch();
+    for (layout, sorted) in [("sorted", true), ("unsorted", false)] {
+        let input = dir.path().join(format!("{layout}.osm.pbf"));
+        if sorted {
+            write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &parent_relations());
+        } else {
+            write_test_pbf(&input, &test_nodes(), &test_ways(), &parent_relations());
+        }
+        for (name, strategy) in [
+            ("complete", Strategy::CompleteWays),
+            ("smart", Strategy::Smart),
+        ] {
+            let out = dir.path().join(format!("{layout}-{name}.osm.pbf"));
+            run_extract(&input, &out, &RegionArg::Bbox(BBOX_STR), strategy);
+            let c = read_all_elements(&out);
+            assert_eq!(
+                relation_ids(&c),
+                vec![50, 100, 400, 401, 403, 404],
+                "{layout} {name}"
+            );
+            assert_eq!(way_ids(&c), vec![10, 12], "{layout} {name}");
+        }
+        let out = dir.path().join(format!("{layout}-simple.osm.pbf"));
+        run_extract(&input, &out, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
+        assert_eq!(
+            relation_ids(&read_all_elements(&out)),
+            vec![100],
+            "{layout}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spatial blob filter
+// ---------------------------------------------------------------------------
+
+/// Helper: write a PBF with nodes in separate blobs at distinct
+/// locations. Each blob is flushed after adding its nodes.
+#[allow(clippy::cast_possible_truncation)]
+fn write_multi_blob_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 1: Copenhagen area (lat ~55.7, lon ~12.5)
+    for i in 1..=10_i64 {
+        bb.add_node(
+            i,
+            557_000_000 + i as i32 * 1000,
+            125_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) - far from Copenhagen
+    for i in 11..=20_i64 {
+        bb.add_node(
+            i,
+            593_000_000 + i as i32 * 1000,
+            180_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 3: Berlin area (lat ~52.5, lon ~13.4) - far from Copenhagen
+    for i in 21..=30_i64 {
+        bb.add_node(
+            i,
+            525_000_000 + i as i32 * 1000,
+            134_000_000 + i as i32 * 1000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+#[test]
+fn spatial_filter_skips_distant_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("multi_blob.osm.pbf");
+    let output = dir.path().join("extracted.osm.pbf");
+
+    write_multi_blob_pbf(&input);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+
+    // Only Copenhagen nodes (1-10) should be in the output.
+    let ids = node_ids(&c);
+    assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    assert!(
+        ids.iter().all(|&id| id <= 10),
+        "no non-Copenhagen nodes should be present"
+    );
+}
+
+/// Write an unsorted PBF whose blobs are in the worst order for a
+/// single-pass classifier: ways first, then the nodes those ways
+/// reference, then a relation whose only member is one of those ways.
+///
+/// The header does not declare `Sort.Type_then_ID`, so extract takes its
+/// unsorted fallback. Node 1 is inside `BBOX_STR`; node 2 is far south of
+/// it. Way 100 therefore belongs in the extract, and relation 300 with it.
+fn write_ways_before_nodes_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 0: ways, before any node has been seen.
+    bb.add_way(100, [("highway", "primary")], &[1, 2], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 1: the nodes those ways reference. Node 1 is inside BBOX_STR.
+    bb.add_node(
+        1,
+        557_000_000,
+        125_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    bb.add_node(
+        2,
+        400_000_000,
+        125_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: a relation whose member way lives in blob 0.
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[block_builder::MemberData {
+            id: MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// On an unsorted input, a way stored before its nodes must still be
+/// extracted - and so must a relation whose member way is.
+///
+/// The unsorted fallback used to classify nodes, ways and relations in a
+/// single file-order sweep, which is only sound when nodes precede ways
+/// precede relations. That is the sorted layout, and this is the branch
+/// taken when the file is not sorted. Under the old sweep, way 100 was
+/// tested against an empty `bbox_node_ids` and relation 300 against an
+/// empty `matched_way_ids`: both were silently absent from the output,
+/// with no error, no warning and no count. Every strategy shares the
+/// fallback, so all three are exercised.
+#[test]
+fn unsorted_way_before_its_nodes_is_still_extracted() {
+    for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("ways_before_nodes.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        write_ways_before_nodes_pbf(&input);
+
+        run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), strategy);
+        let c = read_all_elements(&output);
+
+        assert_eq!(
+            way_ids(&c),
+            vec![100],
+            "a way whose blob precedes its nodes must still be matched"
+        );
+        assert_eq!(
+            relation_ids(&c),
+            vec![300],
+            "a relation whose member way was matched must still be matched"
+        );
+        // And the classification is still selective: node 2 is far outside
+        // the bbox, so this is not satisfied by an extract that keeps
+        // everything. Node 2 may be pulled in as a way member under the
+        // complete-ways and smart strategies, so only node 1's presence and
+        // the way/relation sets are asserted here.
+        assert!(
+            node_ids(&c).contains(&1),
+            "the in-bbox node must be present"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sorted-input fast path
+// ---------------------------------------------------------------------------
+//
+// Library tests asserted that the sorted single-pass extract produces
+// identical output to the unsorted two-pass path. The CLI surface is
+// the same; the strategy / input-shape choice happens internally.
+
+#[test]
+fn simple_sorted_filters_nodes_by_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+#[test]
+fn simple_sorted_includes_ways_with_nodes_in_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+}
+
+#[test]
+fn simple_sorted_does_not_add_extra_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+#[test]
+fn simple_sorted_includes_relations() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(relation_ids(&c), vec![100]);
+}
+
+#[test]
+fn simple_sorted_includes_relations_with_matched_ways() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 200,
+        members: vec![TestMember {
+            id: MemberId::Way(10),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(relation_ids(&c), vec![200]);
+}
+
+#[test]
+fn simple_sorted_empty_extract() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("0.0,0.0,1.0,1.0"),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert!(c.nodes.is_empty());
+    assert!(c.ways.is_empty());
+    assert!(c.relations.is_empty());
+}
+
+#[test]
+fn simple_sorted_output_declares_sorted() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let header = read_header(&output);
+    assert!(
+        header.is_sorted(),
+        "output should declare Sort.Type_then_ID"
+    );
+}
+
+#[test]
+fn simple_sorted_polygon_filters_nodes() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+    write_geojson(&geojson, TRIANGLE_GEOJSON);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Polygon(&geojson),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-extract via --config
+// ---------------------------------------------------------------------------
+
+/// `parse_extract_config` rejects *lexically* identical output paths, but two
+/// slots that spell the same file differently slip past it and open two
+/// independent writers on one file: the second `File::create` truncates what
+/// the first is producing and the two element streams interleave. `sub/..`
+/// normalizes away only under canonicalization, which is what the CLI-side
+/// pairwise check does.
+#[test]
+fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    std::fs::create_dir(dir.path().join("sub")).expect("create subdir");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "dup.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "sub/../dup.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .assert_failure();
+    result.assert_stderr_contains("resolve to the same file");
+    assert!(
+        !dir.path().join("dup.osm.pbf").exists(),
+        "no writer may be opened once a collision is detected"
+    );
+}
+
+/// Distinct output *names* can still be one file. The collision check must
+/// use the same symlink and hardlink aware notion of identity as the
+/// input/output check, not bare path equality.
+#[cfg(unix)]
+#[test]
+fn multi_extract_rejects_symlinked_output_paths() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    let real = dir.path().join("a.osm.pbf");
+    let link = dir.path().join("b.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+    std::fs::write(&real, b"placeholder").expect("seed output");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink output");
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "a.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "b.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .assert_failure();
+    result.assert_stderr_contains("resolve to the same file");
+    assert_eq!(
+        std::fs::read(&real).expect("read seeded output"),
+        b"placeholder",
+        "the aliased target must not be truncated"
+    );
+}
+
+/// Publication is a sequence of renames, not a transaction. A destination
+/// that cannot be renamed over - here, one that is a directory - must be
+/// caught by the preflight so that *nothing* is published, rather than
+/// discovered halfway through the commit loop with the earlier destinations
+/// already replaced.
+///
+/// The assertion that bites is the second one: dropping the preflight still
+/// fails the command, because the doomed rename returns an error either way.
+/// What changes is that the first destination has already been overwritten
+/// by then.
+#[test]
+fn multi_extract_refuses_when_a_destination_cannot_be_published() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    let out_a = dir.path().join("a.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+    std::fs::write(&out_a, b"placeholder").expect("seed first destination");
+    // The second destination is a directory: `rename` over it always fails.
+    std::fs::create_dir(dir.path().join("b.osm.pbf")).expect("create blocking dir");
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "a.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "b.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--overwrite")
+        .assert_failure();
+    // Refused before any extraction, even with overwrite permission: a
+    // directory is never replaced by a file output.
+    result.assert_stderr_contains("is not a regular file");
+    assert_eq!(
+        std::fs::read(&out_a).expect("read first destination"),
+        b"placeholder",
+        "no destination may be published when another one cannot be"
+    );
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with(".pbfhogg-tmp-"))
+        .collect();
+    assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
+}
+
+/// A single-pass multi-extract holds a writer per region beside each
+/// region's staging descriptor, so a config with more regions than the
+/// open-file limit leaves room for is refused up front, naming the counts
+/// and the remedy, with nothing published and no staging file left behind.
+/// At a limit of 64, 40 regions' staging descriptors fit, but their 40
+/// writers on top do not: without the admission the run fails with EMFILE
+/// partway through the writers instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn multi_extract_refuses_more_regions_than_the_descriptor_limit_holds() {
+    const REGIONS: usize = 40;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts: Vec<String> = (0..REGIONS)
+        .map(|i| format!(r#"{{ "output": "r{i}.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }}"#))
+        .collect();
+    let config_json = format!(
+        r#"{{ "directory": "{}", "extracts": [{}] }}"#,
+        dir.path().display(),
+        extracts.join(", ")
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+        .open_file_limit(64)
+        .assert_failure();
+    result.assert_stderr_contains("need 49 descriptors");
+    result.assert_stderr_contains("extract fewer regions per call");
+    for i in 0..REGIONS {
+        assert!(
+            !dir.path().join(format!("r{i}.osm.pbf")).exists(),
+            "region {i} was published"
+        );
+    }
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with(".pbfhogg-tmp-"))
+        .collect();
+    assert!(strays.is_empty(), "staging file leaked: {strays:?}");
+}
+
+#[test]
+fn multi_extract_two_bbox_regions() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let out_a = dir.path().join("a.osm.pbf");
+    let out_b = dir.path().join("b.osm.pbf");
+    let config = dir.path().join("config.json");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "a.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "b.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+
+    // Extract A: nodes 1, 3 in bbox; ways 10, 12 match; relation 100 matches.
+    let ca = read_all_elements(&out_a);
+    assert_eq!(node_ids(&ca), vec![1, 3]);
+    assert_eq!(way_ids(&ca), vec![10, 12]);
+    assert_eq!(relation_ids(&ca), vec![100]);
+
+    // Extract B: node 4 in bbox; way 11 refs [2,4] - only node 4 is in
+    // B's bbox so way 11 matches. Relation 101 has member node 4.
+    let cb = read_all_elements(&out_b);
+    assert_eq!(node_ids(&cb), vec![4]);
+    assert_eq!(way_ids(&cb), vec![11]);
+    assert_eq!(relation_ids(&cb), vec![101]);
+}
+
+#[test]
+fn multi_extract_diagnostics_use_final_output_paths() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let simple_output = dir.path().join("simple.osm.pbf");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"simple.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+    let simple = run_extract_multi(&input, &config, Strategy::Simple);
+    let simple_stderr = simple.stderr_str();
+    assert!(
+        simple_stderr.contains(simple_output.to_str().expect("UTF-8 output path")),
+        "the summary should report the final simple output path; stderr:\n{simple_stderr}"
+    );
+    assert_eq!(
+        simple_stderr.matches("simple.osm.pbf").count(),
+        1,
+        "single-pass multi-extract should report each output once; stderr:\n{simple_stderr}"
+    );
+    assert!(
+        !simple_stderr.contains(".pbfhogg-tmp-"),
+        "single-pass diagnostics must not expose scratch paths; stderr:\n{simple_stderr}"
+    );
+
+    let sequential_output = dir.path().join("sequential.osm.pbf");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"sequential.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+    let sequential = run_extract_multi(&input, &config, Strategy::CompleteWays);
+    let sequential_stderr = sequential.stderr_str();
+    assert!(
+        sequential_stderr.contains(&format!("Extracting to {}", sequential_output.display())),
+        "sequential diagnostics should report the final output path; stderr:\n{sequential_stderr}"
+    );
+    assert!(
+        !sequential_stderr.contains(".pbfhogg-tmp-"),
+        "sequential diagnostics must not expose scratch paths; stderr:\n{sequential_stderr}"
+    );
+}
+
+#[test]
+fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
+    let dir = crate::common::test_scratch();
+    let config_dir = dir.path().join("config");
+    let configured_dir = config_dir.join("configured");
+    let override_dir = dir.path().join("override");
+    let external_dir = dir.path().join("external");
+    std::fs::create_dir(&config_dir).expect("create config directory");
+    std::fs::create_dir(&configured_dir).expect("create configured output directory");
+    std::fs::create_dir(configured_dir.join("nested")).expect("create configured nested directory");
+    std::fs::create_dir(&override_dir).expect("create override directory");
+    std::fs::create_dir(override_dir.join("nested")).expect("create override nested directory");
+    std::fs::create_dir(&external_dir).expect("create external output directory");
+
+    let input = dir.path().join("input.osm.pbf");
+    let config = config_dir.join("extract.json");
+    let relative_output = override_dir.join("nested/relative.osm.pbf");
+    let absolute_output = external_dir.join("absolute.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"configured","extracts":[
+                {{"output":"nested/relative.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}},
+                {{"output":"{}","bbox":[13.5,55.5,14.5,55.9]}}
+            ]}}"#,
+            absolute_output.display()
+        ),
+    )
+    .expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--directory")
+        .arg(&override_dir)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .assert_success();
+
+    assert!(relative_output.exists());
+    assert!(override_dir.join("absolute.osm.pbf").exists());
+    assert!(!configured_dir.join("nested/relative.osm.pbf").exists());
+    assert!(!absolute_output.exists());
+    assert!(
+        result
+            .stderr_str()
+            .contains(relative_output.to_str().expect("UTF-8 output path")),
+        "summary should report the rebased relative output; stderr:\n{}",
+        result.stderr_str()
+    );
+
+    let config_relative_dir = config_dir.join("relative-dir.json");
+    let resolved_dir = config_dir.join("relative-outputs");
+    std::fs::create_dir(&resolved_dir).expect("create config-relative output directory");
+    std::fs::write(
+        &config_relative_dir,
+        r#"{"directory":"relative-outputs","extracts":[{"output":"anchored.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}]}"#,
+    )
+    .expect("write relative directory config");
+    run_extract_multi(&input, &config_relative_dir, Strategy::Simple);
+    assert!(resolved_dir.join("anchored.osm.pbf").exists());
+}
+
+/// `-b` and `--config` quantize a 17-digit edge to the same column.
+/// "12.639999999999999" names 126399999.99999999 decimicrodegrees, which
+/// rounds to column 126400000, so node 1 on that column is inside under
+/// both inputs. Each edge is quantized from its own token, so this no
+/// longer depends on how either parser rounds the token to an f64;
+/// `a_half_step_edge_quantizes_from_its_digits_in_cli_and_config` is the
+/// case where the f64 route would pick a different column.
+#[test]
+fn config_bbox_floats_parse_identically_to_cli_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let out_cli = dir.path().join("cli.osm.pbf");
+    let config = dir.path().join("config.json");
+
+    // Node 1 sits on the edge column. Node 2 is safely interior.
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 126_400_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 557_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+
+    run_extract(
+        &input,
+        &out_cli,
+        &RegionArg::Bbox("12.639999999999999,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "cfg.osm.pbf", "bbox": [12.639999999999999, 55.6, 12.7, 55.8] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+
+    let cli_elements = read_all_elements(&out_cli);
+    let cfg_elements = read_all_elements(&dir.path().join("cfg.osm.pbf"));
+    assert_eq!(
+        node_ids(&cli_elements),
+        vec![1, 2],
+        "the edge column must be inside"
+    );
+    assert_eq!(
+        node_ids(&cfg_elements),
+        node_ids(&cli_elements),
+        "--config and -b must agree on the byte-identical bbox"
+    );
+}
+
+/// A node exactly on a typed decimal edge is inside, and the column next to
+/// it is outside - at a boundary where f64 arithmetic cannot be trusted.
+///
+/// `556_000_000 as f64 * 1e-7` is strictly below `55.6`, so a membership
+/// test on that product excludes a node sitting on the 55.6 edge, while
+/// osmium, which quantizes the typed decimal, includes it. Every edge is
+/// quantized to the decimicrodegree its text names and compared
+/// inclusively. A fixture at a round boundary such as 55.0 cannot see the
+/// difference.
+///
+/// This has to hold at every layer that decides membership -
+/// element-by-element classification, the columnar bbox classifier used by
+/// complete-ways, `smart` and multi-extract, and the raw-blob passthrough
+/// proof, which copies a whole blob through untouched.
+#[test]
+fn bbox_edge_is_the_typed_decimal_column_inclusive() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+
+    // Node 1 sits exactly on 55.6. Node 2 is one column below it, outside.
+    // Node 3 is interior, so no output is trivially empty.
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 556_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 555_999_999,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 557_000_000,
+            lon: 126_500_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+
+    for (name, strategy) in [
+        ("simple", Strategy::Simple),
+        ("smart", Strategy::Smart),
+        ("complete", Strategy::CompleteWays),
+    ] {
+        let out = dir.path().join(format!("{name}.osm.pbf"));
+        run_extract(
+            &input,
+            &out,
+            &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+            strategy,
+        );
+        assert_eq!(
+            node_ids(&read_all_elements(&out)),
+            vec![1, 3],
+            "{name} must include the node on the 55.6 edge and nothing below it"
+        );
+    }
+
+    // Without node 2 the blob's bbox touches the edge exactly, so the simple
+    // strategy nominates it for raw passthrough; the proof must agree that
+    // the edge node is inside.
+    let edge_only = dir.path().join("edge-only.osm.pbf");
+    let edge_nodes: Vec<TestNode> = nodes.into_iter().filter(|n| n.id != 2).collect();
+    write_test_pbf_sorted(&edge_only, &edge_nodes, &[], &[]);
+    let out = dir.path().join("edge-only-out.osm.pbf");
+    let result = run_extract(
+        &edge_only,
+        &out,
+        &RegionArg::Bbox("12.4,55.6,12.7,55.8"),
+        Strategy::Simple,
+    );
+    assert_eq!(node_ids(&read_all_elements(&out)), vec![1, 3]);
+    let stderr = result.stderr_str();
+    assert!(
+        !stderr.contains("filtered instead of copied raw"),
+        "an edge-touching blob must verify for passthrough: {stderr}"
+    );
+
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+                "directory": "{}",
+                "extracts": [
+                    {{ "output": "m.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }}
+                ]
+            }}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        vec![1, 3],
+        "multi-extract must include the node on the 55.6 edge"
+    );
+}
+
+/// An edge typed with more than seven decimals is quantized from its own
+/// digits, half away from zero, identically from `-b` text and from a
+/// `--config` number: `1.00000115` names column 10000012. Its nearest f64
+/// times 1e7 is 10000011.499999998, so any route through the f64 would
+/// pick 10000011 and admit node 1 below the edge.
+#[test]
+fn a_half_step_edge_quantizes_from_its_digits_in_cli_and_config() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 10_000_000,
+            lon: 10_000_011,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 10_000_000,
+            lon: 10_000_012,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+    let out = dir.path().join("cli.osm.pbf");
+    run_extract(
+        &input,
+        &out,
+        &RegionArg::Bbox("1.00000115,0.5,2,2"),
+        Strategy::Simple,
+    );
+    assert_eq!(node_ids(&read_all_elements(&out)), vec![2]);
+
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"cfg.osm.pbf","bbox":[1.00000115,0.5,2,2]}}]}}"#,
+            dir.path().display(),
+        ),
+    )
+    .expect("write config");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("cfg.osm.pbf"))),
+        vec![2]
+    );
+}
+
+#[test]
+fn multi_extract_grid_matches_linear_bbox() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts = (0..20)
+        .map(|i| format!(r#"{{"output":"grid-{i}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{extracts}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+    for i in 0..20 {
+        let output = dir.path().join(format!("grid-{i}.osm.pbf"));
+        let extracted = read_all_elements(&output);
+        assert_eq!(node_ids(&extracted), vec![1, 3]);
+        assert_eq!(way_ids(&extracted), vec![10, 12]);
+        assert_eq!(relation_ids(&extracted), vec![100]);
+    }
+}
+
+#[test]
+fn multi_extract_grid_matches_linear_mixed_regions() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let extracts = (0..20)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!(r#"{{"output":"mixed-{i}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}"#)
+            } else {
+                format!(r#"{{"output":"mixed-{i}.osm.pbf","polygon":{TRIANGLE_GEOJSON}}}"#)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{extracts}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+    for i in 0..20 {
+        let output = dir.path().join(format!("mixed-{i}.osm.pbf"));
+        let extracted = read_all_elements(&output);
+        assert_eq!(node_ids(&extracted), vec![1, 3]);
+        assert_eq!(way_ids(&extracted), vec![10, 12]);
+        assert_eq!(relation_ids(&extracted), vec![100]);
+    }
+}
+
+#[test]
+fn multi_extract_from_config_file() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let out_cph = dir.path().join("copenhagen.osm.pbf");
+    let out_east = dir.path().join("east.osm.pbf");
+    let config = dir.path().join("config.json");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "copenhagen.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "east.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display(),
+    );
+    std::fs::write(&config, config_json).expect("write config");
+
+    run_extract_multi(&input, &config, Strategy::Simple);
+
+    let ca = read_all_elements(&out_cph);
+    assert_eq!(node_ids(&ca), vec![1, 3]);
+
+    let cb = read_all_elements(&out_east);
+    assert_eq!(node_ids(&cb), vec![4]);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-blob bbox partitioning (raw passthrough)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn simple_multi_blob_bbox_partitioning() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // 10 "inside" nodes (lon 12.5, lat 55.65..) + 10 "outside" nodes
+    // far south. block_size=10 -> two separate node blobs, exactly the
+    // split the per-blob classify is supposed to handle.
+    let mut all_nodes: Vec<TestNode> = (0_i32..10)
+        .map(|i| TestNode {
+            id: i64::from(i) + 1,
+            lat: 556_500_000 + i * 100_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    all_nodes.extend((0_i32..10).map(|i| TestNode {
+        id: i64::from(i) + 100,
+        lat: 400_000_000,
+        lon: 500_000_000,
+        tags: vec![],
+        meta: None,
+    }));
+
+    write_multi_block_test_pbf(&input, &all_nodes, &[], &[], 10);
+
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    let got: Vec<i64> = node_ids(&c);
+    let want: Vec<i64> = (1..=10).collect();
+    assert_eq!(got, want, "wrong node set survived the per-blob classify");
+}
+
+// ---------------------------------------------------------------------------
+// Raw passthrough must not trust indexdata
+// ---------------------------------------------------------------------------
+
+/// `nodes` inside `BBOX_STR`, ids starting at `start`.
+fn inside_nodes(count: i32, start: i64) -> Vec<TestNode> {
+    (0..count)
+        .map(|i| TestNode {
+            id: start + i64::from(i),
+            lat: 556_500_000 + i * 50_000,
+            lon: 125_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect()
+}
+
+/// The `BlobHeader.indexdata` bytes of frame `frame` (0 is the OSMHeader).
+fn indexdata_of(pbf: &[u8], frame: usize) -> Vec<u8> {
+    let mut captured = Vec::new();
+    let _ = crate::common::adversarial::mutate_blob_header_indexdata(pbf, frame, |ix| {
+        captured.clone_from(ix);
+    });
+    captured
+}
+
+fn single_region_config(dir: &Path) -> std::path::PathBuf {
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"m.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.display()
+        ),
+    )
+    .expect("write config");
+    config
+}
+
+/// A raw-passthrough blob used to add its indexdata `count` to "N in bbox":
+/// an unverified claim reported as an observation. `--corrupt-indexdata`
+/// inflates every count by 1 000 000 while leaving the bbox honest, so both
+/// node blobs still pass through - the output carries their headers
+/// verbatim - and the summary must still say 20.
+#[test]
+fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&input)
+        .arg("--corrupt-indexdata")
+        .assert_success();
+
+    let out = run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        (1..=20).collect::<Vec<_>>()
+    );
+    assert!(
+        out.stderr_str()
+            .contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "the summary must count decoded nodes, not the inflated claim; stderr:\n{}",
+        out.stderr_str()
+    );
+    // The blobs really were copied raw, so this exercised the passthrough
+    // count rather than the decode path.
+    let input_bytes = std::fs::read(&input).expect("read input");
+    let output_bytes = std::fs::read(&output).expect("read output");
+    for frame in [1, 2] {
+        assert_eq!(
+            indexdata_of(&output_bytes, frame),
+            indexdata_of(&input_bytes, frame),
+            "node blob {frame} should have been passed through verbatim"
+        );
+    }
+
+    let config = single_region_config(dir.path());
+    let out = run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        (1..=20).collect::<Vec<_>>()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("node blobs: 2 passthrough, 0 decoded"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "multi-extract must count decoded nodes too; stderr:\n{stderr}"
+    );
+}
+
+/// A blob whose indexdata bbox claims containment while its nodes are
+/// outside used to be copied raw on the claim alone, putting out-of-region
+/// nodes in the extract. The classify phase now verifies every candidate
+/// against its decoded payload and filters the ones that fail.
+#[test]
+fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut nodes = inside_nodes(10, 1);
+    nodes.extend((0_i64..10).map(|i| TestNode {
+        id: 100 + i,
+        lat: 400_000_000,
+        lon: 500_000_000,
+        tags: vec![],
+        meta: None,
+    }));
+    write_multi_block_test_pbf(&honest, &nodes, &[], &[], 10);
+    // Give the outside blob (frame 2) the inside blob's (frame 1) index,
+    // bbox included.
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let inside_index = indexdata_of(&pbf, 1);
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 2, |ix| {
+        ix.clone_from(&inside_index);
+    });
+    std::fs::write(&input, lying).expect("write lying fixture");
+
+    let want: Vec<i64> = (1..=10).collect();
+    let out = run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    assert_eq!(
+        node_ids(&read_all_elements(&output)),
+        want,
+        "the outside nodes must not ride in on the lying bbox"
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("filtered instead of copied raw"),
+        "the failed verification must be reported; stderr:\n{stderr}"
+    );
+
+    let config = single_region_config(dir.path());
+    let out = run_extract_multi(&input, &config, Strategy::Simple);
+    assert_eq!(
+        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        want,
+        "multi-extract must not trust the lying bbox either"
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("filtered instead of copied raw"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// A passthrough candidate whose block the decoder refuses must not reach
+/// the output through a raw copy. The first node blob's string table gets
+/// an invalid UTF-8 entry: its nodes, its dense-only shape and its honest
+/// indexdata bbox all qualify it for the copy, and only the block validator
+/// refuses it. Single-region and multi-extract both fail with the
+/// decoder's error and publish nothing.
+#[test]
+fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let broken = crate::common::adversarial::mutate_blob_payload(&pbf, 1, |payload| {
+        // The string table, holding its one empty entry, leads the block.
+        assert_eq!(payload[..4], [10, 2, 10, 0], "fixture string table");
+        payload.splice(..4, [10, 3, 10, 1, 0xFF]);
+    });
+    std::fs::write(&input, broken).expect("write broken fixture");
+    let refusal = "invalid UTF-8 at string table index 0";
+
+    let output = dir.path().join("single.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--bbox", BBOX_STR, "--simple"])
+        .assert_failure();
+    out.assert_stderr_contains(refusal);
+    assert!(!output.exists(), "nothing is published");
+
+    let config = multi_config(dir.path(), "multi-refused");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .args(["--simple", "--set-bounds"])
+        .assert_failure();
+    out.assert_stderr_contains(refusal);
+    assert!(
+        !dir.path().join("multi-refused.osm.pbf").exists(),
+        "nothing is published"
+    );
+}
+
+/// A sorted input whose one data blob holds two plain (non-dense) Node
+/// messages, (id, lat, lon) = (1, 10, 20) and (2, 30, 40) decimicrodegrees,
+/// default granularity, no indexdata.
+fn write_plain_node_pbf(input: &Path) {
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(input).expect("create input"),
+        Compression::default(),
+    );
+    writer
+        .write_header(
+            &block_builder::HeaderBuilder::new()
+                .sorted()
+                .build()
+                .expect("header"),
+        )
+        .expect("write header");
+    // Empty string-table entry, then the two plain Node messages.
+    let block = [
+        10, 2, 10, 0, 18, 16, 10, 6, 8, 2, 64, 20, 72, 40, 10, 6, 8, 4, 64, 60, 72, 80,
+    ];
+    writer
+        .write_primitive_block(&block)
+        .expect("write plain nodes");
+    writer.flush().expect("flush");
+}
+
+/// complete-ways and smart classify a sorted bbox input's nodes from dense
+/// columns, which leave plain Node messages out; those must still be
+/// classified, or an in-region plain node and everything it would have
+/// matched is silently missing.
+#[test]
+fn complete_and_smart_classify_plain_nodes_on_sorted_input() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain.osm.pbf");
+    write_plain_node_pbf(&input);
+    for (name, strategy) in [
+        ("complete", Strategy::CompleteWays),
+        ("smart", Strategy::Smart),
+    ] {
+        for (case, bbox, expected) in [
+            ("all", "--bbox=-1,-1,1,1", vec![1, 2]),
+            ("partial", "--bbox=0,0,0.0000025,0.0000025", vec![1]),
+        ] {
+            let out = dir.path().join(format!("{name}-{case}.osm.pbf"));
+            let cli = CliInvoker::new()
+                .arg("extract")
+                .arg(&input)
+                .arg("-o")
+                .arg(&out)
+                .arg(bbox);
+            strategy_args(cli, strategy).assert_success();
+            assert_eq!(
+                node_ids(&read_all_elements(&out)),
+                expected,
+                "{name} {case} lost plain nodes"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain.osm.pbf");
+    write_plain_node_pbf(&input);
+    let single = dir.path().join("single.osm.pbf");
+    CliInvoker::new()
+        .args(["extract", "--simple", "--bbox=-1,-1,1,1"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&single)
+        .assert_success();
+    assert_eq!(node_ids(&read_all_elements(&single)), vec![1, 2]);
+    for (name, bbox, expected) in [
+        ("contained", "[-1,-1,1,1]", vec![1, 2]),
+        ("partial", "[0,0,0.0000025,0.0000025]", vec![1]),
+    ] {
+        let config = dir.path().join(format!("{name}.json"));
+        let a = format!("{name}-a.osm.pbf");
+        let b = format!("{name}-b.osm.pbf");
+        let json = format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"{a}","bbox":{bbox}}},{{"output":"{b}","bbox":[-1,-1,1,1]}}]}}"#,
+            dir.path()
+                .canonicalize()
+                .expect("absolute directory")
+                .display(),
+        );
+        std::fs::write(&config, json).expect("config");
+        run_extract_multi(&input, &config, Strategy::Simple);
+        assert_eq!(node_ids(&read_all_elements(&dir.path().join(a))), expected);
+        assert_eq!(
+            node_ids(&read_all_elements(&dir.path().join(b))),
+            vec![1, 2]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kind claims
+// ---------------------------------------------------------------------------
+
+/// Indexdata kind bytes (byte 1 of the indexdata).
+const KIND_NODE: u8 = 0;
+const KIND_WAY: u8 = 1;
+const KIND_RELATION: u8 = 2;
+
+/// Frames of the fixture's blobs: the header, then one blob per kind.
+const FRAME_WAYS: usize = 2;
+const FRAME_RELATIONS: usize = 3;
+
+/// One forged claim: the frame, its honest kind byte, the claimed kind byte
+/// and the words the refusal uses for the claim and for what the blob holds.
+struct ForgedClaim {
+    frame: usize,
+    honest: u8,
+    claim: u8,
+    claimed: &'static str,
+    found: &'static str,
+}
+
+/// A way blob claiming nodes (the node phase believes it), a way blob
+/// claiming relations, and a relation blob claiming ways (the way phase
+/// believes it).
+const FORGED_CLAIMS: [ForgedClaim; 3] = [
+    ForgedClaim {
+        frame: FRAME_WAYS,
+        honest: KIND_WAY,
+        claim: KIND_NODE,
+        claimed: "node",
+        found: "way",
+    },
+    ForgedClaim {
+        frame: FRAME_WAYS,
+        honest: KIND_WAY,
+        claim: KIND_RELATION,
+        claimed: "relation",
+        found: "way",
+    },
+    ForgedClaim {
+        frame: FRAME_RELATIONS,
+        honest: KIND_RELATION,
+        claim: KIND_WAY,
+        claimed: "way",
+        found: "relation",
+    },
+];
+
+fn write_kind_fixture(path: &Path, sorted: bool) {
+    if sorted {
+        write_test_pbf_sorted(path, &test_nodes(), &test_ways(), &test_relations());
+    } else {
+        write_test_pbf(path, &test_nodes(), &test_ways(), &test_relations());
+    }
+}
+
+/// The fixture with one blob's indexdata kind byte forged: a lie no
+/// producer writes.
+fn forge_kind_claim(dir: &Path, sorted: bool, forged: &ForgedClaim) -> std::path::PathBuf {
+    let honest = dir.join(format!("honest-{sorted}.osm.pbf"));
+    write_kind_fixture(&honest, sorted);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, forged.frame, |index| {
+            assert_eq!(index[1], forged.honest, "frame {} kind", forged.frame);
+            index[1] = forged.claim;
+        });
+    let path = dir.join(format!(
+        "frame{}-claims-{}-{sorted}.osm.pbf",
+        forged.frame, forged.claim
+    ));
+    std::fs::write(&path, lying).expect("write the forged file");
+    path
+}
+
+fn refusal_text(claimed: &str, found: &str) -> String {
+    format!("blob indexdata claims {claimed} elements but the blob holds {found} elements")
+}
+
+fn multi_config(dir: &Path, name: &str) -> std::path::PathBuf {
+    let config = dir.join(format!("{name}.json"));
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"{name}.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.display()
+        ),
+    )
+    .expect("write config");
+    config
+}
+
+/// A blob claiming one kind but holding another used to land in a phase
+/// that ignores its real contents (a node-claimed blob holding ways was read
+/// only by node-phase code, so its ways were dropped) and the extract was
+/// published with exit 0. Every strategy, sorted and unsorted, refuses it
+/// and publishes nothing.
+#[test]
+fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for sorted in [true, false] {
+        for forged in &FORGED_CLAIMS {
+            let input = forge_kind_claim(dir.path(), sorted, forged);
+            for (name, strategy) in [
+                ("simple", Strategy::Simple),
+                ("complete", Strategy::CompleteWays),
+                ("smart", Strategy::Smart),
+            ] {
+                let output = dir.path().join(format!(
+                    "out-{name}-{sorted}-{}-{}.osm.pbf",
+                    forged.frame, forged.claim
+                ));
+                let cli = CliInvoker::new()
+                    .arg("extract")
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&output)
+                    .arg("--bbox")
+                    .arg(BBOX_STR);
+                let out = strategy_args(cli, strategy)
+                    .arg("--set-bounds")
+                    .assert_failure();
+                out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
+                assert!(
+                    !output.exists(),
+                    "{name}, sorted {sorted}, frame {} claims {}: nothing is published",
+                    forged.frame,
+                    forged.claim
+                );
+            }
+        }
+    }
+}
+
+/// A way blob given a node blob's indexdata, bbox included, is a raw
+/// passthrough candidate: the node classify phase reads it raw, finds no
+/// node, and used to drop its ways. Single-region and multi-extract both
+/// refuse it.
+#[test]
+fn extract_refuses_a_passthrough_candidate_holding_ways() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let input = dir.path().join("input.osm.pbf");
+    let ways = [TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![],
+        meta: None,
+    }];
+    write_test_pbf_sorted(&honest, &inside_nodes(4, 1), &ways, &[]);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let node_index = indexdata_of(&pbf, 1);
+    let lying = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, FRAME_WAYS, |ix| {
+        ix.clone_from(&node_index);
+    });
+    std::fs::write(&input, lying).expect("write lying fixture");
+
+    let output = dir.path().join("single.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--bbox", BBOX_STR, "--simple"])
+        .assert_failure();
+    out.assert_stderr_contains(&refusal_text("node", "way"));
+    assert!(!output.exists(), "nothing is published");
+
+    let config = multi_config(dir.path(), "multi-candidate");
+    let out = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .args(["--simple", "--set-bounds"])
+        .assert_failure();
+    out.assert_stderr_contains(&refusal_text("node", "way"));
+    assert!(
+        !dir.path().join("multi-candidate.osm.pbf").exists(),
+        "nothing is published"
+    );
+}
+
+/// Multi-extract classifies each kind from the blobs claiming it, so every
+/// forged claim is refused before any region output is published.
+#[test]
+fn multi_extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let dir = crate::common::test_scratch();
+    for forged in &FORGED_CLAIMS {
+        let input = forge_kind_claim(dir.path(), true, forged);
+        let name = format!("multi-{}-{}", forged.frame, forged.claim);
+        let config = multi_config(dir.path(), &name);
+        let out = CliInvoker::new()
+            .arg("extract")
+            .arg(&input)
+            .arg("--config")
+            .arg(&config)
+            .args(["--simple", "--set-bounds"])
+            .assert_failure();
+        out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
+        assert!(
+            !dir.path().join(format!("{name}.osm.pbf")).exists(),
+            "frame {} claims {}: nothing is published",
+            forged.frame,
+            forged.claim
+        );
+    }
+}
+
+/// The passing counterpart: honest claims extract under every strategy,
+/// sorted and unsorted, and under multi-extract.
+#[test]
+fn extract_accepts_honest_kind_claims() {
+    let dir = crate::common::test_scratch();
+    for sorted in [true, false] {
+        let input = dir.path().join(format!("honest-{sorted}.osm.pbf"));
+        write_kind_fixture(&input, sorted);
+        for (name, strategy) in [
+            ("simple", Strategy::Simple),
+            ("complete", Strategy::CompleteWays),
+            ("smart", Strategy::Smart),
+        ] {
+            let output = dir.path().join(format!("out-{name}-{sorted}.osm.pbf"));
+            run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), strategy);
+            let elements = read_all_elements(&output);
+            let nodes = node_ids(&elements);
+            assert!(
+                nodes.contains(&1) && nodes.contains(&3),
+                "{name}, sorted {sorted}: {nodes:?}"
+            );
+            assert!(
+                way_ids(&elements).contains(&12),
+                "{name}, sorted {sorted}: the way inside the bbox is extracted"
+            );
+        }
+    }
+
+    let input = dir.path().join("honest-true.osm.pbf");
+    let config = multi_config(dir.path(), "multi-honest");
+    run_extract_multi(&input, &config, Strategy::Simple);
+    let elements = read_all_elements(&dir.path().join("multi-honest.osm.pbf"));
+    assert_eq!(node_ids(&elements), vec![1, 3]);
+    assert!(way_ids(&elements).contains(&12));
+}

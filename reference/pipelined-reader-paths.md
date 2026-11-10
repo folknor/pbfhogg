@@ -4,7 +4,7 @@ Reference for every current caller of the ordered pipelined reader
 surfaces on `ElementReader`: the plain
 `into_blocks_pipelined` / `for_each_block_pipelined` / `for_each_pipelined`
 and the fused `for_each_fused_block` / `for_each_fused_blob`. Both are
-one engine, `run_pipeline` in `src/read/pipeline.rs`, generic over the
+one engine, `run_pipeline` in `crates/lib/src/read/pipeline.rs`, generic over the
 `DecodeTransform` that runs on the decode worker: the plain surfaces
 pass the identity transform `Blocks`, the fused ones a command's
 transform. Workload profile, decode shape, and the rule for adding or
@@ -14,7 +14,7 @@ converting callers.
 
 Both surfaces spawn a private rayon decode pool, sized by
 `host::sized_workers` from the `DECODE_WORKERS_*` tunables in
-`src/tunables.rs` (host parallelism minus a reserve, with a floor and a
+`crates/lib/src/tunables.rs` (host parallelism minus a reserve, with a floor and a
 fallback), unless the caller sets a thread count. It decompresses and
 parses blobs into `PrimitiveBlock`s and delivers them in file order to a
 consumer serialized on the calling thread.
@@ -39,24 +39,24 @@ blob count: getid `--add-referenced` -7.7 %, getparents FullScan
 Alternative primitives used elsewhere in the codebase:
 
 - `parallel_classify_phase` / `parallel_classify_accumulate`
-  (`src/scan/classify.rs`) - pread workers, no separate decode pool,
+  (`crates/lib/src/scan/classify.rs`) - pread workers, no separate decode pool,
   no cross-thread-free churn, no oversubscription. Lower memory
   ceiling and lower thread count than pipelined decode.
 - `parallel_classify_phase_ordered` and the ordered pool beneath it
-  (`src/ordered_pool.rs`) - the same pread workers, results delivered
+  (`crates/lib/src/ordered_pool.rs`) - the same pread workers, results delivered
   in schedule order and bounded by an admission window (see
   [pipeline.md](pipeline.md) "Ordered pread pool").
-- Raw `Frames::next_raw` / `HeaderWalker` (`src/read/frame.rs`,
-  `src/read/header_walker.rs`) - sequential or pread-based,
+- Raw `Frames::next_raw` / `HeaderWalker` (`crates/lib/src/read/frame.rs`,
+  `crates/lib/src/read/header_walker.rs`) - sequential or pread-based,
   bypass the decode pool entirely.
 
 ## Invariants
 
-**Retention is solved.** `DecompressPool` in `src/read/decompress.rs`
+**Retention is solved.** `DecompressPool` in `crates/lib/src/read/decompress.rs`
 recycles decompression buffers via
 `PooledBuffer::drop` instead of cross-thread freeing. The pool caps
 each retained buffer's capacity, the sum of its idle capacities and its
-buffer count (`DECOMPRESS_POOL_*` in `src/tunables.rs`). Reuse depends on
+buffer count (`DECOMPRESS_POOL_*` in `crates/lib/src/tunables.rs`). Reuse depends on
 sizing: the decode helpers size a buffer from the blob's declared
 `raw_size` with exact growth, so a caller fetches storage with
 `pool_get(pool, 0)` and adds no capacity guess of its own; a guess past
@@ -67,10 +67,10 @@ keeps a plain decode buffer outside a pool (the raw scan, the pread
 stages) applies the same per-buffer cap once per task through
 `release_decode_outlier`, counted with the pool's own oversize drops; a
 sequential loop that moves its buffer into each block keeps none and is
-not pooled (the "Take loops" note in `src/read/decompress.rs`). The
+not pooled (the "Take loops" note in `crates/lib/src/read/decompress.rs`). The
 compressed-frame read buffers beside them (every pread worker, the
 header-walk consumers, the overlap sweeps, the direct reads' aligned
-scratch) are `ReadBuf` (`src/read/read_buf.rs`): exact growth, and a
+scratch) are `ReadBuf` (`crates/lib/src/read/read_buf.rs`): exact growth, and a
 release past `READ_BUF_MAX_RETAINED_CAPACITY` once per blob, counted in
 `pipeline_read_buf_releases`; apply-changes holds its base-read buffer to
 the stricter scratch limit.
@@ -89,7 +89,7 @@ heavier. Adding to the list of pipelined callers is fine; removing
 from it is not.
 
 **The decode pool is joined.** It is a `joined_pool::JoinedPool`
-(`src/joined_pool.rs`), built per read on the dispatcher thread; every
+(`crates/lib/src/joined_pool.rs`), built per read on the dispatcher thread; every
 worker has exited, thread-local destructors included, before the read
 returns (for `into_blocks_pipelined`, before `PipelinedBlocks`' drop
 returns), on success, error and unwind. A new pipelined caller inherits
@@ -111,7 +111,7 @@ Every counter only grows, so the maximum emitted value of each name is
 the invocation's total (for sequential reads, simply the last emission;
 concurrent reads can emit out of order), which is how `brokkr sidecar
 --stalls` reads `*_wait_ns`. They are not per-read numbers by design;
-`src/read/pipeline_metrics.rs` says why.
+`crates/lib/src/read/pipeline_metrics.rs` says why.
 Dropping `PipelinedBlocks` or returning an error
 from a block closure closes the decoded receiver before the scoped
 threads join, and shutdown propagates through channel disconnection:
@@ -128,7 +128,7 @@ cancellation is checked before each frame, not during its reads).
 - **Surface:** fused (`for_each_fused_buffer`: a projection on the
   block validator, the block built only for a blob holding a selected
   element)
-- **Path:** `src/commands/getid/mod.rs`, `--add-referenced` mode only
+- **Path:** `crates/lib/src/commands/getid/mod.rs`, `--add-referenced` mode only
 - **Scale:** the plain include / invert path is the common one and uses
   `HeaderWalker` + raw-frame reads, no pipelined decode at all.
 - **Per-block work:** light - `IdSet::get` per element during
@@ -139,7 +139,7 @@ cancellation is checked before each frame, not during its reads).
 
 - **Surface:** fused (`for_each_fused_buffer`: a projection on the
   block validator, the block built only for a blob holding a match)
-- **Path:** `src/commands/getparents/mod.rs`, FullScan arm
+- **Path:** `crates/lib/src/commands/getparents/mod.rs`, FullScan arm
 - **Scale:** high-blob-count encodings only. ADR-0006 dispatches
   low-blob-count planet (~50 k blobs) to the `HeaderWalker` arm; the
   FullScan arm runs at ~150 k+ estimated OSMData blobs (Geofabrik-style
@@ -150,7 +150,7 @@ cancellation is checked before each frame, not during its reads).
 ### `tags-filter -R <expr>` single-pass
 
 - **Surface:** fused (`for_each_fused_block`)
-- **Path:** `src/commands/tags_filter/mod.rs` single-pass branch
+- **Path:** `crates/lib/src/commands/tags_filter/mod.rs` single-pass branch
 - **Scale:** every element touched
 - **Per-block work:** heavy - tag iteration, expression match
   against N expressions via `element_matches`, matching elements
@@ -162,7 +162,7 @@ cancellation is checked before each frame, not during its reads).
 ### `add-locations-to-ways` decode-all fallback
 
 - **Surface:** fused (`for_each_fused_block`)
-- **Path:** `src/commands/altw/mod.rs`, `write_output_decode_all`
+- **Path:** `crates/lib/src/commands/altw/mod.rs`, `write_output_decode_all`
 - **Scale:** triggered only by `--force` on non-indexed PBFs.
   Production `--index-type external` uses pread workers.
 - **Per-block work:** heaviest of any pipelined caller. Every
@@ -175,7 +175,7 @@ cancellation is checked before each frame, not during its reads).
 ### `digest`
 
 - **Surface:** fused (`for_each_fused_blob`, with `DigestTransform`)
-- **Path:** `src/commands/digest.rs`
+- **Path:** `crates/lib/src/commands/digest.rs`
 - **Scale:** every blob; the transform sees every blob, not only
   element blocks, and returns a per-blob summary
 - **Per-block work:** the summary is computed on the decode worker;
@@ -184,7 +184,7 @@ cancellation is checked before each frame, not during its reads).
 ### `time-filter` history path
 
 - **Surface:** plain (`for_each_pipelined`)
-- **Path:** `src/commands/time_filter/mod.rs`, history mode
+- **Path:** `crates/lib/src/commands/time_filter/mod.rs`, history mode
 - **Scale:** history PBF scan; every element touched
 - **Per-block work:** medium - timestamp compare, `PendingGroup`
   latest-version tracking, re-encode survivors through `BlockBuilder`
@@ -192,14 +192,14 @@ cancellation is checked before each frame, not during its reads).
 ### `read` bench, pipelined mode
 
 - **Surface:** plain (`for_each_pipelined`)
-- **Path:** `cli/src/lib.rs`, `BenchReadMode::Pipelined`
+- **Path:** `crates/cli/src/lib.rs`, `BenchReadMode::Pipelined`
 - **Scale:** whole file; counts elements by kind
 - **Per-block work:** trivial
 
 ### `build-geocode-index` pass 1
 
 - **Surface:** plain (`for_each_block_pipelined`)
-- **Path:** `src/geocode_index/builder/pass1.rs`, `only_relations()`
+- **Path:** `crates/lib/src/geocode_index/builder/pass1.rs`, `only_relations()`
 - **Scale:** filtered relation scan
 - **Per-block work:** bounded relation metadata extraction
 
@@ -229,11 +229,11 @@ should stay that way:
   `BlobReader` stream per input, cut into work units for the ordered pool,
   for indexed inputs at every `-j`; `StreamingBlocks` for unindexed inputs
 - `apply-changes` - descriptor-first scanner + worker pool, pread
-  per blob (`src/commands/apply_changes/`)
+  per blob (`crates/lib/src/commands/apply_changes/`)
 - `renumber` - external-join style stages (`pass1.rs`, `stage2.rs`,
   `wire_rewrite.rs`, `relations.rs`). Previously a pipelined caller;
   converted to pread workers when the external-join rewrite landed.
-- ALTW external stages 1-4 (`src/commands/altw/external/`) -
+- ALTW external stages 1-4 (`crates/lib/src/commands/altw/external/`) -
   pread workers
 - `getid` single-pass (include / invert) - `HeaderWalker` +
   raw-frame reads

@@ -97,7 +97,7 @@ else it is a refusal, exit 2, with nothing published. Adopted by:
   way blobs `--locations-on-ways` searches without a parse;
 - `add-locations-to-ways`, both index types, at every decode: the raw way
   and node scans (sparse pass 0 and pass 1, external stages 1 and 2, from
-  the kinds the `src/scan` walkers record), both relation member scans, and
+  the kinds the `crates/lib/src/scan` walkers record), both relation member scans, and
   the decode of a node blob for re-encoding (sparse pass 2, external stage
   4). A way inside a blob claiming nodes or relations is refused the same
   way by both, where external used to refuse it with an untyped error and
@@ -291,7 +291,7 @@ order pass found out of order; a kind in strict order is proven
 duplicate-free from the decoded IDs alone and gets no set) pre-allocate their
 ID bitsets to the claimed `max_id` bounded by the input file's size,
 floored at the live-OSM ID range (`id_alloc_bound` in
-`src/commands/check/mod.rs`), and insert any decoded positive ID above the
+`crates/lib/src/commands/check/mod.rs`), and insert any decoded positive ID above the
 allocation after the parallel phase. A claim therefore cannot cause an
 unbounded allocation, and an ID beyond the allocation is still tracked
 correctly; a wrong claim can change the run's memory and time, not its
@@ -436,7 +436,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   block-pair paths refuse any unindexed blob with their own reason, which
   comes first when the first data blob is unindexed; behind an indexed one
   the partial refusal comes first. Each way, the run fails and the advice
-  is `pbfhogg cat`. `cli/tests/cli_input_contract.rs` pins both orders.
+  is `pbfhogg cat`. `crates/cli/tests/cli_input_contract.rs` pins both orders.
 - **`cat`'s own refusals are not about indexing** but about way
   enrichments the header already declared and a re-encode would break:
   `--type` refuses an unindexed blob that yields ways, and plain `cat` a
@@ -452,7 +452,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   of the [CLI reference](../docs/cli/commands.md#proceeding-without-indexdata);
   the outcome of every command
   line on an unindexed file, and on a partially indexed one in either
-  order, is pinned by the tables in `cli/tests/cli_input_contract.rs`. A
+  order, is pinned by the tables in `crates/cli/tests/cli_input_contract.rs`. A
   change to any outcome moves a row there. `renumber` has no `--force` and
   `add-locations-to-ways --index-type external` refuses it at parse time:
   both are deliberate, since neither has an unindexed fallback.

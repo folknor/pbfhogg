@@ -13,7 +13,7 @@ The other fifteen command modules (`altw`, `apply_changes`, `cat`,
 `degrade`, `diff`, `getid`, `getparents`, `inspect` minus JSON,
 `merge_changes`, `renumber`, `repack`, `sort`, `tags_count`,
 `tags_filter`, `time_filter`) compile in a `default-features = false`
-build, and we do not extend the gate to cover `src/commands/` wholesale.
+build, and we do not extend the gate to cover `crates/lib/src/commands/` wholesale.
 
 The feature's contract is therefore "no optional dependencies", not "no
 command layer". `AGENTS.md` (Features section) describes this scope
@@ -25,7 +25,7 @@ ADR-0012), where the question answers itself.
 
 ## Alternatives considered
 
-- **Gate `src/commands/` wholesale behind `commands`.** Rejected: there
+- **Gate `crates/lib/src/commands/` wholesale behind `commands`.** Rejected: there
   is no defect behind the asymmetry - the ungated modules compile clean
   with zero optional dependencies - and the change would touch every
   command module, the `lib.rs` re-exports, and roughly 30 test files for

@@ -117,7 +117,7 @@ replaces the unbounded worst case behind a slow head with backpressure.
 
 `writer_reorder_bytes_high_water` reports the peak output-buffer capacity
 held in the pipelined writer's occupied reorder slots, sampled with the
-span and filled peaks (definition in `src/write/metrics.rs`). Planet,
+span and filled peaks (definition in `crates/lib/src/write/metrics.rs`). Planet,
 interleaved `--bench 1` after `fstrim`. Baseline cells are `184fe3d6`;
 variant cells are that commit plus the uncommitted counter, run with
 `--force`, so they have no UUID.

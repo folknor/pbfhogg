@@ -311,7 +311,7 @@ arm, or the reverse after the `fstrim`).
 - 1 MiB keeps most of the saving, but getid pass 2 runs about 4 % slower
   (26.3 to 28.2 s against 25.1 to 25.4 s; 21 M minor faults against 0.2 M).
   The sequential blob reader allocates each compressed frame, about 1.8 MB
-  at planet, fresh per blob (`BlobReader::next_frame`, `src/read/blob.rs`),
+  at planet, fresh per blob (`BlobReader::next_frame`, `crates/lib/src/read/blob.rs`),
   so a threshold under the frame size maps and unmaps every frame.
 - 4 MiB is wall-neutral where measured (apply-changes medians 98.5 against
   98.3 s over six cells each, getid, renumber, extract `--complete` +1.2 %)

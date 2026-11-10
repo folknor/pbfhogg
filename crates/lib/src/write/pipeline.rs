@@ -410,6 +410,10 @@ impl WritePipeline {
         let (tx, window_rx, inbox) = new_channels();
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "a session thread: the writer keeps its handle and joins it at its end"
+        )]
         let handle = std::thread::spawn(move || body(inbox, &thread_expected));
         Self::new(tx, window_rx, handle, expected, executor, invocation)
     }

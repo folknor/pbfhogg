@@ -42,12 +42,12 @@
 //! path. Both are gone; anything here that is truly unused must now say
 //! so at its own definition, with a reason.
 
+use crate::threads::{Handle, Scope};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::thread::{Scope, ScopedJoinHandle};
 
 use crate::error::{Error, Result};
 use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE};
@@ -89,7 +89,7 @@ enum WriteOp {
 ///
 /// # Failure and thread lifetime
 ///
-/// The pool runs inside `std::thread::scope`, and every worker is joined
+/// The pool runs inside `crate::threads::scope`, and every worker is joined
 /// explicitly before this returns, whatever went wrong - so no pool thread
 /// outlives the call and nothing is still writing to `path` once the caller
 /// sees the result. This used to return on the first panicked join, which
@@ -158,7 +158,7 @@ fn parallel_writer_thread_inner(
 
     let failure = FirstFailure::new();
     let header_len = framed_header.len() as u64;
-    std::thread::scope(|s| run_pool(s, &rx, &file, &failure, header_len, expected, cancel));
+    crate::threads::scope(|s| run_pool(s, &rx, &file, &failure, header_len, expected, cancel));
 
     // Every pool thread has been joined; the record is final.
     if let Some(e) = failure.take() {
@@ -177,8 +177,8 @@ fn parallel_writer_thread_inner(
 /// the pool channels and join every worker. Every failure - spawn, dispatch,
 /// dispatcher panic, worker error or panic - lands in `failure`; nothing
 /// returns early past the join loop.
-fn run_pool<'scope, 'env>(
-    s: &'scope Scope<'scope, 'env>,
+fn run_pool<'w, 'scope, 'env>(
+    s: &'w Scope<'w, 'scope, 'env>,
     rx: &Inbox,
     file: &'scope File,
     failure: &'scope FirstFailure,
@@ -187,12 +187,10 @@ fn run_pool<'scope, 'env>(
     cancel: &'scope crate::host::Recorder,
 ) {
     let mut worker_txs: Vec<SyncSender<WriteOp>> = Vec::with_capacity(POOL_SIZE);
-    let mut worker_handles: Vec<ScopedJoinHandle<'scope, ()>> = Vec::with_capacity(POOL_SIZE);
+    let mut worker_handles: Vec<Handle<'w, 'scope, 'env, ()>> = Vec::with_capacity(POOL_SIZE);
     for index in 0..POOL_SIZE {
         let (wtx, wrx) = sync_channel::<WriteOp>(PER_WORKER_CAPACITY);
-        match std::thread::Builder::new()
-            .spawn_scoped(s, move || pool_worker(index, wrx, file, failure, cancel))
-        {
+        match s.try_spawn(move || pool_worker(index, wrx, file, failure, cancel)) {
             Ok(handle) => {
                 worker_txs.push(wtx);
                 worker_handles.push(handle);

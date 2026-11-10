@@ -103,7 +103,7 @@ pub(super) fn run(
     cancel.marker("MERGECHANGES_SIMPLIFY_START");
     let changes_in: usize = batches.iter().map(|b| b.elements.len()).sum();
     cancel.counter("merge_changes_changes_in", changes_in);
-    let groups = dedupe(&batches, changes_in, allow_version_regression)?;
+    let groups = dedupe(plan, &batches, changes_in, allow_version_regression)?;
     cancel.marker("MERGECHANGES_SIMPLIFY_END");
     // Stage boundary: the sort and scan above have no checkpoint of their own.
     cancel.check()?;
@@ -160,6 +160,7 @@ pub(super) fn run(
 /// Each object's surviving change as `(batch, element)`, in `(kind, id)`
 /// order, grouped create, modify, delete.
 fn dedupe(
+    plan: &stream::Plan<'_>,
     batches: &[Rendered],
     changes_in: usize,
     allow_version_regression: bool,
@@ -171,7 +172,11 @@ fn dedupe(
             keys.push((e.kind, e.id, b, position(i)?));
         }
     }
-    keys.par_sort_unstable();
+    if plan.lanes == usize::MAX {
+        keys.par_sort_unstable();
+    } else {
+        sort_in_lanes(plan.executor, &mut keys, plan.lanes);
+    }
     let element = |k: &Key| &batches[k.2 as usize].elements[k.3 as usize];
 
     let mut groups: [Vec<(u32, u32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -221,7 +226,69 @@ fn dedupe(
     Ok(groups)
 }
 
+/// Sort `keys` with at most `lanes` jobs running at once on `executor`, in
+/// place: split at the median (`select_nth_unstable`), then sort the halves
+/// side by side with the lanes divided between them (the half sorted inline
+/// spends its share too), down to one lane per piece. Keys are unique (they
+/// carry their position), so the result is exactly the sorted sequence.
+fn sort_in_lanes(executor: crate::host::ExecutorRef<'_>, keys: &mut [Key], lanes: usize) {
+    if lanes <= 1 || keys.len() <= 1 {
+        keys.sort_unstable();
+        return;
+    }
+    let mid = keys.len() / 2;
+    keys.select_nth_unstable(mid);
+    let (left, right) = keys.split_at_mut(mid);
+    // `right[0]` is the median, already in place.
+    let right = right.get_mut(1..).unwrap_or_default();
+    let left_lanes = lanes / 2;
+    let right_lanes = lanes - left_lanes;
+    executor.scope(|scope| {
+        scope.spawn(move |_| sort_in_lanes(executor, left, left_lanes));
+        sort_in_lanes(executor, right, right_lanes);
+    });
+}
+
 fn position(i: usize) -> crate::Result<u32> {
     u32::try_from(i)
         .map_err(|_| crate::Error::internal("merge-changes: more than 4 Gi batches or elements"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The lane-bounded sort yields exactly the plain sort, at any lane
+    /// count, on lengths around the split points.
+    #[test]
+    fn sort_in_lanes_matches_sort_unstable() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let kinds = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
+        let mut state = 0x9e37_79b9_u64;
+        for len in [0_u32, 1, 2, 3, 7, 64, 1000] {
+            let keys: Vec<Key> = (0..len)
+                .map(|i| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    let kind = kinds[usize::try_from(state >> 62).unwrap() % 3];
+                    let id = i64::try_from((state >> 20) % 50).unwrap() - 25;
+                    (kind, id, i / 10, i % 10)
+                })
+                .collect();
+            let mut expected = keys.clone();
+            expected.sort_unstable();
+            for lanes in 1..=7 {
+                let mut got = keys.clone();
+                pool.install(|| {
+                    sort_in_lanes(crate::host::ExecutorRef::Pool(&pool), &mut got, lanes);
+                });
+                assert_eq!(got, expected, "len={len} lanes={lanes}");
+            }
+        }
+    }
 }

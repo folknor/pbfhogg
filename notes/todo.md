@@ -31,31 +31,15 @@ Picked for 0.6.0 on 2026-07-30, right after the 0.5.0 release; deferred
 when 0.6.0 was cut down to the library gate, multi-extract descriptor
 admission and the regressions.
 
-- [ ] **`Executor` residue** (decided 2026-10-28): `host::Executor` was
-  narrowed to the library's shared rayon tasks (writer framing, command
-  par-iterators); dedicated pipelines keep their own per-call workers.
-  Left over from that decision, each optional and unmeasured:
-  - merge-changes and the OSC tags-filter under `Parallelism::Fixed(n)`
-    build their own pool and so bypass a caller `Executor::Pool`. The cleaner shape keeps the
-    executor always and makes `n` a job-lane limit: the streaming window
-    (`rayon::current_num_threads()`), the simplify `par_iter` over inputs
-    and the `par_chunks` sort would each honour `n` without spawning jobs
-    that block pool workers on a permit. Measured-path change.
-  - Worker sets run in a `std::thread::scope` without joining their
-    handles (the ordered and classify pools, the read pipeline's stage
-    threads, and other per-stage threads; `parallel_writer` joins its
-    handles and is not one) are waited for only to the end of their main
-    functions: std's scope does not wait for thread-local
-    destructors (found 2026-10-29 while joining the rayon pools, which are
-    now `joined_pool::JoinedPool`s). Harmless today, since no library
-    thread-local records into an invocation and caller code that runs on
-    those threads is rare, but a "no library thread left after the call"
-    promise would need explicit `JoinHandle::join`s there, as
-    `JoinedPool` does.
-  - `no-ambient-rayon` cannot see pool-method scopes or `std::thread`; a
-    new dedicated `std` worker set passes lint unreviewed. (rayon's pool
-    constructors are disallowed in `clippy.toml` outside
-    `joined_pool::JoinedPool`.)
+- [ ] **`Executor` lane limit: planet confirmation** (landed 2026-11-10,
+  unmeasured): merge-changes and the OSC tags-filter now run on the host
+  executor at every `Parallelism`, `Fixed(n)` as a lane limit
+  (`merge_changes::stream::Encoder`, `simplify::sort_in_lanes`). Matched
+  planet A/B against the parent commit: `merge-diffs` default and
+  `--simplify yes` (Auto: only the lane queue plumbing changed, expect
+  noise), and `tag-select --input-kind osc` at default and `--jobs 4`
+  (the `-j` arm changes threading: a shared global pool with 4 lanes
+  instead of a dedicated 4-thread pool). Record in reference/performance.
 
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
@@ -337,11 +321,20 @@ Remaining open findings from the closed hunt.
 
 ### Change stream (`crates/lib/src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **Route uniform partial metadata into partial-column dense groups.**
-  Plain nodes whose partial metadata is uniform, such as apply-changes
-  output, are still written as plain nodes; `BlockBuilder::add_node_partial`
-  could put them in a dense group carrying exactly their columns when that
-  keeps what they claim.
+- [ ] **Partial-metadata dense routing: measure, and the shapes it leaves
+  plain.** `BlockBuilder` now writes a run of partial-metadata nodes dense
+  with exactly their columns where the slot claims what the plain `Info`
+  would and the run is smaller dense (`partial_columns`,
+  `resolve_optional_run`). Open: (1) apply-diff output size on planet and
+  denmark is unmeasured; replication OSC carries complete metadata, so a
+  near-zero delta there is the expected result, not a failure. (2) The
+  size choice is greedy per run: it does not foresee that a later plain
+  node would have joined the plain form's group. (3) A versioned node
+  without `visible` (the common OSC shape when uid or user is missing)
+  stays plain, since a versioned dense slot claims `visible` true; the
+  complete route writes the same shape dense and accepts that claim
+  (DEVIATIONS.md). Whether the partial route should accept it too is a
+  decision, not a bug.
 
 ### Core infrastructure and CLI
 
@@ -396,13 +389,14 @@ Remaining open findings from the closed hunt.
   already lists every polygon containing it under an exact cover, so the
   eight neighbours' entries are pure extra PIP work; the same header signal
   would let the reader drop them.
-- [ ] **The geocode walk costs per cell, not per lookup.** Where a query's
-  answer lies past its 3x3 block, or nothing lies near (open sea), the
-  reader walks cells (ADR-0023), paying s2's `edge_neighbors` (a Hilbert
-  decode and four encodes) and `Cell::rect_bound` per cell (per-call cost
-  unmeasured); that is the +4 to +8 % on uniform bbox points in the latency
-  table. Walking in (face, i, j) arithmetic with a vertex cache would take
-  most of it off. Only worth it if sea-heavy or remote query mixes matter.
+- [ ] **Geocode walk per-cell overhead, only if a coastal-heavy workload
+  appears.** Each expanded cell pays `edge_neighbors` plus four
+  `Cell::rect_bound`. Open sea no longer walks: the presence test answers it
+  in about 1 us per query. The cost is confined to coastal and sparse
+  points whose answer lies just past the 3x3 block, with the +8 %
+  walk-against-nine delta as its ceiling; land mixes are admin-bound.
+  Measure on denmark `--bbox 8.0,54.5,13.0,57.8`, about 20.6 us per query
+  at `7dcabbcc`, admin digest `012d7edd851fd72f`, which must not change.
 
 ## Item/command-specific plans
 

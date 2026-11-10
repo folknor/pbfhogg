@@ -393,6 +393,18 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
+### Where the walk still costs (bygg, 2026-11-10, at `7dcabbcc`)
+
+geocode-query on the denmark index, 100k points, seed 1. Open North
+Sea `5.0,55.5,7.0,57.5`: 0.95 us per query, no answers (`9581539a`,
+dirty tree): the presence test rules out every class before any walk,
+so open sea does not pay the walk the table below implies. The
+sea-heavy country box `8.0,54.5,13.0,57.8`: 20.60 us per query, 69 %
+admin and 39 % address answers (`5f6d309e`, committed). The walk costs
+only on coastal and sparse points whose answer lies just past the 3x3
+block; a face, i, j walk with a vertex cache could recover an estimated
+3 to 5 % there and nothing measurable on land, so it was not built.
+
 ### Query latency: the radius searched in full (bygg, 2026-11-03, on `edefd624`)
 
 brokkr has no geocode query command, so these come from an uncommitted

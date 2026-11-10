@@ -782,7 +782,7 @@ where
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, cancel);
 
-    std::thread::scope(|scope| -> crate::Result<()> {
+    crate::threads::scope(|scope| -> crate::Result<()> {
         // A local of this closure, so every return drops it before the scope
         // joins the workers. See the module docs ("Two limits, two jobs") for
         // why it is not as deep as the window.
@@ -1253,7 +1253,7 @@ where
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, cancel);
 
-    std::thread::scope(|scope| -> crate::Result<()> {
+    crate::threads::scope(|scope| -> crate::Result<()> {
         // Every channel end below is a local of this closure, so any return
         // drops it before the scope joins the workers.
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<PayloadJob<P, T, E>>(window.get());

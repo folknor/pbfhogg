@@ -707,7 +707,7 @@ where
     let scratch_pool = &AtomicU64::new(0);
     // Declared before the scope so it drops after the scope has joined.
     let _emit = EmitOnDrop(metrics, invocation);
-    let result = std::thread::scope(|scope| {
+    let result = crate::threads::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
             for (seq, blob_result) in std::iter::from_fn(|| blob_reader.next_blob()).enumerate() {
@@ -794,6 +794,10 @@ where
             // Tasks borrow the reader's path from this scope: one capture per
             // pipeline, no refcounting per blob.
             let source = source.as_ref();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the read's own joined decode pool, not the host executor"
+            )]
             decode_pool.pool().in_place_scope(|task_scope| {
                 for (seq, blob_result) in raw_rx {
                     if shutdown.load(Relaxed) {

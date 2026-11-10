@@ -17,7 +17,8 @@
 //!   there, but no attribute is interpreted. At an element end past
 //!   [`MERGE_CHANGES_BATCH_BYTES`] the reader seals a batch: it takes credit
 //!   for the batch's bytes from the [`Ledger`] (waiting if the budget is
-//!   spent), then spawns its encode job on the pool tagged `(input, seq)`.
+//!   spent), then hands its encode job, tagged `(input, seq)`, to the
+//!   [`Encoder`], which runs it on the executor within the plan's lanes.
 //!   Credit is taken before the sequence number becomes outstanding, and an
 //!   input's batches are sealed in order.
 //! - **Workers.** Replay a batch into the byte sink, re-emit XML and gzip
@@ -81,6 +82,9 @@ pub(crate) struct Plan<'a> {
     pub(crate) is_gz: bool,
     /// Upper bound on concurrently alive reader threads.
     pub(crate) readers: usize,
+    /// Upper bound on this call's encode jobs running at once on the
+    /// executor ([`Lanes`]); `usize::MAX` leaves them unbounded.
+    pub(crate) lanes: usize,
     pub(crate) executor: crate::host::ExecutorRef<'a>,
     pub(crate) cancel: &'a crate::host::Recorder,
 }
@@ -189,6 +193,142 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// A sealed batch whose credit is taken, waiting for or holding a lane.
+struct Pending<T> {
+    input: usize,
+    seq: usize,
+    credit: usize,
+    batch: LexBatch,
+    tx: Sender<Msg<T>>,
+}
+
+/// The encode side of one merge: runs every sealed batch's encode job on the
+/// executor, at most `limit` at once ([`Plan::lanes`]), with no pool worker
+/// ever waiting for a lane. A sealed batch starts a lane if fewer than
+/// `limit` are running and is queued otherwise; a lane that finishes its job
+/// hands itself to the oldest queued batch by spawning it, or retires when
+/// the queue is empty. The handoff and the retirement happen under the queue
+/// lock, so a queued batch always has a running lane ahead of it, and on
+/// unwind too ([`Handoff`]'s drop), so no lane is lost. Credit for a queued
+/// batch is already taken, so the queue is bounded by the ledger. Every job
+/// answers its position on the result channel, which is unbounded, so a job
+/// never blocks, even inside the coordinator's `yield_now`.
+struct Encoder<'s, T, E> {
+    ledger: &'s Ledger,
+    encode: &'s E,
+    inputs: &'s [&'s Path],
+    limit: usize,
+    lanes: Mutex<LaneState<T>>,
+}
+
+struct LaneState<T> {
+    queue: std::collections::VecDeque<Pending<T>>,
+    running: usize,
+}
+
+impl<'s, T, E> Encoder<'s, T, E>
+where
+    T: Send + 's,
+    E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
+{
+    fn new(plan: &'s Plan<'s>, ledger: &'s Ledger, encode: &'s E) -> Self {
+        Self {
+            ledger,
+            encode,
+            inputs: plan.inputs,
+            limit: plan.lanes.max(1),
+            lanes: Mutex::new(LaneState {
+                queue: std::collections::VecDeque::new(),
+                running: 0,
+            }),
+        }
+    }
+
+    fn submit(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
+        let mut state = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.running < self.limit {
+            state.running += 1;
+            drop(state);
+            self.start(scope, job);
+        } else {
+            state.queue.push_back(job);
+        }
+    }
+
+    fn start(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
+        scope.spawn(move |scope| {
+            let _handoff = Handoff {
+                encoder: self,
+                scope,
+            };
+            self.run(job);
+        });
+    }
+
+    /// Encode one batch and answer its position, a panic included.
+    fn run(&self, job: Pending<T>) {
+        let Pending {
+            input,
+            seq,
+            credit,
+            batch,
+            tx,
+        } = job;
+        let path = self.inputs[input];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.ledger.halted() {
+                return Err(crate::Error::internal(
+                    "merge-changes stopped after an earlier failure",
+                ));
+            }
+            (self.encode)(&batch, path)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(
+                crate::error::panic_error("merge-changes worker", payload.as_ref())
+                    .context(format!("while merging {}", path.display())),
+            )
+        });
+        drop(tx.send(Msg::Member {
+            input,
+            seq,
+            credit,
+            result,
+        }));
+    }
+}
+
+/// Passes a finished lane to the next queued batch, or retires it.
+struct Handoff<'a, 's, T, E>
+where
+    T: Send + 's,
+    E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
+{
+    encoder: &'s Encoder<'s, T, E>,
+    scope: &'a rayon::Scope<'s>,
+}
+
+impl<'s, T, E> Drop for Handoff<'_, 's, T, E>
+where
+    T: Send + 's,
+    E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
+{
+    fn drop(&mut self) {
+        let mut state = self
+            .encoder
+            .lanes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match state.queue.pop_front() {
+            Some(next) => {
+                drop(state);
+                self.encoder.start(self.scope, next);
+            }
+            None => state.running -= 1,
+        }
+    }
+}
+
 /// Run the merge, writing every member in input and batch order to `out`.
 /// Returns the number of changes written.
 ///
@@ -208,16 +348,16 @@ pub(crate) fn run(
     let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, u64)>>();
     let ledger_ref = &ledger;
-    let encode_ref = &encode;
+    let encoder = Encoder::new(plan, ledger_ref, &encode);
+    let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
-        std::thread::scope(|threads| {
+        crate::threads::scope(|threads| {
             let _stop = StopOnDrop(ledger_ref);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();
-                std::thread::Builder::new()
-                    .name(format!("merge-read-{input}"))
-                    .spawn_scoped(threads, move || {
-                        read_input(input, plan, scope, ledger_ref, &tx, encode_ref, true);
+                threads
+                    .spawn_named(format!("merge-read-{input}"), move || {
+                        read_input(input, plan, scope, encoder_ref, &tx, true);
                     })
                     .map(drop)
                     .map_err(|e| {
@@ -248,15 +388,16 @@ where
     let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<T>>();
     let ledger_ref = &ledger;
+    let encoder = Encoder::new(plan, ledger_ref, encode);
+    let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
-        std::thread::scope(|threads| {
+        crate::threads::scope(|threads| {
             let _stop = StopOnDrop(ledger_ref);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();
-                std::thread::Builder::new()
-                    .name(format!("merge-read-{input}"))
-                    .spawn_scoped(threads, move || {
-                        read_input(input, plan, scope, ledger_ref, &tx, encode, false);
+                threads
+                    .spawn_named(format!("merge-read-{input}"), move || {
+                        read_input(input, plan, scope, encoder_ref, &tx, false);
                     })
                     .map(drop)
                     .map_err(|e| {
@@ -365,14 +506,14 @@ fn read_input<'s, T, E>(
     input: usize,
     plan: &'s Plan<'s>,
     scope: &rayon::Scope<'s>,
-    ledger: &'s Ledger,
+    encoder: &'s Encoder<'s, T, E>,
     tx: &Sender<Msg<T>>,
-    encode: &'s E,
     ordered: bool,
 ) where
     T: Send + 's,
     E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
 {
+    let ledger = encoder.ledger;
     let path = plan.inputs[input];
     let cancel = plan.cancel;
     #[cfg(feature = "test-hooks")]
@@ -396,29 +537,16 @@ fn read_input<'s, T, E>(
             ledger.acquire(credit, cancel)?;
             let s = seq.get();
             seq.set(s + 1);
-            let tx = tx.clone();
-            scope.spawn(move |_| {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if ledger.halted() {
-                        return Err(crate::Error::internal(
-                            "merge-changes stopped after an earlier failure",
-                        ));
-                    }
-                    encode(&batch, path)
-                }))
-                .unwrap_or_else(|payload| {
-                    Err(
-                        crate::error::panic_error("merge-changes worker", payload.as_ref())
-                            .context(format!("while merging {}", path.display())),
-                    )
-                });
-                drop(tx.send(Msg::Member {
+            encoder.submit(
+                scope,
+                Pending {
                     input,
                     seq: s,
                     credit,
-                    result,
-                }));
-            });
+                    batch,
+                    tx: tx.clone(),
+                },
+            );
             Ok(())
         };
         let mut sink = LexSink::new(crate::tunables::MERGE_CHANGES_BATCH_BYTES, seal, || {
@@ -749,6 +877,69 @@ fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> cra
                 }
                 None => return rx.recv().map_err(|_| lost()),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// One input cut into many batches.
+    fn many_batch_input(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("input.osc");
+        let mut body = String::from("<osmChange version=\"0.6\"><create>");
+        for k in 0..crate::tunables::MERGE_CHANGES_BATCH_BYTES / 2 {
+            body.push_str(&format!("<node id=\"{k}\" lat=\"1\" lon=\"2\"/>"));
+        }
+        body.push_str("</create></osmChange>");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Every encode job runs on the caller's pool, never more than `lanes`
+    /// at once however wide the pool, and every batch is answered in order;
+    /// a one-thread pool with one lane completes too.
+    #[test]
+    fn encode_jobs_stay_on_the_executor_within_their_lanes() {
+        let scratch = crate::path_guard::tests::scratch();
+        let path = many_batch_input(scratch.path());
+        let host = crate::host::Host::entered_for_tests();
+        for (threads, lanes) in [(6, 2), (1, 1), (3, 1)] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let running = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let off_pool = AtomicUsize::new(0);
+            let inputs = [path.as_path()];
+            let plan = Plan {
+                inputs: &inputs,
+                is_gz: false,
+                readers: 1,
+                lanes,
+                executor: crate::host::ExecutorRef::Pool(&pool),
+                cancel: &host.invocation,
+            };
+            let encode = |batch: &LexBatch, _: &Path| -> crate::Result<usize> {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                if pool.current_thread_index().is_none() {
+                    off_pool.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(batch.bytes())
+            };
+            let batches = collect(&plan, &encode).unwrap();
+            let case = format!("threads={threads} lanes={lanes}");
+            assert!(batches[0].len() > 4, "{case}: {} batches", batches[0].len());
+            assert_eq!(off_pool.load(Ordering::SeqCst), 0, "{case}");
+            let peak = peak.load(Ordering::SeqCst);
+            assert!((1..=lanes).contains(&peak), "{case}: peak {peak}");
         }
     }
 }

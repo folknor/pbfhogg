@@ -74,6 +74,10 @@ impl JoinedPool {
                 invocation.faults().on_built_pool_spawn(thread.index())?;
                 #[cfg(feature = "test-hooks")]
                 let hooks = invocation.clone();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "a pool worker whose handle the pool keeps and joins when it drops"
+                )]
                 let handle = std::thread::Builder::new().spawn(move || {
                     thread.run();
                     #[cfg(feature = "test-hooks")]

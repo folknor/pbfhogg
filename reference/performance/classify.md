@@ -428,7 +428,9 @@ candidate_rx fan-out, the one uncounted dispatch, now records
 merge_streaming_candidate_lock_wait_ns and _recv_wait_ns with the same
 semantics as the classify counters; under --locations-on-ways one idle
 worker holds the lock across the scanner barrier, so its lock wait
-reads large by design.
+reads large by design. First reading, planet apply-diff OSC 4913 at
+`7dcabbcc` (`9260486d`): 100 ms of lock wait and 10 ms of receive wait
+on a 197 s wall, so this dispatch is not a cost either.
 
 #### Mutex<Receiver> blob dispatch is not a bottleneck (do-not-reattempt)
 

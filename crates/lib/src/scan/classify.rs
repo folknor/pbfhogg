@@ -1123,7 +1123,7 @@ fn run_unordered_per_blob<L, R: Send>(
     // Declared before the scope, so it emits after the scope has joined the
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, &host.invocation);
-    std::thread::scope(|scope| -> Result<()> {
+    crate::threads::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
@@ -1423,7 +1423,7 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
         edge: std::sync::atomic::AtomicUsize::new(first_edge),
         done: std::sync::atomic::AtomicBool::new(false),
     };
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         let shared = &shared;
         let advisor =
             scope.spawn(move || advise_behind(shared, willneed, schedule, file, first_edge));
@@ -1731,7 +1731,7 @@ fn run_accumulate_decoded<S: Send>(
     // Emits after the scope has joined, so every thread's waits are in; on
     // a failure or an unwind too.
     let _emit = EmitOnDrop(metrics, &host.invocation);
-    std::thread::scope(|scope| -> Result<()> {
+    crate::threads::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);

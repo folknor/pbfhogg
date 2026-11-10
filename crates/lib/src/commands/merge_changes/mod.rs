@@ -254,26 +254,12 @@ pub(crate) fn merge_changes_to(
     host.invocation
         .counter("merge_changes_total_bytes_in", total_bytes_in);
 
-    // Build a pool of the call's own when the caller fixed the parallelism.
-    // Pool controls par_iter and par_chunks thread count for both the
-    // streaming and simplify paths. Under `Auto` the host's executor is used
-    // (rayon's ambient pool under `Executor::Ambient`).
-    // The streaming path's ordered window spawns onto the same executor its
-    // body is installed on, so the explicit pool is lent as one. It is joined
-    // when `fixed_pool` drops: below on success, on any early return or
-    // unwind otherwise.
-    let fixed_pool = match parallelism.fixed() {
-        Some(_) => Some(crate::joined_pool::JoinedPool::build(
-            "merge-changes worker pool",
-            worker_count,
-            &host.invocation,
-        )?),
-        None => None,
-    };
-    let executor = fixed_pool.as_ref().map_or_else(
-        || host.executor.borrowed(),
-        |pool| crate::host::ExecutorRef::Pool(pool.pool()),
-    );
+    // Every job runs on the host's executor. A fixed parallelism is a lane
+    // limit there, not a pool of the call's own: at most `n` encode jobs at
+    // once (`stream::Encoder`), `n` emit chunks, and a sort split `n` ways.
+    // Under `Auto` the jobs are unbounded, as the executor's width allows.
+    let executor = host.executor.borrowed();
+    let lanes = parallelism.fixed().unwrap_or(usize::MAX);
 
     // The one whole-body executor install in the library. Everywhere else
     // `install` wraps only a parallel computation, so that no `PbfWriter`
@@ -282,38 +268,24 @@ pub(crate) fn merge_changes_to(
     // Under `Executor::Ambient` (the CLI) this is a direct call.
     let cancel = &host.invocation;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
+        let plan = stream::Plan {
+            inputs,
+            is_gz,
+            readers: worker_count,
+            lanes,
+            executor,
+            cancel,
+        };
         match mode {
             MergeMode::Simplify {
                 allow_version_regression,
-            } => simplify::run(
-                &stream::Plan {
-                    inputs,
-                    is_gz,
-                    readers: worker_count,
-                    executor,
-                    cancel,
-                },
-                output,
-                worker_count,
-                *allow_version_regression,
-            ),
+            } => simplify::run(&plan, output, worker_count, *allow_version_regression),
             MergeMode::Stream { scratch } => {
-                let changes_out = write_streaming(
-                    inputs,
-                    output,
-                    is_gz,
-                    worker_count,
-                    executor,
-                    scratch.as_ref(),
-                    cancel,
-                )?;
+                let changes_out = write_streaming(&plan, output, scratch.as_ref())?;
                 Ok((changes_out, changes_out))
             }
         }
     })?;
-    // Inside the marked span, so `MERGECHANGES_END` comes after the pool's
-    // workers have exited.
-    drop(fixed_pool);
 
     host.invocation
         .counter("merge_changes_changes_out", changes_out);
@@ -623,15 +595,12 @@ impl OscWriter {
 
 #[hotpath::measure]
 fn write_streaming(
-    inputs: &[&Path],
+    plan: &stream::Plan<'_>,
     output: &crate::output::BoundOutput,
-    is_gz: bool,
-    readers: usize,
-    executor: crate::host::ExecutorRef<'_>,
     scratch: Option<&crate::scratch::RunScratch>,
-    cancel: &crate::host::Recorder,
 ) -> Result<u64> {
-    for path in inputs {
+    let (is_gz, cancel) = (plan.is_gz, plan.cancel);
+    for path in plan.inputs {
         if let Ok(meta) = std::fs::metadata(path) {
             cancel.counter("merge_changes_input_bytes", meta.len());
         }
@@ -642,17 +611,7 @@ fn write_streaming(
     out.write_all(&prelude)?;
     // The ordered drain overlaps this span; DRAIN below is the postlude.
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_START");
-    let count = stream::run(
-        &stream::Plan {
-            inputs,
-            is_gz,
-            readers,
-            executor,
-            cancel,
-        },
-        scratch,
-        &mut out,
-    )?;
+    let count = stream::run(plan, scratch, &mut out)?;
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
     cancel.marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;

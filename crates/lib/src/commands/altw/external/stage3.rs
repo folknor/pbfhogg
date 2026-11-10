@@ -155,7 +155,7 @@ pub(super) fn stage3_slot_reorder(
     let ctx = integrated;
     let router = ctx.router;
 
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             let handle = scope.spawn(move || -> crate::Result<()> {

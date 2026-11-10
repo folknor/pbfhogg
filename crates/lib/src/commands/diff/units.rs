@@ -200,7 +200,7 @@ pub(super) fn run<C: UnitConsumer>(
     let workers = jobs.max(1);
     let invocation = &host.invocation;
 
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<PlanMsg>(DIFF_UNIT_QUEUE_DEPTH);
         let planner = scope.spawn(move || {
             let mut cursors = [old_cursor, new_cursor];

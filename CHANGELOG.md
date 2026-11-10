@@ -16,6 +16,16 @@
 
 ### Changed
 
+- **`merge-changes` and the OSC `tags-filter` with `-j N` /
+  `Parallelism::Fixed(n)` run on the host's executor** instead of building a
+  pool of their own: `n` now caps how many of their jobs run at once there
+  (encode jobs, simplify's emit chunks and sort), so a library caller's
+  `Executor::Pool` confines them at every setting. Their worker threads are
+  no longer the call's to tear down; a sink callback running in those jobs
+  runs on an executor worker that outlives the call.
+- **Every thread the library starts is joined before the call or session
+  that started it ends**, thread-local destructors included. Scoped worker
+  sets used to be waited for only to the end of their main functions.
 - **PBFs whose DenseInfo carries only some columns are read**, as osmium
   writes them under `add_metadata` (for example
   `add_metadata=version+timestamp`, or a history file written without
@@ -24,6 +34,14 @@
   present column of the wrong length is still refused. New public
   `DenseNodeInfo::columns()` and `DenseColumns`; an absent column reads as
   0 (`visible` as true, the user as empty).
+- **Nodes with partial metadata are written dense where that keeps what
+  they claim.** A run of plain or OSC nodes sharing one partial field set
+  (for example version, timestamp and visible) is written as a dense group
+  with exactly those DenseInfo columns when that is smaller than the plain
+  `Node` messages, instead of always plain. Nodes whose dense slot would
+  read differently (a versioned node without `visible`, a versionless node
+  with a zero uid or changeset, an empty user or `visible` true) stay
+  plain. Complete-metadata output is byte-identical.
 - A dense node with the Osmosis version `-1` keeps its metadata: printing
   outputs (`diff --format osc`, `inspect --show`, `export --metadata`,
   `digest`) show its real timestamp, uid and user, and re-encoding writes it

@@ -1472,7 +1472,8 @@ pub enum PageCachePolicy {
 /// The execution context for the library's shared rayon tasks: `PbfWriter`
 /// framing and the parallel-iterator work in commands (repack, degrade,
 /// simple extract, the geocode index builder, merge-changes), and the
-/// batch workers of merge-changes and the OSC tags-filter.
+/// batch workers of merge-changes and the OSC tags-filter, at every
+/// [`Parallelism`].
 ///
 /// It does not confine all library computation and imposes no aggregate
 /// concurrency limit. Dedicated pipelines (the pipelined reader's decode
@@ -1483,21 +1484,18 @@ pub enum PageCachePolicy {
 /// resource inputs or fixed tunables. Pipeline coordinators and consumers may
 /// run on the invoking thread, and may dispatch shared rayon tasks through
 /// this executor. Merge-changes and the OSC tags-filter with
-/// `Parallelism::Fixed(n)` run on a dedicated rayon pool of `n` threads
-/// instead of this executor; with `Parallelism::Auto` they use this executor.
+/// `Parallelism::Fixed(n)` run at most `n` of their jobs at once on this
+/// executor; they build no pool of their own.
 ///
-/// The rayon pools the library builds itself - the pipelined reader's decode
-/// pool and the `Fixed(n)` pools of merge-changes and the OSC tags-filter -
-/// are joined: every one of their worker threads has exited, thread-local
-/// destructors included, before the call that built them ends (for
-/// `ElementReader::into_blocks_pipelined`, before the returned iterator's
-/// drop returns), on success, error and unwind alike. A caller callback can run on one of those workers, and what it
-/// leaves there is waited for; see [`crate::debug::InstrumentSink`]. The
-/// other dedicated worker sets are `std` threads whose work ends before the
-/// call or session does; those a `std::thread::scope` waits for without an
-/// explicit join are waited for only to the end of their main function, as
-/// that scope does, so their thread-local destructors may still be running
-/// when the call returns.
+/// Every thread the library starts itself - the pipelined reader's decode
+/// pool, the other dedicated worker sets, the threads of a session such as
+/// a block iterator or a writer - has exited, thread-local destructors
+/// included, before the call that started it ends, or for a session before
+/// its end (its flush, its drop) returns, on success, error and unwind alike.
+/// A caller callback can run on one of those threads, and what it leaves
+/// there is waited for; see [`crate::debug::InstrumentSink`]. This
+/// executor's workers are not among them: they are the caller's, outlive
+/// every call, and under `Ambient` may be started by one (below).
 ///
 /// `Ambient` uses whatever pool the calling thread is in, or rayon's global
 /// pool off any pool, exactly as `rayon::spawn` and the par-iterators do.
@@ -1545,6 +1543,10 @@ pub enum Executor {
     /// The caller's own pool.
     Pool(Arc<rayon::ThreadPool>),
 }
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the executor is where the library's rayon work reaches a pool"
+)]
 impl Executor {
     /// This executor, borrowed for one call.
     pub(crate) fn borrowed(&self) -> ExecutorRef<'_> {
@@ -1591,6 +1593,10 @@ pub(crate) enum ExecutorRef<'a> {
     /// A borrowed pool.
     Pool(&'a rayon::ThreadPool),
 }
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the executor is where the library's rayon work reaches a pool"
+)]
 impl ExecutorRef<'_> {
     /// Run `op` inside the pool (`Ambient`: a direct call).
     pub(crate) fn install<R: Send>(self, op: impl FnOnce() -> R + Send) -> R {
@@ -1874,9 +1880,10 @@ pub(crate) fn sized_workers(
 /// command. `Fixed(1)` runs a command's sequential path where it has one;
 /// `Fixed(n)` caps its worker pools at `n` threads. For `diff`, `n` is also
 /// the number of ID-range shards. For `merge_changes` and
-/// `tags_filter::osc::tags_filter_osc`, `Fixed(n)` runs the command's workers
-/// on a dedicated rayon pool of `n` threads instead of [`Host::executor`];
-/// `Auto` uses the executor.
+/// `tags_filter::osc::tags_filter_osc`, whose workers are jobs on
+/// [`Host::executor`] at every setting, `Fixed(n)` caps how many of those jobs
+/// run at once (and, for `merge_changes`, its reader threads at `n`); `Auto`
+/// leaves the jobs to the executor's width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Parallelism {
     /// The command sizes its own pools from the host.

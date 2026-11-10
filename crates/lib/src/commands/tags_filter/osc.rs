@@ -167,9 +167,9 @@ impl TagsFilterOscStats {
 /// - `create` / `modify`: only matching elements are kept.
 /// - `delete`: all deletes are forwarded unconditionally.
 ///
-/// `parallelism` sizes the filtering workers. `Fixed(n)` runs them on a
-/// dedicated rayon pool of `n` threads, joined before the document is
-/// written; `Auto` runs them on [`Host::executor`](crate::host::Host). The
+/// `parallelism` sizes the filtering workers, which run on
+/// [`Host::executor`](crate::host::Host): `Fixed(n)` runs at most `n` of
+/// them at once there, `Auto` leaves them unbounded. The
 /// one reader thread that frames the document runs beside the workers at
 /// any setting, `Fixed(1)` included. The output does not depend on it.
 pub fn tags_filter_osc(
@@ -216,41 +216,25 @@ pub(crate) fn tags_filter_osc_to(
     let is_gz = crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
     host.invocation.marker("TAGSFILTEROSC_START");
-    // A fixed parallelism gets a pool of the call's own, built and dropped on
-    // this thread, outside the scope it serves. `collect` enters the pool
-    // through `ThreadPool::scope`, which installs, so its coordinator runs on
-    // a worker and yields to the encode jobs while it waits: one thread is
-    // enough. Under `Auto` the host's executor runs the workers.
-    let fixed_pool = match parallelism.fixed() {
-        Some(n) => {
-            host.invocation.counter("tagsfilter_worker_count", n);
-            Some(crate::joined_pool::JoinedPool::build(
-                "tags-filter OSC worker pool",
-                n,
-                &host.invocation,
-            )?)
-        }
-        None => None,
-    };
-    let executor = fixed_pool.as_ref().map_or_else(
-        || host.executor.borrowed(),
-        |pool| crate::host::ExecutorRef::Pool(pool.pool()),
-    );
+    // The workers run on the host's executor; a fixed parallelism caps how
+    // many of them run at once there (`stream::Encoder`), not a pool of the
+    // call's own. Under `Auto` they are unbounded.
+    if let Some(n) = parallelism.fixed() {
+        host.invocation.counter("tagsfilter_worker_count", n);
+    }
     let inputs = [input];
     let plan = stream::Plan {
         inputs: &inputs,
         is_gz: false,
         readers: 1,
-        executor,
+        lanes: parallelism.fixed().unwrap_or(usize::MAX),
+        executor: host.executor.borrowed(),
         cancel: &host.invocation,
     };
     let expressions = expressions.as_slice();
     let batches = stream::collect(&plan, &|batch: &LexBatch, path: &Path| {
         filter_batch(batch, path, expressions)
-    });
-    // Joined before the document is written, on success and failure alike.
-    drop(fixed_pool);
-    let batches = batches?;
+    })?;
     let batches: Vec<FilteredBatch> = batches.into_iter().flatten().collect();
     host.invocation.check()?;
     let mut stats = TagsFilterOscStats::default();

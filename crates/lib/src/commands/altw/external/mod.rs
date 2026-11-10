@@ -1075,7 +1075,7 @@ pub(crate) fn external_join_in(
     let input_ref_parallel: &PinnedInput = input;
     let blob_meta_ref_parallel = &blob_meta;
     let bucket_layout_ref = &bucket_layout;
-    let (stage1_out, relation_member_node_ids) = std::thread::scope(
+    let (stage1_out, relation_member_node_ids) = crate::threads::scope(
         |scope| -> Result<(
             super::external::stage1::Stage1Output,
             Option<relation_scan::RelationScanOutput>,
@@ -1401,7 +1401,7 @@ pub(crate) fn external_join_in(
     // Both stage threads return the typed crate::Error unchanged, so a
     // PlatformUnsupported raised by the output writer in stage 4 keeps its
     // kind (and exit code) across the join.
-    let mut stats = std::thread::scope(|scope| -> crate::Result<Stats> {
+    let mut stats = crate::threads::scope(|scope| -> crate::Result<Stats> {
         let s3_handle = scope.spawn(move || -> crate::Result<()> {
             let integrated = IntegratedInputs {
                 way_slot_starts: way_slot_starts_ref,

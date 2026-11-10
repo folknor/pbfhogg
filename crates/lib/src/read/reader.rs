@@ -438,6 +438,10 @@ impl<R: Read + Send> ElementReader<R> {
         let invocation = call.handle().clone();
         let ticket = call.ticket(crate::host::Kind::Session);
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "a session thread: the iterator keeps its handle and joins it in teardown"
+        )]
         let handle = std::thread::spawn(move || {
             let permit = permit;
             let deliver = |block: PrimitiveBlock| {
@@ -634,7 +638,7 @@ where
     let identity = &identity;
     let reduce_op = &reduce_op;
 
-    std::thread::scope(|scope| -> Result<T> {
+    crate::threads::scope(|scope| -> Result<T> {
         // Installed before the first worker spawns: if the calling thread
         // unwinds inside this scope - a `scope.spawn` failure, or a panicking
         // `R::read` inside the pump - this closes the queue and shuts the budget

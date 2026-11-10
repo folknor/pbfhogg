@@ -189,7 +189,7 @@ impl crate::ordered_pool::OrderedConsumer<(u64, Vec<u32>, Option<i64>)> for Stag
 /// Flush every shard's id-shard writers, one thread per shard; the first
 /// failure (in shard order) names its shard file.
 fn flush_shards(shards: &mut [Stage1Shard<'_>], scratch: &RunScratch) -> Result<()> {
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         let handles: Vec<_> = shards
             .iter_mut()
             .map(|shard| {

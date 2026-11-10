@@ -388,7 +388,7 @@ pub(super) fn stage2_node_join(
     let layout_ref = bucket_layout;
     let slot_starts_ref = way_slot_starts;
 
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         for _ in 0..num_workers {
             let pbf_file = Arc::clone(input_pbf.file());
             scope.spawn(move || {

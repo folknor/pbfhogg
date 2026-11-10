@@ -217,6 +217,10 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             let worker_failure = Arc::clone(&failure);
             #[cfg(feature = "test-hooks")]
             let worker_cancel = cancel.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "a session thread: the writer keeps its handle and joins it at shutdown"
+            )]
             let spawned = std::thread::Builder::new().spawn(move || {
                 // Backstop only: `compress_job` already catches everything
                 // between dequeue and send. Recorded before `compressed_tx`
@@ -251,6 +255,10 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
 
         let writer_failure = Arc::clone(&failure);
         let writer_invocation = cancel.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "a session thread: the writer keeps its handle and joins it at shutdown"
+        )]
         let spawned = std::thread::Builder::new().spawn(move || {
             // Backstop as above: `writer_loop` runs every inner-writer call
             // under `guarded`. The receiver is owned out here so it is only

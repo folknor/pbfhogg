@@ -336,7 +336,7 @@ pub(super) fn run_workers(
     // blob.
     let source: Arc<Path> = Arc::from(base.path());
 
-    std::thread::scope(|scope| {
+    crate::threads::scope(|scope| {
         for worker_id in 0..worker_count {
             let drain_tx = drain_tx.clone();
             let loc = locations.as_ref().map(|l| WorkerLoc {

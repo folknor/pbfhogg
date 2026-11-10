@@ -30,15 +30,18 @@ use crate::tunables::PIPE_BUF;
 /// running; a seal attempted from inside a callback is refused as a call in
 /// progress.
 ///
-/// A callback can run on a worker of a rayon pool the library built for the
-/// call (merge-changes emits from its `Parallelism::Fixed` pool's workers).
-/// Those pools are joined before the call ends, unwinding included (see
-/// [`Executor`](crate::host::Executor)), so whatever a callback leaves behind
-/// on such a worker is finished first: rayon work it submitted to the current
-/// pool (`rayon::spawn`, `rayon::spawn_broadcast` and the like) and the
-/// destruction of thread-local values it created, with everything they own.
-/// None of that may wait for the call to end, or for anything the invoking
-/// thread holds until it does, or the call never ends.
+/// A callback can run on a thread the library started for the call (the
+/// decode pool, a stage or worker thread). Those threads are joined before
+/// the call ends, unwinding included (see [`Executor`](crate::host::Executor)),
+/// so whatever a callback leaves behind on one is finished first: rayon work
+/// it submitted to a library-built pool (`rayon::spawn`,
+/// `rayon::spawn_broadcast` and the like) and the destruction of thread-local
+/// values it created, with everything they own. None of that may wait for the
+/// call to end, or for anything the invoking thread holds until it does, or
+/// the call never ends. A callback can also run on a worker of the host's
+/// executor (merge-changes and the OSC tags-filter emit from their jobs
+/// there); that worker is the caller's and outlives the call, so what a
+/// callback leaves on it is not waited for.
 ///
 /// Calls carry no invocation identity: a caller that funnels several
 /// invocations into one collector gives each its own sink that tags what it

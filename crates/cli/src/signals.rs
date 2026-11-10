@@ -57,6 +57,10 @@ pub(crate) fn install(cancel: Invocation) -> std::io::Result<()> {
     if rc != 0 {
         return Err(std::io::Error::from_raw_os_error(rc));
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the process's signal waiter, which lives as long as the process"
+    )]
     let spawned = std::thread::Builder::new()
         .name("pbfhogg-signals".to_owned())
         .spawn(move || wait_loop(&set, &cancel));
@@ -106,6 +110,10 @@ fn wait_loop(set: &libc::sigset_t, cancel: &Invocation) {
 
 /// Print the "stopping" notice from a thread of its own, so the waiter never
 /// blocks on stderr. A failure to start it costs only the notice.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a detached process thread, so the signal waiter never blocks on stderr"
+)]
 fn report_stopping(signo: libc::c_int) {
     drop(
         std::thread::Builder::new()

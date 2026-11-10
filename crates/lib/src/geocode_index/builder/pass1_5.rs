@@ -537,7 +537,7 @@ pub(super) fn run_pass1_5(
         let negative_node_ids: Mutex<Vec<i64>> = Mutex::new(Vec::new());
         let negative_node_ids_ref = &negative_node_ids;
 
-        std::thread::scope(|scope| {
+        crate::threads::scope(|scope| {
             for (worker, store_file) in store_files.into_iter().enumerate() {
                 let file = std::sync::Arc::clone(shared_file);
                 scope.spawn(move || {

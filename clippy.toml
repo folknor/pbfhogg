@@ -98,6 +98,46 @@ disallowed-methods = [
     { path = "rayon_core::ThreadPoolBuilder::build_global", reason = "the rayon global pool belongs to the caller (ADR-0016)" },
     { path = "rayon_core::ThreadPool::new", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
     { path = "rayon_core::Configuration::build", reason = "library rayon pools are built by crate::joined_pool::JoinedPool, which joins its workers" },
+    # Rayon work reaches a pool through `crate::host::Executor` and
+    # `ExecutorRef` only (their impls allow these), so it runs on the caller's
+    # executor and nowhere ambient. A library-built `JoinedPool` is entered
+    # at its one site, with the allow beside it. Definition-based, so imports,
+    # method syntax and the `rayon_core` spelling are all seen.
+    { path = "rayon_core::spawn", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::spawn_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::spawn_broadcast", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::broadcast", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::scope", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::scope_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::in_place_scope", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::in_place_scope_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::join", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::join_context", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::yield_now", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::yield_local", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::install", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::scope", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::scope_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::in_place_scope", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::in_place_scope_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::spawn", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::spawn_fifo", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::broadcast", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::spawn_broadcast", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::join", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::yield_now", reason = "rayon work goes through crate::host::Executor" },
+    { path = "rayon_core::ThreadPool::yield_local", reason = "rayon work goes through crate::host::Executor" },
+    # A `std` worker set inside a call is a `crate::threads::scope`, whose
+    # threads are all joined, thread-local destructors included, before it
+    # returns; `std::thread::scope` waits only for their main functions. A
+    # thread outside any scope is a session's (an iterator's, a writer's) or
+    # a `JoinedPool` worker, which keeps its `JoinHandle` and joins it; each
+    # such spawn carries an allow saying so.
+    { path = "std::thread::scope", reason = "worker sets go through crate::threads::scope, which joins every thread" },
+    { path = "std::thread::Scope::spawn", reason = "worker sets go through crate::threads::scope, which joins every thread" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "worker sets go through crate::threads::scope, which joins every thread" },
+    { path = "std::thread::spawn", reason = "worker sets go through crate::threads::scope; a session thread keeps and joins its handle, with an allow saying so" },
+    { path = "std::thread::Builder::spawn", reason = "worker sets go through crate::threads::scope; a session thread keeps and joins its handle, with an allow saying so" },
     { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

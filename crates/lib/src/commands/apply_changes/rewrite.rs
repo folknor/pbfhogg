@@ -586,7 +586,7 @@ pub(crate) fn merge_to<'a>(
     // threads on every path so an implicit scope join cannot discard a cause.
     let scanner_failure = Arc::clone(&failure);
     let scanner_sender_guard = streaming_channels.drain_tx.clone();
-    let stats = std::thread::scope(|scope| -> Result<MergeStats> {
+    let stats = crate::threads::scope(|scope| -> Result<MergeStats> {
         let scanner_handle = scope.spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 scanner::run_scanner(scanner_cfg, host)

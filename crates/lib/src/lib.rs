@@ -209,6 +209,9 @@ pub(crate) mod scan;
 pub mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
+// The one way the library opens a scope of `std` worker threads: every thread
+// is joined, thread-local destructors included, before the scope returns.
+pub(crate) mod threads;
 // Shared with the CLI's `inspect tags` printer; not a library API.
 #[doc(hidden)]
 pub mod text_quote;

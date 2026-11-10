@@ -10,6 +10,13 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::super::format;
 
+/// The hash the pool keys `s` by.
+pub(super) fn hash_str(s: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub(super) struct StringPool {
     overflowed: bool,
     pub(super) data: Vec<u8>,
@@ -35,12 +42,17 @@ impl StringPool {
     }
 
     pub(super) fn intern(&mut self, s: &str) -> u32 {
+        self.intern_hashed(s, hash_str(s))
+    }
+
+    /// [`Self::intern`] with `hash` = [`hash_str`]`(s)`, computed by the
+    /// caller, so a parallel worker can hash and leave the serial merge only
+    /// the lookup.
+    pub(super) fn intern_hashed(&mut self, s: &str, hash: u64) -> u32 {
         if s.is_empty() {
             return 0;
         }
-        let mut hasher = FxHasher::default();
-        s.hash(&mut hasher);
-        self.intern_with_hash(s, hasher.finish())
+        self.intern_with_hash(s, hash)
     }
 
     fn intern_with_hash(&mut self, s: &str, hash: u64) -> u32 {

@@ -15,10 +15,11 @@
 //! - **Phase 2b** (parallel ways). The way blobs are not read again:
 //!   workers decode each blob's segment of the way store Pass 1.5 wrote
 //!   (`super::way_store`), already classified, resolve coords from the
-//!   store populated by Phase 2a, and emit per-blob `WayBlobOut` records - `PendingStreet`,
-//!   `PendingAddrPoint` (for building centroids), `PendingInterp`, and
-//!   admin way geometry - with owned strings. Main-thread merge interns
-//!   strings, writes records to `street_ways.bin` / `street_nodes.bin`
+//!   store populated by Phase 2a, and emit a per-blob `WayBlobOut` -
+//!   streets (their `NodeCoord` records already encoded), building-centroid
+//!   address points, `PendingInterp`s and admin way geometry, with the
+//!   blob's strings in one buffer and their pool hashes precomputed. The
+//!   main-thread merge interns strings, writes records to `street_ways.bin` / `street_nodes.bin`
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
 //!   entries, and inserts into the `way_geom` map.
 //!
@@ -261,15 +262,26 @@ use crate::tunables::GEOCODE_MERGE_WINDOW_BLOBS;
 // Phase 2b: parallel way scan
 // ---------------------------------------------------------------------------
 
-/// Per-blob output from Phase 2b workers. User strings are owned
-/// (`Box<str>`), shared with Phase 2a's address points. Admin geometries are keyed by way ID for insertion
-/// into the `way_geom` FxHashMap. The optional `error` field carries
-/// u16-overflow diagnostics from `u16::try_from` (see
-/// `StreetWay::node_count` / `InterpWay::node_count` invariants).
+/// Per-blob output from Phase 2b workers.
+///
+/// Phase 2b is bound by its serial merge, not by its workers (they park on
+/// the full result channel for most of the phase), so this is shaped to
+/// leave the merge as little as possible: the strings of streets and
+/// building addresses sit back to back in `text` with their pool hashes
+/// computed here, and the street ways' `NodeCoord` records are encoded here
+/// into `street_nodes`, which the merge writes with one call. A blob's
+/// output is a handful of allocations, not several per way, so neither the
+/// workers nor the merge (which frees them) spend the phase in the
+/// allocator. Admin geometries are keyed by way ID for insertion into the
+/// `way_geom` FxHashMap. The optional `error` field carries u16-overflow
+/// diagnostics from `u16::try_from` (see `StreetWay::node_count` /
+/// `InterpWay::node_count` invariants).
 #[derive(Default)]
 struct WayBlobOut {
-    streets: Vec<PendingStreet>,
-    building_addrs: Vec<PendingAddrPoint>,
+    text: String,
+    streets: Vec<FlatStreet>,
+    street_nodes: Vec<u8>,
+    building_addrs: Vec<FlatAddrPoint>,
     interps: Vec<PendingInterp>,
     admin_geoms: Vec<(i64, Vec<(i32, i32)>)>,
     missing_node_ref_count: u64,
@@ -277,8 +289,55 @@ struct WayBlobOut {
     error: Option<Error>,
 }
 
-struct PendingStreet {
-    name: Box<str>,
+/// A string of `WayBlobOut::text` and its `StringPool` hash.
+#[derive(Clone, Copy)]
+struct Text {
+    start: usize,
+    end: usize,
+    hash: u64,
+}
+
+impl Text {
+    fn push(text: &mut String, s: &str) -> Self {
+        let start = text.len();
+        text.push_str(s);
+        Self {
+            start,
+            end: text.len(),
+            hash: super::strings::hash_str(s),
+        }
+    }
+
+    fn intern(self, text: &str, strings: &mut StringPool) -> Result<u32> {
+        let s = text
+            .get(self.start..self.end)
+            .ok_or_else(|| Error::internal("phase 2b text span lies outside its blob's text"))?;
+        Ok(strings.intern_hashed(s, self.hash))
+    }
+}
+
+/// A street way whose `node_count` coordinates are the next ones in
+/// `WayBlobOut::street_nodes`.
+struct FlatStreet {
+    name: Text,
+    node_count: u16,
+}
+
+/// A building-centroid address point, strings in `WayBlobOut::text`.
+struct FlatAddrPoint {
+    lat_e7: i32,
+    lon_e7: i32,
+    hn: Text,
+    st: Option<Text>,
+    place: Option<Text>,
+    pc: Option<Text>,
+}
+
+/// One Phase 2b worker's state: the output under construction and the
+/// coordinate buffer each way resolves into.
+#[derive(Default)]
+struct WayWorker {
+    out: WayBlobOut,
     coords: Vec<(i32, i32)>,
 }
 
@@ -308,7 +367,7 @@ struct PendingInterp {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn resolve_way_into(
     way: &super::way_store::ExtractedWay<'_>,
-    state: &mut WayBlobOut,
+    worker: &mut WayWorker,
     referenced_nodes: &crate::idset::RankedIdSet,
     coord_slots: &[AtomicU64],
 ) {
@@ -317,6 +376,7 @@ fn resolve_way_into(
         VALUE_INTERPOLATION, VALUE_NAME, VALUE_PLACE, VALUE_POSTCODE, VALUE_STREET,
     };
 
+    let WayWorker { out: state, coords } = worker;
     if state.error.is_some() {
         return;
     }
@@ -344,8 +404,9 @@ fn resolve_way_into(
     // geographic domain, which cannot safely participate in the index.
     let mut rank_outside_store: Option<u64> = None;
     let mut missing_node_ref_count = 0_u64;
-    let coords: Vec<(i32, i32)> = crate::read::elements::WayRefIter::delta_decoded(way.refs)
-        .filter_map(|nid| {
+    coords.clear();
+    coords.extend(
+        crate::read::elements::WayRefIter::delta_decoded(way.refs).filter_map(|nid| {
             let Some(rank) = referenced_nodes.rank_if_set(nid) else {
                 missing_node_ref_count = missing_node_ref_count.saturating_add(1);
                 return None;
@@ -359,8 +420,9 @@ fn resolve_way_into(
                 missing_node_ref_count = missing_node_ref_count.saturating_add(1);
             }
             coord
-        })
-        .collect();
+        }),
+    );
+    let coords: &[(i32, i32)] = coords;
     if let Some(rank) = rank_outside_store {
         state.error = Some(Error::internal(format!(
             "internal error: way {way_id} resolves to coordinate rank {rank}, outside the \
@@ -379,13 +441,9 @@ fn resolve_way_into(
         return;
     }
 
-    // Admin way geometry - move coords if no other consumer needs them
-    if is_admin_way && !is_street && !is_building_addr && !is_interp {
-        state.admin_geoms.push((way_id, coords));
-        return;
-    }
+    // Admin way geometry, owned: it moves into the `way_geom` map.
     if is_admin_way {
-        state.admin_geoms.push((way_id, coords.clone()));
+        state.admin_geoms.push((way_id, coords.to_vec()));
     }
 
     // Interpolation ways - defer file writes to merge, keep slim
@@ -415,7 +473,7 @@ fn resolve_way_into(
                     .map(|(kind, name)| (kind, name.into())),
                 interpolation,
                 complete: missing_node_ref_count == 0,
-                coords,
+                coords: coords.to_vec(),
             });
         }
         return;
@@ -446,19 +504,21 @@ fn resolve_way_into(
         let clat = (sum_lat / count) as i32;
         #[allow(clippy::cast_possible_truncation)]
         let clon = (sum_lon / count) as i32;
-        state.building_addrs.push(PendingAddrPoint {
+        let text = &mut state.text;
+        let point = FlatAddrPoint {
             lat_e7: clat,
             lon_e7: clon,
-            hn: hn.unwrap_or("").into(),
-            st: street.map(Into::into),
-            place: place.map(Into::into),
-            pc: pc.map(Into::into),
-        });
+            hn: Text::push(text, hn.unwrap_or("")),
+            st: street.map(|s| Text::push(text, s)),
+            place: place.map(|s| Text::push(text, s)),
+            pc: pc.map(|s| Text::push(text, s)),
+        };
+        state.building_addrs.push(point);
     }
 
     // Streets - defer file writes to merge. Same u16 invariant as interp.
     if is_street && coords.len() >= 2 {
-        if u16::try_from(coords.len()).is_err() {
+        let Ok(node_count) = u16::try_from(coords.len()) else {
             state.error = Some(Error::invalid_data(format!(
                 "street way: {} coords exceeds u16::MAX. OSM ways are capped at \
                  2000 refs by convention; if this limit ever changes, bump \
@@ -466,11 +526,15 @@ fn resolve_way_into(
                 coords.len()
             )));
             return;
+        };
+        let name = Text::push(&mut state.text, name.unwrap_or(""));
+        state.street_nodes.reserve(coords.len() * NodeCoord::SIZE);
+        for &(lat_e7, lon_e7) in coords {
+            state
+                .street_nodes
+                .extend_from_slice(&NodeCoord { lat_e7, lon_e7 }.to_bytes());
         }
-        state.streets.push(PendingStreet {
-            name: name.unwrap_or("").into(),
-            coords,
-        });
+        state.streets.push(FlatStreet { name, node_count });
     }
 }
 
@@ -704,12 +768,12 @@ pub(super) fn run_pass2(
         let window = std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS)
             .unwrap_or_else(|| crate::ordered_pool::default_window(workers));
         let mut shards = vec![(); workers];
-        let resolve_blob = |state: &mut WayBlobOut, position: usize| -> Result<WayBlobOut> {
+        let resolve_blob = |worker: &mut WayWorker, position: usize| -> Result<WayBlobOut> {
             let mut records = super::way_store::SegmentRecords::new(way_store.segment(position)?);
             while let Some(way) = records.next_way()? {
-                resolve_way_into(&way, state, referenced_ref, coord_store);
+                resolve_way_into(&way, worker, referenced_ref, coord_store);
             }
-            let mut out = std::mem::take(state);
+            let mut out = std::mem::take(&mut worker.out);
             match out.error.take() {
                 Some(error) => Err(error),
                 None => Ok(out),
@@ -724,9 +788,9 @@ pub(super) fn run_pass2(
                 cancel: &host.invocation,
                 waits: crate::ordered_pool::Waits::default(),
             },
-            |_| WayBlobOut::default(),
-            |(), state: &mut WayBlobOut, position| {
-                resolve_blob(state, position).map_err(|e| match way_schedule.get(position) {
+            |_| WayWorker::default(),
+            |(), worker: &mut WayWorker, position| {
+                resolve_blob(worker, position).map_err(|e| match way_schedule.get(position) {
                     Some(entry) => shared_file.locate_blob(entry, e),
                     None => e,
                 })
@@ -779,45 +843,66 @@ pub(super) fn run_pass2(
                     interp_node_offset += (pi.coords.len() * NodeCoord::SIZE) as u64;
                 }
 
-                // Building-centroid addresses
-                write_addr_points(
-                    out.building_addrs,
-                    strings,
-                    &mut addr_points_out,
-                    &mut addr_point_count,
-                )?;
-
-                // Streets
-                for ps in out.streets {
-                    let nc = u16::try_from(ps.coords.len()).map_err(|_| {
-                        Error::internal(format!(
-                            "street way coord count {} overflows u16 at merge (classify should have caught)",
-                            ps.coords.len(),
-                        ))
+                // Building-centroid addresses, interned in the order
+                // `PendingAddrPoint::intern` uses.
+                let text = out.text.as_str();
+                for point in &out.building_addrs {
+                    let housenumber_offset = point.hn.intern(text, strings)?;
+                    let street_offset = match point.st {
+                        Some(s) => s.intern(text, strings)?,
+                        None => 0,
+                    };
+                    let postcode_offset = match point.pc {
+                        Some(s) => s.intern(text, strings)?,
+                        None => 0,
+                    };
+                    let place_offset = match point.place {
+                        Some(s) => s.intern(text, strings)?,
+                        None => 0,
+                    };
+                    let record = AddrPoint {
+                        lat_e7: point.lat_e7,
+                        lon_e7: point.lon_e7,
+                        housenumber_offset,
+                        street_offset,
+                        postcode_offset,
+                        place_offset,
+                    };
+                    addr_points_out.write_all(&record.to_bytes())?;
+                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data(
+                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
+                        )
                     })?;
-                    let name_off = strings.intern(&ps.name);
+                }
+
+                // Streets: one record each, then the blob's coordinates in
+                // one write, already encoded in way order.
+                let mut blob_street_nodes = 0_u64;
+                for street in &out.streets {
+                    let name_offset = street.name.intern(text, strings)?;
                     let sw = StreetWay {
                         node_offset: street_node_offset,
-                        name_offset: name_off,
-                        node_count: nc,
+                        name_offset,
+                        node_count: street.node_count,
                     };
                     street_ways_out.write_all(&sw.to_bytes())?;
-                    for &(lat, lon) in &ps.coords {
-                        street_nodes_out.write_all(
-                            &NodeCoord {
-                                lat_e7: lat,
-                                lon_e7: lon,
-                            }
-                            .to_bytes(),
-                        )?;
-                    }
-                    street_node_offset += (ps.coords.len() * NodeCoord::SIZE) as u64;
+                    let bytes = u64::from(street.node_count) * NodeCoord::SIZE as u64;
+                    street_node_offset += bytes;
+                    blob_street_nodes += bytes;
                     street_way_count = street_way_count.checked_add(1).ok_or_else(|| {
                         Error::invalid_data(
                             "street way count exceeds u32::MAX; bump FORMAT_VERSION",
                         )
                     })?;
                 }
+                if blob_street_nodes != out.street_nodes.len() as u64 {
+                    return Err(Error::internal(format!(
+                        "phase 2b blob holds {} street node bytes for streets counting {blob_street_nodes}",
+                        out.street_nodes.len()
+                    )));
+                }
+                street_nodes_out.write_all(&out.street_nodes)?;
                 Ok(())
             }),
         )?;

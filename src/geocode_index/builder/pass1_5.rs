@@ -377,8 +377,11 @@ fn extract_blob_ways(
             let val = vals.read_varint_u32()?;
             let class = strings.class(&mut w.classes, key)? & CLASS_KEY_MASK;
             // The value is bounds-checked whatever the key, as the decoded
-            // tag walk resolves both strings of every tag.
-            strings.class(&mut w.classes, val)?;
+            // tag walk resolves both strings of every tag. Only a highway
+            // value is ever classified (below), so the rest are not.
+            if val as usize >= strings.table.len() {
+                return Err(string_index_err());
+            }
             match class {
                 CLASS_HIGHWAY => highway = Some(val),
                 CLASS_NAME => slots[VALUE_NAME] = Some(val),

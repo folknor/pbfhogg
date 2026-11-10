@@ -8,6 +8,26 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Delete bodies kept (bygg, 2026-11-10, `f5e01579` against `17644689`)
+
+merge-changes and the OSC tags-filter write a delete's tags, refs,
+members and node location; on the batched path the reader thread now
+records delete children as bytes and the workers parse and render them.
+After a trim, `--iterations 1`, both arms `--commit`, A B B A:
+
+| Cell | A, `17644689` | B, `f5e01579` |
+|---|---|---|
+| planet merge-diffs 4914..4920 | 3.6, 3.6 s (`5a1cc6cb`, `6382fcc8`) | 3.7, 3.7 s (`05e85f56`, `9253cc77`) |
+| planet merge-diffs 4914..4920 `--simplify yes` | 5.4, 5.4 s (`382b33df`, `0c030e90`) | 5.4, 5.4 s (`0f4dc009`, `4ad7d60c`) |
+| planet tag-select `--input-kind osc --input 4913` | 2.4, 2.4 s (`a1c2be75`, `b6e7e9cb`) | 2.7, 2.5 s (`b1993429`, `ea7a58bc`) |
+| denmark merge-diffs 4705 | 11, 11 ms (`580159f4`, `df325935`) | 10, 12 ms (`7e355b8d`, `43deb9bf`) |
+
+Neutral on simplify and denmark; the default merge sits at the 3 %
+noise edge and the OSC tags-filter is mixed on cells of 2.5 s. Kept:
+the change makes the output correct, and no cell shows a cost outside
+noise. The simplify and single-OSC cells needed `76c903fb`, which
+stopped the bench passing `--tmp-dir` where merge-changes refuses it.
+
 ### Run directory only where a merge may spill (bygg, 2026-11-01)
 
 The streaming merge takes an optional scratch, given only for several

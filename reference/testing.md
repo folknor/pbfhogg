@@ -36,7 +36,7 @@ Tests go where they couple least.
   lives there and nowhere else: cargo builds the binary for that
   package's integration tests with the test build's own features,
   profile and target, and hands its path as `CARGO_BIN_EXE_pbfhogg`.
-  The root package's tests get no such path, so they have no way to
+  The library package's tests get no such path, so they have no way to
   reach the binary at all.
 - **Fault-injection tests** in `crates/lib/tests/fault_*.rs`, modules of `all`
   like every other library test (plus a few unit tests beside the
@@ -50,8 +50,10 @@ Placement and tiering are independent axes.
 
 ## Test binaries
 
-Every package sets `autotests = false`; every integration-test target is
-declared in its `Cargo.toml`. One binary per file made every check
+The root `Cargo.toml` is a virtual manifest; the library, CLI and harness
+packages live in `crates/lib/`, `crates/cli/` and `crates/harness/`. Every
+package sets `autotests = false`; every integration-test target is declared
+in that package's `Cargo.toml`. One binary per file made every check
 sweep link and start one harness per file, and a focused `brokkr test
 NAME` list each harness in turn to find one test.
 
@@ -77,7 +79,7 @@ NAME` list each harness in turn to find one test.
 - **`crates/lib/tests/common/` is shared by path, not by a crate.** Each package
   compiles it with its own features, which carry the same names
   (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
-  on those means the same thing in both. `commands` does not: in
+  on those means the same thing in all three packages. `commands` does not: in
   `pbfhogg` it is on by default, in `pbfhogg-cli` it is a no-op feature
   that is off in the `all` and `musl` sweeps. A
   `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
@@ -88,11 +90,11 @@ NAME` list each harness in turn to find one test.
   own features, and its dependency on the library would have to keep
   `commands` off for the `minimal` sweep. `crates/lib/tests/common/` holds fixtures
   only; nothing in it spawns the binary.
-- **A new test file not declared in its package's `crates/lib/tests/all.rs` (or as
+- **A new test file not declared in the `all.rs` under its package's test directory (or as
   its own `[[test]]`) is never compiled, and no test or coverage audit
   reports it.** Add the `mod` line with the file.
 - **A test that must own its process** gets its own `[[test]]` target
-  in `Cargo.toml` with the reason written beside it; the `[[test]]`
+  in its package's `Cargo.toml` with the reason written beside it; the `[[test]]`
   entries are the list. Arming a fault is not such a reason: fault
   state is per run (see "Conventions").
 - **Moving tests between the packages: `scripts/test_inventory.py`.**
@@ -142,7 +144,7 @@ the CLI tests run against a binary with `test-hooks` and both platform
 features, one without the platform features (pbfhogg-cli's default
 build), and one for musl. No sweep pre-builds the binary
 (`build_packages`): cargo builds it for each test build. The `minimal`
-and `geocode-reader` sweeps stay root-only: the CLI's lib dep would turn
+and `geocode-reader` sweeps stay library-only: the CLI's lib dep would turn
 `commands` back on. `brokkr test NAME` searches one package,
 `[test] default_package = "pbfhogg"`; a CLI test needs
 `brokkr test -p pbfhogg-cli NAME`.

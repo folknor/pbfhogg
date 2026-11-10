@@ -24,8 +24,8 @@ other ignored trees never matter:
          an extensionless target may name ``<target>.md`` or
          ``<target>/index.md``.
        - a backticked path with at least one ``/`` whose first component is a
-         tracked top-level directory, or the gitignored ``.plans/`` (and the
-         retired ``plans/``), which no other checkout can resolve. A trailing
+         tracked or retired top-level directory, or the gitignored
+         ``.plans/``, which no other checkout can resolve. A trailing
          ``:LINE``, ``::item`` or ``#anchor`` is ignored. A relative spelling
          such as `altw/mod.rs` is not claimed: its base is unstated.
        - a root-level ``UPPERCASE.md`` name, backticked or bare, or a bare
@@ -106,10 +106,12 @@ ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
 EXPLICIT_ID_RE = re.compile(r"\s*\{#([^}\s]+)\}\s*$")
 HTML_ANCHOR_RE = re.compile(r"<a\s[^>]*\b(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
-# Top-level names claimed by the backticked-path leg even though git does not
-# track them: `.plans/` is gitignored local scratch and `plans/` the retired
-# folder, so a citation of either dangles on every other checkout.
-UNTRACKED_CLAIMED_ROOTS = {".plans", "plans"}
+# Keep retired roots claimed after their last tracked file moves, so stale
+# repository citations still fail. Do not let gitignore hide these paths.
+# `.plans/` is local scratch; `plans/` is the retired document folder.
+UNTRACKED_CLAIMED_ROOTS = {
+    ".plans", "plans", "src", "tests", "examples", "cli", "harness",
+}
 
 # The notes folder and everything under it. The lookbehind refuses a match
 # that is the tail of a longer path (another directory's notes, a URL), but a

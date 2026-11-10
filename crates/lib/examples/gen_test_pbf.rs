@@ -1,4 +1,4 @@
-//! Generate the `tests/test.osm.pbf` fixture used by doc examples.
+//! Generate the `crates/lib/tests/test.osm.pbf` fixture used by doc examples.
 
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};

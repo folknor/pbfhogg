@@ -1236,7 +1236,7 @@ mod tests {
     use crate::error::{BlobError, ErrorKind};
     use crate::read::blob_wire::BlobData;
 
-    /// Truncate `tests/test.osm.pbf` inside the payload of its last blob and
+    /// Truncate `crates/lib/tests/test.osm.pbf` inside the payload of its last blob and
     /// return the file, its path kept alive by the returned tempdir.
     ///
     /// The cut point is derived from the real frame layout rather than guessed,

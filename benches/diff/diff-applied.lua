@@ -7,7 +7,8 @@
 -- lines. For fixed warm/cold text paths use diff-text or diff-unindexed.
 -- Files live under host scratch's bench-iterations and are reclaimed after
 -- each iteration. Cache reuse is refused until persistent files exist.
--- --osc is typed --osc-seq. Snapshot OSC selection has no base fallback.
+-- --osc is typed --osc-seq; omitted binds the sole scoped entry via
+-- default_only, refusing zero or multiple entries. No base fallback.
 --
 --   brokkr bench --dry-run diff-applied --osc 4705 --format default,osc
 --   brokkr bench --alloc diff-applied --variant raw --type way
@@ -15,7 +16,6 @@ local diff = require("diff")
 
 function validate(params)
     diff.validate(params)
-    if #params.osc ~= 1 then fail("--osc must select exactly one scoped sequence") end
     if params["keep-cache"] == "yes" then
         fail("--keep-cache yes needs persistent merged outputs; iteration files are reclaimed")
     end
@@ -29,10 +29,10 @@ function bench(params, keys)
     record.meta = { merged_cache = "miss" }
     if raw then record.meta.diff_pair = "raw-vs-indexed" end
     local merged = output("merged.osm.pbf")
-    binary("apply-changes", params.variant.file, params.osc[1].file, {
+    binary("apply-changes", params.variant.file, params.osc.file, {
         output = merged, overwrite = true, force = raw,
     }):ok()
     local want = params.variant.expect and params.variant.expect.diff
-    want = want and want[keys.osc[1]]
+    want = want and want[keys.osc]
     return diff.run(params, params.variant.file, merged, want)
 end

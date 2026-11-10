@@ -7,13 +7,14 @@
 --
 -- --input selects the typed --variant for PBF, or --osc-seq for OSC. It is
 -- bound under input-kind so only the actual file is reserved and hashed.
--- OSC sequences are explicit, even when the host has only one registered.
+-- Omitted --input binds the sole entry via default_only for either input
+-- kind; zero or multiple entries require an explicit variant or sequence.
 -- Snapshots use their own OSC table, just as the typed command does.
 -- --filter takes one whole readable expression, commas included. The built
 -- revision remains the grammar authority. io_uring is refused, matching the
 -- typed runner. Features, commit selection and counts belong to the runner.
 --
---   brokkr bench --dry-run tag-select --filter 'w/highway=primary,secondary'
+--   brokkr bench --dry-run tag-select --input indexed --filter 'w/highway=primary,secondary'
 --   brokkr bench --alloc tag-select --input-kind osc --input 4705 --jobs 2
 
 local compression = require("compression")

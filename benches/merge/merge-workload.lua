@@ -3,8 +3,8 @@
 -- Each selected matrix value is an arm with one child, except --uring yes,
 -- which runs buffered then uring children on the same build for merge.
 -- Uses the child's own library workload; no command-layer substitute.
--- Child elapsed_ms is retained separately: iteration wall includes launch,
--- setup and teardown, and is not the typed runner's self-reported wall.
+-- Child elapsed_ms is retained separately; the measured child's wall is
+-- the iteration result, not the typed runner's self-reported wall.
 -- Outputs and staging live under host scratch's bench-iterations directory.
 -- Stops return a stopped verdict; their outputs are incomplete.
 -- Build overrides, commits and iteration counts belong to the bench runner.
@@ -30,7 +30,10 @@ function bench(params)
     local stopped = false
     for _, mode in ipairs(modes) do
         local out = output(mode .. ".osm.pbf")
-        local r = binary_with(profiling.options(mode, params.stop),
+        local options = profiling.options(mode, params.stop)
+        -- Only one child per iteration can supply the measured wall.
+        options.measured = mode == "buffered"
+        local r = binary_with(options,
             "bench-merge", params.variant.file, params["osc-seq"][1].file,
             { output = out, compression = compression.parse(params.compressions),
               ["io-mode"] = mode, ["staging-dir"] = scratch(mode) }):ok()

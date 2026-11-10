@@ -1,6 +1,6 @@
 -- apply-diff: typed apply-changes without cache preparation.
 -- --osc selects one sequence from the selected snapshot's own OSC table.
--- Omitted --osc uses all only to discover a sole entry; zero or multiple
+-- Omitted --osc binds the sole entry via default_only; zero or multiple
 -- entries refuse before hashing or building. No primary-table fallback.
 -- --locations-on-ways yes passes the flag; choose --variant
 -- altw-keep-untagged explicitly so changed ways can resolve base nodes.
@@ -17,9 +17,6 @@ local stops = require("stop")
 local profiling = require("profiling")
 
 function validate(params)
-    if #params.osc ~= 1 then
-        fail("--osc must select exactly one sequence; give it explicitly when the scoped table has multiple entries")
-    end
     if params.jobs then
         local digits = params.jobs:gsub("^%+", "")
         local canonical = digits:gsub("^0+", "")
@@ -36,7 +33,7 @@ end
 function bench(params)
     local options = profiling.options("apply", params.stop)
     local out = output("applied.osm.pbf")
-    local r = binary_with(options, "apply-changes", params.variant.file, params.osc[1].file, {
+    local r = binary_with(options, "apply-changes", params.variant.file, params.osc.file, {
         output = out,
         overwrite = true,
         ["locations-on-ways"] = params["locations-on-ways"] == "yes",

@@ -69,7 +69,7 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot's own OSC table" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the base PBF variant; use altw-keep-untagged for locations-on-ways" }
-params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, default = "all", help = "one OSC sequence; omitted selects the sole scoped entry and refuses zero or multiple entries" }
+params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", default_only = true, help = "one OSC sequence; omitted selects the sole scoped entry and refuses zero or multiple entries" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
 params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io_uring output" }
 params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
@@ -316,7 +316,7 @@ params.stop = { validated = true, help = "diff marker: FOO_END, FOO, -FOO or -FO
 params.verbose = { choices = ["yes", "no"], default = "no", help = "print captured diff output" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base or named snapshot, including its own OSC table" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "base PBF variant" }
-params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, default = "all", help = "one OSC sequence (typed --osc-seq); omitted requires a sole entry" }
+params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", default_only = true, help = "one OSC sequence (typed --osc-seq); omitted requires a sole entry" }
 params.type = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the element kind" }
 params.keep-cache = { choices = ["yes", "no"], default = "no", help = "yes refused: iteration outputs cannot persist as a merged cache" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "use O_DIRECT for the diff child only" }
@@ -684,7 +684,7 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.input-kind = { choices = ["pbf", "osc"], default = "pbf", help = "input file kind" }
-params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default = "indexed", help = "PBF variant (typed --variant), or OSC sequence (typed --osc-seq); give an explicit sequence for OSC" }
+params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default_only = true, help = "PBF variant (typed --variant), or OSC sequence (typed --osc-seq); omitted requires a sole entry for the selected input kind" }
 params.filter = { validated = true, split = false, default = "w/highway=primary", help = "one filter expression, commas included" }
 params.omit-referenced = { choices = ["yes", "no"], default = "no", help = "yes: single-pass PBF filter, dropping referenced objects" }
 params.invert-match = { choices = ["yes", "no"], default = "no", help = "yes: keep non-matching PBF objects" }

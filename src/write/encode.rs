@@ -93,6 +93,60 @@ pub(super) fn encode_info_to(
     }
 }
 
+pub(super) trait EncodeMetadata {
+    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable);
+}
+
+impl EncodeMetadata for Metadata<'_> {
+    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
+        encode_info_to(info, strings, self);
+    }
+}
+
+impl EncodeMetadata for super::block_builder::PartialMetadata<'_> {
+    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
+        let raw = super::block_builder::RawPartialMetadata {
+            version: self.version,
+            timestamp: self.timestamp,
+            changeset: self.changeset,
+            uid: self.uid,
+            // `StringTable::add` keeps indices far below `i32::MAX`.
+            user_sid: self.user.map(|user| strings.add(user).cast_signed()),
+            visible: self.visible,
+        };
+        encode_raw_partial_info(info, &raw);
+    }
+}
+
+/// Encode an `Info` body carrying exactly the fields present in `meta`,
+/// explicit zeros and an explicit `visible` of either value included.
+pub(super) fn encode_raw_partial_info(
+    info: &mut Vec<u8>,
+    meta: &super::block_builder::RawPartialMetadata,
+) {
+    info.clear();
+    if let Some(value) = meta.version {
+        encode_optional_int32::<1>(info, value);
+    }
+    if let Some(value) = meta.timestamp {
+        encode_optional_int64::<2>(info, value);
+    }
+    if let Some(value) = meta.changeset {
+        encode_optional_int64::<3>(info, value);
+    }
+    if let Some(value) = meta.uid {
+        encode_optional_int32::<4>(info, value);
+    }
+    if let Some(value) = meta.user_sid {
+        // A checked, nonnegative pre-seeded or interned index.
+        encode_optional_uint32::<5>(info, value.cast_unsigned());
+    }
+    if let Some(value) = meta.visible {
+        info.push(6 << 3);
+        info.push(u8::from(value));
+    }
+}
+
 /// Encode tag key/value pairs into packed fields 2 (keys) and 3 (vals) on `elem`.
 ///
 /// Uses two scratch buffers (`keys_buf` and `vals_buf`) for single-pass dual-buffer
@@ -121,7 +175,7 @@ pub(super) fn encode_tags<'t>(
 
 /// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn encode_way<'t>(
+pub(super) fn encode_way<'t, M: EncodeMetadata>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
@@ -132,7 +186,7 @@ pub(super) fn encode_way<'t>(
     id: i64,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
-    metadata: Option<&Metadata<'_>>,
+    metadata: Option<&M>,
 ) {
     elem.clear();
 
@@ -151,7 +205,7 @@ pub(super) fn encode_way<'t>(
 
     // Field 4: info (submessage)
     if let Some(meta) = metadata {
-        encode_info_to(info_buf, string_table, meta);
+        meta.encode_info(info_buf, string_table);
         encode_bytes_field(elem, 4, info_buf);
     }
 
@@ -177,7 +231,7 @@ pub(super) fn encode_way<'t>(
 /// Uses three packed buffers in a single zip loop for refs/lat/lon to avoid
 /// iterating the data three separate times.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn encode_way_with_locations<'t>(
+pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
@@ -191,7 +245,7 @@ pub(super) fn encode_way_with_locations<'t>(
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
     locations: &[(i32, i32)],
-    metadata: Option<&Metadata<'_>>,
+    metadata: Option<&M>,
 ) {
     elem.clear();
     encode_int64_field(elem, 1, id);
@@ -207,7 +261,7 @@ pub(super) fn encode_way_with_locations<'t>(
     );
 
     if let Some(meta) = metadata {
-        encode_info_to(info_buf, string_table, meta);
+        meta.encode_info(info_buf, string_table);
         encode_bytes_field(elem, 4, info_buf);
     }
 
@@ -302,7 +356,7 @@ pub(super) fn encode_way_raw_bytes_with_locations(
 
 /// Encode a Relation and append it as `PrimitiveGroup.relations` (field 4) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn encode_relation<'t>(
+pub(super) fn encode_relation<'t, M: EncodeMetadata>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
@@ -313,7 +367,7 @@ pub(super) fn encode_relation<'t>(
     id: i64,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     members: &[MemberData<'_>],
-    metadata: Option<&Metadata<'_>>,
+    metadata: Option<&M>,
 ) {
     elem.clear();
     encode_int64_field(elem, 1, id);
@@ -329,7 +383,7 @@ pub(super) fn encode_relation<'t>(
     );
 
     if let Some(meta) = metadata {
-        encode_info_to(info_buf, string_table, meta);
+        meta.encode_info(info_buf, string_table);
         encode_bytes_field(elem, 4, info_buf);
     }
 
@@ -477,7 +531,7 @@ mod tests {
             1,
             [],
             &[i64::MIN, i64::MAX],
-            None,
+            None::<&super::Metadata<'_>>,
         );
 
         let way = WireWay::parse(first_message(&group, 3)).unwrap();
@@ -513,7 +567,7 @@ mod tests {
             [],
             &[i64::MIN, i64::MAX],
             &[(1, 2), (3, 4)],
-            None,
+            None::<&super::Metadata<'_>>,
         );
 
         let way = WireWay::parse(first_message(&group, 3)).unwrap();
@@ -554,7 +608,7 @@ mod tests {
             1,
             [],
             &members,
-            None,
+            None::<&super::Metadata<'_>>,
         );
 
         let relation = WireRelation::parse(first_message(&group, 4)).unwrap();

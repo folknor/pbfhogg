@@ -16,6 +16,12 @@
 - A pipelined `PbfWriter` whose writer thread failed keeps failing: a later
   `flush` returns the original error instead of `Ok`, so it no longer
   certifies an incomplete output.
+- `apply-changes` keeps metadata fields an OSC element leaves out absent in
+  the output, instead of writing uid, changeset or timestamp `0`. A node
+  with partial metadata is written as a plain Node message; nodes with
+  complete or no metadata stay dense. A node without metadata is no longer
+  given zero metadata because it shares a dense run with nodes that have
+  it. `digest` accepts a block holding both node encodings.
 - `diff -v` caps keyed tag lines with the other edit lines at 1000 per
   element; past the cap the element's tag detail is one line giving the
   tag counts and saying details were omitted.

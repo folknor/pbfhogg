@@ -3,7 +3,9 @@
 //! Used by the blob-level merge (sort, cat --dedupe) and time_filter for
 //! overlap-run and sweep-merge operations.
 
-use crate::block_builder::{BlockBuilder, MemberData, Metadata, OwnedBlock, RawMetadata};
+use crate::block_builder::{
+    BlockBuilder, MemberData, Metadata, OwnedBlock, RawMetadata, RawPartialMetadata,
+};
 
 use crate::error::Result;
 pub(crate) use crate::osc::write::OwnedMember;
@@ -483,17 +485,21 @@ fn bad_role(err: crate::Error, id: i64, position: usize, sid: i32) -> crate::Err
     ))
 }
 
-/// Extract [`RawMetadata`] from an [`Info`](crate::Info), preserving the raw
-/// string table index for the user name.
-pub(crate) fn element_raw_metadata(info: &crate::Info<'_>) -> Option<RawMetadata> {
-    info.version().map(|v| RawMetadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user_sid: info.raw_user_sid().unwrap_or(0),
-        visible: info.visible(),
-    })
+/// Extract [`RawPartialMetadata`] from an [`Info`](crate::Info), each field
+/// present exactly when the source carries it, preserving the raw string
+/// table index for the user name. `None` when the `Info` carries no field.
+/// The timestamp is the source's, scaled by its `date_granularity` and
+/// truncated to whole seconds.
+pub(crate) fn element_raw_partial_metadata(info: &crate::Info<'_>) -> Option<RawPartialMetadata> {
+    let meta = RawPartialMetadata {
+        version: info.version(),
+        timestamp: info.milli_timestamp().map(|ms| ms / 1000),
+        changeset: info.changeset(),
+        uid: info.uid(),
+        user_sid: info.raw_user_sid(),
+        visible: info.visible_opt(),
+    };
+    (meta != RawPartialMetadata::default()).then_some(meta)
 }
 
 /// Extract [`RawMetadata`] from a [`DenseNode`](crate::DenseNode), preserving

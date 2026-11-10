@@ -905,7 +905,8 @@ mod census_tests {
     }
 
     /// Every dense slot is judged by value whatever its version: an empty
-    /// name at a nonzero index is no user, padding counts nothing, and an
+    /// name at a nonzero index is no user, a metadata-less node counts
+    /// nothing, and an
     /// Osmosis -1 slot keeps its real timestamp, changeset, uid and user.
     #[test]
     fn dense_slots_count_values_whatever_the_version() {
@@ -920,7 +921,13 @@ mod census_tests {
             let Element::DenseNode(ref dn) = element else {
                 panic!("expected dense nodes");
             };
-            let info = dn.info().expect("dense info");
+            // BlockBuilder gives the metadata-less node a dense group of its
+            // own without DenseInfo, so it has no slot at all.
+            let Some(info) = dn.info() else {
+                assert_eq!(dn.id(), 2, "only node 2 lacks metadata");
+                update_extended_for_element(&mut ext, &element, &users);
+                continue;
+            };
             match dn.id() {
                 1 => {
                     assert!(info.raw_user_sid() > 0, "empty name at a nonzero index");

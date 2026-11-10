@@ -1095,24 +1095,7 @@ fn merge_stats_accuracy() {
 /// survives a merge, and OSC replacements carry the metadata attributes
 /// from the OSC element (node 2's `version="4"` below).
 ///
-/// # A known collapse this test PINS but does not endorse
-///
-/// The `uid == 0` assertion below records what the code does, not what
-/// it should do. The OSC element carries no `uid` at all, and the
-/// written PBF records `uid = 0` - a real user id, indistinguishable
-/// from a genuine user 0. This is the same absent-versus-zero collapse
-/// that has been fixed for coordinates, for `push_info_attrs`, and for
-/// OSC `version`; it survives here because `osc::compact::ArenaMeta`
-/// and `block_builder::Metadata` have no per-field presence bit, so
-/// "attribute absent" and "attribute is zero" share one representation
-/// all the way through the PBF write path.
-///
-/// Closing it means per-field presence in both types - a change across
-/// the PBF write path, not the change stream - so it is filed rather
-/// than done here. Do NOT read this assertion as the intended contract:
-/// when the representation gains presence bits, this expectation must
-/// change to "no uid field at all", and the assertion message is worded
-/// so that a future reader is not misled into preserving the bug.
+/// Partial OSC metadata must retain absence rather than fabricate zeros.
 #[test]
 fn merge_metadata_preservation() {
     let dir = crate::common::test_scratch();
@@ -1194,37 +1177,45 @@ fn merge_metadata_preservation() {
     run_apply_ok(&base, &osc, &output);
 
     let reader = BlobReader::from_path(&output).expect("open pbf");
-    let mut node_meta: Vec<(i64, Option<(i32, i32)>)> = Vec::new();
+    let mut node_meta = Vec::new();
     for blob in reader {
         let blob = blob.expect("read blob");
         if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
             for element in block.elements() {
-                if let Element::DenseNode(dn) = element {
-                    let meta = dn.info().map(|info| (info.version(), info.uid()));
-                    node_meta.push((dn.id(), meta));
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info().expect("base node metadata");
+                        node_meta.push((
+                            dn.id(),
+                            Some(info.version()),
+                            Some(info.uid()),
+                            Some(info.changeset()),
+                            Some(info.milli_timestamp() / 1000),
+                        ));
+                    }
+                    Element::Node(node) => {
+                        let info = node.info();
+                        node_meta.push((
+                            node.id(),
+                            info.version(),
+                            info.uid(),
+                            info.changeset(),
+                            info.milli_timestamp().map(|v| v / 1000),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
     }
-
-    assert_eq!(node_meta.len(), 3);
-    assert_eq!(node_meta[0].0, 1);
-    let (version, uid) = node_meta[0].1.expect("node 1 meta");
-    assert_eq!(version, 5);
-    assert_eq!(uid, 42);
-    assert_eq!(node_meta[1].0, 2);
-    let (version, uid) = node_meta[1].1.expect("node 2 meta");
-    assert_eq!(version, 4, "OSC-sourced version must be carried");
     assert_eq!(
-        uid, 0,
-        "KNOWN COLLAPSE, not a contract: an absent uid is recorded as uid 0 because \
-         ArenaMeta and block_builder::Metadata have no presence bit for it. See this \
-         test's doc comment - when that is fixed, this must become 'no uid field'."
+        node_meta,
+        vec![
+            (1, Some(5), Some(42), Some(12345), Some(1_700_000_000)),
+            (2, Some(4), None, None, None),
+            (3, Some(1), Some(99), Some(11111), Some(1_500_000_000)),
+        ]
     );
-    assert_eq!(node_meta[2].0, 3);
-    let (version, uid) = node_meta[2].1.expect("node 3 meta");
-    assert_eq!(version, 1);
-    assert_eq!(uid, 99);
 }
 
 // ---------------------------------------------------------------------------

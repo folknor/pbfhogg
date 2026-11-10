@@ -803,12 +803,12 @@ mod tests {
         let meta = node
             .metadata()
             .ok_or_else(|| crate::Error::internal("node 100 metadata missing"))?;
-        assert_eq!(meta.version, 7);
-        assert_eq!(meta.timestamp, 86_400);
-        assert_eq!(meta.changeset, 123_456);
-        assert_eq!(meta.uid, 42);
-        assert_eq!(meta.user, "mapper one");
-        assert!(meta.visible);
+        assert_eq!(meta.version, Some(7));
+        assert_eq!(meta.timestamp, Some(86_400));
+        assert_eq!(meta.changeset, Some(123_456));
+        assert_eq!(meta.uid, Some(42));
+        assert_eq!(meta.user, Some("mapper one"));
+        assert_eq!(meta.visible, None);
 
         // No metadata attributes at all -> None.
         let way = overlay
@@ -818,21 +818,23 @@ mod tests {
         // Metadata does not disturb the variable-length sections.
         assert_eq!(way.refs().collect::<Vec<_>>(), vec![100]);
 
-        // Partial metadata: version + timestamp only; user absent -> "".
+        // Partial metadata: version + timestamp only; other fields stay absent.
         let rel = overlay
             .get_relation(300)
             .ok_or_else(|| crate::Error::internal("relation 300 missing"))?;
         let rmeta = rel
             .metadata()
             .ok_or_else(|| crate::Error::internal("relation 300 metadata missing"))?;
-        assert_eq!(rmeta.version, 2);
+        assert_eq!(rmeta.version, Some(2));
         assert_eq!(
             rmeta.timestamp,
-            crate::commands::parse_rfc3339_utc("2026-02-20T21:39:49Z")
-                .map_err(crate::Error::invalid_data_from)?
+            Some(
+                crate::commands::parse_rfc3339_utc("2026-02-20T21:39:49Z")
+                    .map_err(crate::Error::invalid_data_from)?
+            )
         );
-        assert_eq!(rmeta.changeset, 0);
-        assert_eq!(rmeta.user, "");
+        assert_eq!(rmeta.changeset, None);
+        assert_eq!(rmeta.user, None);
         let members: Vec<_> = rel.members().collect();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].2, "outer");
@@ -1221,8 +1223,44 @@ mod tests {
         let meta = node
             .metadata()
             .ok_or_else(|| crate::Error::internal("metadata must survive an absent version"))?;
-        assert_eq!(meta.timestamp, 86_400);
-        assert_eq!(meta.user, "m");
+        assert_eq!(meta.timestamp, Some(86_400));
+        assert_eq!(meta.user, Some("m"));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_presence_is_independent_of_zero() -> ParseResult<()> {
+        let attrs = [
+            r#"version="0""#,
+            r#"timestamp="1970-01-01T00:00:00Z""#,
+            r#"changeset="0""#,
+            r#"uid="0""#,
+            r#"user="""#,
+            r#"visible="false""#,
+        ];
+        for mask in 0..64 {
+            let mut text = String::from(r#"id="1" lat="0" lon="0""#);
+            for (bit, attr) in attrs.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    text.push(' ');
+                    text.push_str(attr);
+                }
+            }
+            let overlay = parse_single_node("create", &text)?;
+            let node = overlay.get_node(1).expect("node");
+            let meta = node.metadata();
+            if mask == 0 {
+                assert!(meta.is_none());
+                continue;
+            }
+            let meta = meta.expect("partial metadata");
+            assert_eq!(meta.version, (mask & 1 != 0).then_some(0));
+            assert_eq!(meta.timestamp, (mask & 2 != 0).then_some(0));
+            assert_eq!(meta.changeset, (mask & 4 != 0).then_some(0));
+            assert_eq!(meta.uid, (mask & 8 != 0).then_some(0));
+            assert_eq!(meta.user, (mask & 16 != 0).then_some(""));
+            assert_eq!(meta.visible, (mask & 32 != 0).then_some(false));
+        }
         Ok(())
     }
 

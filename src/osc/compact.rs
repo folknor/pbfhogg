@@ -155,6 +155,12 @@ pub(super) const META_FLAG_HAS_USER: u8 = 4;
 /// `CompactDiffOverlay` must not treat the former as a claim.
 pub(super) const META_FLAG_HAS_VERSION: u8 = 8;
 
+/// Presence of the remaining optional source fields; the arena stays 29 bytes.
+pub(super) const META_FLAG_HAS_TIMESTAMP: u8 = 16;
+pub(super) const META_FLAG_HAS_CHANGESET: u8 = 32;
+pub(super) const META_FLAG_HAS_UID: u8 = 64;
+pub(super) const META_FLAG_HAS_VISIBLE: u8 = 128;
+
 /// Byte offset of the metadata block inside a node record.
 /// Header: `id:i64, lat:i32, lon:i32, tag_count:u32`.
 pub(super) const NODE_META_OFF: usize = 8 + 4 + 4 + 4;
@@ -190,22 +196,25 @@ fn read_meta<'a>(
     data: &'a [u8],
     offset: usize,
     strings: &'a StringTable,
-) -> Option<crate::write::block_builder::Metadata<'a>> {
+) -> Option<crate::write::block_builder::PartialMetadata<'a>> {
     let flags = data[offset];
     if flags & META_FLAG_PRESENT == 0 {
         return None;
     }
-    Some(crate::write::block_builder::Metadata {
-        version: read_i32_le(data, offset + M_VERSION),
-        timestamp: read_i64_le(data, offset + M_TIMESTAMP),
-        changeset: read_i64_le(data, offset + M_CHANGESET),
-        uid: read_i32_le(data, offset + M_UID),
+    Some(crate::write::block_builder::PartialMetadata {
+        version: (flags & META_FLAG_HAS_VERSION != 0)
+            .then(|| read_i32_le(data, offset + M_VERSION)),
+        timestamp: (flags & META_FLAG_HAS_TIMESTAMP != 0)
+            .then(|| read_i64_le(data, offset + M_TIMESTAMP)),
+        changeset: (flags & META_FLAG_HAS_CHANGESET != 0)
+            .then(|| read_i64_le(data, offset + M_CHANGESET)),
+        uid: (flags & META_FLAG_HAS_UID != 0).then(|| read_i32_le(data, offset + M_UID)),
         user: if flags & META_FLAG_HAS_USER != 0 {
-            strings.resolve(read_u32_le(data, offset + M_USER_ID))
+            Some(strings.resolve(read_u32_le(data, offset + M_USER_ID)))
         } else {
-            ""
+            None
         },
-        visible: flags & META_FLAG_HIDDEN == 0,
+        visible: (flags & META_FLAG_HAS_VISIBLE != 0).then_some(flags & META_FLAG_HIDDEN == 0),
     })
 }
 
@@ -473,7 +482,7 @@ impl<'a> CompactNodeRef<'a> {
 
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
-    pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
+    pub fn metadata(&self) -> Option<crate::write::block_builder::PartialMetadata<'a>> {
         read_meta(self.data, Self::META_OFF, self.strings)
     }
 
@@ -519,7 +528,7 @@ impl<'a> CompactWayRef<'a> {
 
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
-    pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
+    pub fn metadata(&self) -> Option<crate::write::block_builder::PartialMetadata<'a>> {
         read_meta(self.data, Self::META_OFF, self.strings)
     }
 
@@ -578,7 +587,7 @@ impl<'a> CompactRelationRef<'a> {
 
     /// Returns the element metadata carried by the source OSC, or `None`
     /// when the OSC element had no metadata attributes.
-    pub fn metadata(&self) -> Option<crate::write::block_builder::Metadata<'a>> {
+    pub fn metadata(&self) -> Option<crate::write::block_builder::PartialMetadata<'a>> {
         read_meta(self.data, Self::META_OFF, self.strings)
     }
 

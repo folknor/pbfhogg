@@ -653,6 +653,36 @@ impl PrimitiveBlock {
         result.unwrap_or(BlockType::Empty)
     }
 
+    /// Whether every field of every group is a plain `Node` (field 1) or a
+    /// `DenseNodes` (field 2) message, with at least one such field: a node
+    /// block in the sense [`block_type`](Self::block_type) cannot express
+    /// once it mixes dense and plain node groups, which `BlockBuilder` writes
+    /// for nodes with partial metadata. Unlike `block_type` it walks every
+    /// field, not each group's first, so a group that begins with a node and
+    /// holds a way, a changeset or an unknown field is not a node block.
+    pub(crate) fn holds_only_node_groups(&self) -> bool {
+        let mut any = false;
+        for i in 0..self.block.group_count() {
+            let mut cursor = super::wire::Cursor::new(self.block.group(i));
+            loop {
+                match cursor.read_tag() {
+                    Ok(None) => break,
+                    Ok(Some((field, wire_type))) => {
+                        if !matches!(field, 1 | 2) || wire_type != protohoggr::WIRE_LEN {
+                            return false;
+                        }
+                        if cursor.skip_field(wire_type).is_err() {
+                            return false;
+                        }
+                        any = true;
+                    }
+                    Err(_) => return false,
+                }
+            }
+        }
+        any
+    }
+
     /// Returns an iterator over the elements in this `PrimitiveBlock`.
     // wontfix(name-iter-convention): elements() is more descriptive than iter() here;
     // BlockElementsIter name matches established osmpbf public API.

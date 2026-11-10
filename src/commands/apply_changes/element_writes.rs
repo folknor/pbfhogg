@@ -7,7 +7,7 @@
 
 use crate::PrimitiveBlock;
 use crate::block_builder::{BlockBuilder, MemberData};
-use crate::owned::{dense_node_raw_metadata, element_raw_metadata};
+use crate::owned::{dense_node_raw_metadata, element_raw_partial_metadata};
 
 use crate::commands::{
     FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -29,7 +29,7 @@ use super::refresh::{CoordFraming, StaleProbe, evaluate_way, refreshed_locations
 // or stats across those owners. Share only the post-capacity element encoding.
 
 pub(super) fn add_osc_node(bb: &mut BlockBuilder, node: &crate::osc::CompactNodeRef<'_>) {
-    bb.add_node(
+    bb.add_node_partial(
         node.id(),
         node.decimicro_lat(),
         node.decimicro_lon(),
@@ -56,9 +56,9 @@ pub(super) fn add_osc_way(
             .iter()
             .map(|node_id| locs.get(node_id).copied().unwrap_or((0, 0)))
             .collect();
-        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, meta.as_ref());
+        bb.add_way_with_locations_partial(way.id(), way.tags(), &refs, &locations, meta.as_ref());
     } else {
-        bb.add_way(way.id(), way.tags(), &refs, meta.as_ref());
+        bb.add_way_partial(way.id(), way.tags(), &refs, meta.as_ref());
     }
 }
 
@@ -70,7 +70,7 @@ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactR
             role,
         })
         .collect();
-    bb.add_relation(rel.id(), rel.tags(), &members, rel.metadata().as_ref());
+    bb.add_relation_partial(rel.id(), rel.tags(), &members, rel.metadata().as_ref());
 }
 
 // ---------------------------------------------------------------------------
@@ -119,8 +119,10 @@ pub(super) fn write_base_node_local(
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block)?;
     }
-    let meta = element_raw_metadata(&node.info());
-    bb.add_node_raw(
+    // Partial source metadata keeps its field presence (a plain node out);
+    // complete or absent metadata goes dense, as before.
+    let meta = element_raw_partial_metadata(&node.info());
+    bb.add_node_raw_partial(
         node.id(),
         node.decimicro_lat(),
         node.decimicro_lon(),

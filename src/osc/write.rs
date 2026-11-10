@@ -1065,10 +1065,12 @@ mod tests {
     }
 
     /// A node added without metadata to a dense block whose other nodes
-    /// carry it gets a padding slot - version 0 and zeros - both when it
-    /// comes first (backfilled) and when it follows (pushed). That slot
-    /// claims nothing, so the node prints with no metadata at all, not as
+    /// carry it, whether it comes first or follows, prints with no metadata
+    /// at all, not as
     /// `version="0" timestamp="1970-01-01T00:00:00Z" changeset="0" uid="0"`.
+    /// (`BlockBuilder` now gives it a dense group without DenseInfo; files
+    /// from other writers can still pad it with a version-0 slot, which
+    /// claims nothing either.)
     #[test]
     fn a_metadata_less_dense_node_prints_no_metadata() -> crate::Result<()> {
         for nodes in [

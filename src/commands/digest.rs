@@ -445,8 +445,11 @@ fn element_kind(element: &Element<'_>) -> ElementKind {
     }
 }
 
-fn block_kind(block_type: BlockType) -> crate::Result<Option<ElementKind>> {
-    match block_type {
+fn block_kind(block: &PrimitiveBlock) -> crate::Result<Option<ElementKind>> {
+    match block.block_type() {
+        // Dense and plain node groups side by side (what apply-changes writes
+        // for a node with partial metadata) hold one kind.
+        BlockType::Mixed if block.holds_only_node_groups() => Ok(Some(ElementKind::Node)),
         BlockType::DenseNodes | BlockType::Nodes => Ok(Some(ElementKind::Node)),
         BlockType::Ways => Ok(Some(ElementKind::Way)),
         BlockType::Relations => Ok(Some(ElementKind::Relation)),
@@ -467,7 +470,7 @@ fn summarize_block(
     records: Records<'_>,
     buffers: &RecordBuffers,
 ) -> crate::Result<Option<BlockContent>> {
-    let classified = block_kind(block.block_type())?;
+    let classified = block_kind(&block)?;
     // The full form's per-block inputs. A way block in a file declaring
     // pbfhogg.WayMembers-v1 needs its field-5 payload (domain rule 5).
     let full = match records {

@@ -35,8 +35,9 @@ use crate::read::elements::MemberType;
 
 use super::ParseResult;
 use super::compact::{
-    ArenaMeta, META_FLAG_HAS_USER, META_FLAG_HAS_VERSION, META_FLAG_HIDDEN, META_FLAG_PRESENT,
-    member_type_to_byte,
+    ArenaMeta, META_FLAG_HAS_CHANGESET, META_FLAG_HAS_TIMESTAMP, META_FLAG_HAS_UID,
+    META_FLAG_HAS_USER, META_FLAG_HAS_VERSION, META_FLAG_HAS_VISIBLE, META_FLAG_HIDDEN,
+    META_FLAG_PRESENT, member_type_to_byte,
 };
 use super::parse::CompactDiffOverlay;
 use crate::error::Error;
@@ -1108,6 +1109,7 @@ fn arena_meta(
             }
             MetaField::Timestamp => {
                 let text = attr.value.as_ref();
+                meta.flags |= META_FLAG_HAS_TIMESTAMP;
                 meta.timestamp = crate::commands::parse_rfc3339_utc(text).map_err(|err| {
                     Error::invalid_data_with(
                         format!(
@@ -1118,8 +1120,14 @@ fn arena_meta(
                     )
                 })?;
             }
-            MetaField::Changeset => meta.changeset = meta_int::<i64>(field, attr)?,
-            MetaField::Uid => meta.uid = meta_int::<i32>(field, attr)?,
+            MetaField::Changeset => {
+                meta.changeset = meta_int::<i64>(field, attr)?;
+                meta.flags |= META_FLAG_HAS_CHANGESET;
+            }
+            MetaField::Uid => {
+                meta.uid = meta_int::<i32>(field, attr)?;
+                meta.flags |= META_FLAG_HAS_UID;
+            }
             MetaField::User => {
                 user = Some(
                     attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -1128,6 +1136,7 @@ fn arena_meta(
                 );
             }
             MetaField::Visible => {
+                meta.flags |= META_FLAG_HAS_VISIBLE;
                 if attr.value.as_ref() == "false" {
                     meta.flags |= META_FLAG_HIDDEN;
                 }

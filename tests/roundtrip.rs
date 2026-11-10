@@ -1136,15 +1136,13 @@ fn roundtrip_mixed_metadata() {
         _ => panic!("expected DenseNode"),
     }
 
-    // Node 2: default metadata (version 0, uid 0, user "")
+    // Node 2: no metadata (its own dense group, no fabricated zeros)
     match &elements[1] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 2);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags, vec![("name", "osc")]);
-            let info = dn.info().unwrap();
-            assert_eq!(info.version(), 0);
-            assert_eq!(info.uid(), 0);
+            assert!(dn.info().is_none());
         }
         _ => panic!("expected DenseNode"),
     }
@@ -1165,7 +1163,8 @@ fn roundtrip_mixed_metadata() {
 }
 
 /// Reverse mixed metadata: first node has no metadata, later ones do.
-/// Tests the backfill path in BlockBuilder.
+/// The metadata-less nodes keep no metadata: BlockBuilder gives them their
+/// own dense group rather than fabricating zero DenseInfo entries.
 #[test]
 fn roundtrip_backfill_metadata() {
     let mut buf = Vec::new();
@@ -1224,17 +1223,11 @@ fn roundtrip_backfill_metadata() {
     let elements: Vec<_> = prim.elements().collect();
     assert_eq!(elements.len(), 3);
 
-    // Nodes 1 and 2: backfilled default metadata
+    // Nodes 1 and 2: no metadata, not fabricated zeros
     for (i, elem) in elements[..2].iter().enumerate() {
         match elem {
             Element::DenseNode(dn) => {
-                let info = dn.info().unwrap();
-                assert_eq!(
-                    info.version(),
-                    0,
-                    "backfilled node {i} should have version 0"
-                );
-                assert_eq!(info.uid(), 0);
+                assert!(dn.info().is_none(), "node {i} must carry no metadata");
             }
             _ => panic!("expected DenseNode"),
         }

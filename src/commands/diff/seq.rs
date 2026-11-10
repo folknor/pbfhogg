@@ -217,7 +217,7 @@ mod tests {
                 samples[5],
                 samples[10]
             )
-            .unwrap();
+            .expect("write verbose sequence timing to stderr");
         }
     }
 

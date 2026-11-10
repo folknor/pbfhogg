@@ -16,6 +16,9 @@
 - A pipelined `PbfWriter` whose writer thread failed keeps failing: a later
   `flush` returns the original error instead of `Ok`, so it no longer
   certifies an incomplete output.
+- `diff -v` caps keyed tag lines with the other edit lines at 1000 per
+  element; past the cap the element's tag detail is one line giving the
+  tag counts and saying details were omitted.
 
 ## 0.6.0 - 2026-11-09
 

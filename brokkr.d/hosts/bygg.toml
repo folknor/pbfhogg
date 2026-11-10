@@ -24,6 +24,7 @@ seq = 4704
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4705" = "differs" }
 
 [bygg.datasets.denmark.pbf.raw]
 file = "denmark-20260220-seq4704.osm.pbf"
@@ -49,6 +50,9 @@ download_date = "2026-04-28"
 [bygg.datasets.denmark.snapshot.test-unsorted.pbf.indexed]
 file = "denmark-test-unsorted-with-indexdata.osm.pbf"
 xxhash = "bc689783cd03289cfb173072dbe1df82"
+
+[bygg.datasets.denmark.snapshot.test-unsorted.pbf.indexed.expect]
+check-ids = "violations"
 
 [bygg.datasets.denmark.snapshot.test-no-index]
 download_date = "2026-04-28"
@@ -167,6 +171,7 @@ seq = 4704
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4705" = "differs", "4706" = "differs", "4707" = "differs", "4708" = "differs", "4709" = "differs", "4710" = "differs", "4711" = "differs", "4712" = "differs" }
 
 [bygg.datasets.germany.pbf.raw]
 file = "germany-20260224-seq4704.osm.pbf"
@@ -243,6 +248,7 @@ seq = 4706
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4706" = "differs" }
 
 [bygg.datasets.japan.pbf.raw]
 file = "japan-20260225-seq4706.osm.pbf"
@@ -269,6 +275,7 @@ seq = 4710
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4710" = "differs" }
 
 [bygg.datasets.north-america.osc.4710]
 file = "north-america-seq4710.osc.gz"
@@ -290,6 +297,7 @@ seq = 4709
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4709" = "differs" }
 
 [bygg.datasets.norway.pbf.raw]
 file = "norway-20260225-seq4709.osm.pbf"
@@ -316,6 +324,7 @@ seq = 4707
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4707" = "differs" }
 
 [bygg.datasets.switzerland.pbf.raw]
 file = "switzerland-20260225-seq4707.osm.pbf"
@@ -342,6 +351,7 @@ seq = 4706
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4706" = "differs" }
 
 [bygg.datasets.malta.pbf.raw]
 file = "malta-20260225-seq4706.osm.pbf"
@@ -368,6 +378,7 @@ seq = 4704
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4704" = "differs" }
 
 [bygg.datasets.greater-london.pbf.raw]
 file = "greater-london-20260225-seq4704.osm.pbf"
@@ -392,6 +403,7 @@ seq = 4714
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4715" = "differs", "4716" = "differs", "4717" = "differs", "4718" = "differs", "4719" = "differs", "4720" = "differs", "4721" = "differs", "4722" = "differs" }
 
 [bygg.datasets.europe.pbf.altw]
 file = "europe-20260301-seq4714-altw.osm.pbf"
@@ -474,6 +486,7 @@ seq = 4912
 check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
+diff = { "4913" = "differs", "4914" = "differs", "4915" = "differs", "4916" = "differs", "4917" = "differs", "4918" = "differs", "4919" = "differs", "4920" = "differs" }
 
 [bygg.datasets.planet.pbf.altw]
 file = "planet-20260223-altw-reindexed.osm.pbf"

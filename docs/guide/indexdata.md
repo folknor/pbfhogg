@@ -24,7 +24,7 @@ gracefully: a pbfhogg release older than the v3 bump does not recognise `0x03`
 and treats a v3 file as unindexed - output stays correct, but on the slower
 full-decode paths (or with `--force` where indexdata is required).
 
-This enables O(1) blob classification. For example, `apply-changes` determines which blobs are affected by a changeset by comparing ID ranges, passing through ~92% of blobs as raw bytes without decompression.
+This enables O(1) blob classification. For example, `apply-changes` determines which blobs are affected by a changeset by comparing ID ranges, passing through unaffected blobs as raw bytes without decompression.
 
 ### Tagdata (BlobHeader field 4)
 
@@ -58,16 +58,10 @@ Use `pbfhogg cat` without a `--type` flag:
 pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-The passthrough path adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal and the file size overhead is under 0.5%.
+The passthrough path adds indexdata via decompress+scan without re-compressing blobs. The added metadata increases the file size; the amount depends on the input's blob sizes and tag keys. Passthrough uses buffered I/O.
 
-Indexdata generation timings:
-
-| Dataset | Size | Time | Peak anon | Notes |
-|---------|------|------|-----------|-------|
-| Denmark | 461 MB | **2.8s** | - | commit `69a127f`, buffered, host not recorded |
-| Planet | 87 GB | **42.4s** | 72 MiB | commit `53360af4`, buffered, bygg (AMD Ryzen 9 9950X3D2, 30.5 GiB RAM, NVMe SSD) |
-
-Buffered I/O wins for this workload - sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
+For recorded cat measurements and their workload details, see the
+[performance records](https://github.com/folknor/pbfhogg/blob/main/reference/performance/cat.md).
 
 When `cat` is invoked with a `--type` flag (e.g., `cat -t way`), an indexed blob of the selected kind is copied raw on the strength of its indexdata, one of another kind is skipped, and a blob without indexdata (under `--force`) is decoded and re-encoded with fresh indexdata.
 

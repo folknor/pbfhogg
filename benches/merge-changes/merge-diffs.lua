@@ -29,12 +29,15 @@ function bench(params)
     local out = output("merged.osc.gz")
     local args = { "merge-changes" }
     for _, osc in ipairs(params.osc) do args[#args + 1] = osc.file end
-    args[#args + 1] = {
+    local flags = {
         output = out,
         overwrite = true,
         simplify = params.simplify == "yes",
-        ["tmp-dir"] = scratch("merge"),
     }
+    if params.simplify ~= "yes" and #params.osc > 1 then
+        flags["tmp-dir"] = scratch("merge")
+    end
+    args[#args + 1] = flags
     local r = binary_with(options, table.unpack(args)):ok()
     record.summary = r.stderr
     if params.verbose == "yes" then

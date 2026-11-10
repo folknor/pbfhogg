@@ -541,9 +541,10 @@ params.osc-seq = { from = "datasets.{dataset}.osc", many = true, default = "all"
 [bench.merge-diffs]
 script_file = "../benches/merge-changes/merge-diffs.lua"
 description = "Merge configured OSC sequences or ranges, retaining all changes or simplifying per object"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-10
 changelog = [
+  { version = 2, date = 2026-11-10, note = "Only pass --tmp-dir for multiple inputs without --simplify; omit unused scratch for simplified and single-input merges" },
   { version = 1, date = 2026-11-09, note = "Ported typed merge-changes: scoped sequences, lists and inclusive ranges, simplify, spill scratch and profiling with marker stops" },
 ]
 profile = "release"

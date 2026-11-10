@@ -496,9 +496,9 @@ fn merge_changes_refuses_a_node_without_usable_coords() {
     }
 }
 
-/// A `<delete>` node carries no coordinates by design and must keep
-/// working - the counterpart that stops the test above from being
-/// satisfied by refusing every node.
+/// A `<delete>` node needs no coordinates (it keeps them when given) and
+/// must keep working without - the counterpart that stops the test above
+/// from being satisfied by refusing every node.
 #[test]
 fn merge_changes_delete_needs_no_coords() {
     let dir = crate::common::test_scratch();

@@ -393,14 +393,14 @@ fn every_consumer_refuses_a_malformed_member_role() {
     assert_all_accept(dir.path(), &input, "missing and empty roles");
 }
 
-/// The children of an object in `<delete>` carry nothing any consumer
-/// keeps, and each sink used to decide on its own which of them to parse:
-/// the overlay skipped tags and members but parsed `nd`, tags-filter
-/// skipped only tags, merge-changes parsed everything. So a malformed
-/// child of a deleted object was refused by some commands and accepted by
-/// others. The driver now interprets them with the parsers live children
-/// get and routes none of them, so every consumer refuses each the same
-/// way, as libosmium does.
+/// Each sink used to decide on its own which children of an object in
+/// `<delete>` to parse: the overlay skipped tags and members but parsed
+/// `nd`, tags-filter skipped only tags, merge-changes parsed everything. So
+/// a malformed child of a deleted object was refused by some commands and
+/// accepted by others. Every child is now interpreted with the parsers live
+/// children get, whether the sink keeps it (merge-changes, tags-filter) or
+/// drops it (apply-changes' overlay), so every consumer refuses each the
+/// same way, as libosmium does.
 #[test]
 fn every_consumer_refuses_a_malformed_child_of_a_deleted_object() {
     let dir = crate::common::test_scratch();
@@ -446,16 +446,19 @@ fn every_consumer_refuses_a_malformed_child_of_a_deleted_object() {
 }
 
 /// The counterpart: well-formed children of deleted objects are accepted
-/// everywhere, and a re-emitted delete still carries only its identity and
-/// metadata.
+/// everywhere, and a re-emitted delete keeps the body and location its
+/// input gave, as osmium's does (a Geofabrik diff gives every delete the
+/// object's last state).
 #[test]
-fn every_consumer_accepts_and_drops_well_formed_delete_children() {
+fn every_consumer_accepts_and_re_emitters_keep_delete_bodies() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("delete-children.osc.gz");
     write_gz(
         &input,
         "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <delete>\n    \
-         <node id=\"1\" version=\"2\"><tag k=\"highway\" v=\"primary\"/></node>\n    \
+         <node id=\"1\" version=\"2\" lat=\"55.25\" lon=\"12.5\">\
+         <tag k=\"highway\" v=\"primary\"/></node>\n    \
+         <node id=\"4\" version=\"2\"/>\n    \
          <way id=\"2\" version=\"3\"><nd ref=\"1\"/><tag k=\"highway\" v=\"primary\"/></way>\n    \
          <relation id=\"3\" version=\"4\">\
          <member type=\"way\" ref=\"2\" role=\"outer\"/></relation>\n  \
@@ -485,15 +488,34 @@ fn every_consumer_accepts_and_drops_well_formed_delete_children() {
         )
         .unwrap();
         let xml = std::fs::read_to_string(&out).unwrap();
-        for id in ["node id=\"1\"", "way id=\"2\"", "relation id=\"3\""] {
-            assert!(xml.contains(id), "merge-changes {name} lost {id}:\n{xml}");
-        }
-        for child in ["<tag", "<nd", "<member"] {
-            assert!(
-                !xml.contains(child),
-                "merge-changes {name} emitted a child of a deleted object:\n{xml}"
-            );
-        }
+        assert_delete_bodies_kept(&format!("merge-changes {name}"), &xml);
+    }
+
+    let out = dir.path().join("delete-children-tags-filter.osc");
+    pbfhogg::tags_filter::osc::tags_filter_osc(
+        &input,
+        crate::common::out_replace(&out),
+        &["nothing=matches".to_string()],
+        pbfhogg::Parallelism::from_jobs(1),
+        &crate::common::test_host(),
+    )
+    .unwrap();
+    let xml = std::fs::read_to_string(&out).unwrap();
+    assert_delete_bodies_kept("tags-filter OSC", &xml);
+}
+
+/// The bytes a re-emitted copy of the delete-children document must hold.
+fn assert_delete_bodies_kept(what: &str, xml: &str) {
+    for needle in [
+        r#"<node id="1" lat="55.25" lon="12.5" version="2">"#,
+        r#"<tag k="highway" v="primary"/>"#,
+        r#"<node id="4" version="2"/>"#,
+        r#"<way id="2" version="3">"#,
+        r#"<nd ref="1"/>"#,
+        r#"<relation id="3" version="4">"#,
+        r#"<member type="way" ref="2" role="outer"/>"#,
+    ] {
+        assert!(xml.contains(needle), "{what} lost {needle}:\n{xml}");
     }
 }
 

@@ -57,7 +57,7 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
   </modify>
   <delete>
     <node id="99"/>
-    <way id="88"/>
+    <way id="88"><nd ref="5"/><tag k="name" v="gone"/></way>
     <relation id="77"/>
   </delete>
 </osmChange>"#,
@@ -90,7 +90,11 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
 
     assert!(xml.contains(r#"<delete>"#));
     assert!(xml.contains(r#"<node id="99"/>"#));
-    assert!(xml.contains(r#"<way id="88"/>"#));
+    // A delete is kept whatever its tags, and keeps its body.
+    let delete = xml.split("<delete>").nth(1).expect("a delete section");
+    assert!(delete.contains(r#"<way id="88">"#), "{xml}");
+    assert!(delete.contains(r#"<nd ref="5"/>"#), "{xml}");
+    assert!(delete.contains(r#"<tag k="name" v="gone"/>"#), "{xml}");
     assert!(xml.contains(r#"<relation id="77"/>"#));
 }
 

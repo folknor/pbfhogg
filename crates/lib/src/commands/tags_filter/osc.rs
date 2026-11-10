@@ -12,13 +12,13 @@ use crate::commands::merge_changes::stream;
 use crate::error::Result;
 #[cfg(test)]
 use crate::osc::write::{
-    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
-    write_node_xml, write_relation_xml, write_way_xml,
+    OwnedMember, OwnedNode, OwnedRelation, OwnedWay, write_node_xml, write_relation_xml,
+    write_way_xml,
 };
-use crate::osc::xml_parse::{LexBatch, OscAction, OscSink};
+use crate::osc::xml_parse::{DeleteChildren, LexBatch, OscAction, OscSink};
 #[cfg(test)]
 use crate::osc::xml_parse::{
-    coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
+    coord_to_decimicro, delete_coords, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
     parse_owned_metadata, parse_tag,
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
@@ -62,8 +62,7 @@ type Section = OscAction;
 struct CurrentElem {
     kind: ElementKind,
     id: i64,
-    decimicro_lat: i32,
-    decimicro_lon: i32,
+    location: Option<(i32, i32)>,
     tags: Vec<(String, String)>,
     refs: Vec<i64>,
     members: Vec<OwnedMember>,
@@ -86,8 +85,7 @@ impl CurrentElem {
         Self {
             kind,
             id,
-            decimicro_lat: 0,
-            decimicro_lon: 0,
+            location: None,
             tags: Vec::new(),
             refs: Vec::new(),
             members: Vec::new(),
@@ -107,9 +105,9 @@ struct FilteredOsc {
     modify_nodes: Vec<OwnedNode>,
     modify_ways: Vec<OwnedWay>,
     modify_relations: Vec<OwnedRelation>,
-    delete_node_ids: Vec<(i64, Option<OwnedMetadata>)>,
-    delete_way_ids: Vec<(i64, Option<OwnedMetadata>)>,
-    delete_relation_ids: Vec<(i64, Option<OwnedMetadata>)>,
+    delete_nodes: Vec<OwnedNode>,
+    delete_ways: Vec<OwnedWay>,
+    delete_relations: Vec<OwnedRelation>,
 }
 
 #[cfg(test)]
@@ -122,9 +120,9 @@ impl FilteredOsc {
             modify_nodes: Vec::new(),
             modify_ways: Vec::new(),
             modify_relations: Vec::new(),
-            delete_node_ids: Vec::new(),
-            delete_way_ids: Vec::new(),
-            delete_relation_ids: Vec::new(),
+            delete_nodes: Vec::new(),
+            delete_ways: Vec::new(),
+            delete_relations: Vec::new(),
         }
     }
 }
@@ -337,6 +335,7 @@ struct FilterBytes<'a> {
 }
 
 impl OscSink for FilterBytes<'_> {
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
     const END_ELEMENT_EMITS: bool = true;
 
     fn begin_element(
@@ -488,8 +487,7 @@ struct FilterSink<'a> {
 
 #[cfg(test)]
 impl FilterSink<'_> {
-    /// The element a child belongs to. The driver routes children only of
-    /// created and modified objects, which always set one.
+    /// The element a child belongs to; every object, deleted ones included.
     fn current(&mut self) -> Result<&mut CurrentElem> {
         self.current.as_mut().ok_or_else(|| {
             crate::Error::internal("tags-filter OSC: an object child with no current object")
@@ -499,6 +497,8 @@ impl FilterSink<'_> {
 
 #[cfg(test)]
 impl OscSink for FilterSink<'_> {
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
+
     fn begin_element(
         &mut self,
         action: Section,
@@ -508,33 +508,26 @@ impl OscSink for FilterSink<'_> {
         let id = parse_i64_attr(e, "id")?;
         self.section = action;
         // Read on every action, delete included: a `<delete>` carries
-        // the version of the state it supersedes, and the shared
-        // `write_delete_xml` emits it. Dropping it here is how this
-        // filter used to turn a metadata-bearing change stream into an
-        // anonymous one.
+        // the version of the state it supersedes, and is written back with
+        // it. Dropping it here is how this filter used to turn a
+        // metadata-bearing change stream into an anonymous one.
         let metadata = parse_owned_metadata(e)?;
-
-        if action == Section::Delete {
-            self.stats.deletes_in += 1;
-            self.stats.deletes_out += 1;
-            match kind {
-                ElementKind::Node => self.filtered.delete_node_ids.push((id, metadata)),
-                ElementKind::Way => self.filtered.delete_way_ids.push((id, metadata)),
-                ElementKind::Relation => self.filtered.delete_relation_ids.push((id, metadata)),
-            }
-            self.current = None;
-            return Ok(());
-        }
-        if action == Section::Create {
-            self.stats.creates_in += 1;
-        } else {
-            self.stats.modifies_in += 1;
+        match action {
+            Section::Create => self.stats.creates_in += 1,
+            Section::Modify => self.stats.modifies_in += 1,
+            Section::Delete => self.stats.deletes_in += 1,
         }
 
         let mut cur = CurrentElem::new(kind, id, metadata);
         if kind == ElementKind::Node {
-            cur.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
-            cur.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
+            cur.location = if action == Section::Delete {
+                delete_coords(e, id)?
+            } else {
+                Some((
+                    coord_to_decimicro(e, "lat", id)?,
+                    coord_to_decimicro(e, "lon", id)?,
+                ))
+            };
         }
         self.current = Some(cur);
         Ok(())
@@ -590,6 +583,32 @@ fn finalize_current(
     let Some(cur) = current.take() else {
         return;
     };
+    // Every delete is kept, body and all; a create or modify only when a
+    // tag matches.
+    if section == Section::Delete {
+        stats.deletes_out += 1;
+        match cur.kind {
+            ElementKind::Node => filtered.delete_nodes.push(OwnedNode {
+                id: cur.id,
+                location: cur.location,
+                tags: cur.tags,
+                metadata: cur.metadata,
+            }),
+            ElementKind::Way => filtered.delete_ways.push(OwnedWay {
+                id: cur.id,
+                tags: cur.tags,
+                refs: cur.refs,
+                metadata: cur.metadata,
+            }),
+            ElementKind::Relation => filtered.delete_relations.push(OwnedRelation {
+                id: cur.id,
+                tags: cur.tags,
+                members: cur.members,
+                metadata: cur.metadata,
+            }),
+        }
+        return;
+    }
     if !matches_any(expressions, &cur.tags, cur.kind) {
         return;
     }
@@ -599,8 +618,7 @@ fn finalize_current(
             stats.creates_out += 1;
             filtered.create_nodes.push(OwnedNode {
                 id: cur.id,
-                decimicro_lat: cur.decimicro_lat,
-                decimicro_lon: cur.decimicro_lon,
+                location: cur.location,
                 tags: cur.tags,
                 metadata: cur.metadata,
             });
@@ -627,8 +645,7 @@ fn finalize_current(
             stats.modifies_out += 1;
             filtered.modify_nodes.push(OwnedNode {
                 id: cur.id,
-                decimicro_lat: cur.decimicro_lat,
-                decimicro_lon: cur.decimicro_lon,
+                location: cur.location,
                 tags: cur.tags,
                 metadata: cur.metadata,
             });
@@ -709,19 +726,19 @@ fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOs
         writer.write_event(Event::End(BytesEnd::new("modify")))?;
     }
 
-    if !filtered.delete_node_ids.is_empty()
-        || !filtered.delete_way_ids.is_empty()
-        || !filtered.delete_relation_ids.is_empty()
+    if !filtered.delete_nodes.is_empty()
+        || !filtered.delete_ways.is_empty()
+        || !filtered.delete_relations.is_empty()
     {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
-        for (id, meta) in &filtered.delete_node_ids {
-            write_delete_xml(&mut writer, ElementKind::Node, *id, meta.as_ref())?;
+        for node in &filtered.delete_nodes {
+            write_node_xml(&mut writer, node)?;
         }
-        for (id, meta) in &filtered.delete_way_ids {
-            write_delete_xml(&mut writer, ElementKind::Way, *id, meta.as_ref())?;
+        for way in &filtered.delete_ways {
+            write_way_xml(&mut writer, way)?;
         }
-        for (id, meta) in &filtered.delete_relation_ids {
-            write_delete_xml(&mut writer, ElementKind::Relation, *id, meta.as_ref())?;
+        for rel in &filtered.delete_relations {
+            write_relation_xml(&mut writer, rel)?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }

@@ -64,20 +64,40 @@ impl OscAction {
     }
 }
 
+/// What a sink does with the children (`tag`, `nd`, `member`) of an object
+/// in `<delete>`. Every sink states it; there is no default, so a sink that
+/// re-emits deletes cannot lose their bodies by omission.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeleteChildren {
+    /// Route them to the sink like a live object's children. The
+    /// re-emitting sinks (merge-changes, tags-filter OSC) and the lexical
+    /// recorder that feeds them: a delete in a Geofabrik diff carries the
+    /// object's last state, and osmium writes it back out.
+    Route,
+    /// Check them with the parsers a routed child gets, then drop them. A
+    /// sink whose answer a delete's body cannot change (apply-changes'
+    /// overlay keeps a versioned tombstone).
+    CheckAndDrop,
+}
+
 /// Where a driven OSC document's elements go.
 ///
 /// The driver guarantees the call sequence: exactly one `begin_element`
 /// per element, followed by zero or more `tag` / `nd` / `member` calls
 /// (already filtered to the kinds that can carry them), followed by
-/// exactly one `end_element`. The child callbacks fire only inside
-/// `<create>` and `<modify>`: the children of an object in `<delete>` carry
-/// nothing any consumer keeps, so the driver checks them itself with the
-/// same parsers ([`parse_tag`], [`parse_nd`], [`parse_member`]) and routes
-/// none of them, which is what makes every command refuse the same delete. A self-closing element gets `begin_element`
+/// exactly one `end_element`. A child of an object in `<delete>` is routed
+/// or checked and dropped as the sink's [`OscSink::DELETE_CHILDREN`] says,
+/// by the driver and by [`LexBatch::replay`] alike; either way it is read
+/// with the same parsers ([`parse_tag`], [`parse_nd`], [`parse_member`]),
+/// which is what makes every command refuse the same malformed delete. A
+/// self-closing element gets `begin_element`
 /// immediately followed by `end_element`. The sequence is balanced on
 /// success; when the driver fails (a misplaced element, truncation, a sink
 /// error) the last element may be left begun and never ended.
 pub(crate) trait OscSink {
+    /// Whether this sink receives the children of deleted objects.
+    const DELETE_CHILDREN: DeleteChildren;
+
     /// Whether `end_element` emits the finished element (serializes or
     /// writes it), so that a failure there is the output's and not a fault
     /// of the input. Every other callback only interprets the input, and
@@ -556,11 +576,36 @@ fn misplaced(name: &str, parent: &str) -> Error {
     ))
 }
 
+/// Which object child a routed callback is.
+#[derive(Clone, Copy)]
+enum Child {
+    Tag,
+    Nd,
+    Member,
+}
+
+/// Hand one object child to `sink`, or, for a child of a deleted object
+/// and a [`DeleteChildren::CheckAndDrop`] sink, interpret it with the
+/// parser the sink would have used and drop it. The one place the delete
+/// policy is applied, for the driver and for lexical replay.
+fn route_child<S: OscSink>(
+    child: Child,
+    e: &quick_xml::events::BytesStart<'_>,
+    section: OscAction,
+    sink: &mut S,
+) -> ParseResult<()> {
+    let route = section != OscAction::Delete || S::DELETE_CHILDREN == DeleteChildren::Route;
+    match (child, route) {
+        (Child::Tag, true) => sink.tag(e),
+        (Child::Tag, false) => parse_tag(e).map(drop),
+        (Child::Nd, true) => sink.nd(e),
+        (Child::Nd, false) => parse_nd(e).map(drop),
+        (Child::Member, true) => sink.member(e),
+        (Child::Member, false) => parse_member(e).map(drop),
+    }
+}
+
 /// Route an object's child (`level == Element`) to the sink, or refuse it.
-///
-/// A child of a deleted object is interpreted here, by the parser a live
-/// one gets, and then dropped: a malformed one is refused in every command
-/// alike, and no sink sees delete children.
 fn handle_element_child<S: OscSink>(
     name: &str,
     e: &quick_xml::events::BytesStart<'_>,
@@ -568,14 +613,10 @@ fn handle_element_child<S: OscSink>(
     kind: ElementKind,
     sink: &mut S,
 ) -> ParseResult<()> {
-    let live = section != OscAction::Delete;
     match (name, kind) {
-        ("tag", _) if live => sink.tag(e),
-        ("tag", _) => parse_tag(e).map(drop),
-        ("nd", ElementKind::Way) if live => sink.nd(e),
-        ("nd", ElementKind::Way) => parse_nd(e).map(drop),
-        ("member", ElementKind::Relation) if live => sink.member(e),
-        ("member", ElementKind::Relation) => parse_member(e).map(drop),
+        ("tag", _) => route_child(Child::Tag, e, section, sink),
+        ("nd", ElementKind::Way) => route_child(Child::Nd, e, section, sink),
+        ("member", ElementKind::Relation) => route_child(Child::Member, e, section, sink),
         ("bbox" | "bounds", ElementKind::Way | ElementKind::Relation) => Ok(()),
         _ => Err(misplaced(name, &format!("inside <{}>", kind.as_str()))),
     }
@@ -855,17 +896,23 @@ impl LexBatch {
     /// Replay the recorded callbacks into `sink`, locating failures exactly
     /// as [`drive_osc`] does: interpreting the input is the input's fault,
     /// an emitting `end_element` is the output's.
+    /// A delete's children are routed by `S`'s [`OscSink::DELETE_CHILDREN`],
+    /// as the driver routes them.
     pub(crate) fn replay<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
+        let mut section = OscAction::Create;
         for ev in &self.events {
             let e = quick_xml::events::BytesStart::from_content(
                 &self.text[ev.start..ev.end],
                 ev.name_len,
             );
             match ev.op {
-                LexOp::Begin(action, kind) => sink.begin_element(action, kind, &e),
-                LexOp::Tag => sink.tag(&e),
-                LexOp::Nd => sink.nd(&e),
-                LexOp::Member => sink.member(&e),
+                LexOp::Begin(action, kind) => {
+                    section = action;
+                    sink.begin_element(action, kind, &e)
+                }
+                LexOp::Tag => route_child(Child::Tag, &e, section, sink),
+                LexOp::Nd => route_child(Child::Nd, &e, section, sink),
+                LexOp::Member => route_child(Child::Member, &e, section, sink),
                 LexOp::End => {
                     end_element(sink, path)?;
                     continue;
@@ -923,6 +970,8 @@ impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> LexSink<F, H> {
 }
 
 impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> OscSink for LexSink<F, H> {
+    /// Recorded for the replaying sink, which applies its own policy.
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
     /// Sealing hands the batch on (and may wait for room); its failure is
     /// not a fault of the input.
     const END_ELEMENT_EMITS: bool = true;
@@ -1008,6 +1057,50 @@ pub(crate) fn coord_to_decimicro(
     // or map to 0, so the cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     Ok(scaled.round() as i32)
+}
+
+/// The location a `<delete>` node carries, for the sinks that re-emit it.
+///
+/// A delete needs no location, but a Geofabrik diff gives every deleted node
+/// its last one, and a re-emitted delete keeps what it was given. Neither
+/// `lat` nor `lon` present: no location. Both present: each read as a live
+/// node's is ([`coord_to_decimicro`]), refusing a malformed or out-of-range
+/// value. Only one present: refused, since writing half a location (or
+/// dropping the half that came) would change the change silently. An empty
+/// attribute is present, not absent, and refuses as unparsable.
+pub(crate) fn delete_coords(
+    e: &quick_xml::events::BytesStart<'_>,
+    id: i64,
+) -> ParseResult<Option<(i32, i32)>> {
+    let mut lat = false;
+    let mut lon = false;
+    for attr_result in e.attributes() {
+        let attr = attr_result.map_err(xml_err)?;
+        match attr.key.as_ref() {
+            "lat" => lat = true,
+            "lon" => lon = true,
+            _ => {}
+        }
+    }
+    match (lat, lon) {
+        (false, false) => Ok(None),
+        (true, true) => {
+            let read = |name| {
+                coord_to_decimicro(e, name, id).map_err(|err| {
+                    err.context(format!(
+                        "OSC deleted node {id}: a location given on a delete is re-emitted, \
+                         so it must be usable"
+                    ))
+                })
+            };
+            Ok(Some((read("lat")?, read("lon")?)))
+        }
+        (true, false) | (false, true) => Err(Error::invalid_data(format!(
+            "OSC deleted node {id} carries {} without {}; refusing to re-emit half a location",
+            if lat { "lat" } else { "lon" },
+            if lat { "lon" } else { "lat" },
+        ))),
+    }
 }
 
 /// Read an element's metadata into the owned representation used by the
@@ -1159,7 +1252,7 @@ pub(crate) struct CompactSink<'a> {
     overlay: &'a mut CompactDiffOverlay,
     /// `None` while no create/modify element is being staged - which is
     /// also the state during a `<delete>` element, whose children the
-    /// driver never routes here.
+    /// driver checks and drops (`DeleteChildren::CheckAndDrop`).
     staging: Option<Staging>,
 }
 
@@ -1193,6 +1286,9 @@ impl<'a> CompactSink<'a> {
 }
 
 impl OscSink for CompactSink<'_> {
+    /// A delete becomes a versioned tombstone; its body cannot change that.
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::CheckAndDrop;
+
     fn begin_element(
         &mut self,
         action: OscAction,

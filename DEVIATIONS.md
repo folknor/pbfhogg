@@ -266,6 +266,25 @@ three things libosmium's XML reader accepts at the root level:
   silently discard structured content. A childless `<changeset/>` or
   `<bounds/>` is accepted and ignored.
 
+## merge-changes and tags-filter OSC: a deleted node's location is both coordinates or neither
+
+Both commands keep a delete's body as osmium does: tags, way node refs,
+relation members and a deleted node's `lat` / `lon` are written back out.
+They differ from osmium only in which locations they accept on a deleted
+node. pbfhogg reads a delete's coordinates by the rule a created or modified
+node's are read by, and refuses a deleted node that carries `lat` without
+`lon` (or the reverse), an empty or unparsable value, or a value out of
+range. libosmium parses the same attributes, but its writer emits a location
+whenever either coordinate is defined (`Location::is_defined`), so a half
+location in the input can come out as a different location in the merged
+change. A re-emitted
+change that is silently different from its input is the outcome pbfhogg
+refuses. `apply-changes` keeps only a delete's identity and version claim,
+so the location cannot change its answer; it accepts the same file.
+
+Empty metadata attributes are not a deviation: an empty `user=""` is written
+as absent, as osmium's writer omits an empty user.
+
 ## derive-changes: changes are decided by content, not version
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in

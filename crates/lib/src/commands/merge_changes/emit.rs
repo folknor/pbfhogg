@@ -13,10 +13,11 @@
 //! where the driver attributes a failure to the output, not the input.
 //!
 //! The byte contract is the owned writers': `id`, then `lat` and `lon` for
-//! a created or modified node (`coord_to_decimicro` then `format_coord`),
-//! then the metadata in `OwnedMetadata::push_attrs` order and escaping; a
-//! deleted object is `id` and metadata only; an element with no retained
-//! child is self-closing. The differential tests hold the sink to the owned
+//! a node that has them (`coord_to_decimicro` then `format_coord`; always a
+//! created or modified node, a deleted one when its input gave both, see
+//! `delete_coords`), then the metadata in `OwnedMetadata::push_attrs` order
+//! and escaping; a deleted object keeps the body its input gave, written
+//! as a live one's; an element with no retained child is self-closing. The differential tests hold the sink to the owned
 //! path byte for byte.
 
 use quick_xml::events::{BytesEnd, BytesStart, Event};
@@ -26,8 +27,8 @@ use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::write::{OwnedMetadata, append_attr, append_attr_escaped, append_int_attr};
 use crate::osc::xml_parse::{
-    OscSink, append_str_attr, coord_to_decimicro, parse_i64_attr, parse_member_into, parse_nd,
-    scan_owned_metadata_into,
+    DeleteChildren, OscSink, append_str_attr, coord_to_decimicro, delete_coords, parse_i64_attr,
+    parse_member_into, parse_nd, scan_owned_metadata_into,
 };
 
 /// One element's start tag and children, checked and rendered into reused
@@ -143,17 +144,17 @@ impl ElementBuf {
         kind: ElementKind,
         e: &BytesStart<'_>,
     ) -> crate::Result<()> {
-        // The owned sink's order: id, metadata, then a live node's lat and
-        // lon.
+        // The owned sink's order: id, metadata, then a node's lat and lon
+        // (required of a live node, optional on a delete).
         let id = parse_i64_attr(e, "id")?;
         let has_meta = scan_owned_metadata_into(e, &mut self.meta)?;
-        let coords = if kind == ElementKind::Node && action != Action::Delete {
-            Some((
+        let coords = match (kind, action) {
+            (ElementKind::Node, Action::Delete) => delete_coords(e, id)?,
+            (ElementKind::Node, _) => Some((
                 coord_to_decimicro(e, "lat", id)?,
                 coord_to_decimicro(e, "lon", id)?,
-            ))
-        } else {
-            None
+            )),
+            _ => None,
         };
 
         self.head.clear();
@@ -265,6 +266,7 @@ impl<'w> ByteSink<'w> {
 }
 
 impl OscSink for ByteSink<'_> {
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
     const END_ELEMENT_EMITS: bool = true;
 
     fn begin_element(
@@ -429,9 +431,10 @@ newline"/>
   <relation id="21"></relation>
 </modify>
 <delete>
-  <node id="3" version="4" lat="bad"/>
-  <way id="12" visible="false"><nd ref="1"/><tag k="k" v="v"/></way>
-  <relation id="22"/>
+  <node id="3" version="4" lat="55.5" lon="-0.0"><tag k="amenity" v="bench"/></node>
+  <node id="4" version="2"/>
+  <way id="12" visible="false"><tag k="k" v="v"/><nd ref="1"/><bounds minlat="0"/></way>
+  <relation id="22"><member type="node" ref="3" role="a&amp;b"/></relation>
 </delete>
 </osmChange>
 "#;
@@ -448,7 +451,57 @@ newline"/>
             assert_eq!(Ok((text, count)), encode(batch, true));
             changes += count;
         }
-        assert_eq!(changes, 9, "every element of the document was written");
+        assert_eq!(changes, 10, "every element of the document was written");
+    }
+
+    /// A delete keeps the body its input gave, in both paths; asserted on
+    /// the bytes, so two equally lossy writers cannot agree their way past
+    /// it.
+    #[test]
+    fn a_delete_keeps_its_body() {
+        let dir = crate::path_guard::tests::scratch();
+        let recorded = batches(dir.path(), DOC).expect("the document reads");
+        let text: String = recorded
+            .iter()
+            .map(|batch| encode(batch, false).expect("the byte sink accepts it").0)
+            .collect();
+        // Small batches: the deletes span several `<delete>` sections, all
+        // after the last live change.
+        let delete = &text[text.find("<delete>").expect("a delete section")..];
+        for needle in [
+            r#"<node id="3" lat="55.5" lon="0" version="4">"#,
+            r#"<tag k="amenity" v="bench"/>"#,
+            r#"<node id="4" version="2"/>"#,
+            r#"<nd ref="1"/>"#,
+            r#"<tag k="k" v="v"/>"#,
+            r#"<member type="node" ref="3" role="a&amp;b"/>"#,
+        ] {
+            assert!(delete.contains(needle), "{needle} missing from:\n{delete}");
+        }
+    }
+
+    /// A delete's location is both coordinates or neither: half of one,
+    /// or an unusable one, is refused by both paths alike.
+    #[test]
+    fn refuses_an_unusable_delete_location() {
+        let dir = crate::path_guard::tests::scratch();
+        for case in [
+            r#"<node id="1" lat="1"/>"#,
+            r#"<node id="1" lon="1"/>"#,
+            r#"<node id="1" lat="bad" lon="1"/>"#,
+            r#"<node id="1" lat="" lon="1"/>"#,
+            r#"<node id="1" lat="91" lon="1"/>"#,
+        ] {
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"><delete>{case}</delete></osmChange>"
+            );
+            let recorded = batches(dir.path(), &xml).expect("the reader frames it");
+            for batch in &recorded {
+                let byte = encode(batch, false);
+                assert!(byte.is_err(), "{case} accepted: {byte:?}");
+                assert_eq!(byte, encode(batch, true), "{case}");
+            }
+        }
     }
 
     /// The first refusal is the owned sink's when several attributes are

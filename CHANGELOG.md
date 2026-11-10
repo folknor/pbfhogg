@@ -4,6 +4,12 @@
 
 ### Changed
 
+- `merge-changes` and `tags-filter --input-kind osc` keep the body of a
+  delete - tags, way node refs, relation members and a deleted node's
+  location - as osmium does, instead of writing only its identity and
+  metadata. Geofabrik diffs carry the object's last state in every delete.
+  A deleted node carrying only one of `lat` / `lon`, or an unusable
+  value, is now refused by these two commands.
 - Two-pass `tags-filter` walks the blob headers once instead of once per
   pass, about 10 % faster on planet (56 to 50 s for `w/highway=primary`,
   62 to 56 s for `r/type=route` on bygg).

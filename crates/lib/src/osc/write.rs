@@ -195,8 +195,10 @@ impl OwnedMetadata {
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedNode {
     pub(crate) id: i64,
-    pub(crate) decimicro_lat: i32,
-    pub(crate) decimicro_lon: i32,
+    /// Latitude then longitude in decimicrodegrees. Always present on a
+    /// created or modified node; on a deleted one, present when its input
+    /// gave it (`xml_parse::delete_coords`).
+    pub(crate) location: Option<(i32, i32)>,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) metadata: Option<OwnedMetadata>,
 }
@@ -259,13 +261,15 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
 ) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id.to_string();
-    let mut coord_buf = String::new();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
-    let lat_str = coord_buf.clone();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
     elem.push_attribute(("id", id_str.as_str()));
-    elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
+    if let Some((lat, lon)) = node.location {
+        let mut coord_buf = String::new();
+        format_coord(&mut coord_buf, from_decimicro(lat));
+        let lat_str = coord_buf.clone();
+        format_coord(&mut coord_buf, from_decimicro(lon));
+        elem.push_attribute(("lat", lat_str.as_str()));
+        elem.push_attribute(("lon", coord_buf.as_str()));
+    }
     if let Some(meta) = &node.metadata {
         meta.push_attrs(&mut elem);
     }
@@ -336,24 +340,6 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
         write_tags_xml(writer, &rel.tags)?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
-    Ok(())
-}
-
-/// Write an element as a delete entry (id + metadata only, no content).
-#[cfg(test)]
-pub(crate) fn write_delete_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
-    kind: ElementKind,
-    id: i64,
-    metadata: Option<&OwnedMetadata>,
-) -> crate::Result<()> {
-    let mut elem = BytesStart::new(kind.as_str());
-    let id_str = id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    if let Some(meta) = metadata {
-        meta.push_attrs(&mut elem);
-    }
-    writer.write_event(Event::Empty(elem))?;
     Ok(())
 }
 
@@ -657,8 +643,7 @@ mod tests {
         let value = "MINDESTEN\n1864 -1920\ttabbed\rcr &<>\"' end";
         let node = OwnedNode {
             id: 100,
-            decimicro_lat: 551_989_605,
-            decimicro_lon: 92_041_876,
+            location: Some((551_989_605, 92_041_876)),
             tags: vec![("inscription".to_string(), value.to_string())],
             metadata: None,
         };

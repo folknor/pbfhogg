@@ -27,14 +27,14 @@ use crate::ElementKind;
 use crate::osc::version_floor::VersionFloor;
 #[cfg(test)]
 use crate::osc::write::{
-    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
-    write_node_xml, write_relation_xml, write_way_xml,
+    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_node_xml,
+    write_relation_xml, write_way_xml,
 };
 use crate::osc::xml_parse::OscAction;
 #[cfg(test)]
 use crate::osc::xml_parse::{
-    OscSink, coord_to_decimicro, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
-    parse_owned_metadata, parse_tag,
+    DeleteChildren, OscSink, coord_to_decimicro, delete_coords, parse_i64_attr, parse_member,
+    parse_nd, parse_osc_path, parse_owned_metadata, parse_tag,
 };
 
 /// `merge-changes` speaks the same three actions as the shared parser.
@@ -111,8 +111,7 @@ impl MergeChangesStats {
 struct CurrentElem {
     kind: ElementKind,
     id: i64,
-    decimicro_lat: i32,
-    decimicro_lon: i32,
+    location: Option<(i32, i32)>,
     metadata: Option<OwnedMetadata>,
     tags: Vec<(String, String)>,
     refs: Vec<i64>,
@@ -125,8 +124,7 @@ impl CurrentElem {
         Self {
             kind,
             id,
-            decimicro_lat: 0,
-            decimicro_lon: 0,
+            location: None,
             metadata,
             tags: Vec::new(),
             refs: Vec::new(),
@@ -138,8 +136,7 @@ impl CurrentElem {
         match self.kind {
             ElementKind::Node => ChangeElement::Node(OwnedNode {
                 id: self.id,
-                decimicro_lat: self.decimicro_lat,
-                decimicro_lon: self.decimicro_lon,
+                location: self.location,
                 tags: self.tags,
                 metadata: self.metadata,
             }),
@@ -484,8 +481,7 @@ impl<D: ChangeDest> OwnedSink<D> {
         }
     }
 
-    /// The element a child belongs to. The driver routes children only of
-    /// created and modified objects, so a deleted object stays childless.
+    /// The element a child belongs to; every object, deleted ones included.
     fn current(&mut self) -> crate::Result<&mut CurrentElem> {
         self.current.as_mut().ok_or_else(|| {
             crate::Error::internal("merge-changes: an object child with no current object")
@@ -495,6 +491,7 @@ impl<D: ChangeDest> OwnedSink<D> {
 
 #[cfg(test)]
 impl<D: ChangeDest> OscSink for OwnedSink<D> {
+    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
     const END_ELEMENT_EMITS: bool = D::EMITS;
 
     fn begin_element(
@@ -508,15 +505,21 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         let mut elem = CurrentElem::new(kind, id, metadata);
 
         // Coordinates are required of a created or modified node and
-        // meaningless on a delete. This used to be
+        // optional on a delete, kept when given. This used to be
         // `parse_f64_attr_optional(...).unwrap_or(0.0)` followed by a
         // saturating `as i32`, which put a coordinate-less node at 0/0 in
         // the Gulf of Guinea and clamped `lat="1e30"` to `i32::MAX`.
         // Same rule as the overlay parser now, because it is the same
         // function.
-        if kind == ElementKind::Node && action != Action::Delete {
-            elem.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
-            elem.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
+        if kind == ElementKind::Node {
+            elem.location = if action == Action::Delete {
+                delete_coords(e, id)?
+            } else {
+                Some((
+                    coord_to_decimicro(e, "lat", id)?,
+                    coord_to_decimicro(e, "lon", id)?,
+                ))
+            };
         }
 
         self.action = action;
@@ -893,31 +896,19 @@ fn action_tag(action: Action) -> &'static str {
     action.tag()
 }
 
+/// A change's element, written the same way whatever its action: a delete
+/// keeps the body its input gave.
 #[cfg(test)]
 fn write_change_to(writer: &mut OscWriter, change: &Change) -> Result<()> {
-    let delete = change.action == Action::Delete;
-    write_change_element(&mut writer.writer, &change.element, delete)
+    write_change_element(&mut writer.writer, &change.element)
 }
 
 #[cfg(test)]
-fn write_change_element<W: Write>(
-    writer: &mut Writer<W>,
-    element: &ChangeElement,
-    delete: bool,
-) -> Result<()> {
-    if delete {
-        let (kind, id, meta) = match element {
-            ChangeElement::Node(n) => (ElementKind::Node, n.id, n.metadata.as_ref()),
-            ChangeElement::Way(w) => (ElementKind::Way, w.id, w.metadata.as_ref()),
-            ChangeElement::Relation(r) => (ElementKind::Relation, r.id, r.metadata.as_ref()),
-        };
-        write_delete_xml(writer, kind, id, meta)
-    } else {
-        match element {
-            ChangeElement::Node(node) => write_node_xml(writer, node),
-            ChangeElement::Way(way) => write_way_xml(writer, way),
-            ChangeElement::Relation(rel) => write_relation_xml(writer, rel),
-        }
+fn write_change_element<W: Write>(writer: &mut Writer<W>, element: &ChangeElement) -> Result<()> {
+    match element {
+        ChangeElement::Node(node) => write_node_xml(writer, node),
+        ChangeElement::Way(way) => write_way_xml(writer, way),
+        ChangeElement::Relation(rel) => write_relation_xml(writer, rel),
     }
 }
 

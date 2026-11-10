@@ -12,17 +12,19 @@
 //!   thread via the merge channel; the main thread interns strings
 //!   into the shared `StringPool` and streams to `addr_points.bin`.
 //!
-//! - **Phase 2b** (parallel ways). Workers decode way blobs, classify
-//!   by tags, resolve coords from the store populated by Phase 2a, and
-//!   emit per-blob `WayBlobOut` records - `PendingStreet`,
+//! - **Phase 2b** (parallel ways). The way blobs are not read again:
+//!   workers decode each blob's segment of the way store Pass 1.5 wrote
+//!   (`super::way_store`), already classified, resolve coords from the
+//!   store populated by Phase 2a, and emit per-blob `WayBlobOut` records - `PendingStreet`,
 //!   `PendingAddrPoint` (for building centroids), `PendingInterp`, and
 //!   admin way geometry - with owned strings. Main-thread merge interns
 //!   strings, writes records to `street_ways.bin` / `street_nodes.bin`
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
 //!   entries, and inserts into the `way_geom` map.
 //!
-//! Both merges run in blob (file) order through
-//! `parallel_classify_phase_ordered`, which holds dispatch at most
+//! Both merges run in blob (file) order, Phase 2a through
+//! `parallel_classify_phase_ordered` and Phase 2b through
+//! `ordered_pool::run_ordered`; each holds dispatch at most
 //! `GEOCODE_MERGE_WINDOW_BLOBS` ahead of the earliest unmerged blob, so a slow head
 //! cannot grow the reorder buffer across the whole input, while merge still
 //! overlaps classification. Duplicate admin ways use the last file
@@ -259,10 +261,8 @@ use crate::tunables::GEOCODE_MERGE_WINDOW_BLOBS;
 // Phase 2b: parallel way scan
 // ---------------------------------------------------------------------------
 
-/// Per-blob output from Phase 2b workers. All user strings owned
-/// (`Box<str>`) because the `PrimitiveBlock` is dropped on the worker
-/// before the main thread sees the merge - any `&str` borrows into it
-/// would expire. Admin geometries are keyed by way ID for insertion
+/// Per-blob output from Phase 2b workers. User strings are owned
+/// (`Box<str>`), shared with Phase 2a's address points. Admin geometries are keyed by way ID for insertion
 /// into the `way_geom` FxHashMap. The optional `error` field carries
 /// u16-overflow diagnostics from `u16::try_from` (see
 /// `StreetWay::node_count` / `InterpWay::node_count` invariants).
@@ -293,9 +293,12 @@ struct PendingInterp {
     coords: Vec<(i32, i32)>,
 }
 
-/// Classify one way into `state`. Pure in effect (worker-local state
-/// accumulation, no shared writes, no intern calls). Main thread handles
-/// file I/O and string interning at merge time.
+/// Resolve one way-store record into `state`. Pure in effect (worker-local
+/// state accumulation, no shared writes, no intern calls). Main thread
+/// handles file I/O and string interning at merge time.
+///
+/// The record carries the classification Pass 1.5 made from the way's tags
+/// (`pass1_5::extract_blob_ways`) and the tag values its roles read.
 ///
 /// Coord resolution reads `coord_slots` (the store Phase 2a populated).
 /// A ref is dropped from the way's geometry when its node was never
@@ -303,61 +306,32 @@ struct PendingInterp {
 /// the file. Absence is the `coord_pack` presence flag, not an all-zero
 /// slot, so a node at Null Island (lat 0, lon 0) is kept like any other.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn classify_way_into(
-    way: &crate::elements::Way<'_>,
+fn resolve_way_into(
+    way: &super::way_store::ExtractedWay<'_>,
     state: &mut WayBlobOut,
     referenced_nodes: &crate::idset::RankedIdSet,
     coord_slots: &[AtomicU64],
-    needed_admin_ways: &crate::idset::IdSet,
 ) {
+    use super::way_store::{
+        ROLE_ADMIN, ROLE_BUILDING_ADDR, ROLE_INTERP, ROLE_STREET, VALUE_HOUSENUMBER,
+        VALUE_INTERPOLATION, VALUE_NAME, VALUE_PLACE, VALUE_POSTCODE, VALUE_STREET,
+    };
+
     if state.error.is_some() {
         return;
     }
 
-    let way_id = way.id();
-    let is_admin_way = needed_admin_ways.get(way_id);
-
-    // Tag-first classification: check tags before resolving
-    // coordinates. Skips node-index lookups for irrelevant ways.
-    let mut highway: Option<&str> = None;
-    let mut name: Option<&str> = None;
-    let mut hn: Option<&str> = None;
-    let mut addr_st: Option<&str> = None;
-    let mut addr_place: Option<&str> = None;
-    let mut pc: Option<&str> = None;
-    let mut building = false;
-    let mut interp: Option<&str> = None;
-
-    for (k, v) in way.tags() {
-        match k {
-            "highway" => highway = Some(v),
-            "name" => name = Some(v),
-            "addr:housenumber" => hn = Some(v),
-            "addr:street" => addr_st = Some(v),
-            "addr:place" => addr_place = Some(v),
-            "addr:postcode" => pc = Some(v),
-            "building" => building = true,
-            "addr:interpolation" => interp = Some(v),
-            _ => {}
-        }
-    }
-
-    let crate::scan::way::WayGeocodeFlags {
-        is_street,
-        is_building_addr,
-        is_interp,
-    } = crate::scan::way::WayGeocodeFlags::classify(
-        highway.is_some(),
-        name.is_some(),
-        highway.is_some_and(|value| {
-            crate::tunables::GEOCODE_EXCLUDED_HIGHWAYS.contains(&value.as_bytes())
-        }),
-        building,
-        hn.is_some(),
-        addr_st.is_some(),
-        addr_place.is_some(),
-        interp.is_some(),
-    );
+    let way_id = way.way_id;
+    let is_admin_way = way.has(ROLE_ADMIN);
+    let is_street = way.has(ROLE_STREET);
+    let is_building_addr = way.has(ROLE_BUILDING_ADDR);
+    let is_interp = way.has(ROLE_INTERP);
+    let name = way.values[VALUE_NAME];
+    let hn = way.values[VALUE_HOUSENUMBER];
+    let addr_st = way.values[VALUE_STREET];
+    let addr_place = way.values[VALUE_PLACE];
+    let pc = way.values[VALUE_POSTCODE];
+    let interp = way.values[VALUE_INTERPOLATION];
 
     if !is_admin_way && !is_street && !is_building_addr && !is_interp {
         return;
@@ -370,8 +344,7 @@ fn classify_way_into(
     // geographic domain, which cannot safely participate in the index.
     let mut rank_outside_store: Option<u64> = None;
     let mut missing_node_ref_count = 0_u64;
-    let coords: Vec<(i32, i32)> = way
-        .refs()
+    let coords: Vec<(i32, i32)> = crate::read::elements::WayRefIter::delta_decoded(way.refs)
         .filter_map(|nid| {
             let Some(rank) = referenced_nodes.rank_if_set(nid) else {
                 missing_node_ref_count = missing_node_ref_count.saturating_add(1);
@@ -528,9 +501,9 @@ pub(super) fn run_pass2(
     output_dir: &std::path::Path,
     node_schedule: &[crate::scan::classify::ScheduledBlob],
     way_schedule: &[crate::scan::classify::ScheduledBlob],
+    way_store: &super::way_store::WayStore,
     shared_file: &crate::read::input::InputFile,
     max_node_id: i64,
-    needed_admin_ways: crate::idset::IdSet,
     referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
     host: &crate::host::Entered<'_>,
@@ -703,14 +676,16 @@ pub(super) fn run_pass2(
     }
     host.invocation.marker("GEOCODE_PASS2A_END");
 
-    // ---------------- Phase 2b: parallel way scan ----------------
+    // ---------------- Phase 2b: parallel way resolve ----------------
     //
-    // Workers classify each way, resolve coords via the store populated
-    // by Phase 2a (only loaded from by this point; Phase 2a's workers have
-    // joined), and emit a `WayBlobOut` per blob. The main-thread merge
-    // interns strings, writes records to the four output files, pushes
-    // `SlimInterpWay` entries, and inserts into the `way_geom` map. Merge
-    // order is file order, through a bounded window; see the module docs.
+    // One ordered task per scheduled way blob, empty ones included: a
+    // worker decodes that blob's way-store segment, resolves coords via
+    // the store populated by Phase 2a (only loaded from by this point;
+    // Phase 2a's workers have joined), and emits a `WayBlobOut`. The
+    // main-thread merge interns strings, writes records to the four output
+    // files, pushes `SlimInterpWay` entries, and inserts into the `way_geom`
+    // map. Merge order is way-schedule (file) order, through a bounded
+    // window; see the module docs.
     let mut street_node_offset: u64 = 0;
     let mut interp_node_offset: u64 = 0;
     let mut street_way_count: u32 = 0;
@@ -720,33 +695,43 @@ pub(super) fn run_pass2(
     host.invocation.marker("GEOCODE_PASS2B_START");
     {
         let referenced_ref = &referenced_nodes;
-        let needed_admin_ways_ref = &needed_admin_ways;
+        let workers = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        );
+        let window = std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS)
+            .unwrap_or_else(|| crate::ordered_pool::default_window(workers));
+        let mut shards = vec![(); workers];
+        let resolve_blob = |state: &mut WayBlobOut, position: usize| -> Result<WayBlobOut> {
+            let mut records = super::way_store::SegmentRecords::new(way_store.segment(position)?);
+            while let Some(way) = records.next_way()? {
+                resolve_way_into(&way, state, referenced_ref, coord_store);
+            }
+            let mut out = std::mem::take(state);
+            match out.error.take() {
+                Some(error) => Err(error),
+                None => Ok(out),
+            }
+        };
 
-        crate::scan::classify::parallel_classify_phase_ordered(
-            shared_file,
-            way_schedule,
-            None,
-            std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
-            WayBlobOut::default,
-            |block, state: &mut WayBlobOut| -> Result<WayBlobOut> {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(way) = element {
-                        classify_way_into(
-                            &way,
-                            state,
-                            referenced_ref,
-                            coord_store,
-                            needed_admin_ways_ref,
-                        );
-                    }
-                }
-                let mut out = std::mem::take(state);
-                match out.error.take() {
-                    Some(error) => Err(error),
-                    None => Ok(out),
-                }
+        crate::ordered_pool::run_ordered(
+            way_schedule.len(),
+            &mut shards,
+            crate::ordered_pool::PoolConfig {
+                window,
+                cancel: &host.invocation,
+                waits: crate::ordered_pool::Waits::default(),
             },
-            |_seq, out| {
+            |_| WayBlobOut::default(),
+            |(), state: &mut WayBlobOut, position| {
+                resolve_blob(state, position).map_err(|e| match way_schedule.get(position) {
+                    Some(entry) => shared_file.locate_blob(entry, e),
+                    None => e,
+                })
+            },
+            &mut crate::ordered_pool::ConsumeFn(|_seq: usize, out: WayBlobOut| -> Result<()> {
                 missing_node_ref_count =
                     missing_node_ref_count.saturating_add(out.missing_node_ref_count);
                 for &way_id in &out.missing_ref_way_ids {
@@ -834,8 +819,7 @@ pub(super) fn run_pass2(
                     })?;
                 }
                 Ok(())
-            },
-            host,
+            }),
         )?;
     }
     host.invocation.marker("GEOCODE_PASS2B_END");
@@ -875,7 +859,6 @@ pub(super) fn run_pass2(
         interp_ways.len(),
         way_geom.len()
     );
-    drop(needed_admin_ways);
     drop(referenced_nodes);
     drop(coord_mmap);
 

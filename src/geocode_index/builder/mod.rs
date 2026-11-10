@@ -23,6 +23,7 @@ mod pass1_5;
 mod pass2;
 mod pass3;
 mod strings;
+mod way_store;
 
 use strings::StringPool;
 
@@ -450,13 +451,14 @@ fn build_generation(
     let pass1_ms = pass1_start.elapsed_ms();
 
     // -----------------------------------------------------------------------
-    // Pass 1.5: Referenced node collection (planet-scale memory optimization)
+    // Pass 1.5: Way extraction + referenced node collection
     //
-    // Scan way blobs to collect node IDs referenced by geocode-relevant ways
-    // (streets, building addresses, interpolation, admin members). The dense
-    // node index in pass 2 only populates entries for these nodes, so its
-    // page-cache working set follows the referenced subset rather than every
-    // node in the file. Same pattern as ALTW pass 0.
+    // The one read of the way blobs: geocode-relevant ways (streets,
+    // building addresses, interpolation, admin members) go to the scratch
+    // way store Pass 2b resolves from, and the node IDs they reference are
+    // collected. The coordinate store in pass 2 only holds entries for these
+    // nodes, so its size follows the referenced subset rather than every
+    // node in the file.
     // -----------------------------------------------------------------------
     host.invocation.marker("GEOCODE_PASS1_END");
     // Every pass boundary is a checkpoint; the passes check their own blob
@@ -482,25 +484,26 @@ fn build_generation(
         host.diagnostics,
         Progress,
         "geocode.pass1_5",
-        "Pass 1.5: Referenced node collection..."
+        "Pass 1.5: Way extraction..."
     );
 
-    let referenced_nodes = pass1_5::run_pass1_5(
+    let (referenced_nodes, way_store) = pass1_5::run_pass1_5(
         &way_schedule,
         max_node_id,
         &shared_file,
         &needed_admin_ways,
+        scratch,
         host,
     )?;
+    drop(needed_admin_ways);
     host.invocation.marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
-    // Pass 2: Nodes + Ways (fused single scan)
+    // Pass 2: Nodes, then ways
     //
-    // Sorted PBFs (Sort.Type_then_ID) guarantee all node blobs come before
-    // way blobs. A single sequential scan processes nodes first (populating
-    // the dense coordinate index for referenced nodes + address points), then
-    // ways (streets, buildings, interpolation, admin geometry).
+    // The node blobs populate the coordinate store for referenced nodes and
+    // write node address points; then the way store is resolved against it
+    // (streets, buildings, interpolation, admin geometry).
     // -----------------------------------------------------------------------
     host.invocation.marker("GEOCODE_PASS2_START");
     crate::host::diag!(
@@ -531,13 +534,14 @@ fn build_generation(
         output_dir,
         &node_schedule,
         &way_schedule,
+        &way_store,
         &shared_file,
         max_node_id,
-        needed_admin_ways,
         referenced_nodes,
         &mut strings,
         host,
     )?;
+    way_store.remove(scratch);
     drop(node_schedule);
     drop(way_schedule);
     drop(shared_file);

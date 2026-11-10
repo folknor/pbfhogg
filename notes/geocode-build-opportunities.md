@@ -72,6 +72,19 @@ Measured phase weights from planet result `38565e43` (`8e3a0d1`, 2026-04-20,
 
 ### G1. Full rewrite: geocode-relevant way extraction store
 
+**Status: implemented 2026-11-10, awaiting commit and bench.** Pass 1.5
+now validates each way blob with the block validator, classifies ways by
+byte equality on the accepted string table and writes relevant ways to
+per-worker scratch files (`builder/way_store.rs`, one segment per
+way-schedule position). Pass 2b resolves from that store through
+`ordered_pool::run_ordered`; it no longer reads the PBF. Denmark output was
+byte-identical to the previous build. Deliberate deltas: a tag string index
+past the string table is refused instead of truncating the way's tags, and
+duplicate string-table entries of a key now classify in Pass 1.5 as they
+did in Pass 2b, so such ways get their coordinates. Direct Pass 3 bucket
+emission from the resolver was deferred: it buys little over reading the
+just-written street files.
+
 This is the strongest new direction.
 
 **Bottleneck.** The builder currently processes way blobs twice. Pass 1.5
@@ -306,12 +319,10 @@ If picking up this note cold:
 - **Sorted + indexed PBF precondition.** Enforced at entry via
   `require_indexdata`; sorted-PBF node-before-way invariant is what
   makes Phase 2a/2b a clean barrier.
-- **Disjoint rank ranges across node blobs.** Phase 2a writes to
-  `coord_mmap` concurrently via `CoordMmapShared::write_coord` without
-  atomics; correctness depends on `IdSet::rank(id)` (formerly
-  `IdSetDense`) being unique
-  per set ID + sorted PBF guaranteeing each ID in at most one blob.
-  `debug_assert!` in `write_coord` catches bounds regressions.
+- **Coordinate installs.** Phase 2a installs coordinates into atomic
+  slots with compare-exchange; identical duplicates are accepted and
+  conflicting ones fail the build, so worker timing cannot pick the
+  coordinate.
 - **Bucket-order cell_id monotonicity.** Pass 3 Stage B asserts
   cell_id monotonicity across buckets; buckets partition by top 8
   bits of cell_id so bucket N's min > bucket N-1's max by
@@ -327,11 +338,9 @@ If picking up this note cold:
   must either carry raw string bytes into an ordered intern phase or accept
   non-byte-identical output and validate semantically. Do not intern through a
   shared mutex in the hot scanner path as the default design.
-- **Zero-coord sentinel in way coord resolution.** `(lat == 0 &&
-  lon == 0)` reads drop as "missing" (both in Pass 2b's coord_slice
-  read and in the sequential predecessor). A real node at Null
-  Island is silently dropped - `KNOWN LIMITATION` comments mark the
-  sites; fix shape is a presence bitmap alongside the coord array.
+- **Coordinate presence.** Absence in the coordinate store is the
+  `coord_pack` presence flag, not an all-zero slot, so a node at Null
+  Island is kept.
 - **Scratch formats are not reader formats.** G1 and G4 can change temporary
   record layouts freely. Reader-visible files listed in `format.rs` should
   remain stable unless there is a product reason to bump `FORMAT_VERSION`.

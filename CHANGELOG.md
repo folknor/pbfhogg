@@ -22,6 +22,15 @@
   complete or no metadata stay dense. A node without metadata is no longer
   given zero metadata because it shares a dense run with nodes that have
   it. `digest` accepts a block holding both node encodings.
+- `--direct-io` help and the I/O capability matrix in `docs/cli/commands.md`
+  now state which read passes and writes each command actually performs
+  with O_DIRECT; a run prints a Note when the filesystem reports zero
+  direct-I/O alignment and so falls back to buffered I/O.
+- `build-geocode-index` decompresses each way blob once instead of twice
+  and validates every way blob, so a tag string index past the string
+  table is refused instead of cutting the way's tags short. A key repeated
+  in a blob's string table no longer loses the way's coordinates. Planet
+  builds need extra scratch for the way store.
 - `diff -v` caps keyed tag lines with the other edit lines at 1000 per
   element; past the cap the element's tag detail is one line giving the
   tag counts and saying details were omitted.

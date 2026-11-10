@@ -368,6 +368,28 @@ impl DenseColumns {
         }
     }
 
+    /// The columns of a node whose metadata carries exactly these fields, in
+    /// `DenseInfo` field order: version, timestamp, changeset, uid, user,
+    /// visible.
+    #[must_use]
+    pub(crate) fn from_presence(fields: [bool; 6]) -> Self {
+        let bits = [
+            Self::VERSION,
+            Self::TIMESTAMP,
+            Self::CHANGESET,
+            Self::UID,
+            Self::USER,
+            Self::VISIBLE,
+        ];
+        Self(
+            fields
+                .iter()
+                .zip(bits)
+                .filter(|(present, _)| **present)
+                .fold(0, |acc, (_, bit)| acc | bit),
+        )
+    }
+
     /// No column at all.
     #[must_use]
     pub fn is_empty(self) -> bool {

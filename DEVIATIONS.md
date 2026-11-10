@@ -949,11 +949,15 @@ re-encoding command: an absent field is written absent, a present zero stays
 a present zero, and `--clean` zeroes only the fields an element carries.
 The Osmosis `-1` version and changeset are read field by field as absent,
 as libosmium reads them, and the element's other fields are kept. A node
-whose metadata is complete with a version of at least 1 is written dense; any
-other node with metadata is written as a plain `Node` (a DenseInfo column
-cannot leave one node's field out, and a version-0 dense slot does not claim
-its zero fields). Absent visibility on a node written dense becomes visible,
-the PBF default. Dense input nodes are re-encoded dense as decoded, with the
+whose metadata is complete with a version of at least 1 is written dense with
+all six columns; absent visibility on such a node becomes visible, the PBF
+default, and a changeset of `-1` a dense 0. Any other node with metadata is
+written dense with exactly its present fields as columns only where the
+dense slot claims what its plain `Info` would (a DenseInfo column cannot
+leave one node's field out, a versioned slot claims `visible` true without
+its column, and a slot below version 1 claims only values no padding holds),
+and only when its run is smaller dense; otherwise it is written as a plain
+`Node`. Dense input nodes are re-encoded dense as decoded, with the
 DenseInfo columns their group carried (a group with all five core columns
 is written with all six); the Osmosis `-1` version and changeset are
 written as 0, which is how libosmium reads them and how pbfhogg's metadata

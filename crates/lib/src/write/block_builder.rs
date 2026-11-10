@@ -136,6 +136,87 @@ impl<'a> PartialMetadata<'a> {
     fn dense_route(&self) -> Option<Metadata<'a>> {
         self.complete().filter(|m| m.version >= 1)
     }
+
+    /// How [`BlockBuilder::add_node_partial`] writes a node with this
+    /// metadata; see [`partial_columns`] for the partial rule.
+    fn route(&self) -> NodeRoute<Metadata<'a>> {
+        if *self == Self::default() {
+            return NodeRoute::NoMeta;
+        }
+        if let Some(full) = self.dense_route() {
+            return NodeRoute::Complete(full);
+        }
+        partial_columns(
+            self.version,
+            self.timestamp,
+            self.changeset,
+            self.uid,
+            self.user.map(|u| !u.is_empty()),
+            self.visible,
+        )
+        .map_or(NodeRoute::Plain, NodeRoute::Partial)
+    }
+}
+
+/// Where a node with possibly partial metadata goes.
+enum NodeRoute<M> {
+    /// No field at all: dense, without `DenseInfo`.
+    NoMeta,
+    /// Complete with a version of at least 1: dense with every column, as
+    /// it always was.
+    Complete(M),
+    /// Dense with exactly these columns is claim-equivalent to the plain
+    /// node, so the run may go either way (`resolve_optional_run`).
+    Partial(DenseColumns),
+    /// Only a plain `Node` keeps what the node claims.
+    Plain,
+}
+
+/// The `DenseInfo` columns a node with partial metadata may be written dense
+/// with, exactly its present fields, or `None` when a dense slot would read
+/// back a different claim than the plain `Info` (`MetaClaims::from_info`
+/// against `DenseNodeInfo::claims`). `user` is `Some(non-empty)` when a user
+/// is present.
+///
+/// - Version 1 or more: a dense slot claims every present column as
+///   decoded, so the fields agree, but it claims `visible` true when the
+///   column is absent, where the plain `Info` claims nothing; and it claims a
+///   changeset of -1 as 0, where the plain `Info` reads it absent. So
+///   `visible` must be present and the changeset other than -1. (Complete
+///   metadata keeps its older route, absent `visible` written true; see
+///   DEVIATIONS.md.)
+/// - Otherwise (no version, 0 or negative): a dense slot claims a field only
+///   by a value no padding slot holds, so every present field must hold one:
+///   a timestamp non-zero in milliseconds (the readers' wrapping scale by the
+///   builder's default `date_granularity` of 1000), a positive changeset and
+///   uid, a non-empty user, `visible` false.
+fn partial_columns(
+    version: Option<i32>,
+    timestamp: Option<i64>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user: Option<bool>,
+    visible: Option<bool>,
+) -> Option<DenseColumns> {
+    let ok = if version.is_some_and(|v| v >= 1) {
+        visible.is_some() && changeset != Some(-1)
+    } else {
+        timestamp.is_none_or(|t| t.wrapping_mul(1000) != 0)
+            && changeset.is_none_or(|c| c > 0)
+            && uid.is_none_or(|u| u > 0)
+            && user.is_none_or(|nonempty| nonempty)
+            && visible.is_none_or(|v| !v)
+    };
+    ok.then(|| {
+        DenseColumns::from_presence([
+            version.is_some(),
+            timestamp.is_some(),
+            changeset.is_some(),
+            uid.is_some(),
+            user.is_some(),
+            visible.is_some(),
+        ])
+    })
 }
 
 /// [`RawMetadata`] whose fields may each be absent, for re-encoding a source
@@ -285,6 +366,18 @@ pub struct BlockBuilder {
     /// The pending dense run's `DenseInfo` columns; empty when its nodes
     /// carry no metadata.
     dense_columns: DenseColumns,
+    /// The pending dense run holds partial-metadata nodes that could equally
+    /// be written plain (`NodeRoute::Partial`): `shadow_plain` holds their
+    /// plain `Node` messages, and sealing the run keeps the smaller form
+    /// (`resolve_optional_run`). Such a run never shares a group with
+    /// nodes that must be dense, even with the same columns.
+    dense_optional: bool,
+    shadow_plain: Vec<u8>,
+    // The dense candidate of an optional run, encoded to be measured.
+    dense_candidate: Vec<u8>,
+    // A raw plain-source node's checked tags, staged so its route can be
+    // chosen after every index is checked.
+    raw_tags_scratch: Vec<(u32, u32)>,
 
     // Dense node delta state
     last_dense_id: i64,
@@ -303,7 +396,9 @@ pub struct BlockBuilder {
     // Node groups already closed, in insertion order (dense runs sealed by a
     // metadata-presence change or a plain node, and plain groups), and the
     // body of the pending plain node group. At most one of `plain_group` and
-    // the dense run is pending at a time.
+    // a mandatory dense run is pending at a time; an optional run
+    // (`dense_optional`) may follow a pending plain group, which it can still
+    // join when it resolves plain.
     node_groups: Vec<u8>,
     plain_group: Vec<u8>,
     group_buf: Vec<u8>,
@@ -426,6 +521,10 @@ impl BlockBuilder {
             dense_user_sids: Vec::with_capacity(prealloc),
             dense_visibles: Vec::with_capacity(prealloc),
             dense_columns: DenseColumns::default(),
+            dense_optional: false,
+            shadow_plain: Vec::new(),
+            dense_candidate: Vec::new(),
+            raw_tags_scratch: Vec::new(),
 
             last_dense_id: 0,
             last_dense_lat: 0,
@@ -707,12 +806,16 @@ impl BlockBuilder {
     /// defaulting to visible), is written dense, exactly as
     /// [`add_node`](Self::add_node) writes it. A complete node with version 0
     /// is written plain, since a version-0 dense slot does not claim its zero
-    /// fields. Any other
+    /// fields. Any other node carries a partial field set, which a dense
+    /// group can hold only as a column set shared by the whole group. Where
+    /// a dense slot with exactly the node's columns claims what its plain
+    /// `Info` would (`partial_columns`), consecutive nodes with the same
+    /// field set form a candidate dense run, also encoded plain, and the run
+    /// is written in whichever form is smaller when it closes. Otherwise the
     /// node is written as a plain `Node` message with an `Info` carrying only
-    /// the present fields: DenseInfo has one column per field for the whole
-    /// group, so it cannot say that one node lacks a field. Consecutive plain
-    /// nodes share one group, and plain and dense nodes never share a group,
-    /// so the block's groups keep insertion order.
+    /// the present fields. Consecutive plain nodes share one group, and plain
+    /// and dense nodes never share a group, so the block's groups keep
+    /// insertion order.
     pub fn add_node_partial<'t>(
         &mut self,
         id: i64,
@@ -721,11 +824,129 @@ impl BlockBuilder {
         tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&PartialMetadata<'_>>,
     ) {
-        match metadata.map(PartialMetadata::dense_route) {
-            None => self.add_node(id, decimicro_lat, decimicro_lon, tags, None),
-            Some(Some(full)) => self.add_node(id, decimicro_lat, decimicro_lon, tags, Some(&full)),
-            Some(None) => self.add_plain_node(id, decimicro_lat, decimicro_lon, tags, metadata),
+        let Some(meta) = metadata else {
+            return self.add_node(id, decimicro_lat, decimicro_lon, tags, None);
+        };
+        match meta.route() {
+            NodeRoute::NoMeta => self.add_node(id, decimicro_lat, decimicro_lon, tags, None),
+            NodeRoute::Complete(full) => {
+                self.add_node(id, decimicro_lat, decimicro_lon, tags, Some(&full));
+            }
+            NodeRoute::Partial(columns) => {
+                self.add_optional_node(id, decimicro_lat, decimicro_lon, tags, meta, columns);
+            }
+            NodeRoute::Plain => {
+                self.add_plain_node(id, decimicro_lat, decimicro_lon, tags, metadata);
+            }
         }
+    }
+
+    /// Add a node routed `NodeRoute::Partial` to the optional dense run.
+    #[allow(clippy::cast_possible_wrap)]
+    fn add_optional_node<'t>(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+        meta: &PartialMetadata<'_>,
+        columns: DenseColumns,
+    ) {
+        if !self.can_add_node() {
+            self.refuse(BlockType::DenseNodes, id);
+            return;
+        }
+        self.block_type = Some(BlockType::DenseNodes);
+        self.begin_optional_node(columns);
+        // One traversal feeds both forms with the same interned indices, in
+        // the order the plain path interns them: each key, its value, then
+        // the user. An absent user is not interned.
+        self.packed_scratch.clear();
+        self.packed_vals_scratch.clear();
+        for (key, val) in tags {
+            let key_idx = self.string_table.add(key);
+            let val_idx = self.string_table.add(val);
+            self.tag_key_indices.insert(key_idx);
+            self.dense_keys_vals.push(key_idx as i32);
+            self.dense_keys_vals.push(val_idx as i32);
+            protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_idx));
+            protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_idx));
+        }
+        self.dense_keys_vals.push(0);
+        let raw = RawPartialMetadata {
+            version: meta.version,
+            timestamp: meta.timestamp,
+            changeset: meta.changeset,
+            uid: meta.uid,
+            // `StringTable::add` keeps indices far below `i32::MAX`.
+            user_sid: meta.user.map(|u| self.string_table.add(u).cast_signed()),
+            visible: meta.visible,
+        };
+        self.push_optional_node(id, decimicro_lat, decimicro_lon, &raw);
+    }
+
+    /// Start or continue an optional run with `columns`. A mandatory run, or
+    /// an optional one with other columns, is sealed first; a pending plain
+    /// group is left open.
+    #[inline]
+    fn begin_optional_node(&mut self, columns: DenseColumns) {
+        if !self.dense_ids.is_empty() && (!self.dense_optional || columns != self.dense_columns) {
+            self.seal_dense_run();
+        }
+        self.dense_columns = columns;
+        self.dense_optional = true;
+    }
+
+    /// The common tail of an optional node, whose tags are already in
+    /// `dense_keys_vals` and, packed for a plain `Node`, in `packed_scratch`
+    /// and `packed_vals_scratch`: its dense slot (absent fields as
+    /// placeholders the run's columns leave unwritten) and its plain `Node`
+    /// in `shadow_plain`, byte for byte what `add_plain_node` writes.
+    fn push_optional_node(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        meta: &RawPartialMetadata,
+    ) {
+        let lat = i64::from(decimicro_lat);
+        let lon = i64::from(decimicro_lon);
+        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
+        self.last_dense_id = id;
+        self.last_dense_lat = lat;
+        self.last_dense_lon = lon;
+        self.add_dense_metadata_raw(&RawMetadata {
+            version: meta.version.unwrap_or(0),
+            timestamp: meta.timestamp.unwrap_or(0),
+            changeset: meta.changeset.unwrap_or(0),
+            uid: meta.uid.unwrap_or(0),
+            user_sid: meta.user_sid.unwrap_or(0),
+            visible: meta.visible.unwrap_or(true),
+            columns: self.dense_columns,
+        });
+
+        self.elem_scratch.clear();
+        protohoggr::encode_tag(&mut self.elem_scratch, 1, protohoggr::WIRE_VARINT);
+        protohoggr::encode_varint(&mut self.elem_scratch, protohoggr::zigzag_encode_64(id));
+        if !self.packed_scratch.is_empty() {
+            encode_bytes_field(&mut self.elem_scratch, 2, &self.packed_scratch);
+            encode_bytes_field(&mut self.elem_scratch, 3, &self.packed_vals_scratch);
+        }
+        super::encode::encode_raw_partial_info(&mut self.info_scratch, meta);
+        encode_bytes_field(&mut self.elem_scratch, 4, &self.info_scratch);
+        for (field, value) in [(8, decimicro_lat), (9, decimicro_lon)] {
+            protohoggr::encode_tag(&mut self.elem_scratch, field, protohoggr::WIRE_VARINT);
+            protohoggr::encode_varint(
+                &mut self.elem_scratch,
+                protohoggr::zigzag_encode_64(i64::from(value)),
+            );
+        }
+        encode_bytes_field(&mut self.shadow_plain, 1, &self.elem_scratch);
+        self.track_coords(decimicro_lat, decimicro_lon);
+        self.track_id(id);
+        self.count += 1;
     }
 
     /// Append a plain `Node` message to the pending plain group.
@@ -817,6 +1038,11 @@ impl BlockBuilder {
     /// uniform input both conditions are one untaken branch.
     #[inline]
     fn begin_dense_node(&mut self, columns: DenseColumns) {
+        // An optional run resolves first, since it may still join the
+        // pending plain group, which precedes it.
+        if self.dense_optional {
+            self.seal_dense_run();
+        }
         if !self.plain_group.is_empty() {
             self.flush_plain_group();
         }
@@ -1254,11 +1480,14 @@ impl BlockBuilder {
     /// fields may each be absent: dense through
     /// [`add_node_raw`](Self::add_node_raw) when the metadata is absent or
     /// complete with a version of at least 1 (the rule of
-    /// [`add_node_partial`](Self::add_node_partial)), otherwise a plain `Node`
-    /// carrying only the present `Info` fields, under the same group rules
-    /// as [`add_node_partial`](Self::add_node_partial). Indices are checked
-    /// as `add_node_raw` checks them. A plain node keeps a tag key index of
-    /// zero as it is: only a dense node cannot carry one.
+    /// [`add_node_partial`](Self::add_node_partial)), otherwise under
+    /// `add_node_partial`'s partial rule: an optional dense run with exactly
+    /// its columns where that keeps its claims, else a plain `Node` carrying
+    /// only the present `Info` fields. The user's emptiness is judged by the
+    /// string its checked index names. Indices are checked as `add_node_raw`
+    /// checks them, all before the node touches the builder. A node with a
+    /// tag key index of zero stays plain, which keeps that index as it is:
+    /// only a dense node cannot carry one.
     pub(crate) fn add_node_raw_partial(
         &mut self,
         id: i64,
@@ -1269,6 +1498,9 @@ impl BlockBuilder {
     ) -> Result<()> {
         let meta = match metadata {
             None => return self.add_node_raw(id, decimicro_lat, decimicro_lon, raw_tags, None),
+            Some(meta) if *meta == RawPartialMetadata::default() => {
+                return self.add_node_raw(id, decimicro_lat, decimicro_lon, raw_tags, None);
+            }
             Some(meta) => match meta.dense_route() {
                 Some(full) => {
                     return self.add_node_raw(
@@ -1292,25 +1524,58 @@ impl BlockBuilder {
             let e = e.context(raw_sid_context("node", id, "user name", sid));
             return Err(self.refuse_raw_index(e));
         }
-        // Seal first: sealing a run with metadata encodes its DenseInfo
-        // through `packed_scratch`, which would overwrite the staged keys.
-        self.block_type = Some(BlockType::DenseNodes);
-        self.seal_dense_run();
-        self.packed_scratch.clear();
-        self.packed_vals_scratch.clear();
+        // Every index is checked before the node touches the builder, so its
+        // route can be chosen from the checked tags.
+        let mut tags = std::mem::take(&mut self.raw_tags_scratch);
+        tags.clear();
         for (key_sid, val_sid) in raw_tags {
             if !index_in(key_sid, seeded) {
+                self.raw_tags_scratch = tags;
                 let e = bad_unsigned_sid("node", id, "tag key", key_sid);
                 return Err(self.refuse_raw_index(e));
             }
             if !index_in(val_sid, seeded) {
+                self.raw_tags_scratch = tags;
                 let e = bad_unsigned_sid("node", id, "tag value", val_sid);
                 return Err(self.refuse_raw_index(e));
             }
+            tags.push((key_sid, val_sid));
+        }
+        // A tag key index of zero would be rewritten to a fresh empty-string
+        // slot in a dense node, a string the plain form does not need, so
+        // such a node stays plain and both forms keep one string table.
+        let user_nonempty = meta.user_sid.map(|sid| {
+            usize::try_from(sid).is_ok_and(|sid| !self.string_table.get(sid).is_empty())
+        });
+        let columns = if tags.iter().any(|&(key, _)| key == 0) {
+            None
+        } else {
+            partial_columns(
+                meta.version,
+                meta.timestamp,
+                meta.changeset,
+                meta.uid,
+                user_nonempty,
+                meta.visible,
+            )
+        };
+        self.block_type = Some(BlockType::DenseNodes);
+        if let Some(columns) = columns {
+            self.add_raw_optional_node(id, decimicro_lat, decimicro_lon, &tags, meta, columns);
+            self.raw_tags_scratch = tags;
+            return Ok(());
+        }
+        // Seal first: sealing a run with metadata encodes its DenseInfo
+        // through `packed_scratch`, which would overwrite the staged keys.
+        self.seal_dense_run();
+        self.packed_scratch.clear();
+        self.packed_vals_scratch.clear();
+        for &(key_sid, val_sid) in &tags {
             self.tag_key_indices.insert(key_sid);
             protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_sid));
             protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_sid));
         }
+        self.raw_tags_scratch = tags;
 
         self.elem_scratch.clear();
         protohoggr::encode_tag(&mut self.elem_scratch, 1, protohoggr::WIRE_VARINT);
@@ -1333,6 +1598,33 @@ impl BlockBuilder {
         self.track_id(id);
         self.count += 1;
         Ok(())
+    }
+
+    /// Add a raw node with checked tags, none with key index zero, to the
+    /// optional dense run.
+    fn add_raw_optional_node(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: &[(u32, u32)],
+        meta: &RawPartialMetadata,
+        columns: DenseColumns,
+    ) {
+        self.begin_optional_node(columns);
+        self.packed_scratch.clear();
+        self.packed_vals_scratch.clear();
+        for &(key_sid, val_sid) in tags {
+            self.tag_key_indices.insert(key_sid);
+            // Below a table length, which a block's byte limit keeps far
+            // below `i32::MAX`.
+            self.dense_keys_vals.push(key_sid.cast_signed());
+            self.dense_keys_vals.push(val_sid.cast_signed());
+            protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_sid));
+            protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_sid));
+        }
+        self.dense_keys_vals.push(0);
+        self.push_optional_node(id, decimicro_lat, decimicro_lon, meta);
     }
 
     /// Check a raw way's or relation's copied values, member roles (empty for
@@ -1509,6 +1801,17 @@ impl BlockBuilder {
             self.reset();
             return Ok(None);
         };
+
+        // An optional run chooses its form before the groups are copied
+        // below, which write a pending dense run directly.
+        if self.dense_optional {
+            self.seal_dense_run();
+            if let Some(reason) = self.poison.as_deref() {
+                return Err(crate::error::Error::invalid_data(format!(
+                    "BlockBuilder refused to encode a block: {reason}"
+                )));
+            }
+        }
 
         // Every tracked key is in the table: `add` returns slots it has, and
         // the raw adds refuse a key at or past the seeded source table, which
@@ -1872,6 +2175,8 @@ impl BlockBuilder {
 
     fn clear_dense_run(&mut self) {
         self.dense_columns = DenseColumns::default();
+        self.dense_optional = false;
+        self.shadow_plain.clear();
         self.last_dense_id = 0;
         self.last_dense_lat = 0;
         self.last_dense_lon = 0;
@@ -1900,13 +2205,62 @@ impl BlockBuilder {
         if self.dense_ids.is_empty() {
             return;
         }
-        std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
-        let result = self.encode_dense_nodes_group();
-        std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
-        if let Err(err) = result {
-            self.poison(err.to_string());
+        if self.dense_optional {
+            self.resolve_optional_run();
+        } else {
+            std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
+            let result = self.encode_dense_nodes_group();
+            std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
+            if let Err(err) = result {
+                self.poison(err.to_string());
+            }
         }
         self.clear_dense_run();
+    }
+
+    /// Close an optional run in the smaller of its two forms: the dense
+    /// group (after the pending plain group, closed into its own group), or
+    /// its plain `Node` messages appended to the pending plain group, which
+    /// stays open. Both forms intern the same strings, so the string table
+    /// does not depend on the choice. Compared by encoded length, wrappers
+    /// included; a tie goes plain. The choice is local: a later plain node
+    /// that would have joined the plain form opens a new group after a
+    /// dense one, which this does not foresee.
+    #[cold]
+    fn resolve_optional_run(&mut self) {
+        let mut candidate = std::mem::take(&mut self.dense_candidate);
+        candidate.clear();
+        std::mem::swap(&mut self.encode_buf, &mut candidate);
+        let result = self.encode_dense_nodes_group();
+        std::mem::swap(&mut self.encode_buf, &mut candidate);
+        if let Err(err) = result {
+            self.poison(err.to_string());
+            self.dense_candidate = candidate;
+            return;
+        }
+        let len = super::encode::len_field_size;
+        let pending = if self.plain_group.is_empty() {
+            Some(0)
+        } else {
+            len(self.plain_group.len())
+        };
+        let dense = pending.and_then(|p| p.checked_add(candidate.len()));
+        let plain = self
+            .plain_group
+            .len()
+            .checked_add(self.shadow_plain.len())
+            .and_then(len);
+        match (dense, plain) {
+            (Some(dense), Some(plain)) if dense < plain => {
+                if !self.plain_group.is_empty() {
+                    self.flush_plain_group();
+                }
+                self.node_groups.extend_from_slice(&candidate);
+            }
+            (_, Some(_)) => self.plain_group.extend_from_slice(&self.shadow_plain),
+            (_, None) => self.poison("plain node group length overflows usize".to_owned()),
+        }
+        self.dense_candidate = candidate;
     }
 
     /// Drop every retained buffer that one block grew past the retention
@@ -1939,6 +2293,9 @@ impl BlockBuilder {
         release(&mut self.dense_visibles);
         release(&mut self.node_groups);
         release(&mut self.plain_group);
+        release(&mut self.shadow_plain);
+        release(&mut self.dense_candidate);
+        release(&mut self.raw_tags_scratch);
         release(&mut self.group_buf);
         release(&mut self.elem_scratch);
         release(&mut self.packed_scratch);
@@ -2026,7 +2383,10 @@ fn bad_unsigned_sid(kind: &str, id: i64, field: &str, sid: u32) -> crate::error:
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{BlockBuilder, MemberData, Metadata, RawMetadata, RawPartialMetadata};
+    use super::{
+        BlockBuilder, MemberData, Metadata, NodeRoute, PartialMetadata, RawMetadata,
+        RawPartialMetadata,
+    };
     use crate::{MemberId, MemberType, PrimitiveBlock};
     use protohoggr::encode_bytes_field;
 
@@ -2065,6 +2425,13 @@ mod tests {
                     crate::Element::Node(n) => n.info(),
                     crate::Element::Way(w) => w.info(),
                     crate::Element::Relation(r) => r.info(),
+                    // A node with no field at all claims nothing either way,
+                    // so it goes dense without DenseInfo.
+                    crate::Element::DenseNode(n) if expected == PartialMetadata::default() => {
+                        assert!(n.info().is_none());
+                        count += 1;
+                        continue;
+                    }
                     _ => panic!("partial metadata must use plain Info"),
                 };
                 assert_eq!(info.version(), expected.version);
@@ -2308,6 +2675,313 @@ mod tests {
             assert_eq!((n.decimicro_lat(), n.decimicro_lon()), coords);
             assert_eq!(n.tags().collect::<Vec<_>>(), tags);
         }
+        Ok(())
+    }
+
+    type Claimed = (
+        Option<i32>,
+        Option<i64>,
+        Option<i64>,
+        Option<i32>,
+        Option<String>,
+        Option<bool>,
+    );
+
+    /// What one node element claims, as every metadata output reads it.
+    fn claims_of(e: &crate::Element<'_>) -> Claimed {
+        use crate::read::claims::MetaClaims;
+        let claims = match e {
+            crate::Element::Node(n) => Some(MetaClaims::from_info(&n.info())),
+            crate::Element::DenseNode(n) => n.info().and_then(MetaClaims::from_dense),
+            _ => panic!("node"),
+        };
+        claims.map_or((None, None, None, None, None, None), |c| {
+            (
+                c.version,
+                c.milli_timestamp,
+                c.changeset,
+                c.uid,
+                c.user.map(|u| u.expect("user resolves").to_owned()),
+                c.visible,
+            )
+        })
+    }
+
+    fn metadata_grid() -> Vec<PartialMetadata<'static>> {
+        let mut grid = Vec::new();
+        for version in [None, Some(0), Some(-1), Some(3)] {
+            for timestamp in [None, Some(0), Some(5), Some(1_i64 << 61)] {
+                for changeset in [None, Some(0), Some(-1), Some(7)] {
+                    for uid in [None, Some(0), Some(-2), Some(9)] {
+                        for user in [None, Some(""), Some("m")] {
+                            for visible in [None, Some(true), Some(false)] {
+                                grid.push(PartialMetadata {
+                                    version,
+                                    timestamp,
+                                    changeset,
+                                    uid,
+                                    user,
+                                    visible,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// Every metadata shape, in a run long enough that a dense form wins
+    /// wherever one is allowed, claims exactly what the plain encoding of
+    /// the same node claims, and keeps it through a dense re-encode. Shapes
+    /// `partial_columns` admits are written dense with exactly their present
+    /// columns; the others stay plain.
+    #[test]
+    fn uniform_partial_runs_go_dense_without_changing_a_claim() -> crate::Result<()> {
+        const RUN: i64 = 40;
+        let mut dense_shapes = 0;
+        for meta in metadata_grid() {
+            let mut plain = BlockBuilder::new();
+            let mut routed = BlockBuilder::new();
+            for id in 1..=RUN {
+                plain.add_plain_node(id, 10, 20, [("k", "v")], Some(&meta));
+                routed.add_node_partial(id, 10, 20, [("k", "v")], Some(&meta));
+            }
+            let plain_bytes = plain.take()?.expect("block").to_vec();
+            let routed_bytes = routed.take()?.expect("block").to_vec();
+            let smaller = routed_bytes.len() < plain_bytes.len();
+            let plain = PrimitiveBlock::from_vec(plain_bytes)?;
+            let routed = PrimitiveBlock::from_vec(routed_bytes)?;
+            let route = meta.route();
+            let mut expected: Vec<Claimed> = plain.elements().map(|e| claims_of(&e)).collect();
+            if matches!(route, NodeRoute::Complete(_)) {
+                // The complete route's standing deviations (DEVIATIONS.md):
+                // absent visibility is written visible, and a changeset of
+                // -1, absent to a plain reader, is a dense 0.
+                for c in &mut expected {
+                    c.5 = c.5.or(Some(true));
+                    if meta.changeset == Some(-1) {
+                        c.2 = Some(0);
+                    }
+                }
+            }
+            let got: Vec<Claimed> = routed.elements().map(|e| claims_of(&e)).collect();
+            assert_eq!(got, expected, "{meta:?}");
+
+            let dense = node_ids(&routed).iter().all(|&(_, d)| d);
+            match route {
+                NodeRoute::Partial(columns) => {
+                    assert!(dense, "{meta:?} must win dense in a run of {RUN}");
+                    dense_shapes += 1;
+                    for e in routed.elements() {
+                        let crate::Element::DenseNode(n) = e else {
+                            panic!("dense")
+                        };
+                        assert_eq!(n.info().expect("info").columns(), columns, "{meta:?}");
+                        assert_eq!(n.tags().collect::<Vec<_>>(), [("k", "v")]);
+                        assert_eq!((n.decimicro_lat(), n.decimicro_lon()), (10, 20));
+                    }
+                    assert!(smaller, "{meta:?}");
+                    // A dense re-encode keeps the columns and the claims.
+                    let mut again = BlockBuilder::new();
+                    for e in routed.elements() {
+                        let crate::Element::DenseNode(n) = e else {
+                            panic!("dense")
+                        };
+                        let m = crate::owned::dense_node_metadata(&n)?;
+                        again.add_node_dense(n.id(), 10, 20, n.tags(), m.as_ref());
+                    }
+                    let again = PrimitiveBlock::from_vec(again.take()?.expect("block").to_vec())?;
+                    let reread: Vec<Claimed> = again.elements().map(|e| claims_of(&e)).collect();
+                    assert_eq!(reread, expected, "re-encoded {meta:?}");
+                }
+                NodeRoute::Plain => assert!(node_ids(&routed).iter().all(|&(_, d)| !d)),
+                NodeRoute::NoMeta | NodeRoute::Complete(_) => assert!(dense),
+            }
+        }
+        assert!(dense_shapes > 0);
+        Ok(())
+    }
+
+    /// The shapes the claim rule turns away, named.
+    #[test]
+    fn partial_shapes_whose_dense_claim_differs_stay_plain() {
+        let versioned = PartialMetadata {
+            version: Some(2),
+            timestamp: Some(9),
+            ..PartialMetadata::default()
+        };
+        let cases = [
+            // A versioned slot claims visible true without its column.
+            versioned,
+            // A versioned slot claims a changeset of -1 as 0.
+            PartialMetadata {
+                changeset: Some(-1),
+                visible: Some(true),
+                ..versioned
+            },
+            // Below version 1 a zero uid reads as padding.
+            PartialMetadata {
+                uid: Some(0),
+                ..PartialMetadata::default()
+            },
+            // Non-zero seconds, zero milliseconds after the wrapping scale.
+            PartialMetadata {
+                timestamp: Some(1 << 61),
+                ..PartialMetadata::default()
+            },
+            // Below version 1 an explicit empty user reads as padding.
+            PartialMetadata {
+                timestamp: Some(9),
+                user: Some(""),
+                ..PartialMetadata::default()
+            },
+            // Below version 1 a visible true is not claimed.
+            PartialMetadata {
+                timestamp: Some(9),
+                visible: Some(true),
+                ..PartialMetadata::default()
+            },
+        ];
+        for meta in cases {
+            assert!(matches!(meta.route(), NodeRoute::Plain), "{meta:?}");
+        }
+        let admitted = [
+            PartialMetadata {
+                visible: Some(true),
+                ..versioned
+            },
+            PartialMetadata {
+                timestamp: Some(9),
+                uid: Some(4),
+                user: Some("m"),
+                visible: Some(false),
+                ..PartialMetadata::default()
+            },
+        ];
+        for meta in admitted {
+            assert!(matches!(meta.route(), NodeRoute::Partial(_)), "{meta:?}");
+        }
+    }
+
+    /// A lone partial node is smaller plain, so it stays plain and joins
+    /// the plain group around it; the dense form is taken only where it is
+    /// smaller.
+    #[test]
+    fn a_lone_partial_node_stays_plain_when_plain_is_smaller() -> crate::Result<()> {
+        let partial = PartialMetadata {
+            version: Some(2),
+            timestamp: Some(9),
+            visible: Some(true),
+            ..PartialMetadata::default()
+        };
+        let other = PartialMetadata {
+            version: Some(2),
+            ..PartialMetadata::default()
+        };
+        let mut bb = BlockBuilder::new();
+        bb.add_node_partial(1, 0, 0, [], Some(&other));
+        bb.add_node_partial(2, 0, 0, [], Some(&partial));
+        bb.add_node_partial(3, 0, 0, [], Some(&other));
+        let block = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
+        assert_eq!(node_ids(&block), [(1, false), (2, false), (3, false)]);
+        // One plain group: the optional node joined the pending one.
+        assert_eq!(block.groups().count(), 1);
+
+        // A run that wins dense between plain nodes keeps insertion order.
+        let mut bb = BlockBuilder::new();
+        bb.add_node_partial(1, 0, 0, [], Some(&other));
+        for id in 2..30 {
+            bb.add_node_partial(id, 0, 0, [], Some(&partial));
+        }
+        bb.add_node_partial(30, 0, 0, [], Some(&other));
+        let block = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
+        let ids = node_ids(&block);
+        assert_eq!(ids.first(), Some(&(1, false)));
+        assert!(ids[1..29].iter().all(|&(_, d)| d));
+        assert_eq!(ids.last(), Some(&(30, false)));
+        assert_eq!(
+            ids.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            (1..=30).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// Complete metadata is written exactly as `add_node` writes it, before
+    /// and after an optional run, so complete-metadata output is unchanged.
+    #[test]
+    fn complete_partial_metadata_bytes_match_add_node() -> crate::Result<()> {
+        let complete = PartialMetadata {
+            version: Some(2),
+            timestamp: Some(5),
+            changeset: Some(6),
+            uid: Some(7),
+            user: Some("u"),
+            visible: None,
+        };
+        let full = complete.complete().expect("complete");
+        let mut a = BlockBuilder::new();
+        let mut b = BlockBuilder::new();
+        for id in 1..100 {
+            a.add_node(id, 1, 2, [("k", "v")], Some(&full));
+            b.add_node_partial(id, 1, 2, [("k", "v")], Some(&complete));
+        }
+        assert_eq!(a.take()?.map(<[u8]>::to_vec), b.take()?.map(<[u8]>::to_vec));
+        Ok(())
+    }
+
+    /// The raw rewrite of uniform partial plain nodes goes dense with their
+    /// columns, keeping claims and tags; a node with tag key index zero
+    /// stays plain.
+    #[test]
+    fn raw_uniform_partial_nodes_go_dense() -> crate::Result<()> {
+        let meta = PartialMetadata {
+            version: Some(2),
+            timestamp: Some(9),
+            user: Some("m"),
+            visible: Some(true),
+            ..PartialMetadata::default()
+        };
+        let mut src = BlockBuilder::new();
+        for id in 1..=30 {
+            src.add_plain_node(id, 10, 20, [("a", "b")], Some(&meta));
+        }
+        let source = PrimitiveBlock::from_vec(src.take()?.expect("block").to_vec())?;
+        let mut bb = BlockBuilder::new();
+        bb.pre_seed_string_table(&source)?;
+        for e in source.elements() {
+            let crate::Element::Node(n) = e else {
+                panic!("plain")
+            };
+            let raw = crate::owned::element_raw_partial_metadata(&n.info());
+            bb.add_node_raw_partial(n.id(), 10, 20, n.raw_tags(), raw.as_ref())?;
+        }
+        let out = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
+        assert!(node_ids(&out).iter().all(|&(_, d)| d));
+        let want: Vec<Claimed> = source.elements().map(|e| claims_of(&e)).collect();
+        let got: Vec<Claimed> = out.elements().map(|e| claims_of(&e)).collect();
+        assert_eq!(got, want);
+        for e in out.elements() {
+            let crate::Element::DenseNode(n) = e else {
+                panic!("dense")
+            };
+            assert_eq!(n.tags().collect::<Vec<_>>(), [("a", "b")]);
+        }
+
+        let raw = RawPartialMetadata {
+            version: Some(2),
+            timestamp: Some(9),
+            visible: Some(true),
+            ..RawPartialMetadata::default()
+        };
+        let mut bb = BlockBuilder::new();
+        bb.pre_seed_string_table(&source_table(&["", "v"]))?;
+        for id in 1..=30 {
+            bb.add_node_raw_partial(id, 0, 0, [(0, 1)].into_iter(), Some(&raw))?;
+        }
+        let out = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
+        assert!(node_ids(&out).iter().all(|&(_, d)| !d));
         Ok(())
     }
 

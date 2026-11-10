@@ -204,9 +204,13 @@ output claims what the input did, apart from sub-second timestamps, which are
 truncated to whole seconds. A plain `Info` is
 re-encoded with each field present exactly when it was decoded present
 (`element_metadata` in `crates/lib/src/owned.rs`): the `-1` version or
-changeset stays absent, the other fields stay as carried, and a node is
-written dense only when its metadata is complete with a version of 1 or more,
-so a plain version-0 node keeps its explicit zero fields as a plain node.
+changeset stays absent, the other fields stay as carried. A node is written
+dense with all six columns when its metadata is complete with a version of 1
+or more; a partial one is written dense, with exactly its present fields as
+columns, only when the slot rules above read it back as the plain `Info`
+reads it and its run is smaller dense (`partial_columns` and
+`resolve_optional_run` in `crates/lib/src/write/block_builder.rs`). So a
+plain version-0 node with an explicit zero field stays a plain node.
 
 The `inspect --extended` metadata census follows only the version rule above.
 It counts, it does not print, so its other fields follow the next section.

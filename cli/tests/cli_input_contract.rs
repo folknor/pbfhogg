@@ -577,8 +577,8 @@ fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--add-self"])
 }
 
-/// getparents on its full-scan arm, which a small file reaches only through
-/// the hidden threshold instrument.
+/// getparents with the hidden threshold instrument, which sends a small
+/// indexed file to the full-scan arm. An unindexed first blob keeps the walker.
 fn getparents_full_scan(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--full-scan-min-blobs", "1"])
 }
@@ -1785,7 +1785,7 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
     ),
     ("getparents", getparents, &[], Mixed::RefusesPartial),
     (
-        "getparents --full-scan-min-blobs 1",
+        "getparents --full-scan-min-blobs 1 (walker: first blob unindexed)",
         getparents_full_scan,
         &[],
         Mixed::RefusesPartial,

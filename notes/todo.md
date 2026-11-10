@@ -1044,11 +1044,6 @@ the fastest one.
   which flags, and how each recovery is reported. First candidate: a repeated `Info` or
   `DenseInfo` message, refused while the block is parsed, before any
   `--clean` applies, so `cat --clean` cannot rescue that file today.
-- [ ] **A mislabelled row in the partial-index contract table** (found
-  2026-10-26). In `cli/tests/cli_input_contract.rs`, the reverse-order
-  table's `getparents --full-scan-min-blobs 1` row runs the walker arm,
-  not the full scan: an unindexed first blob makes dispatch pick the
-  walker. The result is right; the label is misleading.
 - [ ] **Missing-indexdata and unsorted refusals name one remedy** (raised
   2026-10-26). `IndexdataMismatch` advice now names `check --index` and
   `cat --reindex`; `MissingIndexdata` (partial and whole) names `cat` only

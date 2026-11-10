@@ -102,6 +102,23 @@ blobs on tagdata, so this screens the seam on the blobs the expression
 decodes, not on every fused workload. A regression screen, not a bound;
 no re-measure without a change to the decode-worker closure.
 
+### One header walk for every two-pass schedule (bygg, 2026-11-10, `e802ffd4` against `61c19154`)
+
+Pass 1's walk now records every data blob with its kind and the
+closure, way-dependency and pass-2 schedules are cut from it. Before,
+each later walk was cold on planet: pass 1 reads 28 GB of payload in
+between, so each re-read about 500 MB of headers at near zero cores,
+4.6 to 4.9 s apiece (sidecars `f60408df`, `0b19b3c4`).
+
+After a trim, `--iterations 1`, both arms `--commit`, A B B A, planet:
+
+| Filter | A, `61c19154` | B, `e802ffd4` |
+|---|---|---|
+| `w/highway=primary` (pass-2 walk saved) | 55.4, 56.6 s (`7532c026`, `c98653d3`) | 50.0, 50.2 s (`2c63baf3`, `51cfd441`) |
+| `r/type=route` (closure and pass-2 walks saved) | 62, 62 s (`04a68224`, `25c97213`) | 56.2, 56.2 s (`2b16eb38`, `2b84bbf0`) |
+
+About 10 % faster on both filters, every cell. Kept.
+
 ### OSC tags-filter takes -j (bygg, 2026-11-02)
 
 `tags_filter_osc` takes a `Parallelism`: `Fixed(n)` runs the batch workers

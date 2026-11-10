@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Two-pass `tags-filter` walks the blob headers once instead of once per
+  pass, about 10 % faster on planet (56 to 50 s for `w/highway=primary`,
+  62 to 56 s for `r/type=route` on bygg).
 - Replacing an existing directory output that the caller cannot write is
   refused before any work starts, instead of failing at publication after
   the whole run.

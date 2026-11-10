@@ -423,7 +423,7 @@ fn the_streaming_diff_reads_only_the_pinned_inputs() {
 
 /// The front reads and the streaming readers open `O_DIRECT` when asked
 /// to, through the pin's own direct open: the unindexed reader and the
-/// one-shard block-pair streams (a multi-shard walk stays buffered).
+/// indexed work-unit cursors, at every `-j`.
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_inputs() {

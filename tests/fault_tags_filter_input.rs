@@ -14,12 +14,10 @@
 //! The opens, in order (see `Route::opens`):
 //!
 //! - two-pass: the indexdata probe (not under `invert` or
-//!   `distrust_metadata`), pass 1's header read, pass 1's schedule walk (its
-//!   descriptor serves the classify pool), the relation closure's schedule
-//!   walk (only when a relation was selected; its descriptor serves every
-//!   convergence round), the way-dependency schedule walk, pass 2's header
-//!   read and pass 2's schedule walk (its descriptor serves the decode
-//!   workers).
+//!   `distrust_metadata`), pass 1's header read, pass 1's schedule walk (the
+//!   run's only walk: the closure, way-dependency and pass-2 schedules are
+//!   cut from its catalog, and its descriptor serves every pool), and pass
+//!   2's header read.
 //! - `-R`: the probe (under the same condition, and only for expressions
 //!   that leave some kind out, as every route's here do: no `n/`) and the
 //!   pipelined reader.
@@ -69,19 +67,15 @@ impl Route {
         !self.invert && !self.distrust
     }
 
-    /// Opens of one run. Under `invert` every relation is selected (no
-    /// expression admits a relation, so none matches), so the closure runs.
-    /// The way-dependency walk opens the input only when the closure pulled
-    /// in a way that is not a direct match: path way 2000, which `invert`
-    /// selects directly.
+    /// Opens of one run. The two-pass count does not depend on whether the
+    /// closure or the way-dependency phase runs: both read through pass 1's
+    /// walk descriptor.
     fn opens(self) -> u64 {
         let probe = u64::from(self.probes());
         if self.omit_referenced {
             return probe + 1;
         }
-        let closure = u64::from(self.relations || self.invert);
-        let way_deps = u64::from(self.relations && !self.invert);
-        probe + 4 + closure + way_deps
+        probe + 3
     }
 
     fn expressions(self) -> Vec<String> {
@@ -335,15 +329,15 @@ fn check_route(route: Route, expected_opens: u64) {
 
 #[test]
 fn two_pass_reads_only_the_pinned_input() {
-    check_route(Route::TWO_PASS, 7);
-    // No relation selected: no closure walk, and no way-dependency walk
-    // (every included way is a direct match).
+    check_route(Route::TWO_PASS, 4);
+    // No relation selected: no closure and no way-dependency phase, which
+    // open nothing anyway.
     check_route(
         Route {
             relations: false,
             ..Route::TWO_PASS
         },
-        5,
+        4,
     );
     // Forced on an input without indexdata: the probe still runs.
     check_route(
@@ -351,7 +345,7 @@ fn two_pass_reads_only_the_pinned_input() {
             unindexed: true,
             ..Route::TWO_PASS
         },
-        7,
+        4,
     );
 }
 
@@ -363,14 +357,14 @@ fn two_pass_without_the_probe_reads_only_the_pinned_input() {
             relations: false,
             ..Route::TWO_PASS
         },
-        5,
+        3,
     );
     check_route(
         Route {
             distrust: true,
             ..Route::TWO_PASS
         },
-        6,
+        3,
     );
     check_route(
         Route {
@@ -378,7 +372,7 @@ fn two_pass_without_the_probe_reads_only_the_pinned_input() {
             relations: false,
             ..Route::TWO_PASS
         },
-        4,
+        3,
     );
 }
 
@@ -413,7 +407,7 @@ fn direct_reads_follow_the_pinned_input() {
                 direct: true,
                 ..Route::TWO_PASS
             },
-            7,
+            4,
         ),
         (
             Route {

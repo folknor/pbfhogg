@@ -238,12 +238,10 @@ implementation under test.
 - **Layout.** Where a primary, a variant and a `snapshot.KEY` file live;
   snapshot key rules (`[a-zA-Z0-9_-]+`, `base` reserved).
 - **External tools.** Lookup of osmium, osmosis, osmconvert, curl.
-- **Building pbfhogg-cli** for verify: `cargo build --release --locked -p
-  pbfhogg-cli` from the invocation's build root (never verify's own
-  `CARGO_MANIFEST_DIR`), executable path read from cargo's JSON
-  `compiler-artifact` message, never `target/release/pbfhogg`. Built once,
-  before any capability probe, never rebuilt into the same path during a
-  run.
+- **No building.** Only brokkr builds. devkit never invokes cargo; a tool
+  that needs the pbfhogg binary is handed its path by the caller (see
+  verify), and checks it exists and is executable before any capability
+  probe. The path is never rebuilt or replaced during a run.
 - **Run lease and process control.** Each run gets an id that is never
   reused, a staging dir on the destination filesystem
   (`DATA/.tools-staging/RUNID`) and a work dir `SCRATCH/tools/RUNID`
@@ -309,10 +307,13 @@ verdict may rest on the code under test. It keeps its own header walker
   `--direct-io`, `-v`, and the OSC resolution with its primary-table
   fallback for encoding-only snapshots. `brokkr verify`'s nidhogg and
   elivagar subcommands stay in brokkr.
-- The binary under test: built by devkit with features from argv plus
-  the host section, or `--pbfhogg PATH` (from `brokkr build --commit REF
-  pbfhogg`, which replaces `--commit`). `--pbfhogg` is exclusive with
-  feature options: the artifact decides its features. Per-subcommand
+- The binary under test: always `--pbfhogg PATH`, required, from a brokkr
+  build (`brokkr build pbfhogg`, or `brokkr build --commit REF pbfhogg`,
+  which replaces `--commit`). verify has no feature options: the artifact
+  decides its features. `brokkr run` builds and runs one target only, so
+  today a run is two invocations, `brokkr build pbfhogg` then `brokkr run
+  pbfhogg-verify -- --pbfhogg PATH`; brokkr#150 asks for one invocation
+  that builds both and hands the runner the path. Per-subcommand
   capability probing of `--overwrite`, `--staging-dir`, `--tmp-dir` and
   `digest --form` is ported, so an old binary still verifies.
 - Reference cache: the full key (run id, tool identity with its `ldd`

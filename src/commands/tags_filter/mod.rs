@@ -302,10 +302,10 @@ pub(crate) fn tags_filter_to<'a>(
     // A malformed expression is refused before the input is touched.
     let expressions = parse_expressions(opts.expression_strs)?;
 
-    // Every pass opens the input again, each through its own open file
-    // description (the indexdata probe, the header reads, the schedule walks
-    // whose descriptors serve the worker pools, `-R`'s reader), and each is
-    // derived from this one pin, so a file renamed over the input mid-run
+    // The run opens the input several times, each through its own open file
+    // description (the indexdata probe, the header reads, the two-pass
+    // path's one schedule walk whose descriptor serves every worker pool,
+    // `-R`'s reader), and each is derived from this one pin, so a file renamed over the input mid-run
     // cannot be read partly from each: where `/proc/self/fd` reopens the pin
     // every open reaches the pinned file, otherwise on Unix a replaced input
     // fails the run (`PinnedInput` says what it does off Unix). Taken before
@@ -775,7 +775,15 @@ fn tags_filter_two_pass(
     // Workers own the full PrimitiveBlock lifecycle (pread → decompress →
     // PrimitiveBlock → tag match → send compact results). Consumer merges
     // matching IDs into the IdSet collections.
-    {
+    //
+    // Pass 1's header walk is the run's only one: it also keeps a catalog
+    // of every OsmData blob, from which the closure, way-dependency and
+    // pass-2 schedules are cut in memory. Separate walks were each cold at
+    // planet (pass 1's payload reads evict the headers, about 500 MB and
+    // 4.6 s per walk on bygg), so each later walk cost a full cold read.
+    // The walker is kept, unread, only so each filtered phase can still
+    // report unindexed blobs through it; its file serves every pool.
+    let (walker, input_file, catalog) = {
         // Refuse a file without a readable header before pass 1. (The output
         // header, and its warning about undeclared enrichment, is built
         // before pass 2.)
@@ -799,11 +807,20 @@ fn tags_filter_two_pass(
         let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
         let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
+        let mut catalog: Vec<CatalogEntry> = Vec::new();
         let mut blobs_skipped_by_tag: u64 = 0;
         while let Some(meta) = walker.next_header()? {
             if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
             }
+            let entry = crate::scan::classify::ScheduledBlob::from_meta(
+                &meta,
+                kind_claims(distrust_metadata),
+            )?;
+            catalog.push(CatalogEntry {
+                blob: entry,
+                kind: meta.index.as_ref().map(|i| i.kind),
+            });
             // Same predicate as `build_classify_schedule_blob_filtered`: only
             // a kind or bbox filter loses pruning on an unindexed blob.
             if expr_filter.as_ref().is_some_and(BlobFilter::uses_index) {
@@ -820,10 +837,7 @@ fn tags_filter_two_pass(
                 }
                 continue;
             }
-            schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
-                &meta,
-                kind_claims(distrust_metadata),
-            )?);
+            schedule.push(entry);
         }
         if blobs_skipped_by_tag > 0 {
             crate::host::diag!(
@@ -844,7 +858,6 @@ fn tags_filter_two_pass(
         );
 
         let shared_file = walker.input();
-        drop(walker);
 
         /// Per-blob classification result from a worker.
         struct ClassifyResult {
@@ -928,7 +941,12 @@ fn tags_filter_two_pass(
             },
             host,
         )?;
-    }
+        (walker, shared_file, catalog)
+    };
+    let mut walker = walker;
+    // The file is wholly indexed or wholly unindexed (the walk refused a
+    // partial one), so one unindexed entry means kind pruning cannot skip.
+    let has_unindexed = catalog.iter().any(|e| e.kind.is_none());
 
     host.invocation.marker("TAGSFILTER_PASS1_END");
 
@@ -937,10 +955,12 @@ fn tags_filter_two_pass(
     // - member relations recurse transitively (cycle-safe via set membership)
     host.invocation.marker("TAGSFILTER_CLOSURE_START");
     if has_included_relation {
+        if !distrust_metadata && has_unindexed {
+            walker.observe_filter_index(None);
+        }
         let closure = collect_relation_member_closure(
-            input,
-            direct_io,
-            distrust_metadata,
+            &input_file,
+            &kind_schedule(&catalog, crate::ElementKind::Relation, distrust_metadata),
             &mut included_relation_ids,
             &direct_way_ids,
             &mut member_way_ids,
@@ -961,10 +981,12 @@ fn tags_filter_two_pass(
     // whole argument.
     host.invocation.marker("TAGSFILTER_WAYDEPS_START");
     if !member_way_ids.is_empty() {
+        if !distrust_metadata && has_unindexed {
+            walker.observe_filter_index(None);
+        }
         collect_way_node_dependencies(
-            input,
-            direct_io,
-            distrust_metadata,
+            &input_file,
+            &kind_schedule(&catalog, crate::ElementKind::Way, distrust_metadata),
             &member_way_ids,
             &mut relation_dep_node_ids,
             jobs,
@@ -1010,47 +1032,35 @@ fn tags_filter_two_pass(
 
     host.invocation
         .marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
-    let _ = walker
-        .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
-
     let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
     let mut blobs_skipped: u64 = 0;
-    while let Some(meta) = walker.next_header()? {
-        if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
-            continue;
-        }
-
+    for entry in &catalog {
         // Type-only filter: skip blob types not needed (no tag index filtering
         // in pass 2 - elements can be included via relation closure without
         // having the matching tag key).
         //
-        // The `if let Some(idx) = meta.index.as_ref()` gate means a blob
+        // The `if let Some(kind) = entry.kind` gate means a blob
         // without indexdata falls through unskipped and decodes fully in
         // pass 2 when the whole file lacks indexdata (`--force`; a partially
-        // indexed file never gets here, the walks refuse it). That costs a
+        // indexed file never gets here, pass 1's walk refused it). That costs a
         // decode and nothing else: `filter_block_pass2` writes an element
         // only when its ID is in the set for its actual kind, so a blob of a
         // kind the filter would have skipped contributes nothing.
-        if blob_filter.as_ref().is_some_and(BlobFilter::uses_index) {
-            walker.observe_filter_index(meta.index.as_ref());
+        if entry.kind.is_none() && blob_filter.as_ref().is_some_and(BlobFilter::uses_index) {
+            walker.observe_filter_index(None);
         }
         if let Some(ref filter) = blob_filter
-            && let Some(idx) = meta.index.as_ref()
-            && !filter.wants_index(idx)
+            && let Some(kind) = entry.kind
+            && !filter.wants(kind)
         {
             blobs_skipped += 1;
             continue;
         }
 
-        schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
-            &meta,
-            kind_claims(distrust_metadata),
-        )?);
+        schedule.push(entry.blob);
     }
-    let input_file = walker.input();
     drop(walker);
+    drop(catalog);
     host.invocation.marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
 
     host.invocation
@@ -1175,17 +1185,14 @@ struct RelationClosureSummary {
 /// included relation -> include member nodes/ways/relations.
 /// Recursion terminates when no new relation IDs are discovered.
 ///
-/// `distrust_metadata` widens the schedule to every OsmData blob. See
-/// [`kind_schedule_filter`].
+/// `schedule` comes from [`kind_schedule`], which widens it to every OsmData
+/// blob under `--distrust-metadata`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn collect_relation_member_closure(
-    input: &PinnedInput,
-    // Not honoured yet: the schedule walk and the pool's payload reads both
-    // pread through the walker's buffered descriptor. Kept as the place the
-    // flag reaches once those reads honour it.
-    _direct_io: bool,
-    distrust_metadata: bool,
+    shared_file: &crate::read::input::InputFile,
+    // Reused across convergence iterations.
+    schedule: &[crate::scan::classify::ScheduledBlob],
     included_relation_ids: &mut IdSet,
     direct_way_ids: &IdSet,
     member_way_ids: &mut IdSet,
@@ -1194,14 +1201,6 @@ fn collect_relation_member_closure(
     host: &crate::host::Entered<'_>,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
-
-    // Build schedule once - reused across convergence iterations.
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        input,
-        kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
-        kind_claims(distrust_metadata),
-        host,
-    )?;
 
     struct ClosureResult {
         node_ids: Vec<i64>,
@@ -1231,8 +1230,8 @@ fn collect_relation_member_closure(
         // under the noise floor even over a few iterations.
         let mut results: Vec<ClosureResult> = Vec::new();
         crate::scan::classify::parallel_classify_accumulate(
-            &shared_file,
-            &schedule,
+            shared_file,
+            schedule,
             jobs,
             || ClosureResult {
                 node_ids: Vec::new(),
@@ -1291,7 +1290,21 @@ fn collect_relation_member_closure(
     Ok(summary)
 }
 
-/// The `build_classify_schedule` kind filter for a reference-expansion scan.
+/// One OsmData blob from pass 1's header walk: its schedule entry (with the
+/// kind claim `kind_claims` chose) and the kind its indexdata declares,
+/// `None` for an unindexed blob. Positions are not kept: each phase's
+/// schedule is cut from the catalog in file order and its pool numbers it
+/// from zero, while the entry keeps the blob's file ordinal and offsets.
+#[derive(Clone, Copy)]
+struct CatalogEntry {
+    blob: crate::scan::classify::ScheduledBlob,
+    kind: Option<crate::ElementKind>,
+}
+
+/// The schedule of a reference-expansion scan over blobs of `kind`, cut
+/// from the pass-1 catalog: the blobs claiming `kind` and every unindexed
+/// one (its kind is known only once decoded), or every blob under
+/// `--distrust-metadata`.
 ///
 /// A per-kind schedule selects blobs on the kind their *indexdata* declares,
 /// which is exactly the claim `--distrust-metadata` says it will not believe.
@@ -1304,39 +1317,33 @@ fn collect_relation_member_closure(
 /// every OsmData blob and the per-element `if let Element::Way(_)` /
 /// `Element::Relation(_)` match inside each scan does the kind selection from
 /// decoded data instead.
-fn kind_schedule_filter(
+fn kind_schedule(
+    catalog: &[CatalogEntry],
     kind: crate::ElementKind,
     distrust_metadata: bool,
-) -> Option<crate::ElementKind> {
-    if distrust_metadata { None } else { Some(kind) }
+) -> Vec<crate::scan::classify::ScheduledBlob> {
+    catalog
+        .iter()
+        .filter(|e| distrust_metadata || e.kind.is_none_or(|k| k == kind))
+        .map(|e| e.blob)
+        .collect()
 }
 
 /// Scan all way blobs and add the node refs of the closure's member ways
 /// (direct matches collected theirs in pass 1).
 ///
-/// `distrust_metadata` widens the schedule to every OsmData blob. See
-/// [`kind_schedule_filter`].
+/// `schedule` comes from [`kind_schedule`], which widens it to every OsmData
+/// blob under `--distrust-metadata`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn collect_way_node_dependencies(
-    input: &PinnedInput,
-    // Not honoured yet: the schedule walk and the pool's payload reads both
-    // pread through the walker's buffered descriptor. Kept as the place the
-    // flag reaches once those reads honour it.
-    _direct_io: bool,
-    distrust_metadata: bool,
+    shared_file: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     member_way_ids: &IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        input,
-        kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
-        kind_claims(distrust_metadata),
-        host,
-    )?;
-
     // Per-blob node-ref accumulation. Earlier this function used
     // `parallel_classify_accumulate` with a per-worker `IdSet`; at
     // planet's invert-match keep-rate (~99 % of ways included) each
@@ -1357,8 +1364,8 @@ fn collect_way_node_dependencies(
     // project does not chase (reference/performance/inspect.md, "inspect --nodes
     // reads through a projection").
     crate::scan::classify::parallel_classify_phase(
-        &shared_file,
-        &schedule,
+        shared_file,
+        schedule,
         jobs,
         || (),
         |block, _state| {

@@ -751,15 +751,6 @@ Known to work, no performance question open, but not in the results DB:
     is in reference/performance/classify.md, "Mutex<Receiver> blob dispatch
     is not a bottleneck".
 
-- [ ] **tags-filter walks the headers again for each later pass.** The
-  relation closure, the way dependencies and the pass-2 schedule each run
-  their own header walk where pass 1's walk could feed them all: repeated
-  work on a measured planet path, left alone when tags-filter adopted input
-  pinning (`0f64d8f4`) for a measured change of its own. Read altw sparse
-  P4 first (notes/altw.md, "four redundant header walks", built and
-  reverted twice): consolidating walks pays only where something evicts the headers
-  between them, and never sum per-phase walk durations.
-
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   instrumentation calls in per-command `probes` modules, then swap the
   backend from the current FIFO sink to `tracing` spans/events so

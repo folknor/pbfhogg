@@ -4009,6 +4009,24 @@ and its disk read from 26.1 to 6.5 GB; GEOCODE_PASS1_5_SCAN rises from
 8.9 to 11.1 s; peak RSS in Pass 2b falls from 13.7 to 12.8 GB. The way
 store is 7.2 GB of scratch (`geocode_way_store_bytes`).
 
+### Pass 1 reads only the relation blobs (bygg, 2026-11-10, `da55488a` against `4b08aa07`)
+
+Pass 1 read the whole input to reach the relation blobs, since the
+sequential reader's relation filter skips decode, not the read. It now
+decodes only the relation schedule from the header walk, in parallel.
+
+After a trim, `--iterations 1`, both arms `--commit`. Planet, order A B,
+B A: A 154 s (`6ddd7015`) and 153 s (`fc598497`), B 127 s (`e83f931b`)
+and 124 s (`4dc30ff2`), about 18 % faster. Against `fc598497`,
+GEOCODE_PASS1 goes from 28.3 s at 0.4 cores reading 87.5 GB to 0.37 s
+reading 85 MB; every other phase is within a few percent. Germany,
+same order: A 9.4 s (`fa053349`) and 8.8 s (`4e0f2e90`), B 6.9 s
+(`8c334b91`) and 6.9 s (`f162c983`). Germany gains more than its 0.58 s
+Pass 1: against `4e0f2e90`, GEOCODE_SCHEDULES also falls from 1,265 ms
+reading 2.6 GB to 31 ms, as the walk no longer runs after a full
+sequential read of the file. The germany index is byte-identical
+across the change, all 19 files by md5.
+
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
 
 | Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |

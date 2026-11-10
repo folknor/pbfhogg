@@ -61,7 +61,7 @@ const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output f
 /// replacing it is not.
 ///
 /// Takes the join handle, so a later `flush()` will not try to join twice; the
-/// error it recovered has already been returned to the caller by then.
+/// recovered error is retained for later writes and flushes.
 ///
 /// This ends the pipeline's useful life, so it records the writer thread's
 /// death for every later write (each then comes straight back here, without
@@ -70,13 +70,15 @@ const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output f
 /// Every caller holds proof the receiver is gone - an observed death notice
 /// or a failed send - and no permit of its own.
 fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
-    // The failure is consumed here, so a later `flush` can no longer see it.
     if let Some(completion) = &pipeline.completion {
         completion.fail();
     }
     pipeline.writer_gone.record();
     pipeline.wait_for_framing();
-    match pipeline.join_handle.take() {
+    if let Some(error) = &pipeline.recovered_error {
+        return error.clone();
+    }
+    let error = match pipeline.join_handle.take() {
         Some(handle) => match handle.join() {
             Ok(Err(e)) => e,
             Ok(Ok(())) => Error::internal(
@@ -84,10 +86,11 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
             ),
             Err(payload) => panic_error("writer thread", payload.as_ref()),
         },
-        // Already joined - flush() or an earlier send failure took the handle
-        // and surfaced whatever it found.
+        // Defensive fallback: recovered failures normally return above.
         None => Error::internal("writer thread terminated"),
-    }
+    };
+    pipeline.recovered_error = Some(error.clone());
+    error
 }
 
 fn flush_wrapped_writer<W: Write>(writer: &mut W, _metrics: &WriterMetrics) -> Result<()> {
@@ -436,6 +439,8 @@ pub struct PbfWriter<W: Write> {
     writer: Option<W>,
     compression: Compression,
     pipeline: Option<WritePipeline>,
+    /// A failed pipeline flush remains failed after its pipeline is consumed.
+    flush_error: Option<Error>,
     /// Final operation for the owned synchronous writer. Generic writers only
     /// flush; the path-owned sync constructor also synchronizes the file.
     finalize_writer: fn(&mut W, &WriterMetrics) -> Result<()>,
@@ -798,6 +803,7 @@ impl<W: Write> PbfWriter<W> {
             writer: None,
             compression,
             pipeline: Some(pipeline),
+            flush_error: None,
             finalize_writer: flush_wrapped_writer::<W>,
             #[cfg(test)]
             finished: false,
@@ -858,6 +864,7 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
+            flush_error: None,
             finalize_writer: flush_wrapped_writer::<W>,
             #[cfg(test)]
             finished: true,
@@ -1252,7 +1259,9 @@ impl<W: Write> PbfWriter<W> {
     /// (every pipelined constructor moves it into the writer thread), so
     /// there is nothing for a later write to fall back to. Any write after
     /// `flush` on a pipelined writer fails with "the pipelined writer owns
-    /// the output file". Calling `flush` twice is harmless.
+    /// the output file". Successful repeated flushes are harmless. A pipeline
+    /// failure remains an error on every later flush, including one already
+    /// reported by a write; its original cause is retained.
     ///
     /// After successful writes, `flush` checks completion and reports deferred
     /// errors. The public file-backed constructors (`to_path*`,
@@ -1267,7 +1276,11 @@ impl<W: Write> PbfWriter<W> {
     #[hotpath::measure]
     pub fn flush(&mut self) -> Result<()> {
         let _call = self.cancel.call();
+        let pipelined = self.pipeline.is_some();
         let result = self.flush_inner();
+        if pipelined {
+            self.flush_error = result.as_ref().err().cloned();
+        }
         if let Some(completion) = &self.completion {
             if result.is_ok() {
                 completion.finish();
@@ -1285,6 +1298,9 @@ impl<W: Write> PbfWriter<W> {
 
     fn flush_inner(&mut self) -> Result<()> {
         self.mark_finished();
+        if let Some(error) = &self.flush_error {
+            return Err(error.clone());
+        }
         let t_flush = crate::counters::Stopwatch::start();
         if let Some(mut pipeline) = self.pipeline.take() {
             // State the final item count BEFORE dropping the sender, so the
@@ -1299,6 +1315,9 @@ impl<W: Write> PbfWriter<W> {
             pipeline.wait_for_framing();
             // Drop sender to signal the writer thread that no more items are coming.
             drop(pipeline.tx);
+            if let Some(error) = pipeline.recovered_error.take() {
+                return Err(error);
+            }
             if let Some(handle) = pipeline.join_handle.take() {
                 handle
                     .join()
@@ -1674,7 +1693,24 @@ mod tests {
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
         );
-        w.flush().unwrap();
+        let repeated = w.write_raw(b"again").expect_err("writer remains failed");
+        assert!(is_storage_full(&repeated));
+        assert_eq!(repeated.to_string(), err.to_string());
+        for _ in 0..2 {
+            let flushed = w.flush().expect_err("failure must remain sticky");
+            assert!(is_storage_full(&flushed));
+            assert_eq!(flushed.to_string(), err.to_string());
+        }
+    }
+
+    #[test]
+    fn a_failed_pipeline_flush_retains_its_original_error() {
+        let mut w = writer_with_dead_thread(Err(storage_full("flush: no space left on device")));
+        let first = w.flush().expect_err("thread failed");
+        let second = w.flush().expect_err("failure must remain sticky");
+        assert!(is_storage_full(&first));
+        assert!(is_storage_full(&second));
+        assert_eq!(second.to_string(), first.to_string());
     }
 
     /// A writer thread that exited cleanly mid-stream is still a short file.
@@ -1686,7 +1722,8 @@ mod tests {
             err.to_string().contains("output is incomplete"),
             "got: {err}"
         );
-        w.flush().unwrap();
+        assert!(w.flush().is_err());
+        assert!(w.flush().is_err());
     }
 
     /// Writing after `flush` must be an error, not a panic.
@@ -1748,7 +1785,8 @@ mod tests {
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
         );
-        w.flush().unwrap();
+        assert!(w.flush().is_err());
+        assert!(w.flush().is_err());
     }
 
     /// The sync (non-pipelined) path must refuse an oversize blob body too.
@@ -1939,7 +1977,8 @@ mod tests {
             err.is_some_and(|e| e.to_string().contains("owned variant")),
             "write_primitive_block_owned must surface the writer thread's error"
         );
-        w.flush().unwrap();
+        assert!(w.flush().is_err());
+        assert!(w.flush().is_err());
 
         let mut w = writer_with_dead_thread(Err(storage_full(
             "no-indexdata variant: no space left on device",
@@ -1956,7 +1995,8 @@ mod tests {
             err.is_some_and(|e| e.to_string().contains("no-indexdata variant")),
             "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
-        w.flush().unwrap();
+        assert!(w.flush().is_err());
+        assert!(w.flush().is_err());
     }
 
     /// Cover the other framing entry points and the raw-send permit path on

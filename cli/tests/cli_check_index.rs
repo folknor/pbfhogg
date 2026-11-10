@@ -177,6 +177,71 @@ fn a_file_that_makes_no_claims_passes() {
     );
 }
 
+/// Coverage is a file-level contract even when the missing index could not
+/// describe the payload. Exercise both orders and an interior gap, with a
+/// wholly unindexed counterpart for each shape.
+#[test]
+fn unindexable_blobs_without_indexdata_violate_partial_coverage() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("coverage.osm.pbf");
+    let mut nodes = generate_nodes(6, 1);
+    for node in &mut nodes {
+        node.tags.clear();
+    }
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 2);
+    let stripped = degrade_with(dir.path(), &input, "--strip-tagdata", "no-tags.osm.pbf");
+    let pbf = std::fs::read(&stripped).expect("read fixture");
+    assert_eq!(crate::common::adversarial::locate_blobs(&pbf).len(), 4);
+
+    // An empty PrimitiveBlock with the required string table and no groups.
+    let empty = vec![0x0a, 0x02, 0x0a, 0x00];
+    for payload in [empty, mixed_kind_block()] {
+        for blob in 1..=3 {
+            let rewritten = crate::common::adversarial::mutate_blob_payload(&pbf, blob, |bytes| {
+                *bytes = payload.clone();
+            });
+            let partial = crate::common::adversarial::mutate_blob_header_indexdata(
+                &rewritten,
+                blob,
+                Vec::clear,
+            );
+            let offset = crate::common::adversarial::locate_blobs(&partial)[blob].frame_start;
+            std::fs::write(&input, &partial).expect("write partial fixture");
+            let out = CliInvoker::new()
+                .args(["check", "--index", "--json"])
+                .arg(&input)
+                .run();
+            assert_eq!(
+                out.status.code(),
+                Some(EXIT_ANSWER_NEGATIVE),
+                "{}",
+                out.stderr_str()
+            );
+            let json: serde_json::Value = serde_json::from_str(&out.stdout_str()).expect("JSON");
+            let report = &json["index"];
+            assert_eq!(report["blobs_unindexable"], 1);
+            assert_eq!(report["total_violations"], 1);
+            let violations = report["violations"].as_array().expect("violations");
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0]["blob"], blob - 1);
+            assert_eq!(violations[0]["offset"], offset);
+            assert!(
+                violations[0]["detail"]
+                    .as_str()
+                    .expect("detail")
+                    .contains("partially indexed")
+            );
+
+            let unindexed = (1..=3).fold(partial, |bytes, at| {
+                crate::common::adversarial::mutate_blob_header_indexdata(&bytes, at, Vec::clear)
+            });
+            std::fs::write(&input, unindexed).expect("write unindexed fixture");
+            let out = check_index(&input);
+            assert!(out.status.success(), "{}", out.stdout_str());
+        }
+    }
+}
+
 /// Presence counts include malformed claims, and file coverage stays visible
 /// even when per-blob findings have already filled the report cap.
 #[test]
@@ -186,7 +251,7 @@ fn partial_index_remains_visible_under_a_cap_and_counts_unreadable_claims() {
     write_fixture(&input);
     let pbf = std::fs::read(&input).expect("read fixture");
     let malformed = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |index| {
-        *index = vec![255]
+        *index = vec![255];
     });
     let partial =
         crate::common::adversarial::mutate_blob_header_indexdata(&malformed, 2, Vec::clear);

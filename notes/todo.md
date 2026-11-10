@@ -34,12 +34,6 @@ The README's three tables come from the campaign at `53360af4`
   applied should be `differs`: denmark 4705, planet 4913, and so on). The
   `test-unsorted` snapshot is the same file as `unsorted` and has no
   `check-ids = "violations"` of its own.
-- [ ] **check --index coverage of unindexable blobs.** `unindexed_candidate`
-  needs an observable kind, so an empty or mixed-kind unindexed blob among
-  indexed ones passes `check --index` while the consumers' guard in
-  `src/read/frame.rs` refuses the same file. docs/guide/indexdata.md now
-  states the exception; decide whether coverage should instead be
-  independent of indexability.
 - [ ] **README Tokyo extract line.** vs-osmium has an `extract` row now
   (dataset bbox, complete-ways on both sides); measure it on japan to
   bring the README line back.
@@ -420,14 +414,12 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **`diff -v` keyed tag lines are not bounded in count.**
-  `VERBOSE_SEQUENCE_DIFF_MAX_EDITS` caps the positioned scripts (refs,
-  members, duplicate-key tags) but its doc says keyed unique-key tag lines
-  are not counted, so an element with thousands of changed unique keys
-  prints thousands of `-"k"="v"` / `+` / `~` lines. Values are printed whole
-  by contract (the -v paragraph in the CLI reference: complete literals, never
-  truncated); whether the line count should get a cap and an omission line
-  is an open contract choice. Found 2026-10-28 while settling -v escaping.
+- [x] **`diff -v` keyed tag line count bounded (2026-11-10).** The same
+  1000-line cap as positioned scripts now counts keyed removals, additions,
+  value changes and the order-change line. Above it, the entire tag detail
+  becomes `tags: N -> M (details omitted)`. This bounds output without
+  truncating literals or presenting a partial keyed diff as complete; the
+  -v contract in the CLI reference records the distinction from range summaries.
 
 - [ ] **`VERBOSE_SEQUENCE_DIFF_MAX_WORK` is unmeasured.** Its doc in
   `src/tunables.rs` says "sized so one call stays in the low milliseconds;
@@ -470,66 +462,59 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Core infrastructure and CLI
 
-- [ ] **Replacing a directory output the caller cannot write fails at the
-  move into its backup, and nothing says so up front.** The move renames
-  the old directory into the backup container, a new parent, and Linux
-  then requires write permission on the moved directory itself
-  (`vfs_rename`, `MAY_WRITE` on a directory source whose parent changes).
-  So an unprivileged `build-geocode-index --overwrite` over a read-only
-  index (mode 0555, say) passes construction and fails at publication with
-  "cannot move existing output ... aside"; nothing is lost (the empty
-  container is removed) but the work is. True for every `Staging`
-  placement, not introduced by `Staging::DirWithBackups`. Decide whether
-  construction should check it and refuse before any work, and document
-  it in `docs/cli/commands.md`. Found 2026-10-29 by the backup-placement
-  item's spar.
+- [x] **Refuse a non-writable directory output before replacement work.**
+  On Linux, shared destination inspection checks effective write/search
+  access to an existing directory at construction and again at publication,
+  before moving it into a backup container changes its parent. This respects
+  ACLs and privileges and covers every staging placement. Permission changes
+  after a check can still fail publication safely. Covered by output tests
+  for early refusal, permission changes and cleanup; documented in the
+  output contract in `docs/cli/commands.md`.
 
-- [ ] **A standalone pipelined `PbfWriter` flushes `Ok` after a write
-  already returned its writer thread's error.** `pipeline_send_error`
-  takes the join handle, so a later `flush` finds no thread to join and
-  returns `Ok(())` for the `to_path*` family (tests pin it with
-  `w.flush().unwrap()`); only a writer filling an `Output` stays failed,
-  through its `Completion`. Later writes are refused since the framing
-  barrier landed (2026-10-29), but a caller that ignores one write error
-  and trusts `flush` is told the file is good. Decide whether a recovered
-  failure should make `flush` fail too. Found 2026-10-29 by the framing
-  barrier item's scout.
+- [x] **Keep recovered pipelined `PbfWriter` failures sticky.** Retain the
+  original writer-thread error after a failed write, and return it from
+  later writes and flushes. Failed pipeline flushes also remain failed on
+  repeat calls; successful repeated flushes remain harmless. This keeps a
+  standalone writer from certifying an incomplete file after its caller
+  ignored a write error, matching the failure semantics of a writer filling
+  an `Output`. Updated the unit and framing-barrier fault tests that pinned
+  the old behavior. Resolved 2026-11-10.
 
-- [ ] **JSON output and the human text quoting escape different sets.** The
+- [x] **JSON output and the human text quoting escape different sets.** The
   human text (`diff -v`, `inspect --show`, the inspect report, `inspect
   tags`) goes through `text_quote::Quoted`, which also escapes C1 controls,
   DEL, U+2028/U+2029 and the bidi controls; `inspect --json` and export go
   through serde_json, which escapes only quote, backslash and C0 and leaves
-  the rest literal (valid JSON, not terminal-safe). Both are correct for
-  their consumer; open question is whether JSON printed to a terminal
-  should match. Also: `inspect --get` prints raw values by design, so a
+  the rest literal (valid JSON, not terminal-safe). Keep this difference,
+  including on a terminal: JSON is a data format whose bytes should not
+  depend on whether stdout is displayed, piped or saved. Consumers displaying
+  JSON must escape display controls themselves. Documented this policy and
+  the literal controls in docs/cli/commands.md and the serialization code;
+  no output behavior changed. Also: `inspect --get` prints raw values by design, so a
   newline in a header string makes a multi-line answer (documented; use
-  `--json`). Found 2026-10-28 while quoting inspect text.
+  `--json`). Found 2026-10-28 while quoting inspect text. Resolved 2026-11-10.
 
-- [ ] **`inspect --blocks` / `--anomalies` and `--locations` still hold
-  per-blob and per-way lists.** The ordering sequence is bounded now (a
-  64-segment head plus a count), but `--blocks`/`--anomalies` keep a
-  `BlockInfo` per data blob (`BlockAccum.block_infos`), and the JSON path
-  re-collects them into a `Vec` of `Value`s even when `--blocks N` asks for
-  only the first and last N. `--locations` keeps one `u32` per located way
-  (`LocationStats.coord_counts`) and
-  `locations_json` clones and sorts it for the percentiles, so twice that.
-  Both are opt-in and not on brokkr verify's path. Fix shape: a first-N /
-  last-N ring for the block listing with streaming per-kind stats (the
-  anomaly medians need a decision: exact medians need the values, an
-  approximate sketch does not), and a histogram over coord counts for the
-  `--locations` percentiles (coord counts per way are capped by the way
-  node limit, so an exact histogram is small). Found 2026-10-28 bounding
-  the ordering sequence.
+- [ ] **`inspect --blocks` / `--anomalies` retain per-blob records.**
+  Location counts now use an exact sparse histogram, merged across decode
+  workers; text and JSON share percentile selection without cloning or
+  sorting one value per located way. JSON block listing now selects directly
+  from the records without an intermediate reference list, and constructs
+  Values only for the selected first/last N records.
+  Retain `BlockAccum.block_infos` for now: the scan API takes `show_blocks`,
+  while the limit and anomaly filter arrive only when rendering the reusable
+  report. A first/last ring would discard data needed by later render calls,
+  exact per-kind distributions and median-based anomaly selection. Bounding
+  this needs a scan-time retention contract and an explicit decision about
+  exact distributions and anomaly output, rather than a local ring swap.
+  Both listings remain opt-in. Reviewed 2026-11-10.
 
-- [ ] **A decoded data blob with no elements is classified mixed.**
-  `classify_block(false, false, false)` returns `BlockKind::Mixed`, so under
-  `--distrust-metadata` / `--extended` / `--locations` an empty data blob
-  makes `ordering.standard` and `data.objects_ordered` false and counts as
-  a mixed block, while the index-only path reports the blob's declared kind.
-  Whether an empty blob should be neutral to ordering (skipped) or flagged
-  as its own anomaly is undecided; "mixed" is the wrong word for it either
-  way. Found 2026-10-28 bounding the ordering sequence.
+- [x] **A decoded data blob with no elements is classified mixed.**
+  Fixed 2026-11-10: decoded empty blobs have their own `empty` kind, stats,
+  listing label and anomaly reason. They count as data blobs and retain
+  byte sizes, but contribute no ordering segment and do not change element
+  ordering. This describes the absence of elements without inventing a type
+  transition. The index-only path still reports declared kinds, as it does
+  for other unverified index claims; decoding reports measured contents.
 
 - [ ] **`cli/src/lib.rs` argument splatting is partially cleaned up.** Round 4
   introduced `WriteOpts` and per-command flag structs for `getid`,
@@ -541,24 +526,24 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   (the attributes themselves are the list). Low urgency; folds into the lint
   exemptions item above.
 
-- [ ] **The promise guard has two blind spots.** Every CLI test runs
-  `pbfhogg` under the seccomp promise guard (`cli/tests/guard.rs`), which
-  enforces the no-helper-process and inherited-descriptor promise of
-  docs/cli/commands.md "Names pbfhogg leaves behind" for the whole
-  run. It cannot see: (1) io_uring submissions - an `IORING_OP_CLOSE` (or
-  similar) on the inherited descriptor is no syscall the filter checks; the
-  `--io-uring` writer is the only ring and never touches an inherited
-  descriptor, and only the brokkr text lints (`brokkr.d/lints.toml`) guard
-  that. (2) a
-  process-creating `clone3` caller that ignores the `ENOSYS` the guard
-  returns and carries on (glibc and musl fall back to `clone`, which the
-  guard kills; a raw caller need not). Closing (1) would need a
-  ring-op allowlist (`IORING_REGISTER_RESTRICTIONS`) or a guard that bans
-  `io_uring_setup` on runs without `--io-uring`. (hotpath builds, which the
-  guard never runs, are covered by the `no-hotpath-cpu` script check on the
-  resolved graph; its residue is that it certifies the checked resolution
-  only, trusting Cargo's source configuration, and not a build passing
-  `hotpath/hotpath-cpu` on the command line.)
+- [ ] **The promise guard's remaining blind spots.** `cli/tests/guard.rs`
+  now kills `io_uring_setup` unless the child arguments explicitly contain
+  `--io-uring` before `--`, closing the ring-submission gap for ordinary
+  runs. Control probes check both the ban and the exception without needing
+  host ring support. Explicit `--io-uring` runs still cannot be checked for
+  submissions such as `IORING_OP_CLOSE` on the inherited lease; the brokkr
+  text lints remain the tripwire. A ring-op allowlist would need cooperation
+  from the ring creator (`IORING_REGISTER_RESTRICTIONS`), outside this
+  test-only change's scope. Keep `clone3` returning `ENOSYS`: killing it
+  would also kill glibc's legitimate thread creation, and seccomp cannot
+  inspect the flags in memory. A raw process-creating caller can ignore
+  `ENOSYS` and continue, but cannot create a process; a surviving control
+  probe now records that distinction. The guard proves no process creation
+  succeeded, not that none was attempted. These residual limits stay open.
+  Hotpath builds, which the guard never runs, are covered by the
+  `no-hotpath-cpu` script check on the resolved graph; it certifies the
+  checked resolution only, trusting Cargo's source configuration, not a
+  build passing `hotpath/hotpath-cpu` on the command line.
 
 - [ ] **The O_DIRECT path constructors' non-regular-target check is not
   race-free.** `direct_io::create_for_write` (behind
@@ -576,16 +561,19 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   destination; `Output` stages a fresh file) when this landed; recorded so
   the boundary is a decision, not an oversight.
 
-- [ ] **Uncited performance figures on the site.** `docs/guide/performance.md`
-  (the N. America apply-changes table, the Japan osmium sentence, the blob
-  share and RSS claims) and `docs/guide/indexdata.md` (the blob share and
-  size-overhead claims) carry numbers with no commit or host, against the
-  AGENTS.md convention. The four guide pages that were added to the sidebar
-  had theirs replaced by a pointer to the Performance page; these two pages
-  still need each figure either sourced from `.brokkr/results.db` /
-  `reference/performance.md` with commit and host, or dropped. The same
-  holds for inspect's index-only timing in the CLI reference
-  `docs/cli/commands.md` and the apply-changes sentence of `cli/README.md`.
+- [ ] **Uncited performance figures on the site.** Still open for
+  `docs/guide/indexdata.md` (blob-share and size-overhead claims), owned by
+  another agent and left untouched here. Each figure needs a source in
+  `.brokkr/results.db` / `reference/performance.md` with commit and host,
+  or removal. On 2026-11-10, removed the unsupported apply-changes scale
+  table, Japan osmium comparison, blob-share and RSS claims, and io_uring
+  timing advice from `docs/guide/performance.md`; replaced its unpinned
+  extract comparison with the Japan row at `cadc3e6` on plantasjen from
+  `reference/performance.md`. Replaced inspect's index-only timing in
+  `docs/cli/commands.md` with the reference's `53360af4` / bygg measurement,
+  and replaced the apply-changes scale figures in `cli/README.md` with a
+  pointer to the recorded measurements.
+
 - [ ] **Old site fragments into the correctness and deviations pages land on
   a pointer.** Those two site pages became pointers to the root
   `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such
@@ -610,18 +598,20 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Read path
 
-- [ ] **The CLI's `cat` never evicts its inputs, though the CLI runs on
-  `PageCachePolicy::Evict`.** Found 2026-10-30: cat walks raw
-  frames (`FileReader` through `Frames::of_input`), which has no eviction
-  hook, so `Host::page_cache` does not reach it; `fadvise_input_evictions`
-  stays 0 for a cat on either policy. Other raw-frame and pread walkers
-  (getid's schedule walk, degrade, `check` index, cat reindex, the
-  pread-from-workers passes of tags-filter and others) are likely the same,
-  unaudited. Undecided whether a passthrough cat should evict at all (it
-  is the fastest planet path and buffered prefetch helps it); either way
-  the `Host::page_cache` wording in docs/guide/advanced.md now says cat
-  does not evict; the other walkers are not yet named there. Decide,
-  then make the code or the wording true.
+- [x] **Audit input eviction beyond `BlobReader`.** Audited 2026-11-10:
+  only host-bound blob/element readers honour `Host::page_cache`; their
+  sequential/pipelined passes evict under `Evict`. Keep the other walkers
+  non-evicting: raw `Frames` (cat passthrough/type filtering, cat reindex,
+  degrade, check index, getid's sequential path) preserve buffered readahead
+  without adding unmeasured eviction overhead; input-front probes retain
+  bytes for the following pass; `HeaderWalker` and inline body reads retain
+  headers/bodies for reuse; scheduled positional workers, classify pools
+  (including cat clean), and range-copy/splice routes have no shared safe
+  consumed prefix across out-of-order reads and later passes. These are
+  deliberate reader-level exceptions, now listed with their users and
+  rationale in docs/guide/advanced.md. `Keep` suppresses all input eviction
+  advice; `Evict` is not a command-wide promise. No eviction behavior or
+  BlobReader range changed; the range measurement item below stays open.
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
   The API half is closed - eviction is opt-in on the public readers

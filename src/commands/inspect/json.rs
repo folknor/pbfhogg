@@ -1,5 +1,9 @@
 //! JSON serialization of `InspectReport`. Gated on the `commands` feature to
 //! avoid pulling in `serde_json` for library-only consumers.
+//!
+//! Keep strings as data for serde_json, without pre-escaping display controls.
+//! JSON output uses the same escaping regardless of its destination; see
+//! `text_quote` for the stronger escaping used by human-readable output.
 
 #![cfg(feature = "commands")]
 

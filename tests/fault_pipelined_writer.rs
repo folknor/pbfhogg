@@ -170,7 +170,11 @@ fn end_writer<W: Write>(
                 at.dispatched,
                 "a refused write must not dispatch a framing job"
             );
-            drop(writer.flush());
+            assert!(
+                writer.flush().is_err(),
+                "recovered failure must stay failed"
+            );
+            assert!(writer.flush().is_err(), "repeated flush must stay failed");
             (Some(err), at)
         }
     }

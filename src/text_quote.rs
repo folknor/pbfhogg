@@ -2,7 +2,11 @@
 //! member roles, user names, header strings, file names) in human-readable
 //! CLI output: `diff -v`, `inspect --show`, the `inspect` report and
 //! `inspect tags`. Machine output (`--json`, export) goes through serde_json
-//! instead, and `inspect --get` prints the raw value.
+//! instead, even when stdout is a terminal: its bytes do not depend on the
+//! destination. JSON permits literal DEL, C1, Unicode line separators and
+//! bidi controls, so raw JSON is not a terminal-safe display of untrusted
+//! strings. Consumers that display it must apply their own display escaping.
+//! `inspect --get` prints the raw value.
 
 use crate::{MemberId, MemberType};
 

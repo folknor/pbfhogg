@@ -166,8 +166,8 @@ pub enum IndexViolationKind {
     /// The stored tag index lists keys the blob does not carry. Sound but
     /// false: it costs a decode that the index existed to avoid.
     TagKeysSpurious { spurious: usize, example: String },
-    /// Some data blobs carry indexdata and this one, which could carry it,
-    /// does not. Consumers that read indexdata from the first blob alone take
+    /// Some data blobs carry readable indexdata and this one has none,
+    /// regardless of payload indexability. Consumers probing the first blob take
     /// the file as indexed and then fail or misbehave at this blob. A wholly
     /// unindexed file is not this.
     MissingAmongIndexed,
@@ -521,8 +521,8 @@ struct BlobVerdict {
     tagdata_present: bool,
     /// The payload is one no index can describe.
     unindexable: bool,
-    /// The payload is indexable and the header carries no indexdata field at
-    /// all (present but unreadable indexdata is its own finding instead).
+    /// The header carries no indexdata, regardless of payload indexability.
+    /// Present but unreadable indexdata is its own finding instead.
     unindexed_candidate: bool,
     /// Index findings first, then tag findings, as they are reported.
     found: Vec<IndexViolationKind>,
@@ -572,7 +572,7 @@ fn verify_blob(ordinal: u64, frame: &RawBlobFrame, block: &mut Vec<u8>) -> Resul
         index_present: frame.index_present,
         tagdata_present: frame.tagdata_present,
         unindexable: observed.is_none(),
-        unindexed_candidate: observed.is_some() && !frame.index_present,
+        unindexed_candidate: !frame.index_present,
         found,
     })
 }
@@ -609,7 +609,7 @@ fn check_index_inner(
     // indexed file: reporting it, as a violation, is part of its job.
     frames.accept_partial_index();
     let mut report = IndexReport::default();
-    // The first indexable blob with no indexdata, for the partial-index verdict.
+    // The first data blob with no indexdata, for the partial-index verdict.
     let mut first_unindexed: Option<(u64, u64)> = None;
     let mut has_readable_index = false;
 

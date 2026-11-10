@@ -32,10 +32,10 @@ pub mod verify_ids;
 /// nothing over the mixture (the command input contract, ruled 2026-10-26,
 /// stands), but `check` answers "is this file right?", and a file the
 /// commands refuse is a definite negative answer. It is a policy verdict,
-/// not a proof that a claim is false: the walks see headers only, so a blob
-/// no index can describe (empty, or mixed kinds) carrying no indexdata among
-/// indexed ones stops them while `check --index`, which decodes it and
-/// exempts it, passes the file. Stopping instead of refusing is what lets
+/// not a proof that a claim is false: even a blob no index can describe
+/// (empty, or mixed kinds) must not lack indexdata among indexed ones.
+/// `check --index` reports that mixture as a coverage violation.
+/// Stopping instead of refusing is what lets
 /// the other selected checks, `--index` included, still run and report.
 #[derive(Debug)]
 pub enum CheckOutcome<R> {

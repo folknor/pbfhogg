@@ -2551,12 +2551,10 @@ fn check_reports_the_index_beside_a_check_a_partial_file_stops() {
     }
 }
 
-/// The policy divergence a partial stop carries: the walks see headers
-/// only, so an empty data blob without indexdata among indexed ones stops
-/// `--ids`, while `--index`, which decodes it and finds nothing to index,
-/// passes the file. The run exits 1 on the stop alone.
+/// An empty data blob without indexdata among indexed ones stops `--ids`
+/// and fails `--index` coverage, even though no index can describe its payload.
 #[test]
-fn an_unindexable_blob_among_indexed_ones_stops_ids_while_index_passes() {
+fn an_unindexable_blob_among_indexed_ones_stops_ids_and_fails_index() {
     let dir = crate::common::test_scratch();
     let indexed = dir.path().join("indexed.osm.pbf");
     crate::common::write_test_pbf_sorted(&indexed, &crate::common::generate_nodes(5, 1), &[], &[]);
@@ -2585,7 +2583,7 @@ fn an_unindexable_blob_among_indexed_ones_stops_ids_while_index_passes() {
         .words(&["--ids", "--index", "--json"]));
     assert_eq!(out.status.code(), Some(1), "stdout:\n{}", out.stdout_str());
     let value: serde_json::Value = serde_json::from_str(&out.stdout_str()).expect("valid JSON");
-    assert_eq!(value["index"]["passed"], serde_json::Value::Bool(true));
+    assert_eq!(value["index"]["passed"], serde_json::Value::Bool(false));
     assert_eq!(value["ids"]["passed"], serde_json::Value::Bool(false));
     assert!(value["ids"]["partially_indexed"].is_object(), "{value}");
 }

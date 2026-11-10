@@ -356,13 +356,14 @@ pub(super) struct WritePipeline {
     pub(super) expected: SeqTotal,
     /// Death notice from the framing closures; see [`WriterGone`].
     pub(super) writer_gone: WriterGone,
+    /// The original failure recovered by a producer after the thread exited.
+    pub(super) recovered_error: Option<Error>,
     /// Where the framing closures run, and whether the producer is on one of
     /// its workers (see [`recv_permit`]).
     pub(super) executor: crate::host::Executor,
     /// The output's writing session, when this writer is driven by an
     /// [`Output`](crate::Output). A failure recovered from the writer thread
-    /// poisons it, so the later `flush` (which finds no thread left to join
-    /// and would otherwise succeed) cannot certify the output.
+    /// poisons it immediately, before the caller can publish the output.
     pub(super) completion: Option<crate::output::Completion>,
     /// The invocation whose writer counters the producer side records into.
     pub(super) invocation: crate::host::Permit,
@@ -389,6 +390,7 @@ impl WritePipeline {
             window_rx,
             expected,
             writer_gone: WriterGone::new(),
+            recovered_error: None,
             executor,
             completion: None,
             invocation,

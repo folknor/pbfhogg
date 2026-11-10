@@ -186,6 +186,6 @@ The answer comes from the first data blob only, the same probe the commands
 above use: a file whose first data blob carries indexdata reports indexed even
 if later blobs do not, and a file with no data blobs reports indexed (no blob
 lacks indexdata). `check --index` reports a partially indexed file as a
-violation when a blob with readable indexdata and an indexable blob with no
-indexdata are both present. Empty or mixed-kind unindexed blobs do not trigger
-that coverage finding, although consumers refuse them among indexed blobs.
+violation when a blob with readable indexdata and a data blob with no
+indexdata are both present, regardless of whether the unindexed blob is
+empty, mixed-kind or indexable.

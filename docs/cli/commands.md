@@ -763,6 +763,15 @@ newline spans lines; use `--json` to read such a value losslessly. The file
 name is the path's last component as UTF-8, with invalid bytes replaced, in
 every form.
 
+`inspect --json` and `export` use serde_json's JSON escaping for every
+destination, including a terminal. Quotes, backslashes and C0 controls are
+escaped; DEL, C1 controls, U+2028/U+2029 and Unicode bidi controls remain
+literal. This deliberately differs from human text quoting: the data format
+has the same bytes whether displayed, piped or saved, and JSON readers
+recover the original strings. Raw JSON is therefore not a terminal-safe
+display of untrusted strings; use a viewer that escapes display controls
+when reading it interactively.
+
 #### inspect tags
 
 Count tag keys, or key=value pairs for expressions with `=` (subcommand of

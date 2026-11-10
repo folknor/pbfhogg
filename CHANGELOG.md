@@ -10,6 +10,12 @@
 - `inspect` reports a decoded data blob with no elements as `empty`, with
   its own stats and anomaly reason, instead of counting it as mixed; it no
   longer makes the file read as unordered.
+- `check --index` reports an empty or mixed-kind unindexed blob among
+  indexed ones as a coverage violation, matching the commands that refuse
+  such a file; it used to pass.
+- A pipelined `PbfWriter` whose writer thread failed keeps failing: a later
+  `flush` returns the original error instead of `Ok`, so it no longer
+  certifies an incomplete output.
 
 ## 0.6.0 - 2026-11-09
 

@@ -6,6 +6,9 @@ pub(super) use crate::read::claims::MetaClaims;
 use super::ExportOptions;
 
 fn push_json_string(buf: &mut String, value: &str) -> crate::Result<()> {
+    // Use serde_json's data encoding for every destination, including a
+    // terminal. Literal Unicode display controls are permitted in JSON;
+    // display escaping belongs to the consumer, not the property value.
     let encoded = serde_json::to_string(value)
         .map_err(|error| crate::Error::internal_with("failed to encode a JSON string", error))?;
     buf.push_str(&encoded);

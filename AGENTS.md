@@ -40,8 +40,10 @@ Params and supported modes are declared in `brokkr.d/benches.toml` and each
 script's header. Boolean params take `yes` or `no`, for example
 `--direct-io yes` or `--io-uring yes` where supported. Marker stops are a
 script param: `--stop RENUMBER_EXT_STAGE2D_END`, `--stop -RENUMBER_EXT_STAGE2D`
-and `--stop RENUMBER_EXT_STAGE2D` resolve to the same end marker. Stopped
-outputs are incomplete; consult the bench help for stop support.
+and `--stop RENUMBER_EXT_STAGE2D` resolve to the same end marker. Use
+`--stop =MARKER` for an exact point marker name (or any exact marker name),
+without appending `_END`; brokkr matches the resolved name verbatim with no
+fallback. Stopped outputs are incomplete; consult the bench help for stop support.
 
 Runs are stored even for dirty trees, marked dirty and excluded from
 comparisons. There is no runner `--force` option. Markdown and config edits

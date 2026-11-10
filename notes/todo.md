@@ -11,23 +11,6 @@ The README's three tables come from the campaign at `53360af4`
   (`be808f35`) took 42.4 s. The CLI arm's interval is 13 s or more behind
   a plain cat, and the library arm swings 12 s between iterations.
   Unexplained.
-- [ ] **Script benches with no clean cell since their engines moved**
-  (`--iterations 1`, three invocations per condition; dry-run first with
-  `brokkr bench --dry-run NAME ...`, the flag before the bench name;
-  dedupe-self, dedupe-pair, vs-osmium and diff-text are v2 since
-  brokkr#134, so compare on child walls):
-  - dedupe-pair `--with one-relation`, cold x3, warm x2: `6fdde3f4` is
-    the dirty variant measured at `bd2408d5`.
-  - dedupe-self, denmark and `--dataset japan`, cold and warm x3, plus one
-    `--cache warm --check yes`: `5432aac7` and `6fdde3f4` changed the
-    engine.
-  - sort-cold `--dataset europe --force yes` x3 after a trim, plus typed
-    `brokkr sort --dataset europe --bench 1` x2: `5432aac7` was only ever
-    an uncommitted variant.
-  - diff-unindexed `--new 20260420`, all and `--type way`, x3:
-    `b58e8ef3` is on its read path.
-  - diff-text denmark `--new 320k` x3, and germany `--new 20260420
-    --verbose yes --common no` x3: `3286a9c5` landed with no clean cell.
 - [ ] **Remaining expect declarations (brokkr#71).** The check and
   diff-snapshots answers are declared in `brokkr.d/hosts/bygg.toml`. Not
   run: `diff` per OSC (a primary diffed against itself with its next OSC

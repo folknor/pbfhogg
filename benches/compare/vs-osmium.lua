@@ -57,7 +57,7 @@ local function rows(params, keys)
         },
         ["extract"] = {
             pbfhogg = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, { output = out() } } end,
-            osmium = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, osm({ strategy = "complete_ways" }) } end,
+            osmium = function() return { "extract", pbf, "--bbox=" .. params.dataset.bbox, osm({ strategy = "complete_ways" }) } end,
         },
         ["apply-changes"] = {
             pbfhogg = function() return { "apply-changes", pbf, params.osc.file, { output = out() } } end,

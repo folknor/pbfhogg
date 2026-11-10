@@ -2461,6 +2461,19 @@ and per-task groups of contiguous blocks were not tested. A thread-local
 builder was not tested because it is ruled out on other grounds: the
 executor's threads belong to the caller and outlive the invocation.
 
+### apply-changes keeps absent OSC metadata absent (bygg, 2026-11-10, `cb42cf0f` against `bd169b02`)
+
+A node with partial OSC metadata is written as a plain Node message;
+nodes with complete or no metadata stay dense, and a dense run now holds
+only one of the two. Real diffs carry complete metadata, so the dense
+path gains only an untaken branch.
+
+Denmark apply-diff, `--iterations 1`, interleaved matched pairs after a
+trim, both arms built with `--commit`: pair 1, 310 ms (`163df027`)
+against 308 ms (`36db967b`); pair 2, 315 ms (`dd6fe479`) against 306 ms
+(`cb4a0943`). Within noise: neutral, as expected. Denmark only; no planet
+cell was run, since the dense hot path's work is unchanged.
+
 ### apply-changes' create-run loop lifted into a function its tests drive (bygg, 2026-11-04, against `3c5b8d3a`)
 
 `CreateEncoder::emit`'s batching and ordered-write loop moved, unchanged,
@@ -3943,6 +3956,23 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### G1: way blobs decompressed once, Pass 2b off the PBF (bygg, 2026-11-10, `9d9a2a79` against `0b52650b`)
+
+Interleaved `--iterations 1` pairs after a trim, both arms `--commit`.
+Denmark: 1.3 s (`ab82dd55`) against 1.2 s (`72227dc8`), 1.2 s
+(`f946f8e2`) against 1.2 s (`d3aaae61`); too small to resolve. Germany:
+11.6 s (`32280d21`) against 11.1 s (`2cb622e8`), 10.7 s (`0d670319`)
+against 10.9 s (`089830dc`); no consistent sign on the wall.
+
+The phase split is not neutral. GEOCODE_PASS2B, the span G1 was meant
+to shrink, got slower in both pairs (2,617 to 2,848 ms in pair 2, +20 %
+in pair 1), and its core count fell from 11.2 to 3.9 in pair 1: the
+ordered pool over the way store runs far less parallel than the old
+decode. GEOCODE_PASS1_5_SCAN, now writing the store, is +18 %. Pass 3
+and admin assembly are a little faster, and RSS after Pass 2 drops from
+about 2.0 GB to 0.4 GB. Verdict: not a win as landed; Pass 2b's lost
+parallelism is the lead. No planet cell run until that is understood.
+
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
 
 | Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |
@@ -4594,6 +4624,19 @@ cold headers after the add-referenced cells and is not a pair.
 `getid --invert` was not measured: it builds every block it decodes as
 before, the only change being that construction and the kind-claim
 refusal are one call instead of two.
+
+## getid's full scan skips rejected payloads (bygg, 2026-11-10, `04bacd00` against `93be495d`)
+
+The full-scan arm prescreens each blob's indexdata from its header and
+skips a rejected payload instead of copying it. Planet `8k` snapshot,
+where dispatch takes the full scan, `--iterations 1` interleaved pairs,
+both arms `--commit`: 28.2 s (`afbfa6ad`) against 28.1 s (`3dcce726`),
+27.9 s (`01b438b4`) against 26.7 s (`168f1b05`). `GETID_SCAN` reads
+92.5 GB on both arms at 0.2 cores: the scan is bound on disk read, and a
+skipped payload is still read through the buffered reader, so the change
+saves only the copy. Within noise to slightly faster; kept, as it does
+less work. The low-density control on the walker arm was not run, since
+that arm's code did not change.
 
 ## getid --add-referenced follows relation members (bygg, 2026-11-03, against `7bdd2813`)
 
@@ -6004,6 +6047,39 @@ denmark` passed. isolation-cat planet `--bench 3` (`d73fbee8`): library
 43.1, 55.4, 54.4 s, CLI 55.9, 61.3, 69.5 s, ratio 1.28. Not published:
 the CLI arm's best is 13 s behind the typed `cat` cell above on the same
 file and commit, and that gap is unexplained.
+
+## Clean cells for script benches whose engines moved (bygg, 2026-11-10, at `9d9a2a79`)
+
+Cells the README campaign left without a clean run after their engines
+changed (`5432aac7`, `6fdde3f4`, `b58e8ef3`, `3286a9c5`). Committed
+tree, markdown only dirty, `--iterations 1`, run back to back after a
+trim. dedupe-self, dedupe-pair and diff-text are ranked on their child
+wall.
+
+| Bench | Condition | Cells |
+|---|---|---|
+| sort-cold | europe, `--force yes`, first after trim | 29.1, 29.0, 28.8 s (`69539b76`, `0bed0d36`, `9131c95b`) |
+| sort-pbf | europe, indexed | 25.6, 25.6 s (`2ae6efa4`, `d4b2931d`) |
+| dedupe-pair | denmark, `--with one-relation`, cold | 311, 319, 318 ms (`19b87fb1`, `8d9cf48b`, `ab25a84f`) |
+| dedupe-pair | warm | 214, 216 ms (`29b68bfd`, `f7b25682`) |
+| dedupe-self | denmark, cold | 1.3, 1.3, 1.3 s (`f91248b5`, `387f91fd`, `0912639d`) |
+| dedupe-self | denmark, warm | 1.2, 1.2, 1.2 s (`54dd84c5`, `3ab6aa20`, `54461ff8`) |
+| dedupe-self | denmark, warm, `--check yes` | 1.9 s (`28dc5320`) |
+| dedupe-self | japan, cold | 6.1, 6.1, 6.1 s (`c7716b46`, `eec16a11`, `15565620`) |
+| dedupe-self | japan, warm | 5.7, 5.7, 5.7 s (`0f655be1`, `1973d6c9`, `09dae305`) |
+| diff-unindexed | germany, `--new 20260420`, all | 95, 99, 95 s (`2118dcf8`, `9ca09674`, `17cab69a`) |
+| diff-unindexed | `--type way` | 54.6, 54.6, 54.2 s (`21a629b3`, `3ef5b849`, `89223288`) |
+| diff-text | denmark, `--new 320k` | 3.1, 3.2, 3.1 s (`1ba372b9`, `bf6db0c0`, `785b41b2`) |
+| diff-text | germany, `--new 20260420 --verbose yes --common no` | 8.4, 8.3, 8.3 s (`f12c91a4`, `f2a69547`, `b67bbe41`) |
+
+Every condition is tight, within 4 % across its cells. These are the
+current baselines for those benches; no verdict on the engine moves
+themselves, which had no clean before-cell.
+
+The vs-osmium `extract` row was also run on japan: pbfhogg 2.5, 2.4,
+2.4 s (`a19f6494`, `77c3fa6c`, `1e4ce672`), but every osmium arm failed
+at once with "wrong format for coordinate: '=139.5'", so the row passes
+its bbox in a form osmium does not parse and has no comparison yet.
 
 ## Changes with no cell of their own (2026-10-24 to 2026-10-30)
 

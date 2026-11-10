@@ -2319,6 +2319,29 @@ enum Command {
         #[arg(long, default_value = "buffered")]
         io_mode: BenchIoMode,
     },
+    /// Benchmark: time reverse geocoding queries over fixed pseudo-random
+    /// points in a bbox against a built index (emits kv to stderr). Hidden:
+    /// a measuring instrument for the geocode-query script bench, not a
+    /// command.
+    #[command(hide = true)]
+    BenchGeocodeQuery {
+        /// Geocode index directory, as build-geocode-index wrote it
+        index_dir: PathBuf,
+        /// Points are drawn uniformly from this box:
+        /// min_lon,min_lat,max_lon,max_lat
+        #[arg(short = 'b', long = "bbox", value_parser = parse_bbox)]
+        bbox: pbfhogg::extract::Bbox,
+        /// Points per round
+        #[arg(long, default_value_t = 100_000)]
+        queries: u32,
+        /// Seed of the point sequence; the same seed and bbox give the same
+        /// points on every revision
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Timed rounds over the same points, after one untimed warm-up round
+        #[arg(long, default_value_t = 3)]
+        rounds: u32,
+    },
     /// Build a reverse geocoding index from a PBF file
     BuildGeocodeIndex {
         /// Input PBF file
@@ -3527,6 +3550,13 @@ pub fn run() -> process::ExitCode {
                 )
             }
             Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
+            Command::BenchGeocodeQuery {
+                index_dir,
+                bbox,
+                queries,
+                seed,
+                rounds,
+            } => run_bench_geocode_query(&index_dir, &bbox, queries, seed, rounds),
             Command::BenchWrite {
                 file,
                 compression,
@@ -5112,6 +5142,148 @@ fn run_merge_changes(
     let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, mode, jobs, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("merge_changes.summary"))?;
     Ok(())
+}
+
+/// Time `Reader::query` over a fixed pseudo-random point set. The points are
+/// a pure function of bbox and seed (splitmix64, uniform in the box), so two
+/// revisions query the same points. One untimed warm-up round faults the
+/// index into the page cache; each timed round then queries every point
+/// once. Reports the timed rounds' total as `elapsed_ms`, each round's
+/// per-query mean, and answer tallies plus a digest of the admin answers, so
+/// two runs can be checked for answering alike.
+fn run_bench_geocode_query(
+    dir: &std::path::Path,
+    bbox: &pbfhogg::extract::Bbox,
+    queries: u32,
+    seed: u64,
+    rounds: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    if queries == 0 || rounds == 0 {
+        return Err("bench-geocode-query needs --queries and --rounds above 0".into());
+    }
+    let points = geocode_query_points(bbox, queries, seed);
+
+    let open_start = Instant::now();
+    let reader = pbfhogg::geocode_index::reader::Reader::open(dir)?;
+    let open_ms = open_start.elapsed().as_millis();
+
+    // The warm-up round is also the answer tally: answers do not change
+    // between rounds, so the timed rounds keep only a sink against the
+    // optimizer.
+    let tally = GeocodeQueryTally::warm_up(&reader, &points);
+
+    let mut sink = 0usize;
+    let mut round_ns: Vec<u128> = Vec::with_capacity(rounds as usize);
+    let timed_start = Instant::now();
+    for _ in 0..rounds {
+        let start = Instant::now();
+        for &(lat, lon) in &points {
+            if let Ok(r) = reader.query(lat, lon) {
+                sink = sink.wrapping_add(r.admin.len());
+            }
+        }
+        round_ns.push(start.elapsed().as_nanos());
+    }
+    let elapsed_ms = timed_start.elapsed().as_millis();
+    std::hint::black_box(sink);
+
+    let per_query = |ns: u128| ns as f64 / f64::from(queries) / 1000.0;
+    let rounds_us: Vec<String> = round_ns
+        .iter()
+        .map(|&ns| format!("{:.2}", per_query(ns)))
+        .collect();
+    let best = round_ns.iter().copied().min().unwrap_or(0);
+    output::cli_eprintln!("elapsed_ms={elapsed_ms}");
+    output::cli_eprintln!("open_ms={open_ms}");
+    output::cli_eprintln!("queries={queries}");
+    output::cli_eprintln!("rounds={rounds}");
+    output::cli_eprintln!("us_per_query_best={:.2}", per_query(best));
+    output::cli_eprintln!("us_per_query_rounds={}", rounds_us.join(","));
+    tally.report();
+    Ok(())
+}
+
+/// `queries` (lat, lon) points uniform in `bbox`, a pure function of bbox
+/// and seed (splitmix64), so every revision queries the same points.
+fn geocode_query_points(bbox: &pbfhogg::extract::Bbox, queries: u32, seed: u64) -> Vec<(f64, f64)> {
+    let mut state = seed;
+    let mut unit = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // The top 53 bits, exact in an f64, scaled into [0, 1).
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..queries)
+        .map(|_| {
+            let lat = bbox.min_lat + unit() * (bbox.max_lat - bbox.min_lat);
+            let lon = bbox.min_lon + unit() * (bbox.max_lon - bbox.min_lon);
+            (lat, lon)
+        })
+        .collect()
+}
+
+/// What one pass of bench-geocode-query answered: counts per class, and an
+/// FNV-1a digest of every query's admin answers (level and name, in
+/// answer order), so two runs over the same points can be checked for
+/// answering alike.
+#[derive(Default)]
+struct GeocodeQueryTally {
+    admin_answered: u64,
+    admin_matches: u64,
+    addresses: u64,
+    streets: u64,
+    interpolations: u64,
+    errors: u64,
+    digest: u64,
+}
+
+impl GeocodeQueryTally {
+    fn warm_up(reader: &pbfhogg::geocode_index::reader::Reader, points: &[(f64, f64)]) -> Self {
+        let mut t = Self {
+            digest: 0xCBF2_9CE4_8422_2325,
+            ..Self::default()
+        };
+        for &(lat, lon) in points {
+            let Ok(r) = reader.query(lat, lon) else {
+                t.errors += 1;
+                continue;
+            };
+            t.admin_answered += u64::from(!r.admin.is_empty());
+            t.admin_matches += r.admin.len() as u64;
+            t.addresses += u64::from(r.address.is_some());
+            t.streets += u64::from(r.street.is_some());
+            t.interpolations += u64::from(r.interpolation.is_some());
+            for a in &r.admin {
+                t.hash(&[a.admin_level]);
+                t.hash(a.name.as_bytes());
+                t.hash(&[0]);
+            }
+            t.hash(&[0xFF]);
+        }
+        t
+    }
+
+    fn hash(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.digest ^= u64::from(b);
+            self.digest = self.digest.wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    fn report(&self) {
+        output::cli_eprintln!("admin_answered={}", self.admin_answered);
+        output::cli_eprintln!("admin_matches={}", self.admin_matches);
+        output::cli_eprintln!("addresses={}", self.addresses);
+        output::cli_eprintln!("streets={}", self.streets);
+        output::cli_eprintln!("interpolations={}", self.interpolations);
+        output::cli_eprintln!("errors={}", self.errors);
+        output::cli_eprintln!("admin_digest={:016x}", self.digest);
+    }
 }
 
 fn run_bench_read(

@@ -320,6 +320,9 @@ impl CommandPaths {
             Command::Digest { file: input, .. }
             | Command::Check { file: input, .. }
             | Command::BenchRead { file: input, .. }
+            | Command::BenchGeocodeQuery {
+                index_dir: input, ..
+            }
             | Command::BenchWrite { file: input, .. } => paths.inputs.push(input.clone()),
         }
         paths

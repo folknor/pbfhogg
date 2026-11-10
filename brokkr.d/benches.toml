@@ -102,6 +102,24 @@ params.compression = { validated = true, help = "refused: build-geocode-index wr
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
+[bench.geocode-query]
+script_file = "../benches/build-geocode-index/geocode-query.lua"
+description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
+version = 1
+date = 2026-11-10
+changelog = [
+  { version = 1, date = 2026-11-10, note = "Added: index built untimed, then the bench-geocode-query instrument measured; per-query means and an admin answer digest recorded" },
+]
+profile = "release"
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset; its bbox is the default point box" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant the index is built from" }
+params.bbox = { validated = true, split = false, help = "min_lon,min_lat,max_lon,max_lat the points are drawn from; omitted uses the dataset bbox" }
+params.queries = { validated = true, default = "100000", help = "points per round" }
+params.rounds = { validated = true, default = "3", help = "timed rounds after the untimed warm-up round" }
+params.seed = { validated = true, default = "1", help = "seed of the point sequence" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the query child's stderr" }
+
 # -- cat
 
 [bench.copy-pbf]

@@ -386,15 +386,22 @@ verdict may rest on the code under test. It keeps its own header walker
   `--direct-io`, `-v`, and the OSC resolution with its primary-table
   fallback for encoding-only snapshots. `brokkr verify`'s nidhogg and
   elivagar subcommands stay in brokkr.
-- The binary under test: always `--pbfhogg PATH`, required, from a brokkr
-  build (`brokkr build pbfhogg`, or `brokkr build --commit REF pbfhogg`,
-  which replaces `--commit`). verify has no feature options: the artifact
-  decides its features. `brokkr run` builds and runs one target only, so
-  today a run is two invocations, `brokkr build pbfhogg` then `brokkr run
-  pbfhogg-verify -- --pbfhogg PATH`; brokkr#150 asks for one invocation
-  that builds both and hands the runner the path. Per-subcommand
-  capability probing of `--overwrite`, `--staging-dir`, `--tmp-dir` and
-  `digest --form` is ported, so an old binary still verifies.
+- The binary under test: `--pbfhogg PATH`, with a clap env fallback to
+  `BROKKR_WITH_EXE`; require a path from one of those sources. brokkr#150
+  landed in brokkr `c77a256`: `brokkr run --with TARGET` builds TARGET as
+  `brokkr build` does, including its immutable executable snapshot, then
+  builds and runs the program with that snapshot's absolute path in
+  `BROKKR_WITH_EXE`, under one lock hold. The normal invocation is
+  `brokkr run --with pbfhogg pbfhogg-verify -- all --dataset denmark --variant indexed`.
+  `--with-commit REF` replaces the old `brokkr verify --commit REF`;
+  `--with-features LIST` (repeatable), `--with-all-features` and
+  `--with-no-default-features` select the pbfhogg build. The program's own
+  `--commit`, `--features`, `--all-features` and `--no-default-features`
+  still select the verifier build; the profile is shared by both builds.
+  verify itself has no build or feature options: the artifact decides its
+  features. Per-subcommand capability probing of `--overwrite`,
+  `--staging-dir`, `--tmp-dir` and `digest --form` is ported, so an old
+  binary still verifies.
 - Reference cache: the full key (run id, tool identity with its `ldd`
   closure, controlled environment, input digests and extensions, argv with
   placeholders) and the integrity checks ported unchanged, in a new
@@ -428,9 +435,12 @@ verdict may rest on the code under test. It keeps its own header walker
    roll-forward whose entries match what `brokkr download` would have
    written, digests included. Then file the retirement of `brokkr
    download`.
-4. verify. Gate: `verify all` on denmark and germany agreeing with
-   `brokkr verify all` check by check. brokkr's implementation stays
-   runnable until this lands; then file its retirement.
+4. verify. Gate: `brokkr run --with pbfhogg pbfhogg-verify -- all --dataset denmark --variant indexed`
+   and `brokkr run --with pbfhogg pbfhogg-verify -- all --dataset germany --variant indexed`
+   agreeing with `brokkr verify all --dataset denmark --variant indexed`
+   and `brokkr verify all --dataset germany --variant indexed`, respectively,
+   check by check. brokkr's implementation stays runnable until this lands;
+   then file its retirement.
 
 AGENTS.md's brokkr sections shrink at each retirement.
 
@@ -447,6 +457,3 @@ AGENTS.md's brokkr sections shrink at each retirement.
   a provenance field, or the tool keeps a sidecar file and the bench
   cannot see it. Needs a brokkr ticket.
 - **gc.** Deferred, see devkit. Needs the liveness proof named there.
-- **Retiring `brokkr verify --commit`.** Replaced by `brokkr build
-  --commit` plus `--pbfhogg PATH`; the printed path has to be passed by
-  hand, since capturing it into a variable is off limits for agents.

@@ -83,6 +83,19 @@ reading 2.6 GB to 31 ms, as the walk no longer runs after a full
 sequential read of the file. The germany index is byte-identical
 across the change, all 19 files by md5.
 
+### Admin rings simplified to 20 m instead of a vertex cap (bygg, 2026-11-10, `9470143c` against `8094648a`)
+
+After a trim, `--iterations 1`, both arms `--commit`. Germany A B B A:
+6.7 s (`924fd3d9`) and 6.5 s (`995dca50`) against 6.3 s (`e4dae083`)
+and 6.3 s (`632417dd`). Planet one pair: 117 s (`0a083f67`) against
+109 s (`05725781`). Germany index built once per arm: admin_vertices.bin
+103.4 MB against 41.7 MB, so the 20 m tolerance keeps fewer vertices
+than the old level-scaled cap, not more; admin polygons 43,091 against
+43,044 and dropped relations 1,059 against 1,060, the polygons that fit
+inside the tolerance; every non-admin file unchanged in size. The
+default is not slower to build and stores less admin geometry. Query
+latency was not measured.
+
 ### Pass 3 bucket writes in parallel, stage B on the ordered pool (bygg, 2026-11-10, `b9ccca65` against `9775b0e2`)
 
 Stage A groups each chunk's cover results by bucket and writes bucket

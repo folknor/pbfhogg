@@ -64,51 +64,17 @@ Brokkr is convention-free at the protocol layer. Two optional naming conventions
 
 Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count - derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
-### pbfhogg bench mapping
+### pbfhogg benches
 
-Use `brokkr bench NAME --help` for params. The former typed commands map to:
+Bare `brokkr bench` lists the registered benches with their versions and
+short descriptions. Use `brokkr bench NAME --help` for params.
 
-| Former typed command | Bench NAME and required mode |
-|---|---|
-| `sort` | `sort-pbf` |
-| `cat` | `copy-pbf` |
-| `inspect` | `file-info` |
-| `add-locations-to-ways` | `embed-locations` |
-| `apply-changes` | `apply-diff` |
-| `merge-changes` | `merge-diffs` |
-| `diff` | `diff-applied` |
-| `diff-snapshots` | `diff-pair` |
-| `extract` | `region-extract` |
-| `multi-extract` | `region-extract --mode multi` |
-| `getid` | `id-select` |
-| `getparents` | `parent-select` |
-| `tags-filter` | `tag-select` |
-| `time-filter` | `time-snapshot` |
-| `renumber` | `id-remap` |
-| `repack` | `reencode-pbf` |
-| `degrade` | `perturb-pbf` |
-| `check-ids` | `id-order` |
-| `check-refs` | `ref-integrity` |
-| `check-index` | `index-integrity` |
-| `check-locations` | `location-integrity` |
-| `digest` | `canonical-digest` |
-| `build-geocode-index` | `geocode-build` |
-| `read` | `decode-workload` |
-| `write` | `encode-workload` |
-| `merge` | `merge-workload` |
-
-Examples:
+Examples of combined params:
 
 ```sh
 brokkr bench file-info --dataset denmark --mode tags --type way
-brokkr bench --iterations 1 embed-locations --dataset europe --index-type external
-brokkr bench --hotpath geocode-build --dataset denmark
-brokkr bench region-extract --dataset japan --mode multi --regions 5
-brokkr bench copy-pbf --dataset planet --clean yes
 brokkr bench merge-diffs --dataset planet --osc 4914..4920
 brokkr bench --iterations 1 diff-pair --dataset planet --from base --to 20260411
-brokkr bench reencode-pbf --dataset denmark --elements-per-blob 8000
-brokkr bench perturb-pbf --dataset denmark --strip-locations yes
 ```
 
 `file-info --mode nodes` reads node statistics. Its tags mode suppresses row

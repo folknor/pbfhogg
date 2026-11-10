@@ -1218,6 +1218,105 @@ fn merge_metadata_preservation() {
     );
 }
 
+/// A later diff must re-encode a surviving partial plain node without
+/// inventing metadata or losing its tags when the dense run closes.
+#[test]
+fn chained_apply_preserves_partial_node_metadata() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let first = dir.path().join("first.osm.pbf");
+    let second = dir.path().join("second.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let nodes: Vec<_> = (1..=3)
+        .map(|id| TestNode {
+            id,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![("name", "base")],
+            meta: None,
+        })
+        .collect();
+    write_test_pbf_sorted(&base, &nodes, &[], &[]);
+    write_osc(
+        &osc,
+        r#"<osmChange version="0.6"><modify>
+<node id="2" lat="35" lon="45" version="4"><tag k="name" v="partial"/></node>
+</modify></osmChange>"#,
+    );
+    run_apply_ok(&base, &osc, &first);
+
+    // Node 1 shares the first output's blob with node 2. Editing it
+    // prevents passthrough from hiding a broken plain-node rewrite.
+    write_osc(
+        &osc,
+        r#"<osmChange version="0.6"><modify>
+<node id="1" lat="11" lon="21"><tag k="name" v="changed"/></node>
+</modify></osmChange>"#,
+    );
+    run_apply_ok(&first, &osc, &second);
+
+    for path in [&first, &second] {
+        let mut ids = Vec::new();
+        let mut data_blocks = 0;
+        let mut partial_count = 0;
+        for blob in BlobReader::from_path(path).expect("open output") {
+            if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+                data_blocks += 1;
+                for element in block.elements() {
+                    match element {
+                        Element::DenseNode(node) => ids.push(node.id()),
+                        Element::Node(node) => {
+                            ids.push(node.id());
+                            partial_count += 1;
+                            assert_eq!(node.id(), 2);
+                            assert_eq!((node.lat(), node.lon()), (35.0, 45.0));
+                            assert_eq!(node.tags().collect::<Vec<_>>(), vec![("name", "partial")]);
+                            let info = node.info();
+                            assert_eq!(info.version(), Some(4));
+                            assert_eq!(info.milli_timestamp(), None);
+                            assert_eq!(info.changeset(), None);
+                            assert_eq!(info.uid(), None);
+                            assert!(info.user().is_none());
+                            assert!(info.visible());
+                        }
+                        _ => panic!("unexpected non-node"),
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            data_blocks, 1,
+            "the second diff must touch the partial node's blob"
+        );
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(partial_count, 1);
+    }
+    let elements = read_all_elements(&second);
+    assert_eq!(
+        elements.nodes,
+        vec![
+            (
+                1,
+                110_000_000,
+                210_000_000,
+                vec![("name".into(), "changed".into())]
+            ),
+            (
+                2,
+                350_000_000,
+                450_000_000,
+                vec![("name".into(), "partial".into())]
+            ),
+            (
+                3,
+                100_000_000,
+                200_000_000,
+                vec![("name".into(), "base".into())]
+            ),
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // LocationsOnWays
 // ---------------------------------------------------------------------------

@@ -547,6 +547,27 @@ fn refuses_an_unresolvable_string_reference() {
 // Diff fixes the contract depends on
 // ---------------------------------------------------------------------------
 
+/// Dense and plain node groups in one block describe the same elements
+/// as a dense-only block, in both digest forms.
+#[test]
+fn digest_accepts_dense_and_plain_node_groups_in_one_block() {
+    let dir = crate::common::test_scratch();
+    let dense = dir.path().join("dense.osm.pbf");
+    let mixed = dir.path().join("mixed.osm.pbf");
+    let nodes = [node(1, 10, 20, vec![]), node(2, 30, 40, vec![])];
+    write_test_pbf_non_indexed(&dense, &nodes, &[], &[]);
+    write_test_pbf_non_indexed(&mixed, &nodes[..1], &[], &[]);
+    let bytes = std::fs::read(&mixed).expect("read");
+    let mixed_bytes = mutate_blob_payload(&bytes, 1, |payload| {
+        // PrimitiveBlock field 2: a separate PrimitiveGroup, holding
+        // field 1 Node { sint64 id: 2, sint64 lat: 30, sint64 lon: 40 }.
+        payload.extend_from_slice(&[0x12, 8, 0x0a, 6, 0x08, 4, 0x40, 60, 0x48, 80]);
+    });
+    std::fs::write(&mixed, mixed_bytes).expect("write");
+    assert_eq!(digest_ok(&mixed), digest_ok(&dense));
+    assert_eq!(full_ok(&mixed), full_ok(&dense));
+}
+
 /// An empty PrimitiveGroup next to a way group used to make the block
 /// "mixed", which the streaming merge refuses. Empty groups are neutral.
 #[test]

@@ -256,9 +256,10 @@ params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO
 [bench.vs-osmium]
 script_file = "../benches/compare/vs-osmium.lua"
 description = "One row of the guide's CLI command table, pbfhogg or osmium, inputs cold"
-version = 2
-date = 2026-11-09
+version = 3
+date = 2026-11-10
 changelog = [
+  { version = 3, date = 2026-11-10, note = "Add extract row using the dataset bbox and matching complete-ways strategies, with osmium --fsync" },
   { version = 2, date = 2026-11-09, note = "Eviction moved from the preflight into the timed block, before every iteration's child, so it holds whatever the hash cache does; the iteration wall includes it" },
   { date = 2026-11-08, note = "Script moved from inline to benches/compare/vs-osmium.lua, unchanged" },
   { version = 1, date = 2026-11-08, note = "Added: cold-cache preflight, osmium given --fsync and --keep-member-nodes" },
@@ -266,7 +267,7 @@ changelog = [
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the PBF variant both tools read" }
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
-params.row = { validated = true, required = true, help = "inspect, sort, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
+params.row = { validated = true, required = true, help = "inspect, sort, extract, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
 
 # -- degrade

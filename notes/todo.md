@@ -40,16 +40,13 @@ The README's three tables come from the campaign at `53360af4`
   `src/read/frame.rs` refuses the same file. docs/guide/indexdata.md now
   states the exception; decide whether coverage should instead be
   independent of indexability.
-- [ ] **vs-osmium extract row.** vs-osmium has none, so README's Tokyo
-  extract line stays dropped; a row in `benches/compare/vs-osmium.lua`
-  would bring it back.
+- [ ] **README Tokyo extract line.** vs-osmium has an `extract` row now
+  (dataset bbox, complete-ways on both sides); measure it on japan to
+  bring the README line back.
 - [ ] **Performance guide plantasjen tables** (Japan extract, apply-changes
   at scale and with LocationsOnWays, write throughput, the io_uring and
   O_DIRECT tips) carry host and commit labels but were not re-measured on
   bygg.
-- [ ] **CHANGELOG 0.6.0 pipe and FIFO caveat** on `check --index` /
-  `cat --reindex`: its wording was checked against commit `b00e2e0b` and
-  docs/cli/commands.md, not against `src/read/frame_pool.rs`.
 - [ ] **brokkr doc fix.** `brokkr man library isolation-scenarios` still
   lists "the capped malloc arenas" in the CLI interval (gone since
   `25172fc3`).

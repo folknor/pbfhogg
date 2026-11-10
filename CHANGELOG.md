@@ -239,10 +239,13 @@ state.
 the first four entries, which were recorded without a host)
 
 - `check --index` 494 s -> 29 s and `cat --reindex` 444 s -> 44 s (worker
-  pool instead of one thread). A pipe or FIFO input is still accepted, but
-  because the read now runs ahead of the workers, an error partway through
-  one is reported only once the process feeding it writes more or closes
-  it; until then the command waits.
+  pool instead of one thread). Both accept pipe or FIFO input when
+  `check --index` is run alone. The sequential read runs ahead within a
+  bounded window, so a worker error can be delayed while the calling thread
+  is blocked reading more input. Reporting it can require enough input to
+  fill that window, EOF or a read error; merely writing more bytes need not
+  unblock it. Cancellation does not interrupt a blocking read. Combining
+  `check --index` with another check requires a regular file.
 - Europe unindexed `sort --force` 180 s -> 30 s, with about 125 MB more
   peak memory; `cat --dedupe` scans unindexed blobs the same way.
 - Cold header walks (`inspect`, `getid`, `tags-filter`, `extract` and others)

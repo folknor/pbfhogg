@@ -26,6 +26,8 @@
 -- run that passes proves every ID exists. The inspect row has no osmium
 -- counterpart: bare inspect answers from indexdata, and `osmium fileinfo -e`
 -- computes a census (timestamps, bbox, metadata coverage) pbfhogg does not.
+-- extract uses the dataset bbox and the complete-ways strategy on both
+-- sides (pbfhogg's default, osmium's explicit complete_ways).
 
 local DENMARK_IDS = { "n115722", "n115723", "n115724", "w2080", "w2081", "w2082", "r174", "r213", "r339" }
 
@@ -52,6 +54,10 @@ local function rows(params, keys)
         ["sort"] = {
             pbfhogg = function() return { "sort", pbf, { output = out() } } end,
             osmium = function() return { "sort", pbf, osm({}) } end,
+        },
+        ["extract"] = {
+            pbfhogg = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, { output = out() } } end,
+            osmium = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, osm({ strategy = "complete_ways" }) } end,
         },
         ["apply-changes"] = {
             pbfhogg = function() return { "apply-changes", pbf, params.osc.file, { output = out() } } end,
@@ -112,6 +118,9 @@ end
 function validate(params, keys)
     local row = rows(params, keys)[params.row]
     if not row then fail("unknown --row " .. params.row) end
+    if params.row == "extract" and type(params.dataset.bbox) ~= "string" then
+        fail("the extract row needs a configured dataset bbox")
+    end
     if params.row == "apply-changes" and not params.osc then fail("the apply-changes row needs --osc") end
     if params.row ~= "apply-changes" and params.osc then fail("--osc is for the apply-changes row only") end
     if params.tool == "osmium" and not row.osmium then

@@ -631,62 +631,83 @@ fn project_on_segment(
 // Douglas-Peucker simplification
 // ---------------------------------------------------------------------------
 
-/// Douglas-Peucker polyline simplification with a vertex cap.
+/// Douglas-Peucker ring simplification with a positional tolerance in metres.
 ///
-/// If the ring already has ≤ `max_vertices` vertices, it is returned unchanged.
-/// Otherwise, binary search for an epsilon that yields ≤ `max_vertices` vertices.
-/// Coordinates are `(x, y)` (longitude, latitude) in degrees.
-pub fn simplify_ring(ring: &[(f64, f64)], max_vertices: usize) -> Vec<(f64, f64)> {
-    if ring.len() <= max_vertices {
+/// Returns the subset of `ring`'s own vertices (bit-identical, in order) that
+/// Douglas-Peucker keeps when every removed vertex must lie within
+/// `tolerance_m` of the edge that replaces it. `tolerance_m <= 0` (or NaN)
+/// returns the ring unchanged. Coordinates are `(x, y)` (longitude, latitude)
+/// in degrees.
+///
+/// **Contract.** For any point farther than `tolerance_m` from the original
+/// ring, [`point_in_ring_with_antimeridian`] gives the same answer against the
+/// result as against `ring`, whether or not the result is simple. The result
+/// may cross itself, or cross another ring simplified beside it, but only
+/// within that distance of the original boundary, where the answer was
+/// already allowed to move.
+///
+/// Why it holds, so that changes here keep it holding:
+///
+/// - Each kept edge AB replaces an original subchain S whose every vertex is
+///   within the tolerance of the segment AB (clamped, not the infinite line),
+///   measured in an affine metric fixed per span (below). The tolerance band
+///   round a segment is convex, so S and the closed loop S + BA lie in it.
+///   For a point p whose even-odd parity against that loop is odd, a ray from
+///   p perpendicular to AB and away from it must cross S before leaving the
+///   band, so p is within the tolerance of S. Parity is additive over the
+///   loops, so the ring's answer can change only at such points.
+/// - The affine metric for a span is `R * sqrt(dlat^2 + (c * dlon)^2)` in
+///   radians, `c` the largest `cos(lat)` over the span's whole latitude
+///   interval (1 when it straddles the equator). Along any straight lon/lat
+///   path inside that interval, true spherical length is at most this, so a
+///   bound in the affine metric is a bound in metres on the sphere.
+/// - Spans are measured in the frame the reader tests the ring in
+///   ([`pip_ring_frame`]). Both endpoints of every raw edge spanning more than
+///   180 degrees of longitude (a seam crossing) are always kept, so those
+///   edges survive verbatim and the reader picks the same frame; and no kept
+///   edge spans more than `ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG` of longitude in
+///   that frame (a longer chord is split even when every vertex under it is
+///   on it, unless it is an original edge with nothing to split). So the
+///   reader's unwrap of the result reproduces exactly the kept subsequence of
+///   the original frame, closing vertex included.
+pub fn simplify_ring(ring: &[(f64, f64)], tolerance_m: f64) -> Vec<(f64, f64)> {
+    // NaN fails `> 0.0` too, so it also means "keep everything".
+    let simplifies = tolerance_m > 0.0;
+    if !simplifies || ring.len() <= 3 {
         return ring.to_vec();
     }
-    if ring.len() < 2 {
-        return ring.to_vec();
-    }
-
-    // Compute the bounding box diagonal as the upper bound for epsilon.
-    // This ensures hi is always large enough to reduce to 2 vertices.
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
-    for &(x, y) in ring {
-        if x < min_x {
-            min_x = x;
-        }
-        if x > max_x {
-            max_x = x;
-        }
-        if y < min_y {
-            min_y = y;
-        }
-        if y > max_y {
-            max_y = y;
-        }
-    }
-    let diag = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2)).sqrt();
-
-    // Binary search for epsilon
-    let mut lo = 0.0_f64;
-    let mut hi = diag;
-
-    for _ in 0..20 {
-        let epsilon = (lo + hi) / 2.0;
-        let count = dp_count(ring, epsilon);
-        if count > max_vertices {
-            lo = epsilon;
-        } else {
-            hi = epsilon;
-        }
-    }
-
-    // Use `hi` (which always gives <= max_vertices)
+    let frame = pip_ring_frame(ring);
+    let last = ring.len() - 1;
     let mut keep = vec![false; ring.len()];
     keep[0] = true;
-    if let Some(last) = ring.len().checked_sub(1) {
-        keep[last] = true;
+    keep[last] = true;
+    for i in 0..last {
+        if (ring[i + 1].0 - ring[i].0).abs() > 180.0 {
+            keep[i] = true;
+            keep[i + 1] = true;
+        }
     }
-    dp_mark(ring, 0, ring.len() - 1, hi, &mut keep);
+
+    // The forced vertices partition the ring; each span between two of them
+    // is simplified on its own, so no kept edge skips a forced vertex.
+    let tolerance_rad = tolerance_m / EARTH_RADIUS_M;
+    let tolerance_sq = tolerance_rad * tolerance_rad;
+    let mut stack = Vec::new();
+    let mut span_start = 0;
+    for span_end in 1..=last {
+        if !keep[span_end] {
+            continue;
+        }
+        stack.push((span_start, span_end));
+        while let Some((start, end)) = stack.pop() {
+            if let Some(split) = dp_split(&frame, start, end, tolerance_sq) {
+                keep[split] = true;
+                stack.push((start, split));
+                stack.push((split, end));
+            }
+        }
+        span_start = span_end;
+    }
 
     ring.iter()
         .zip(keep.iter())
@@ -695,40 +716,44 @@ pub fn simplify_ring(ring: &[(f64, f64)], max_vertices: usize) -> Vec<(f64, f64)
         .collect()
 }
 
-/// Count how many vertices would be kept at a given epsilon (allocation-free).
-fn dp_count(ring: &[(f64, f64)], epsilon: f64) -> usize {
-    if ring.len() <= 2 {
-        return ring.len();
-    }
-    let mut count = 2;
-    let mut stack = vec![(0, ring.len() - 1)];
-    while let Some((start, end)) = stack.pop() {
-        if let Some(max_idx) = dp_split(ring, start, end, epsilon * epsilon) {
-            count += 1;
-            stack.push((start, max_idx));
-            stack.push((max_idx, end));
-        }
-    }
-    count
-}
-
-/// Return the most significant interior vertex when it exceeds `epsilon_sq`.
-fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, epsilon_sq: f64) -> Option<usize> {
+/// The interior vertex at which to split `pts[start..=end]`, or `None` when
+/// the chord may stand: every interior vertex is within `tolerance_sq`
+/// (squared radians in the span's affine metric) of the chord, and the chord
+/// is no longer than `ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG` of longitude.
+/// [`simplify_ring`] states the metric and why each part is needed.
+fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, tolerance_sq: f64) -> Option<usize> {
+    use crate::tunables::{ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG, DEGENERATE_SEGMENT_EPSILON};
     if end <= start + 1 {
         return None;
     }
-    let (ax, ay) = pts[start];
-    let (bx, by) = pts[end];
+    let span = &pts[start..=end];
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    for &(_, lat) in span {
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+    }
+    let nearest_equator = if min_lat <= 0.0 && max_lat >= 0.0 {
+        0.0
+    } else {
+        min_lat.abs().min(max_lat.abs())
+    };
+    let c = nearest_equator.to_radians().cos();
+    let to_metric = |(lon, lat): (f64, f64)| (lon.to_radians() * c, lat.to_radians());
+
+    let (ax, ay) = to_metric(pts[start]);
+    let (bx, by) = to_metric(pts[end]);
     let dx = bx - ax;
     let dy = by - ay;
     let len_sq = dx * dx + dy * dy;
 
     let mut max_dist = 0.0_f64;
     let mut max_idx = start + 1;
-    for (i, &(px, py)) in pts.iter().enumerate().skip(start + 1).take(end - start - 1) {
+    for (i, &pt) in pts.iter().enumerate().take(end).skip(start + 1) {
+        let (px, py) = to_metric(pt);
         let rx = px - ax;
         let ry = py - ay;
-        let dist = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
+        let dist = if len_sq < DEGENERATE_SEGMENT_EPSILON {
             rx * rx + ry * ry
         } else {
             let t = ((rx * dx + ry * dy) / len_sq).clamp(0.0, 1.0);
@@ -741,19 +766,15 @@ fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, epsilon_sq: f64) -> Op
             max_idx = i;
         }
     }
-    (max_dist > epsilon_sq).then_some(max_idx)
-}
-
-/// Mark vertices to keep using an explicit stack.
-fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mut [bool]) {
-    let mut stack = vec![(start, end)];
-    while let Some((range_start, range_end)) = stack.pop() {
-        if let Some(max_idx) = dp_split(pts, range_start, range_end, epsilon * epsilon) {
-            keep[max_idx] = true;
-            stack.push((range_start, max_idx));
-            stack.push((max_idx, range_end));
-        }
+    if max_dist > tolerance_sq {
+        return Some(max_idx);
     }
+    if (pts[end].0 - pts[start].0).abs() > ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG {
+        // Every vertex is on the chord (or within tolerance of it), so the
+        // deviation names no split point; halve the span instead.
+        return Some(start + (end - start) / 2);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,147 +1261,258 @@ mod tests {
 
     // -- simplify_ring -------------------------------------------------------
 
-    #[test]
-    fn simplify_already_small() {
-        let ring = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)];
-        let result = simplify_ring(&ring, 10);
-        assert_eq!(result.len(), ring.len());
+    /// One metre in degrees of latitude on the crate's sphere.
+    fn metres_to_deg(m: f64) -> f64 {
+        (m / EARTH_RADIUS_M).to_degrees()
     }
 
-    #[test]
-    fn simplify_reduces_vertices() {
-        // A ring with many points that can be simplified
-        let mut ring = Vec::new();
-        for i in 0..100 {
-            let angle = i as f64 * 2.0 * PI / 100.0;
-            ring.push((angle.cos(), angle.sin()));
+    /// Distance in metres from `p` to the nearest edge of `ring` (closing edge
+    /// included), measured with the SMALLEST `cos(lat)` over the ring's
+    /// latitude interval. That under-estimates the per-span metric the
+    /// simplifier bounds, so "this distance exceeds the tolerance" implies the
+    /// simplifier's own distance does too: a sound side of the contract.
+    /// `p` is tried at its +/-360 images so the seam rings are measured on the
+    /// short side.
+    fn conservative_distance_m(p: (f64, f64), ring: &[(f64, f64)]) -> f64 {
+        let frame = pip_ring_frame(ring);
+        let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &(_, lat) in frame.iter() {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
         }
-        ring.push(ring[0]); // Close the ring
-
-        let result = simplify_ring(&ring, 20);
-        assert!(result.len() <= 20);
-        assert!(result.len() >= 3);
-    }
-
-    /// Reference implementation: the recursive Douglas-Peucker marker that
-    /// the explicit-stack version replaced, transcribed verbatim (sqrt
-    /// distance against a non-squared epsilon, as it was).
-    fn dp_mark_recursive_reference(
-        pts: &[(f64, f64)],
-        start: usize,
-        end: usize,
-        epsilon: f64,
-        keep: &mut [bool],
-    ) {
-        if end <= start + 1 {
-            return;
-        }
-        let (ax, ay) = pts[start];
-        let (bx, by) = pts[end];
-        let dx = bx - ax;
-        let dy = by - ay;
-        let len_sq = dx * dx + dy * dy;
-        let mut max_dist = 0.0_f64;
-        let mut max_idx = start;
-        for (i, pt) in pts.iter().enumerate().take(end).skip(start + 1) {
-            let px = pt.0 - ax;
-            let py = pt.1 - ay;
-            let dist = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
-                (px * px + py * py).sqrt()
-            } else {
-                let t = ((px * dx + py * dy) / len_sq).clamp(0.0, 1.0);
-                let proj_x = t * dx - px;
-                let proj_y = t * dy - py;
-                (proj_x * proj_x + proj_y * proj_y).sqrt()
-            };
-            if dist > max_dist {
-                max_dist = dist;
-                max_idx = i;
+        let c = min_lat.abs().max(max_lat.abs()).to_radians().cos();
+        let m = |(lon, lat): (f64, f64)| (lon.to_radians() * c, lat.to_radians());
+        let mut best = f64::INFINITY;
+        for shift in [0.0, 360.0, -360.0] {
+            let (px, py) = m((p.0 + shift, p.1));
+            let n = frame.len();
+            for i in 0..n {
+                let (ax, ay) = m(frame[i]);
+                let (bx, by) = m(frame[(i + 1) % n]);
+                let (dx, dy) = (bx - ax, by - ay);
+                let len_sq = dx * dx + dy * dy;
+                let t = if len_sq > 0.0 {
+                    (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (qx, qy) = (ax + t * dx - px, ay + t * dy - py);
+                best = best.min((qx * qx + qy * qy).sqrt() * EARTH_RADIUS_M);
             }
         }
-        if max_dist > epsilon {
-            keep[max_idx] = true;
-            dp_mark_recursive_reference(pts, start, max_idx, epsilon, keep);
-            dp_mark_recursive_reference(pts, max_idx, end, epsilon, keep);
-        }
+        best
     }
 
-    /// Replacing recursion with a stack must not move a single vertex.
-    /// A stack-depth test cannot see a geometry change, and a changed
-    /// simplification would be invisible right up to the point-in-polygon
-    /// answers it feeds, so the equivalence is asserted directly - kept-set
-    /// for the marker, count for the epsilon search - over shapes chosen to
-    /// exercise both the collinear and the degenerate-chord branches.
-    #[test]
-    fn iterative_douglas_peucker_matches_the_recursive_version_exactly() {
-        let mut state = 0x1234_5678_9abc_def0_u64;
+    /// The simplifier's contract, checked on a sample grid: every point
+    /// farther than the tolerance from the original ring keeps its answer.
+    /// Returns how many points were far enough to be checked, so a caller can
+    /// assert the check was not vacuous.
+    fn assert_far_points_keep_containment(
+        ring: &[(f64, f64)],
+        simplified: &[(f64, f64)],
+        tolerance_m: f64,
+        lon: (f64, f64),
+        lat: (f64, f64),
+    ) -> usize {
+        let steps = 120;
+        let mut checked = 0;
+        for i in 0..=steps {
+            for j in 0..=steps {
+                let px = lon.0 + (lon.1 - lon.0) * f64::from(i) / f64::from(steps);
+                let py = lat.0 + (lat.1 - lat.0) * f64::from(j) / f64::from(steps);
+                if conservative_distance_m((px, py), ring) <= tolerance_m {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(
+                    point_in_ring_with_antimeridian(px, py, simplified),
+                    point_in_ring_with_antimeridian(px, py, ring),
+                    "({px}, {py}) is beyond {tolerance_m} m of the boundary but its \
+                     containment changed"
+                );
+            }
+        }
+        checked
+    }
+
+    /// A closed, deterministic, jagged ring round `(lon0, lat0)`: radius in
+    /// degrees with pseudo-random wiggle, dense enough that simplification
+    /// removes most vertices, and with a deep inward spike every 37 vertices.
+    #[allow(clippy::cast_precision_loss)]
+    fn jagged_ring(lon0: f64, lat0: f64, radius: f64, n: u32, seed: u64) -> Vec<(f64, f64)> {
+        let mut state = seed;
         let mut next = || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            state
+            (state % 10_000) as f64 / 10_000.0
         };
-        let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
-        // Comb: worst case for recursion depth, and every split peels one.
-        rings.push((0..400).map(|i| (f64::from(i), f64::from(i % 2))).collect());
-        // Perfectly collinear: no split ever exceeds epsilon.
-        rings.push((0..50).map(|i| (f64::from(i), 0.0)).collect());
-        // Degenerate chord: first and last coincide, so len_sq < 1e-30.
-        rings.push(
-            (0..60)
-                .map(|i| {
-                    let a = f64::from(i) / 59.0 * std::f64::consts::TAU;
-                    (a.cos(), a.sin())
-                })
-                .collect(),
+        let mut ring: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let a = f64::from(i) / f64::from(n) * std::f64::consts::TAU;
+                let spike = if i % 37 == 0 { 0.4 } else { 1.0 };
+                let r = radius * spike * (0.85 + 0.3 * next());
+                (lon0 + r * a.cos(), lat0 + r * a.sin())
+            })
+            .collect();
+        ring.push(ring[0]);
+        ring
+    }
+
+    #[test]
+    fn simplify_with_no_tolerance_keeps_every_vertex() {
+        let ring = jagged_ring(10.0, 55.0, 0.1, 200, 7);
+        assert_eq!(simplify_ring(&ring, 0.0), ring);
+        assert_eq!(simplify_ring(&ring, f64::NAN), ring);
+        let tiny = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
+        assert_eq!(simplify_ring(&tiny, 1e9), tiny);
+    }
+
+    #[test]
+    fn simplified_ring_is_a_subsequence_of_the_original() {
+        let ring = jagged_ring(10.0, 55.0, 0.1, 2_000, 11);
+        let simplified = simplify_ring(&ring, 200.0);
+        assert!(
+            simplified.len() < ring.len() / 2,
+            "{} kept",
+            simplified.len()
         );
-        // Random scatter.
-        for _ in 0..8 {
-            rings.push(
-                (0..120)
-                    .map(|_| {
-                        #[allow(clippy::cast_precision_loss)]
-                        let x = (next() % 10_000) as f64 / 100.0;
-                        #[allow(clippy::cast_precision_loss)]
-                        let y = (next() % 10_000) as f64 / 100.0;
-                        (x, y)
-                    })
-                    .collect(),
+        assert_eq!(simplified.first(), ring.first());
+        assert_eq!(simplified.last(), ring.last());
+        let mut it = ring.iter();
+        for v in &simplified {
+            assert!(
+                it.any(|o| o == v),
+                "{v:?} is not an original vertex in order"
             );
         }
+    }
 
-        for ring in &rings {
-            for &epsilon in &[0.0, 1e-9, 0.001, 0.05, 0.5, 3.0, 100.0] {
-                let last = ring.len() - 1;
-                let mut iterative = vec![false; ring.len()];
-                dp_mark(ring, 0, last, epsilon, &mut iterative);
-                let mut recursive = vec![false; ring.len()];
-                dp_mark_recursive_reference(ring, 0, last, epsilon, &mut recursive);
-                assert_eq!(
-                    iterative,
-                    recursive,
-                    "dp_mark diverged at epsilon {epsilon} for a {}-point ring",
-                    ring.len()
-                );
-                let expected = 2 + recursive.iter().filter(|k| **k).count();
-                assert_eq!(
-                    dp_count(ring, epsilon),
-                    expected,
-                    "dp_count diverged at epsilon {epsilon}"
-                );
-            }
+    /// The tolerance is in metres at every latitude: a bump smaller than it
+    /// goes and a larger one stays, with the ring's longitudes laid out in
+    /// metres for its latitude.
+    #[test]
+    fn tolerance_is_measured_in_metres() {
+        for lat0 in [0.0, 45.0, 70.0] {
+            let c = f64::cos(f64::to_radians(lat0));
+            let step = metres_to_deg(100.0) / c;
+            // A straight east-west run with one 15 m bump and one 60 m bump.
+            let mut ring: Vec<(f64, f64)> = (0..=20).map(|i| (f64::from(i) * step, lat0)).collect();
+            ring[5].1 += metres_to_deg(15.0);
+            ring[15].1 += metres_to_deg(60.0);
+            ring.push((20.0 * step, lat0 + metres_to_deg(500.0)));
+            ring.push((0.0, lat0 + metres_to_deg(500.0)));
+            ring.push(ring[0]);
+            let simplified = simplify_ring(&ring, 30.0);
+            assert!(!simplified.contains(&ring[5]), "15 m bump kept at {lat0}");
+            assert!(
+                simplified.contains(&ring[15]),
+                "60 m bump dropped at {lat0}"
+            );
         }
     }
 
     #[test]
-    fn simplify_ring_handles_deep_path_without_recursion() {
-        let ring: Vec<_> = (0..20_000)
-            .map(|i| (i as f64, if i % 2 == 0 { 0.0 } else { 1.0 }))
+    fn far_points_keep_containment_on_a_jagged_ring() {
+        let ring = jagged_ring(10.0, 55.0, 0.2, 1_500, 3);
+        for tolerance in [50.0, 500.0, 3_000.0] {
+            let simplified = simplify_ring(&ring, tolerance);
+            assert!(simplified.len() < ring.len());
+            let checked = assert_far_points_keep_containment(
+                &ring,
+                &simplified,
+                tolerance,
+                (9.7, 10.3),
+                (54.8, 55.2),
+            );
+            assert!(checked > 1_000, "only {checked} points checked");
+        }
+    }
+
+    /// A ring straddling the antimeridian: its seam-crossing edges must be
+    /// stored verbatim, so the reader still unwraps it, and the contract holds
+    /// on both sides of the seam.
+    #[test]
+    fn seam_crossing_edges_survive_simplification() {
+        let ring: Vec<(f64, f64)> = jagged_ring(180.0, -17.0, 0.3, 1_000, 5)
+            .into_iter()
+            .map(|(lon, lat)| (if lon > 180.0 { lon - 360.0 } else { lon }, lat))
             .collect();
-        let simplified = simplify_ring(&ring, 64);
-        assert!(simplified.len() <= 64);
-        assert_eq!(simplified.first(), ring.first());
-        assert_eq!(simplified.last(), ring.last());
+        assert!(ring_crosses_antimeridian(&ring));
+        let simplified = simplify_ring(&ring, 500.0);
+        assert!(simplified.len() < ring.len());
+        assert!(ring_crosses_antimeridian(&simplified));
+        for pair in ring.windows(2) {
+            if (pair[1].0 - pair[0].0).abs() > 180.0 {
+                assert!(
+                    simplified.windows(2).any(|s| s == pair),
+                    "seam edge {pair:?} was not kept verbatim"
+                );
+            }
+        }
+        let east = assert_far_points_keep_containment(
+            &ring,
+            &simplified,
+            500.0,
+            (179.6, 180.0),
+            (-17.4, -16.6),
+        );
+        let west = assert_far_points_keep_containment(
+            &ring,
+            &simplified,
+            500.0,
+            (-180.0, -179.6),
+            (-17.4, -16.6),
+        );
+        assert!(east > 500 && west > 500, "east {east}, west {west}");
+    }
+
+    /// A ring winding round the south pole, closing along latitude -90. Its
+    /// long parallel runs have zero deviation, so only the chord-length guard
+    /// keeps them split; without it the ring stores an edge the reader would
+    /// read as a seam crossing, and every answer inside flips.
+    #[test]
+    fn a_ring_round_the_pole_keeps_its_frame() {
+        let mut ring: Vec<(f64, f64)> = (0..=720)
+            .map(|i| {
+                let lon = -180.0 + f64::from(i) * 0.5;
+                (lon, -70.0 + 0.5 * f64::sin(f64::from(i) * 0.37))
+            })
+            .collect();
+        for i in 0..=720 {
+            ring.push((180.0 - f64::from(i) * 0.5, -90.0));
+        }
+        ring.push(ring[0]);
+        assert!(!ring_crosses_antimeridian(&ring));
+        let simplified = simplify_ring(&ring, 2_000.0);
+        assert!(simplified.len() < ring.len() / 2);
+        assert!(!ring_crosses_antimeridian(&simplified));
+        for pair in simplified.windows(2) {
+            assert!(
+                (pair[1].0 - pair[0].0).abs() <= crate::tunables::ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG
+                    || ring.windows(2).any(|o| o == pair),
+                "chord {pair:?} is longer than the guard"
+            );
+        }
+        assert!(point_in_ring_with_antimeridian(0.0, -80.0, &simplified));
+        assert!(point_in_ring_with_antimeridian(170.0, -85.0, &simplified));
+        assert!(!point_in_ring_with_antimeridian(0.0, -60.0, &simplified));
+    }
+
+    #[test]
+    fn simplify_ring_handles_deep_path_without_recursion() {
+        // A comb peels one vertex per split: worst case for a recursive DP.
+        let tooth = metres_to_deg(10.0);
+        let mut ring: Vec<_> = (0..20_000)
+            .map(|i| (f64::from(i) * tooth, if i % 2 == 0 { 0.0 } else { tooth }))
+            .collect();
+        ring.push(ring[0]);
+        let simplified = simplify_ring(&ring, 1.0);
+        assert_eq!(simplified.len(), ring.len());
+        let flattened = simplify_ring(&ring, 100.0);
+        assert!(flattened.len() < 10, "{} kept", flattened.len());
+        assert_eq!(flattened.first(), ring.first());
+        assert_eq!(flattened.last(), ring.last());
     }
 
     // -- assemble_rings ------------------------------------------------------

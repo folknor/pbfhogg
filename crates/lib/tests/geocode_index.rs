@@ -3230,6 +3230,9 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
     let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
+            // The fixture ring is a centimetre across: any positive
+            // tolerance collapses it, and no polygon would reach the cell.
+            admin_tolerance_m: 0.0,
             ..Default::default()
         },
         &index_dir,

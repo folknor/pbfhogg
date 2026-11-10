@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **`build-geocode-index`: `--max-admin-vertices` is replaced by
+  `--admin-tolerance <METERS>`** (default 20, `0` keeps every vertex), and
+  the geocode index `FORMAT_VERSION` is bumped to 6: existing indexes must
+  be rebuilt. Admin boundaries were simplified to a vertex count, so the
+  boundary could move by any distance the count demanded, kilometres on a
+  large ring, and a query well inside one area could resolve to its
+  neighbour. A query farther than the tolerance from a boundary now gets the
+  answer the unsimplified boundary gives, at every admin level. Index size
+  and admin lookup cost now follow the tolerance rather than a fixed budget.
+  Equal-area admin candidates at one level now resolve deterministically.
 - `merge-changes` and `tags-filter --input-kind osc` keep the body of a
   delete - tags, way node refs, relation members and a deleted node's
   location - as osmium does, instead of writing only its identity and
@@ -31,6 +41,17 @@
   complete or no metadata stay dense. A node without metadata is no longer
   given zero metadata because it shares a dense run with nodes that have
   it. `digest` accepts a block holding both node encodings.
+- Every other command that re-encodes elements (`cat`, `sort`, `repack`,
+  `degrade`, `extract`, `tags-filter`, `time-filter`, `getid`,
+  `getparents`, `add-locations-to-ways`) now keeps the metadata fields of
+  a plain node, way or relation exactly as the input carries them. An
+  absent uid, changeset, timestamp or user is no longer written as `0` or
+  empty, and an `Info` without a version keeps its other fields instead of
+  being dropped whole, which used to lose its user and turn a deleted
+  element visible. A version or changeset of `-1` is read as absent and
+  stays absent. `--clean` zeroes a field the element carries and leaves an
+  absent one absent. A plain node with version 0 stays a plain node.
+  Dense nodes are unchanged.
 - `--direct-io` help and the I/O capability matrix in `docs/cli/commands.md`
   now state which read passes and writes each command actually performs
   with O_DIRECT; a run prints a Note when the filesystem reports zero

@@ -1315,24 +1315,14 @@ pub(crate) const GEOCODE_ADMIN_LEVEL_MIN: u8 = 2;
 /// The `admin_level` whose boundaries carry the country code.
 pub(crate) const GEOCODE_COUNTRY_ADMIN_LEVEL: u8 = 2;
 
-// The CLI cap is interpreted as the local-boundary budget, with progressively
-// more detail retained for larger administrative levels. This reduces border
-// displacement without making a country and a municipality share one arbitrary
-// vertex budget. Postal boundaries deliberately use the local cap: their
-// reserved level is not an administrative hierarchy level and must not inherit
-// country budgets.
-
-/// Admin vertex-budget multiplier for levels 0 to 2 (applied to the base
-/// `max_admin_vertices`).
-pub(crate) const ADMIN_VERTEX_MULTIPLIER_LEVELS_0_TO_2: usize = 16;
-/// Admin vertex-budget multiplier for level 3.
-pub(crate) const ADMIN_VERTEX_MULTIPLIER_LEVEL_3: usize = 8;
-/// Admin vertex-budget multiplier for level 4.
-pub(crate) const ADMIN_VERTEX_MULTIPLIER_LEVEL_4: usize = 4;
-/// Admin vertex-budget multiplier for level 5.
-pub(crate) const ADMIN_VERTEX_MULTIPLIER_LEVEL_5: usize = 2;
-/// Admin vertex-budget multiplier for every other level.
-pub(crate) const ADMIN_VERTEX_MULTIPLIER_DEFAULT: usize = 1;
+/// Longest longitude extent, in degrees of the ring's point-in-polygon frame,
+/// that one simplified admin edge may span. `geo::simplify_ring` splits any
+/// longer chord even when every vertex under it lies on it, so no stored edge
+/// can reach the 180 degrees at which the reader's antimeridian frame would
+/// read it the other way round the globe. Any value below 180 is sound; this
+/// one leaves a wide margin and only binds on long straight parallels (a ring
+/// running round a pole).
+pub(crate) const ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG: f64 = 90.0;
 
 /// Default street-cell S2 level of `BuildConfig`.
 pub(crate) const GEOCODE_DEFAULT_STREET_LEVEL: u8 = 17;
@@ -1343,8 +1333,12 @@ pub(crate) const GEOCODE_DEFAULT_COARSE_LEVEL: u8 = 14;
 /// Default admin-cell S2 level of `BuildConfig`.
 pub(crate) const GEOCODE_DEFAULT_ADMIN_LEVEL: u8 = 10;
 
-/// Default `max_admin_vertices` of `BuildConfig`.
-pub(crate) const GEOCODE_DEFAULT_MAX_ADMIN_VERTICES: u16 = 500;
+/// Default `admin_tolerance_m` of `BuildConfig`: the most, in metres, that a
+/// simplified admin boundary may move. A point farther than this from every
+/// original ring of a polygon gets the same containment answer as against the
+/// unsimplified rings. Smaller keeps more vertices, so a larger index and more
+/// point-in-polygon work per admin candidate.
+pub(crate) const GEOCODE_DEFAULT_ADMIN_TOLERANCE_M: f32 = 20.0;
 
 /// Default fine search radius of `BuildConfig`, in metres.
 pub(crate) const GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M: f32 = 75.0;

@@ -7,6 +7,12 @@ which release brought what). This page is written by hand, not generated:
 (`crates/cli/src/lib.rs`, `doc_coverage_tests`) fails when a visible command,
 flag or enumerated value of the CLI has no place here.
 
+Older links to the former CLI reference must use this page. The former
+site fragments `#index-verifying-blob-level-metadata` and
+`#locations-verifying-inline-way-locations` are now `#index-verification`
+and `#inline-location-verification`; the former LocationsOnWays maintenance
+section is the `--locations-on-ways` section. Old fragments are not forwarded.
+
 Every enumerated flag value (`--compression`, `--type`, `--index-type`,
 `--clean`, `inspect tags --sort`, the `bench-*` modes) is parsed once at
 the argument boundary, so a malformed one is a usage error before any input
@@ -289,7 +295,8 @@ check, export, digest, build-geocode-index) size them themselves and have no
 **With `--force`, a command that would refuse unindexed input proceeds with
 the slower fallback.** Only commands that refuse unindexed input have the flag, and each
 refuses through the same gate: a typed missing-indexdata error naming the
-input, which the CLI follows with `Generate an indexed PBF first ...` (the
+input, which the CLI follows with `Generate an indexed PBF first ...` and
+`check --index` to diagnose missing or contradictory blob metadata (the
 library's text names no command or flag). The CLI then adds `Or pass --force
 to proceed anyway.` only where
 `--force` is accepted: modes that need indexdata whatever `--force` says get
@@ -980,6 +987,11 @@ files whose hints are well-formed and false.
 `Sort.Type_then_ID` with a blob internally out of order passes it. Combine it
 with `--ids`, which checks ID and type order.
 
+The CLI names `check --index` alongside the repair for missing indexdata
+(whole or partial) and contradictory indexdata. For an unsorted refusal it
+names `check --index --ids` alongside `sort --distrust-metadata`: diagnosing
+order requires `--ids`. These checks report defects; they do not repair them.
+
 `check --index` is the other side of that boundary. It decompresses every
 OSMData blob, re-derives the metadata from the payload with `try_scan_block_ids_checked`
 (and, where the blob carries tagdata, the key set from the same walk), and
@@ -1576,7 +1588,7 @@ With `--format osc`, generates an OSC diff file instead of text output. Text-onl
 
 With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does (same paths and refusals) but formats nothing. `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
-With `-v`, each modified element is followed by indented detail lines: `coordinates: (lat, lon) -> (lat, lon)` for a node, `-ref @i n<id>` and `+ref @i n<id>` for a way's node refs, `-member @i type/id "role"` and `+member @i type/id "role"` for a relation (an unknown member type prints as `unknown(raw)/id`), and `-"k"="v"`, `+"k"="v"`, `~"k": "old" -> "new"` for tags. Way refs, member and tag order are content, so detail is never empty for a modified element. Refs and members are ordered edit scripts: all removals, then all insertions, each with its zero-based position in the old list (removals) or the new list (insertions), so a moved member prints as a `-member`/`+member` pair of the same member at its old and new positions, and a dropped duplicate as one `-member`. Removing the marked old items and placing the inserted ones at their new positions, with the kept items filling the rest in order, gives the new list. When several shortest scripts exist the one printed is fixed by the algorithm, not by which item moved. A script of more than 1000 edits, or one too costly to compute, prints one line instead: `refs: N -> M, old @a..b -> new @c..d replaced (details omitted)` (`members:` and `tags:` likewise), with N and M the list lengths and half-open ranges; it says the old range was replaced by the new one, not that every item in them differs. Keyed tag detail also has a 1000-line limit, counting additions, removals, value changes and the order-change line; above it the entire tag detail is replaced by `tags: N -> M (details omitted)`, with the old and new tag counts. Tags are keyed, without positions: a reorder of keys present on both sides adds `tags: order changed`, and a tag list with a duplicate key prints an ordered `-tag @i "k"="v"`/`+tag @i "k"="v"` edit script instead. Every key, value and role prints as a complete double-quoted literal that is also a valid JSON string, never truncated: `"` and `\` print as `\"` and `\\`, newline, carriage return and tab as `\n`, `\r` and `\t`, and every other control character (C0, DEL, C1), U+2028, U+2029 and the Unicode bidi controls (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) as `\u` with four lowercase hex digits; all other text prints as itself. So each detail record is exactly one line, whichever of LF, CRLF or Unicode line breaks a reader splits on, and `=` or ` -> ` inside a literal is never a separator.
+With `-v`, each modified element is followed by indented detail lines: `coordinates: (lat, lon) -> (lat, lon)` for a node, `-ref @i n<id>` and `+ref @i n<id>` for a way's node refs, `-member @i type/id "role"` and `+member @i type/id "role"` for a relation (an unknown member type prints as `unknown(raw)/id`), and `-"k"="v"`, `+"k"="v"`, `~"k": "old" -> "new"` for tags. Way refs, member and tag order are content, so detail is never empty for a modified element. Refs and members are ordered edit scripts: all removals, then all insertions, each with its zero-based position in the old list (removals) or the new list (insertions), so a moved member prints as a `-member`/`+member` pair of the same member at its old and new positions, and a dropped duplicate as one `-member`. Removing the marked old items and placing the inserted ones at their new positions, with the kept items filling the rest in order, gives the new list. When several shortest scripts exist the one printed is fixed by the algorithm, not by which item moved. A script of more than 1000 edits, or one too costly to compute, prints one line instead: `refs: N -> M, old @a..b -> new @c..d replaced (details omitted)` (`members:` and `tags:` likewise), with N and M the list lengths and half-open ranges; it says the old range was replaced by the new one, not that every item in them differs. Keyed tag detail also has a 1000-line limit, counting additions, removals, value changes and the order-change line; above it the entire tag detail is replaced by `tags: N -> M (details omitted)`, with the old and new tag counts. Keyed tags favor readability over reconstructing the new order: inserting a new key before or after an existing key can print the same detail. Tags are keyed, without positions: a reorder of keys present on both sides adds `tags: order changed`, and a tag list with a duplicate key prints an ordered `-tag @i "k"="v"`/`+tag @i "k"="v"` edit script instead. Every key, value and role prints as a complete double-quoted literal that is also a valid JSON string, never truncated: `"` and `\` print as `\"` and `\\`, newline, carriage return and tab as `\n`, `\r` and `\t`, and every other control character (C0, DEL, C1), U+2028, U+2029 and the Unicode bidi controls (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) as `\u` with four lowercase hex digits; all other text prints as itself. So each detail record is exactly one line, whichever of LF, CRLF or Unicode line breaks a reader splits on, and `=` or ` -> ` inside a literal is never a separator.
 
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
@@ -1603,6 +1615,15 @@ With `--format osc`, roundtrips content - applying the derived OSC to the old PB
 A comparison whose ID ranges give no point to cut a work unit within 1 GiB of blobs (one ID repeated across that many adjacent blobs) is refused as a resource limit.
 
 **Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`, and every blob header of both files is checked: it refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). Each header is checked as the input's stream reaches it, and the rest of both files is read before the run succeeds, so a defect late in a file can be refused after earlier text was written. The body of a blob of a kind `-t` excludes is never read. Blob bodies of the selected kinds are decoded where the comparison needs them: a byte-identical blob pair (same claimed range and count, same compression and compressed bytes) is not decoded when the comparison may skip equal blobs (`-c`, `-q`, `--format osc`), so a corrupt body inside such a pair passes there and is refused by a diff that prints common elements. Where a block holds elements past its claimed last ID, the merge refuses the claim when it meets them, unless a work-unit boundary falls inside the block's claimed range: the block is then clipped to each unit's range, and what it holds past its claim is in no unit. Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
+
+Indexed diff also trusts claimed element counts: byte-identical pairs add
+the claimed count to the common total, and single-sided runs use it for
+created or deleted totals, including count-only comparisons. A false count
+can therefore produce a wrong summary without a refusal, even when emitted
+elements are correct. Run `check --index` on both inputs to validate these
+claims; use `check --index --ids` to check their order too. Repair false
+metadata with `cat --reindex`, or order with `sort --distrust-metadata`,
+before comparing again.
 
 ### digest
 
@@ -1992,7 +2013,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--street-level <N>` | S2 cell level for streets/addresses; must exceed `--coarse-level`, within the builder's segment-cover limit. Default comes from the builder configuration |
 | `--coarse-level <N>` | Fallback cell level for rural areas; must be below `--street-level`, within the builder's segment-cover limit. Default comes from the builder configuration |
 | `--admin-level <N>` | S2 cell level for admin boundaries, within the builder's work limit. Default comes from the builder configuration |
-| `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value. Default comes from the builder configuration |
+| `--admin-tolerance <METERS>` | How far admin boundary simplification may move a boundary, the same at every admin level. A query farther than this from a boundary gets the answer the unsimplified boundary gives; nearer, it may get the neighbour or no area at that level. `0` keeps every vertex; smaller values make a larger index and slower admin lookups. Default comes from the builder configuration |
 | `--search-radius <M>` | Fine-level search distance in meters: a query answers the nearest street, address and interpolation closer than this. At most a fixed number of smallest cell widths at `--street-level` (see [Search radius bounds](#search-radius-bounds)). Default comes from the builder configuration |
 | `--coarse-search-radius <M>` | Coarse-level search distance in meters: the fallback for a class with nothing closer than `--search-radius`. At most a fixed number of smallest cell widths at `--coarse-level`. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
@@ -2135,6 +2156,10 @@ index. Indexes containing only some of those kinds, such as an admin-boundaries
 extract, are legitimate and still build.
 
 Outputs a set of binary files. See [performance/geocode.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/geocode.md) for measured build times, index size, and peak memory.
+
+The `bench-read`, `bench-write` and `bench-merge` commands are synthetic
+diagnostic workloads. They are intentionally outside the README user-command
+benchmark surface and are not planet-scale validation targets.
 
 ### bench-read
 

@@ -12,11 +12,6 @@ use super::Result;
 use super::pass1::RawAdminRelation;
 use crate::error::Error;
 use crate::geo::RingSearchBudgetExceeded;
-use crate::tunables::{
-    ADMIN_VERTEX_MULTIPLIER_DEFAULT, ADMIN_VERTEX_MULTIPLIER_LEVEL_3,
-    ADMIN_VERTEX_MULTIPLIER_LEVEL_4, ADMIN_VERTEX_MULTIPLIER_LEVEL_5,
-    ADMIN_VERTEX_MULTIPLIER_LEVELS_0_TO_2,
-};
 
 use super::super::format::*;
 
@@ -70,7 +65,7 @@ pub(super) fn assemble_admin_polygons(
 ) -> (Vec<AssembledPolygon>, DroppedAdminRelations) {
     use rayon::prelude::*;
 
-    let max_verts = config.max_admin_vertices as usize;
+    let tolerance_m = f64::from(config.admin_tolerance_m);
 
     // Per-relation work is independent - ring assembly, Douglas-Peucker
     // simplification, and hole attachment all read-only against `way_geom`
@@ -82,13 +77,7 @@ pub(super) fn assemble_admin_polygons(
         executor.install(|| {
             relations
                 .par_iter()
-                .map(|rel| {
-                    assemble_one_relation(
-                        rel,
-                        way_geom,
-                        admin_vertex_cap(rel.admin_level, max_verts),
-                    )
-                })
+                .map(|rel| assemble_one_relation(rel, way_geom, tolerance_m))
                 .collect()
         });
     let mut dropped = DroppedAdminRelations::default();
@@ -108,26 +97,6 @@ pub(super) fn assemble_admin_polygons(
         }
     }
     (polygons, dropped)
-}
-
-/// Interpret the CLI cap as the local-boundary budget and retain progressively
-/// more detail for larger administrative levels. This reduces border
-/// displacement without making a country and a municipality share one
-/// arbitrary vertex budget.
-// Postal boundaries deliberately use the local cap. Their reserved level is
-// not an administrative hierarchy level and must not inherit country budgets.
-fn admin_vertex_cap(admin_level: u8, base: usize) -> usize {
-    if base == 0 {
-        return 0;
-    }
-    let multiplier = match admin_level {
-        0..=2 => ADMIN_VERTEX_MULTIPLIER_LEVELS_0_TO_2,
-        3 => ADMIN_VERTEX_MULTIPLIER_LEVEL_3,
-        4 => ADMIN_VERTEX_MULTIPLIER_LEVEL_4,
-        5 => ADMIN_VERTEX_MULTIPLIER_LEVEL_5,
-        _ => ADMIN_VERTEX_MULTIPLIER_DEFAULT,
-    };
-    base.saturating_mul(multiplier)
 }
 
 /// Decide whether `hole` belongs to the outer ring `outer_f64`.
@@ -176,10 +145,22 @@ fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
 /// budget. Exceeding it on either the outer or the inner rings refuses the
 /// whole relation: a polygon assembled without its holes, or from a partial
 /// ring set, would be a silently different boundary.
+///
+/// Every ring is simplified on its own to `tolerance_m` (`geo::simplify_ring`
+/// states the contract). The reader's answer for this polygon is
+/// `in outer and not in any hole`, so if each ring keeps its own answer for a
+/// point, the polygon does: a point farther than the tolerance from every
+/// original ring of the polygon is answered as the unsimplified polygon
+/// would answer it. Simplified rings may therefore cross each other or
+/// themselves near the boundary; nothing here repairs that, because no
+/// answer outside the tolerance depends on it. What must NOT see simplified
+/// geometry is the decision which outer owns which hole: it changes the
+/// boolean formula itself, deep inside the hole, so it is made on the
+/// original rings.
 fn assemble_one_relation(
     rel: &RawAdminRelation,
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
-    max_verts: usize,
+    tolerance_m: f64,
 ) -> std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded> {
     // Extracts may contain a relation but omit one or more member ways. Only
     // member geometry present in this PBF can close an outer ring; missing
@@ -209,11 +190,7 @@ fn assemble_one_relation(
             .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
             .collect();
 
-        let simplified = if max_verts > 0 {
-            crate::geo::simplify_ring(&outer_f64, max_verts)
-        } else {
-            outer_f64.clone()
-        };
+        let simplified = crate::geo::simplify_ring(&outer_f64, tolerance_m);
 
         if simplified.len() < 3 {
             continue;
@@ -233,13 +210,11 @@ fn assemble_one_relation(
 
         // Add inner rings (holes) that fall inside this outer ring.
         //
-        // Test containment against the *original* `outer_f64`, not the
-        // Douglas-Peucker-simplified `simplified`. Aggressive simplification
-        // on the outer can shift the boundary by up to the DP tolerance,
-        // and a hole whose `hole[0]` lies near the original boundary can
-        // end up outside `simplified` even though the hole is topologically
-        // inside. "Which outer owns this hole" is about original topology;
-        // the rendered geometry we store in `vertices` is still the
+        // Test ownership against the *original* `outer_f64` and the original
+        // hole vertices, not simplified ones: simplification moves the
+        // boundary by up to the tolerance, so a hole sampled near it could
+        // change owner, which changes answers everywhere inside the hole,
+        // far beyond the tolerance. The geometry stored in `vertices` is the
         // simplified form.
         for hole in &inner_rings {
             if hole.is_empty() {
@@ -253,11 +228,7 @@ fn assemble_one_relation(
                 .iter()
                 .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
                 .collect();
-            let sh = if max_verts > 0 {
-                crate::geo::simplify_ring(&hole_f64, max_verts)
-            } else {
-                hole_f64
-            };
+            let sh = crate::geo::simplify_ring(&hole_f64, tolerance_m);
 
             if sh.len() >= 3 {
                 vertices.push(RING_SENTINEL);
@@ -414,22 +385,11 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     use super::{
-        DroppedAdminRelations, admin_vertex_cap, assemble_admin_polygons, hole_inside_outer,
+        DroppedAdminRelations, assemble_admin_polygons, hole_inside_outer,
         missing_admin_way_geometry,
     };
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
-
-    #[test]
-    fn admin_vertex_budget_scales_by_level() {
-        assert_eq!(admin_vertex_cap(8, 500), 500);
-        assert_eq!(admin_vertex_cap(5, 500), 1_000);
-        assert_eq!(admin_vertex_cap(4, 500), 2_000);
-        assert_eq!(admin_vertex_cap(3, 500), 4_000);
-        assert_eq!(admin_vertex_cap(2, 500), 8_000);
-        assert_eq!(admin_vertex_cap(2, usize::MAX), usize::MAX);
-        assert_eq!(admin_vertex_cap(2, 0), 0);
-    }
 
     #[test]
     fn relations_without_assembled_geometry_are_counted() {
@@ -636,5 +596,170 @@ mod tests {
         let outer = rect_lonlat(0.0, 0.0, 10.0, 10.0);
         let hole = rect_ring_e7(20.0, 20.0, 22.0, 22.0);
         assert!(!hole_inside_outer(&hole, &outer));
+    }
+
+    /// `(lon, lat)` degrees to an assembled `(lat_e7, lon_e7)` ring.
+    #[allow(clippy::cast_possible_truncation)]
+    fn ring_e7(lonlat: &[(f64, f64)]) -> Vec<(i32, i32)> {
+        lonlat
+            .iter()
+            .map(|&(lon, lat)| (deg_to_e7(lat) as i32, deg_to_e7(lon) as i32))
+            .collect()
+    }
+
+    /// Point-in-polygon over a stored polygon, exactly as the reader runs it.
+    fn stored_contains(
+        vertices: &[crate::geocode_index::format::NodeCoord],
+        lon: f64,
+        lat: f64,
+    ) -> bool {
+        let rings = crate::geocode_index::format::parse_rings(vertices.iter().copied());
+        let holes: Vec<&[(f64, f64)]> = rings[1..].iter().map(Vec::as_slice).collect();
+        crate::geo::point_in_polygon(lon, lat, &rings[0], &holes)
+    }
+
+    /// A simple ring whose bottom edge dips under the tip of a deep notch
+    /// coming down from the top edge. Douglas-Peucker under the former
+    /// vertex cap (10 here) dropped exactly the dip vertex (5, 1), its
+    /// smallest deviation, a full degree: the new bottom segment
+    /// (2, 2)-(8, 2) passed above the notch tip (5, 1.5), the stored ring
+    /// crossed itself, and (5, 1.2), some 21 km inside the boundary, read as
+    /// outside it. A count knob let the error reach whatever the count
+    /// demanded; a metric tolerance below that distance cannot.
+    fn notch_over_dip_ring() -> Vec<(f64, f64)> {
+        vec![
+            (0.0, 0.0),
+            (2.0, 2.0),
+            (5.0, 1.0),
+            (8.0, 2.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (6.0, 10.0),
+            (5.0, 1.5),
+            (4.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ]
+    }
+
+    #[test]
+    fn simplification_keeps_containment_beside_a_notch() {
+        let outer = notch_over_dip_ring();
+        let query = (5.0, 1.2);
+        assert!(
+            crate::geo::point_in_ring(query.0, query.1, &outer),
+            "the query point is inside the unsimplified boundary"
+        );
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        way_geom.insert(1, ring_e7(&outer));
+        let relations = vec![RawAdminRelation {
+            id: 1,
+            admin_level: 8,
+            name_offset: 1,
+            country_code_offset: 0,
+            outer_way_ids: vec![1],
+            inner_way_ids: Vec::new(),
+        }];
+        for admin_tolerance_m in [BuildConfig::default().admin_tolerance_m, 15_000.0] {
+            let config = BuildConfig {
+                admin_tolerance_m,
+                ..BuildConfig::default()
+            };
+            let (polygons, _) = assemble_admin_polygons(
+                &relations,
+                &way_geom,
+                &config,
+                &crate::host::Executor::Ambient,
+            );
+            assert_eq!(polygons.len(), 1);
+            assert!(
+                stored_contains(&polygons[0].vertices, query.0, query.1),
+                "simplification at {admin_tolerance_m} m moved a point 21 km inside \
+                 the boundary outside it: {:?}",
+                polygons[0].vertices
+            );
+        }
+    }
+
+    /// Through the builder, on a ring dense enough to be simplified hard:
+    /// every sample point farther than the tolerance from the original
+    /// boundary keeps its answer, holes included.
+    #[test]
+    fn far_points_keep_their_admin_answer() {
+        let wavy = |lon0: f64, radius: f64, n: u32, amp: f64, freq: f64| {
+            let mut ring: Vec<(f64, f64)> = (0..n)
+                .map(|i| {
+                    let a = f64::from(i) / f64::from(n) * std::f64::consts::TAU;
+                    let r = radius * (1.0 + amp * f64::sin(f64::from(i) * freq));
+                    (lon0 + r * a.cos(), 55.0 + r * a.sin())
+                })
+                .collect();
+            ring.push(ring[0]);
+            ring
+        };
+        // Wiggles of a few hundred metres: under the 1 km tolerance, so most
+        // vertices go, but not by much, so the bands overlap the wiggles.
+        let outer = wavy(10.0, 0.2, 2_000, 0.03, 1.7);
+        let hole = wavy(10.05, 0.05, 500, 0.1, 2.3);
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        way_geom.insert(1, ring_e7(&outer));
+        way_geom.insert(2, ring_e7(&hole));
+        let relations = vec![RawAdminRelation {
+            id: 1,
+            admin_level: 4,
+            name_offset: 1,
+            country_code_offset: 0,
+            outer_way_ids: vec![1],
+            inner_way_ids: vec![2],
+        }];
+        let tolerance = 1_000.0_f32;
+        let config = BuildConfig {
+            admin_tolerance_m: tolerance,
+            ..BuildConfig::default()
+        };
+        let (polygons, _) = assemble_admin_polygons(
+            &relations,
+            &way_geom,
+            &config,
+            &crate::host::Executor::Ambient,
+        );
+        assert_eq!(polygons.len(), 1);
+        let stored = &polygons[0].vertices;
+        assert!(
+            stored.len() < (outer.len() + hole.len()) / 2,
+            "{} stored",
+            stored.len()
+        );
+
+        // Conservative metres: the smallest cos(lat) over the box.
+        let c = f64::to_radians(55.25).cos();
+        let seg_dist_m = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+            let m = |(lon, lat): (f64, f64)| (lon.to_radians() * c, lat.to_radians());
+            let ((px, py), (ax, ay), (bx, by)) = (m(p), m(a), m(b));
+            let (dx, dy) = (bx - ax, by - ay);
+            let t = (((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            let (qx, qy) = (ax + t * dx - px, ay + t * dy - py);
+            (qx * qx + qy * qy).sqrt() * crate::geo::EARTH_RADIUS_M
+        };
+        let mut checked = 0;
+        for i in 0..=100 {
+            for j in 0..=100 {
+                let p = (
+                    9.75 + 0.5 * f64::from(i) / 100.0,
+                    54.75 + 0.5 * f64::from(j) / 100.0,
+                );
+                let near = [&outer, &hole]
+                    .iter()
+                    .flat_map(|r| r.windows(2))
+                    .any(|w| seg_dist_m(p, w[0], w[1]) <= f64::from(tolerance));
+                if near {
+                    continue;
+                }
+                checked += 1;
+                let original = crate::geo::point_in_polygon(p.0, p.1, &outer, &[&hole]);
+                assert_eq!(stored_contains(stored, p.0, p.1), original, "{p:?}");
+            }
+        }
+        assert!(checked > 5_000, "only {checked} points checked");
     }
 }

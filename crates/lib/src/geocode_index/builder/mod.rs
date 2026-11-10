@@ -66,7 +66,11 @@ pub struct BuildConfig {
     pub street_level: u8,
     pub coarse_level: u8,
     pub admin_level: u8,
-    pub max_admin_vertices: u16,
+    /// How far, in metres, admin boundary simplification may move a
+    /// boundary; 0 stores every vertex. A query farther than this from every
+    /// original ring of a polygon gets the answer the unsimplified polygon
+    /// gives. Must be finite and non-negative.
+    pub admin_tolerance_m: f32,
     pub fine_search_radius_m: f32,
     pub coarse_search_radius_m: f32,
 }
@@ -79,7 +83,7 @@ impl Default for BuildConfig {
             street_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
             coarse_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
             admin_level: crate::tunables::GEOCODE_DEFAULT_ADMIN_LEVEL,
-            max_admin_vertices: crate::tunables::GEOCODE_DEFAULT_MAX_ADMIN_VERTICES,
+            admin_tolerance_m: crate::tunables::GEOCODE_DEFAULT_ADMIN_TOLERANCE_M,
             fine_search_radius_m: crate::tunables::GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M,
             coarse_search_radius_m: crate::tunables::GEOCODE_DEFAULT_COARSE_SEARCH_RADIUS_M,
             direct_io: false,
@@ -136,6 +140,8 @@ impl BuildConfig {
             self.coarse_level,
         )
         .map_err(Error::invalid_argument_from)?;
+        crate::geocode_index::format::validate_admin_tolerance(self.admin_tolerance_m)
+            .map_err(Error::invalid_argument_from)?;
         Ok(())
     }
 }
@@ -807,7 +813,7 @@ fn build_generation(
         street_cell_level: config.street_level,
         coarse_cell_level: config.coarse_level,
         admin_cell_level: config.admin_level,
-        max_admin_vertices: config.max_admin_vertices,
+        admin_tolerance_m: config.admin_tolerance_m,
         fine_search_radius_m: config.fine_search_radius_m,
         coarse_search_radius_m: config.coarse_search_radius_m,
         replication_sequence: repl_seq,

@@ -1691,7 +1691,8 @@ impl Reader {
 
     // -- Admin search --------------------------------------------------------
 
-    /// Ranked admin: one per level, smallest area. The interior high bit is
+    /// Ranked admin: one per level, smallest area, ties to the lower polygon
+    /// index ([`admin_ranks_before`]). The interior high bit is
     /// read but ignored as a PIP bypass; every candidate still runs
     /// admin_polygon_contains (see the comment below).
     fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
@@ -1712,7 +1713,11 @@ impl Reader {
                     continue;
                 };
                 let level = poly.admin_level as usize;
-                if level >= ADMIN_LEVEL_SLOTS || poly.area >= best_by_level[level].1 {
+                if level >= ADMIN_LEVEL_SLOTS {
+                    continue;
+                }
+                let (best_idx, best_area) = best_by_level[level];
+                if !admin_ranks_before(poly.area, poly_idx, best_area, best_idx) {
                     continue;
                 }
                 // The interior high bit is only a hint: the reader still runs the
@@ -2119,9 +2124,48 @@ fn first_admin_attempt(seen: &mut FxHashSet<u32>, polygon_index: u32) -> bool {
     seen.insert(polygon_index)
 }
 
+/// Whether a candidate ranks ahead of the level's current best: smaller
+/// stored area, and on an equal area the lower polygon index. A total order,
+/// so the winner among containing polygons does not depend on which of the
+/// nine neighbourhood cells, or which entry within one, presented a
+/// candidate first; with area alone, two equal-area polygons swapped places
+/// whenever a rebuild changed the cell cover, far from either boundary.
+/// `best_idx` is `None` while the level has no winner yet.
+fn admin_ranks_before(
+    area: f32,
+    polygon_index: u32,
+    best_area: f32,
+    best_idx: Option<u32>,
+) -> bool {
+    match area.total_cmp(&best_area) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => best_idx.is_none_or(|best| polygon_index < best),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Equal-area candidates resolve to the lower polygon index whichever is
+    /// presented first, so the ranked answer is independent of traversal.
+    #[test]
+    fn equal_area_admin_candidates_rank_by_polygon_index() {
+        let pick = |order: &[(f32, u32)]| {
+            let mut best = (None, f32::MAX);
+            for &(area, idx) in order {
+                if admin_ranks_before(area, idx, best.1, best.0) {
+                    best = (Some(idx), area);
+                }
+            }
+            best.0
+        };
+        assert_eq!(pick(&[(5.0, 7), (5.0, 3)]), Some(3));
+        assert_eq!(pick(&[(5.0, 3), (5.0, 7)]), Some(3));
+        assert_eq!(pick(&[(5.0, 3), (4.0, 9), (5.0, 1)]), Some(9));
+        assert_eq!(pick(&[(f32::MAX, 2)]), Some(2));
+    }
 
     /// A fixed pseudo-random sequence in `[0, 1)`, so every run checks the
     /// same points.

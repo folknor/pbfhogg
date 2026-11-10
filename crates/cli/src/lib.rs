@@ -2346,13 +2346,14 @@ enum Command {
             default_value_t = GeocodeBuildConfig::default().admin_level
         )]
         admin_level: u8,
-        /// Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2
-        /// retain up to 2x, 4x, 8x, and 16x this value
+        /// Admin boundary simplification tolerance in meters: queries farther
+        /// than this from a boundary get the unsimplified answer; 0 keeps
+        /// every vertex
         #[arg(
             long,
-            default_value_t = GeocodeBuildConfig::default().max_admin_vertices
+            default_value_t = GeocodeBuildConfig::default().admin_tolerance_m
         )]
-        max_admin_vertices: u16,
+        admin_tolerance: f32,
         /// Fine-level search distance in meters: queries answer the nearest
         /// closer than this; limited to a fixed number of cell widths at
         /// --street-level
@@ -2495,7 +2496,7 @@ struct GeocodeLevels {
     street_level: u8,
     coarse_level: u8,
     admin_level: u8,
-    max_admin_vertices: u16,
+    admin_tolerance: f32,
     search_radius: f32,
     coarse_search_radius: f32,
 }
@@ -3482,7 +3483,7 @@ pub fn run() -> process::ExitCode {
                 street_level,
                 coarse_level,
                 admin_level,
-                max_admin_vertices,
+                admin_tolerance,
                 search_radius,
                 coarse_search_radius,
                 io,
@@ -3514,7 +3515,7 @@ pub fn run() -> process::ExitCode {
                         street_level,
                         coarse_level,
                         admin_level,
-                        max_admin_vertices,
+                        admin_tolerance,
                         search_radius,
                         coarse_search_radius,
                     },
@@ -3659,7 +3660,7 @@ fn run_build_geocode_index(
         street_level: levels.street_level,
         coarse_level: levels.coarse_level,
         admin_level: levels.admin_level,
-        max_admin_vertices: levels.max_admin_vertices,
+        admin_tolerance_m: levels.admin_tolerance,
         fine_search_radius_m: levels.search_radius,
         coarse_search_radius_m: levels.coarse_search_radius,
     };

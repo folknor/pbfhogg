@@ -22,9 +22,10 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// `strings.bin` entries length-prefixed instead of NUL-terminated (see
 /// [`read_pool_string`]); version 5 adds `AddrPoint.place_offset`
 /// (`addr:place`), `InterpWay.parent_kind`, and the numeric-step
-/// `interpolation_type` values. Readers deliberately reject other versions:
-/// existing indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 5;
+/// `interpolation_type` values; version 6 replaces the header's u16 admin
+/// vertex budget with the f32 `admin_tolerance_m` in bytes 12..16. Readers
+/// deliberately reject other versions: existing indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -242,10 +243,11 @@ pub struct Header {
     pub street_cell_level: u8,
     pub coarse_cell_level: u8,
     pub admin_cell_level: u8,
-    /// Base local-boundary simplification budget, not a stored-record limit.
-    /// Country/region budgets are multiples of this value; readers need only
-    /// each polygon's actual vertex_count. Retained for v3 metadata compatibility.
-    pub max_admin_vertices: u16,
+    /// Metres the builder's admin boundary simplification was allowed to move
+    /// a boundary (0: unsimplified). Descriptive: a query farther than this
+    /// from a polygon's source boundary got the source answer. Readers need
+    /// only each polygon's actual vertex_count.
+    pub admin_tolerance_m: f32,
     pub fine_search_radius_m: f32,
     pub coarse_search_radius_m: f32,
     pub replication_sequence: u32,
@@ -268,8 +270,7 @@ impl Header {
         buf[9] = self.coarse_cell_level;
         buf[10] = self.admin_cell_level;
         // buf[11] reserved
-        buf[12..14].copy_from_slice(&self.max_admin_vertices.to_le_bytes());
-        // buf[14..16] reserved
+        buf[12..16].copy_from_slice(&self.admin_tolerance_m.to_le_bytes());
         buf[16..20].copy_from_slice(&self.fine_search_radius_m.to_le_bytes());
         buf[20..24].copy_from_slice(&self.coarse_search_radius_m.to_le_bytes());
         buf[24..28].copy_from_slice(&self.replication_sequence.to_le_bytes());
@@ -317,12 +318,15 @@ impl Header {
             .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
         validate_radius("coarse search radius", coarse_search_radius_m, coarse)
             .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
+        let admin_tolerance_m = f32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        validate_admin_tolerance(admin_tolerance_m)
+            .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
         Ok(Self {
             format_version: version,
             street_cell_level: street,
             coarse_cell_level: coarse,
             admin_cell_level: admin,
-            max_admin_vertices: u16::from_le_bytes([buf[12], buf[13]]),
+            admin_tolerance_m,
             fine_search_radius_m,
             coarse_search_radius_m,
             replication_sequence: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
@@ -1135,9 +1139,22 @@ pub(crate) fn validate_radius(name: &str, radius: f32, level: u8) -> Result<(), 
     Ok(())
 }
 
-/// A search radius the index cannot carry. A neutral leaf: the builder config
-/// check classifies it as an invalid argument, the header parse as invalid
-/// index metadata.
+/// Check the admin simplification tolerance, in metres: finite and
+/// non-negative. Shared by the builder config check and the header parse, as
+/// [`validate_radius`] is.
+pub(crate) fn validate_admin_tolerance(tolerance_m: f32) -> Result<(), RadiusError> {
+    if !tolerance_m.is_finite() || tolerance_m < 0.0 {
+        return Err(RadiusError::NotFinite {
+            name: "admin tolerance".to_owned(),
+            radius: tolerance_m,
+        });
+    }
+    Ok(())
+}
+
+/// A search radius or other metre distance the index cannot carry. A neutral
+/// leaf: the builder config check classifies it as an invalid argument, the
+/// header parse as invalid index metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RadiusError {
     /// Not a finite non-negative number.
@@ -1240,7 +1257,7 @@ mod tests {
             street_cell_level: 17,
             coarse_cell_level: 14,
             admin_cell_level: 10,
-            max_admin_vertices: 500,
+            admin_tolerance_m: 20.0,
             fine_search_radius_m: 75.0,
             coarse_search_radius_m: 1000.0,
             replication_sequence: 0,
@@ -1359,7 +1376,7 @@ mod tests {
             street_cell_level: 17,
             coarse_cell_level: 14,
             admin_cell_level: 10,
-            max_admin_vertices: 500,
+            admin_tolerance_m: 20.0,
             fine_search_radius_m: 75.0,
             coarse_search_radius_m: 1000.0,
             replication_sequence: 4704,
@@ -1379,7 +1396,7 @@ mod tests {
         assert_eq!(parsed.street_cell_level, 17);
         assert_eq!(parsed.coarse_cell_level, 14);
         assert_eq!(parsed.admin_cell_level, 10);
-        assert_eq!(parsed.max_admin_vertices, 500);
+        assert_eq!(parsed.admin_tolerance_m.to_bits(), 20.0_f32.to_bits());
         assert!((parsed.fine_search_radius_m - 75.0).abs() < f32::EPSILON);
         assert!((parsed.coarse_search_radius_m - 1000.0).abs() < f32::EPSILON);
         assert_eq!(parsed.replication_sequence, 4704);

@@ -854,7 +854,7 @@ impl<R: Read + Send> BlobReader<R> {
         // zero-fill: `Frames::over_file`). One fresh allocation per blob, so under a glibc mmap threshold
         // below the frame size every frame is mapped and unmapped: at
         // planet a 1 MiB threshold cost getid's second pass about 4 %
-        // (reference/performance.md, "glibc's sliding mmap threshold across
+        // (reference/performance/memory.md, "glibc's sliding mmap threshold across
         // commands"). Recycling frames would have to follow the frame's last
         // `Bytes` slice, which a raw payload carries past decompression.
         let frame_len = header.payload_offset() + header.data_size;

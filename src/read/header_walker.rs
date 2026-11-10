@@ -302,7 +302,7 @@ impl Positional for crate::read::direct_reader::DirectPositional {
 ///   walk over headers an earlier walk left cached, bodies not, read the
 ///   bodies: europe `check --refs` measured 0.27 s and no disk read for its
 ///   schedule walk with probes, 19.8 s and 15.9 GB with density-gated windows
-///   alone (`reference/performance.md`). A transport that cannot tell
+///   alone (`reference/performance/read-pipeline.md`). A transport that cannot tell
 ///   residency never reads windows; the `O_DIRECT` one always misses, since
 ///   none of its reads come from cache.
 ///
@@ -628,7 +628,7 @@ impl HeaderWalker {
     ///
     /// Buffered probes and payload reads go through the page cache, so the
     /// headers a walk read stay cached for a later walk of the same file
-    /// (a warm walk is far cheaper than a cold one; reference/performance.md
+    /// (a warm walk is far cheaper than a cold one; reference/performance/read-pipeline.md
     /// records the swing). A caller honouring `--direct-io` opens the walk
     /// with [`Self::open_direct`] instead, giving that residency up.
     pub(crate) fn open<'a>(

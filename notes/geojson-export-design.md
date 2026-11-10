@@ -93,7 +93,7 @@ These cannot be built from inside the pbfhogg workspace; they need the
   and brokkr has no GeoJSON scratch output kind, so no bench cell can run
   today. Once that plumbing and the Denmark altw artifact exist, establish
   the v1 export throughput baseline (host + commit recorded) in
-  `reference/performance.md`. A first-ever baseline needs no
+  `reference/performance/README.md`. A first-ever baseline needs no
   performance-history arc.
 
 ## Cross-references

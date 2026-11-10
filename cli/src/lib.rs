@@ -2017,7 +2017,7 @@ enum Command {
         ///              disk equal to referenced_nodes * 8 bytes.
         ///   external - double radix join with bounded working memory and
         ///              sequential I/O. Requires sorted input with indexdata and
-        ///              has high temporary-disk demand. See reference/performance.md.
+        ///              has high temporary-disk demand. See reference/performance/README.md.
         #[arg(long, default_value = "auto")]
         index_type: IndexTypeArg,
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.

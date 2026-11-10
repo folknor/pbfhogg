@@ -1,7 +1,7 @@
 # Testing
 
 Test placement, validation tiers, and conventions for pbfhogg.
-Cross-ref `reference/performance.md` for perf baselines, and
+Cross-ref `reference/performance/README.md` for perf baselines, and
 "Tests that do not run everywhere" below for the runbook on tests
 that skip or compile out by default.
 

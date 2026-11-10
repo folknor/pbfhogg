@@ -187,7 +187,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         // parallelism; a fixed budget would need a cap on concurrent jobs,
         // which trades assembly wall for memory. The envelope is reached
         // only under backpressure (slow output, a straggling early chunk, a
-        // producer outrunning the pool); reference/performance.md
+        // producer outrunning the pool); reference/performance/diff.md
         // "Unindexed `.osc.gz` assembly" records an ordinary run far below it.
         //
         // The permits are what make this a bound on seq *distance*, which is

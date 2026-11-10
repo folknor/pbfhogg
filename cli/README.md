@@ -64,7 +64,7 @@ Benchmarked on Denmark (487 MB, 59M elements):
 | tags-filter | 0.24s | 0.56s | 2.3x |
 | add-locations-to-ways | 6.5s | 12.1s | 1.9x |
 
-For `apply-changes` measurements at larger scales, including commit and host, see [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
+For `apply-changes` measurements at larger scales, including commit and host, see [reference/performance/apply-changes.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/apply-changes.md).
 
 ## License
 

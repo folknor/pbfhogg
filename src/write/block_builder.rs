@@ -1631,7 +1631,7 @@ impl BlockBuilder {
     /// Computing a width per value costs more than bulk-copying the
     /// already-encoded bytes. Shapes not tried: accumulating packed lengths
     /// as values are added, and reserving prefix space then compacting. See
-    /// reference/performance.md "Dense-node direct encoding, refused".
+    /// reference/performance/write-pipeline.md "Dense-node direct encoding, refused".
     ///
     /// DenseNodes fields:
     ///   id (sint64 packed, field 1), denseinfo (submessage, field 5),

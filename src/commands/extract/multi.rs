@@ -165,7 +165,7 @@ pub(super) fn try_extract_multi_single_pass(
     // every region an ID belongs to. Workers encode each blob's matches into
     // pages and the consumer only installs or merges them: direct hot-loop
     // set insertion and whole-worker dense accumulation have already lost on
-    // time and memory, respectively (reference/performance-history.md). No
+    // time and memory, respectively (reference/performance/multi-extract.md). No
     // up-front refusal bounds memory: header ID ranges cannot predict
     // membership, and an admission budget needs a caller's memory policy, not
     // a machine-RAM guess inside this library.
@@ -407,7 +407,7 @@ pub(super) fn try_extract_multi_single_pass(
         // not the offset tables a build appends. This one pass replaced a
         // block pool for the rest and a raw pool that copied each candidate
         // into a block; it is a simplification, measured neutral at planet
-        // (reference/performance.md, "Payloads validated where they lie").
+        // (reference/performance/check.md, "Payloads validated where they lie").
         let node_blobs_ref = &node_blobs;
         crate::scan::classify::parallel_project_phase(
             &shared_file,
@@ -586,7 +586,7 @@ pub(super) fn try_extract_multi_single_pass(
     // length on `read::project_ids::WaySpans` at planet. This loop adds the
     // per-region membership tests on top, so the message re-parse a
     // projection would remove is a smaller share still
-    // (reference/performance.md, "inspect --nodes reads through a
+    // (reference/performance/inspect.md, "inspect --nodes reads through a
     // projection").
     host.invocation.marker("MULTI_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(

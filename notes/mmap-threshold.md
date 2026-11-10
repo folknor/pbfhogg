@@ -1,7 +1,7 @@
 # glibc's mmap threshold: a per-command policy for the CLI
 
 Transient note. The measured cells, the mechanism and the CLI-wide verdict
-are durable and live in reference/performance.md, "glibc's sliding mmap
+are durable and live in reference/performance/memory.md, "glibc's sliding mmap
 threshold across commands", and in the `set_mmap_threshold` doc in
 `src/process.rs`. This note holds what is not settled.
 

@@ -803,7 +803,7 @@ impl PrimitiveBlock {
 ///
 /// The tenth-byte rule needs a position within the varint, and carrying one
 /// per byte makes the loop serial: it cost 15-19 % of single-threaded planet
-/// decode (see "Packed varint count" in `reference/performance.md`). So the
+/// decode (see "Packed varint count" in `reference/performance/read-pipeline.md`). So the
 /// common case runs eight bytes at a time: terminal bytes are counted with one
 /// mask and popcount per word, and the only state carried between words is
 /// the length of the continuation run at the word's end. Without a run of
@@ -1777,7 +1777,7 @@ fn validate_info(info_data: Option<&[u8]>) -> Result<Option<super::wire::WireInf
 /// Cost: measured on planet against the tree before this check, the
 /// per-element parse refusals and the re-encode `Result`s in `owned.rs`
 /// together cost nothing visible on `brokkr read` or `repack`
-/// (reference/performance.md, "Element parse and re-encode refusals checked
+/// (reference/performance/read-pipeline.md, "Element parse and re-encode refusals checked
 /// in release"). Re-measure only after a change to these sites.
 #[inline]
 #[track_caller]

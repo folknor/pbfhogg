@@ -256,7 +256,7 @@ fn append_capped_missing_refs(
 /// of missing references: a ways-only planet, every ref missing, costs about
 /// one node-range bitset. Workers keep the `Vec` push in their hot loop and
 /// sort and deduplicate each blob's misses; the serial merge inserts them
-/// (the push-then-drain shape `reference/performance-history.md` records,
+/// (the push-then-drain shape `reference/performance/classify.md` records,
 /// never a set insertion per element). A file with no missing references
 /// allocates nothing for them.
 ///
@@ -283,7 +283,7 @@ fn append_capped_missing_refs(
 /// still checks (a check that passed a corrupt file would vouch for it). An
 /// earlier refusal of a selective parser here rested on a Europe hotpath
 /// that timed only the offset tables; the element walk it left out was most
-/// of the workers' CPU after decompression (`reference/performance.md`,
+/// of the workers' CPU after decompression (`reference/performance/projections.md`,
 /// "check --refs and getid read through projections").
 ///
 /// # Input

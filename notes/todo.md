@@ -3,7 +3,7 @@
 ## Carried over from the 0.6.0 release (2026-11-09)
 
 The README's three tables come from the campaign at `53360af4`
-(reference/performance.md "README campaign"). Left open:
+(reference/performance/cross-command.md "README campaign"). Left open:
 
 - [ ] **Planet isolation-cat row, held back from the README library
   table.** `d73fbee8`: library 43.1-55.4 s, CLI 55.9-69.5 s, ratio 1.28,
@@ -305,7 +305,7 @@ are removed; git history keeps them. Detail stays in notes/.
   (see the apply-changes entry below).
 - Milestones A/B/C + GPU (Non-traditional optimization research).
 - **renumber polish** (formerly notes/renumber-optimization.md, retired
-  to git history; baseline in reference/performance.md). Item 1:
+  to git history; baseline in reference/performance/README.md). Item 1:
   varint encode fast path in the three wire_rewrite call sites via
   protohoggr's `encode_varint_to_slice` - plausible ~1-1.5 % of wall,
   needs a paired same-commit bench and widens the unsafe surface; skip
@@ -379,7 +379,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   always.
 
 - [ ] **`merge-changes --simplify` holds the rendered XML of every input
-  change** (peak anon at planet 7-OSC in reference/performance.md,
+  change** (peak anon at planet 7-OSC in reference/performance/README.md,
   merge-changes `--simplify`). The
   output's `(kind, id)` order is what forces holding it. Bounding it further
   means either spilling rendered batches to scratch and reading survivors
@@ -506,12 +506,12 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 - [ ] **Uncited performance figures on the site.** Still open for
   `docs/guide/indexdata.md` (blob-share and size-overhead claims), owned by
   another agent and left untouched here. Each figure needs a source in
-  `.brokkr/results.db` / `reference/performance.md` with commit and host,
+  `.brokkr/results.db` / `reference/performance/README.md` with commit and host,
   or removal. On 2026-11-10, removed the unsupported apply-changes scale
   table, Japan osmium comparison, blob-share and RSS claims, and io_uring
   timing advice from `docs/guide/performance.md`; replaced its unpinned
   extract comparison with the Japan row at `cadc3e6` on plantasjen from
-  `reference/performance.md`. Replaced inspect's index-only timing in
+  `reference/performance/README.md`. Replaced inspect's index-only timing in
   `docs/cli/commands.md` with the reference's `53360af4` / bygg measurement,
   and replaced the apply-changes scale figures in `cli/README.md` with a
   pointer to the recorded measurements.
@@ -647,7 +647,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   The level cap (19) stays either way: an exact cover's work still doubles
   per level, now bounded by a proved cell count rather than a sample count.
   The PIP cost is the query cost: admin point-in-polygon dominates every row
-  of the query latency table in `reference/performance.md`. The query's own admin cell
+  of the query latency table in `reference/performance/geocode.md`. The query's own admin cell
   already lists every polygon containing it under an exact cover, so the
   eight neighbours' entries are pure extra PIP work; the same header signal
   would let the reader drop them.
@@ -676,7 +676,7 @@ Per-command plans and open follow-ups. Details drift as work lands.
   - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
   - Open questions preserved from the note: actual overlap-blob ratio under larger OSCs (re-measure if input diffs grow; governs worker-pool load); byte-budget reorder capacity sizing (current setting works at planet; revisit on RSS/stall signals); scanner HeaderWalker vs worker throughput balance (no signal it's an issue).
 
-- [ ] **[notes/altw-external.md](altw-external.md)** - `add-locations-to-ways --index-type external`. Current baselines and history are in `reference/performance.md` and [`notes/altw-optimization-history.md`](altw-optimization-history.md); failed attempts and the do-not-retry list are there too.
+- [ ] **[notes/altw-external.md](altw-external.md)** - `add-locations-to-ways --index-type external`. Current baselines and history are in `reference/performance/add-locations-to-ways.md` and [`notes/altw-optimization-history.md`](altw-optimization-history.md); failed attempts and the do-not-retry list are there too.
 
 ## Planet-scale validation coverage
 
@@ -691,7 +691,7 @@ cells land. This section tracks the remaining axes and dataset gaps.
   thrashes at planet on a 28 GB-class host: the rank-indexed flat scratch
   outgrows the page cache and pass 2's location write-back turns into
   random-access mmap faults (soft failure, unboundedly slow, not OOM;
-  reference/performance.md "Auto routing threshold"). Planet runs need
+  reference/performance/add-locations-to-ways.md "Auto routing threshold"). Planet runs need
   `--index-type external`, which the README says. Open: whether the
   default should route to external, or refuse, at planet scale.
 
@@ -725,7 +725,7 @@ Known to work, no performance question open, but not in the results DB:
   cache). Not needed for general validation; open only if ID-set shape
   becomes a perf question.
 - [ ] **`--direct-io` at planet**. Covered: apply-changes, cat
-  passthrough, `cat --dedupe` and sort (reference/performance.md
+  passthrough, `cat --dedupe` and sort (reference/performance/write-pipeline.md
   "`--direct-io` impact summary"). Not measured: extract,
   add-locations-to-ways external, merge-changes. Only matters if
   direct-io becomes a default on any of them.
@@ -742,7 +742,7 @@ Known to work, no performance question open, but not in the results DB:
 - [ ] **altw external pass A's exposure to sustained-write state
   (2026-11-09).** A short trim before a cell
   restores pass A (about 23 s against 36-41 s without one) and launch-time
-  Dirty/Writeback is negligible (reference/performance.md, "altw external
+  Dirty/Writeback is negligible (reference/performance/sort.md, "altw external
   pass A after a trim or after another cell", `098c89cb`); exposure scales
   with scratch bytes ("Packed id-shard records"). Left: an idle-only rest
   cell and no-trim gaps matched to the trim's duration (the harness
@@ -761,7 +761,7 @@ Known to work, no performance question open, but not in the results DB:
   binding is the head blob's own work behind a 64-slot window
   (`POOL_REORDER_CAPACITY_WIDE`). Whether a wider window or a different
   germany blob mix explains it, and whether it moves the wall, is not
-  measured (reference/performance.md, "Read-ahead advice after the
+  measured (reference/performance/sort.md, "Read-ahead advice after the
   credit").
 - [ ] **getid's full-scan arm reads every payload it then skips
   (2026-11-09).** `filter_by_id_streaming` uses `Frames::next_raw`, so a
@@ -775,7 +775,7 @@ Known to work, no performance question open, but not in the results DB:
   (2026-11-08).** One sweep per component: an input whose every kind is
   one connected component (the Denmark `chained` snapshot) sweeps in
   three jobs, the node component dominating (`SORT_PASS2` 24.1 s at
-  `d044980e`, bygg; reference/performance.md, "Sort across the blob-merge
+  `d044980e`, bygg; reference/performance/sort.md, "Sort across the blob-merge
   engine move on unsorted Denmark"). Thread utilization and the critical
   path were not measured; this records the limit, not a defect or a
   remedy.
@@ -834,7 +834,7 @@ Known to work, no performance question open, but not in the results DB:
   - Every altw router publish takes a global `stats` mutex and the global
     `notify_mu`. Same caveat.
   - The `Mutex<Receiver>` desc-lock reading that used to be listed here
-    is in reference/performance-history.md, "Mutex<Receiver> blob dispatch
+    is in reference/performance/classify.md, "Mutex<Receiver> blob dispatch
     is not a bottleneck".
 
 - [ ] **tags-filter walks the headers again for each later pass.** The
@@ -890,7 +890,7 @@ benchmarks.
 Blob-level raw passthrough is closed for tags-filter (the pin is the
 comment block at the pass-2 worker in `src/commands/tags_filter/mod.rs`).
 time-filter still decodes and re-encodes via BlockBuilder; renumber's
-external mode splices ids on the wire (reference/performance.md,
+external mode splices ids on the wire (reference/performance/renumber.md,
 "Renumber (external mode)").
 
 Per-group raw passthrough, for partial-match blobs (e.g. extract boundary

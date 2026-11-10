@@ -1509,7 +1509,7 @@ pub enum PageCachePolicy {
 /// of the call's worker sets ended takes those workers' arenas with the free
 /// memory in them, which it strands if it then idles and reuses if it then
 /// works; a pool started before the call never gets them, and the next worker
-/// set does. Neither order suits every command (reference/performance.md,
+/// set does. Neither order suits every command (reference/performance/memory.md,
 /// "Idle executor threads take exited workers' arenas").
 /// `Pool` confines the work to the caller's pool. A caller can check where a
 /// writer's framing ran: the invocation counter
@@ -1631,7 +1631,7 @@ impl ExecutorRef<'_> {
 /// each pool on two arena locks and cost every allocation-heavy command
 /// measured wall time without bounding memory, so the event went with it
 /// ([`crate::process::cap_malloc_arenas`] has the mechanism;
-/// reference/performance.md, "The CLI no longer caps malloc arenas", the
+/// reference/performance/memory.md, "The CLI no longer caps malloc arenas", the
 /// numbers).
 pub trait ProcessActions: Send + Sync {
     /// Request permission to hold `wanted` descriptors at once. The answer's

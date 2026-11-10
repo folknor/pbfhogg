@@ -141,7 +141,7 @@ impl DenseNodeColumns {
         // so on a block whose true nanodegree value overflows `i64` it put
         // the node somewhere else than a simple extract does, and a matched
         // planet A/B of extract --strategy smart and multi-extract found
-        // its removal inside noise (reference/performance.md, "Columnar
+        // its removal inside noise (reference/performance/read-pipeline.md, "Columnar
         // granularity-100 shortcut").
         let mut cumulative_lat: i64 = 0;
         for delta in PackedSint64Iter::new(dense.lat_data) {

@@ -14,7 +14,7 @@ add-locations-to-ways can expand output, so the bound remains the configured
 decoded-block count times a bounded input payload. The former 64-block command
 materialization, its second rayon dispatch, the command-batch byte override,
 and the shared batch helper are deleted. See
-`reference/performance-history.md` for the measured basis: the retained
+`reference/performance/read-pipeline.md` for the measured basis: the retained
 high-blob-count cells improved getid by 7.68%, getparents by 6.51%, and
 tags-filter by 6.97%; getid primary's pass-2 peak RSS fell from 1.18 GB to
 596 MB.

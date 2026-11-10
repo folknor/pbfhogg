@@ -293,7 +293,7 @@ pub(super) fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractSta
 /// writer's executor a job. That is deliberate. A pool started lazily by its
 /// first job takes the malloc arenas a just-ended worker set left, free
 /// memory and all, and strands them if it then idles while the next phase
-/// runs on its own workers (`reference/performance.md`, "Idle executor
+/// runs on its own workers (`reference/performance/memory.md`, "Idle executor
 /// threads take exited workers' arenas"). Simple extract alternates classify
 /// pools with these write pools, and a node write whose blobs are mostly
 /// verified raw copies would start the executor for a handful of rebuilt

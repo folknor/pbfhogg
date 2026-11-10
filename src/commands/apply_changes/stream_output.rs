@@ -23,7 +23,7 @@
 //! encoded serially that kept the drain busy for a third of a second while
 //! the workers kept producing way output behind it, a backlog of framed
 //! output the allocator then kept as free memory in the workers' arenas for
-//! the rest of the run (reference/performance.md, "apply-changes' memory
+//! the rest of the run (reference/performance/apply-changes.md, "apply-changes' memory
 //! step at the node-to-way transition").
 
 use std::ops::Range;
@@ -151,8 +151,8 @@ where
                             // builder kept for the run: an invocation-owned
                             // pool of builders, tested at planet, showed no
                             // wall or sampled-peak benefit and usually
-                            // lengthened the transition (reference/
-                            // performance.md, "apply-changes' create-run
+                            // lengthened the transition (reference/performance/
+                            // apply-changes.md, "apply-changes' create-run
                             // builders are made per block"). A thread-local
                             // is ruled out on its own grounds: the
                             // executor's threads belong to the caller and

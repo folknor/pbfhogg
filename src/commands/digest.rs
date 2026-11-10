@@ -279,7 +279,7 @@ struct DigestTransform {
 /// a buffer from empty and freed it on the consumer: mapped, faulted and
 /// unmapped per block on every worker at once. At planet that left the
 /// workers off-CPU about a quarter of their time and the full form at
-/// 106.8 s against 61.7 s with reuse (bygg, reference/performance.md,
+/// 106.8 s against 61.7 s with reuse (bygg, reference/performance/digest.md,
 /// "digest v2 cost"). Buffers are cleared before reuse and pass by
 /// ownership, so no bytes cross between blocks; a buffer dropped on an
 /// error path is simply not reused.
@@ -636,7 +636,7 @@ impl DigestState {
         // streams - each 1024-byte block's lane sums computed on a pool,
         // folded here in order, bit-identical output, no new version - was
         // built and measured at planet and did not beat this (66.2 s
-        // against 61.7 s, bygg, reference/performance.md, "digest v2
+        // against 61.7 s, bygg, reference/performance/digest.md, "digest v2
         // cost"). Reconsider it only if serialization gets faster or this
         // hashing is shown to be the limit.
         self.buffers.give(content.records);

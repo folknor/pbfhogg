@@ -954,7 +954,7 @@ crate::counters::counter_set! {
 /// One lock per blob is not a measured cost: stored planet extract and
 /// tags-filter cells on bygg (through `141bb4c4`) record well under half a
 /// second of descriptor lock wait per invocation, summed over every worker,
-/// on walls above 50 s (reference/performance-history.md, "Mutex<Receiver>
+/// on walls above 50 s (reference/performance/classify.md, "Mutex<Receiver>
 /// blob dispatch is not a bottleneck"). A batch drain or an atomic claim
 /// needs a measurement showing this lock binding first; an atomic claim
 /// would also have to re-home the dispatcher's advancing `WILLNEED` cursor.
@@ -1082,7 +1082,7 @@ struct DecodeLocal<S> {
 /// where the advice lives, and no dispatch cost has been shown to recover.
 /// For extract simple's node and way classify, removing the advice
 /// measured neutral on planet and europe (bygg, 2026-11-08, at `e91e5f11`,
-/// reference/performance.md): it is kept, not proven to pay there. That
+/// reference/performance/classify.md): it is kept, not proven to pay there. That
 /// reading predates the advice being issued in calls the kernel honours
 /// whole; with them, planet `check --refs` ran 15 % faster (2026-11-09,
 /// "Classify WILLNEED in honoured calls").
@@ -1225,7 +1225,7 @@ struct ClassifyLocal<S> {
 /// idle that costs nothing: planet `cat --clean` (bygg) spends about 15 s
 /// of its 141 s wall in the syscall with the consumer waiting on results
 /// 90 % of the time, and moving the call before or after the credit made no
-/// difference (`reference/performance.md`, "Read-ahead advice after the
+/// difference (`reference/performance/classify.md`, "Read-ahead advice after the
 /// credit", "Classify WILLNEED in honoured calls"). Where the merge binds it
 /// is a third of the bottleneck: geocode Phase 2a on planet waited on
 /// results 0.75 s of 21.7 s and spent 7.2 s of it in the syscall (sidecar

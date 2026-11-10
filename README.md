@@ -70,7 +70,7 @@ Every command listed below runs on the full planet on normal hardware, within 28
 | `tags-filter -R highway=primary` | 34.4 s | 404 MiB | `53360af4` |
 | `time-filter` (snapshot, cutoff 2024-01-01) | 120 s | 688 MiB | `53360af4` |
 
-¹ On a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs; on a base without its untagged nodes most of the diff's way references go unresolved and the command refuses. See [reference/performance.md](reference/performance.md).
+¹ On a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs; on a base without its untagged nodes most of the diff's way references go unresolved and the command refuses. See [reference/performance/apply-changes.md](reference/performance/apply-changes.md).
 
 ² Median of two cells, each the first after a trim; the cell-to-cell band on identical code is about 280-300 s.
 
@@ -82,7 +82,7 @@ The largest temp files go to the output's parent directory (or `--tmp-dir`): `ad
 
 History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
 
-Per-command phase breakdowns are in [reference/performance.md](reference/performance.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance-history.md](reference/performance-history.md). Note that recorded results always track the latest git head and may not match the released version.
+Per-command phase breakdowns are in [reference/performance/README.md](reference/performance/README.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance/README.md](reference/performance/README.md). Note that recorded results always track the latest git head and may not match the released version.
 
 The goal for pbfhogg 1.0 is that every CLI command must be planet-scale safe on a 32GB RAM host (28-ish free GB.)
 
@@ -229,7 +229,7 @@ not yet explained. -->
 
 `isolation-cat` gives medians of five paired processes; the other rows give each call's best of three. The calls run with the page cache kept and fixed parallelism; the CLI evicts its input and sizes its work by probing the machine.
 
-All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance.md](reference/performance.md).
+All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance/README.md](reference/performance/README.md).
 
 Run a workload with `brokkr bench --iterations 1 copy-pbf --dataset denmark`; use `brokkr bench NAME --help` for its params and the [bench mapping](AGENTS.md#pbfhogg-bench-mapping) for other commands. Runner options such as `--hotpath`, `--alloc`, `--commit REF` and `--dry-run` go before NAME.
 

@@ -1050,7 +1050,7 @@ fn run_filtered_pass(
     // most of the run (planet on bygg, 30 workers: no window or send wait,
     // consumer idle for 89 % of the wall), so results in flight stay near
     // one per worker, and the peak is the workers' own working sets
-    // (`reference/performance.md`, "cat --clean's peak against the README
+    // (`reference/performance/cat.md`, "cat --clean's peak against the README
     // row").
     let pass = crate::scan::classify::parallel_classify_phase_ordered(
         input,

@@ -588,7 +588,7 @@ impl ScanState {
 /// scan of the (almost always empty) list of empty entries other than index 0,
 /// with no string-table load per element (resolving each name instead was a
 /// measured slowdown of planet `inspect --extended`; see
-/// reference/performance.md).
+/// reference/performance/inspect.md).
 pub(super) struct UserNames {
     len: usize,
     /// Indices whose string is empty. Index 0 is held separately because the

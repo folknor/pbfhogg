@@ -161,7 +161,7 @@ impl<'a> InputSource<'a> {
     /// tripled their summed pread time on europe (bygg, 2026-11-09, at
     /// `3d980bee`: 22.3 s to 68.1 s, stage 2 47.9 s to 53.0 s), so those
     /// pools keep a plain [`Self::open`]. Per-blob dispatched pools measured
-    /// indifferent (reference/performance.md, "Scheduled-read advice:
+    /// indifferent (reference/performance/read-pipeline.md, "Scheduled-read advice:
     /// RANDOM against plain").
     pub(crate) fn open_random_access(&self, invocation: &crate::host::Invocation) -> Result<File> {
         let file = self.open()?;

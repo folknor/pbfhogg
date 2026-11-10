@@ -43,7 +43,7 @@
 //! remainder itself from owned elements: at planet, relation blobs hold
 //! about 31k relations each, the merge thread then ran the relation phase
 //! at about 8 cores, and the results queued behind it held about 0.7 GB of
-//! owned remainders at the phase's start (`reference/performance.md`,
+//! owned remainders at the phase's start (`reference/performance/repack-degrade.md`,
 //! "repack and degrade encode each blob on its worker").
 //!
 //! The `repack_input_blobs_coalesced` counter tracks how often a non-empty
@@ -577,7 +577,7 @@ fn run_kind_phase(
     // workers, with their free memory, and idles on it while the next
     // phase's workers grow fresh arenas. Planet repack with its executor
     // started here peaked about 300 MB higher in its way phase
-    // (reference/performance.md, "Idle executor threads take exited
+    // (reference/performance/memory.md, "Idle executor threads take exited
     // workers' arenas"). One block gains nothing from parallel framing.
     // Starting the executor early instead is no general cure: a pool that
     // does real work after a phase (the geocode builder's) loses the reuse.

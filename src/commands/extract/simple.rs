@@ -701,7 +701,7 @@ fn verify_candidate(
     // nodes alone. It replaced a copy into a dropped block; that copy ran
     // only for nominated candidates, none on the planet bbox, and the same
     // copy in check --locations measured within noise at planet
-    // (reference/performance.md, "Payloads validated where they lie").
+    // (reference/performance/check.md, "Payloads validated where they lie").
     let (st, groups) = scratch;
     crate::read::block::validate_in_place(decompressed, st, groups, None, |_, _| {
         crate::read::block::NoProjection

@@ -83,7 +83,7 @@ pub(super) enum ProbeEntry {
 /// A separate hash map of the same nodes was dropped: at a planet daily
 /// diff it was 92 MB beside the 29 MB of sorted IDs the diff holds anyway,
 /// and the searches that replaced it measured within noise
-/// (reference/performance.md, "Inline-location refresh"). One filter, not
+/// (reference/performance/apply-changes.md, "Inline-location refresh"). One filter, not
 /// one per list: a second filter word on every ref would cost the hot miss
 /// path more than the delete searches it saves.
 pub(super) struct StaleProbe {

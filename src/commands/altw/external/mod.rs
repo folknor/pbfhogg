@@ -16,7 +16,7 @@
 //!    emit enriched ways.
 //!
 //! All I/O is sequential. Temporary-disk demand and peak memory depend on the
-//! input; see `reference/performance.md` for measurements. This path does not
+//! input; see `reference/performance/add-locations-to-ways.md` for measurements. This path does not
 //! build a random-access node index.
 
 use std::num::NonZeroUsize;
@@ -819,7 +819,7 @@ pub(super) fn slot_bucket_bounds(
 /// Run the full external join pipeline for add-locations-to-ways.
 ///
 /// Bounded working memory and sequential I/O. Temporary-disk demand depends
-/// on the input; see `reference/performance.md` for measured resource use and
+/// on the input; see `reference/performance/add-locations-to-ways.md` for measured resource use and
 /// the module docs for the algorithm.
 ///
 /// The input is read in several passes, so it must be a regular file
@@ -1099,7 +1099,7 @@ pub(crate) fn external_join_in(
             // that row measures the rest of pass A, not the scan; read the
             // scan's own time from the START/END pair. Wall swings seen in
             // this stage at planet scale have been in pass A, with the scan
-            // steady (reference/performance.md, "altw external pass A swings
+            // steady (reference/performance/add-locations-to-ways.md, "altw external pass A swings
             // with run history").
             let rel_handle = if keep_untagged_nodes && !inject_prepass {
                 None

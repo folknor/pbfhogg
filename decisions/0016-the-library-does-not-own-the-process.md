@@ -40,4 +40,4 @@ start, which is no worse than at any point the library could name. The
 original points included the CLI's two-arena cap at each cross-thread
 allocate-and-free pool; measured, it cost every allocation-heavy command
 measured wall time without bounding memory, and its hook was removed
-(reference/performance.md, "The CLI no longer caps malloc arenas").
+(reference/performance/memory.md, "The CLI no longer caps malloc arenas").

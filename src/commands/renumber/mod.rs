@@ -456,7 +456,7 @@ pub(crate) fn renumber_external_to<'a>(
         "Renumber assigns IDs by file position and resolves references by rank.",
     )?;
     // Preserve the external-renumber zlib:1 default documented in
-    // reference/performance.md. This legacy value-based API cannot distinguish
+    // reference/performance/renumber.md. This legacy value-based API cannot distinguish
     // omitted compression from an explicit Zlib(6): both arrive as the same
     // Compression value and both select level 1 here. Other values pass through.
     // Removing this branch would change the default on the measured write path.

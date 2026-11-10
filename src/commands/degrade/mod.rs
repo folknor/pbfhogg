@@ -1323,7 +1323,7 @@ fn run_kind_phase(
     // Under the unsort modes this flush can be the writer executor's first
     // job, after the phase's pool has ended, and the pool started there idles
     // through the next phase holding the exited workers' arenas
-    // (`reference/performance.md`, "Idle executor threads take exited
+    // (`reference/performance/memory.md`, "Idle executor threads take exited
     // workers' arenas"). Left as is on purpose: the unsort modes generate
     // adversarial test inputs, where a few hundred MB of peak is no cost.
     blobs += write_central(&mut output, writer, flags)?;

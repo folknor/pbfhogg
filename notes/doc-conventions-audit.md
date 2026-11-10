@@ -64,7 +64,7 @@ What remains is housekeeping: fold or delete the local files.
 "avoid citing source line numbers - they drift fast." The `reference/testing.md`
 citation is gone. Remaining:
 
-- `reference/performance-history.md` cites `extract.rs:2813` twice.
+- `reference/performance/README.md` cites `extract.rs:2813` twice.
 - `reference/pipeline.md` cites line ranges in `~/Programs/nidhogg/`, a
   different repository on one developer's machine.
 - Test comments: `tests/geocode_index.rs`, `tests/getid.rs`,

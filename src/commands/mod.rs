@@ -188,7 +188,7 @@ impl BlockSink for FramedBlocks<'_> {
 ///
 /// What a kept builder holds is its working set, one block's worth per
 /// buffer: at planet, hundreds of MB summed over apply-changes' rewrite
-/// workers, with every buffer under the limit (`reference/performance.md`,
+/// workers, with every buffer under the limit (`reference/performance/apply-changes.md`,
 /// "apply-changes' retained encode storage, attributed"). That is the price
 /// of keeping it, measured against per-blob builders when this was adopted;
 /// lowering it means removing buffers that duplicate another's bytes, not
@@ -732,7 +732,7 @@ pub fn has_tagdata(
 
 // This is a first-data-blob hint, not validation of every blob. Keep the
 // early return: an all-blob preflight previously caused a measured regression
-// across header-walking commands (reference/performance-history.md). Consumers
+// across header-walking commands (reference/performance/README.md). Consumers
 // decide what absent metadata in later blobs means (fallback decode or a
 // mid-run error); `inspect --indexed` reports this same hint.
 fn probe_first_data_blob<'a>(

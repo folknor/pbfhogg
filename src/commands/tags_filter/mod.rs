@@ -1354,7 +1354,7 @@ fn collect_way_node_dependencies(
     // was built and measured at planet `w/highway=primary`: the walk after
     // its schedule loop went from 10.3 s to 8.7 s, but the command only
     // from 75.7 s to 74.0 s (2.3 %, both pairs), under the noise floor this
-    // project does not chase (reference/performance.md, "inspect --nodes
+    // project does not chase (reference/performance/inspect.md, "inspect --nodes
     // reads through a projection").
     crate::scan::classify::parallel_classify_phase(
         &shared_file,

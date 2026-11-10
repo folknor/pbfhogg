@@ -19,7 +19,7 @@
 //! 120 MB (hash indexes 89.7 MB, deleted sets 10.0 MB, floors 19.0 MB, the
 //! interner's lookup about 1 MB), and apply-changes kept them beside a 60 MB
 //! set of sorted copies of the same IDs; this representation is the 60 MB
-//! alone (reference/performance.md, "Apply-changes retained lookup
+//! alone (reference/performance/apply-changes.md, "Apply-changes retained lookup
 //! storage").
 //!
 //! Every ID order here is `osm_id_cmp` (0, -1, -2, ..., then the positive

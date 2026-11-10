@@ -62,7 +62,7 @@ Specifications are saved to the ./notes folder.
    memory ceiling, blob-count asymmetry, throughput at size) pulls in japan
    or europe, and planet only when nothing smaller can exercise the 30 GB-RAM
    ceiling - planet is an explicit user decision per
-   `reference/performance.md` and costs minutes to hours. Running a larger
+   `reference/performance/README.md` and costs minutes to hours. Running a larger
    dataset than the question needs - a planet bench to "be extra sure" of a
    change denmark already proves - is waste, not rigor. If no command exists
    that can verify a gate (no test pins the behavior, no tool decodes the
@@ -95,7 +95,7 @@ Specifications are saved to the ./notes folder.
    load-bearing work. A survey that prices a hot path traces the premise
    through the actual caller ordering at the priced call site - what the
    structure admits is not what the callers do. For optimization work the
-   survey includes the failure history: `reference/performance-history.md`
+   survey includes the failure history: `reference/performance/README.md`
    and whatever optimization notes are live in `notes/` at the time (their
    "Don't re-attempt" / "Failed attempts" sections) are the ledger of every
    tried and rejected approach, with the measured numbers and physical
@@ -126,21 +126,21 @@ Specifications are saved to the ./notes folder.
     if it exists.
     A spec that adds, moves, or reorganizes tests also cites
     `reference/testing.md`, the placement-and-tier contract those bricks must
-    satisfy. The measurement record is `reference/performance.md` plus
-    `reference/performance-history.md` plus `.brokkr/results.db`:
-    `performance.md` holds the current baselines and live per-command
-    breakdowns, `performance-history.md` is the durable ledger of
+    satisfy. The measurement record is indexed by `reference/performance/README.md`,
+    with raw runs in `.brokkr/results.db`. Each target file under
+    `reference/performance/` holds current baselines and live per-command
+    breakdowns first, followed by a History section with
     optimization arcs, superseded baselines, and regression retrospectives
     (the home where a landed-then-deleted plan or spec note's findings settle
-    - the "history ledger" the loop points durable references at), and
-    `.brokkr/results.db` is the raw stored runs. A spec that claims a
+    - the "history ledger" the loop points durable references at).
+    A spec that claims a
     performance effect, or whose changes touch a measured path, states the
     pre-change baseline (host + commit hash) the keep/revert verdict will be
     read against, and after landing records the post-change numbers the same
     way (commit, then benchmark, then write the hash-anchored numbers): the
-    new current numbers replace the baseline in `reference/performance.md`,
+    new current numbers replace the baseline in the target file under `reference/performance/`,
     and the superseded baseline plus the arc narrative settle into
-    `reference/performance-history.md`. Gate dataset choice, bench invocations, and
+    the same target file's History section. Gate dataset choice, bench invocations, and
     noise bounds follow that document's reading rules - a verdict read off a
     single run, an instrumented-mode RSS figure, or a mismatched gate dataset
     is not a verdict. A spec off every

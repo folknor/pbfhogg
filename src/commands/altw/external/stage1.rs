@@ -359,7 +359,7 @@ pub(super) fn stage1_pass_a(
     // The ordered pool writes the two sidecars in blob order; cancellation
     // is checked on its consumer. The window buys no memory here (results
     // are small), but it is not dropped for an unbounded run: in the
-    // planet runs recorded in reference/performance.md its admission wait
+    // planet runs recorded in reference/performance/add-locations-to-ways.md its admission wait
     // is zero, so workers do not
     // park behind a slow head, and it stays the bound if one ever stalls.
     let pool_result = crate::ordered_pool::run_ordered(
@@ -661,7 +661,7 @@ pub(super) fn stage1_way_pass(
     // reserved offsets to one shared file would queue the same way. A shape
     // that bounds descriptors without sharing inodes (private files opened
     // on flush from a bounded descriptor cache) is untried. The run is in
-    // reference/performance.md, "Shared per-bucket id shards".
+    // reference/performance/add-locations-to-ways.md, "Shared per-bucket id shards".
     //
     // Unlike stages 2 and 3, the CPU-side count carries no fixed cap, on
     // purpose. A cap of 8 (30 workers uncapped on a 32-CPU host) was tried
@@ -670,7 +670,7 @@ pub(super) fn stage1_way_pass(
     // slow and lost about a quarter when it was fast, where more workers
     // overlap each one's serial pread, decode and emit chain; later-phase
     // deltas were mixed in sign and smaller than cell-to-cell drift. The
-    // run is in reference/performance.md, "External stage 1 worker cap".
+    // run is in reference/performance/add-locations-to-ways.md, "External stage 1 worker cap".
     // Descriptor exhaustion is handled by the fd cap below, not by a CPU
     // cap.
     let cpu_cap = crate::host::sized_workers(

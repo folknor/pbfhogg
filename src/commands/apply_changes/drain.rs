@@ -392,7 +392,7 @@ pub(super) fn run_drain(
         // old separate boundary channel needed an idle re-poll for.
         //
         // Carrying the boundary on this shared channel was not given a
-        // planet A/B, by argument (reference/performance.md, "Node boundary
+        // planet A/B, by argument (reference/performance/apply-changes.md, "Node boundary
         // on the drain channel, not measured"): every message ahead of it is
         // node work this check waits for anyway, and the scanner blocks on
         // the barrier right after sending it, so a full channel cannot

@@ -325,7 +325,7 @@ length of the continuation run between words. Without a run of
 nine continuation bytes no varint reaches a tenth byte, so the
 array is valid exactly when it does not end mid-varint. Only an
 array that holds such a run, which no PBF writer emits, is
-judged byte by byte. `performance.md` holds the measurements.
+judged byte by byte. `performance/README.md` holds the measurements.
 `packed_uint32_count`, the variant for tag string indices, scans
 per byte, because its `u32` bound needs the position anyway.
 

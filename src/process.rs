@@ -263,7 +263,7 @@ pub fn malloc_trim() -> i32 {
 /// but cost getid about 4 % (each ~1.8 MB compressed frame is allocated
 /// fresh per blob); 4 MiB was wall-neutral where measured and saved 5 to
 /// 30 %, but raised cat `--clean`'s peak by 12 %. No value was a uniform
-/// win, so the CLI sets none (reference/performance.md, "glibc's sliding
+/// win, so the CLI sets none (reference/performance/memory.md, "glibc's sliding
 /// mmap threshold across commands", which holds every cell). Do not
 /// re-measure a fixed threshold until the per-blob allocate-and-free of
 /// blob-scale buffers is gone (the blob reader's compressed frames first);
@@ -298,7 +298,7 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
 /// stopped calling it, only repack and degrade peaked much higher without
 /// it at planet, and that was mostly live data, not arena memory: decoded
 /// elements queued behind their merge thread, since moved onto the workers
-/// (reference/performance.md, "repack and degrade encode each blob on its
+/// (reference/performance/repack-degrade.md, "repack and degrade encode each blob on its
 /// worker").
 ///
 /// The cost is that every thread's allocations above the tcache limit
@@ -311,7 +311,7 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
 /// wall of every re-encoding command the CLI used to cap by 9 to 45 % (cat
 /// `--clean`, repack, degrade, time-filter, cat `--dedupe`, the geocode
 /// builder), and apply-changes, which never took it, ran twenty times
-/// longer with it (reference/performance.md, "The CLI no longer caps
+/// longer with it (reference/performance/memory.md, "The CLI no longer caps
 /// malloc arenas"). No command in this repository calls it.
 ///
 /// The setting is process-global and overrides an arena_max glibc tunable.

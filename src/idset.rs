@@ -519,7 +519,7 @@ impl IdSet {
     /// hot loop - the chunk lookup is random access and measured 29x
     /// slower than `Vec::push` there. Accumulate matches in a `Vec<i64>`
     /// and drain into the set afterwards; direct `set()` is fine on
-    /// sparse paths. See `reference/performance-history.md`
+    /// sparse paths. See `reference/performance/classify.md`
     /// "IdSetDense accumulation".
     ///
     /// Negative IDs are a silent no-op: they are not valid OSM element IDs

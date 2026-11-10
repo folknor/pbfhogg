@@ -36,10 +36,10 @@ the packed-u64-IdRecord work has a matched-commit comparand: hotpath
 allocation profile existed for external at europe before these.
 
 Compression axis at europe is **measured and settled** - see
-`reference/performance.md` "Compression axis": `none` 246.8 s, `zstd:1`
+`reference/performance/add-locations-to-ways.md` "Compression axis": `none` 246.8 s, `zstd:1`
 233.3 s (-13.9 %) vs the zlib:6 270.8 s reference. zstd:1 for
 closed pipelines is already documented in README.md and
-`reference/performance.md`. Do not re-propose output-compression knob
+`reference/performance/add-locations-to-ways.md`. Do not re-propose output-compression knob
 sweeps.
 
 **The europe compression result does not transfer to planet.** See "The
@@ -171,7 +171,7 @@ utilization during the 2026-07-14 suite. "Tired drive" in this doc means
 GC working through accumulated trim debt, nothing more. Trim before
 matched suites, and expect post-trim walls to run somewhat faster than
 the 2026-07-14 baselines for drive-state reasons - re-pin with a matched
-pair before crediting code. Full record in `reference/performance.md`
+pair before crediting code. Full record in `reference/performance/add-locations-to-ways.md`
 "Drive health + trim state".
 
 ## Current architecture and planet cost model
@@ -308,7 +308,7 @@ Ordered. Each item lists what it absorbs from the previous edition.
 packs `(local_id, blob_idx, blob_local_slot, closure)` at per-run widths
 with a two-word escape for oversized slots (`IdCodec`), so no stage-1
 synchronisation and no N2 dependency. Shards 149.2 -> 99.5 GB
-(reference/performance.md, "Packed id-shard records"). Still open from
+(reference/performance/add-locations-to-ways.md, "Packed id-shard records"). Still open from
 this item: the in-memory side (stage 2 still parses into 12-byte
 `IdRecord` structs and sorts by key, so the u64 in-place sort and radix
 retry below need the linear-slot form).
@@ -448,7 +448,7 @@ The stage-3 `.min(4)` and stage-1 fd-capped counts are separate knobs;
 leave them unless a specific counter implicates them. A stage-1 CPU cap
 of 8 was measured on bygg planet on 2026-10-28 and not adopted (no
 reliable whole-command win; pass A lost about a quarter in the one
-fast-drive pair): reference/performance.md "External stage 1 worker cap".
+fast-drive pair): reference/performance/add-locations-to-ways.md "External stage 1 worker cap".
 Also open: `ALTW_STAGE2_WORKERS_CAP` in src/tunables.rs carries no
 rationale beyond "cap"; whatever this sweep settles should land there as
 its reason.
@@ -621,7 +621,7 @@ dispatch loop.
 
 256 shared per-bucket files with 128 KiB worker-local batches appended
 under a per-bucket mutex were built and run on planet against `09c86a56`
-(reference/performance.md, "Shared per-bucket id shards, refused"):
+(reference/performance/add-locations-to-ways.md, "Shared per-bucket id shards, refused"):
 pass A 22.2 to 28.2 s trimmed and 22.6 to 35.1 s untrimmed, with 241 and
 386 summed thread-seconds of lock wait while summed write time fell to a
 tenth. The convoy caution held. A lock-free reserved-offset variant would
@@ -676,7 +676,7 @@ EMFILE or memory failure exists at 30 workers.
 | L5 straddler cache | kept, quantified small | S5 |
 | L6 consolidated writers | kept, fallback | S6 |
 | L7/A2 output executor | stays shelved - milestone 1 measured on this host: pool consolidation lost 30 s planet; permit pool (64) is not the cap, compression CPU is | [A2 milestone 1 write-up](altw-optimization-history.md#a2-milestone-1-inline-way-framing-reverted-2026-04-25) |
-| L8 zstd:1 output note | settled + documented (README, performance.md); removed as a lever | do-not-retry |
+| L8 zstd:1 output note | settled + documented (README, ../reference/performance/add-locations-to-ways.md); removed as a lever | do-not-retry |
 | L9/A3 DenseNodes filter | **demoted 2026-07-14** - its ceiling gate was falsified by the planet zstd:1 cell | S2 |
 | L10/L11 payload format | kept, weakened by N3 | S3 |
 | L12 presence-bitmap carry-along | still a carry-along: any stage-2 inner-loop reshape (N1) may carry a presence bit for free; do not land alone | note here |

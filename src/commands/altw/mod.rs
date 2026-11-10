@@ -139,13 +139,13 @@ pub enum IndexType {
     /// bytes. Workers store coordinates with relaxed `AtomicU64` mmap stores
     /// at byte offset `IdSet::rank_if_set(node_id) << 3` (not pwrites, so no
     /// syscall per tuple). Works on any PBF. Runtime and page-cache behavior
-    /// depend on the input and host; see `reference/performance.md` for
+    /// depend on the input and host; see `reference/performance/add-locations-to-ways.md` for
     /// measurements.
     Sparse,
     /// External join via double radix permutation. Uses bounded working
     /// memory and sequential I/O, and requires sorted input with indexdata.
     /// Its temporary-disk demand depends on the input; see
-    /// `reference/performance.md` for measurements.
+    /// `reference/performance/add-locations-to-ways.md` for measurements.
     External,
     /// Selects a backend at runtime (the default). Unsorted or unindexed
     /// input uses sparse. For sorted, indexed input, external is selected
@@ -153,7 +153,7 @@ pub enum IndexType {
     /// page-cache budget; when the budget is unknown, or the available
     /// memory does not exceed the sparse run's anon allowance, sparse is
     /// kept and the store estimate is skipped. See `reference/pipeline.md`
-    /// for the routing rule and `reference/performance.md` for measurements.
+    /// for the routing rule and `reference/performance/add-locations-to-ways.md` for measurements.
     #[default]
     Auto,
 }
@@ -482,7 +482,7 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // Pass 0: collect the set of node IDs referenced by ways. Only these
     // nodes need coordinate lookups, so only these get indexed. The store
     // therefore follows the referenced-node working set rather than every
-    // node in the input; see `reference/performance.md` for measurements.
+    // node in the input; see `reference/performance/add-locations-to-ways.md` for measurements.
     host.invocation.marker("ALTW_PASS0_START");
     let (referenced, shared) = collect_way_referenced_node_ids(
         input,
@@ -928,7 +928,7 @@ fn emit_stats_counters(stats: &Stats, invocation: &crate::host::Recorder) {
 /// consumes and drops immediately after the union, so transient worker-side
 /// memory stays bounded to in-flight blob refs rather than all completed
 /// blobs. Store size and peak memory depend on the input; see
-/// `reference/performance.md` for measurements.
+/// `reference/performance/add-locations-to-ways.md` for measurements.
 ///
 /// `direct_io` is intentionally dropped on this path: the blob bodies are
 /// pread from the shared file handle on worker threads, which is
@@ -1361,7 +1361,7 @@ mod tests {
 
     /// The store sizes and budget below are the measured pair the threshold
     /// was chosen between: the smaller store ran linear on sparse, the larger
-    /// thrashed. The measurements live in `reference/performance.md`; these
+    /// thrashed. The measurements live in `reference/performance/add-locations-to-ways.md`; these
     /// values are fixed test inputs, not a claim about today's datasets.
     #[test]
     fn route_reproduces_the_measured_grid() {

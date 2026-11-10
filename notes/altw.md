@@ -118,7 +118,7 @@ are the whole phase.
 > only the *first* walk of a session pays. `a3c46737` ran seconds after
 > the europe sparse hotpath evicted japan's headers, with no warm
 > iteration to win best-of-N. Same artifact as the getparents planet
-> "+16.8 % regression" closed the same day (reference/performance.md).
+> "+16.8 % regression" closed the same day (reference/performance/add-locations-to-ways.md).
 >
 > **Cause 2, a real regression (~0.9 s):** comparing warm-walk iterations
 > only, HEAD run 1 vs `c6f08ff` run 0:
@@ -250,7 +250,7 @@ of the wall; decode work is ~3.4 cores. Compression sweep at japan:
 zlib:6 11.9 s, none 9.7 s (-18 %), zstd:1 8.9 s (-25 %). **The
 compression axis is settled - do not re-propose output-compression
 knob sweeps.** zstd:1 for closed pipelines is documented in README.md
-/ `reference/performance.md`; the writer-ceiling diagnostic (measure
+/ `reference/performance/add-locations-to-ways.md`; the writer-ceiling diagnostic (measure
 any pass-2 CPU item under both zlib:6 and zstd:1/none) is the
 operative lesson and is shared with the external doc.
 
@@ -690,7 +690,7 @@ small-scale benches are untrustworthy.** A cold walk costs ~50-88 us per
 blob; a warm one is ~free. Measured swings on identical code: japan pass
 0 walk 3116 ms cold vs 29 ms warm two phases later (45x+); getparents
 planet 4457 ms / 405 MB cold vs 97 ms / **0 kB** warm
-(reference/performance.md). Both of the 2026-07-14 "regressions" were
+(reference/performance/add-locations-to-ways.md). Both of the 2026-07-14 "regressions" were
 this artifact wearing a code-regression costume. Four walks means four
 independent chances to be measured cold; one walk means one, and a cat
 TOC (external N2) means none. **Every walk deleted is a benchmark made
@@ -947,7 +947,7 @@ hard parse error with a migration hint.
   arrangements, and the baseline-variance trap in P4. Do not re-open on the
   strength of the 107.4 s figure - that figure is the overcount.
 - **Output-compression knob sweeps.** Settled; japan sweep above,
-  europe axis in `reference/performance.md`, zstd:1 guidance shipped.
+  europe axis in `reference/performance/add-locations-to-ways.md`, zstd:1 guidance shipped.
   The external doc's single-planet-cell reopen condition was **spent
   2026-07-14** and came back negative (planet streaming is not
   compression-bound: -80 % compression CPU for <=5 % wall). The axis is

@@ -713,7 +713,7 @@ checks do not resolve string indices, for one. The default index-only report
 decodes no payload and reports the stored claims, so it can succeed on the same
 file.
 
-On indexed PBFs, uses an index-only fast path that reads blob headers without decompression. On Denmark (487 MB indexed), this took 111 ms at commit `53360af4` on bygg (2026-11-09, median of three cold-input runs); see [reference/performance.md, README campaign](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md#readme-campaign-bygg-2026-11-09-at-53360af4).
+On indexed PBFs, uses an index-only fast path that reads blob headers without decompression. On Denmark (487 MB indexed), this took 111 ms at commit `53360af4` on bygg (2026-11-09, median of three cold-input runs); see [reference/performance/cross-command.md, README campaign](https://github.com/folknor/pbfhogg/blob/main/reference/performance/cross-command.md#readme-campaign-bygg-2026-11-09-at-53360af4).
 
 ```
 pbfhogg inspect [OPTIONS] <FILE>
@@ -1385,7 +1385,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
-| `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md)). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
+| `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see [reference/performance/renumber.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/renumber.md)). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
 | `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -1721,10 +1721,10 @@ Embed node coordinates in ways. Two index strategies, and `auto` (the
 default) to choose between them:
 
 - **auto** (default) - Runs sparse unless the input is sorted and indexed, the page-cache budget can be read from the host, and the estimated sparse store exceeds 80 % of that budget; then it runs external. Where available memory cannot be read (every non-Linux host, containers without a visible cgroup v2 mount) or is at most the 3 GiB the sparse run reserves for itself, it runs sparse. A `Note:` on stderr names the choice and why. The estimate counts every node, so a sorted file of mostly standalone nodes can be routed to external, whose scratch demand is far higher; pass `--index-type sparse` there. Rule and limits in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
-- **sparse** - A flat memory-mapped array of 8 bytes per referenced node, in scratch storage; works on any PBF, sorted or not. How it is laid out is in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways). Working-set behavior depends on the available page cache; see [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measurements.
-- **external** - Double radix permutation via 4-stage pipeline with bounded memory and high scratch-disk demand. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. See [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured resource use. It has encoding limits the sparse index does not: node IDs up to 2^38 (about 2.7e11), at most 2^32 way blobs, and about 2^40 (1.1e12) way node refs in total. Past one, the run fails with exit 2 naming the limit and pointing at sparse, and nothing is published; details in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
+- **sparse** - A flat memory-mapped array of 8 bytes per referenced node, in scratch storage; works on any PBF, sorted or not. How it is laid out is in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways). Working-set behavior depends on the available page cache; see [performance/add-locations-to-ways.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/add-locations-to-ways.md) for measurements.
+- **external** - Double radix permutation via 4-stage pipeline with bounded memory and high scratch-disk demand. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. See [performance/add-locations-to-ways.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/add-locations-to-ways.md) for measured resource use. It has encoding limits the sparse index does not: node IDs up to 2^38 (about 2.7e11), at most 2^32 way blobs, and about 2^40 (1.1e12) way node refs in total. Past one, the run fails with exit 2 naming the limit and pointing at sparse, and nothing is published; details in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
 
-`--index-type dense` was removed; see [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured comparisons. `dense` survives as a hidden value (absent from `--help`) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
+`--index-type dense` was removed; see [performance/add-locations-to-ways.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/add-locations-to-ways.md) for measured comparisons. `dense` survives as a hidden value (absent from `--help`) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -2112,7 +2112,7 @@ interpolation ways and no admin polygons - fails rather than publishing an empty
 index. Indexes containing only some of those kinds, such as an admin-boundaries
 extract, are legitimate and still build.
 
-Outputs a set of binary files. See [performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured build times, index size, and peak memory.
+Outputs a set of binary files. See [performance/geocode.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/geocode.md) for measured build times, index size, and peak memory.
 
 ### bench-read
 

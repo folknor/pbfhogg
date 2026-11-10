@@ -13,7 +13,7 @@ but with near-zero production bite since the production planet dump is
 50 k blobs. Landing gate measurements, including the cross-day I/O
 environment shift that made this file's absolute 8k walls unusable as
 bounds (~45 % swing in steady sequential read rate between sessions,
-same code, same file), are in `performance.md` "Blob-count threshold
+same code, same file), are in `performance/classify.md` "Blob-count threshold
 dispatch landing gates".
 
 PBFs from different producers pack very different numbers of elements per
@@ -176,7 +176,7 @@ threshold-based dispatch here is new ground.
 - `README.md` "Planet scale" table: every entry is measured on the
   `planet.osm.org`-packed blob layout. The table needs a one-liner
   caveat once measurements on the other layout land.
-- `reference/performance.md` planet sections: same.
+- `reference/performance/add-locations-to-ways.md` planet sections: same.
 - "N seconds at planet scale" predictions in plan and work notes:
   likewise.
 
@@ -270,12 +270,12 @@ reading payloads for nothing: density (a mean recent frame size below
 128 KiB; the planet dump's ~1.8 MB frames keep the probe) and residency
 (a cache-only probe first; only a run of misses authorises a window, so
 a walk whose headers an earlier walk left cached reads the headers
-alone). Measured in `reference/performance.md` "Header walk read-ahead
+alone). Measured in `reference/performance/read-pipeline.md` "Header walk read-ahead
 on cold dense files": denmark cold inspect 0.64 to 0.22 s, europe cold
 inspect 45.6 to 14.4 s, planet unchanged. Rejected alternatives: a
 buffered-sequential walk dispatched on blob count (measured for sort as
 the "M3" experiment - europe -21 % but planet +11 %, see
-`reference/performance-history.md` "Sort"), read-ahead on density alone
+`reference/performance/read-pipeline.md` "Sort"), read-ahead on density alone
 (it read the bodies under cached headers: europe check --refs 8.3 to
 27.6 s), and a worker-sharded resync scan.
 
@@ -285,7 +285,7 @@ episode therefore also advises `WILLNEED` over a bounded distance after
 it, in calls no longer than the kernel's per-call cap; crossing an
 episode's end restarts the miss streak, so the walk's own in-flight
 advice never renews it and a header-warm region ends it within one
-episode. Measured in `reference/performance.md` "Header walk prefetch on
+episode. Measured in `reference/performance/read-pipeline.md` "Header walk prefetch on
 cold dense files": europe cold inspect 14.2 to 9.7 s, cold denmark
 `cat --dedupe` passthrough back at the old engine's wall, planet
 unchanged.
@@ -463,7 +463,7 @@ accumulation at 28.6x blob count is implicated. Uninvestigated.
   adversarial test PBFs; the `--unsort` mode exercises `sort`'s
   overlap-run path which is orthogonal to but motivated alongside
   this work (its design note was retired to git history).
-- [`reference/performance-history.md`](performance-history.md) "Sort" -
+- [`reference/performance/sort.md`](performance/sort.md) "Sort" -
   the `HeaderWalker` pass-1 trade-off that first surfaced the asymmetry.
 - getparents - second instance of the same asymmetry, larger
   magnitude; its full measurement record (a note since retired to git

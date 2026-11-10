@@ -26,7 +26,7 @@
 //! needs [`FrameSkip`], whose implementations keep the I/O shape each caller
 //! was measured with: `BufReader::seek_relative` plus one sentinel byte for
 //! a seekable stream (a plain `Seek::seek` discards the buffer, see
-//! `reference/performance-history.md` "`seek_raw` BufReader-discard fix"),
+//! `reference/performance/read-pipeline.md` "`seek_raw` BufReader-discard fix"),
 //! `FileReader::skip` for the command readers (the same for buffered input,
 //! `DirectReader::skip` for O_DIRECT), and an extent check against the size
 //! captured at open for the pread walker.

@@ -80,7 +80,7 @@ pub(crate) struct Frame {
 /// frame's), so its memory is the sum of the tagdata the output gains, with
 /// no fixed bound. Measured on an unindexed Europe input, 522k blobs all
 /// passed through: about 895 MB of peak anon more than indexdata alone, the
-/// 877 MB of tagdata the output grew by (reference/performance.md, "sort
+/// 877 MB of tagdata the output grew by (reference/performance/sort.md, "sort
 /// --force on unindexed Europe"). Accepted: only `--force` on an unindexed
 /// input and `--distrust-metadata` reframe blobs at that scale, and `cat`
 /// is the streaming reindex for such a file. If bounded memory here becomes
@@ -170,7 +170,7 @@ pub(crate) struct IndexPolicy {
 ///
 /// The walk preads headers (`fadvise(RANDOM)`) rather than streaming the
 /// file: `sort`'s planet pass 1 measured 32 GB read through a buffered
-/// reader against 674 MB walked (reference/performance-history.md, "Sort").
+/// reader against 674 MB walked (reference/performance/sort.md, "Sort").
 /// Only on a cold region of small frames does it read windows and prefetch
 /// ahead of them (`header_walker::PreadSource`), which also leaves those
 /// payloads cached for pass 2's copy. An indexed blob under a header claiming

@@ -65,7 +65,7 @@ The largest speedups come from blob passthrough (sort, apply-changes, cat --type
 
 Japan (2.4 GB, Tokyo bbox), indexed PBFs, on plantasjen at commit
 `cadc3e6`. Best of three runs (or single-sample where noted in the source):
-[reference/performance.md, Extract](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md#extract).
+[reference/performance/extract.md, Extract](https://github.com/folknor/pbfhogg/blob/main/reference/performance/extract.md#extract).
 
 | Strategy | pbfhogg |
 |----------|---------|
@@ -80,7 +80,7 @@ Simple extract uses a 3-phase barrier pipeline with parallel classification and 
 `apply-changes` uses blob-level indexdata to classify blobs and passes
 unmodified blobs through without decompression. Runtime and memory depend
 on the input and change set; see the commit- and host-pinned measurements in
-[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
+[reference/performance/README.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md).
 
 ## Apply-changes with LocationsOnWays
 
@@ -97,13 +97,13 @@ the diff moved left them stale, and the run did less work than it does
 now. Since the refresh, the flag replaces the two-step pipeline with a
 single command, provided the base was made with
 `add-locations-to-ways --keep-untagged-nodes`; see
-[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measurements of the current code.
+[reference/performance/README.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md) for measurements of the current code.
 
 ## Planet-scale pipeline
 
 Runtime and resource use depend on the command, input snapshot, encoding, and
-host. See [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured command runs and
-[reference/performance-history.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance-history.md) for optimization history.
+host. See [reference/performance/README.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md) for measured command runs and
+[reference/performance/README.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md) for optimization history.
 
 ## Performance tips
 
@@ -119,7 +119,7 @@ memory, and `auto`, the default, picks between them at run time (staying on
 sparse where it cannot read the host's memory). When to use each
 is in [Advanced Topics](./advanced.md#add-locations-to-ways-index-types),
 and measured comparisons between the strategies are in
-[performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
+[Performance](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md).
 
 ### O_DIRECT for planet-scale I/O
 
@@ -130,7 +130,7 @@ O_DIRECT wins for concurrent read/write patterns (merge). For sequential single-
 ### io_uring for large writes
 
 The `--io-uring` flag replaces the synchronous writer thread with io_uring `WriteFixed`. Compare it with buffered writes on the intended workload; see the commit- and host-pinned measurements in
-[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md).
+[reference/performance/README.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/README.md).
 
 ### Compression choice
 

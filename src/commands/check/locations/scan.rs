@@ -107,7 +107,7 @@ pub(super) type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);
 /// buffer afterwards. No claim is enforced here; the way scanner judges the
 /// one claim the check acts on. This replaced a copy of the payload into a
 /// built-and-dropped block; at planet the copy measured within noise of
-/// nothing (reference/performance.md, "Payloads validated where they
+/// nothing (reference/performance/check.md, "Payloads validated where they
 /// lie"), so the borrowed check is kept because it does less, not because it
 /// is faster. There is no speed left to find in this call.
 pub(super) fn validate_block(block: &[u8], scratch: &mut ValidateScratch) -> Result<()> {

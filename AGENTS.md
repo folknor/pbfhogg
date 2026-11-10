@@ -215,15 +215,15 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 
 | Type | Memory | Temp disk | Best for |
 |------|--------|-----------|----------|
-| `sparse` | Depends on the referenced-node working set | `referenced_count * 8` bytes of scratch storage | rank-indexed flat mmap; see [reference/performance.md](reference/performance.md) for measurements |
-| `external` | One ID or slot bucket per stage worker, not a node-ID-wide index; the mode that fits planet on a 30 GB-class host | High scratch-disk demand; see [reference/performance.md](reference/performance.md) for measurements | ID- and slot-position-bucketed join; requires sorted input with indexdata |
+| `sparse` | Depends on the referenced-node working set | `referenced_count * 8` bytes of scratch storage | rank-indexed flat mmap; see [reference/performance/add-locations-to-ways.md](reference/performance/add-locations-to-ways.md) for measurements |
+| `external` | One ID or slot bucket per stage worker, not a node-ID-wide index; the mode that fits planet on a 30 GB-class host | High scratch-disk demand; see [reference/performance/add-locations-to-ways.md](reference/performance/add-locations-to-ways.md) for measurements | ID- and slot-position-bucketed join; requires sorted input with indexdata |
 | `auto` (default) | (one of the above) | (one of the above) | Runtime routing, sparse unless a known page-cache budget is exceeded; see [reference/pipeline.md](reference/pipeline.md) |
 
-`dense` was removed. See [reference/performance.md](reference/performance.md) for measured comparisons with the rank-indexed sparse path.
+`dense` was removed. See [reference/performance/add-locations-to-ways.md](reference/performance/add-locations-to-ways.md) for measured comparisons with the rank-indexed sparse path.
 
 ## Benchmarking Rules
-- **Measure what the decision needs, not a survey.** A handful of matched cells on the commands the change touches. A sweep across many commands (or more than about ten planet cells for one item) needs the maintainer's go-ahead first: planet cells cost minutes each and the maintainer's time is the budget. Record every cell run, with its conclusion, in `reference/performance.md`, so no survey is ever repeated.
-- **A recorded negative result is a ruling, not a hypothesis.** Before measuring anything, search git history (`git log -S`, `git log --grep`) and `reference/performance.md` for earlier attempts at the same knob or shape. If one exists, its result stands: re-measuring needs a named change in the code since then that plausibly overturns it, and the maintainer's go-ahead. Allocator tuning (`mallopt`, mmap and trim thresholds, arena caps, `malloc_trim`) has been tried several times and is settled at the `set_mmap_threshold` doc in `src/process.rs`.
+- **Measure what the decision needs, not a survey.** A handful of matched cells on the commands the change touches. A sweep across many commands (or more than about ten planet cells for one item) needs the maintainer's go-ahead first: planet cells cost minutes each and the maintainer's time is the budget. Record every cell run, with its conclusion, in the command's file under `reference/performance/` (indexed by its `README.md`), so no survey is ever repeated.
+- **A recorded negative result is a ruling, not a hypothesis.** Before measuring anything, search git history (`git log -S`, `git log --grep`) and the command's file under `reference/performance/`, History section included, for earlier attempts at the same knob or shape. If one exists, its result stands: re-measuring needs a named change in the code since then that plausibly overturns it, and the maintainer's go-ahead. Allocator tuning (`mallopt`, mmap and trim thresholds, arena caps, `malloc_trim`) has been tried several times and is settled at the `set_mmap_threshold` doc in `src/process.rs`.
 - **Ignore performance differences below 2-3 %.** They are noise for every decision here: not a regression to fix, not a win to claim, not a reason to run more cells. Do not chase them with extra benchmark runs or code-layout tweaks (`#[inline]` attributes and the like).
 - **Modest memory at planet scale is not a reason to hold back a large wall win.** Report the peak; do not trade the win away for it.
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.
@@ -236,7 +236,7 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 - **Read a span from its START/END pair, not from a segment row.** `brokkr sidecar --human` and `--compare` label each segment by the marker that begins it, so a row named `FOO_END` measures what ran after FOO, not FOO; `--durations` gives the span itself.
 - **Trim before a matched A/B suite** (`sudo fstrim -av`). The weekly fstrim timer cannot keep up with planet-scale scratch churn, and accumulated trim debt widens the drive-state band that interleaving has to cancel. "Drive state" in these docs means trim debt + SLC/GC behaviour on a near-full healthy drive (SMART-verified), never failing hardware.
 
-Drive-state and cache-state evidence, with dates and UUIDs, lives in [`reference/performance.md`](reference/performance.md) - it is volatile and does not belong here.
+Drive-state and cache-state evidence, with dates and UUIDs, lives in [`reference/performance/README.md`](reference/performance/README.md) - it is volatile and does not belong here.
 
 ## Workspace
 Cargo workspace: **`pbfhogg`** (root, library) + **`pbfhogg-cli`** (`cli/`, produces the `pbfhogg` binary; the program itself is the package's library target `pbfhogg_cli` in `cli/src/lib.rs`, which `cli/src/main.rs` only calls, so the package's tests can reach the command tree - it is not an API). Library users: `default-features = false` drops the `commands` feature (see Features below for exactly what that gates). `pbfhogg-cli` carries a no-op `commands` feature so brokkr can apply `--features commands` symmetrically across both crates - the CLI's lib dep already always pulls in `pbfhogg/commands`.
@@ -264,7 +264,7 @@ The third member, **`pbfhogg-harness`** (`harness/`, bin only, `publish = false`
 ## Conventions
 - Library code never mutates process state, reads the environment or writes stderr; see ADR-0016.
 - Performance numbers in markdown must include commit hash and hostname. Script results are auto-stored in the per-user bench store; legacy typed results remain in `.brokkr/results.db`.
-- `reference/performance-history.md` is a record of measured numbers and their verdicts, not of machinery: how the code works is described in the code and the other reference documents.
+- `reference/performance/` is a record of measured numbers and their verdicts, one file per command or subsystem with current baselines first and a History section after, not of machinery: how the code works is described in the code and the other reference documents.
 - Strict clippy: `unwrap_used = "deny"`, `expect_used = "deny"` (tests exempt; a production `expect` carries `#[expect(clippy::expect_used, reason = "...")]` saying why it cannot fire - see `clippy.toml`), `cognitive_complexity = "deny"`.
 - Tunables (sizes, depths, worker counts and caps, channel and reorder capacities, timeouts, thresholds, geocode policy values) live in `src/tunables.rs`, grouped by scope with their rationale. A new tunable goes there, not in a local `const` or an inline literal. Format and protocol constants (field numbers, record layouts, spec limits) stay with the code that owns the format.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.
@@ -291,7 +291,7 @@ second.
 
 | Folder | Contents | Rule |
 |---|---|---|
-| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `reference/performance/` (the durable record of measured numbers over time, per command), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
 | `decisions/` | Durable architecture decision records (ADRs) | Binding records of chosen design, cited from source and durable docs. |
 | `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
 | `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |

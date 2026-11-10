@@ -217,7 +217,7 @@ through `BlockBuilder` and frame the output; the ordered pool
 is input order, with at most its admission window of results alive. Sidecar
 phases: one `CAT_FILTERED_*` pair per input, with `CAT_NODES_*`,
 `CAT_WAYS_*` and `CAT_RELATIONS_*` nested inside as write-side kind
-transitions, not barriers (see `reference/performance.md` before comparing
+transitions, not barriers (see `reference/performance/README.md` before comparing
 them with the per-kind shape). Migrated
 off the earlier `into_blocks_pipelined` + batch-budget path, then off one
 phase per kind (see `src/commands/cat/mod.rs`).
@@ -303,7 +303,7 @@ Sequence admission (`window.rs`): the scanner takes one token from a window of `
 
 The drain channel (`DRAIN_CHANNEL_CAPACITY`, 32 messages) is what bounds the results queued into a drain that is busy writing: a rewritten blob's item carries every frame its rewrite produced, and while the drain is writer-bound (the node phase at planet) the workers block sending once it is full, each holding at most its one finished result. That backlog is therefore about the capacity plus the worker count times a rewrite result, not a ceiling on the run's memory: the item the drain is writing, the reorder map (bounded in count by the window), worker scratch and the frames already handed to the writer are outside it.
 
-Worker scratch (`WorkerScratch` in `streaming.rs`) follows the release rule once per blob, after its handler returns: every buffer a worker keeps across blobs is dropped if one blob grew it past `MAX_RETAINED_SCRATCH_CAPACITY`, except the decode buffer, which follows the decode pool's own limit (`release_decode_outlier`, the check every worker-kept plain decode buffer in the crate takes, counted in `pipeline_decompress_pool_oversize_drops`). The base-read buffer is the crate's worker read buffer (`ReadBuf` in `src/read/read_buf.rs`: exact growth, a fresh allocation, never a doubling) but is held to the common scratch limit rather than the read buffers' 16 MiB line, although ordinary `--locations-on-ways` way frames exceed it, so under `-l` it is released and regrown on about every way blob; at planet that cost no measurable wall and lowered the peak (`reference/performance.md`, "apply-changes' worker scratch follows the release rule"), while the same limit on `check --locations` cost wall time ("Worker read buffers follow a retention limit"), which is why the stricter line stays this command's own. Counters: `merge_streaming_read_buf_peak_bytes`, `merge_streaming_read_buf_allocs`, `merge_streaming_scratch_peak_bytes`, and the invocation totals `pipeline_read_buf_releases` / `pipeline_read_buf_release_capacity_bytes` (allocations freed and their capacity, across every read buffer of the run).
+Worker scratch (`WorkerScratch` in `streaming.rs`) follows the release rule once per blob, after its handler returns: every buffer a worker keeps across blobs is dropped if one blob grew it past `MAX_RETAINED_SCRATCH_CAPACITY`, except the decode buffer, which follows the decode pool's own limit (`release_decode_outlier`, the check every worker-kept plain decode buffer in the crate takes, counted in `pipeline_decompress_pool_oversize_drops`). The base-read buffer is the crate's worker read buffer (`ReadBuf` in `src/read/read_buf.rs`: exact growth, a fresh allocation, never a doubling) but is held to the common scratch limit rather than the read buffers' 16 MiB line, although ordinary `--locations-on-ways` way frames exceed it, so under `-l` it is released and regrown on about every way blob; at planet that cost no measurable wall and lowered the peak (`reference/performance/apply-changes.md`, "apply-changes' worker scratch follows the release rule"), while the same limit on `check --locations` cost wall time ("Worker read buffers follow a retention limit"), which is why the stricter line stays this command's own. Counters: `merge_streaming_read_buf_peak_bytes`, `merge_streaming_read_buf_allocs`, `merge_streaming_scratch_peak_bytes`, and the invocation totals `pipeline_read_buf_releases` / `pipeline_read_buf_release_capacity_bytes` (allocations freed and their capacity, across every read buffer of the run).
 
 Optional `--locations-on-ways` keeps inline way-node coordinates current through the merge, from two separate sources:
 
@@ -383,7 +383,7 @@ counterpart doesn't exist yet.
 
 Embeds node coordinates in ways. Index strategies (`--index-type`, default
 `auto`, which routes to one of the other two; `dense` was removed. See
-[performance.md](performance.md) for measured comparisons):
+[performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured comparisons):
 
 **Sparse**: rank-indexed flat mmap. Builds an `IdSet` of
 way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
@@ -395,7 +395,7 @@ serial writer bottleneck. Pass 2's `get(node_id)` is
 once pass 1 finishes, the store is advised `MADV_RANDOM` so pass 2's
 genuinely-random per-ref lookups stop paying kernel readahead
 speculation. The effect on disk reads and wall time depends on the dataset
-and host; see [performance.md](performance.md) for measured results. Its
+and host; see [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured results. Its
 working-set limit depends on available page cache.
 
 **External** (`altw/external/`, 4-stage bounded-memory join; requires
@@ -408,7 +408,7 @@ sorted + indexed input):
 4. Assembly → pread workers reframe way blobs, splicing coord payloads
 
 Bounded memory with high scratch-disk demand. See
-[performance.md](performance.md) for measured resource use. Requires sorted
+[performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured resource use. Requires sorted
 input with indexdata.
 
 Its scratch records carry fixed-width fields, so the backend has encoding
@@ -482,7 +482,7 @@ backends' own indexdata check reads, so a header-only file counts as indexed
 and frames before the first data blob are skipped. An unreadable or malformed
 frame header up to there is an input error, not a reason to pick sparse; the
 data blob payloads are not read by the selection. This runtime rule follows the measured
-store-versus-cache behavior documented in [performance.md](performance.md).
+store-versus-cache behavior documented in [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md).
 
 Limits of the rule, both accepted with auto as the default:
 
@@ -640,7 +640,7 @@ The two downstream consumers are:
 - Only uses the **read pipeline**; no writes
 - Locations-on-ways path (production shape): elivagar's own bounded read
   loop over `BlobReader` + `Blob::to_primitiveblock()` - Option 3 of the
-  decode-backpressure decision (`reference/performance-history.md`
+  decode-backpressure decision (`reference/performance/read-pipeline.md`
   "Pipelined-reader decode-admission bound"). The raw-Geofabrik path stays
   on the legacy pipelined reader.
 - With injected-prepass landed 2026-07-11, that loop sets `parse_waymembers`
@@ -694,7 +694,7 @@ whose workers each pread a contiguous run of node blobs, read three times
 slower under `FADV_RANDOM` than plain on europe, while stage 4, which
 dispatches blobs one at a time across the pool, and extract simple's
 classify pools (with their sliding `WILLNEED`) measured indifferent
-(`reference/performance.md`, "Scheduled-read advice: RANDOM against
+(`reference/performance/read-pipeline.md`, "Scheduled-read advice: RANDOM against
 plain"). A reader of contiguous runs therefore keeps a plain description of
 its own; for the other plain pools (apply-changes, renumber, extract's
 `pread_execute`) advice sensitivity is unmeasured. Opening the path
@@ -1000,16 +1000,16 @@ string.
 
 ## Benchmark context (daily loop at planet, plantasjen)
 
-The measurement record is `reference/performance.md` (current baselines
-and per-command breakdowns), `reference/performance-history.md` (arcs
-and retrospectives), and `.brokkr/results.db`. Headline planet figures
+The measurement record is indexed by `reference/performance/README.md`: each
+target file holds current baselines and per-command breakdowns first, then
+arcs and retrospectives under History. Raw runs are in `.brokkr/results.db`. Headline planet figures
 for the ratified daily loop:
 
 | Step | Wall | Pin |
 |---|---:|---|
-| `apply-changes` (zstd:1, cross-disk, parallel pwrite) | 80.9 s | performance.md apply-changes table |
+| `apply-changes` (zstd:1, cross-disk, parallel pwrite) | 80.9 s | performance/apply-changes.md apply-changes table |
 | `add-locations-to-ways --index-type external` | 546.0 s | UUID `7fd04130`, commit `16e3694` |
-| `build-geocode-index` | 432.9 s | 2026-04-18 arc, performance.md |
+| `build-geocode-index` | 432.9 s | 2026-04-18 arc, performance/geocode.md |
 
 Total ~17-18 min per daily refresh on a 30 GB-class host. The
 injected-prepass flag (landed 2026-07-11) must stay inside the standing

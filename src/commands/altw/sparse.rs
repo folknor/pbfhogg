@@ -372,7 +372,7 @@ crate::counters::counter_set! {
 /// workers streaming semi-ordered payloads); sparse pass 2 has no such
 /// ordering, and the matched europe pair confirmed the opposite sign here:
 /// pass-2 disk read -57 %, pass-2 work -11.3 % (2026-07-16, `25cb0df`;
-/// reference/performance.md).
+/// reference/performance/add-locations-to-ways.md).
 fn advise_random_store(mmap: &memmap2::MmapMut, invocation: &crate::host::Recorder) {
     #[cfg(unix)]
     {

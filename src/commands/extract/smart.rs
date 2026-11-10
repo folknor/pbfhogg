@@ -472,7 +472,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // was built and measured at planet (Europe bbox, smart): this phase
     // stayed at 16.6-16.9 s, since every way's refs are scanned against the
     // node set and that, not the message re-parse a projection removes, is
-    // its cost (reference/performance.md, "inspect --nodes reads through a
+    // its cost (reference/performance/inspect.md, "inspect --nodes reads through a
     // projection").
     host.invocation.marker("PASS1_WAY_CLASSIFY_START");
     crate::scan::classify::parallel_classify_phase(
@@ -658,7 +658,7 @@ pub(super) fn extract_smart(
         // Deliberately a block walk. On `WaySpans` restricted to
         // `extra_way_ids` this phase went from 10.1 s to 8.7 s at planet,
         // but the command moved by under 1 % (131.9 s against 131.5 s
-        // median), noise for a 130 s run (reference/performance.md,
+        // median), noise for a 130 s run (reference/performance/inspect.md,
         // "inspect --nodes reads through a projection").
         host.invocation.marker("SMART_PASS2_CLASSIFY_START");
         crate::scan::classify::parallel_classify_phase(

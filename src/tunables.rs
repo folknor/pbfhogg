@@ -236,7 +236,7 @@ pub(crate) const HEADER_WINDOW_SIZE: usize = 1024 * 1024;
 /// renews only on new evidence of a cold region and stops within one
 /// episode of a region whose headers are cached. Without it a cold dense
 /// walk reads at queue depth one: denmark `cat --dedupe` pass 1 read 306 MB
-/// in 1 MiB windows at about 1.7 GB/s (`reference/performance.md`, "Header
+/// in 1 MiB windows at about 1.7 GB/s (`reference/performance/read-pipeline.md`, "Header
 /// walk prefetch on cold dense files").
 pub(crate) const HEADER_WALK_PREFETCH_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -286,7 +286,7 @@ pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 /// 16 MiB retains every buffer of the planet file (payload plus tables; its
 /// blocks run a few MiB, pool drops 0 at `getparents` planet on bygg). The
 /// earlier 4 MiB cap, combined with a 4x-compressed-size reservation,
-/// dropped every planet buffer (see `reference/performance.md`, "Decode
+/// dropped every planet buffer (see `reference/performance/read-pipeline.md`, "Decode
 /// buffers sized from the blob and recycled"). One retained outlier per
 /// worker is the cost: up to this much per pread worker.
 ///
@@ -519,7 +519,7 @@ const _: () = assert!(
 /// is dropped after about every way blob and regrown by the next. Measured at
 /// planet against a 16 MiB line that kept every frame, that churn (about
 /// 15,000 releases in 51,000 reads) cost no wall time above noise and lowered
-/// the run's peak anon by about 100 MB more (`reference/performance.md`,
+/// the run's peak anon by about 100 MB more (`reference/performance/apply-changes.md`,
 /// "apply-changes' worker scratch follows the release rule"). That is a
 /// measured outcome under glibc, not a property of the rule: freed capacity
 /// lowers the peak only as far as the allocator returns or reuses it.
@@ -547,7 +547,7 @@ pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
 /// and regrew a buffer on most way-blob reads (90,972 releases) and ran
 /// 214.4 and 222.9 s against 197.4 to 204.2 s, with no lower run peak; this
 /// line ran 204.4 s with no release (bygg, `22a5f24a`,
-/// `reference/performance.md`, "Worker read buffers follow a retention
+/// `reference/performance/read-pipeline.md`, "Worker read buffers follow a retention
 /// limit"). apply-changes keeps the stricter scratch limit on its base-read
 /// buffer, measured neutral there (`MAX_RETAINED_SCRATCH_CAPACITY`).
 pub(crate) const READ_BUF_MAX_RETAINED_CAPACITY: usize = DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
@@ -576,7 +576,7 @@ pub(crate) const ZLIB_RESERVE_SLACK: usize = 64;
 /// nothing because the writer is the bottleneck. The backlog is about this
 /// capacity plus the worker count times a rewrite result; at 256 it reached
 /// about 1 GB at planet and stayed as allocator free memory, and 32 holds the
-/// channel near 0.15 GB with the same wall time (`reference/performance.md`,
+/// channel near 0.15 GB with the same wall time (`reference/performance/apply-changes.md`,
 /// "apply-changes' drain channel held the node phase's backlog"). Fixed
 /// rather than scaled with the worker count, which already adds one held
 /// result per worker.
@@ -603,7 +603,7 @@ pub(crate) const CANDIDATE_CHANNEL_CAPACITY: usize = 64;
 /// 512 is chosen to sit above what planet runs keep in flight, so that on
 /// normal input it does not bind; it exists so a pathological stall cannot
 /// grow the map without limit. The measured in-flight high water and the
-/// planet A/B are in `reference/performance.md` ("Apply-changes sequence
+/// planet A/B are in `reference/performance/apply-changes.md` ("Apply-changes sequence
 /// window").
 pub(crate) const APPLY_CHANGES_SEQ_WINDOW: usize = 512;
 
@@ -663,13 +663,13 @@ pub(crate) const DESCRIPTOR_OVERHEAD: usize = 64;
 /// Route to external when the estimated sparse store exceeds this many
 /// percent of the page-cache budget. This is a policy threshold selected
 /// from the measured store-versus-cache behavior, not a measured optimum;
-/// see `reference/performance.md` for the supporting measurements.
+/// see `reference/performance/add-locations-to-ways.md` for the supporting measurements.
 pub(crate) const AUTO_STORE_BUDGET_PCT: u64 = 80;
 
 /// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
 /// buffers, writer queues). Subtracted from available memory before applying
 /// [`AUTO_STORE_BUDGET_PCT`], so the budget reflects what the page cache can
-/// actually keep resident for the store. See `reference/performance.md` for
+/// actually keep resident for the store. See `reference/performance/add-locations-to-ways.md` for
 /// measured resource use.
 /// Keep this measured allowance fixed: indexed node count estimates the
 /// file-backed store, not the referenced-ID span or the decode/queue footprint.
@@ -791,7 +791,7 @@ pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
 /// run (two dense planet blobs merged, about 2 MB compressed) completes in a
 /// chunk or two without parking behind the write loop, which is what lets
 /// later runs proceed while the head drains; the planet self-merge's
-/// `overlap_run_chunks` bears that out (reference/performance.md). The wall
+/// `overlap_run_chunks` bears that out (reference/performance/sort.md). The wall
 /// effect of other sizes is not measured.
 pub(crate) const OVERLAP_RUN_CHUNK_BYTES: usize = 2 << 20;
 
@@ -800,7 +800,7 @@ pub(crate) const OVERLAP_RUN_CHUNK_BYTES: usize = 2 << 20;
 /// demotes mostly consumed cursors (less than an eighth of their elements
 /// left) to owned tails, releasing their blocks. On planet merged with
 /// itself the largest run charge, two dense twin blobs, is about a fifth of
-/// this (`overlap_run_pinned_high_water_bytes`, reference/performance.md),
+/// this (`overlap_run_pinned_high_water_bytes`, reference/performance/sort.md),
 /// so ordinary runs never demote; a run with many sparse tails stops
 /// pinning whole blocks for a few elements each.
 ///
@@ -865,7 +865,7 @@ pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 /// CPU, since a blob crossing a cut is decoded once by each unit it
 /// touches, about one blob per unit. At ~1 MB planet blobs this is a few
 /// dozen blobs a unit, so the crossing decode stays a few percent. Measured
-/// on planet diff (bygg, 32 workers, reference/performance.md): 16 MiB cost
+/// on planet diff (bygg, 32 workers, reference/performance/diff.md): 16 MiB cost
 /// about 4 % wall for about a third less peak memory.
 pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 
@@ -884,7 +884,7 @@ pub(crate) const DIFF_UNIT_TARGET_BYTES: usize = 32 << 20;
 /// both sides summed. Without that, a diff of two equal files framed
 /// differently ran serial on the head unit: denmark against its own
 /// `cat --dedupe` output took 8.2 s at `4e0eaa50` on bygg, 0.65 s with every
-/// frame counted (reference/performance.md, "Common lines cut by elements").
+/// frame counted (reference/performance/diff.md, "Common lines cut by elements").
 /// Verbose details on modified elements, and frames on both inputs too
 /// large for a cut between them (a one-sided oversized frame is carried and
 /// clipped at the other side's cuts), are not bounded by any element count and can still outrun the channel; the text
@@ -969,7 +969,7 @@ pub(crate) const DIFF_OUTPUT_CHUNK_DEPTH: usize = 4;
 /// behind the head. A bound on run-ahead, not sustained parallelism: units
 /// that each outrun it still wait. The text diff writes no scratch, so
 /// memory is the only place this run-ahead can live. Not measured beyond
-/// the oversized-frame cell in reference/performance.md.
+/// the oversized-frame cell in reference/performance/diff.md.
 pub(crate) const DIFF_TEXT_OVERFLOW_BYTES: usize = 256 << 20;
 
 // ---------------------------------------------------------------------------
@@ -1187,7 +1187,7 @@ pub(crate) const GEOCODE_MERGE_WINDOW_BLOBS: usize = 256;
 /// address, street or node. With std's 8 KiB default, growing `AddrPoint`
 /// from 20 to 24 bytes made the node merge the bottleneck of Pass 2a on
 /// Germany (0.95 s to 1.44 s on bygg); a 1 MiB buffer took it back to
-/// 0.95 s. See `reference/performance.md`, build-geocode-index.
+/// 0.95 s. See `reference/performance/geocode.md`, build-geocode-index.
 pub(crate) const GEOCODE_DATA_FILE_BUFFER_BYTES: usize = 1 << 20;
 
 /// IDs the dense node-ID bitmap may cover per input byte, passed to

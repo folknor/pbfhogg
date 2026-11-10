@@ -371,7 +371,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
 
 - **The gate reads the first data blob only** (`has_indexdata`). An
   all-blob preflight was a measured regression across header-walking
-  commands ([performance-history.md](performance-history.md), "TAINTED
+  commands ([performance/README.md](performance/README.md), "TAINTED
   window"), so the probe stays first-blob-only. A header-only file counts as
   indexed: no blob lacks indexdata.
 - **A partially indexed file lies about nothing, and every command refuses

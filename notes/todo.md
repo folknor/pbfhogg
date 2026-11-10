@@ -377,12 +377,6 @@ Remaining open findings from the closed hunt.
 
 ### Spatial and node-location resolution
 
-- [ ] **Admin tolerance default (20 m) has no query-latency cell.** Since
-  `9470143c` admin rings are simplified to a metric tolerance. Build time
-  and stored vertices are measured (reference/performance/geocode.md: germany
-  admin vertices 103 MB to 42 MB); admin point-in-polygon query cost at
-  20 m against the former cap is not. The interior-flags item below is the
-  way to make small tolerances cheap at query time.
 
 ### Geocode index
 

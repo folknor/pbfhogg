@@ -639,6 +639,17 @@ fn project_on_segment(
 /// returns the ring unchanged. Coordinates are `(x, y)` (longitude, latitude)
 /// in degrees.
 ///
+/// **No ring vanishes.** A ring that fits inside the tolerance as a whole
+/// would come back as a point or a line, which answers nothing. When the
+/// result has fewer than three distinct vertices, or no signed area where the
+/// original has some, the ring is simplified again at the smaller tolerance
+/// its own width allows (`ring_width_floor_m`), which keeps at least half its
+/// signed area; a ring that still fails, or has no area to keep, is returned
+/// unchanged. Either way the tolerance used is at most `tolerance_m`, so the
+/// contract below holds as stated. This protects a ring's signed area, not
+/// its even-odd interior: a ring that the reader already reads as empty (one
+/// traversed twice) is not detected.
+///
 /// **Contract.** For any point farther than `tolerance_m` from the original
 /// ring, [`point_in_ring_with_antimeridian`] gives the same answer against the
 /// result as against `ring`, whether or not the result is simple. The result
@@ -677,6 +688,95 @@ pub fn simplify_ring(ring: &[(f64, f64)], tolerance_m: f64) -> Vec<(f64, f64)> {
         return ring.to_vec();
     }
     let frame = pip_ring_frame(ring);
+    let keep = dp_keep(ring, &frame, tolerance_m);
+    let keep = if ring_collapsed(&keep, &frame) {
+        // The ring as a whole fits inside the tolerance. Retry at a
+        // tolerance the ring's own width bounds, which provably keeps at
+        // least half its signed area; with no such tolerance, or should
+        // rounding beat the bound, keep the input whole.
+        match ring_width_floor_m(&frame) {
+            Some(floor_m) => {
+                let retried = dp_keep(ring, &frame, tolerance_m.min(floor_m));
+                if ring_collapsed(&retried, &frame) {
+                    return ring.to_vec();
+                }
+                retried
+            }
+            None => return ring.to_vec(),
+        }
+    } else {
+        keep
+    };
+    ring.iter()
+        .zip(keep.iter())
+        .filter(|(_, k)| **k)
+        .map(|(&pt, _)| pt)
+        .collect()
+}
+
+/// Whether the vertices `keep` marks lost the ring `frame` (reader frame):
+/// fewer than three distinct vertices, or no signed area while the original
+/// has some. A ring of no signed area to begin with (a cancelling figure
+/// eight) is never counted as collapsed, so it is simplified as any other.
+fn ring_collapsed(keep: &[bool], frame: &[(f64, f64)]) -> bool {
+    let kept: Vec<(f64, f64)> = frame
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, k)| **k)
+        .map(|(&pt, _)| pt)
+        .collect();
+    if kept.len() == frame.len() {
+        return false;
+    }
+    kept.len() < 4
+        || (planar_signed_area(&kept, 1.0) == 0.0 && planar_signed_area(frame, 1.0) != 0.0)
+}
+
+/// Shoelace signed area of a closed `(lon, lat)` ring with longitude scaled
+/// by `c`, relative to the first vertex so small rings keep their digits.
+fn planar_signed_area(ring: &[(f64, f64)], c: f64) -> f64 {
+    let Some(&(x0, y0)) = ring.first() else {
+        return 0.0;
+    };
+    let mut twice = 0.0;
+    for w in ring.windows(2) {
+        let (ax, ay) = ((w[0].0 - x0) * c, w[0].1 - y0);
+        let (bx, by) = ((w[1].0 - x0) * c, w[1].1 - y0);
+        twice += ax * by - bx * ay;
+    }
+    twice / 2.0
+}
+
+/// A tolerance in metres at which Douglas-Peucker cannot collapse `frame`:
+/// `w / 4` with `w = 2|A| / P`, area and perimeter measured in metres in
+/// the frame whose east-west scale is the smallest `cos(lat)` over the ring.
+///
+/// Why it holds. Every span's metric (see [`simplify_ring`]) uses a cosine
+/// at least that small, so a vertex within `t` of its chord there is within
+/// `t` here too. Rotate one replaced subchain so its chord lies on `y = 0`:
+/// the subchain lies in `|y| <= t`, so replacing it changes the signed area
+/// by `|integral y dx| <= t * length`. Summed over the disjoint replaced
+/// subchains, `|A - A_out| <= t * P`, and `t <= |A| / (2P)` leaves
+/// `|A_out| >= |A| / 2 > 0`. The bound is on signed area, so it holds for
+/// self-crossing rings too. `None` when the ring has no area or perimeter in
+/// that frame (a ring of no signed area, or one at a pole).
+fn ring_width_floor_m(frame: &[(f64, f64)]) -> Option<f64> {
+    let max_abs_lat = frame.iter().fold(0.0_f64, |m, &(_, lat)| m.max(lat.abs()));
+    let c = max_abs_lat.to_radians().cos();
+    let to_m = EARTH_RADIUS_M * std::f64::consts::PI / 180.0;
+    let area_m2 = planar_signed_area(frame, c).abs() * to_m * to_m;
+    let perimeter_m: f64 = frame
+        .windows(2)
+        .map(|w| ((w[1].0 - w[0].0) * c).hypot(w[1].1 - w[0].1) * to_m)
+        .sum();
+    let floor = area_m2 / (2.0 * perimeter_m);
+    (floor.is_finite() && floor > 0.0).then_some(floor)
+}
+
+/// One Douglas-Peucker pass over `ring` (reader frame `frame`) at
+/// `tolerance_m`, marking the vertices it keeps; [`simplify_ring`] states
+/// the contract.
+fn dp_keep(ring: &[(f64, f64)], frame: &[(f64, f64)], tolerance_m: f64) -> Vec<bool> {
     let last = ring.len() - 1;
     let mut keep = vec![false; ring.len()];
     keep[0] = true;
@@ -700,7 +800,7 @@ pub fn simplify_ring(ring: &[(f64, f64)], tolerance_m: f64) -> Vec<(f64, f64)> {
         }
         stack.push((span_start, span_end));
         while let Some((start, end)) = stack.pop() {
-            if let Some(split) = dp_split(&frame, start, end, tolerance_sq) {
+            if let Some(split) = dp_split(frame, start, end, tolerance_sq) {
                 keep[split] = true;
                 stack.push((start, split));
                 stack.push((split, end));
@@ -708,12 +808,7 @@ pub fn simplify_ring(ring: &[(f64, f64)], tolerance_m: f64) -> Vec<(f64, f64)> {
         }
         span_start = span_end;
     }
-
-    ring.iter()
-        .zip(keep.iter())
-        .filter(|(_, k)| **k)
-        .map(|(&pt, _)| pt)
-        .collect()
+    keep
 }
 
 /// The interior vertex at which to split `pts[start..=end]`, or `None` when
@@ -1499,6 +1594,88 @@ mod tests {
         assert!(!point_in_ring_with_antimeridian(0.0, -60.0, &simplified));
     }
 
+    /// A ring that fits inside the tolerance is a whole mapped feature (on
+    /// real data, a cadastral exclave a few metres across, or a sliver along
+    /// a creek); collapsing it to a point or a line erased it from the index
+    /// at every point. Each shape here collapsed under plain Douglas-Peucker
+    /// at 20 m and must come back as a ring that still holds its middle.
+    #[test]
+    fn a_ring_inside_the_tolerance_is_not_collapsed() {
+        let lat0: f64 = 51.37;
+        let c = lat0.to_radians().cos();
+        let m_lon = |m: f64| metres_to_deg(m) / c;
+        let m_lat = metres_to_deg;
+        // A 10 m square, a 15 m by 600 m sliver with a wiggle along each
+        // side, and a 6 m triangle.
+        let square = vec![
+            (12.0, lat0),
+            (12.0 + m_lon(10.0), lat0),
+            (12.0 + m_lon(10.0), lat0 + m_lat(10.0)),
+            (12.0, lat0 + m_lat(10.0)),
+            (12.0, lat0),
+        ];
+        let mut sliver: Vec<(f64, f64)> = (0..=12)
+            .map(|i| {
+                (
+                    12.0 + m_lon(50.0 * f64::from(i)),
+                    lat0 + m_lat(if i % 2 == 0 { 0.0 } else { 2.0 }),
+                )
+            })
+            .collect();
+        sliver.extend((0..=12).rev().map(|i| {
+            (
+                12.0 + m_lon(50.0 * f64::from(i)),
+                lat0 + m_lat(if i % 2 == 0 { 15.0 } else { 13.0 }),
+            )
+        }));
+        sliver.push(sliver[0]);
+        let triangle = vec![
+            (12.0, lat0),
+            (12.0 + m_lon(6.0), lat0),
+            (12.0 + m_lon(3.0), lat0 + m_lat(5.0)),
+            (12.0, lat0),
+        ];
+        let mut triangle4 = triangle.clone();
+        triangle4.insert(1, (12.0 + m_lon(3.0), lat0));
+        let cases = [
+            ("square", square, (12.0 + m_lon(5.0), lat0 + m_lat(5.0))),
+            ("sliver", sliver, (12.0 + m_lon(300.0), lat0 + m_lat(7.5))),
+            (
+                "triangle",
+                triangle4,
+                (12.0 + m_lon(3.0), lat0 + m_lat(2.0)),
+            ),
+        ];
+        for (name, ring, inside) in cases {
+            assert!(
+                point_in_ring_with_antimeridian(inside.0, inside.1, &ring),
+                "{name}"
+            );
+            let simplified = simplify_ring(&ring, 20.0);
+            assert!(simplified.len() >= 4, "{name} collapsed to {simplified:?}");
+            assert!(
+                planar_signed_area(&simplified, c).abs()
+                    >= planar_signed_area(&ring, c).abs() / 2.0,
+                "{name} kept under half its area: {simplified:?}"
+            );
+            assert!(
+                point_in_ring_with_antimeridian(inside.0, inside.1, &simplified),
+                "{name} lost its middle: {simplified:?}"
+            );
+            assert_eq!(simplified.first(), ring.first());
+            assert_eq!(simplified.last(), ring.last());
+        }
+        // A ring of no area at all (out and back along a line) has nothing
+        // to keep and is returned as it is.
+        let line = vec![
+            (12.0, lat0),
+            (12.0 + m_lon(5.0), lat0),
+            (12.0 + m_lon(9.0), lat0),
+            (12.0, lat0),
+        ];
+        assert_eq!(simplify_ring(&line, 20.0), line);
+    }
+
     #[test]
     fn simplify_ring_handles_deep_path_without_recursion() {
         // A comb peels one vertex per split: worst case for a recursive DP.
@@ -1506,6 +1683,11 @@ mod tests {
         let mut ring: Vec<_> = (0..20_000)
             .map(|i| (f64::from(i) * tooth, if i % 2 == 0 { 0.0 } else { tooth }))
             .collect();
+        // Closed through a body 1 km tall, so the teeth are detail on a ring
+        // wider than the tolerance, not a sliver kept whole for its own width.
+        let body = metres_to_deg(1_000.0);
+        ring.push((19_999.0 * tooth, body));
+        ring.push((0.0, body));
         ring.push(ring[0]);
         let simplified = simplify_ring(&ring, 1.0);
         assert_eq!(simplified.len(), ring.len());

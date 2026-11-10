@@ -681,6 +681,62 @@ mod tests {
         }
     }
 
+    /// A 10 m exclave of B inside A, mapped as B's outer and A's hole, as
+    /// German cadastral boundaries carry hundreds of them. At the default
+    /// tolerance both rings once collapsed, so a query in the middle of the
+    /// exclave answered A, the neighbour, at every level both were mapped at.
+    #[test]
+    fn an_exclave_inside_the_tolerance_keeps_its_answer() {
+        let lat0: f64 = 51.37;
+        let c = lat0.to_radians().cos();
+        let d = crate::geo::EARTH_RADIUS_M.recip().to_degrees();
+        let (w_lon, w_lat) = (10.0 * d / c, 10.0 * d);
+        let mainland = rect_lonlat(12.0, 51.3, 12.4, 51.45);
+        let exclave = rect_lonlat(12.2, lat0, 12.2 + w_lon, lat0 + w_lat);
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        way_geom.insert(1, ring_e7(&mainland));
+        way_geom.insert(2, ring_e7(&exclave));
+        let relations = vec![
+            RawAdminRelation {
+                id: 1,
+                admin_level: 4,
+                name_offset: 1,
+                country_code_offset: 0,
+                outer_way_ids: vec![1],
+                inner_way_ids: vec![2],
+            },
+            RawAdminRelation {
+                id: 2,
+                admin_level: 4,
+                name_offset: 2,
+                country_code_offset: 0,
+                outer_way_ids: vec![2],
+                inner_way_ids: Vec::new(),
+            },
+        ];
+        let (polygons, _) = assemble_admin_polygons(
+            &relations,
+            &way_geom,
+            &BuildConfig::default(),
+            &crate::host::Executor::Ambient,
+        );
+        let middle = (12.2 + w_lon / 2.0, lat0 + w_lat / 2.0);
+        let answers: Vec<u32> = polygons
+            .iter()
+            .filter(|p| stored_contains(&p.vertices, middle.0, middle.1))
+            .map(|p| p.name_offset)
+            .collect();
+        assert_eq!(answers, vec![2], "the exclave's middle must answer B alone");
+        // Passing counterpart: outside the exclave, A answers.
+        let beside = (12.1, 51.4);
+        let answers: Vec<u32> = polygons
+            .iter()
+            .filter(|p| stored_contains(&p.vertices, beside.0, beside.1))
+            .map(|p| p.name_offset)
+            .collect();
+        assert_eq!(answers, vec![1]);
+    }
+
     /// Through the builder, on a ring dense enough to be simplified hard:
     /// every sample point farther than the tolerance from the original
     /// boundary keeps its answer, holes included.

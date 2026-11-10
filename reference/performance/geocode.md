@@ -93,8 +93,22 @@ and 6.3 s (`632417dd`). Planet one pair: 117 s (`0a083f67`) against
 than the old level-scaled cap, not more; admin polygons 43,091 against
 43,044 and dropped relations 1,059 against 1,060, the polygons that fit
 inside the tolerance; every non-admin file unchanged in size. The
-default is not slower to build and stores less admin geometry. Query
-latency was not measured.
+default is not slower to build and stores less admin geometry.
+
+Query latency, geocode-query, 100k seeded points in the Germany box
+5.9,47.3,15.0,55.0, best of 3 rounds, child `us_per_query_best`. The
+vertex-cap arm is `74df55c6`, the bench commit's CLI on `8094648a`'s
+library (a commit object outside main), against `9a7e719b`. Germany
+A B B A: 91.06 (`91156a4f`) and 98.72 us (`4018afe3`) against 83.98
+(`05b87e31`) and 86.52 us (`53a67bb6`), about 10 % faster. Planet one
+pair: 127.21 us (`acaf50e0`) against 108.39 us (`74b3c642`), about 15 %
+faster. Answers differ as expected: germany points with an admin answer
+70,254 against 70,246; planet admin polygons 929,941 against 910,045,
+about 20,000 fewer, with dropped relations 2,742 against 2,753. These
+were not only polygons inside 20 m: rings collapsed to stored zero-area
+lines and holes collapsed with them, so exclaves answered as their
+neighbour. The commit after `9e098409` reruns a collapsed ring at a
+floor of its own width; those cells are recorded below it.
 
 ### Pass 3 bucket writes in parallel, stage B on the ordered pool (bygg, 2026-11-10, `b9ccca65` against `9775b0e2`)
 

@@ -1,5 +1,20 @@
 # Read Pipeline
 
+### DenseInfo columns read per group (bygg, 2026-11-10, `9e098409` against `9a7e719b`)
+
+Column presence is decided once per group and the dense iterator keeps
+one no-value test per column, with a cold helper for a missing column;
+BlockBuilder groups dense runs by column set. After a trim,
+`--iterations 1`, both arms `--commit`, A B B A, planet:
+
+| Cell | A, `9a7e719b` | B, `9e098409` |
+|---|---|---|
+| decode-workload `--modes pipelined` (measured call) | 189, 188 s (`76be6a97`, `e8393e6e`) | 184, 184 s (`22e0956a`, `cac5129b`) |
+| copy-pbf `--clean yes` | 145, 140 s (`f72848bb`, `b3db61ca`) | 143, 142 s (`81ba07ad`, `75cdc0ee`) |
+
+The decode loop is about 2 % faster on both pairs and cat clean is
+neutral: no cost on complete-column input. Kept.
+
 ### Decode buffers sized from the blob and recycled (bygg, 2026-10-30)
 
 The pread decode workers asked the per-worker `DecompressPool` for

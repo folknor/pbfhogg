@@ -29,6 +29,10 @@
   neighbour. A query farther than the tolerance from a boundary now gets the
   answer the unsimplified boundary gives, at every admin level. Index size
   and admin lookup cost now follow the tolerance rather than a fixed budget.
+  An admin ring that fits inside the tolerance as a whole (a small exclave,
+  a sliver along a shared boundary, or the matching hole in its neighbour)
+  is simplified at a tolerance its own width allows instead of collapsing,
+  so a query inside it keeps that area rather than getting the neighbour.
   Equal-area admin candidates at one level now resolve deterministically.
 - `merge-changes` and `tags-filter --input-kind osc` keep the body of a
   delete - tags, way node refs, relation members and a deleted node's

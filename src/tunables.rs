@@ -838,19 +838,25 @@ pub(crate) const SWEEP_GROUP_INDEX_THRESHOLD: usize = 32;
 /// caps that storage (8 bytes an entry, so 8 MiB at most). Past the budget
 /// the detail prints one line naming the replaced old and new ranges instead
 /// of an edit script. Per call and independent of shard count, so a run's
-/// memory does not grow with it beyond one budget per worker. Sized so one
-/// call stays in the low milliseconds; not measured.
+/// memory does not grow with it beyond one budget per worker. Release-mode
+/// unit timing on bygg, 2026-11-10, 0e42bba3 + diff changes: 30k integer
+/// sequences, 11 calls each, disjoint median 1.18 ms / max 2.54 ms;
+/// 500 scattered replacements (1000 edits) median 1.43 ms / max 1.46 ms.
+/// Keep 1 << 20: near-cap search stays in low milliseconds. This is a work
+/// bound, not a latency bound for arbitrary Eq implementations or lengths.
+/// Reproduce with the ignored seq::tests::verbose_sequence_budget_timing.
 pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_WORK: usize = 1 << 20;
 
-/// Most edit lines (removals plus insertions) one ordered sequence prints
+/// Most detail lines one tag list or ordered sequence prints
 /// under a modified element in `diff -v`. A larger script, including a pure
 /// bulk insertion or deletion that needs no search at all, prints one
 /// summary line naming the replaced old and new ranges instead. This is a
 /// readability bound on output, independent of the search budget above
 /// (which by itself already stops near 1023 edits): it is what keeps a
 /// reversed long way or a rebuilt large relation from printing tens of
-/// thousands of lines. Per sequence, not per element; keyed tag lines are
-/// not counted.
+/// thousands of lines. Per list, not per element. Unique-key tags use the
+/// same cap, counting each removal, addition, value change and order-change
+/// line; overflow replaces the entire keyed detail with a count summary.
 pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_EDITS: usize = 1000;
 
 /// Compressed frame bytes (both inputs together) at which the block-pair

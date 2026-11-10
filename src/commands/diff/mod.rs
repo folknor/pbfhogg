@@ -961,6 +961,30 @@ fn write_tag_diff_iter<'a>(
         });
     }
 
+    // Count before writing: an omitted detail must never look like a
+    // complete keyed diff with only its tail silently missing.
+    let removed = old_vec
+        .iter()
+        .filter(|(k, _)| !new_map.contains_key(k))
+        .count();
+    let changed = new_vec
+        .iter()
+        .filter(|(k, v)| old_map.get(k) != Some(v))
+        .count();
+    let common_old = old_vec.iter().filter(|(k, _)| new_map.contains_key(k));
+    let common_new = new_vec.iter().filter(|(k, _)| old_map.contains_key(k));
+    let reordered = !common_old.map(|(k, _)| k).eq(common_new.map(|(k, _)| k));
+    if removed + changed + usize::from(reordered) > crate::tunables::VERBOSE_SEQUENCE_DIFF_MAX_EDITS
+    {
+        writeln!(
+            output,
+            "  tags: {} -> {} (details omitted)",
+            old_vec.len(),
+            new_vec.len()
+        )?;
+        return Ok(());
+    }
+
     for (k, v) in &old_vec {
         if !new_map.contains_key(k) {
             writeln!(output, "  -{}={}", Quoted(k), Quoted(v))?;
@@ -987,9 +1011,7 @@ fn write_tag_diff_iter<'a>(
     // Tag order is element content, so a reorder needs a line of its own.
     // Only keys present on both sides are compared, so a plain insertion or
     // removal is not mistaken for a reorder.
-    let common_old = old_vec.iter().filter(|(k, _)| new_map.contains_key(k));
-    let common_new = new_vec.iter().filter(|(k, _)| old_map.contains_key(k));
-    if !common_old.map(|(k, _)| k).eq(common_new.map(|(k, _)| k)) {
+    if reordered {
         writeln!(output, "  tags: order changed")?;
     }
     Ok(())
@@ -1124,6 +1146,45 @@ mod text_unit_sink_tests {
         fn abandoned(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn keyed_tag_details_respect_line_cap() {
+        let keys: Vec<String> = (0..1001).map(|i| format!("key{i}")).collect();
+        let old: Vec<(&str, &str)> = keys.iter().map(|k| (k.as_str(), "old")).collect();
+        let new: Vec<(&str, &str)> = keys.iter().map(|k| (k.as_str(), "new")).collect();
+        let render = |a: &[(&str, &str)], b: &[(&str, &str)]| {
+            let mut out = Vec::new();
+            write_tag_diff_iter(
+                &mut out,
+                a.iter().copied().map(Ok),
+                b.iter().copied().map(Ok),
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            render(&old, &new),
+            "  tags: 1001 -> 1001 (details omitted)\n"
+        );
+        assert_eq!(render(&[], &new), "  tags: 0 -> 1001 (details omitted)\n");
+        assert_eq!(render(&old, &[]), "  tags: 1001 -> 0 (details omitted)\n");
+        let at_cap = render(&old[..1000], &new[..1000]);
+        assert_eq!(at_cap.lines().count(), 1000);
+        assert!(!at_cap.contains("omitted"));
+        let mut reversed = new[..1000].to_vec();
+        reversed.reverse();
+        assert_eq!(
+            render(&old[..1000], &reversed),
+            "  tags: 1000 -> 1000 (details omitted)\n"
+        );
+        // The cap is shared by all keyed change kinds, not each kind alone.
+        assert_eq!(
+            render(&old[..1000], &new[500..1001]),
+            "  tags: 1000 -> 501 (details omitted)\n"
+        );
+        // A large unchanged list needs no omission line.
+        assert_eq!(render(&old, &old), "");
     }
 
     fn options() -> DiffOptions {

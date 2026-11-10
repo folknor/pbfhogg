@@ -568,6 +568,11 @@ impl<'a> Iterator for DenseTagIter<'a> {
         }
         pair
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Each remaining key/value pair occupies at least two bytes.
+        (0, Some(self.cursor.remaining() / 2))
+    }
 }
 
 impl std::iter::FusedIterator for DenseTagIter<'_> {}
@@ -602,6 +607,14 @@ impl<'a> Iterator for CheckedDenseTagIter<'a> {
         self.failed = item.is_err();
         Some(item)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.failed {
+            return (0, Some(0));
+        }
+        // Each remaining key/value pair occupies at least two bytes.
+        (0, Some(self.cursor.remaining() / 2))
+    }
 }
 
 /// An iterator over the tags of a dense node as raw index pairs.
@@ -627,14 +640,76 @@ impl Iterator for DenseRawTagIter<'_> {
         let val = validated(self.cursor.read_varint(), "DenseNodes keys_vals value") as i32;
         Some((key, val))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Each remaining key/value pair occupies at least two bytes.
+        (0, Some(self.cursor.remaining() / 2))
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::*;
     use crate::Element;
     use crate::PrimitiveBlock;
     use crate::write::block_builder::{BlockBuilder, Metadata};
+
+    #[test]
+    fn dense_tag_size_hint() {
+        let mut builder = BlockBuilder::new();
+        builder.add_node(1, 0, 0, [], None);
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let Element::DenseNode(node) = block.elements().next().unwrap() else {
+            panic!("fixture contains a dense node");
+        };
+        // A two-byte varint makes the byte bound larger than the pair count.
+        let data = [0x80, 0, 0x80, 0, 0, 0];
+        let mut tags = DenseTagIter {
+            block: node.block,
+            cursor: Cursor::new(&data),
+        };
+        let mut checked = CheckedDenseTagIter {
+            block: node.block,
+            cursor: Cursor::new(&data),
+            failed: false,
+        };
+        let mut raw = DenseRawTagIter {
+            cursor: Cursor::new(&data),
+        };
+        for upper in [3, 1, 0] {
+            assert_eq!(tags.size_hint(), (0, Some(upper)));
+            assert_eq!(checked.size_hint(), (0, Some(upper)));
+            assert_eq!(raw.size_hint(), (0, Some(upper)));
+            if upper > 0 {
+                assert!(tags.next().is_some());
+                assert!(checked.next().unwrap().is_ok());
+                assert!(raw.next().is_some());
+            }
+        }
+        assert!(tags.next().is_none());
+        assert!(checked.next().is_none());
+        assert!(raw.next().is_none());
+
+        let mut tags = DenseTagIter {
+            block: node.block,
+            cursor: Cursor::new(&[127, 0, 0, 0]),
+        };
+        assert!(tags.next().is_none());
+        assert_eq!(tags.size_hint(), (0, Some(0)));
+        for data in [&[127, 0, 0, 0][..], &[0x80, 0x80, 0x80, 0x80][..]] {
+            let mut checked = CheckedDenseTagIter {
+                block: node.block,
+                cursor: Cursor::new(data),
+                failed: false,
+            };
+            assert_eq!(checked.size_hint(), (0, Some(2)));
+            assert!(checked.next().unwrap().is_err());
+            assert_eq!(checked.size_hint(), (0, Some(0)));
+            assert!(checked.next().is_none());
+        }
+    }
 
     // MIN then MAX makes every second delta -1, so each running sum (ID,
     // timestamp, changeset, uid) has to wrap from MIN back to MAX.

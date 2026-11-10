@@ -675,7 +675,7 @@ EMFILE or memory failure exists at 30 workers.
 | L4 segmented grouped emission | **retired** - its target counter no longer exists post-A1, and N1's cheap u64 sort removes the motivation | ledger only |
 | L5 straddler cache | kept, quantified small | S5 |
 | L6 consolidated writers | kept, fallback | S6 |
-| L7/A2 output executor | stays shelved - milestone 1 measured on this host: pool consolidation lost 30 s planet; permit pool (64) is not the cap, compression CPU is | history doc |
+| L7/A2 output executor | stays shelved - milestone 1 measured on this host: pool consolidation lost 30 s planet; permit pool (64) is not the cap, compression CPU is | [A2 milestone 1 write-up](altw-optimization-history.md#a2-milestone-1-inline-way-framing-reverted-2026-04-25) |
 | L8 zstd:1 output note | settled + documented (README, performance.md); removed as a lever | do-not-retry |
 | L9/A3 DenseNodes filter | **demoted 2026-07-14** - its ceiling gate was falsified by the planet zstd:1 cell | S2 |
 | L10/L11 payload format | kept, weakened by N3 | S3 |

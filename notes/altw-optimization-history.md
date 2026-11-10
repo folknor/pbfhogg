@@ -834,3 +834,42 @@ instead of running a full blob scan.
    Cross-disk scratch probes for #6 and any related stage-2/3 seam will
    regress +30% until a second 990-PRO-class drive is available. Design
    choices that assume symmetric NVMe throughput cannot be benched here.
+
+## A2 milestone 1: inline way framing (reverted, 2026-04-25)
+
+Restored from `notes/altw-external.md` at commit `1a9e7488`.
+Historical measurement on plantasjen; implementation `b641095`,
+revert `1050111`. The explanation below is the contemporary diagnosis.
+
+**Milestone 1 tried, reverted [2026-04-25].** Way workers absorbed
+`frame_blob_pipelined` and emitted via `write_raw_owned`, eliminating
+the writer's rayon-spawn for ways (commit `b641095`, reverted in
+`1050111`). The mechanism worked exactly as designed:
+
+  - `writer_permit_wait_ns` 166 s -> 1.7 s cumulative (-99 %).
+  - `s4_send_ms` 1309 s -> 8.7 s cumulative (-99 %).
+  - `writer_payload_framed_items` -17,529 (way blob count); same
+    +17,529 in `writer_payload_raw_items`.
+  - `s4_way_frame_compress_ms` 2869 s cumulative (compress moved
+    from rayon pool into stage-4 worker pool).
+
+Despite that, **stage 4 wall regressed +30 s at planet** (255 s ->
+285 s). The permit/send waits the workers used to spend got
+re-absorbed by the workers doing compress in the same time slots.
+With 22 stage-4 decode threads on this 22-core host, pre-A2 had
+both stage-4 workers AND the writer's rayon pool active
+concurrently; post-A2-m1 the rayon pool sat mostly idle while stage
+4 workers got CPU-fatter. Total wall barely moved on the worker
+critical path; the +30 s is the elimination of the prior implicit
+parallelism between the two pools.
+
+Continuing to milestone 2 (filtered nodes also frame in worker)
+would consolidate more work into stage-4 workers and probably
+deepen the regression rather than reverse it. Milestone 3 (custom
+output coordinator + parallel pwrite) is much larger than
+incremental and the wall ceiling at this point isn't writer-thread
+serial pwrite anyway.
+
+Net: not the next clean lever. The audit's design is structurally
+sound but the on-this-host parallelism math doesn't favour it
+without a coordinated multi-stage rework. Move on.

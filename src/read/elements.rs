@@ -830,6 +830,20 @@ impl<'a> Iterator for CheckedTagIter<'a> {
         self.failed = item.is_err();
         Some(item)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.failed {
+            return (0, Some(0));
+        }
+        // A mismatched tail yields an error past the shorter array.
+        let upper = self
+            .key_indices
+            .size_hint()
+            .1
+            .zip(self.val_indices.size_hint().1)
+            .map(|(keys, vals)| keys.max(vals));
+        (0, upper)
+    }
 }
 
 /// An iterator over the tags of an element as raw index pairs.
@@ -963,6 +977,34 @@ impl<'a> Info<'a> {
 mod tests {
     use super::*;
     use crate::write::block_builder::{BlockBuilder, MemberData};
+
+    #[test]
+    fn checked_tag_size_hint() {
+        let mut builder = BlockBuilder::new();
+        builder.add_relation(1, [], &[], None);
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes).unwrap();
+        let Element::Relation(relation) = block.elements().next().unwrap() else {
+            panic!("fixture contains a relation");
+        };
+        for (keys, vals) in [(&[0, 0][..], &[0][..]), (&[0][..], &[0, 0][..])] {
+            let mut tags = CheckedTagIter::new(relation.block, keys, vals);
+            assert_eq!(tags.size_hint(), (0, Some(2)));
+            assert!(tags.next().unwrap().is_ok());
+            assert_eq!(tags.size_hint(), (0, Some(1)));
+            assert!(tags.next().unwrap().is_err());
+            assert_eq!(tags.size_hint(), (0, Some(0)));
+            assert!(tags.next().is_none());
+        }
+        let mut tags = CheckedTagIter::new(relation.block, &[127, 0], &[0, 0]);
+        assert!(tags.next().unwrap().is_err());
+        assert_eq!(tags.size_hint(), (0, Some(0)));
+        let mut tags = CheckedTagIter::new(relation.block, &[0], &[0]);
+        assert_eq!(tags.size_hint(), (0, Some(1)));
+        assert!(tags.next().unwrap().is_ok());
+        assert_eq!(tags.size_hint(), (0, Some(0)));
+        assert!(tags.next().is_none());
+    }
 
     #[test]
     fn way_ref_and_location_accumulators_wrap_at_signed_boundaries() {

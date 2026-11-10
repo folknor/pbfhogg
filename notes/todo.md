@@ -82,10 +82,6 @@ admission and the regressions.
     new dedicated `std` worker set passes lint unreviewed. (rayon's pool
     constructors are disallowed in `clippy.toml` outside
     `joined_pool::JoinedPool`.)
-  - `notes/altw-external.md` points to a "history doc" for the A2
-    milestone 1 write-up (the +30 s planet pool-consolidation datum); no such text was found in
-    `reference/performance-history.md` or
-    `notes/altw-optimization-history.md`.
 
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
@@ -644,16 +640,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   with the host's cache state accepted as spent for the duration. It has
   survived four rounds untouched for that reason.
 
-- [ ] **The checked and dense tag iterators report the default `size_hint`.**
-  `CheckedTagIter` (`src/read/elements.rs`), `DenseTagIter`,
-  `CheckedDenseTagIter` and `DenseRawTagIter` (`src/read/dense.rs`) return
-  `(0, None)`, while `TagIter` and `RawTagIter` report a finite upper bound.
-  The default is true, so nothing is wrong; a known upper bound would only let
-  adapters size better. If added: `CheckedTagIter` needs `(0, max of the two
-  array uppers)`, not the minimum, because on mismatched arrays (unreachable on
-  a constructed block) it yields one extra `Err` item past the shorter array;
-  the dense ones can bound by `cursor.remaining() / 2` (every pair is at least
-  two bytes), and `CheckedDenseTagIter` must report `(0, Some(0))` once failed.
 
 ### Spatial and node-location resolution
 

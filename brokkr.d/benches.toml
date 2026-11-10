@@ -671,9 +671,10 @@ params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io
 [bench.tag-select]
 script_file = "../benches/tags-filter/tag-select.lua"
 description = "Filter PBF objects with optional references, or filter OSC changes, on a dataset or snapshot"
-version = 2
-date = 2026-11-09
+version = 3
+date = 2026-11-10
 changelog = [
+  { version = 3, date = 2026-11-10, note = "Restore indexed as the PBF input default; OSC sequences remain explicit, with only the selected input kind bound" },
   { date = 2026-11-09, note = "Use shared compression, stop, profiling helpers; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Replaced hex expression encoding with readable comma-preserving params using split = false" },
   { version = 1, date = 2026-11-09, note = "Ported typed tags-filter: PBF and OSC inputs, expression encoding, reference modes, inversion, tag removal, jobs, compression, direct I/O and profiling with marker stops" },
@@ -685,7 +686,7 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.input-kind = { choices = ["pbf", "osc"], default = "pbf", help = "input file kind" }
-params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default_only = true, help = "PBF variant (typed --variant), or OSC sequence (typed --osc-seq); omitted requires a sole entry for the selected input kind" }
+params.input = { from = "datasets.{dataset}.snapshot.{snapshot}.{input-kind}", default = "indexed", help = "PBF variant (typed --variant), default indexed; OSC requires an explicit sequence (typed --osc-seq)" }
 params.filter = { validated = true, split = false, default = "w/highway=primary", help = "one filter expression, commas included" }
 params.omit-referenced = { choices = ["yes", "no"], default = "no", help = "yes: single-pass PBF filter, dropping referenced objects" }
 params.invert-match = { choices = ["yes", "no"], default = "no", help = "yes: keep non-matching PBF objects" }

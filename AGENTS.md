@@ -157,6 +157,7 @@ answer "is this file right?" belong on `check`; descriptive flags on `inspect`.
 `apply-diff` and `diff-applied` use `--osc N`; omission requires exactly one
 entry in the selected snapshot's OSC table. `merge-diffs --osc` is required
 and supports lists, repeated flags, `all` and inclusive ranges.
+`tag-select` defaults to PBF input with `--input indexed`;
 `tag-select --input-kind osc --input N` requires an explicit sequence.
 `merge-workload --osc-seq N` selects from the primary OSC table only.
 Generic commands retain their own OSC options; see their help.
@@ -166,7 +167,8 @@ Generic commands retain their own OSC options; see their help.
 Datasets have a primary PBF (`[datasets.<region>.pbf.*]`) and OSC table,
 plus optional `[datasets.<region>.snapshot.<key>.*]` tables. `base` is reserved
 for the primary. Snapshot-aware scripts take `--snapshot KEY`, usually with
-`--variant`; `tag-select` uses `--input` for the PBF variant or OSC sequence.
+`--variant`; `tag-select` uses `--input` for the PBF variant (default
+`indexed`) or an explicit OSC sequence, scoped by `--input-kind`.
 `diff-pair` takes `--from` and `--to`; non-indexed pairs require both
 `--variant` and `--to-variant` set to the same key. `encode-workload` and
 `merge-workload` remain primary-only. Bound params and input digests are

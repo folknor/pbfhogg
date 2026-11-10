@@ -337,27 +337,6 @@ impl<R: Read + Send> ElementReader<R> {
         )
     }
 
-    /// [`for_each_block_pipelined`](Self::for_each_block_pipelined) for the
-    /// library's own consumers: the blocks never reach a caller, so none is
-    /// issued.
-    pub(crate) fn for_each_own_block_pipelined<F>(self, f: F) -> Result<()>
-    where
-        F: FnMut(PrimitiveBlock) -> Result<()>,
-    {
-        let call = self.blob_iter.cancel_token().call()?;
-        super::pipeline::run_pipeline(
-            self.blob_iter,
-            &call,
-            self.decode_threads,
-            self.pipeline_config,
-            self.blob_filter,
-            self.resources,
-            self.diagnostics,
-            super::pipeline::Blocks,
-            f,
-        )
-    }
-
     /// Ordered pipelined read with a per-block transform executed on the
     /// decode workers. The consumer remains serialized on the calling thread.
     ///

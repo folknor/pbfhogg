@@ -9,10 +9,9 @@
 //! after each open in turn, the last included. Every open is taken on the
 //! calling thread, between passes, so the counts are exact.
 //!
-//! The opens, in order: the indexdata probe, the replication header read,
-//! pass 1's relation scan (all three `O_DIRECT` under direct reads), then
-//! the schedule walk, whose one description the unindexed classify, pass
-//! 1.5 and pass 2 share.
+//! The opens, in order: the indexdata probe and the replication header read
+//! (both `O_DIRECT` under direct reads), then the schedule walk, whose one
+//! description the unindexed classify, pass 1, pass 1.5 and pass 2 share.
 //!
 //! The replacement differs in what every open feeds the index: its header
 //! carries other replication values, its boundary relation another name and
@@ -31,7 +30,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 use crate::common::snapshot_dir;
 
 /// Every build opens the input this many times, on every route.
-const OPENS: u64 = 4;
+const OPENS: u64 = 3;
 
 /// What one fixture puts in the index.
 struct Fixture {
@@ -400,7 +399,7 @@ fn unindexed_build_reads_only_the_pinned_input() {
     );
 }
 
-/// The probe, the header read and pass 1 open `O_DIRECT` when asked to,
+/// The probe and the header read open `O_DIRECT` when asked to,
 /// through the pin's own direct open; the walk stays buffered.
 #[cfg(feature = "linux-direct-io")]
 #[test]

@@ -382,9 +382,9 @@ fn build_generation(
     // `output_dir` is the output's staging directory, which `OutputDir`
     // created when it was staged; it is not created again here.
 
-    // The input is opened four times: the indexdata probe, the replication
-    // header read, pass 1's relation scan and the schedule walk, whose one
-    // description the unindexed classify, pass 1.5 and pass 2 then share.
+    // The input is opened three times: the indexdata probe, the replication
+    // header read and the schedule walk, whose one description the
+    // unindexed classify, pass 1, pass 1.5 and pass 2 then share.
     // Every open is derived from this pin, taken before any of them, so an
     // input renamed over mid-build is never read partly from each file.
     // Pinned here rather than by the caller: nothing else reads the input
@@ -424,8 +424,29 @@ fn build_generation(
     let mut strings = StringPool::new();
 
     // -----------------------------------------------------------------------
+    // One header walk produces everything the passes need: the relation
+    // schedule (Pass 1), the way schedule (Pass 1.5), the node schedule
+    // (Pass 2a), the node-ID bound (used for Pass 1.5's file-size-bounded
+    // `IdSet` pre-allocation and verified in Pass 2a), and one shared file
+    // handle for every pread phase. It runs first so Pass 1 reads only the
+    // relation blobs (see `pass1_5::build_schedules`). Consolidating what were
+    // two walks saved ~26 s at Europe / ~80 s at planet (2026-04-18 bench
+    // `bf8f2038`).
+    // -----------------------------------------------------------------------
+    host.invocation.marker("GEOCODE_SCHEDULES_START");
+    let pass1_5::Schedules {
+        relations: relation_schedule,
+        nodes: node_schedule,
+        ways: way_schedule,
+        max_node_id,
+        file: shared_file,
+    } = pass1_5::build_schedules(&input, host)?;
+    host.invocation.marker("GEOCODE_SCHEDULES_END");
+    host.invocation.check()?;
+
+    // -----------------------------------------------------------------------
     // Pass 1: Relations - collect admin boundary metadata + way member IDs
-    // (Runs first so we know which way IDs to collect in pass 3.)
+    // (Runs before Pass 1.5 so it knows which admin member ways to keep.)
     // -----------------------------------------------------------------------
     host.invocation.marker("GEOCODE_PASS1_START");
     crate::host::diag!(
@@ -438,7 +459,8 @@ fn build_generation(
     let pass1_start = crate::counters::Stopwatch::start();
 
     let (admin_relations, needed_admin_ways) =
-        pass1::run_pass1(&input, config.direct_io, &mut strings, host)?;
+        pass1::run_pass1(&relation_schedule, &shared_file, &mut strings, host)?;
+    drop(relation_schedule);
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -464,20 +486,6 @@ fn build_generation(
     // Every pass boundary is a checkpoint; the passes check their own blob
     // reads, results and chunks in between.
     host.invocation.check()?;
-
-    // -----------------------------------------------------------------------
-    // One header walk produces everything Pass 1.5 and Pass 2a need: the
-    // way schedule (Pass 1.5), the node schedule (Pass 2a), the node-ID
-    // bound (used for Pass 1.5's file-size-bounded `IdSet` pre-allocation and
-    // verified in Pass 2a), and one shared file handle for both pread phases.
-    // Previously two separate header walks: Pass 1.5's own walker and
-    // Pass 2a's `build_classify_schedule(Node)` call. Consolidated walker
-    // saves ~26 s at Europe / ~80 s at planet (2026-04-18 bench `bf8f2038`).
-    // -----------------------------------------------------------------------
-    host.invocation.marker("GEOCODE_SCHEDULES_START");
-    let (node_schedule, way_schedule, max_node_id, shared_file) =
-        pass1_5::build_pass2_schedules(&input, host)?;
-    host.invocation.marker("GEOCODE_SCHEDULES_END");
 
     host.invocation.marker("GEOCODE_PASS1_5_START");
     crate::host::diag!(

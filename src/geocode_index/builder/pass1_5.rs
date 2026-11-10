@@ -688,11 +688,18 @@ pub(super) fn run_pass1_5(
     Ok((referenced_nodes, store))
 }
 
-/// Single header pass that produces everything Pass 1.5 and Pass 2a need to
-/// start: the way-blob schedule (for Pass 1.5 + unused by Pass 2a), the
-/// node-blob schedule (for Pass 2a), the node-ID bound (used for Pass 1.5's
-/// size-bounded `IdSet` pre-allocation and verified by Phase 2a), and a
-/// single shared file handle reused across both phases' `pread_at` workers.
+/// Single header pass that produces everything Pass 1, Pass 1.5 and Pass 2a
+/// need to start: the relation-blob schedule (Pass 1), the way-blob schedule
+/// (Pass 1.5), the node-blob schedule (Pass 2a), the node-ID bound (used for
+/// Pass 1.5's size-bounded `IdSet` pre-allocation and verified by Phase 2a),
+/// and a single shared file handle reused across every phase's `pread_at`
+/// workers.
+///
+/// It runs before Pass 1 so Pass 1 reads only the relation blobs. Pass 1
+/// used to stream the whole file through a kind-filtered sequential reader,
+/// whose filter skips the decode but not the read: on planet that was a
+/// read of the entire file (about 90 GB) to reach the relation blobs at its
+/// tail.
 ///
 /// Consolidates two previously-separate header walks (Pass 1.5's
 /// `build_way_schedule_and_max_node_id` and Pass 2a's
@@ -712,15 +719,10 @@ pub(super) fn run_pass1_5(
 /// bound checked against decoded nodes in Phase 2a; Pass 1.5 separately caps
 /// dense `IdSet` pre-allocation by input file size.
 #[allow(clippy::type_complexity)]
-pub(super) fn build_pass2_schedules(
+pub(super) fn build_schedules(
     input: &PinnedInput,
     host: &crate::host::Entered<'_>,
-) -> Result<(
-    Vec<ScheduledBlob>, // node_schedule
-    Vec<ScheduledBlob>, // way_schedule
-    i64,                // max_node_id
-    InputFile,
-)> {
+) -> Result<Schedules> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
@@ -730,6 +732,7 @@ pub(super) fn build_pass2_schedules(
     // `into_file_order` below).
     let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
     let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
+    let mut relation_schedule: Vec<ScheduledBlob> = Vec::new();
     // OsmData blobs without indexdata (a `--force` run). Their kinds and
     // node-ID range are established by decoding them, below.
     let mut unindexed: Vec<ScheduledBlob> = Vec::new();
@@ -755,7 +758,7 @@ pub(super) fn build_pass2_schedules(
                 node_schedule.push(entry);
             }
             crate::ElementKind::Way => way_schedule.push(entry),
-            crate::ElementKind::Relation => {}
+            crate::ElementKind::Relation => relation_schedule.push(entry),
         }
     }
 
@@ -794,7 +797,10 @@ pub(super) fn build_pass2_schedules(
                             kinds.has_ways = true;
                             continue;
                         }
-                        crate::Element::Relation(_) => continue,
+                        crate::Element::Relation(_) => {
+                            kinds.has_relations = true;
+                            continue;
+                        }
                     };
                     kinds.has_nodes = true;
                     kinds.max_node_id = kinds.max_node_id.max(node_id);
@@ -822,10 +828,14 @@ pub(super) fn build_pass2_schedules(
             if kinds.has_ways {
                 way_schedule.push(*entry);
             }
+            if kinds.has_relations {
+                relation_schedule.push(*entry);
+            }
         }
     }
     into_file_order(&mut node_schedule);
     into_file_order(&mut way_schedule);
+    into_file_order(&mut relation_schedule);
 
     host.invocation
         .counter("pass2_node_blobs", node_schedule.len());
@@ -833,15 +843,35 @@ pub(super) fn build_pass2_schedules(
         .counter("pass2_way_blobs", way_schedule.len());
     host.invocation.counter("pass2_max_node_id", max_node_id);
 
-    Ok((node_schedule, way_schedule, max_node_id, shared_file))
+    Ok(Schedules {
+        relations: relation_schedule,
+        nodes: node_schedule,
+        ways: way_schedule,
+        max_node_id,
+        file: shared_file,
+    })
 }
 
-/// What decoding an unindexed blob says about it: which of the two Pass 2
-/// phases need it, and the largest node ID it holds.
+/// What the one header walk gives the passes: a file-order schedule per
+/// kind, the node-ID bound and the shared file description they all read.
+pub(super) struct Schedules {
+    /// Pass 1.
+    pub(super) relations: Vec<ScheduledBlob>,
+    /// Phase 2a.
+    pub(super) nodes: Vec<ScheduledBlob>,
+    /// Pass 1.5 (and, through the way store, Phase 2b).
+    pub(super) ways: Vec<ScheduledBlob>,
+    pub(super) max_node_id: i64,
+    pub(super) file: InputFile,
+}
+
+/// What decoding an unindexed blob says about it: which passes need it,
+/// and the largest node ID it holds.
 #[derive(Clone, Copy, Default)]
 struct UnindexedBlobKinds {
     has_nodes: bool,
     has_ways: bool,
+    has_relations: bool,
     max_node_id: i64,
 }
 

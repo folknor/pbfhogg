@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lint the document-folder conventions from AGENTS.md ("Document folders").
 
-Three checks, over the files git tracks or would track (``git ls-files --cached
+Four checks, over the files git tracks or would track (``git ls-files --cached
 --others --exclude-standard``), so build output, ``data/``, ``research/`` and
 other ignored trees never matter:
 
@@ -61,6 +61,10 @@ other ignored trees never matter:
      carry the needed context inline. (The work-item list lives in ``notes/``,
      so check 1 refuses a citation of it.)
 
+  4. sidebar-coverage: every markdown page under ``docs/``, except the home
+     page and ``docs/public/``, is named by a sidebar link in the VitePress
+     config. Navigation links and sidebar section keys do not count.
+
 Root-level files and ``notes/`` are not scanned at all: the first are exempt,
 the second carries no truth guarantee, so a dead link there is its own business.
 The exception is ``CORRECTNESS.md`` and ``DEVIATIONS.md``: they sit at the root
@@ -74,6 +78,7 @@ printed only when every check is clean; a per-check ``== label: 0`` line can
 never be last on a failing run.
 """
 
+import ast
 import pathlib
 import re
 import subprocess
@@ -532,6 +537,68 @@ def markdown_paragraphs(text):
         yield start, "\n".join(block)
 
 
+# --------------------------------------------------------------- check 4
+
+
+def sidebar_coverage():
+    """Read the config's literal sidebar, ignoring comments and other links.
+
+    Tokenize strings before punctuation so braces inside labels or comments
+    cannot end the sidebar early. This deliberately requires an inline object
+    or array; a computed sidebar needs parser support rather than a false pass.
+    """
+    config = "docs/.vitepress/config.ts"
+    text = (ROOT / config).read_text(encoding="utf-8")
+    tokens = re.findall(
+        r"//[^\n]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\""
+        r"|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|[^\s]",
+        text,
+    )
+    tokens = [t for t in tokens if not t.startswith(("//", "/*"))]
+    starts = [
+        i + 2 for i, token in enumerate(tokens[:-2])
+        if token in ("sidebar", "'sidebar'", '"sidebar"') and tokens[i + 1] == ":"
+    ]
+    if len(starts) != 1 or tokens[starts[0]] not in ("{", "["):
+        return [f"{config}: expected one literal sidebar object or array"]
+    start = starts[0]
+    depth = 0
+    links = []
+    for i in range(start, len(tokens)):
+        token = tokens[i]
+        if token in ("{", "["):
+            depth += 1
+        elif token in ("}", "]"):
+            depth -= 1
+            if depth == 0:
+                break
+        if token in ("link", "'link'", '"link"') and tokens[i + 1:i + 2] == [":"]:
+            value = tokens[i + 2] if i + 2 < len(tokens) else ""
+            if not value.startswith(("'", '"')):
+                return [f"{config}: sidebar links must be string literals"]
+            try:
+                links.append(ast.literal_eval(value))
+            except (ValueError, SyntaxError):
+                return [f"{config}: invalid sidebar link literal {value}"]
+    else:
+        return [f"{config}: unterminated sidebar"]
+
+    pages = set()
+    for link in links:
+        if SCHEME_RE.match(link) or link.startswith("//"):
+            continue
+        path = urllib.parse.unquote(link.split("#", 1)[0].split("?", 1)[0])
+        resolved, ok = resolve_link("docs/index.md", path)
+        if ok:
+            pages.add(resolved)
+    return [
+        f"{rel}: no sidebar entry names this page in {config}"
+        for rel in FILES
+        if in_site(rel) and rel.endswith(".md")
+        and rel != "docs/index.md" and rel not in pages
+    ]
+
+
 # ------------------------------------------------------------------- main
 
 
@@ -598,6 +665,7 @@ def main():
         ("durable-cites-notes", transient_cites),
         ("dangling", dangling),
         ("source-comment-citations", source_comment_cites),
+        ("sidebar-coverage", sidebar_coverage()),
     )
     for label, rows in checks:
         print(f"== {label}: {len(rows)}")

@@ -104,13 +104,13 @@ the diff moved left them stale, and the run did less work than it does
 now. Since the refresh, the flag replaces the two-step pipeline with a
 single command, provided the base was made with
 `add-locations-to-ways --keep-untagged-nodes`; see
-`reference/performance.md` for measurements of the current code.
+[reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measurements of the current code.
 
 ## Planet-scale pipeline
 
 Runtime and resource use depend on the command, input snapshot, encoding, and
-host. See `reference/performance.md` for measured command runs and
-`reference/performance-history.md` for optimization history.
+host. See [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md) for measured command runs and
+[reference/performance-history.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance-history.md) for optimization history.
 
 ## Performance tips
 

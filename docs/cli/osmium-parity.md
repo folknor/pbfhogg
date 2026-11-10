@@ -252,7 +252,7 @@ These osmium flags have no pbfhogg equivalent:
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
 | `extract -S, --option` | Strategy options are fixed: complete-ways always includes parent relations (osmium's `relations=true`), smart completes `multipolygon` and `boundary` (osmium's `types=multipolygon,boundary`), with no `complete-partial-relations` or `tags` filter. See [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
-| `--index-type` | `auto` (default; runtime routing between the other two, see `reference/pipeline.md`), `sparse`, `external` (bounded-memory join with sequential I/O). Different valid values from osmium's `-i, --index-type`. |
+| `--index-type` | `auto` (default; runtime routing between the other two, see [reference/pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md)), `sparse`, `external` (bounded-memory join with sequential I/O). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 

@@ -641,7 +641,7 @@ extra descriptor the caller passes it (for example one on which the caller holds
 lease for those directories) stays open until the pbfhogg process exits. This is about processes
 and descriptors, not kernel I/O: the kernel may finish asynchronous cleanup after the process is
 gone. The CLI test suite runs every pbfhogg child it starts under a seccomp filter that kills it
-on any breach of this, for the whole run (`reference/testing.md` says what that filter does and
+on any breach of this, for the whole run ([reference/testing.md](https://github.com/folknor/pbfhogg/blob/main/reference/testing.md) says what that filter does and
 does not see).
 
 The spellings below are the contract for an external tool that cannot do that (a cleanup job
@@ -1370,7 +1370,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
 | `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
-| `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see `reference/performance.md`). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
+| `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see [reference/performance.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance.md)). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |

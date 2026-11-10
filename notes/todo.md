@@ -603,19 +603,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   `reference/performance.md` with commit and host, or dropped. The same
   holds for inspect's index-only timing in the CLI reference
   `docs/cli/commands.md` and the apply-changes sentence of `cli/README.md`.
-- [ ] **Nothing catches a site page missing from the sidebar.** Four guide
-  pages sat outside `docs/.vitepress/config.ts` from the scaffold until they
-  were listed; `scripts/check_doc_links.py` checks links and anchors only.
-  Have it parse the sidebar links out of config.ts and fail on a `docs/`
-  page (outside `docs/public/` and the home page) that no sidebar entry names.
-- [ ] **Site pages cite `reference/` documents as backticked paths.**
-  `docs/guide/index.md`, `advanced.md` (build-geocode-index),
-  `performance.md`, `docs/cli/osmium-parity.md` (`--index-type` row) and the
-  CLI reference itself (renumber's `--compression` row, the promise-guard
-  sentence citing `reference/testing.md`) name `reference/performance.md`,
-  `reference/pipeline.md` and the like in code spans, which neither VitePress
-  nor GitHub makes clickable. Turn each into a GitHub URL link, the form
-  `scripts/check_doc_links.py` resolves for site pages.
 - [ ] **Old site fragments into the correctness and deviations pages land on
   a pointer.** Those two site pages became pointers to the root
   `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such

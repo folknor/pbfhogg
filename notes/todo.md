@@ -521,16 +521,6 @@ Conditional measurement work; run only when the stated question arises:
   needs across dataset sizes and hosts, and the structural route (recycling
   blob-scale buffers) are in `notes/mmap-threshold.md`.
 
-- [ ] **Stall-counter follow-ups (found 2026-10-26 adding the unordered
-  pools' `*_wait_ns` counters).** Each is its own change; none is measured.
-  - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`
-    fan-out (`crates/lib/src/commands/apply_changes/streaming.rs`).
-  - The first-error slot is a mutex locked on every claim in altw stages 2
-    and 3 and geocode pass 1.5; an `AtomicBool` fast check would avoid the
-    shared cache-line traffic. Planet-measured paths: needs its own A/B.
-  - Every altw router publish takes a global `stats` mutex and the global
-    `notify_mu`. Same caveat.
-
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   instrumentation calls in per-command `probes` modules, then swap the
   backend from the current FIFO sink to `tracing` spans/events so

@@ -413,6 +413,23 @@ for ~29% cumulative Europe smart-extract wall. Planet smart extract at
 `cadc3e6` (UUID `2d028196`, Europe bbox): 11.17 GB peak anon / 279 s - see
 the Extract section above and the `reference/performance/extract.md` Extract planet footnote.
 
+#### First-error slots and the altw router locks, declined on arithmetic (2026-11-10)
+
+The first-error mutex is locked once per bucket claim in altw stages 2
+and 3, 256 buckets per stage, and once per way blob in geocode Pass 1.5,
+about 10^5 on planet beside a shared fetch_add claim counter; an
+AtomicBool fast check has nothing to recover, per the dispatch ruling
+below. Every altw router publish takes the global stats mutex and
+notify_mu, once per way blob, about 1000 per second over a 140 s stage
+3, well under 1 % of one core, in a pipeline bound by stage 3 and stage
+4's result sends; the closest change, notifying only parked workers in
+the ordered pool, measured flat on altw external. apply-changes'
+candidate_rx fan-out, the one uncounted dispatch, now records
+merge_streaming_candidate_lock_wait_ns and _recv_wait_ns with the same
+semantics as the classify counters; under --locations-on-ways one idle
+worker holds the lock across the scanner barrier, so its lock wait
+reads large by design.
+
 #### Mutex<Receiver> blob dispatch is not a bottleneck (do-not-reattempt)
 
 The shared `Mutex<Receiver>` single-recv-per-lock dispatch used by the

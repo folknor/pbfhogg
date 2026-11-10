@@ -38,6 +38,20 @@ the wall is the exact comparison, and `CAT_FILTERED_*` the exact ordered-pass
 total (it excludes the schedule walk and the final flush). Runs from
 `8da26b23` until that change carry no per-kind rows.
 
+### cat --repair leaves the hot paths alone (bygg, 2026-11-10, `9bb34208` against `1d982110`)
+
+Guard cells for the repair route: plain and clean cat must not move.
+After a trim, `--iterations 1`, both arms `--commit`, A B B A, planet:
+
+| Cell | A, `1d982110` | B, `9bb34208` |
+|---|---|---|
+| copy-pbf | 42.4, 53.5 s (`81b09e34`, `4e6d523f`) | 42.4, 41.0 s (`46a017b2`, `15d2e5f4`) |
+| copy-pbf `--clean yes` | 147, 148 s (`12395af3`, `2b2fd2bb`) | 143, 142 s (`80656be4`, `3861ee68`) |
+
+Plain cat is unchanged; A's 53.5 s cell is the fourth after a trim and
+reads as drive state, the other three matching. Clean is neutral to
+slightly faster. Kept.
+
 ### cat --clean's peak against the README row (bygg, 2026-11-03, at `1f93e674`)
 
 Planet `cat --clean version`, stored cell `6f9896db`, `--bench 1`, 30

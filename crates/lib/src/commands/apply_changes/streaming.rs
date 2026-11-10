@@ -247,6 +247,19 @@ crate::counters::counter_set! {
         /// the release. Excludes the decode buffer, which the decode pool
         /// accounts, the block builder and the coordinate slots.
         pub scratch_peak_bytes => "merge_streaming_scratch_peak_bytes",
+        /// A worker blocked acquiring the mutex over the shared candidate
+        /// receiver, queued behind a peer that holds it. The holder keeps the
+        /// lock across its receive, so this is the fan-out's queueing: a
+        /// receive wait of t with n peers queued adds up to n x t here, and
+        /// under `--locations-on-ways` the scanner's barrier wait lands here
+        /// multiplied by the idle workers. Read it against
+        /// `merge_streaming_candidate_recv_wait_ns`, never by subtraction.
+        /// Only the slow path is timed (a failed `try_lock`).
+        pub candidate_lock_wait_ns => "merge_streaming_candidate_lock_wait_ns",
+        /// A worker holding the candidate receiver blocked on an empty
+        /// channel: the scanner (or its barrier) behind the workers. A
+        /// receive that finds an item records nothing.
+        pub candidate_recv_wait_ns => "merge_streaming_candidate_recv_wait_ns",
     }
 }
 
@@ -417,11 +430,14 @@ fn worker_loop(
             // Poison recovery keeps the channel usable for the remaining
             // workers. Nothing can panic while the guard is held (it covers
             // only the receive), and a worker that panics elsewhere is caught
-            // and published to the failure slot by `run_workers`.
-            let rx = candidate_rx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match rx.recv() {
+            // and published to the failure slot by `run_workers`. Both waits
+            // are stall counters for `brokkr sidecar --stalls`; see their
+            // docs on `WorkerCounters`.
+            let rx = crate::counters::lock_recording_wait(
+                candidate_rx,
+                &counters.candidate_lock_wait_ns,
+            );
+            match crate::counters::recv_recording_wait(&rx, &counters.candidate_recv_wait_ns) {
                 Ok(item) => item,
                 Err(_) => break, // channel closed by scanner
             }

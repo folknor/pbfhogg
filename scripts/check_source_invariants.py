@@ -157,8 +157,18 @@ for source, expected in SELF_TEST:
             f"call(s), got {got}, in {source!r}"
         )
 
+def matching(pattern):
+    """The files `pattern` selects under the repository root. A glob that
+    selects nothing is an error, not a pass: after a layout change it would
+    otherwise scan nothing and report the invariants ok."""
+    paths = sorted(p for p in root.glob(pattern) if p.is_file())
+    if not paths:
+        errors.append(f"check_source_invariants.py: glob {pattern!r} matches no file")
+    return paths
+
+
 for pattern in ("src/**/*.rs", "cli/src/**/*.rs"):
-    for path in sorted(root.glob(pattern)):
+    for path in matching(pattern):
         for line, args in counter_casts(path.read_text()):
             errors.append(
                 f"{path.relative_to(root)}:{line}: counter argument casts "
@@ -215,7 +225,7 @@ for source, expected in GATED_STATIC_SELF_TEST:
             f"static(s), got {got}, in {source!r}"
         )
 
-for path in sorted(root.glob("src/**/*.rs")):
+for path in matching("src/**/*.rs"):
     for line in gated_statics(path.read_text()):
         errors.append(
             f"{path.relative_to(root)}:{line}: a static gated on the test-hooks "

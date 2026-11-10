@@ -91,7 +91,7 @@ Surveyed 2026-11-10. Each item names where the move must touch it.
   with it too.
 
 **brokkr.d and scripts.**
-- `brokkr.d/lints.toml`: about 45 `[[textlint]]` rules with root-relative
+- `brokkr.d/lints.toml`: every `[[textlint]]` rule has root-relative
   globs (`src/**`, `cli/src/**`, `harness/src/**`, `tests/**`,
   `cli/tests/**`, `harness/tests/**`) and exact paths in `exclude` and
   `must_scan`. A glob that selects nothing is neither a failure nor a
@@ -164,6 +164,46 @@ only reorders the hard commit to last.
 Gate: `brokkr check --gate` green; `brokkr check --audit` reports no dead
 selector that was not there before; the dry-run listing reviewed by hand
 and its unclassified bucket empty.
+
+**Step 1 landed 2026-11-10 (uncommitted at time of writing), gate passed**
+(`check complete`, audit 0 findings, 0 unclassified). Corrections to the
+plan above, decided while doing it:
+- `cli/src/io_reach.rs`'s `include_str!` cannot do an ancestor walk (it
+  resolves at compile time), so it became a runtime read through the same
+  walk. The walk lives in `workspace_root()` in each `test_scratch.rs`;
+  `describe.rs` and the CLI's docs reads call it.
+- `cli/src/library_text_rule.rs`'s `CARGO_MANIFEST_DIR/../src` was left as
+  is: it is already loud (more than 50 files asserted) and names the
+  library's own directory, which step 2 rewrites to `../lib/src` by hand.
+- The audit's one pre-existing dead selector, `benches/**/*.rs` in
+  `glibc-allocator-calls-live-in-debug` (benches/ holds Lua only), was
+  removed, so step 2's "no dead selector" gate starts from zero.
+- The gate was red before any of this: `cli_output_contract`'s tier-3
+  interrupt sweep had one row, `build-geocode-index`, taking about 23 s on
+  its own, past the 20 s per-test kill however rows were dealt. The sweep
+  now splits that row's ordinals over four units (`SPLIT` in the `tier3`
+  module) and deals units to six shards, each under about 7 s.
+- `scripts/textlint_coverage.py record` also refuses a dead selector
+  (glob, exclude or `must_scan`), so the pinned manifest cannot start
+  blind. The manifest is `notes/crates-textlint-coverage.json` (38 rules,
+  6951 admitted paths, counts equal to brokkr's audit printout). It pins
+  file sets, so a `.rs` file added before step 2 shows up as "gained":
+  re-record immediately before the move. Step 2's gate is
+  `textlint_coverage.py check notes/crates-textlint-coverage.json --moved`.
+- `scripts/rewrite_citations.py` (move map shared through
+  `scripts/move_map.py`): `list --out notes/crates-citations.txt` is the
+  dry run (407 repo-root, 2 file-relative links, 34 package-relative, 1
+  historical in CHANGELOG.md, 0 external, 0 unclassified). Two classes the
+  plan did not name: assertion-message strings in library code citing
+  `tests/...` count as package-relative (cargo runs tests from the
+  package dir), and `../`-relative links from `docs/guide` to `../cli/`
+  resolve to `docs/cli/` and are not citations of a moved path at all.
+  Step 2 runs `apply --base REF` with REF the last pre-move commit (it
+  classifies against REF and refuses to touch a line edited since), then
+  `check`. notes/ is not scanned, CHANGELOG.md and
+  `reference/performance-history.md` are dated records and kept, and bare
+  `Cargo.toml` citations are left to a hand review since the root manifest
+  splits.
 
 ### Step 2: the move
 

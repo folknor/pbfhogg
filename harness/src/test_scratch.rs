@@ -2,10 +2,21 @@
 //! under the workspace's gitignored `data/test-scratch`, as
 //! `cli/src/test_scratch.rs` gives the CLI's.
 
+/// The workspace root: the nearest ancestor of `CARGO_MANIFEST_DIR` that
+/// holds `Cargo.lock`, as `tests/common/scratch.rs` finds it. Never a fixed
+/// `..`, which would silently name a different directory if the package
+/// moved deeper.
+pub(crate) fn workspace_root() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("Cargo.lock").is_file())
+        .expect("a Cargo.lock above the package manifest marks the workspace root")
+}
+
 /// A fresh scratch directory; dropping the guard removes it.
 #[allow(clippy::disallowed_methods)] // fixture directories in test scratch
 pub(crate) fn scratch() -> tempfile::TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/test-scratch");
+    let root = workspace_root().join("data/test-scratch");
     std::fs::create_dir_all(&root).expect("create test scratch root");
     tempfile::TempDir::new_in(root).expect("create test scratch directory")
 }

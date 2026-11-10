@@ -1,5 +1,8 @@
 [workspace]
 members = ["cli", "harness"]
+# Explicit: edition 2024 implies resolver 3 only for a root package, and a
+# virtual manifest has no edition, so without this it would drop to 1.
+resolver = "3"
 exclude = ["bench/osmpbf-baseline"]
 
 [workspace.dependencies]

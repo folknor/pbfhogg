@@ -5648,10 +5648,9 @@ mod short_flag_tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
     fn the_reference_table_is_the_vocabulary() {
-        let doc = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../docs/cli/commands.md"
-        ))
+        let doc = std::fs::read_to_string(
+            crate::test_scratch::workspace_root().join("docs/cli/commands.md"),
+        )
         .unwrap();
         let section = doc
             .split("## Short flags")
@@ -5938,10 +5937,9 @@ mod doc_coverage_tests {
     #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
     #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn the_cli_reference_covers_the_command_tree() {
-        let doc = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../docs/cli/commands.md"
-        ))
+        let doc = std::fs::read_to_string(
+            crate::test_scratch::workspace_root().join("docs/cli/commands.md"),
+        )
         .unwrap();
         let lines: Vec<&str> = doc.lines().collect();
         let heads = headings(&lines);

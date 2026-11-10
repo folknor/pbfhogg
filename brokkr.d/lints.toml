@@ -21,7 +21,7 @@ stage = "pre-clippy"
 [[textlint]]
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
-paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "benches/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs"]
 exclude = ["src/debug.rs", "src/process.rs"]
 region = "code"
 message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"

@@ -172,8 +172,12 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
     fn direct_io_matrix_matches_reach() {
-        let docs = include_str!("../../docs/cli/commands.md");
+        let docs = std::fs::read_to_string(
+            crate::test_scratch::workspace_root().join("docs/cli/commands.md"),
+        )
+        .unwrap();
         let actual = docs
             .split("<!-- io-reach:start -->\n")
             .nth(1)

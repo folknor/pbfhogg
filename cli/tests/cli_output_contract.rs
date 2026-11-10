@@ -2759,15 +2759,21 @@ fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_wo
 /// their counts. And the fixture's ordinals are not real data's: a phase
 /// with one checkpoint here may pass thousands on a planet, which no
 /// in-tree fixture reproduces.
+///
+/// `part` of `parts` takes the ordinals `k` with `k % parts == part`, so a
+/// row whose ordinals together outlast the check watchdog can be spread over
+/// several tests; `0` of `1` is every ordinal.
 #[cfg(feature = "test-hooks")]
-fn every_ordinal_unwinds(fx: &Fx, row: &Row) -> Result<(), String> {
+fn every_ordinal_unwinds(fx: &Fx, row: &Row, part: u64, parts: u64) -> Result<(), String> {
     use interrupted::{checkpoint_count, interrupt_at};
     let count = checkpoint_count(fx, row)?;
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut tried = 0usize;
     // No early return: a known gap must not hide the ordinals after the
     // first failing one, so the row's verdict is taken over all of them.
-    for k in 1..=count {
+    for k in (1..=count).filter(|k| k % parts == part) {
+        tried += 1;
         let signal = if k % 2 == 1 {
             libc::SIGINT
         } else {
@@ -2791,8 +2797,9 @@ fn every_ordinal_unwinds(fx: &Fx, row: &Row) -> Result<(), String> {
         failures.join("\n")
     );
     ensure!(
-        completed.len() < usize::try_from(count).unwrap_or(usize::MAX),
-        "no pause landed before the run completed ({count} checkpoints counted)"
+        count > 0 && (tried == 0 || completed.len() < tried),
+        "no pause landed before the run completed ({count} checkpoints counted, \
+         {tried} tried in part {part} of {parts})"
     );
     if !completed.is_empty() {
         eprintln!("[{}] {count} checkpoints counted{finished}", row.label);
@@ -2801,20 +2808,63 @@ fn every_ordinal_unwinds(fx: &Fx, row: &Row) -> Result<(), String> {
 }
 
 /// The exhaustive sweep, split so each test stays well inside the check
-/// watchdog. Rows are dealt to shards by their index in [`ROWS`], so a new
-/// row is covered without touching this module.
+/// watchdog. Work units are dealt to shards by their index, so a new row is
+/// covered without touching this module. A unit is a row, or for a row in
+/// [`SPLIT`] one part of its ordinals: build-geocode-index alone ran about
+/// 23 s single-threaded, past the 20 s per-test kill however the rows were
+/// dealt.
 #[cfg(feature = "test-hooks")]
 mod tier3 {
     use super::*;
 
+    /// Rows whose ordinals are spread over several units, with the count.
+    const SPLIT: &[(&str, u64)] = &[("build-geocode-index", 4)];
+
+    fn parts_of(row: &Row) -> u64 {
+        SPLIT
+            .iter()
+            .find(|(label, _)| *label == row.label)
+            .map_or(1, |&(_, parts)| parts)
+    }
+
     fn shard(n: usize, of: usize) {
-        run_property_on(
-            Prop::Interrupted,
-            every_ordinal_unwinds,
-            ROWS.iter()
-                .enumerate()
-                .filter(|(i, _)| i % of == n)
-                .map(|(_, row)| row),
+        for (label, _) in SPLIT {
+            assert!(
+                ROWS.iter().any(|row| row.label == *label),
+                "SPLIT names {label}, which is not a row"
+            );
+        }
+        let fx = Fx::new();
+        let mut failures = Vec::new();
+        let units = ROWS.iter().flat_map(|row| {
+            let parts = parts_of(row);
+            (0..parts).map(move |part| (row, part, parts))
+        });
+        for (_, (row, part, parts)) in units.enumerate().filter(|(i, _)| i % of == n) {
+            let verdict = every_ordinal_unwinds(&fx, row, part, parts);
+            let gap = row.gaps.iter().find(|(p, _)| *p == Prop::Interrupted);
+            match (verdict, gap) {
+                // A part can pass where the whole row would not, so a gap
+                // marker's "passes: remove it" check needs the whole row.
+                (_, Some(_)) if parts > 1 => failures.push(format!(
+                    "[{}] carries a known Interrupted gap, so it cannot be in SPLIT",
+                    row.label
+                )),
+                (Ok(()), None) => {}
+                (Err(why), None) => failures.push(format!("[{}] {why}", row.label)),
+                (Err(why), Some((_, reason))) => {
+                    eprintln!("known gap [{}] Interrupted: {reason}\n  {why}", row.label);
+                }
+                (Ok(()), Some((_, reason))) => failures.push(format!(
+                    "[{}] is marked as a known Interrupted gap ({reason}) but passes: remove the marker",
+                    row.label
+                )),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Interrupted violations:\n\n{}",
+            failures.join("\n\n")
         );
     }
 
@@ -2837,6 +2887,8 @@ mod tier3 {
         an_interrupt_at_every_checkpoint_unwinds_shard_1 = 1,
         an_interrupt_at_every_checkpoint_unwinds_shard_2 = 2,
         an_interrupt_at_every_checkpoint_unwinds_shard_3 = 3,
+        an_interrupt_at_every_checkpoint_unwinds_shard_4 = 4,
+        an_interrupt_at_every_checkpoint_unwinds_shard_5 = 5,
     }
 }
 

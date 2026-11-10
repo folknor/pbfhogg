@@ -552,10 +552,15 @@ window and advice as % of wall:
 | germany | after credit | 7.1 | | |
 
 An earlier planet cell of the tree arm before the counter was wired
-measured 142.8 s. Verdict: no difference outside noise. The window binds
-on germany (12 to 15 % of wall) in both arms, while warm advice costs
-30 ms in total there, so what binds the window is the head blob's own
-work, not the advice. On planet the consumer spends 2 s of a 143 s wall
+measured 142.8 s. Verdict: no difference outside noise. The germany
+window column is a sum of every worker's parked time divided by the
+wall, so the percentages read about thirty times high: against the 30
+workers' roughly 199 worker-seconds in the ordered pass, 0.8 to 1.1 s
+parked is about 0.4 %, and removing it could gain at most about 27 ms of
+wall, or about 150 ms if every idle core in the ways segment were
+counted (2026-11-10, on stored sidecar `ccc17685`). The window does not
+bind germany; its wall goes to decode and encode at about 30 cores, a
+cold schedule walk and the final flush. On planet the consumer spends 2 s of a 143 s wall
 in advice, 1.4 %, with `ordered_pool_result_recv` at 90 %: the consumer
 placement is not a cost, and neither a worker-side cursor nor a dedicated
 advisor thread has a cost to recover. Whether the advice pays at all on

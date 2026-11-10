@@ -8,9 +8,18 @@ The README's three tables come from the campaign at `53360af4`
 - [ ] **Planet isolation-cat row, held back from the README library
   table.** `d73fbee8`: library 43.1-55.4 s, CLI 55.9-69.5 s, ratio 1.28,
   where the typed `brokkr cat` cell on the same file and commit
-  (`be808f35`) took 42.4 s. The CLI arm's interval is 13 s or more behind
-  a plain cat, and the library arm swings 12 s between iterations.
-  Unexplained.
+  (`be808f35`) took 42.4 s. Explained 2026-11-10 as drive state, not
+  code: every arm does identical syscall work and the whole delta is the
+  writer waiting on input bytes; L1 matches the typed cat at 2.2 GB/s
+  and later iterations sag to 1.6 GB/s after a burst. The session ran
+  about 48 minutes disk-bound, the harness digesting each 92 GB output
+  between arms, library arm always first, so every CLI arm runs deeper
+  into the sag. A plain `copy-pbf --iterations 3` after a trim shows the
+  same with no harness: 42.4, 41.1, 50.1 s (`41328086`). Left: a
+  publishable row, three `brokkr library isolation-cat --dataset planet
+  --bench 1` runs each after a trim and a rest of about ten minutes, and
+  SMART thermal counters around one to tell throttling from SLC or GC
+  (smartctl is not on the agent allowlist).
 - [ ] **Performance guide plantasjen tables** (Japan extract, apply-changes
   at scale and with LocationsOnWays, write throughput, the io_uring and
   O_DIRECT tips) carry host and commit labels but were not re-measured on
@@ -668,15 +677,6 @@ Known to work, no performance question open, but not in the results DB:
   on the exposure is left in hand: the unbuilt shapes there (a bounded
   descriptor cache over private files, striped buckets) bound
   descriptors, not write exposure.
-- [ ] **cat --clean's window binds on germany (2026-11-09).** At
-  `b58e8ef3` on bygg, germany `cat --clean` parks workers at the ordered
-  pool's window for 12 to 15 % of the wall (`ordered_pool_window_wait_ns`)
-  while planet records 0; the read-ahead advice costs 30 ms there, so the
-  binding is the head blob's own work behind a 64-slot window
-  (`POOL_REORDER_CAPACITY_WIDE`). Whether a wider window or a different
-  germany blob mix explains it, and whether it moves the wall, is not
-  measured (reference/performance/sort.md, "Read-ahead advice after the
-  credit").
 - [ ] **getid's full-scan arm reads every payload it then skips
   (2026-11-09).** `filter_by_id_streaming` uses `Frames::next_raw`, so a
   blob the indexdata prescreen rejects has its whole payload copied into

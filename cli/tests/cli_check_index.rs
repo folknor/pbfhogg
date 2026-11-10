@@ -168,10 +168,51 @@ fn a_file_that_makes_no_claims_passes() {
         out.stdout_str(),
     );
     assert!(
-        out.stdout_str().contains("0 with indexdata"),
+        out.stdout_str().contains("0 with indexdata")
+            && out
+                .stdout_str()
+                .contains("OK (no indexdata claims to verify)"),
         "and the summary should say the claims are absent: {}",
         out.stdout_str()
     );
+}
+
+/// Presence counts include malformed claims, and file coverage stays visible
+/// even when per-blob findings have already filled the report cap.
+#[test]
+fn partial_index_remains_visible_under_a_cap_and_counts_unreadable_claims() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    let pbf = std::fs::read(&input).expect("read fixture");
+    let malformed = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |index| {
+        *index = vec![255]
+    });
+    let partial =
+        crate::common::adversarial::mutate_blob_header_indexdata(&malformed, 2, Vec::clear);
+    std::fs::write(&input, partial).expect("write fixture");
+    let out = CliInvoker::new()
+        .args(["check", "--index", "--json", "--max-errors", "1"])
+        .arg(&input)
+        .run();
+    assert_eq!(out.status.code(), Some(EXIT_ANSWER_NEGATIVE));
+    let json: serde_json::Value = serde_json::from_str(&out.stdout_str()).expect("JSON");
+    let report = &json["index"];
+    assert_eq!(
+        report["blobs_with_indexdata"].as_u64(),
+        report["blobs"].as_u64().map(|count| count - 1)
+    );
+    assert!(report["total_violations"].as_u64().expect("count") >= 2);
+    let violations = report["violations"].as_array().expect("violations");
+    assert_eq!(violations.len(), 1);
+    assert!(
+        violations[0]["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("partially indexed")
+    );
+    let uncapped = check_index(&input);
+    assert!(uncapped.stdout_str().contains("not a readable blob index"));
 }
 
 // ---------------------------------------------------------------------------

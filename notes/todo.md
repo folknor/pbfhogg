@@ -34,22 +34,12 @@ The README's three tables come from the campaign at `53360af4`
   applied should be `differs`: denmark 4705, planet 4913, and so on). The
   `test-unsorted` snapshot is the same file as `unsorted` and has no
   `check-ids = "violations"` of its own.
-- [ ] **check --index loose ends** (from the 2026-11-09 ruling that a
-  wholly unindexed file is a clean pass by design):
-  - docs/guide/indexdata.md says flatly that `check --index` reports a
-    partially indexed file as a violation, but `unindexed_candidate`
-    needs an observable kind, so an empty or mixed-kind unindexed blob
-    among indexed ones passes while the consumers' guard in
-    `src/read/frame.rs` refuses the same file. Qualify the sentence, or
-    make coverage independent of indexability.
-  - `blobs_with_index` counts only parseable indexdata while
-    `blobs_with_tagdata` counts any present field.
-  - `MissingAmongIndexed` is raised once, for the first unindexed blob,
-    after every other finding, so a `max_errors` cap can hide it from the
-    listing (the exit code still carries it).
-  - Optional: say "no indexdata claims to verify" beside OK on a file
-    with none, and extend `a_file_that_makes_no_claims_passes` to assert
-    it.
+- [ ] **check --index coverage of unindexable blobs.** `unindexed_candidate`
+  needs an observable kind, so an empty or mixed-kind unindexed blob among
+  indexed ones passes `check --index` while the consumers' guard in
+  `src/read/frame.rs` refuses the same file. docs/guide/indexdata.md now
+  states the exception; decide whether coverage should instead be
+  independent of indexability.
 - [ ] **vs-osmium extract row.** vs-osmium has none, so README's Tokyo
   extract line stays dropped; a row in `benches/compare/vs-osmium.lua`
   would bring it back.

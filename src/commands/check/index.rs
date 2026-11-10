@@ -268,7 +268,7 @@ impl std::fmt::Display for IndexViolation {
 pub struct IndexReport {
     /// OSMData blobs seen.
     pub blobs: u64,
-    /// Blobs whose header carried a parseable `indexdata`.
+    /// Blobs whose header carried an `indexdata` field, including unreadable claims.
     pub blobs_with_index: u64,
     /// Blobs whose header carried a `tagdata` field.
     pub blobs_with_tagdata: u64,
@@ -277,6 +277,8 @@ pub struct IndexReport {
     /// is a violation.
     pub blobs_unindexable: u64,
     /// Stored violations, limited by `max_errors` unless it is zero.
+    /// The file-wide partial-index finding takes priority over the last
+    /// per-blob finding when the cap is full.
     pub violations: Vec<IndexViolation>,
     /// Total violations found, which may exceed `violations.len()`.
     pub total_violations: u64,
@@ -343,7 +345,12 @@ impl IndexReport {
             self.blobs, self.blobs_with_index, self.blobs_with_tagdata, self.blobs_unindexable
         )?;
         if self.passed() {
-            writeln!(out, "Blob metadata for {file_name}: OK")
+            let note = if self.blobs_with_index == 0 {
+                " (no indexdata claims to verify)"
+            } else {
+                ""
+            };
+            writeln!(out, "Blob metadata for {file_name}: OK{note}")
         } else {
             writeln!(
                 out,
@@ -510,6 +517,7 @@ struct BlobVerdict {
     file_offset: u64,
     /// The header carried a readable indexdata.
     indexed: bool,
+    index_present: bool,
     tagdata_present: bool,
     /// The payload is one no index can describe.
     unindexable: bool,
@@ -561,6 +569,7 @@ fn verify_blob(ordinal: u64, frame: &RawBlobFrame, block: &mut Vec<u8>) -> Resul
         ordinal,
         file_offset: frame.file_offset(),
         indexed: frame.index.is_some(),
+        index_present: frame.index_present,
         tagdata_present: frame.tagdata_present,
         unindexable: observed.is_none(),
         unindexed_candidate: observed.is_some() && !frame.index_present,
@@ -602,6 +611,7 @@ fn check_index_inner(
     let mut report = IndexReport::default();
     // The first indexable blob with no indexdata, for the partial-index verdict.
     let mut first_unindexed: Option<(u64, u64)> = None;
+    let mut has_readable_index = false;
 
     host.invocation.marker("CHECK_INDEX_START");
     // The header comes first or the file is not a PBF: a zero-byte or
@@ -634,7 +644,8 @@ fn check_index_inner(
         },
         |verdict: BlobVerdict| {
             report.blobs += 1;
-            report.blobs_with_index += u64::from(verdict.indexed);
+            report.blobs_with_index += u64::from(verdict.index_present);
+            has_readable_index |= verdict.indexed;
             report.blobs_with_tagdata += u64::from(verdict.tagdata_present);
             report.blobs_unindexable += u64::from(verdict.unindexable);
             if verdict.unindexed_candidate && first_unindexed.is_none() {
@@ -656,16 +667,19 @@ fn check_index_inner(
     host.invocation.marker("CHECK_INDEX_END");
 
     if let Some((blob_ordinal, file_offset)) = first_unindexed
-        && report.blobs_with_index > 0
+        && has_readable_index
     {
         report.total_violations += 1;
-        if opts.max_errors == 0 || report.violations.len() < opts.max_errors {
-            report.violations.push(IndexViolation {
-                blob_ordinal,
-                file_offset,
-                kind: IndexViolationKind::MissingAmongIndexed,
-            });
+        // Keep the file-wide coverage finding visible even when earlier
+        // per-blob findings filled the cap. The total still counts them all.
+        if opts.max_errors != 0 && report.violations.len() == opts.max_errors {
+            report.violations.pop();
         }
+        report.violations.push(IndexViolation {
+            blob_ordinal,
+            file_offset,
+            kind: IndexViolationKind::MissingAmongIndexed,
+        });
     }
 
     Ok(report)

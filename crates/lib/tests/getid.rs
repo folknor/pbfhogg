@@ -800,7 +800,10 @@ fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
 }
 
 #[test]
-fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
+/// The Osmosis -1 sentinels mark their own fields absent, field by field as
+/// libosmium reads them: the other fields the `Info` carries, explicit zeros
+/// and the empty user included, are kept.
+fn getid_normalizes_way_version_minus_one_to_absent_version() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -859,15 +862,15 @@ fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
             id: 10,
             version: None,
             changeset: None,
-            uid: None,
-            user: None,
+            uid: Some(0),
+            user: Some(String::new()),
             visible: Some(true),
         }
     );
 }
 
 #[test]
-fn getid_normalizes_way_changeset_minus_one_to_zero() {
+fn getid_normalizes_way_changeset_minus_one_to_absent() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -925,11 +928,65 @@ fn getid_normalizes_way_changeset_minus_one_to_zero() {
         RawWayMeta {
             id: 10,
             version: Some(4),
-            changeset: Some(0),
+            changeset: None,
             uid: Some(9),
             user: Some("osmosis".to_string()),
             visible: Some(false),
         }
+    );
+}
+
+/// A versionless `Info` keeps its real fields through re-encoding: before
+/// presence was carried, the whole `Info` was dropped, losing the user and
+/// turning the deleted way visible.
+#[test]
+fn getid_keeps_fields_of_versionless_way_info() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: Some(TestMeta {
+                version: -1,
+                timestamp: 1_700_000_000,
+                changeset: 5,
+                uid: 9,
+                user: "alice",
+                visible: false,
+            }),
+        }],
+        &[],
+    );
+
+    let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
+    getid(
+        &input,
+        crate::common::out(&output),
+        &id_set,
+        &default_opts(),
+        &forced_write_options(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .expect("getid");
+
+    let ways = read_raw_way_meta(&output);
+    assert_eq!(
+        ways,
+        [RawWayMeta {
+            id: 10,
+            version: None,
+            changeset: Some(5),
+            uid: Some(9),
+            user: Some("alice".to_string()),
+            visible: Some(false),
+        }]
     );
 }
 

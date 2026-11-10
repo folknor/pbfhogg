@@ -901,7 +901,7 @@ fn assemble_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node(
+                    bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),

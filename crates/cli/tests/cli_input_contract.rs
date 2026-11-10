@@ -1442,6 +1442,10 @@ fn policy_holds(fx: &Fx, row: &PolicyRow) -> Result<(), String> {
             );
             ensure!(text.contains(reason), "wanted {reason:?}; output:\n{text}");
             ensure!(text.contains(RECIPE), "wanted the recipe; output:\n{text}");
+            ensure!(
+                text.contains("pbfhogg check --index "),
+                "wanted index diagnostic; output:\n{text}"
+            );
             let advice = match escape {
                 Escape::Force(_) => Some("Or pass --force to proceed anyway."),
                 Escape::Flag(flag, _) => {
@@ -1887,7 +1891,7 @@ fn mixed_holds(
         }
         Mixed::RefusesPartial => {
             ensure!(code == Some(2), "[{label}] exit {code:?}; output:\n{text}");
-            for wanted in [PARTIAL_INDEX, INDEXING_ADVICE] {
+            for wanted in [PARTIAL_INDEX, INDEXING_ADVICE, "pbfhogg check --index "] {
                 ensure!(
                     text.contains(wanted),
                     "[{label}] wanted {wanted:?}; output:\n{text}"

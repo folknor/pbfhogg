@@ -642,9 +642,9 @@ fn encode_way_full_block(
         );
     }
     if preserve_locations && locations_buf.len() == refs_buf.len() && !locations_buf.is_empty() {
-        bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
+        bb.add_way_with_locations_partial(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
     } else {
-        bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
+        bb.add_way_partial(w.id(), w.tags(), refs_buf, meta.as_ref());
     }
     Ok(())
 }
@@ -744,7 +744,7 @@ fn worker_split_blob(
             (Element::Node(n), ElementKind::Node) => {
                 ensure_node_capacity_local(bb, &mut framed)?;
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -760,7 +760,7 @@ fn worker_split_blob(
                 ensure_relation_capacity_local(bb, &mut framed)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }
             _ => {}
         }

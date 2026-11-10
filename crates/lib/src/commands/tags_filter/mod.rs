@@ -452,7 +452,7 @@ fn filter_block_parallel(
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node(
+                    bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),
@@ -470,7 +470,7 @@ fn filter_block_parallel(
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
+                    bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     stats.ways_matched += 1;
                 }
             }
@@ -481,7 +481,7 @@ fn filter_block_parallel(
                     ensure_relation_capacity_local(bb, output)?;
                     relation_members_into(r, &mut members_buf)?;
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation(
+                    bb.add_relation_partial(
                         r.id(),
                         tags_buf.iter().copied(),
                         &members_buf,
@@ -650,7 +650,7 @@ fn filter_block_pass2(
                         tags_buf.extend(n.tags());
                     }
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node(
+                    bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),
@@ -677,7 +677,7 @@ fn filter_block_pass2(
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
+                    bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     if direct {
                         stats.ways_matched += 1;
                     } else {
@@ -695,7 +695,7 @@ fn filter_block_pass2(
                     }
                     relation_members_into(r, &mut members_buf)?;
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation(
+                    bb.add_relation_partial(
                         r.id(),
                         tags_buf.iter().copied(),
                         &members_buf,

@@ -1307,7 +1307,7 @@ fn process_block(
                 {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node(
+                    bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),
@@ -1334,14 +1334,20 @@ fn process_block(
                     }
                 }
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
+                bb.add_way_with_locations_partial(
+                    w.id(),
+                    w.tags(),
+                    refs_buf,
+                    locations_buf,
+                    meta.as_ref(),
+                );
                 stats.ways_written += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }
         }

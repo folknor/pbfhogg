@@ -296,6 +296,10 @@ the headers since the previous one, so a command that walks N times
 pays roughly one cold walk per eviction, not N (measured on sparse
 ALTW, see the europe note below).
 
+Read single-cell walls with header cache state in mind: RSS-pass baselines
+with warm headers exclude the cold schedule walk. Historical observations
+made before `6fdde3f4` also predate cold-walk read-ahead.
+
 ### getid include mode confirms, steeper (2026-07-10)
 
 Full three-cell matrix (scan arm via `--commit 51c662e`, the parent of

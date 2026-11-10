@@ -194,7 +194,12 @@ encoding is left alone; outputs that print metadata read it instead:
   the wire it cannot be told apart from padding.
 
 Re-encoding is unaffected: the conversions that feed a rewrite keep a version-0
-slot and its fields as they are, and drop only `-1` slots.
+slot and its fields as they are, and drop only `-1` slots. A plain `Info` is
+re-encoded with each field present exactly when it was decoded present
+(`element_metadata` in `crates/lib/src/owned.rs`): the `-1` version or
+changeset stays absent, the other fields stay as carried, and a node is
+written dense only when its metadata is complete with a version of 1 or more,
+so a plain version-0 node keeps its explicit zero fields as a plain node.
 
 The `inspect --extended` metadata census follows only the version rule above.
 It counts, it does not print, so its other fields follow the next section.
@@ -571,3 +576,19 @@ brokkr comparisons across runs. All OSC parser callers emit
 `merge_changes_decompress_ns` once per input file, with that file's time rather
 than an accumulated command total, including the apply-changes overlay and
 OSC tags-filter. There are no command-specific replacement counters.
+
+## Coordinate domain checks
+
+The general PBF readers and dense-node iterators expose coordinates without
+checking geographic ranges; the node scanner checks only the i32
+representation. Bbox parsing, location joins and `check --locations` have
+separate domain checks. This is a deliberate boundary, not a promise that
+reading a node validates its geographic position.
+
+Location joins in add-locations-to-ways and apply-changes judge the
+truncated decimicrodegree value. An input less than 100 nanodegrees beyond
++-90 latitude or +-180 longitude can therefore be written at the limit,
+while `check --locations` rejects the exact nanodegree input. The written
+coordinate is valid. Exact join-time checking would require nanodegrees or
+a remainder flag on the scanner's hot path; retain truncation unless a real
+producer demonstrates a need for the extra information.

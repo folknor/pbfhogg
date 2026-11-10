@@ -33,8 +33,8 @@ use super::{
 };
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::owned::{
-    OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
-    read_node, read_relation, read_way, relation_members_into,
+    OwnedElement, add_owned_node, add_owned_relation, add_owned_way, dense_node_metadata,
+    element_metadata, read_dense_node, read_node, read_relation, read_way, relation_members_into,
 };
 use crate::read::input::{InputSource, PinnedInput};
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase_ordered};
@@ -566,7 +566,7 @@ fn filter_block_snapshot(
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -592,7 +592,7 @@ fn filter_block_snapshot(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
+                bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                 stats.elements_written += 1;
             }
             Element::Relation(r) => {
@@ -611,7 +611,7 @@ fn filter_block_snapshot(
                 tags_buf.extend(r.tags());
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(
+                bb.add_relation_partial(
                     r.id(),
                     tags_buf.iter().copied(),
                     &members_buf,
@@ -676,14 +676,7 @@ fn write_owned_element(
             {
                 writer.write_primitive_block_owned(block)?;
             }
-            let meta = owned_to_metadata(n.metadata.as_ref());
-            bb.add_node(
-                n.id,
-                n.decimicro_lat,
-                n.decimicro_lon,
-                n.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                meta.as_ref(),
-            );
+            add_owned_node(bb, &n);
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
@@ -691,13 +684,7 @@ fn write_owned_element(
             {
                 writer.write_primitive_block_owned(block)?;
             }
-            let meta = owned_to_metadata(w.metadata.as_ref());
-            bb.add_way(
-                w.id,
-                w.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                &w.refs,
-                meta.as_ref(),
-            );
+            add_owned_way(bb, &w);
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
@@ -705,21 +692,7 @@ fn write_owned_element(
             {
                 writer.write_primitive_block_owned(block)?;
             }
-            let meta = owned_to_metadata(r.metadata.as_ref());
-            let members: Vec<MemberData<'_>> = r
-                .members
-                .iter()
-                .map(|m| MemberData {
-                    id: m.id,
-                    role: &m.role,
-                })
-                .collect();
-            bb.add_relation(
-                r.id,
-                r.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                &members,
-                meta.as_ref(),
-            );
+            add_owned_relation(bb, &r);
         }
     }
     Ok(())

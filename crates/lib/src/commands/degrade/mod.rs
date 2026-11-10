@@ -1406,7 +1406,7 @@ fn worker_decode_kind(
             (Element::Node(n), ElementKind::Node) => {
                 ensure_node_capacity_local(bb, &mut framed)?;
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -1422,13 +1422,13 @@ fn worker_decode_kind(
                 // add_way drops inline LOW coords - the documented
                 // behaviour for the decode path regardless of
                 // --strip-locations.
-                bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
+                bb.add_way_partial(w.id(), w.tags(), refs_buf, meta.as_ref());
             }
             (Element::Relation(r), ElementKind::Relation) => {
                 ensure_relation_capacity_local(bb, &mut framed)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }
             _ => {}
         }

@@ -111,15 +111,16 @@ together so the surface changes once.
 
   (B) **Replace `--index-type` on `add-locations-to-ways` with a single
   user-facing override flag.** Today: `--index-type sparse|external|auto`,
-  default `sparse`. The three-value flag exposes implementation names
-  (`sparse`, `external`) that don't mean anything to a user picking a
-  PBF tool, and the `auto` value is what the default should have been
-  in the first place.
+  default `auto` since 0.6.0 (`7c282070`, in the CLI and the library's
+  `IndexType` default). The three-value flag still exposes
+  implementation names (`sparse`, `external`) that don't mean anything
+  to a user picking a PBF tool.
 
   Proposed shape:
-  - Default behaviour: today's `auto` logic. Pick external when the input
-    is sorted + indexed (the fast path at planet scale), pick sparse
-    otherwise.
+  - Default behaviour: today's `auto` logic, unchanged (reference/pipeline.md
+    has its rules: external only where the input allows it and a known
+    memory budget says sparse's store would outgrow the page cache,
+    sparse otherwise).
   - Single override flag, opting INTO the in-memory path: `--in-memory`
     (working name; alternatives considered: `--low-disk`,
     `--minimal-disk`, `--no-spill`). The override only matters when auto
@@ -183,7 +184,7 @@ together so the surface changes once.
   1 semantic-negative answer, 2 failure, 64 usage error, documented in
   `docs/cli/commands.md` "Exit codes". The
   stdout half is partly delivered: the CLI writes stdout through
-  `cli/src/output.rs` (a closed reader is a silent exit 0, not a panic), the
+  `crates/cli/src/output.rs` (a closed reader is a silent exit 0, not a panic), the
   library's report types render into a caller-supplied `io::Write`, and
   text lints in `brokkr.d/lints.toml` ban `print!`/`println!` and raw stdout
   handles outside that file. The stderr half is delivered too: the library
@@ -197,7 +198,7 @@ together so the surface changes once.
 
 - [ ] **A `--json` diagnostics mode.** The global `-q, --quiet` landed
   (`docs/cli/commands.md` "Quiet": a kind filter in
-  `StderrSink::event`, `cli/src/host.rs`). Still open: `--json`, a second
+  `StderrSink::event`, `crates/cli/src/host.rs`). Still open: `--json`, a second
   sink serializing each diagnostic event's kind, key and arguments, which
   needs no library changes. It is a new capability with a public format to
   design, and normalising the summary-line shapes and keys is its first
@@ -230,8 +231,8 @@ The maintainer wants this resolved, but not in the drain.
 - [ ] **`too_many_arguments` and `too_many_lines` are denied and then
   allowed locally all over.** Both are `deny` in the workspace
   `[workspace.lints.clippy]` (root `Cargo.toml`), yet many functions carry
-  a local `#[allow]`, often both lints in one attribute, across `src/`,
-  `cli/src/` and the tests: the extract entry points,
+  a local `#[allow]`, often both lints in one attribute, across `crates/lib/src/`,
+  `crates/cli/src/` and the tests: the extract entry points,
   `writer_from_header`, `getid_dispatched`, `filter_by_id`, the getparents
   dispatchers, altw's `write_output_*`, `tags_filter_*`, apply-changes'
   `worker_loop` and `handle_candidate`, several CLI `run_*` functions, and
@@ -303,11 +304,7 @@ are removed; git history keeps them. Detail stays in notes/.
   varint encode fast path in the three wire_rewrite call sites via
   protohoggr's `encode_varint_to_slice` - plausible ~1-1.5 % of wall,
   needs a paired same-commit bench and widens the unsafe surface; skip
-  unless renumber becomes critical-path. Item 2: **do not re-propose**
-  deriving way ranks from the schedule instead of `way_id_set` - the
-  IdSet serves R2d's reverse lookup, dense-ID-per-blob does not hold on
-  real planets, and every alternative measured or sketched is strictly
-  worse than the 160 MB it would save. Item 3: finer reframe_ms
+  unless renumber becomes critical-path. Also: finer reframe_ms
   breakdown is measurement tooling with no consumer; build only
   alongside a specific optimization candidate.
 - **time-filter, gated on a real history workload** (formerly
@@ -336,69 +333,21 @@ are removed; git history keeps them. Detail stays in notes/.
 
 ## Bug-hunt carry-over (hunt 2026-08-12, closed out 2026-08-20)
 
-The seven `notes/bugs-*.md` documents are retired; `git log` holds the full
-hunt record and the fixes. Everything those documents left deliberately open
-is restated here, with the reason it was left open, because that is the part
-that has to outlive the notes. Refuted findings did not move here - they are
-recorded as comments at the code they concern (`src/debug.rs` on FIFO marker
-atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
-`src/commands/extract/multi.rs` on the reverted parallel writer,
-`impl Drop for UringState` on the teardown asymmetry).
+Remaining open findings from the closed hunt.
 
-### Change stream (`src/osc/`, apply-changes, merge-changes, diff)
+### Change stream (`crates/lib/src/osc/`, apply-changes, merge-changes, diff)
 
-- [ ] **Keep `VERBOSE_SEQUENCE_DIFF_MAX_WORK` at `1 << 20`.** The budget
-  bounds search work, not wall time for arbitrary lengths or expensive
-  equality. The ignored `verbose_sequence_budget_timing` unit test retains
-  the timing probe without a host-dependent timing assertion.
-
-- [ ] **`diff -v` keyed tag lines carry no positions.** Unique-key tag lists
-  print keyed `-"k"="v"`/`+"k"="v"`/`~"k"` plus `tags: order changed`, so
-  `[a=1] -> [a=1,b=2]` and `[a=1] -> [b=2,a=1]` print the same `+"b"="2"`, and
-  the detail cannot reconstruct the new tag order. Deliberate: the keyed
-  view is the readable one for the common case, and the CLI reference says tags
-  are keyed without positions. Revisit only if someone wants `-v` to be a
-  reconstructible patch; then tags would go through the positioned script
-  always.
-
-- [ ] **`merge-changes --simplify` holds the rendered XML of every input
-  change** (peak anon at planet 7-OSC in reference/performance/README.md,
-  merge-changes `--simplify`). The
-  output's `(kind, id)` order is what forces holding it. Bounding it further
-  means either spilling rendered batches to scratch and reading survivors
-  back by range, or an index-only first pass plus a re-parse into key-range
-  buckets; both add a full payload write and read.
-
-- [ ] **General PBF metadata extraction/re-encoding still defaults absent
-  fields.** Presence preservation covers the OSC-to-PBF path; a broader
-  metadata API migration remains outside that scope.
+- [ ] **Read partial-column DenseInfo.** libosmium writes and reads any
+  subset of DenseInfo columns; `validate_dense_info_arrays` refuses one
+  (DEVIATIONS.md, a DenseInfo with only some columns is refused). Choose
+  column presence once per group, keep the existing complete iterator for
+  normal input, and re-encode partial-column nodes without inventing
+  columns. Fix the dense whole-slot drop on version below 0 in the same
+  pass.
 
 ### Core infrastructure and CLI
 
-- [ ] **Keep JSON escaping independent of stdout's destination.**
-  `inspect --json` and export use serde_json: quote, backslash and C0 are
-  escaped, while C1 controls, DEL, U+2028/U+2029 and bidi controls remain
-  literal. Human text escapes those display controls too. Consumers displaying
-  JSON must escape display controls themselves; terminal output uses the same
-  JSON bytes as pipes and files. `inspect --get` prints raw values by design,
-  so a header newline makes a multi-line answer; use `--json` for structured
-  values. The policy is documented in `docs/cli/commands.md`.
-
-- [ ] **`inspect --blocks` / `--anomalies` retain per-blob records.**
-  Location counts now use an exact sparse histogram, merged across decode
-  workers; text and JSON share percentile selection without cloning or
-  sorting one value per located way. JSON block listing now selects directly
-  from the records without an intermediate reference list, and constructs
-  Values only for the selected first/last N records.
-  Retain `BlockAccum.block_infos` for now: the scan API takes `show_blocks`,
-  while the limit and anomaly filter arrive only when rendering the reusable
-  report. A first/last ring would discard data needed by later render calls,
-  exact per-kind distributions and median-based anomaly selection. Bounding
-  this needs a scan-time retention contract and an explicit decision about
-  exact distributions and anomaly output, rather than a local ring swap.
-  Both listings remain opt-in. Reviewed 2026-11-10.
-
-- [ ] **`cli/src/lib.rs` argument splatting is partially cleaned up.** Round 4
+- [ ] **`crates/cli/src/lib.rs` argument splatting is partially cleaned up.** Round 4
   introduced `WriteOpts` and per-command flag structs for `getid`,
   `tags-filter`, `check`, `inspect`, `diff` and the geocode-index levels, which
   removed every run of three or more adjacent same-typed parameters - the class
@@ -408,75 +357,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   (the attributes themselves are the list). Low urgency; folds into the lint
   exemptions item above.
 
-- [ ] **The promise guard's remaining blind spots.** `cli/tests/guard.rs`
-  now kills `io_uring_setup` unless the child arguments explicitly contain
-  `--io-uring` before `--`, closing the ring-submission gap for ordinary
-  runs. Control probes check both the ban and the exception without needing
-  host ring support. Explicit `--io-uring` runs still cannot be checked for
-  submissions such as `IORING_OP_CLOSE` on the inherited lease; the brokkr
-  text lints remain the tripwire. A ring-op allowlist would need cooperation
-  from the ring creator (`IORING_REGISTER_RESTRICTIONS`), outside this
-  test-only change's scope. Keep `clone3` returning `ENOSYS`: killing it
-  would also kill glibc's legitimate thread creation, and seccomp cannot
-  inspect the flags in memory. A raw process-creating caller can ignore
-  `ENOSYS` and continue, but cannot create a process; a surviving control
-  probe now records that distinction. The guard proves no process creation
-  succeeded, not that none was attempted. These residual limits stay open.
-  Hotpath builds, which the guard never runs, are covered by the
-  `no-hotpath-cpu` script check on the resolved graph; it certifies the
-  checked resolution only, trusting Cargo's source configuration, not a
-  build passing `hotpath/hotpath-cpu` on the command line.
-
-- [ ] **The O_DIRECT path constructors' non-regular-target check is not
-  race-free.** `direct_io::create_for_write` (behind
-  `PbfWriter::to_path_direct` and `to_path_uring`) stats the path before
-  its `O_DIRECT` open, re-stats it when the open fails `EINVAL` or
-  `EOPNOTSUPP`, and fstats the opened descriptor. A FIFO renamed into place
-  between the first stat and the open still blocks the open, and a device
-  renamed in sees the open (it is never written). A failed re-stat keeps
-  the open's own classification, so an `EINVAL` from a swapped-in device can
-  still read as `direct-io` unavailable. Closing it would need a
-  non-blocking probe open plus a `/proc/self/fd` reopen (the input-pinning
-  pattern), or `O_NONBLOCK` cleared afterwards, which the `fcntl F_SETFL`
-  text lint in `brokkr.d/lints.toml` confines to `src/read/input.rs`. Judged
-  outside the path constructors' contract (their caller owns the
-  destination; `Output` stages a fresh file) when this landed; recorded so
-  the boundary is a decision, not an oversight.
-
-- [ ] **Old site fragments into the correctness and deviations pages land on
-  a pointer.** Those two site pages became pointers to the root
-  `CORRECTNESS.md` and `DEVIATIONS.md` on GitHub, so an outside bookmark such
-  as `/pbfhogg/cli/deviations#diff-content-equality-vs-version-ordering`
-  now opens the pointer page, not the section. Accepted when the copies were
-  removed (recreating the headings would be a second copy to drift); a
-  fragment-forwarding script on those two pages is the fix if it matters.
-  The site's search also no longer indexes their content.
-  The CLI commands page lost three site fragments the same way when the
-  repository's CLI reference replaced it (headings renamed so both renderers
-  slug them alike): `#index-verifying-blob-level-metadata`,
-  `#locations-verifying-inline-way-locations` and
-  `#locations-on-ways-maintaining-a-locationsonways-file` now open the page
-  top; they are `#index-verification`, `#inline-location-verification` and
-  the `--locations-on-ways` section (check what each renderer slugs
-  that heading to before citing an anchor). Repository links of the form
-  `blob/main/reference/cli-reference.md#...` (outside this tree: issue
-  comments, other projects' notes) no longer resolve at all; the content
-  is `docs/cli/commands.md` under the same section names except
-  "`-j/--jobs`" (now "Worker threads"), "`--force`" (now "Proceeding
-  without indexdata") and the two `check` subsections above.
-
 ### Read path
-
-- [ ] **Keep input eviction a reader-level policy.** Only host-bound
-  blob/element readers evict when `Host::page_cache` is `Evict`. Raw `Frames`
-  preserve buffered readahead without unmeasured eviction overhead;
-  input-front probes retain bytes for the following pass; `HeaderWalker`
-  and inline body reads retain headers/bodies for reuse. Scheduled positional
-  workers, classify pools and range-copy/splice routes have no shared safe
-  consumed prefix across out-of-order reads and later passes. These exceptions
-  and their users are documented in `docs/guide/advanced.md`. `Keep` suppresses
-  all input eviction advice; `Evict` is not a command-wide promise. The
-  `BlobReader` range measurement remains open below.
 
 - [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
   The API half is closed - eviction is opt-in on the public readers
@@ -498,35 +379,13 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Spatial and node-location resolution
 
-- [ ] **The PBF read path does not validate coordinate ranges.** `parse_bbox`
-  now rejects a latitude outside -90..90 or a longitude outside -180..180, and
-  every path that joins node coordinates into ways (both add-locations-to-ways
-  stores, and the apply-changes `--locations-on-ways` kept-node sink) refuses a
-  joined node outside the same domain; `check --locations` reports one. The
-  general read path (`read/elements.rs`, the dense node iterators) and the node
-  scanner (`scan/node.rs`, which bounds only the `i32` representation) still
-  hand out whatever the file says. Recorded because the bbox work made the
-  asymmetry visible; changing the read path is a deliberate decision, not a
-  follow-up.
-
-- [ ] **Join-time domain checks judge the truncated value.** add-locations-to-ways
-  and apply-changes `--locations-on-ways` test the domain on the
-  decimicrodegree value after truncation toward zero (`coord_pack::in_domain`),
-  so a node within 100 nanodegrees past +-90 / +-180 degrees (possible only
-  under a non-default granularity or offset) is accepted and written at the
-  limit, while `check --locations` judges the exact nanodegree value and
-  reports it. The written coordinate is in the domain; the two commands
-  disagree only about whether the input was. Judging the exact value would
-  need the scanner to hand out nanodegrees or a remainder flag on the hot
-  path; left as is unless a real producer is found writing such values.
-
 - [ ] **Ring simplification can change polygon topology.** Douglas-Peucker can
   introduce self-intersections that flip containment near a boundary. The
   recursion / stack-overflow defect is fixed (explicit stacks); the topology
   sub-point is open because no topology-preserving replacement and no biting
   real caller-order fixture was established. Precise scope so it is not
   rediscovered:
-  - **Producer.** `src/geo.rs` Douglas-Peucker, called from
+  - **Producer.** `crates/lib/src/geo.rs` Douglas-Peucker, called from
     `geocode_index/builder/admin.rs::assemble_one_relation`, which simplifies
     every outer and inner ring of every admin relation.
   - **Knob.** `--max-admin-vertices`, default 500. `admin_vertex_cap` now reads
@@ -561,7 +420,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 - [ ] **Admin interior flags are sound; the reader cannot use them yet.** Since
   2026-11-03 ([ADR-0022](../decisions/0022-admin-edges-are-covered-in-the-point-in-polygon-geometry.md),
   superseding ADR-0015) the edge cells are a conservative cover of the
-  reader's own point-in-polygon boundary (`src/geocode_index/builder/cover.rs`),
+  reader's own point-in-polygon boundary (`crates/lib/src/geocode_index/builder/cover.rs`),
   so a flagged cell is wholly inside its polygon. Re-enabling a PIP skip
   needs two things the index does not have: a header signal that its flags
   come from that builder (older indexes carry flags on boundary cells), and a
@@ -588,15 +447,15 @@ Per-command plans and open follow-ups. Details drift as work lands.
 
 - [ ] **[reference/blob-density.md](../reference/blob-density.md)** - Geofabrik-style PBFs (small blobs, many of them) scale very differently from `planet.openstreetmap.org`-style PBFs (large blobs, few of them). The `HeaderWalker`-touching commands split into three shapes: selective header-walk (`getid`, `getparents`), resolved by ADR-0006's blob-count dispatch; pure parallel-classify (`tags-filter`), which gains on density; and the shape-3 hybrid (`check --refs`, `check --ids`, `cat --clean`, `repack`, `degrade`, `extract --smart`, all via `build_classify_schedules_split`), whose serial schedule walk regresses on high blob count with near-zero production bite. Per-phase walk durations cannot be summed (ALTW sparse P4, notes/altw.md): a walk costs only where the preceding phase evicted the headers. Do NOT chase the shape-3 callers unless a high-blob-count *planet* becomes a real workload.
 
-  - [ ] **Shape-3 serial schedule walk (`build_classify_schedules_split`).** The single-threaded `HeaderWalker` loop in `src/scan/classify.rs` does one QD=1 pread per blob. Measured 2026-07-12, before the cold-walk read-ahead of `6fdde3f4`: ~70 us/blob, invisible at production planet's blob count but a fixed ~97-109 s at 1.45 M blobs. **Full six-caller 8k sweep done 2026-07-12** (table in `reference/blob-density.md` "Full shape-3 sweep"): the walk fraction splits the family, which **narrows the payoff** from the earlier "helps six commands" framing. Read-only callers are ~2/3 walk - `check --refs` 66 % (`1851f73a`), `check --ids` 67 % (dirty) - so flattening it roughly halves their 8k wall (~2.7x -> ~1.3x). Re-encoding callers are only 18-29 % walk - `extract --smart` 29 % (`4b82686f`), `cat --clean` 19 % (`3f4c222c`), `repack` 18 % (`8f275ebf`), `degrade` 18 % (`6f8a3e94`) - their 8k regression is dominated by framing + writing 1.45 M tiny blobs, which the walk fix does not touch. So: **if the primitive is ever built, it is a win for the read-only pair only** (and those two are the same commands whose getid/getparents selective-scan cousins already got ADR-0006 dispatch). The io_uring batched-header-walker this entry used to name cannot work (each header's offset comes from the one before, so there is never a second probe to batch); cold walks of small-blob files now read ahead in windows instead, which the 8k sweep predates - see `reference/blob-density.md` "The walk term". Unmeasured at 8k since. Still deferred: near-zero production bite.
+  - [ ] **Shape-3 serial schedule walk (`build_classify_schedules_split`).** The single-threaded `HeaderWalker` loop in `crates/lib/src/scan/classify.rs` does one QD=1 pread per blob. Measured 2026-07-12, before the cold-walk read-ahead of `6fdde3f4`: ~70 us/blob, invisible at production planet's blob count but a fixed ~97-109 s at 1.45 M blobs. **Full six-caller 8k sweep done 2026-07-12** (table in `reference/blob-density.md` "Full shape-3 sweep"): the walk fraction splits the family, which **narrows the payoff** from the earlier "helps six commands" framing. Read-only callers are ~2/3 walk - `check --refs` 66 % (`1851f73a`), `check --ids` 67 % (dirty) - so flattening it roughly halves their 8k wall (~2.7x -> ~1.3x). Re-encoding callers are only 18-29 % walk - `extract --smart` 29 % (`4b82686f`), `cat --clean` 19 % (`3f4c222c`), `repack` 18 % (`8f275ebf`), `degrade` 18 % (`6f8a3e94`) - their 8k regression is dominated by framing + writing 1.45 M tiny blobs, which the walk fix does not touch. So: **if the primitive is ever built, it is a win for the read-only pair only** (and those two are the same commands whose getid/getparents selective-scan cousins already got ADR-0006 dispatch). The io_uring batched-header-walker this entry used to name cannot work (each header's offset comes from the one before, so there is never a second probe to batch); cold walks of small-blob files now read ahead in windows instead, which the 8k sweep predates - see `reference/blob-density.md` "The walk term". Unmeasured at 8k since. Still deferred: near-zero production bite.
 
 - [ ] **degrade** - v2 ideas, pick up when a consumer surfaces: `--recompress C` (forces decode even for passthrough-eligible flags); richer `--unsort` chaos modes (rotate/shuffle/reverse - only when sort measurement needs more than one overlap per kind); a registered planet `unsorted` snapshot for `sort` benching; `--unsort` throughput (denmark 7.7 -> 27.3 s from the Owned round-trip through the merge thread; three sketches in the retired notes/degrade.md's git history, worker-fires-the-swap being the cleanest - acceptable today because `--unsort` is one-time generation work). Flag semantics in docs/cli/commands.md.
 
 - [ ] **getparents FullScan arm** - one idea parked without a trigger: converting the FullScan arm from pipelined decode to `parallel_classify_phase` (pure per-blob work, lower memory ceiling; est. 10-20 % where oversubscription bites). Bench-gated, speculative, and ADR-0006's dispatch already routes the cases where it would matter most.
 
 - [ ] **apply-changes** (plan note `apply-changes-opportunities.md` deleted 2026-07-13; git history has the full record) - `apply-changes --locations-on-ways`. Cross-disk `--io-uring` rows (93.0 / 127.9 / 82.8 s) still need re-measurement on the fixed writer (the `fa8251d` CopyRange fix); cross-disk `--compression none` + `--io-uring` is open until re-measured. Multi-file output / RAID-0 is unlanded and low priority. Remaining items:
-  - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; the scaffolding that used to sit in `src/write/raw_passthrough.rs` was deleted 2026-08-20; the per-group passthrough analysis is in this file's raw passthrough section). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
-  - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
+  - [ ] **#11 splice-in-place for low-touch rewrites (deferred).** For `NeedsRewrite` blobs with <=K affected elements (K~64), splice raw wire bytes for unmodified element runs instead of full decode + re-encode (~1.5-2 s at daily; the scaffolding that used to sit in `crates/lib/src/write/raw_passthrough.rs` was deleted 2026-08-20; the per-group passthrough analysis is in this file's raw passthrough section). Saves classify/rewrite CPU but not output bytes, so it will not move the writer-bound wall. Revisit if the writer ceiling moves.
+  - [ ] **#13 exact-membership metadata / sidecar (format project).** Per-blob ID-range-only metadata forces slow-path decode on pure creates inside an existing range: 15,224 FalsePositive blobs / 92,677 slow-path = 16 % of slow-path work wasted at planet. The false-positive distinction is documented on `block_overlaps_diff` in `crates/lib/src/commands/apply_changes/classify.rs` (`range_overlaps` true for create IDs inside the blob's range, `block_overlaps_diff` false because no element in the block matches; the old `classify_only` "FalsePositive" comment the note pointed at was removed in the streaming refactor). Two fix shapes: (a) wire-format exact-overlap scanner on decompressed bytes; (b) per-blob membership sketch in indexdata. Not a quick cleanup.
   - Open questions preserved from the note: actual overlap-blob ratio under larger OSCs (re-measure if input diffs grow; governs worker-pool load); byte-budget reorder capacity sizing (current setting works at planet; revisit on RSS/stall signals); scanner HeaderWalker vs worker throughput balance (no signal it's an issue).
 
 - [ ] **[notes/altw-external.md](altw-external.md)** - `add-locations-to-ways --index-type external`. Current baselines and history are in `reference/performance/add-locations-to-ways.md` and [`notes/altw-optimization-history.md`](altw-optimization-history.md); failed attempts and the do-not-retry list are there too.
@@ -610,13 +469,18 @@ cells land. This section tracks the remaining axes and dataset gaps.
 
 ### Latent planet risks
 
-- [ ] **altw sparse at planet.** The default `--index-type sparse`
+- [ ] **altw sparse at planet where auto cannot see memory.** Sparse
   thrashes at planet on a 28 GB-class host: the rank-indexed flat scratch
   outgrows the page cache and pass 2's location write-back turns into
   random-access mmap faults (soft failure, unboundedly slow, not OOM;
-  reference/performance/add-locations-to-ways.md "Auto routing threshold"). Planet runs need
-  `--index-type external`, which the README says. Open: whether the
-  default should route to external, or refuse, at planet scale.
+  reference/performance/add-locations-to-ways.md "Auto routing
+  threshold"). Since 0.6.0 the default `auto` routes such a run to
+  external where it knows the memory budget. Left: auto keeps sparse when
+  the budget is unknown (every non-Linux host, containers without a
+  visible cgroup v2 mount) or available memory is at or below the 3 GiB
+  headroom, so a planet run there still thrashes, announced only by the
+  `altw.auto_select` Note. Open: whether that case should warn or refuse
+  instead.
 
 ### Blocked on dataset / config
 
@@ -640,7 +504,7 @@ cells land. This section tracks the remaining axes and dataset gaps.
 
 ### Un-benched permutations (low priority)
 
-Known to work, no performance question open, but not in the results DB:
+Conditional measurement work; run only when the stated question arises:
 
 - [ ] **ID-set shape for `getid` / `getparents`**. The lists are
   configurable per dataset (`getid_ids` / `getparents_ids`); no bench
@@ -652,14 +516,6 @@ Known to work, no performance question open, but not in the results DB:
   "`--direct-io` impact summary"). Not measured: extract,
   add-locations-to-ways external, merge-changes. Only matters if
   direct-io becomes a default on any of them.
-- [ ] **`renumber` with non-default flags**. Has no non-default flags
-  in pbfhogg today (just the one variant since the in-memory path
-  was retired). If a future variant adds flags this reopens.
-- [ ] **`brokkr bench decode-workload` / `brokkr bench encode-workload` / `brokkr bench merge-workload` at planet**.
-  Synthetic benchmarks, intentionally excluded from the README user
-  surface. Periodically-useful diagnostic tools; not a validation
-  target.
-
 ## Performance
 
 - [ ] **altw external pass A's exposure to sustained-write state
@@ -677,35 +533,6 @@ Known to work, no performance question open, but not in the results DB:
   on the exposure is left in hand: the unbuilt shapes there (a bounded
   descriptor cache over private files, striped buckets) bound
   descriptors, not write exposure.
-- [ ] **getid's full-scan arm reads every payload it then skips
-  (2026-11-09).** `filter_by_id_streaming` uses `Frames::next_raw`, so a
-  blob the indexdata prescreen rejects has its whole payload copied into
-  memory first. `next_header` already returns the index, so rejected
-  blobs could `skip_payload` (a `seek_relative` inside the `BufReader` for
-  small blobs). That changes the arm's I/O shape, which ADR-0006 measured
-  as a sequential read, so it wants its own matched cells at low and high
-  blob density.
-- [ ] **Sort pass 2 parallelism is bounded by overlap component count
-  (2026-11-08).** One sweep per component: an input whose every kind is
-  one connected component (the Denmark `chained` snapshot) sweeps in
-  three jobs, the node component dominating (`SORT_PASS2` 24.1 s at
-  `d044980e`, bygg; reference/performance/sort.md, "Sort across the blob-merge
-  engine move on unsorted Denmark"). Thread utilization and the critical
-  path were not measured; this records the limit, not a defect or a
-  remedy.
-- [ ] **Same-ID groups in the overlap sweep are held whole
-  (2026-11-09).** The sweep still gathers every copy
-  of one ID before writing any (`emit_group` in
-  `src/commands/blob_merge/sweep.rs`), uncharged against
-  `SWEEP_PINNED_BYTES`, because a cursor delivers an ID's copies in block
-  order and `sort` accepts descending versions inside a blob. Output
-  ships block by block inside a group and the dedupe lookup is indexed
-  past `SWEEP_GROUP_INDEX_THRESHOLD`, so only the hold remains. Removing
-  it means a merge keyed on (ID, version, tie) with an eager (ID,
-  version) pass over every overlap blob before its cursor opens (sorted
-  views where it fails): a second pass over normal input, and live
-  cursor blocks and views are still held. Only adversarial or
-  many-version input reaches the hold.
 - [ ] **Byte-budgeted fused task engine (2026-11-08).** One execution model for decode, transform, encode
   and frame under one byte budget, replacing the unordered classify pool,
   `run_ordered`, the writer's separate rayon framing dispatch and
@@ -722,7 +549,7 @@ Known to work, no performance question open, but not in the results DB:
   admission protocol's liveness around the earliest task, oversized and
   hostile blobs, cancellation and error paths that release leases, and a
   byte ledger does not bound pages glibc retains. apply-changes now bounds
-  outstanding seqs by count (`apply_changes/window.rs`, 512, non-binding
+  outstanding seqs by count (`crates/lib/src/commands/apply_changes/window.rs`, 512, non-binding
   at planet with in-flight peaks of 300-410); a byte budget here would
   replace that window, not sit beside it.
 
@@ -731,25 +558,15 @@ Known to work, no performance question open, but not in the results DB:
   needs across dataset sizes and hosts, and the structural route (recycling
   blob-scale buffers) are in `notes/mmap-threshold.md`.
 
-- [ ] **A cold schedule header walk costs ~6 s at planet (found
-  2026-10-30).** Cells that run without the headers in page cache spend
-  about 6 s per schedule walk (every command that schedule-walks without
-  cached headers; tags-filter two-pass walks several times, see below); the
-  RSS-pass baselines had them cached. Read single-cell walls with that in
-  mind. Measured before the cold-walk read-ahead of `6fdde3f4`.
-
 - [ ] **Stall-counter follow-ups (found 2026-10-26 adding the unordered
   pools' `*_wait_ns` counters).** Each is its own change; none is measured.
   - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`
-    fan-out (`apply_changes/streaming.rs`).
+    fan-out (`crates/lib/src/commands/apply_changes/streaming.rs`).
   - The first-error slot is a mutex locked on every claim in altw stages 2
     and 3 and geocode pass 1.5; an `AtomicBool` fast check would avoid the
     shared cache-line traffic. Planet-measured paths: needs its own A/B.
   - Every altw router publish takes a global `stats` mutex and the global
     `notify_mu`. Same caveat.
-  - The `Mutex<Receiver>` desc-lock reading that used to be listed here
-    is in reference/performance/classify.md, "Mutex<Receiver> blob dispatch
-    is not a bottleneck".
 
 - [ ] **Expose phase events as a proper Rust event/hook API** - wrap
   instrumentation calls in per-command `probes` modules, then swap the
@@ -767,24 +584,6 @@ Known to work, no performance question open, but not in the results DB:
   rollout plan. No `probes` module or `tracing` usage exists in the
   tree today.
 
-## Cross-pipeline optimization
-
-Cross-thread buffer retention is solved: `DecompressPool`
-(`src/read/decompress.rs`) recycles decompression buffers in the
-pipelined reader. Thread oversubscription was the open concern; the
-ordered and classify pools now bound their workers, and the fused task
-engine entry under Performance is the live design.
-
-Altw's optimization history, with what was tried and refused, is
-[notes/altw-optimization-history.md](altw-optimization-history.md).
-See [reference/pipelined-reader-paths.md](../reference/pipelined-reader-paths.md)
-for the pipelined-reader audit. Sequential conversion was attempted for
-getparents (commit `c912e4d`) and reverted - 4.7x regression on
-Denmark (1400ms vs 300ms). Decompression dominates, not per-block
-processing. **Do not convert decompression-dominated pipelined paths
-to sequential.** Renumber converted separately (external join
-architecture, not driven by retention/oversubscription).
-
 ## Milestone 2: Performance supremacy
 
 Goal: fastest or equal on every PBF transform operation, with published
@@ -792,49 +591,11 @@ benchmarks.
 
 ### Raw group passthrough
 
-Blob-level raw passthrough is closed for tags-filter (the pin is the
-comment block at the pass-2 worker in `src/commands/tags_filter/mod.rs`).
-time-filter still decodes and re-encodes via BlockBuilder; renumber's
-external mode splices ids on the wire (reference/performance/renumber.md,
-"Renumber (external mode)").
-
-Per-group raw passthrough, for partial-match blobs (e.g. extract boundary
-blobs where some groups match and some do not), is **not built**. Seven
-unused scaffolding primitives carried the idea for four months without a
-consumer - `frame_raw_block` in `src/write/raw_passthrough.rs`, the
-`PrimitiveBlock::raw_group_bytes` / `raw_stringtable_bytes` /
-`block_scalars` / `group_count` accessors, and the `WireBlock::raw_stringtable`
-/ `raw_proto` accessors underneath them - all behind blanket or per-item
-`allow(dead_code)`. They were deleted on 2026-08-20 (`fb079ac5`).
-
-The design question any consumer has to solve is mixing raw and
-re-encoded groups in one output blob: raw groups carry the original
-string-table indices, `BlockBuilder` issues fresh ones. Two viable
-shapes: a string-table-aligned re-encode (copy the original `StringTable`
-whole and re-encode partial groups against its indices, a different write
-path, one output blob per input blob), or split output (raw-only and
-re-encoded groups as separate blobs, both paths exist, but it doubles the
-boundary-blob count).
-
-Two shadow-counter measurements at planet scale put the idea on the
-shelf: tags-filter (2026-04-18, shadow counter `a5c6854` reverted in
-`0ef4107`, UUID `8c786794`, `w/highway=primary`), 0 of 50,364 pass-2
-blobs all-included, and multi-extract (2026-04-20, UUID `dad573cb`,
-5-region `--config --simple`), 0 of 32,835 node blobs qualifying, pinned
-in `src/commands/extract/multi.rs` `try_extract_multi_single_pass`. Both are
-structural: blobs are ID-sorted and OSM IDs are chronological, not
-geographic or tag-coherent, so an 8,000-element blob scatters in both
-dimensions. A group is smaller, so its qualifying fraction is not
-automatically zero; shadow-count at group granularity on a real workload
-before writing any code.
-
-### Write-path throughput
-
-`BlockBuilder` (`src/write/block_builder.rs`) interns strings in one
-arena (`src/write/string_table.rs`). Varint SIMD is closed: scalar beats
-SIMD 2-6x on LEB128 varints because the 1-byte fast path is perfectly
-branch-predicted (the retired notes/SIMD.md, in git history); only batch
-decode into columnar arrays remains a live SIMD direction.
+- [ ] Shadow-count fully selected groups on a real partial-match workload
+  before implementing per-group raw passthrough. A consumer must choose
+  between preserving the original string table for mixed raw/re-encoded
+  groups and splitting those groups into separate output blobs. See
+  `reference/pipeline.md`, "Block Builder", for the constraints.
 
 ## Milestone 3: Beyond the benchmark
 
@@ -854,14 +615,8 @@ the fastest one.
   which flags, and how each recovery is reported. First candidate: a repeated `Info` or
   `DenseInfo` message, refused while the block is parsed, before any
   `--clean` applies, so `cat --clean` cannot rescue that file today.
-- [ ] **Missing-indexdata and unsorted refusals name one remedy** (raised
-  2026-10-26). `IndexdataMismatch` advice now names `check --index` and
-  `cat --reindex`; `MissingIndexdata` (partial and whole) names `cat` only
-  and `Unsorted` names `sort --distrust-metadata` only, and diff's
-  claimed-count trust is uncovered. Decide whether they should also name
-  `check --index` (to find out what is wrong).
-- [ ] Auto-selection: `--index-type auto` exists (sparse vs external) but
-  is not the default; blob-count dispatch landed for getid and getparents
+- [ ] Auto-selection: `--index-type auto` (sparse vs external) is the
+  default since 0.6.0; blob-count dispatch landed for getid and getparents
   (ADR-0006) and `-j 0` sizes workers automatically. Extend to other
   decisions: sequential vs pread-from-workers based on available RAM and
   blob count elsewhere; compression level based on output target.
@@ -895,11 +650,11 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
   CLI features (they broke `--all-features` builds through duplicate
   `#[global_allocator]` definitions). The cross-thread-free pattern that
   motivated a retry is gone from the pipelined reader (see the
-  decoded-block working-set note in `src/read/pipeline.rs`). Retry only
+  decoded-block working-set note in `crates/lib/src/read/pipeline.rs`). Retry only
   if a fresh `--alloc` planet profile shows allocator-bound time;
   revisit when `tikv-jemallocator` tags a jemalloc 5.3.1 release.
   Allocator policy knobs are settled at the `set_mmap_threshold` doc in
-  `src/process.rs`.
+  `crates/lib/src/process.rs`.
 
 - [ ] **1. Custom allocators (per-block arena)** - 4/6 reviewers ranked 1st.
   Research note retired to git history 2026-07-16
@@ -919,7 +674,7 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 allocations that remain, ordered by impact:
 
 - [ ] **Geocode pass 3 stage A par_iter** - per-way `Vec::new()` inside
-  the two `flat_map_iter` closures in `src/geocode_index/builder/pass3.rs`.
+  the two `flat_map_iter` closures in `crates/lib/src/geocode_index/builder/pass3.rs`.
   Hard to fix due to
   parallel iterator ownership semantics. `SmallVec` could avoid heap
   allocation for ways with few segments. Low priority.

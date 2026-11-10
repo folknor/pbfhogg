@@ -180,6 +180,17 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 
 Used by all commands that produce PBF output.
 
+Individual LEB128 varints retain scalar encoding: the common one-byte
+fast path is well predicted, while SIMD setup costs more than it saves.
+Batch decode into columnar arrays is a separate optimization question.
+
+Raw group passthrough must preserve original string-table indices or emit
+raw and re-encoded groups in separate blobs, increasing boundary-blob
+count. ID-sorted blobs are neither geographically nor tag coherent, so
+whole-blob selection is a poor predictor of a useful group-level hit rate.
+Unused raw-group scaffolding was removed; measure group selection before
+building a consumer.
+
 ### Node-Only Wire Scanner
 
 `crates/lib/src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
@@ -507,6 +518,13 @@ Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) f
 2. **Stage 2** (`stage2.rs`, `wire_rewrite.rs`) - parallel way assembly; builds a separate `IdSet` for ways and remaps node refs via rank-indexed lookup.
 3. **Relations** (`relations.rs`) - sequential collect of relation IDs, then parallel rewrite remapping member refs across all three kinds.
 
+Renumber has one external variant; there is no separate mode-specific flag
+permutation to validate.
+
+The way IdSet also supplies reverse lookup in R2d. Deriving way ranks from
+the schedule cannot replace it: real planet blobs do not have dense ID
+ranges, and the alternatives add more storage or work than they save.
+
 ### time-filter
 
 Two paths, picked from the header's `HistoricalInformation` (`crates/lib/src/commands/time_filter/mod.rs`):
@@ -520,6 +538,12 @@ The input is pinned before the header read (see "One input, one file, across pas
 Header-only scan (fast path on indexed PBFs - reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
 
 Pinning (see "One input, one file, across passes") is decided per library entry: the scan pins when its index-only walk may run, since a data blob without indexdata sends it back to the start for a full decode; a decode-only scan (`--extended`, `--locations`, `--distrust-metadata`) opens once and takes no pin; `node_stats` pins (indexdata probe, then schedule walk); the `--get` header route (`inspect::inspect_header`) opens once and takes `file.size` from that open's descriptor. The CLI pins once itself when `--indexed` or `--nodes` joins the scanning report, and hands the pin to every call.
+
+Opt-in block and anomaly listings retain all per-blob records. The scan
+accepts `show_blocks`, but limits and anomaly filters belong to later
+render calls on the reusable report. A first/last ring would lose records
+needed by another render, exact per-kind distributions and median-based
+anomaly selection; bounding retention requires a scan-time contract.
 
 ### check
 
@@ -568,6 +592,10 @@ bytes, without building owned elements.
   create, modify, delete, are cut into one chunk per worker, and each chunk's
   rendered bytes are spliced into its own `<action>` section and gzip member.
   Memory is the rendered XML of every input change, not owned elements.
+  The output order requires retaining changes until survivors are known.
+  Bounding this further requires spilling rendered batches and reading
+  survivor ranges back, or an index-only pass followed by a re-parse into
+  key-range buckets; both add a full payload write and read.
 
 `tags-filter --input-kind osc` runs on the same readers through
 `stream::collect`: workers render kept elements into nine (action, kind)

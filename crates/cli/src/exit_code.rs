@@ -163,13 +163,14 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
         // A partially indexed file has no fallback to grant, so the escape
         // switch is not advice there.
         ErrorKind::MissingIndexdata { partial, .. } => Some(format!(
-            "\n\nGenerate an indexed PBF first:\n\n  pbfhogg cat {} -o indexed.osm.pbf{}",
+            "\n\nGenerate an indexed PBF first:\n\n  pbfhogg cat {} -o indexed.osm.pbf{}\n\nInspect missing or contradictory blob metadata with:\n\n  pbfhogg check --index {}",
             input_word(error, "input.osm.pbf"),
             if *partial {
                 ""
             } else {
                 advice.indexdata.unwrap_or("")
-            }
+            },
+            input_word(error, "input.osm.pbf")
         )),
         // One remedy for every Unsorted: a header without the sorted claim
         // sorts the same either way, and one whose claim the file
@@ -178,7 +179,8 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
         ErrorKind::Unsorted { .. } => Some(format!(
             "\n\nSort the input first, decoding every blob rather than believing the header's \
              sort claim and the blobs' indexdata:\n\n  pbfhogg sort --distrust-metadata {} -o \
-             sorted.osm.pbf",
+             sorted.osm.pbf\n\nInspect metadata and element order with:\n\n  pbfhogg check --index --ids {}",
+            input_word(error, "input.osm.pbf"),
             input_word(error, "input.osm.pbf")
         )),
         ErrorKind::IndexdataMismatch { .. } => {

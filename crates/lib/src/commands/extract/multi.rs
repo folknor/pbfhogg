@@ -548,7 +548,7 @@ pub(super) fn try_extract_multi_single_pass(
                         let meta = element_metadata(ElementKind::Node, id, &nd.info())?;
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_node(
+                            bbs[i].add_node_partial(
                                 id,
                                 nd.decimicro_lat(),
                                 nd.decimicro_lon(),
@@ -634,7 +634,7 @@ pub(super) fn try_extract_multi_single_pass(
                     let meta = element_metadata(ElementKind::Way, wid, &w.info())?;
                     for i in regions_of(&mask) {
                         ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
-                        bbs[i].add_way(wid, w.tags(), scratch, meta.as_ref());
+                        bbs[i].add_way_partial(wid, w.tags(), scratch, meta.as_ref());
                         counts[i] += 1;
                     }
                 }
@@ -709,7 +709,7 @@ pub(super) fn try_extract_multi_single_pass(
                     let meta = element_metadata(ElementKind::Relation, rid, &r.info())?;
                     for i in regions_of(&mask) {
                         ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;
-                        bbs[i].add_relation(rid, r.tags(), &members_buf, meta.as_ref());
+                        bbs[i].add_relation_partial(rid, r.tags(), &members_buf, meta.as_ref());
                         counts[i] += 1;
                     }
                 }

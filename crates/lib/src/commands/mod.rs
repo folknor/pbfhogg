@@ -34,7 +34,7 @@ pub mod time_filter;
 use std::path::Path;
 
 use crate::blob::BlobKind;
-use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, PartialMetadata};
 use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -559,6 +559,37 @@ pub(crate) fn clean_metadata<'a>(
         }
         if clean.user {
             m.user = "";
+        }
+        m
+    })
+}
+
+/// [`clean_metadata`] for a plain element's partial metadata: a cleaned
+/// field the element carries becomes its zero value, as for complete
+/// metadata (osmium's `--clean` values); a field it does not carry stays
+/// absent, so cleaning never fabricates a field.
+pub(crate) fn clean_partial_metadata<'a>(
+    meta: Option<PartialMetadata<'a>>,
+    clean: &cat::CleanAttrs,
+) -> Option<PartialMetadata<'a>> {
+    if !clean.any() {
+        return meta;
+    }
+    meta.map(|mut m| {
+        if clean.version {
+            m.version = m.version.map(|_| 0);
+        }
+        if clean.changeset {
+            m.changeset = m.changeset.map(|_| 0);
+        }
+        if clean.timestamp {
+            m.timestamp = m.timestamp.map(|_| 0);
+        }
+        if clean.uid {
+            m.uid = m.uid.map(|_| 0);
+        }
+        if clean.user {
+            m.user = m.user.map(|_| "");
         }
         m
     })

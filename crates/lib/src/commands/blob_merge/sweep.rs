@@ -125,9 +125,9 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Result;
 use crate::osm_id::{OsmIdKey, osm_id_cmp, osm_id_key};
 use crate::owned::{
-    OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
-    read_node, read_relation, read_way, relation_members_into, write_single_node_local,
-    write_single_relation_local, write_single_way_local,
+    OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
+    read_dense_node, read_node, read_relation, read_way, relation_members_into,
+    write_single_node_local, write_single_relation_local, write_single_way_local,
 };
 use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
@@ -190,9 +190,18 @@ impl Item {
     fn version(&self) -> i32 {
         match self {
             Item::Held(h) => borrowed_version(&h.elem),
-            Item::Node(n) => n.metadata.as_ref().map_or(0, |m| m.version),
-            Item::Way(w) => w.metadata.as_ref().map_or(0, |m| m.version),
-            Item::Relation(r) => r.metadata.as_ref().map_or(0, |m| m.version),
+            Item::Node(n) => n
+                .metadata
+                .as_ref()
+                .map_or(0, OwnedMetadata::version_or_zero),
+            Item::Way(w) => w
+                .metadata
+                .as_ref()
+                .map_or(0, OwnedMetadata::version_or_zero),
+            Item::Relation(r) => r
+                .metadata
+                .as_ref()
+                .map_or(0, OwnedMetadata::version_or_zero),
         }
     }
 
@@ -466,7 +475,7 @@ impl Output<'_> {
                 Element::Node(n) => {
                     crate::commands::ensure_node_capacity_local(&mut self.bb, &mut self.filled)?;
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                    self.bb.add_node(
+                    self.bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),
@@ -479,7 +488,8 @@ impl Output<'_> {
                     let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                     self.refs.clear();
                     self.refs.extend(w.refs());
-                    self.bb.add_way(w.id(), w.tags(), &self.refs, meta.as_ref());
+                    self.bb
+                        .add_way_partial(w.id(), w.tags(), &self.refs, meta.as_ref());
                 }
                 Element::Relation(r) => {
                     crate::commands::ensure_relation_capacity_local(
@@ -490,7 +500,7 @@ impl Output<'_> {
                     relation_members_into(r, &mut members)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     self.bb
-                        .add_relation(r.id(), r.tags(), &members, meta.as_ref());
+                        .add_relation_partial(r.id(), r.tags(), &members, meta.as_ref());
                 }
             },
             Item::Node(n) => write_single_node_local(n, &mut self.bb, &mut self.filled)?,

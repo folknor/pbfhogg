@@ -3450,6 +3450,7 @@ fn assert_claim_refused(out: &CliOutput, output: &Path) {
 fn assert_order_refused(out: &CliOutput, output: &Path, needle: &str) {
     assert_refused(out, output, needle);
     out.assert_stderr_contains("Sort the input first");
+    out.assert_stderr_contains("pbfhogg check --index --ids ");
 }
 
 const ORDER_REFUSAL: &str = "out of the order its header declares";

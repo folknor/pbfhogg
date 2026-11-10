@@ -771,7 +771,7 @@ struct ExtractPass3IdSets<'a> {
     matched_relation_ids: &'a IdSet,
 }
 
-use super::super::clean_metadata;
+use super::super::{clean_metadata, clean_partial_metadata};
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
@@ -829,11 +829,11 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = clean_metadata(
+                    let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
                         clean,
                     );
-                    bb.add_node(
+                    bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat(),
                         n.decimicro_lon(),
@@ -856,11 +856,11 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = clean_metadata(
+                    let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
                         clean,
                     );
-                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
                     if in_extra && !in_matched {
                         stats.ways_from_relations += 1;
                     } else {
@@ -872,11 +872,11 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 if ids.matched_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
                     relation_members_into(r, &mut members_buf)?;
-                    let meta = clean_metadata(
+                    let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
                         clean,
                     );
-                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                    bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }

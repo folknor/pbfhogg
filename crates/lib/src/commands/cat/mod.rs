@@ -589,7 +589,7 @@ fn reencode_unclassifiable(
                 check_tags(n.tags_checked())?;
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -622,9 +622,9 @@ fn reencode_unclassifiable(
                         .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon())),
                 );
                 if locations_buf.is_empty() {
-                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 } else {
-                    bb.add_way_with_locations(
+                    bb.add_way_with_locations_partial(
                         w.id(),
                         w.tags(),
                         &refs_buf,
@@ -638,7 +638,7 @@ fn reencode_unclassifiable(
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 ensure_relation_capacity_local(&mut bb, &mut output)?;
                 relation_members_into(r, &mut members_buf)?;
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }
         }
         count += 1;
@@ -839,11 +839,11 @@ fn process_block(
             }
             Element::Node(n) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                let meta = clean_metadata(
+                let meta = clean_partial_metadata(
                     element_meta(clean, ElementKind::Node, n.id(), &n.info())?,
                     clean,
                 );
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -856,21 +856,21 @@ fn process_block(
                 ensure_way_capacity_local(bb, output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = clean_metadata(
+                let meta = clean_partial_metadata(
                     element_meta(clean, ElementKind::Way, w.id(), &w.info())?,
                     clean,
                 );
-                bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
+                bb.add_way_partial(w.id(), w.tags(), refs_buf, meta.as_ref());
                 count += 1;
             }
             Element::Relation(r) if filter_relation => {
                 ensure_relation_capacity_local(bb, output)?;
                 relation_members_into(r, &mut members_buf)?;
-                let meta = clean_metadata(
+                let meta = clean_partial_metadata(
                     element_meta(clean, ElementKind::Relation, r.id(), &r.info())?,
                     clean,
                 );
-                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                 count += 1;
             }
             _ => {}
@@ -880,7 +880,7 @@ fn process_block(
     Ok(count)
 }
 
-use super::clean_metadata;
+use super::{clean_metadata, clean_partial_metadata};
 
 /// Resolve metadata for re-encoding. Under `--clean user` the user is dropped
 /// afterwards, so it is not resolved at all: `cat` is the recovery command and
@@ -892,7 +892,7 @@ fn element_meta<'a>(
     kind: ElementKind,
     id: i64,
     info: &crate::Info<'a>,
-) -> crate::Result<Option<crate::block_builder::Metadata<'a>>> {
+) -> crate::Result<Option<crate::block_builder::PartialMetadata<'a>>> {
     if clean.user {
         crate::owned::element_metadata_dropping_user(kind, id, info)
     } else {

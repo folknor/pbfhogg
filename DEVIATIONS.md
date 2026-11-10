@@ -925,3 +925,32 @@ byte length, not by its first byte; versions and changesets libosmium refuses
 are accepted and judged by value; an empty input reports `(none)` for "All
 objects have"; and the timestamp range ignores zero timestamps. CORRECTNESS.md
 "Metadata coverage in inspect --extended" gives the rule.
+
+## Re-encoding: absent metadata fields stay absent
+
+libosmium's object model has no absent metadata field: decoding reads an
+absent version, timestamp, changeset or uid as 0 and an absent user as empty,
+and the PBF writer then emits whichever fields its `add_metadata` option
+selects, so an osmium round trip writes zeros the input never claimed.
+`osmium cat --clean` likewise sets the cleaned fields to zero and writes them.
+pbfhogg keeps the presence of each field of a plain `Info` through every
+re-encoding command: an absent field is written absent, a present zero stays
+a present zero, and `--clean` zeroes only the fields an element carries.
+The Osmosis `-1` version and changeset are read field by field as absent,
+as libosmium reads them, and the element's other fields are kept. A node
+whose metadata is complete with a version of at least 1 is written dense; any
+other node with metadata is written as a plain `Node` (a DenseInfo column
+cannot leave one node's field out, and a version-0 dense slot does not claim
+its zero fields). Absent visibility on a node written dense becomes visible,
+the PBF default. Dense input nodes are re-encoded dense as decoded.
+
+## PBF decoding: a DenseInfo with only some columns is refused
+
+libosmium's PBF writer emits each DenseInfo column independently under
+`add_metadata` (for example `add_metadata=version+timestamp` writes only the
+version and timestamp columns), and its reader accepts any subset. pbfhogg
+refuses a DenseInfo that carries some but not all of the version, timestamp,
+changeset, uid and user columns, so such an osmium output cannot be read.
+This is a refusal, not a silent loss: the dense iterator decodes a slot only
+while every column yields, so accepting the shape without per-group column
+presence would blank the metadata of every node in the group.

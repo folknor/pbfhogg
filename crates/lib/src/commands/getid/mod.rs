@@ -1752,7 +1752,7 @@ fn process_block(
             Element::Node(n) => {
                 ensure_node_capacity_local(bb, output)?;
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                bb.add_node(
+                bb.add_node_partial(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
@@ -1766,14 +1766,14 @@ fn process_block(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                bb.add_way(w.id(), w.tags().take(keep_tags), &refs_buf, meta.as_ref());
+                bb.add_way_partial(w.id(), w.tags().take(keep_tags), &refs_buf, meta.as_ref());
                 ways += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation(
+                bb.add_relation_partial(
                     r.id(),
                     r.tags().take(keep_tags),
                     &members_buf,

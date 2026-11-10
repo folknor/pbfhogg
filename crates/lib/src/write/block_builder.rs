@@ -125,6 +125,16 @@ impl<'a> PartialMetadata<'a> {
             visible: self.visible.unwrap_or(true),
         })
     }
+
+    /// The complete metadata a node may be written dense with: complete
+    /// and with a version of at least 1. A DenseInfo slot with version 0
+    /// claims only its non-zero fields (`DenseNodeInfo::claims`), so a
+    /// version-0 node with an explicit uid 0, changeset 0 or empty user
+    /// would lose those claims in a dense slot; it is written plain.
+    /// Absent visibility still goes dense as visible, the PBF default.
+    fn dense_route(&self) -> Option<Metadata<'a>> {
+        self.complete().filter(|m| m.version >= 1)
+    }
 }
 
 /// [`RawMetadata`] whose fields may each be absent, for re-encoding a source
@@ -151,6 +161,11 @@ impl RawPartialMetadata {
             user_sid: self.user_sid?,
             visible: self.visible.unwrap_or(true),
         })
+    }
+
+    /// [`PartialMetadata::dense_route`]'s rule for raw metadata.
+    fn dense_route(&self) -> Option<RawMetadata> {
+        self.complete().filter(|m| m.version >= 1)
     }
 }
 
@@ -628,8 +643,11 @@ impl BlockBuilder {
     /// Add a node whose metadata fields may each be absent.
     ///
     /// A node with no metadata, or with all five of version, timestamp,
-    /// changeset, uid and user (visibility defaulting to visible), is written
-    /// dense, exactly as [`add_node`](Self::add_node) writes it. Any other
+    /// changeset, uid and user and a version of at least 1 (visibility
+    /// defaulting to visible), is written dense, exactly as
+    /// [`add_node`](Self::add_node) writes it. A complete node with version 0
+    /// is written plain, since a version-0 dense slot does not claim its zero
+    /// fields. Any other
     /// node is written as a plain `Node` message with an `Info` carrying only
     /// the present fields: DenseInfo has one column per field for the whole
     /// group, so it cannot say that one node lacks a field. Consecutive plain
@@ -643,7 +661,7 @@ impl BlockBuilder {
         tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&PartialMetadata<'_>>,
     ) {
-        match metadata.map(PartialMetadata::complete) {
+        match metadata.map(PartialMetadata::dense_route) {
             None => self.add_node(id, decimicro_lat, decimicro_lon, tags, None),
             Some(Some(full)) => self.add_node(id, decimicro_lat, decimicro_lon, tags, Some(&full)),
             Some(None) => self.add_plain_node(id, decimicro_lat, decimicro_lon, tags, metadata),
@@ -1172,7 +1190,8 @@ impl BlockBuilder {
     /// Add a node using pre-seeded string table indices whose metadata
     /// fields may each be absent: dense through
     /// [`add_node_raw`](Self::add_node_raw) when the metadata is absent or
-    /// complete ([`RawPartialMetadata::complete`]), otherwise a plain `Node`
+    /// complete with a version of at least 1 (the rule of
+    /// [`add_node_partial`](Self::add_node_partial)), otherwise a plain `Node`
     /// carrying only the present `Info` fields, under the same group rules
     /// as [`add_node_partial`](Self::add_node_partial). Indices are checked
     /// as `add_node_raw` checks them. A plain node keeps a tag key index of
@@ -1187,7 +1206,7 @@ impl BlockBuilder {
     ) -> Result<()> {
         let meta = match metadata {
             None => return self.add_node_raw(id, decimicro_lat, decimicro_lon, raw_tags, None),
-            Some(meta) => match meta.complete() {
+            Some(meta) => match meta.dense_route() {
                 Some(full) => {
                     return self.add_node_raw(
                         id,

@@ -11,3 +11,7 @@ date. [Osmium Parity](./osmium-parity.md) maps each osmium command to its
 pbfhogg counterpart.
 
 Parser and encoder edge cases are in [Correctness](../guide/correctness.md).
+
+Old section fragments on this pointer page are not forwarded, and site
+search does not index the linked content. Keeping headings or content here
+would create a second copy that could drift; use the repository sections.

@@ -4,7 +4,8 @@
 //! overlap-run and sweep-merge operations.
 
 use crate::block_builder::{
-    BlockBuilder, MemberData, Metadata, OwnedBlock, RawMetadata, RawPartialMetadata,
+    BlockBuilder, MemberData, Metadata, OwnedBlock, PartialMetadata, RawMetadata,
+    RawPartialMetadata,
 };
 
 use crate::error::Result;
@@ -150,13 +151,34 @@ impl std::fmt::Display for TypeFilter {
 // sweep-merge pass. They are not long-lived.
 // ---------------------------------------------------------------------------
 
-pub(crate) struct OwnedMetadata {
-    pub(crate) version: i32,
-    pub(crate) timestamp: i64,
-    pub(crate) changeset: i64,
-    pub(crate) uid: i32,
-    pub(crate) user: String,
-    pub(crate) visible: bool,
+/// Owned element metadata, keeping where it came from.
+///
+/// A dense slot and a plain `Info` with the same stored values can make
+/// different claims: a version-0 dense slot does not claim its zero uid,
+/// changeset or empty user (`DenseNodeInfo::claims`), a plain `Info` that
+/// carries them does. So a dense node's metadata stays [`Dense`] and is
+/// written dense as decoded, and a plain element's stays [`Plain`], each
+/// field present exactly when the source carried it.
+///
+/// [`Dense`]: OwnedMetadata::Dense
+/// [`Plain`]: OwnedMetadata::Plain
+pub(crate) enum OwnedMetadata {
+    Dense {
+        version: i32,
+        timestamp: i64,
+        changeset: i64,
+        uid: i32,
+        user: String,
+        visible: bool,
+    },
+    Plain {
+        version: Option<i32>,
+        timestamp: Option<i64>,
+        changeset: Option<i64>,
+        uid: Option<i32>,
+        user: Option<String>,
+        visible: Option<bool>,
+    },
 }
 
 pub(crate) struct OwnedNode {
@@ -203,7 +225,7 @@ pub(crate) enum OwnedElement {
 
 /// Extract version from optional metadata (0 if absent).
 fn version_of(meta: &Option<OwnedMetadata>) -> i32 {
-    meta.as_ref().map_or(0, |m| m.version)
+    meta.as_ref().map_or(0, OwnedMetadata::version_or_zero)
 }
 
 impl PartialEq for OwnedNode {
@@ -265,12 +287,11 @@ impl Ord for OwnedRelation {
 // ---------------------------------------------------------------------------
 
 impl OwnedMetadata {
-    /// Own a borrowed [`Metadata`]: the one field mapping the owned
-    /// conversions share with [`element_metadata`] and
-    /// [`dense_node_metadata`], so an owned element and a borrowed re-encode
-    /// of the same input write the same metadata.
-    fn from_borrowed(meta: Metadata<'_>) -> Self {
-        Self {
+    /// Own a dense node's [`Metadata`] from [`dense_node_metadata`], so an
+    /// owned element and a borrowed re-encode of the same input write the
+    /// same metadata.
+    fn from_dense(meta: Metadata<'_>) -> Self {
+        Self::Dense {
             version: meta.version,
             timestamp: meta.timestamp,
             changeset: meta.changeset,
@@ -280,14 +301,85 @@ impl OwnedMetadata {
         }
     }
 
-    pub(crate) fn as_borrowed(&self) -> Metadata<'_> {
-        Metadata {
-            version: self.version,
-            timestamp: self.timestamp,
-            changeset: self.changeset,
-            uid: self.uid,
-            user: &self.user,
-            visible: self.visible,
+    /// Own a plain element's [`PartialMetadata`] from [`element_metadata`].
+    fn from_plain(meta: PartialMetadata<'_>) -> Self {
+        Self::Plain {
+            version: meta.version,
+            timestamp: meta.timestamp,
+            changeset: meta.changeset,
+            uid: meta.uid,
+            user: meta.user.map(str::to_owned),
+            visible: meta.visible,
+        }
+    }
+
+    /// The version, 0 when absent: the ordering and dedupe key the sort
+    /// sweep shares with its borrowed side.
+    pub(crate) fn version_or_zero(&self) -> i32 {
+        match self {
+            Self::Dense { version, .. } => *version,
+            Self::Plain { version, .. } => version.unwrap_or(0),
+        }
+    }
+
+    /// Visibility, absent read as visible (the PBF default).
+    pub(crate) fn visible(&self) -> bool {
+        match self {
+            Self::Dense { visible, .. } => *visible,
+            Self::Plain { visible, .. } => visible.unwrap_or(true),
+        }
+    }
+
+    /// The metadata as the builder takes it: `Ok` complete metadata for a
+    /// dense node, `Err` partial metadata for a plain element.
+    pub(crate) fn as_borrowed(&self) -> std::result::Result<Metadata<'_>, PartialMetadata<'_>> {
+        match self {
+            Self::Dense {
+                version,
+                timestamp,
+                changeset,
+                uid,
+                user,
+                visible,
+            } => Ok(Metadata {
+                version: *version,
+                timestamp: *timestamp,
+                changeset: *changeset,
+                uid: *uid,
+                user,
+                visible: *visible,
+            }),
+            Self::Plain {
+                version,
+                timestamp,
+                changeset,
+                uid,
+                user,
+                visible,
+            } => Err(PartialMetadata {
+                version: *version,
+                timestamp: *timestamp,
+                changeset: *changeset,
+                uid: *uid,
+                user: user.as_deref(),
+                visible: *visible,
+            }),
+        }
+    }
+
+    /// The metadata as partial metadata, for a way or relation (which never
+    /// carries dense metadata; a dense value converts field for field).
+    fn as_partial(&self) -> PartialMetadata<'_> {
+        match self.as_borrowed() {
+            Ok(m) => PartialMetadata {
+                version: Some(m.version),
+                timestamp: Some(m.timestamp),
+                changeset: Some(m.changeset),
+                uid: Some(m.uid),
+                user: Some(m.user),
+                visible: Some(m.visible),
+            },
+            Err(p) => p,
         }
     }
 }
@@ -306,16 +398,64 @@ impl OwnedElement {
     }
 
     pub(crate) fn visible(&self) -> bool {
-        self.metadata().is_none_or(|m| m.visible)
+        self.metadata().is_none_or(OwnedMetadata::visible)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shared helper
+// Shared helpers: add an owned element to a builder, dense metadata through
+// the dense add, plain metadata through the presence-keeping partial adds.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
-    meta.map(OwnedMetadata::as_borrowed)
+pub(crate) fn add_owned_node(bb: &mut BlockBuilder, node: &OwnedNode) {
+    let tags = node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    match node.metadata.as_ref().map(OwnedMetadata::as_borrowed) {
+        None => bb.add_node(node.id, node.decimicro_lat, node.decimicro_lon, tags, None),
+        Some(Ok(full)) => bb.add_node(
+            node.id,
+            node.decimicro_lat,
+            node.decimicro_lon,
+            tags,
+            Some(&full),
+        ),
+        Some(Err(partial)) => bb.add_node_partial(
+            node.id,
+            node.decimicro_lat,
+            node.decimicro_lon,
+            tags,
+            Some(&partial),
+        ),
+    }
+}
+
+/// Add an owned way: with its inline locations when it carries one per ref,
+/// plain otherwise.
+pub(crate) fn add_owned_way(bb: &mut BlockBuilder, way: &OwnedWay) {
+    let tags = way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let meta = way.metadata.as_ref().map(OwnedMetadata::as_partial);
+    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
+        bb.add_way_with_locations_partial(way.id, tags, &way.refs, &way.locations, meta.as_ref());
+    } else {
+        bb.add_way_partial(way.id, tags, &way.refs, meta.as_ref());
+    }
+}
+
+pub(crate) fn add_owned_relation(bb: &mut BlockBuilder, rel: &OwnedRelation) {
+    let members: Vec<MemberData<'_>> = rel
+        .members
+        .iter()
+        .map(|m| MemberData {
+            id: m.id,
+            role: &m.role,
+        })
+        .collect();
+    let meta = rel.metadata.as_ref().map(OwnedMetadata::as_partial);
+    bb.add_relation_partial(
+        rel.id,
+        rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &members,
+        meta.as_ref(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -330,37 +470,37 @@ fn map_sentinel(value: i64) -> i64 {
     if value == -1 { 0 } else { value }
 }
 
-/// Extract [`Metadata`] from the [`Info`](crate::Info) of the Node, Way or
-/// Relation `kind` `id`, for re-encoding.
+/// Extract [`PartialMetadata`] from the [`Info`](crate::Info) of the Node,
+/// Way or Relation `kind` `id`, for re-encoding.
 ///
-/// Returns `None` if the info block has no version: the element is then
-/// re-encoded without metadata, whatever other fields its `Info` carries.
-/// Absent timestamp, changeset and uid become 0, the block builder's
-/// normalisation for a field it cannot leave out of a written `Info`.
+/// Each field is present exactly when the `Info` carries it (after the
+/// reader's Osmosis -1 normalisation; the timestamp truncated to whole
+/// seconds), so re-encoding through the `add_*_partial` builder methods
+/// neither invents a 0 for an absent field nor drops the fields of a
+/// versionless `Info`. `None` when the `Info` carries no field at all.
 ///
 /// A user name that is written is resolved, never substituted: a user string
 /// index past the block's string table, or negative, is an error naming the
-/// element and the index, not an empty user. Only the metadata this returns
-/// is resolved - a versionless `Info` is dropped whole, so its user is never
-/// looked up - and the refusal stands even where the caller later clears the
-/// user, except for `cat --clean user`, which uses
-/// [`element_metadata_dropping_user`] and never resolves it.
+/// element and the index, not an empty user. The refusal stands even where
+/// the caller later clears the user, except for `cat --clean user`, which
+/// uses [`element_metadata_dropping_user`] and never resolves it.
 pub(crate) fn element_metadata<'a>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
-) -> Result<Option<Metadata<'a>>> {
+) -> Result<Option<PartialMetadata<'a>>> {
     element_metadata_impl::<true>(kind, id, info)
 }
 
-/// [`element_metadata`] for `cat --clean user` alone: the user is not resolved
-/// (it comes back empty), so a bad user string index does not fail the run.
-/// See [`dense_node_metadata_dropping_user`] for why this exists.
+/// [`element_metadata`] for `cat --clean user` alone: a present user is not
+/// resolved (it comes back as `Some("")`, an absent one stays `None`), so a
+/// bad user string index does not fail the run. See
+/// [`dense_node_metadata_dropping_user`] for why this exists.
 pub(crate) fn element_metadata_dropping_user<'a>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
-) -> Result<Option<Metadata<'a>>> {
+) -> Result<Option<PartialMetadata<'a>>> {
     element_metadata_impl::<false>(kind, id, info)
 }
 
@@ -369,23 +509,21 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
-) -> Result<Option<Metadata<'a>>> {
-    let Some(version) = info.version() else {
-        return Ok(None);
-    };
+) -> Result<Option<PartialMetadata<'a>>> {
     let user = match info.user() {
-        _ if !RESOLVE_USER => "",
-        None => "",
-        Some(user) => user.map_err(|e| bad_user(e, kind, id, info.raw_user_sid()))?,
+        None => None,
+        Some(_) if !RESOLVE_USER => Some(""),
+        Some(user) => Some(user.map_err(|e| bad_user(e, kind, id, info.raw_user_sid()))?),
     };
-    Ok(Some(Metadata {
-        version,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
+    let meta = PartialMetadata {
+        version: info.version(),
+        timestamp: info.milli_timestamp().map(|ms| ms / 1000),
+        changeset: info.changeset(),
+        uid: info.uid(),
         user,
-        visible: info.visible(),
-    }))
+        visible: info.visible_opt(),
+    };
+    Ok((meta != PartialMetadata::default()).then_some(meta))
 }
 
 /// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode), for
@@ -541,7 +679,7 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
         // dense nodes check it in `dense_node_metadata` to avoid adding
         // branches to the hot DenseNodeIter path. See CORRECTNESS.md
         // "Osmosis -1 sentinel".
-        metadata: dense_node_metadata(dn)?.map(OwnedMetadata::from_borrowed),
+        metadata: dense_node_metadata(dn)?.map(OwnedMetadata::from_dense),
     })
 }
 
@@ -555,7 +693,7 @@ pub(crate) fn read_node(n: &crate::Node<'_>) -> Result<OwnedNode> {
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
         metadata: element_metadata(crate::ElementKind::Node, n.id(), &n.info())?
-            .map(OwnedMetadata::from_borrowed),
+            .map(OwnedMetadata::from_plain),
     })
 }
 
@@ -569,7 +707,7 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> Result<OwnedWay> {
         refs: w.refs().collect(),
         locations: Vec::new(),
         metadata: element_metadata(crate::ElementKind::Way, w.id(), &w.info())?
-            .map(OwnedMetadata::from_borrowed),
+            .map(OwnedMetadata::from_plain),
     })
 }
 
@@ -612,7 +750,7 @@ pub(crate) fn read_relation(r: &crate::Relation<'_>) -> Result<OwnedRelation> {
             .collect(),
         members,
         metadata: element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?
-            .map(OwnedMetadata::from_borrowed),
+            .map(OwnedMetadata::from_plain),
     })
 }
 
@@ -628,14 +766,7 @@ pub(crate) fn write_single_node_local(
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
     crate::commands::ensure_node_capacity_local(bb, output)?;
-    let meta = owned_to_metadata(node.metadata.as_ref());
-    bb.add_node(
-        node.id,
-        node.decimicro_lat,
-        node.decimicro_lon,
-        node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        meta.as_ref(),
-    );
+    add_owned_node(bb, node);
     Ok(())
 }
 
@@ -645,23 +776,7 @@ pub(crate) fn write_single_way_local(
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
     crate::commands::ensure_way_capacity_local(bb, output)?;
-    let meta = owned_to_metadata(way.metadata.as_ref());
-    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
-        bb.add_way_with_locations(
-            way.id,
-            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            &way.refs,
-            &way.locations,
-            meta.as_ref(),
-        );
-    } else {
-        bb.add_way(
-            way.id,
-            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            &way.refs,
-            meta.as_ref(),
-        );
-    }
+    add_owned_way(bb, way);
     Ok(())
 }
 
@@ -671,29 +786,159 @@ pub(crate) fn write_single_relation_local(
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
     crate::commands::ensure_relation_capacity_local(bb, output)?;
-    let members: Vec<MemberData<'_>> = rel
-        .members
-        .iter()
-        .map(|m| MemberData {
-            id: m.id,
-            role: &m.role,
-        })
-        .collect();
-    let meta = owned_to_metadata(rel.metadata.as_ref());
-    bb.add_relation(
-        rel.id,
-        rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        &members,
-        meta.as_ref(),
-    );
+    add_owned_relation(bb, rel);
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::read_dense_node;
-    use crate::block_builder::{BlockBuilder, Metadata};
+    use crate::block_builder::{BlockBuilder, Metadata, PartialMetadata};
     use crate::{Element, PrimitiveBlock};
+
+    type Fields = (
+        Option<i32>,
+        Option<i64>,
+        Option<i64>,
+        Option<i32>,
+        Option<String>,
+        Option<bool>,
+    );
+
+    fn info_fields(info: &crate::Info<'_>) -> Fields {
+        (
+            info.version(),
+            info.milli_timestamp(),
+            info.changeset(),
+            info.uid(),
+            info.user().map(|u| u.unwrap().to_owned()),
+            info.visible_opt(),
+        )
+    }
+
+    fn one_block(bb: &mut BlockBuilder) -> PrimitiveBlock {
+        PrimitiveBlock::from_vec(bb.take().unwrap().unwrap().to_vec()).unwrap()
+    }
+
+    /// Each plain element's metadata survives decode, own and re-encode with
+    /// its field presence: no field is invented as 0 or empty, and a
+    /// versionless `Info` keeps its other fields. Both the borrowed
+    /// (`element_metadata` + partial add) and the owned (read + write)
+    /// routes are checked.
+    #[test]
+    fn plain_metadata_presence_survives_reencode() {
+        let partials = [
+            PartialMetadata {
+                version: Some(3),
+                ..PartialMetadata::default()
+            },
+            PartialMetadata {
+                timestamp: Some(1_600_000_000),
+                user: Some("alice"),
+                visible: Some(false),
+                ..PartialMetadata::default()
+            },
+            // Complete with version 0: a dense slot would not claim the zeros.
+            PartialMetadata {
+                version: Some(0),
+                timestamp: Some(0),
+                changeset: Some(0),
+                uid: Some(0),
+                user: Some(""),
+                visible: None,
+            },
+        ];
+        let mut src = BlockBuilder::new();
+        for (id, meta) in (1..).zip(&partials) {
+            src.add_way_partial(id, [], &[1, 2], Some(meta));
+        }
+        let ways = one_block(&mut src);
+        let mut src = BlockBuilder::new();
+        for (id, meta) in (1..).zip(&partials) {
+            src.add_node_partial(id, 10, 20, [], Some(meta));
+        }
+        let nodes = one_block(&mut src);
+
+        for block in [&ways, &nodes] {
+            let expected: Vec<Fields> = block
+                .elements()
+                .map(|e| match e {
+                    Element::Way(w) => info_fields(&w.info()),
+                    Element::Node(n) => info_fields(&n.info()),
+                    _ => panic!("fixture holds plain nodes and ways only"),
+                })
+                .collect();
+            assert_eq!(expected.len(), 3);
+
+            let mut borrowed = BlockBuilder::new();
+            let mut owned = BlockBuilder::new();
+            for e in block.elements() {
+                match e {
+                    Element::Way(w) => {
+                        let meta =
+                            super::element_metadata(crate::ElementKind::Way, w.id(), &w.info())
+                                .unwrap();
+                        let refs: Vec<i64> = w.refs().collect();
+                        borrowed.add_way_partial(w.id(), w.tags(), &refs, meta.as_ref());
+                        super::add_owned_way(&mut owned, &super::read_way(&w).unwrap());
+                    }
+                    Element::Node(n) => {
+                        let meta =
+                            super::element_metadata(crate::ElementKind::Node, n.id(), &n.info())
+                                .unwrap();
+                        borrowed.add_node_partial(
+                            n.id(),
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                            n.tags(),
+                            meta.as_ref(),
+                        );
+                        super::add_owned_node(&mut owned, &super::read_node(&n).unwrap());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            for out in [one_block(&mut borrowed), one_block(&mut owned)] {
+                let got: Vec<Fields> = out
+                    .elements()
+                    .map(|e| match e {
+                        Element::Way(w) => info_fields(&w.info()),
+                        Element::Node(n) => info_fields(&n.info()),
+                        _ => panic!("partial metadata must stay plain"),
+                    })
+                    .collect();
+                assert_eq!(got, expected);
+            }
+        }
+    }
+
+    /// A dense version-0 slot is owned as dense metadata and written back
+    /// dense, not as a plain node claiming its zero fields.
+    #[test]
+    fn owned_dense_metadata_stays_dense() {
+        let mut src = BlockBuilder::new();
+        let zero = Metadata {
+            version: 0,
+            timestamp: 0,
+            changeset: 0,
+            uid: 0,
+            user: "",
+            visible: true,
+        };
+        src.add_node(1, 10, 20, [], Some(&zero));
+        let block = one_block(&mut src);
+        let Some(Element::DenseNode(dn)) = block.elements().next() else {
+            panic!("fixture holds a dense node");
+        };
+        let mut out = BlockBuilder::new();
+        super::add_owned_node(&mut out, &read_dense_node(&dn).unwrap());
+        let out = one_block(&mut out);
+        let Some(Element::DenseNode(back)) = out.elements().next() else {
+            panic!("owned dense metadata must be written dense");
+        };
+        assert_eq!(back.info().map(crate::DenseNodeInfo::version), Some(0));
+    }
 
     #[test]
     fn corrupt_dense_user_sid_is_refused() {

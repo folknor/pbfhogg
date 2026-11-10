@@ -661,7 +661,8 @@ pub enum ErrorKind {
     /// the caller's business: the text names no flag and no command.
     /// `partial` is set when the file carries indexdata on some data blobs
     /// and not others; no fallback runs on such a file, so a caller has no
-    /// slower path to grant and only re-indexing helps.
+    /// slower path to grant and only re-indexing helps. A diagnostic check
+    /// can report missing or contradictory metadata; it does not repair it.
     MissingIndexdata {
         reason: Cow<'static, str>,
         partial: bool,
@@ -669,9 +670,13 @@ pub enum ErrorKind {
     /// The input is not in `Sort.Type_then_ID` order (its header does not
     /// declare it, or its blobs or elements contradict the declaration) and
     /// the operation needs that order. `reason` says what was found.
+    /// Diagnosing this requires checking element order as well as metadata:
+    /// consistent indexdata alone does not establish sorted elements.
     Unsorted { reason: Cow<'static, str> },
     /// A blob's indexdata (the `BlobHeader` element-kind and ID-range
-    /// claim) disagrees with what the blob holds. `reason` says how.
+    /// claim, including its element count) disagrees with what the blob
+    /// holds. `reason` says how. Checking metadata diagnoses the disagreement;
+    /// re-indexing repairs the claim, without sorting the elements.
     /// `contradiction` is set when the disagreement is a decoded element of
     /// a kind other than the claimed one, which a run that already decoded
     /// the blob establishes for free.

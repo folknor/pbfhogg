@@ -21,9 +21,6 @@ The README's three tables come from the campaign at `53360af4`
   at scale and with LocationsOnWays, write throughput, the io_uring and
   O_DIRECT tips) carry host and commit labels but were not re-measured on
   bygg.
-- [ ] **brokkr doc fix.** `brokkr man library isolation-scenarios` still
-  lists "the capped malloc arenas" in the CLI interval (gone since
-  `25172fc3`).
 
 ## 0.7.0 items (moved from the 0.6.0 list on 2026-10-30)
 

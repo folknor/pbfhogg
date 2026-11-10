@@ -18,8 +18,10 @@
 //!   store populated by Phase 2a, and emit a per-blob `WayBlobOut` -
 //!   streets (their `NodeCoord` records already encoded), building-centroid
 //!   address points, `PendingInterp`s and admin way geometry, with the
-//!   blob's strings in one buffer and their pool hashes precomputed. The
-//!   main-thread merge interns strings, writes records to `street_ways.bin` / `street_nodes.bin`
+//!   blob's strings in one buffer and their pool hashes precomputed, and
+//!   each string the pool already held after Phase 2a resolved to its
+//!   offset against a read-only clone of the pool. The
+//!   main-thread merge interns the remaining strings, writes records to `street_ways.bin` / `street_nodes.bin`
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
 //!   entries, and inserts into the `way_geom` map.
 //!
@@ -85,29 +87,23 @@ pub(super) struct SlimInterpWay {
 // Phase 2a: parallel node scan
 // ---------------------------------------------------------------------------
 
-/// Per-blob output from Phase 2a workers: pending `AddrPoint`s only -
+/// Per-blob output from Phase 2a workers: pending address points only -
 /// coord writes go straight to the coordinate store from the worker (see
 /// `coord_slots` below), avoiding the 1.86 GB-on-Germany channel
 /// traffic that the earlier "coord writes in NodeBlobOut" shape carried.
-/// Strings stay owned (`Box<str>`) so the main thread interns them into
-/// the shared `StringPool` at merge time - workers can't touch
-/// `StringPool` directly without serialising on a mutex.
+///
+/// Phase 2a's merge is its bottleneck on planet (the consumer waits on
+/// results under 4 % of the phase), so the output is packed as Phase 2b's
+/// is: the blob's strings back to back in `text` with their pool hashes
+/// computed here, rather than three or four `Box<str>` per point allocated
+/// on a worker and freed on the merge thread. The merge interns them into
+/// the shared `StringPool`, which workers cannot touch without serialising
+/// on a mutex.
 #[derive(Default)]
 struct NodeBlobOut {
-    addr_points: Vec<PendingAddrPoint>,
+    text: String,
+    addr_points: Vec<FlatAddrPoint>,
     error: Option<Error>,
-}
-
-/// Pending address point - used by both Phase 2a (addr-tagged nodes) and
-/// Phase 2b (building centroids with addr tags). Owned strings so the
-/// main thread can intern into the shared `StringPool` at merge time.
-struct PendingAddrPoint {
-    lat_e7: i32,
-    lon_e7: i32,
-    hn: Box<str>,
-    st: Option<Box<str>>,
-    place: Option<Box<str>>,
-    pc: Option<Box<str>>,
 }
 
 /// The names an address carries, as `(street, place)`: an empty value is
@@ -140,42 +136,50 @@ fn interpolation_parent<'t>(
     }
 }
 
-/// Intern and append a blob's pending address points, in order. Both Pass
-/// 2 merges run this serially for every address, so it is one out-of-line
+/// Intern and append a blob's address points, in order, each point's
+/// strings in the order housenumber, street, postcode, place (the pool's
+/// offsets follow first-occurrence order, so this order is part of the
+/// index bytes; the order the strings sit in `text` is not). Both Pass 2
+/// merges run this serially for every address, so it is one out-of-line
 /// loop rather than two inlined copies in the merge closures: inlined, the
 /// Pass 2a merge became the planet bottleneck (Pass 2a 21 s to 30 s on
 /// bygg; `reference/performance.md`, build-geocode-index).
 #[inline(never)]
 fn write_addr_points(
-    points: Vec<PendingAddrPoint>,
+    points: &[FlatAddrPoint],
+    text: &str,
     strings: &mut StringPool,
     out: &mut impl Write,
     count: &mut u32,
 ) -> Result<()> {
     for point in points {
-        out.write_all(&point.intern(strings).to_bytes())?;
+        let housenumber_offset = point.hn.intern(text, strings)?;
+        let street_offset = match point.st {
+            Some(s) => s.intern(text, strings)?,
+            None => 0,
+        };
+        let postcode_offset = match point.pc {
+            Some(s) => s.intern(text, strings)?,
+            None => 0,
+        };
+        let place_offset = match point.place {
+            Some(s) => s.intern(text, strings)?,
+            None => 0,
+        };
+        let record = AddrPoint {
+            lat_e7: point.lat_e7,
+            lon_e7: point.lon_e7,
+            housenumber_offset,
+            street_offset,
+            postcode_offset,
+            place_offset,
+        };
+        out.write_all(&record.to_bytes())?;
         *count = count.checked_add(1).ok_or_else(|| {
             Error::invalid_data("address point count exceeds u32::MAX; bump FORMAT_VERSION")
         })?;
     }
     Ok(())
-}
-
-impl PendingAddrPoint {
-    fn intern(&self, strings: &mut StringPool) -> AddrPoint {
-        let housenumber_offset = strings.intern(&self.hn);
-        let street_offset = self.st.as_deref().map_or(0, |s| strings.intern(s));
-        let postcode_offset = self.pc.as_deref().map_or(0, |s| strings.intern(s));
-        let place_offset = self.place.as_deref().map_or(0, |s| strings.intern(s));
-        AddrPoint {
-            lat_e7: self.lat_e7,
-            lon_e7: self.lon_e7,
-            housenumber_offset,
-            street_offset,
-            postcode_offset,
-            place_offset,
-        }
-    }
 }
 
 /// View the anonymous coordinate mmap as `slot_count` atomic slots, one per
@@ -289,29 +293,41 @@ struct WayBlobOut {
     error: Option<Error>,
 }
 
-/// A string of `WayBlobOut::text` and its `StringPool` hash.
+/// A string of a blob's packed `text` and its `StringPool` hash, or the
+/// offset a worker already found for it.
 #[derive(Clone, Copy)]
 struct Text {
     start: usize,
     end: usize,
     hash: u64,
+    /// The string's offset, found by the worker in a read-only clone of the
+    /// pool taken before the phase (`StringPool::find_hashed`): final, since
+    /// every entry of the clone is already in the live pool and keeps its
+    /// offset. `None` leaves it to the merge, which interns it in order.
+    resolved: Option<u32>,
 }
 
 impl Text {
-    fn push(text: &mut String, s: &str) -> Self {
+    /// Append `s` to `text`, resolving it against `base` when given.
+    fn push(text: &mut String, s: &str, base: Option<&StringPool>) -> Self {
         let start = text.len();
         text.push_str(s);
+        let hash = super::strings::hash_str(s);
         Self {
             start,
             end: text.len(),
-            hash: super::strings::hash_str(s),
+            hash,
+            resolved: base.and_then(|pool| pool.find_hashed(s, hash)),
         }
     }
 
     fn intern(self, text: &str, strings: &mut StringPool) -> Result<u32> {
+        if let Some(offset) = self.resolved {
+            return Ok(offset);
+        }
         let s = text
             .get(self.start..self.end)
-            .ok_or_else(|| Error::internal("phase 2b text span lies outside its blob's text"))?;
+            .ok_or_else(|| Error::internal("pass 2 text span lies outside its blob's text"))?;
         Ok(strings.intern_hashed(s, self.hash))
     }
 }
@@ -323,7 +339,8 @@ struct FlatStreet {
     node_count: u16,
 }
 
-/// A building-centroid address point, strings in `WayBlobOut::text`.
+/// An address point (an addressed node in Phase 2a, a building centroid in
+/// Phase 2b), strings in its blob's packed `text`.
 struct FlatAddrPoint {
     lat_e7: i32,
     lon_e7: i32,
@@ -370,7 +387,9 @@ fn resolve_way_into(
     worker: &mut WayWorker,
     referenced_nodes: &crate::idset::RankedIdSet,
     coord_slots: &[AtomicU64],
+    base: &StringPool,
 ) {
+    let base = Some(base);
     use super::way_store::{
         ROLE_ADMIN, ROLE_BUILDING_ADDR, ROLE_INTERP, ROLE_STREET, VALUE_HOUSENUMBER,
         VALUE_INTERPOLATION, VALUE_NAME, VALUE_PLACE, VALUE_POSTCODE, VALUE_STREET,
@@ -508,10 +527,10 @@ fn resolve_way_into(
         let point = FlatAddrPoint {
             lat_e7: clat,
             lon_e7: clon,
-            hn: Text::push(text, hn.unwrap_or("")),
-            st: street.map(|s| Text::push(text, s)),
-            place: place.map(|s| Text::push(text, s)),
-            pc: pc.map(|s| Text::push(text, s)),
+            hn: Text::push(text, hn.unwrap_or(""), base),
+            st: street.map(|s| Text::push(text, s, base)),
+            place: place.map(|s| Text::push(text, s, base)),
+            pc: pc.map(|s| Text::push(text, s, base)),
         };
         state.building_addrs.push(point);
     }
@@ -527,7 +546,7 @@ fn resolve_way_into(
             )));
             return;
         };
-        let name = Text::push(&mut state.text, name.unwrap_or(""));
+        let name = Text::push(&mut state.text, name.unwrap_or(""), base);
         state.street_nodes.reserve(coords.len() * NodeCoord::SIZE);
         for &(lat_e7, lon_e7) in coords {
             state
@@ -701,14 +720,16 @@ pub(super) fn run_pass2(
                             }
                             let names = hn.and_then(|h| Some((h, address_names(st, place)?)));
                             if let Some((h, (st, place))) = names {
-                                state.addr_points.push(PendingAddrPoint {
+                                let text = &mut state.text;
+                                let point = FlatAddrPoint {
                                     lat_e7,
                                     lon_e7,
-                                    hn: h.into(),
-                                    st: st.map(Into::into),
-                                    place: place.map(Into::into),
-                                    pc: pc.map(Into::into),
-                                });
+                                    hn: Text::push(text, h, None),
+                                    st: st.map(|s| Text::push(text, s, None)),
+                                    place: place.map(|s| Text::push(text, s, None)),
+                                    pc: pc.map(|s| Text::push(text, s, None)),
+                                };
+                                state.addr_points.push(point);
                             }
                         }};
                     }
@@ -728,7 +749,8 @@ pub(super) fn run_pass2(
             },
             |_seq, out| {
                 write_addr_points(
-                    out.addr_points,
+                    &out.addr_points,
+                    &out.text,
                     strings,
                     &mut addr_points_out,
                     &mut addr_point_count,
@@ -758,6 +780,14 @@ pub(super) fn run_pass2(
 
     host.invocation.marker("GEOCODE_PASS2B_START");
     {
+        // Phase 2b is bound by its serial merge, most of which was interning
+        // strings the pool already held from Phase 2a (house numbers,
+        // streets, postcodes). Workers resolve those against this read-only
+        // clone, taken after Phase 2a's workers have joined; the merge
+        // interns only the rest, in its usual order, so every offset is the
+        // one serial interning assigns. Freed when the phase ends.
+        let base = strings.clone();
+        let base_ref = &base;
         let referenced_ref = &referenced_nodes;
         let workers = crate::host::sized_workers(
             &*host.resources,
@@ -771,7 +801,7 @@ pub(super) fn run_pass2(
         let resolve_blob = |worker: &mut WayWorker, position: usize| -> Result<WayBlobOut> {
             let mut records = super::way_store::SegmentRecords::new(way_store.segment(position)?);
             while let Some(way) = records.next_way()? {
-                resolve_way_into(&way, worker, referenced_ref, coord_store);
+                resolve_way_into(&way, worker, referenced_ref, coord_store, base_ref);
             }
             let mut out = std::mem::take(&mut worker.out);
             match out.error.take() {
@@ -843,38 +873,16 @@ pub(super) fn run_pass2(
                     interp_node_offset += (pi.coords.len() * NodeCoord::SIZE) as u64;
                 }
 
-                // Building-centroid addresses, interned in the order
-                // `PendingAddrPoint::intern` uses.
+                // Building-centroid addresses, after the interpolation
+                // parents and before the street names.
                 let text = out.text.as_str();
-                for point in &out.building_addrs {
-                    let housenumber_offset = point.hn.intern(text, strings)?;
-                    let street_offset = match point.st {
-                        Some(s) => s.intern(text, strings)?,
-                        None => 0,
-                    };
-                    let postcode_offset = match point.pc {
-                        Some(s) => s.intern(text, strings)?,
-                        None => 0,
-                    };
-                    let place_offset = match point.place {
-                        Some(s) => s.intern(text, strings)?,
-                        None => 0,
-                    };
-                    let record = AddrPoint {
-                        lat_e7: point.lat_e7,
-                        lon_e7: point.lon_e7,
-                        housenumber_offset,
-                        street_offset,
-                        postcode_offset,
-                        place_offset,
-                    };
-                    addr_points_out.write_all(&record.to_bytes())?;
-                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
-                        Error::invalid_data(
-                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
-                        )
-                    })?;
-                }
+                write_addr_points(
+                    &out.building_addrs,
+                    text,
+                    strings,
+                    &mut addr_points_out,
+                    &mut addr_point_count,
+                )?;
 
                 // Streets: one record each, then the blob's coordinates in
                 // one write, already encoded in way order.

@@ -316,6 +316,23 @@ impl WillneedPrefetch {
         shared_file: &std::sync::Arc<std::fs::File>,
         entry: &ScheduledBlob,
     ) {
+        self.advise_until(shared_file, entry, None);
+    }
+
+    /// [`Self::before_dispatch`], giving up once `stop` returns true. With a
+    /// `stop`, each piece handed to `will_need` ends at the next multiple of
+    /// `WILLNEED_CALL_BYTES`, so `stop` is checked between single syscalls
+    /// (the same calls `will_need` would make, one `fstat` each) and a run
+    /// that ends does not wait out a long range. The advice is cumulative: a
+    /// cursor through the coalesced ranges in file order, so advising for a
+    /// later entry covers every earlier one skipped.
+    fn advise_until(
+        &mut self,
+        shared_file: &std::sync::Arc<std::fs::File>,
+        entry: &ScheduledBlob,
+        stop: Option<&dyn Fn() -> bool>,
+    ) {
+        use crate::tunables::WILLNEED_CALL_BYTES;
         let Some(window_end) = entry
             .data_offset()
             .checked_add(entry.data_size() as u64)
@@ -325,6 +342,9 @@ impl WillneedPrefetch {
         };
 
         while let Some(&(range_offset, range_size)) = self.ranges.get(self.next_range) {
+            if stop.is_some_and(|stop| stop()) {
+                return;
+            }
             let Some(range_end) = range_offset.checked_add(range_size) else {
                 self.next_range += 1;
                 self.next_offset = 0;
@@ -338,7 +358,13 @@ impl WillneedPrefetch {
             if offset >= window_end {
                 break;
             }
-            let end = range_end.min(window_end);
+            let mut end = range_end.min(window_end);
+            if stop.is_some()
+                && let Some(chunk_end) =
+                    (offset / WILLNEED_CALL_BYTES + 1).checked_mul(WILLNEED_CALL_BYTES)
+            {
+                end = end.min(chunk_end);
+            }
             let Some(size) = end.checked_sub(offset) else {
                 self.next_range += 1;
                 self.next_offset = 0;
@@ -1191,25 +1217,86 @@ struct ClassifyLocal<S> {
 }
 
 /// The calling thread's side of [`parallel_classify_phase_ordered`]: the
-/// caller's merge, and the sliding `WILLNEED` advice, which follows the
-/// window's edge (the furthest position a worker may be admitted to next).
+/// caller's merge, and the window's edge (the furthest position a worker may
+/// be admitted to next), handed to the [`advise_behind`] thread that issues
+/// the sliding `WILLNEED` advice.
 ///
-/// The advice stays on this thread, after each credit is published. Since
-/// the advice is issued in calls the kernel honours whole, planet
-/// `cat --clean` (bygg) spends about 15 s of its 141 s wall in the syscall
-/// (`fadvise_willneed_wait_ns`, 2 s when each call was cut to its first
-/// 128 KiB) with no change in wall, so the thread is still not what binds;
-/// moving the call before or after the credit made no difference on planet
-/// or on germany, where the window binds (`reference/performance.md`,
-/// "Read-ahead advice after the credit", "Classify WILLNEED in honoured
-/// calls"). A worker-side cursor would put the syscall and a shared lock on
-/// the threads that are the bottleneck; a dedicated advisor thread has no
-/// measured cost to recover.
+/// The advice used to run here, after each credit. Where this thread is
+/// idle that costs nothing: planet `cat --clean` (bygg) spends about 15 s
+/// of its 141 s wall in the syscall with the consumer waiting on results
+/// 90 % of the time, and moving the call before or after the credit made no
+/// difference (`reference/performance.md`, "Read-ahead advice after the
+/// credit", "Classify WILLNEED in honoured calls"). Where the merge binds it
+/// is a third of the bottleneck: geocode Phase 2a on planet waited on
+/// results 0.75 s of 21.7 s and spent 7.2 s of it in the syscall (sidecar
+/// `4dc30ff2`). A worker-side cursor would put the syscall and a shared lock
+/// on threads 80 % busy there, so the advice has its own thread.
 struct ClassifyConsumer<'a, M> {
     merge: M,
-    willneed: WillneedPrefetch,
-    schedule: &'a [ScheduledBlob],
-    file: &'a std::sync::Arc<std::fs::File>,
+    advisor: Option<AdvisorLink<'a>>,
+}
+
+/// The consumer's end of an [`advise_behind`] thread.
+struct AdvisorLink<'a> {
+    shared: &'a AdvisorShared,
+    thread: std::thread::Thread,
+    /// The last edge handed over, so a repeated edge (clamped at the end of
+    /// the schedule) does not wake the advisor.
+    last: usize,
+}
+
+/// State the consumer and the advisor thread share.
+struct AdvisorShared {
+    /// The latest window edge. One writer, the consumer, and nothing else is
+    /// published through it, so `Relaxed` suffices.
+    edge: std::sync::atomic::AtomicUsize,
+    /// Set (with an unpark) once the run has ended, however it ended.
+    done: std::sync::atomic::AtomicBool,
+}
+
+/// Ends the advisor on every exit from the run, unwinding included. Lives
+/// inside the scope, so it drops before the scope joins the advisor, which
+/// would otherwise stay parked and hang the join.
+struct StopAdvisor<'a> {
+    shared: &'a AdvisorShared,
+    thread: std::thread::Thread,
+}
+
+impl Drop for StopAdvisor<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .done
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+/// The advisor thread: advise up to the latest edge, park when caught up.
+/// Skipping intermediate edges advises the same bytes, as the advice is
+/// cumulative through a file-ordered schedule. Its `WillneedPrefetch` drops
+/// here, emitting `fadvise_willneed_wait_ns` before the scope joins.
+fn advise_behind(
+    shared: &AdvisorShared,
+    mut willneed: WillneedPrefetch,
+    schedule: &[ScheduledBlob],
+    file: &std::sync::Arc<std::fs::File>,
+    mut served: usize,
+) {
+    use std::sync::atomic::Ordering;
+    let stopped = || shared.done.load(Ordering::Acquire);
+    while !stopped() {
+        let edge = shared.edge.load(Ordering::Relaxed);
+        if edge > served {
+            if let Some(entry) = edge.checked_sub(1).and_then(|last| schedule.get(last)) {
+                willneed.advise_until(file, entry, Some(&stopped));
+            }
+            served = edge;
+        } else {
+            // An unpark since the last park returns at once, so an edge
+            // stored between the load and here is not missed.
+            std::thread::park();
+        }
+    }
 }
 
 impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R>
@@ -1220,8 +1307,14 @@ impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R
     }
 
     fn on_advance(&mut self, edge: usize) {
-        if let Some(entry) = edge.checked_sub(1).and_then(|last| self.schedule.get(last)) {
-            self.willneed.before_dispatch(self.file, entry);
+        if let Some(link) = &mut self.advisor
+            && edge > link.last
+        {
+            link.last = edge;
+            link.shared
+                .edge
+                .store(edge, std::sync::atomic::Ordering::Relaxed);
+            link.thread.unpark();
         }
     }
 }
@@ -1251,8 +1344,10 @@ impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R
 /// fail: its error ends the run at once. Failures surface in schedule order
 /// (the lowest failing position's classify error, or the merge's own at its
 /// position), located as in [`parallel_classify_phase`]. The sliding
-/// `WILLNEED` advice tracks the window's edge, advised before the positions
-/// it covers can be claimed.
+/// `WILLNEED` advice tracks the window's edge on a thread of its own (see
+/// [`ClassifyConsumer`]): the first window before any worker starts, every
+/// later edge asynchronously, normally well ahead of the claims it covers
+/// since the advice reaches a byte window past the edge.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
@@ -1297,6 +1392,81 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
     let decode_threads = resolve_thread_count(threads, &*host.resources);
     let window = window.unwrap_or_else(|| crate::ordered_pool::default_window(decode_threads));
     let file = input.file();
+    if schedule.is_empty() {
+        // Nothing to advise; the pool returns at once.
+        return run_project_ordered(
+            input,
+            schedule,
+            decode_threads,
+            window,
+            worker_init,
+            project,
+            ClassifyConsumer {
+                merge,
+                advisor: None,
+            },
+            host,
+        );
+    }
+    host.invocation.check()?;
+    // The first window is advised here, before any worker starts, as it
+    // always was; the advisor thread takes every later edge.
+    let mut willneed = WillneedPrefetch::new(schedule, &host.invocation);
+    let first_edge = window.get().min(schedule.len());
+    if let Some(entry) = first_edge
+        .checked_sub(1)
+        .and_then(|last| schedule.get(last))
+    {
+        willneed.before_dispatch(file, entry);
+    }
+    let shared = AdvisorShared {
+        edge: std::sync::atomic::AtomicUsize::new(first_edge),
+        done: std::sync::atomic::AtomicBool::new(false),
+    };
+    std::thread::scope(|scope| {
+        let shared = &shared;
+        let advisor =
+            scope.spawn(move || advise_behind(shared, willneed, schedule, file, first_edge));
+        let thread = advisor.thread().clone();
+        let _stop = StopAdvisor {
+            shared,
+            thread: thread.clone(),
+        };
+        let consumer = ClassifyConsumer {
+            merge,
+            advisor: Some(AdvisorLink {
+                shared,
+                thread,
+                last: first_edge,
+            }),
+        };
+        run_project_ordered(
+            input,
+            schedule,
+            decode_threads,
+            window,
+            worker_init,
+            project,
+            consumer,
+            host,
+        )
+    })
+}
+
+/// The pool run behind [`parallel_project_phase_ordered`], given its
+/// consumer.
+#[allow(clippy::too_many_arguments)]
+fn run_project_ordered<S, R: Send, M: FnMut(usize, R) -> Result<()>>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    decode_threads: usize,
+    window: std::num::NonZeroUsize,
+    worker_init: impl Fn() -> S + Sync,
+    project: impl Fn(crate::read::block::BlockBuffer<'_>, &mut S) -> Result<R> + Sync,
+    mut consumer: ClassifyConsumer<'_, M>,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let file = input.file();
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
         schedule.len(),
@@ -1337,12 +1507,7 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
             local.read_buf.release_outlier(&host.invocation);
             result
         },
-        &mut ClassifyConsumer {
-            merge,
-            willneed: WillneedPrefetch::new(schedule, &host.invocation),
-            schedule,
-            file,
-        },
+        &mut consumer,
     )
 }
 

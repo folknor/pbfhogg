@@ -17,6 +17,7 @@ pub(super) fn hash_str(s: &str) -> u64 {
     hasher.finish()
 }
 
+#[derive(Clone)]
 pub(super) struct StringPool {
     overflowed: bool,
     pub(super) data: Vec<u8>,
@@ -53,6 +54,20 @@ impl StringPool {
             return 0;
         }
         self.intern_with_hash(s, hash)
+    }
+
+    /// The offset `s` already holds in this pool, without inserting; `hash`
+    /// = [`hash_str`]`(s)`. `Some` is exactly what [`Self::intern_hashed`]
+    /// would return now, and stays so: entries are append-only and never
+    /// move, and an existing value keeps its offset even once the overflow
+    /// latch is set. So a read-only clone taken at a phase boundary resolves
+    /// any later intern of a value it holds (Pass 2b's workers, see
+    /// `pass2.rs`); `None` leaves the value to the live pool.
+    pub(super) fn find_hashed(&self, s: &str, hash: u64) -> Option<u32> {
+        if s.is_empty() {
+            return Some(0);
+        }
+        self.find_with_hash(s, hash)
     }
 
     fn intern_with_hash(&mut self, s: &str, hash: u64) -> u32 {
@@ -151,6 +166,28 @@ mod tests {
         assert_eq!(pool_offset(limit - 130, 128), Some((u32::MAX - 130, 128)));
         assert_eq!(pool_offset(limit - 129, 128), None);
         assert_eq!(pool_offset(usize::MAX, 1), None);
+    }
+
+    /// A clone taken at a phase boundary resolves exactly what the live pool
+    /// would intern later, and leaves values added after it to the pool.
+    #[test]
+    fn a_clone_finds_the_offsets_later_interns_return() {
+        use super::hash_str;
+        let mut pool = StringPool::new();
+        let a = pool.intern("Main Street");
+        let base = pool.clone();
+        let b = pool.intern("Side Road");
+        assert_eq!(
+            base.find_hashed("Main Street", hash_str("Main Street")),
+            Some(a)
+        );
+        assert_eq!(pool.intern("Main Street"), a);
+        assert_eq!(base.find_hashed("Side Road", hash_str("Side Road")), None);
+        assert_eq!(
+            pool.find_hashed("Side Road", hash_str("Side Road")),
+            Some(b)
+        );
+        assert_eq!(base.find_hashed("", hash_str("")), Some(0));
     }
 
     #[test]

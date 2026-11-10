@@ -210,6 +210,8 @@ CLI commands vs osmium 1.19.1 - Denmark (487 MB indexed), bygg, both tools start
 
 Times are the tool process's own wall, without the bench's cache-eviction preparation. osmium writes with `--fsync`.
 
+On Japan (2.4 GB indexed), `extract` of the dataset's Tokyo bbox with complete ways takes 2.4 s against osmium's 7.2 s, 2.9x, median of three alternating single runs at `4b08aa07` on bygg (`vs-osmium --row extract`).
+
 ⁴ osmium has one add-locations-to-ways mode (run with `--keep-member-nodes`), so both rows time the same osmium command against pbfhogg's two index types.
 
 Library mode - the same work called through the library API from the `pbfhogg-harness` executable, against the CLI running the equivalent command, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified; the CLI arm timed from its command interval, inputs evicted before each arm):

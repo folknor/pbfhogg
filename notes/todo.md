@@ -17,9 +17,6 @@ The README's three tables come from the campaign at `53360af4`
   applied should be `differs`: denmark 4705, planet 4913, and so on). The
   `test-unsorted` snapshot is the same file as `unsorted` and has no
   `check-ids = "violations"` of its own.
-- [ ] **README Tokyo extract line.** vs-osmium has an `extract` row now
-  (dataset bbox, complete-ways on both sides); measure it on japan to
-  bring the README line back.
 - [ ] **Performance guide plantasjen tables** (Japan extract, apply-changes
   at scale and with LocationsOnWays, write throughput, the io_uring and
   O_DIRECT tips) carry host and commit labels but were not re-measured on

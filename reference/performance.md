@@ -3973,6 +3973,42 @@ and admin assembly are a little faster, and RSS after Pass 2 drops from
 about 2.0 GB to 0.4 GB. Verdict: not a win as landed; Pass 2b's lost
 parallelism is the lead. No planet cell run until that is understood.
 
+### Pass 2b's merge fed packed worker output (bygg, 2026-11-10, `4b08aa07` against `9d9a2a79` and `0b52650b`)
+
+Pass 2b's single merge thread was the bottleneck before and after G1:
+workers spent 50.0 s, then 82.7 s, blocked handing results over inside
+a phase under 3 s, while the merge waited 8 ms, then 4 ms, for work.
+`4b08aa07` packs each blob's output on the worker (one text buffer with
+precomputed pool hashes, street coordinates pre-encoded into one byte
+buffer written in one call per blob) and drops Pass 1.5's per-value
+key matching.
+
+Germany, `--iterations 1`, after a trim, three arms all `--commit`, in
+the order A B C, C B A, A B C:
+
+| Arm | Cells |
+|---|---|
+| A, pre-G1 `0b52650b` | 11.7, 10.6, 10.7 s (`a1f4ad69`, `b2164581`, `db7fd364`) |
+| B, G1 `9d9a2a79` | 11.3, 11.2, 11.0 s (`8d1a4170`, `e8ed3ec3`, `fac59171`) |
+| C, packed merge `4b08aa07` | 8.8, 8.8, 8.8 s (`339975a6`, `2351720c`, `de1fb6a5`) |
+
+C is about 17 % under A on the wall, every cell. Phase by phase against
+A (`db7fd364` against `de1fb6a5`): GEOCODE_PASS2B 2,561 to 594 ms;
+GEOCODE_PASS1_5_SCAN 682 to 796 ms, the cost of writing the way store
+and the validation G1 moved there; RSS from Pass 2 admin assembly on
+about 2.0 GB to 0.35 GB. Verdict: G1 plus the packed merge kept. The
+germany index built at `4b08aa07` is byte-identical to `0b52650b`'s, all
+19 files by md5, including the 2,724 interpolation records denmark
+lacks.
+
+Planet (`planet-20260223-reindexed`), `--iterations 1`, both arms
+`--commit`, order A C, C A: A 181 s (`397200b0`) and 177 s
+(`96ce7e1a`); C 155 s (`4a802fab`) and 154 s (`9228b533`), about 13 %
+faster. Against `96ce7e1a`, C's GEOCODE_PASS2B goes from 33.3 to 7.9 s
+and its disk read from 26.1 to 6.5 GB; GEOCODE_PASS1_5_SCAN rises from
+8.9 to 11.1 s; peak RSS in Pass 2b falls from 13.7 to 12.8 GB. The way
+store is 7.2 GB of scratch (`geocode_way_store_bytes`).
+
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
 
 | Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |
@@ -6076,10 +6112,12 @@ Every condition is tight, within 4 % across its cells. These are the
 current baselines for those benches; no verdict on the engine moves
 themselves, which had no clean before-cell.
 
-The vs-osmium `extract` row was also run on japan: pbfhogg 2.5, 2.4,
-2.4 s (`a19f6494`, `77c3fa6c`, `1e4ce672`), but every osmium arm failed
-at once with "wrong format for coordinate: '=139.5'", so the row passes
-its bbox in a form osmium does not parse and has no comparison yet.
+The vs-osmium `extract` row's first japan run failed on every osmium arm
+("wrong format for coordinate: '=139.5'"); `aba6ff4b` fixed the bbox
+spelling. At `4b08aa07`, japan, dataset bbox, complete-ways on both
+sides: pbfhogg 2.4, 2.4, 2.5 s (`cf923912`, `17377af1`, `d4566fdf`),
+osmium 7.2, 7.2, 7.1 s (`900e5298`, `31503713`, `3672b775`), about 2.9
+times faster.
 
 ## Changes with no cell of their own (2026-10-24 to 2026-10-30)
 

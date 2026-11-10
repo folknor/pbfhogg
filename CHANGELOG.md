@@ -30,7 +30,9 @@
   and validates every way blob, so a tag string index past the string
   table is refused instead of cutting the way's tags short. A key repeated
   in a blob's string table no longer loses the way's coordinates. Planet
-  builds need extra scratch for the way store.
+  builds need about 7 GB of extra scratch for the way store. Together
+  with a cheaper Pass 2b merge, a planet build is about 13 % faster (177
+  to 154 s on bygg) and a germany build about 17 % (10.6 to 8.8 s).
 - `diff -v` caps keyed tag lines with the other edit lines at 1000 per
   element; past the cap the element's tag detail is one line giving the
   tag counts and saying details were omitted.

@@ -212,7 +212,8 @@ struct Pending<T> {
 /// unwind too ([`Handoff`]'s drop), so no lane is lost. Credit for a queued
 /// batch is already taken, so the queue is bounded by the ledger. Every job
 /// answers its position on the result channel, which is unbounded, so a job
-/// never blocks, even inside the coordinator's `yield_now`.
+/// never blocks, even inside the coordinator's `yield_now`. With no limit
+/// (`usize::MAX`) a batch is spawned directly, with no lock or handoff.
 struct Encoder<'s, T, E> {
     ledger: &'s Ledger,
     encode: &'s E,
@@ -244,7 +245,21 @@ where
         }
     }
 
+    /// Run `job` on the executor: at once when the jobs are unbounded
+    /// (`Auto`, the default path, with no lane bookkeeping at all), else
+    /// within the lane limit.
     fn submit(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
+        if self.limit == usize::MAX {
+            scope.spawn(move |_| self.run(job));
+        } else {
+            self.submit_in_lane(scope, job);
+        }
+    }
+
+    /// The lane-limited path, kept out of the readers' seal so the default
+    /// path's code is what it was before lanes existed.
+    #[inline(never)]
+    fn submit_in_lane(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
         let mut state = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
         if state.running < self.limit {
             state.running += 1;

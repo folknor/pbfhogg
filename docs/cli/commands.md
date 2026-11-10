@@ -1803,6 +1803,26 @@ is refused once a read has met both kinds of data blob.
 
 Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression (under `--locations-on-ways` some are decompressed first and then copied; see below).
 
+**Sort order.** The base header must claim `Sort.Type_then_ID`, with or
+without `--locations-on-ways`. A base that does not is refused from the header
+alone (exit 2, nothing published), before the OSC is parsed or any base
+element is decoded, with the advice
+`pbfhogg sort --distrust-metadata <BASE> -o sorted.osm.pbf`. The indexdata
+check comes first and probes the first data blob: without `--force`, a base
+whose first data blob carries no indexdata is refused as unindexed (see
+[Proceeding without indexdata](#proceeding-without-indexdata)) whatever its
+header claims, and the sort claim is not reached. A base that claims the
+order without holding it passes the header check; disorder the run detects is
+refused later, while the output is written, as `refusing to write an unsorted
+PBF under a Sort.Type_then_ID header`, with the same exit code and advice and
+nothing published. The run checks blob order (kind, then ID) using ID-range
+bounds and, for decoded blobs, the observed first element; blobs copied
+without being decoded are checked by their indexdata claims. It also checks
+element order inside every blob it decodes (below), where an element that
+also falls outside its blob's claimed range is refused as false indexdata
+instead. Disorder confined to a blob copied without being decoded can pass
+undetected.
+
 Which blobs are unmodified is decided from each blob's indexdata ID range,
 and a passed-through blob's element count in the statistics is its indexdata
 claim. A blob whose claimed range misses the diff is copied without being

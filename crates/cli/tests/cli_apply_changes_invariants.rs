@@ -7,6 +7,7 @@
 //! test pins one invariant:
 //!
 //! - `interior_create_in_*_false_positive_blob_*`: a create inside a blob the diff otherwise leaves alone forces its rewrite, so it lands at its sorted position rather than as the next blob's gap create.
+//! - `base_without_the_sort_claim_*`: a base header without `Sort.Type_then_ID` is refused, after the indexdata check.
 //! - `unsorted_base_*`, `sorted_multi_blob_base_*`: the sorted stamp is only written over input in order.
 //! - `forced_run_*`: an unindexed base under `--force` comes out wholly indexed, and a blob mixing kinds is refused.
 //! - `empty_base_pbf_*`: `last_type == None` forever; trailing creates must flush all three kinds.
@@ -495,18 +496,95 @@ fn block(groups: &[Vec<u8>]) -> Vec<u8> {
 
 /// A sorted PBF whose data blobs are `blocks`, none carrying indexdata.
 fn write_unindexed_blocks(path: &Path, blocks: &[Vec<u8>]) {
+    write_blocks(path, blocks, true, false);
+}
+
+/// A PBF whose data blobs are `blocks`, its header claiming
+/// `Sort.Type_then_ID` when `sorted`, every blob indexed or none.
+fn write_blocks(path: &Path, blocks: &[Vec<u8>], sorted: bool, indexed: bool) {
     use pbfhogg::writer::{Compression, PbfWriter};
     let file = File::create(path).unwrap();
     let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    let header = pbfhogg::block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .unwrap();
-    writer.write_header(&header).unwrap();
+    let mut header = pbfhogg::block_builder::HeaderBuilder::new();
+    if sorted {
+        header = header.sorted();
+    }
+    writer.write_header(&header.build().unwrap()).unwrap();
     for b in blocks {
-        writer.write_primitive_block_no_indexdata(b).unwrap();
+        if indexed {
+            writer.write_primitive_block(b).unwrap();
+        } else {
+            writer.write_primitive_block_no_indexdata(b).unwrap();
+        }
     }
     writer.flush().unwrap();
+}
+
+/// A base whose header does not claim `Sort.Type_then_ID` is refused from
+/// the header (exit 2, the `sort --distrust-metadata` advice, nothing
+/// published), though its content is in order. The indexdata check comes
+/// first: an unindexed claimless base is refused as unindexed, and only
+/// `--force` lets it reach the sort refusal.
+#[test]
+fn base_without_the_sort_claim_is_refused_after_the_indexdata_check() {
+    let dir = crate::common::test_scratch();
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="99" lat="9.0" lon="9.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+    let blocks = [
+        block(&[group(&[dense(&[1, 2])])]),
+        block(&[group(&[way(100, &[1, 2])])]),
+    ];
+    let run = |base: &Path, force: bool| {
+        let mut cli = CliInvoker::new()
+            .arg("apply-changes")
+            .arg(base)
+            .arg(&osc)
+            .arg("-o")
+            .arg(&output);
+        if force {
+            cli = cli.arg("--force");
+        }
+        let out = cli.run();
+        assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+        assert!(!output.exists(), "a refused apply-changes published output");
+        out.stderr_str()
+    };
+    let sort_refused = |stderr: &str| {
+        assert!(
+            stderr.contains("requires a sorted base PBF (Sort.Type_then_ID)"),
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("pbfhogg sort --distrust-metadata"),
+            "stderr:\n{stderr}"
+        );
+    };
+
+    let indexed = dir.path().join("indexed.osm.pbf");
+    write_blocks(&indexed, &blocks, false, true);
+    sort_refused(&run(&indexed, false));
+
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    write_blocks(&unindexed, &blocks, false, false);
+    let stderr = run(&unindexed, false);
+    assert!(
+        stderr.contains("no blob-level indexdata"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("requires a sorted base"),
+        "stderr:\n{stderr}"
+    );
+    sort_refused(&run(&unindexed, true));
 }
 
 /// Every shape a forced run meets: an indexable block the diff rewrites, one

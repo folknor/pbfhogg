@@ -18,17 +18,15 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-007 - bench-read relation mode turns a role decode error into an empty role
+## BUG-009 - Geocode Pass 3's span includes the header write and smoke test
 
-Lateral finding from the BUG-002 scout, not yet judged. The `bench-read` relation
-mode in `crates/cli/src/lib.rs` reads member roles with
-`m.role().ok().unwrap_or_default()`, so a role that fails to decode counts as an
-empty string and the run succeeds. A revision that breaks role decoding can then
-complete less work and look faster, the same shape as the geocode-query error
-swallowing.
+Lateral finding from the BUG-006 scout, not yet judged. The geocode builder's smoke
+test has no marker pair of its own, and `GEOCODE_PASS3_END` fires after it, so
+Pass 3's sidecar span also counts the header write and the smoke test. Timing
+attribution only, not correctness.
 
-Fix: fail the run on a decode error. Enforcement: an instrument test with a
-deliberately failing role lookup.
+Fix: end the Pass 3 span before the header write and give the smoke test its own
+START/END pair.
 
 ## BUG-008 - A lint comment says nothing builds against musl
 

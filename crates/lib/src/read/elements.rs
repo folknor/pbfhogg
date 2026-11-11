@@ -332,6 +332,16 @@ pub struct Relation<'a> {
     rel: WireRelation<'a>,
 }
 
+/// Name the relation, the member position and the string index on a failed
+/// role lookup.
+#[cold]
+#[inline(never)]
+fn bad_role(err: crate::Error, id: i64, position: usize, sid: i32) -> crate::Error {
+    err.context(format!(
+        "relation {id} member {position}: role string index {sid}"
+    ))
+}
+
 impl<'a> Relation<'a> {
     pub(super) fn new(block: &'a WireBlock<'static>, rel: WireRelation<'a>) -> Relation<'a> {
         Relation { block, rel }
@@ -376,6 +386,34 @@ impl<'a> Relation<'a> {
     /// Returns an iterator over the members of this relation.
     pub fn members(&self) -> RelMemberIter<'a> {
         RelMemberIter::new(self.block, &self.rel)
+    }
+
+    /// Resolve every member of this relation into `buf`, in member order,
+    /// ready for [`BlockBuilder::add_relation`](crate::block_builder::BlockBuilder::add_relation).
+    /// `buf` is cleared first, so one buffer can be reused across the
+    /// relations of a block.
+    ///
+    /// # Errors
+    ///
+    /// A member whose role string index is negative or past the block's
+    /// string table is an error naming the relation, the member's position
+    /// and the index - never an empty role, which would re-encode the
+    /// relation silently changed. On an error `buf` holds the members before
+    /// the bad one.
+    pub fn members_into(&self, buf: &mut Vec<crate::block_builder::MemberData<'a>>) -> Result<()> {
+        buf.clear();
+        for (position, m) in self.members().enumerate() {
+            let role = self.member_role(position, &m)?;
+            buf.push(crate::block_builder::MemberData { id: m.id, role });
+        }
+        Ok(())
+    }
+
+    /// The role of member `m` at `position`, a failed lookup carrying the
+    /// relation id, the position and the string index.
+    pub(crate) fn member_role(&self, position: usize, m: &RelMember<'a>) -> Result<&'a str> {
+        m.role()
+            .map_err(|e| bad_role(e, self.id(), position, m.role_sid))
     }
 
     /// Returns an iterator over the tags of this relation as raw index pairs.
@@ -1086,5 +1124,57 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, [i64::MIN, i64::MAX]);
+    }
+
+    /// `members_into` resolves members in order into a cleared buffer and
+    /// refuses a role index past the string table or negative, naming the
+    /// relation, the position and the index.
+    #[test]
+    fn members_into_resolves_or_refuses_roles() {
+        use crate::read::wire_fixtures::{Group, block, relation};
+
+        let negative = u64::from_ne_bytes((-1i64).to_ne_bytes());
+        let bytes = block(
+            &["", "outer", "inner"],
+            &[Group {
+                relations: vec![
+                    relation(1, &[(1, 10, 2), (2, 11, 1)]),
+                    relation(2, &[(1, 10, 2), (9, 11, 1)]),
+                    relation(3, &[(negative, 10, 2)]),
+                ],
+                ..Group::default()
+            }],
+        );
+        let block = crate::PrimitiveBlock::from_vec(bytes).unwrap();
+        let relations: Vec<_> = block
+            .elements()
+            .map(|element| match element {
+                Element::Relation(relation) => relation,
+                _ => panic!("fixture contains only relations"),
+            })
+            .collect();
+
+        let mut buf = vec![crate::block_builder::MemberData {
+            id: MemberId::from_id_and_type(99, MemberType::Node),
+            role: "stale",
+        }];
+        relations[0].members_into(&mut buf).unwrap();
+        let got: Vec<_> = buf.iter().map(|m| (m.id.id(), m.role)).collect();
+        assert_eq!(got, [(10, "outer"), (11, "inner")]);
+
+        let err = relations[1].members_into(&mut buf).unwrap_err().to_string();
+        assert!(
+            err.contains("relation 2 member 1: role string index 9"),
+            "{err}"
+        );
+        let got: Vec<_> = buf.iter().map(|m| (m.id.id(), m.role)).collect();
+        assert_eq!(got, [(10, "outer")], "the prefix before the bad member");
+
+        let err = relations[2].members_into(&mut buf).unwrap_err().to_string();
+        assert!(
+            err.contains("relation 3 member 0: role string index -1"),
+            "{err}"
+        );
+        assert!(buf.is_empty());
     }
 }

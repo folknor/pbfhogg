@@ -8,7 +8,7 @@ use super::{
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::write::WriteOptions;
@@ -479,7 +479,7 @@ fn filter_block_parallel(
                 tags_buf.extend(r.tags());
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Relation) != invert {
                     ensure_relation_capacity_local(bb, output)?;
-                    relation_members_into(r, &mut members_buf)?;
+                    r.members_into(&mut members_buf)?;
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation_partial(
                         r.id(),
@@ -693,7 +693,7 @@ fn filter_block_pass2(
                     if !remove_tags || direct {
                         tags_buf.extend(r.tags());
                     }
-                    relation_members_into(r, &mut members_buf)?;
+                    r.members_into(&mut members_buf)?;
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation_partial(
                         r.id(),

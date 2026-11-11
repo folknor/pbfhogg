@@ -59,8 +59,8 @@ use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
-    read_node, read_relation, read_way, read_way_with_locations, relation_members_into,
-    write_single_node_local, write_single_relation_local, write_single_way_local,
+    read_node, read_relation, read_way, read_way_with_locations, write_single_node_local,
+    write_single_relation_local, write_single_way_local,
 };
 use crate::read::input::InputSource;
 use crate::write::WriteOptions;
@@ -758,7 +758,7 @@ fn worker_split_blob(
             }
             (Element::Relation(r), ElementKind::Relation) => {
                 ensure_relation_capacity_local(bb, &mut framed)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }

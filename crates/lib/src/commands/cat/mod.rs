@@ -12,7 +12,7 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_int
 use crate::blob_meta::scan_block_ids_and_tags;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
-use crate::owned::{TypeFilter, dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{TypeFilter, dense_node_metadata, element_metadata};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 use crate::{BlobFilter, Element, ElementKind, PrimitiveBlock};
@@ -795,7 +795,7 @@ fn reencode_unclassifiable(
                 check_tags(r.tags_checked())?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 ensure_relation_capacity_local(&mut bb, &mut output)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }
         }
@@ -1024,7 +1024,7 @@ fn process_block(
             }
             Element::Relation(r) if filter_relation => {
                 ensure_relation_capacity_local(bb, output)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = clean_partial_metadata(
                     element_meta(clean, ElementKind::Relation, r.id(), &r.info())?,
                     clean,

@@ -687,6 +687,28 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
     assert_refused(&out, role_needle, "cat --clean user, bad role");
 }
 
+/// The bench-write instrument refuses a bad role under both writers instead
+/// of encoding an empty one: a revision whose role decoding fails does less
+/// work and must never complete as a faster run.
+#[test]
+fn bench_write_refuses_a_bad_role_string_index() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("bad-role.osm.pbf");
+    write_bad_string_pbf(&input, BadString::Role, false);
+    for mode in ["sync", "pipelined"] {
+        let out = CliInvoker::new()
+            .arg("bench-write")
+            .arg(&input)
+            .args(["--writer", mode])
+            .run();
+        assert_refused(
+            &out,
+            "relation 1 member 0: role string index 9",
+            &format!("bench-write --writer {mode}"),
+        );
+    }
+}
+
 /// `cat --clean user` drops the user, so it never resolves it: a file with an
 /// out-of-range user string index is rescued by it.
 #[test]

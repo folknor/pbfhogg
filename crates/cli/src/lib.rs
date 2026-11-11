@@ -5511,6 +5511,9 @@ fn bench_write_loop<W: std::io::Write>(
             .decode()
             .map_err(|e| blob.locate_error(Some(&std::sync::Arc::from(path)), e))?;
         if let pbfhogg::BlobDecode::OsmData(block) = decoded {
+            // Members borrow roles from this block, so the buffer lives per
+            // block, as in the re-encoding commands.
+            let mut members: Vec<MemberData<'_>> = Vec::new();
             for el in block.elements() {
                 match el {
                     pbfhogg::Element::DenseNode(dn) => {
@@ -5553,13 +5556,10 @@ fn bench_write_loop<W: std::io::Write>(
                         {
                             writer.write_primitive_block(bytes)?;
                         }
-                        let members: Vec<_> = r
-                            .members()
-                            .map(|m| MemberData {
-                                id: m.id,
-                                role: m.role().ok().unwrap_or_default(),
-                            })
-                            .collect();
+                        // A bad role refuses the run: an empty role would
+                        // encode a changed relation, and a revision whose
+                        // role decoding fails must never read as faster.
+                        r.members_into(&mut members)?;
                         bb.add_relation(r.id(), r.tags(), &members, None);
                         rels += 1;
                     }

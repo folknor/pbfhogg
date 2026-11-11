@@ -70,10 +70,11 @@ byte-identical blobs as common without decoding either.
 
 Member roles and user names are not covered by this gap. `RelMember::role`
 and the `user` accessors return a `Result`, and every path that writes them
-propagates it: the re-encoding commands (through `relation_members_into`,
-`element_metadata` and `dense_node_metadata` in `crates/lib/src/owned.rs`, which the
-owned-element conversions share) and the OSC writer refuse a bad role or user
-index with an error naming the element, rather than writing an empty string.
+propagates it: the re-encoding commands (through the public
+`Relation::members_into`, and `element_metadata` and `dense_node_metadata` in
+`crates/lib/src/owned.rs`, which the owned-element conversions share), the
+`bench-write` instrument and the OSC writer refuse a bad role or user index
+with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
 bad role as empty when classifying boundary members.
 

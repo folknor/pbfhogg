@@ -1246,7 +1246,7 @@ fn write_output_decode_all(
 // ---------------------------------------------------------------------------
 
 use super::flush_local;
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
@@ -1345,7 +1345,7 @@ fn process_block(
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;

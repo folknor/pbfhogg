@@ -628,34 +628,6 @@ fn bad_user(
     err.context(format!("{} {id}: user name{sid}", kind.as_str()))
 }
 
-/// Resolve every member of `r` into `buf`, which is cleared first. A role
-/// string index past the block's string table, or negative, is an error
-/// naming the relation and the member's position, not an empty role. On an
-/// error `buf` holds the members before the bad one; the caller propagates.
-pub(crate) fn relation_members_into<'a>(
-    r: &crate::Relation<'a>,
-    buf: &mut Vec<MemberData<'a>>,
-) -> Result<()> {
-    buf.clear();
-    for (position, m) in r.members().enumerate() {
-        let role = m
-            .role()
-            .map_err(|e| bad_role(e, r.id(), position, m.role_sid))?;
-        buf.push(MemberData { id: m.id, role });
-    }
-    Ok(())
-}
-
-/// Name the relation, the member position and the string index on a failed
-/// role lookup.
-#[cold]
-#[inline(never)]
-fn bad_role(err: crate::Error, id: i64, position: usize, sid: i32) -> crate::Error {
-    err.context(format!(
-        "relation {id} member {position}: role string index {sid}"
-    ))
-}
-
 /// Extract [`RawPartialMetadata`] from an [`Info`](crate::Info), each field
 /// present exactly when the source carries it, preserving the raw string
 /// table index for the user name. `None` when the `Info` carries no field.
@@ -760,15 +732,13 @@ pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> Result<OwnedWay> {
 }
 
 /// A bad role string index is an error naming the relation and member, as in
-/// [`relation_members_into`].
+/// [`Relation::members_into`](crate::Relation::members_into).
 pub(crate) fn read_relation(r: &crate::Relation<'_>) -> Result<OwnedRelation> {
     let members = r
         .members()
         .enumerate()
         .map(|(position, m)| {
-            let role = m
-                .role()
-                .map_err(|e| bad_role(e, r.id(), position, m.role_sid))?;
+            let role = r.member_role(position, &m)?;
             Ok(OwnedMember {
                 id: m.id,
                 role: role.to_owned(),

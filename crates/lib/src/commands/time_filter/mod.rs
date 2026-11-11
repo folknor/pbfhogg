@@ -34,7 +34,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::owned::{
     OwnedElement, add_owned_node, add_owned_relation, add_owned_way, dense_node_metadata,
-    element_metadata, read_dense_node, read_node, read_relation, read_way, relation_members_into,
+    element_metadata, read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::input::{InputSource, PinnedInput};
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase_ordered};
@@ -609,7 +609,7 @@ fn filter_block_snapshot(
                 ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(
                     r.id(),

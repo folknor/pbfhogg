@@ -17,7 +17,7 @@ use super::{
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
@@ -587,7 +587,7 @@ fn process_block(
                 let is_self = add_self && ids.relation_ids.get(r.id());
                 if is_parent || is_self {
                     ensure_relation_capacity_local(bb, output)?;
-                    relation_members_into(r, &mut members_buf)?;
+                    r.members_into(&mut members_buf)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                     relations += 1;

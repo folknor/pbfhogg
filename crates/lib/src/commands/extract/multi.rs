@@ -19,7 +19,7 @@ use super::common::{
 use super::membership::{BatchBuilder, Membership, PageBatch, full_mask, mask_words, regions_of};
 use super::{ExtractStats, Region};
 
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Try single-pass multi-extract: read the PBF once, classify each element
 /// against all N regions, write to N output files. Returns `None` to fall
@@ -705,7 +705,7 @@ pub(super) fn try_extract_multi_single_pass(
                     if !relation_members.mask_into(rid, &mut mask) {
                         continue;
                     }
-                    relation_members_into(r, &mut members_buf)?;
+                    r.members_into(&mut members_buf)?;
                     let meta = element_metadata(ElementKind::Relation, rid, &r.info())?;
                     for i in regions_of(&mask) {
                         ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;

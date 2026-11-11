@@ -753,10 +753,11 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.encode-workload]
 script_file = "../benches/write/encode-workload.lua"
 description = "Decode and encode a dataset into a byte sink with sync or pipelined writers"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-11
 changelog = [
   { version = 1, date = 2026-11-09, note = "Ported typed write: synthetic workload matrix, I/O refusals, marker stops and profiling" },
+  { version = 2, date = 2026-11-11, note = "bench-write refuses a bad member role and reuses one member buffer per block instead of allocating per relation" },
 ]
 target = "pbfhogg"
 profile = "release"

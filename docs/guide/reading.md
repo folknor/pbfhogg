@@ -246,7 +246,11 @@ reader.for_each(|element| {
         Element::Relation(rel) => {
             println!("Relation {} with {} members", rel.id(), rel.members().count());
             for member in rel.members() {
-                println!("  {:?} role={}", member.member_id, member.role());
+                // `role()` is a `Result`: a bad string index is an error.
+                match member.role() {
+                    Ok(role) => println!("  {:?} role={role}", member.id),
+                    Err(e) => eprintln!("  {:?} bad role: {e}", member.id),
+                }
             }
         }
     }

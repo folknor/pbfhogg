@@ -126,8 +126,8 @@ use crate::error::Result;
 use crate::osm_id::{OsmIdKey, osm_id_cmp, osm_id_key};
 use crate::owned::{
     OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
-    read_dense_node, read_node, read_relation, read_way, relation_members_into,
-    write_single_node_local, write_single_relation_local, write_single_way_local,
+    read_dense_node, read_node, read_relation, read_way, write_single_node_local,
+    write_single_relation_local, write_single_way_local,
 };
 use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
@@ -497,7 +497,7 @@ impl Output<'_> {
                         &mut self.filled,
                     )?;
                     let mut members: Vec<MemberData<'_>> = Vec::new();
-                    relation_members_into(r, &mut members)?;
+                    r.members_into(&mut members)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     self.bb
                         .add_relation_partial(r.id(), r.tags(), &members, meta.as_ref());
@@ -610,7 +610,7 @@ fn validate_loser(item: &Item) -> Result<()> {
         Element::Relation(r) => {
             element_metadata(ElementKind::Relation, r.id(), &r.info())?;
             let mut members: Vec<MemberData<'_>> = Vec::new();
-            relation_members_into(r, &mut members)?;
+            r.members_into(&mut members)?;
         }
     }
     Ok(())

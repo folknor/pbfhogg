@@ -13,8 +13,19 @@
   with `--clean` (and `--type` with `--clean`). New library entry
   `cat::repair` and `CatStats::blobs_repaired`. Plain `cat`, `--clean` and
   `--type` are unchanged without the flag.
+- **`Relation::members_into`** resolves a relation's members into a reusable
+  `Vec<MemberData>` ready for `BlockBuilder::add_relation`, refusing a role
+  string index that is negative or past the string table with an error naming
+  the relation, the member and the index. It is the conversion every
+  re-encoding command uses, now public so `BlockBuilder` users need not map
+  `RelMember::role` errors by hand.
 
 ### Changed
+
+- **`bench-write` fails on a relation member whose role does not resolve**
+  instead of encoding an empty role and completing the run. It also reuses
+  one member buffer per block rather than allocating one per relation, so its
+  timings do not compare with earlier revisions.
 
 - **`build-geocode-index` refuses to publish an index whose smoke test
   fails.** The smoke test used to query the first address point and pass on

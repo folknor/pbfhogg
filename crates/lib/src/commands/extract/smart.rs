@@ -772,7 +772,7 @@ struct ExtractPass3IdSets<'a> {
 }
 
 use super::super::{clean_metadata, clean_partial_metadata};
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
@@ -871,7 +871,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
-                    relation_members_into(r, &mut members_buf)?;
+                    r.members_into(&mut members_buf)?;
                     let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
                         clean,

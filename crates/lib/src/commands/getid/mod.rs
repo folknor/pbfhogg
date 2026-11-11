@@ -12,7 +12,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Error;
 use crate::file_writer::FileWriter;
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::block::BlockBuffer;
 use crate::read::header_walker::ScanArm;
 use crate::read::input::{InputFile, InputSource, PinnedInput};
@@ -1771,7 +1771,7 @@ fn process_block(
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(
                     r.id(),

@@ -93,7 +93,7 @@ use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::owned::{
     OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
-    read_dense_node, read_node, read_relation, read_way, relation_members_into,
+    read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::frame::Frames;
 use crate::read::input::InputSource;
@@ -1426,7 +1426,7 @@ fn worker_decode_kind(
             }
             (Element::Relation(r), ElementKind::Relation) => {
                 ensure_relation_capacity_local(bb, &mut framed)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
             }

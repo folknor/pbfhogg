@@ -561,7 +561,7 @@ pub(super) struct ExtractPass2IdSets<'a> {
 }
 
 use super::super::{clean_metadata, clean_partial_metadata};
-use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
@@ -657,7 +657,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
             }
             Element::Relation(r) if emit_rels && ids.matched_relation_ids.get(r.id()) => {
                 ensure_relation_capacity_local(bb, output)?;
-                relation_members_into(r, &mut members_buf)?;
+                r.members_into(&mut members_buf)?;
                 let meta = clean_partial_metadata(
                     element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
                     clean,

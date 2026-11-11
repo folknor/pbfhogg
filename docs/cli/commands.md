@@ -2208,7 +2208,10 @@ pbfhogg bench-read --mode <MODE> <FILE>
 
 Benchmark instrument: decode every element of a PBF and re-encode it through
 `BlockBuilder` into a byte sink (nothing is published), printing
-`elapsed_ms=` and the element counts on stderr.
+`elapsed_ms=` and the element counts on stderr. A relation member whose role
+string index does not resolve fails the run with an error naming the relation,
+the member and the index, as the re-encoding commands do, rather than being
+encoded with an empty role.
 
 ```
 pbfhogg bench-write [OPTIONS] <FILE>

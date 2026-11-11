@@ -80,13 +80,13 @@ fn renumber_nodes_sequentially() {
     let norm = read_normalized(&output);
     assert_eq!(norm.nodes.len(), 3);
     assert_eq!(norm.nodes[0].id, 1);
-    assert_eq!(norm.nodes[0].lat, 100_000_000);
-    assert_eq!(norm.nodes[0].lon, 200_000_000);
-    assert_eq!(norm.nodes[0].tags.get("name"), Some(&"a".to_string()));
+    assert_eq!(norm.nodes[0].decimicro_lat(), 100_000_000);
+    assert_eq!(norm.nodes[0].decimicro_lon(), 200_000_000);
+    assert_eq!(norm.nodes[0].tag("name"), Some("a"));
     assert_eq!(norm.nodes[1].id, 2);
-    assert_eq!(norm.nodes[1].lat, 110_000_000);
+    assert_eq!(norm.nodes[1].decimicro_lat(), 110_000_000);
     assert_eq!(norm.nodes[2].id, 3);
-    assert_eq!(norm.nodes[2].tags.get("name"), Some(&"c".to_string()));
+    assert_eq!(norm.nodes[2].tag("name"), Some("c"));
 }
 
 #[test]
@@ -646,8 +646,8 @@ fn renumber_nodes_and_ways_end_to_end() {
     assert_eq!(way_100.refs, vec![1, 2, 2]);
     assert_eq!(way_200.refs, vec![2, 3]);
     assert_eq!(way_300.refs, vec![3, 4, 1]);
-    assert_eq!(way_100.tags.get("highway"), Some(&"stop".to_string()));
-    assert_eq!(way_300.tags.get("barrier"), Some(&"gate".to_string()));
+    assert_eq!(way_100.tag("highway"), Some("stop"));
+    assert_eq!(way_300.tag("barrier"), Some("gate"));
 }
 
 #[test]
@@ -1056,7 +1056,7 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
     let summary = |r: &crate::common::NormalizedRelation| -> Vec<(String, i64, String)> {
         r.members
             .iter()
-            .map(|m| (m.member_type.clone(), m.ref_id, m.role.clone()))
+            .map(|m| (m.member_type.as_str().to_owned(), m.ref_id, m.role.clone()))
             .collect()
     };
     let s = |t: &str, id: i64, role: &str| (t.to_string(), id, role.to_string());

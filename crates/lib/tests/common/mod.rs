@@ -33,11 +33,16 @@
 
 pub mod adversarial;
 pub mod groups;
+pub mod model;
 pub mod oracle;
 pub mod process;
 
-use std::collections::BTreeMap;
 use std::path::Path;
+
+#[allow(unused_imports)]
+pub use model::{
+    MemberKind, NormalizedMember, NormalizedMeta, NormalizedNode, NormalizedRelation, NormalizedWay,
+};
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -177,22 +182,12 @@ pub struct TestMember {
 
 /// Write a complete PBF file containing the given nodes, ways, and relations.
 ///
-/// Creates a header blob followed by one or more primitive blocks. Elements are
-/// written in order (all nodes, then all ways, then all relations) and the
-/// builder is flushed between element types and whenever a block reaches its
-/// capacity limit (8000 entities by default).
-///
-/// When `sorted` is true, the header declares `Sort.Type_then_ID`.
-///
-/// `block_size_override` forces a block flush every N elements within each
-/// type section instead of waiting for the 8000-entity cap. Use this to
-/// produce multi-block fixtures that exercise batch boundaries, blob
-/// classification, and passthrough coalescing without allocating thousands
-/// of elements. `None` keeps the natural 8000/block behaviour.
+/// Creates a header blob followed by the blocks of
+/// [`encode_fixture_blocks`], through the sync writer with `indexdata` and
+/// `tagdata` on every data blob. When `sorted` is true, the header declares
+/// `Sort.Type_then_ID`.
 ///
 /// This is the canonical test PBF writer shared across most integration tests.
-/// The `add_locations_to_ways` tests use a local variant because their
-/// `TestRelation` type uses a different member representation.
 pub fn write_test_pbf_impl(
     path: &Path,
     nodes: &[TestNode],
@@ -201,20 +196,18 @@ pub fn write_test_pbf_impl(
     sorted: bool,
     block_size_override: Option<usize>,
 ) {
-    write_blocks(
-        path,
-        nodes,
-        ways,
-        relations,
-        sorted,
-        block_size_override,
-        true,
-    );
+    let blocks = encode_fixture_blocks(nodes, ways, relations, block_size_override);
+    let framing = if sorted {
+        FixtureFraming::INDEXED
+    } else {
+        FixtureFraming::INDEXED.unsorted()
+    };
+    frame_fixture_blocks(path, &blocks, framing);
 }
 
-/// [`write_multi_block_test_pbf`] without `indexdata` on any blob: the same
-/// blocks, so a fixture pair from the two writers differs only in whether
-/// the merge paths can use indexdata.
+/// [`write_multi_block_test_pbf`] without `indexdata` or `tagdata` on any
+/// blob: the same blocks, so a fixture pair from the two writers differs only
+/// in whether the merge paths can use the BlobHeader indexes.
 pub fn write_multi_block_non_indexed_pbf(
     path: &Path,
     nodes: &[TestNode],
@@ -223,90 +216,76 @@ pub fn write_multi_block_non_indexed_pbf(
     block_size: usize,
 ) {
     assert!(block_size > 0, "block_size must be > 0");
-    write_blocks(path, nodes, ways, relations, true, Some(block_size), false);
+    let blocks = encode_fixture_blocks(nodes, ways, relations, Some(block_size));
+    frame_fixture_blocks(path, &blocks, FixtureFraming::NON_INDEXED);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_blocks(
-    path: &Path,
+/// The data blocks of a fixture, as serialized `PrimitiveBlock`s: nodes,
+/// then ways, then relations, each kind starting a new block, a block closed
+/// when it reaches capacity (8000 entities by default) or, with
+/// `block_size_override`, every N elements of a kind. The override produces
+/// multi-block fixtures that exercise batch boundaries, blob classification
+/// and passthrough coalescing without thousands of elements.
+///
+/// Every fixture writer encodes through this, so writers that differ only in
+/// framing write the same blocks by construction.
+pub fn encode_fixture_blocks(
     nodes: &[TestNode],
     ways: &[TestWay],
     relations: &[TestRelation],
-    sorted: bool,
     block_size_override: Option<usize>,
-    indexdata: bool,
-) {
-    let write = |writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>, bytes: &[u8]| {
-        if indexdata {
-            writer.write_primitive_block(bytes).expect("write block");
-        } else {
-            writer
-                .write_primitive_block_no_indexdata(bytes)
-                .expect("write block");
+) -> Vec<Vec<u8>> {
+    struct Blocks {
+        bb: BlockBuilder,
+        out: Vec<Vec<u8>>,
+        in_block: usize,
+        cap: Option<usize>,
+    }
+    impl Blocks {
+        /// Close the open block if `fits` says the next element does not
+        /// fit or the override count is reached.
+        fn before_add(&mut self, fits: bool) {
+            let hit = matches!(self.cap, Some(cap) if self.in_block >= cap);
+            if !fits || hit {
+                self.close();
+            }
+            self.in_block += 1;
         }
+        fn close(&mut self) {
+            if let Some(bytes) = self.bb.take().expect("take") {
+                self.out.push(bytes.to_vec());
+            }
+            self.in_block = 0;
+        }
+    }
+
+    let mut blocks = Blocks {
+        bb: BlockBuilder::new(),
+        out: Vec::new(),
+        in_block: 0,
+        cap: block_size_override,
     };
-    let file = std::fs::File::create(path).expect("create file");
-    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-    let mut writer = PbfWriter::new(buf, Compression::default());
-    let mut hb = block_builder::HeaderBuilder::new();
-    if sorted {
-        hb = hb.sorted();
-    }
-    let header = hb.build().expect("build header");
-    writer.write_header(&header).expect("write header");
-
-    let mut bb = BlockBuilder::new();
-    let mut batch_count = 0usize;
-
-    // Nodes
     for n in nodes {
-        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
-        if (!bb.can_add_node() || hit_override)
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            write(&mut writer, bytes);
-            batch_count = 0;
-        }
+        let fits = blocks.bb.can_add_node();
+        blocks.before_add(fits);
         let meta = n.meta.as_ref().map(to_block_meta);
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
-        batch_count += 1;
+        blocks
+            .bb
+            .add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
     }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        write(&mut writer, bytes);
-    }
-    batch_count = 0;
-
-    // Ways
+    blocks.close();
     for w in ways {
-        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
-        if (!bb.can_add_way() || hit_override)
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            write(&mut writer, bytes);
-            batch_count = 0;
-        }
+        let fits = blocks.bb.can_add_way();
+        blocks.before_add(fits);
         let meta = w.meta.as_ref().map(to_block_meta);
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
-        batch_count += 1;
+        blocks
+            .bb
+            .add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
     }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        write(&mut writer, bytes);
-    }
-    batch_count = 0;
-
-    // Relations
+    blocks.close();
     for r in relations {
-        let hit_override = matches!(block_size_override, Some(s) if batch_count >= s);
-        if (!bb.can_add_relation() || hit_override)
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            write(&mut writer, bytes);
-            batch_count = 0;
-        }
+        let fits = blocks.bb.can_add_relation();
+        blocks.before_add(fits);
         let members: Vec<MemberData<'_>> = r
             .members
             .iter()
@@ -316,16 +295,94 @@ fn write_blocks(
             })
             .collect();
         let meta = r.meta.as_ref().map(to_block_meta);
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
-        batch_count += 1;
+        blocks
+            .bb
+            .add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
     }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        write(&mut writer, bytes);
+    blocks.close();
+    blocks.out
+}
+
+/// How [`frame_fixture_blocks`] frames a fixture's blocks: the only ways two
+/// fixtures of the same elements may differ.
+#[derive(Clone, Copy, Debug)]
+pub struct FixtureFraming {
+    /// The header declares `Sort.Type_then_ID`.
+    pub sorted: bool,
+    /// Data BlobHeaders carry `indexdata` and `tagdata`.
+    pub indexdata: bool,
+    /// Written through the pipelined [`PbfWriter::to_path`] rather than the
+    /// sync writer.
+    pub pipelined: bool,
+}
+
+impl FixtureFraming {
+    /// Sorted header, indexed blobs, sync writer.
+    pub const INDEXED: Self = Self {
+        sorted: true,
+        indexdata: true,
+        pipelined: false,
+    };
+    /// Sorted header, blobs without `indexdata` or `tagdata`, sync writer.
+    pub const NON_INDEXED: Self = Self {
+        sorted: true,
+        indexdata: false,
+        pipelined: false,
+    };
+    /// Sorted header, indexed blobs, pipelined writer.
+    pub const PIPELINED: Self = Self {
+        sorted: true,
+        indexdata: true,
+        pipelined: true,
+    };
+
+    /// The same framing under a header that claims no sort order.
+    #[must_use]
+    pub const fn unsorted(self) -> Self {
+        Self {
+            sorted: false,
+            ..self
+        }
+    }
+}
+
+/// Write `blocks` (from [`encode_fixture_blocks`]) as a complete PBF under
+/// `framing`, with the default compression.
+pub fn frame_fixture_blocks(path: &Path, blocks: &[Vec<u8>], framing: FixtureFraming) {
+    fn write_all<W: std::io::Write>(mut writer: PbfWriter<W>, blocks: &[Vec<u8>], indexdata: bool) {
+        for bytes in blocks {
+            if indexdata {
+                writer.write_primitive_block(bytes).expect("write block");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(bytes)
+                    .expect("write block");
+            }
+        }
+        writer.flush().expect("flush");
     }
 
-    writer.flush().expect("flush");
+    let mut hb = block_builder::HeaderBuilder::new();
+    if framing.sorted {
+        hb = hb.sorted();
+    }
+    let header = hb.build().expect("build header");
+    if framing.pipelined {
+        let writer = PbfWriter::to_path(
+            path,
+            Compression::default(),
+            &header,
+            crate::common::test_executor(),
+        )
+        .expect("create writer");
+        write_all(writer, blocks, framing.indexdata);
+    } else {
+        let file = std::fs::File::create(path).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
+        writer.write_header(&header).expect("write header");
+        write_all(writer, blocks, framing.indexdata);
+    }
 }
 
 /// Write a test PBF without the sorted header flag. See [`write_test_pbf_impl`].
@@ -479,178 +536,33 @@ pub fn write_many_block_pbf(path: &Path, node_blocks: usize) {
     writer.flush().expect("flush");
 }
 
-/// Write a sorted PBF whose OsmData blobs carry `indexdata` in their
-/// `BlobHeader`s. This helper uses [`PbfWriter::to_path`] to exercise the
-/// pipelined writer and flushes each element type into its own block. The
-/// regular sync fixture helpers also emit indexdata through
-/// `write_primitive_block`; use [`write_test_pbf_non_indexed`] when a fixture
-/// needs that field absent. Allowlist-only.
+/// Write a sorted PBF through the pipelined writer ([`PbfWriter::to_path`]),
+/// every data blob carrying `indexdata` and `tagdata`. Its blocks are
+/// [`write_test_pbf_sorted`]'s; only the writer differs. Allowlist-only.
 pub fn write_indexed_pbf(
     path: &Path,
     nodes: &[TestNode],
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
-    let mut writer = PbfWriter::to_path(
-        path,
-        Compression::default(),
-        &header,
-        crate::common::test_executor(),
-    )
-    .expect("create writer");
-
-    let mut bb = BlockBuilder::new();
-
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        let meta = n.meta.as_ref().map(to_block_meta);
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        let meta = w.meta.as_ref().map(to_block_meta);
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        let meta = r.meta.as_ref().map(to_block_meta);
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    writer.flush().expect("flush");
+    let blocks = encode_fixture_blocks(nodes, ways, relations, None);
+    frame_fixture_blocks(path, &blocks, FixtureFraming::PIPELINED);
 }
 
-/// Write a sorted test PBF whose OsmData blobs lack the `indexdata`
-/// `BlobHeader` field. Use this to exercise read paths (most visibly
-/// `diff_element_stream` in `commands::diff`) that only fire when one
-/// or both inputs are non-indexed. The `PrimitiveBlock` payload is
-/// identical to `write_test_pbf_sorted`; only the outer blob header
-/// differs. The header declares `Sort.Type_then_ID` so consumers that
-/// require sorted inputs still accept the output.
+/// Write a sorted test PBF whose OsmData blobs carry neither `indexdata` nor
+/// `tagdata`, for the read paths that only fire on non-indexed input (most
+/// visibly `diff_element_stream` in `commands::diff`). Its blocks are
+/// [`write_test_pbf_sorted`]'s; only the BlobHeaders differ. The header
+/// declares `Sort.Type_then_ID` so consumers that require sorted inputs
+/// still accept the output.
 pub fn write_test_pbf_non_indexed(
     path: &Path,
     nodes: &[TestNode],
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    let file = std::fs::File::create(path).expect("create file");
-    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-    let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
-    writer.write_header(&header).expect("write header");
-
-    let mut bb = BlockBuilder::new();
-
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer
-                .write_primitive_block_no_indexdata(bytes)
-                .expect("write block");
-        }
-        let meta = n.meta.as_ref().map(to_block_meta);
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer
-            .write_primitive_block_no_indexdata(bytes)
-            .expect("write block");
-    }
-
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer
-                .write_primitive_block_no_indexdata(bytes)
-                .expect("write block");
-        }
-        let meta = w.meta.as_ref().map(to_block_meta);
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer
-            .write_primitive_block_no_indexdata(bytes)
-            .expect("write block");
-    }
-
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer
-                .write_primitive_block_no_indexdata(bytes)
-                .expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        let meta = r.meta.as_ref().map(to_block_meta);
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, meta.as_ref());
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer
-            .write_primitive_block_no_indexdata(bytes)
-            .expect("write block");
-    }
-
-    writer.flush().expect("flush");
+    let blocks = encode_fixture_blocks(nodes, ways, relations, None);
+    frame_fixture_blocks(path, &blocks, FixtureFraming::NON_INDEXED);
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,7 +949,10 @@ pub struct PbfContentsWithCoords {
 
 /// Read all elements from a PBF file, preserving node coordinates.
 ///
-/// Handles both `DenseNode` and `Node` element variants. Returns a
+/// Reads through pbfhogg's reader, so its callers exercise the product
+/// decoder. Tags are checked (an unresolvable index fails the read instead of
+/// ending the list), a role that does not resolve fails it, and an unknown
+/// member kind reads `unknown:N` with its raw value. Returns a
 /// [`PbfContentsWithCoords`] with all elements in file order.
 pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
     let reader = BlobReader::from_path(path).expect("open pbf");
@@ -1049,64 +964,49 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
 
     for blob in reader {
         let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let tags: Vec<(String, String)> = dn
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents.nodes.push((
-                            dn.id(),
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                            tags,
-                        ));
-                    }
-                    Element::Node(n) => {
-                        let tags: Vec<(String, String)> = n
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents
-                            .nodes
-                            .push((n.id(), n.decimicro_lat(), n.decimicro_lon(), tags));
-                    }
-                    Element::Way(w) => {
-                        let tags: Vec<(String, String)> = w
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        let refs: Vec<i64> = w.refs().collect();
-                        contents.ways.push((w.id(), refs, tags));
-                    }
-                    Element::Relation(r) => {
-                        let tags: Vec<(String, String)> = r
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        let members: Vec<(i64, String, String)> = r
-                            .members()
-                            .map(|m| {
-                                let type_str = match m.id.member_type() {
-                                    pbfhogg::MemberType::Node => "node",
-                                    pbfhogg::MemberType::Way => "way",
-                                    pbfhogg::MemberType::Relation => "relation",
-                                    pbfhogg::MemberType::Unknown(_) => "unknown",
-                                    _ => "unknown",
-                                };
-                                (
-                                    m.id.id(),
-                                    type_str.to_string(),
-                                    m.role().unwrap_or("").to_string(),
-                                )
-                            })
-                            .collect();
-                        contents.relations.push((r.id(), members, tags));
-                    }
-                    _ => {}
+        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
+            continue;
+        };
+        for element in block.elements() {
+            match element {
+                Element::DenseNode(dn) => {
+                    let tags = checked_tags(dn.tags_checked(), &format!("dense node {}", dn.id()));
+                    contents
+                        .nodes
+                        .push((dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags));
                 }
+                Element::Node(n) => {
+                    let tags = checked_tags(n.tags_checked(), &format!("node {}", n.id()));
+                    contents
+                        .nodes
+                        .push((n.id(), n.decimicro_lat(), n.decimicro_lon(), tags));
+                }
+                Element::Way(w) => {
+                    let tags = checked_tags(w.tags_checked(), &format!("way {}", w.id()));
+                    contents.ways.push((w.id(), w.refs().collect(), tags));
+                }
+                Element::Relation(r) => {
+                    let what = format!("relation {}", r.id());
+                    let tags = checked_tags(r.tags_checked(), &what);
+                    let members = r
+                        .members()
+                        .map(|m| {
+                            let kind = match member_kind(m.id.member_type()) {
+                                MemberKind::Node => "node".to_owned(),
+                                MemberKind::Way => "way".to_owned(),
+                                MemberKind::Relation => "relation".to_owned(),
+                                MemberKind::Unknown(raw) => format!("unknown:{raw}"),
+                            };
+                            let role = m
+                                .role()
+                                .unwrap_or_else(|e| panic!("{what}: role: {e}"))
+                                .to_owned();
+                            (m.id.id(), kind, role)
+                        })
+                        .collect();
+                    contents.relations.push((r.id(), members, tags));
+                }
+                other => panic!("element kind the oracle does not know: {other:?}"),
             }
         }
     }
@@ -1150,57 +1050,24 @@ pub struct PbfContentsIdOnly {
 
 /// Read all elements from a PBF file, discarding node coordinates.
 ///
-/// Handles both `DenseNode` and `Node` element variants. Returns a
-/// [`PbfContentsIdOnly`] with all elements in file order.
+/// Reads through pbfhogg's reader, as [`read_all_elements_with_coords`]
+/// does, with the same refusals. Returns a [`PbfContentsIdOnly`] with all
+/// elements in file order.
 pub fn read_all_elements_id_only(path: &Path) -> PbfContentsIdOnly {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut contents = PbfContentsIdOnly {
-        nodes: Vec::new(),
-        ways: Vec::new(),
-        relations: Vec::new(),
-    };
-
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let tags: Vec<(String, String)> = dn
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents.nodes.push((dn.id(), tags));
-                    }
-                    Element::Node(n) => {
-                        let tags: Vec<(String, String)> = n
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents.nodes.push((n.id(), tags));
-                    }
-                    Element::Way(w) => {
-                        let tags: Vec<(String, String)> = w
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        let refs: Vec<i64> = w.refs().collect();
-                        contents.ways.push((w.id(), refs, tags));
-                    }
-                    Element::Relation(r) => {
-                        let tags: Vec<(String, String)> = r
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents.relations.push((r.id(), tags));
-                    }
-                    _ => {}
-                }
-            }
-        }
+    let full = read_all_elements_with_coords(path);
+    PbfContentsIdOnly {
+        nodes: full
+            .nodes
+            .into_iter()
+            .map(|(id, _, _, tags)| (id, tags))
+            .collect(),
+        ways: full.ways,
+        relations: full
+            .relations
+            .into_iter()
+            .map(|(id, _, tags)| (id, tags))
+            .collect(),
     }
-
-    contents
 }
 
 /// Extract just the node IDs from a [`PbfContentsIdOnly`].
@@ -1222,191 +1089,14 @@ pub fn relation_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
 // PBF reading helpers - "normalized" variant for element-equivalence cross-checks
 // ---------------------------------------------------------------------------
 //
-// Used by tests that need to assert two PBFs contain the same elements without
-// requiring byte-identical output. Byte-identical comparison is too strict: two
-// semantically-equivalent PBFs can differ in string-table ordering, DenseNodes
-// delta packing, and block flush boundaries without any actual element
-// difference. The normalized form captures what callers actually care about:
-//
-// - ID, coordinates (nodes), tags as a BTreeMap (order-insensitive), refs/
-//   members as a Vec (order-sensitive, since OSM semantics depend on it),
-//   metadata per element.
-//
-// Each type section is sorted by id so two PBFs with the same element set but
-// different file orderings compare equal. Used by the renumber external tests
-// to cross-check against the in-memory path.
-
-/// Normalized element metadata. Matches `pbfhogg::block_builder::Metadata`
-/// shape with owned strings. `None` means the element has no metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedMeta {
-    pub version: i32,
-    pub timestamp: i64,
-    pub changeset: i64,
-    pub uid: i32,
-    pub user: String,
-    pub visible: bool,
-}
-
-/// Normalized node: id + coords + tags (order-insensitive) + metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedNode {
-    pub id: i64,
-    pub lat: i32,
-    pub lon: i32,
-    pub tags: BTreeMap<String, String>,
-    pub meta: Option<NormalizedMeta>,
-}
-
-/// Normalized way: id + refs (order-sensitive) + tags + metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedWay {
-    pub id: i64,
-    pub refs: Vec<i64>,
-    pub tags: BTreeMap<String, String>,
-    pub meta: Option<NormalizedMeta>,
-}
-
-/// Normalized relation member: type + ref id + role.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedMember {
-    pub member_type: String,
-    pub ref_id: i64,
-    pub role: String,
-}
-
-/// Normalized relation: id + members (order-sensitive) + tags + metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedRelation {
-    pub id: i64,
-    pub members: Vec<NormalizedMember>,
-    pub tags: BTreeMap<String, String>,
-    pub meta: Option<NormalizedMeta>,
-}
-
-/// Normalized view of a complete PBF file. Each section sorted by id.
-#[derive(Debug)]
-pub struct NormalizedPbf {
-    pub nodes: Vec<NormalizedNode>,
-    pub ways: Vec<NormalizedWay>,
-    pub relations: Vec<NormalizedRelation>,
-}
-
-/// Build a `NormalizedMeta` from a Node/Way/Relation `Info`. Returns `None`
-/// when the info has no version (i.e. no metadata block was present, matching
-/// `commands::element_metadata`).
-fn meta_from_info(info: &pbfhogg::Info<'_>) -> Option<NormalizedMeta> {
-    info.version().map(|v| NormalizedMeta {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info
-            .user()
-            .and_then(std::result::Result::ok)
-            .unwrap_or("")
-            .to_string(),
-        visible: info.visible(),
-    })
-}
-
-/// Build a `NormalizedMeta` from a `DenseNode`. Returns `None` when no info
-/// block is present (matching `commands::dense_node_metadata`).
-fn meta_from_dense_node(dn: &pbfhogg::DenseNode<'_>) -> Option<NormalizedMeta> {
-    dn.info()
-        .filter(|i| {
-            // The product's presence rule (`DenseNodeInfo::claims`): version
-            // >= 1 claims metadata; a version below 1 (0 or the Osmosis -1)
-            // only through a value padding never holds.
-            i.claimed_version().is_some()
-                || i.milli_timestamp() != 0
-                || i.changeset() > 0
-                || i.uid() > 0
-                || !i.user().unwrap_or("").is_empty()
-                || !i.visible()
-        })
-        .map(|i| NormalizedMeta {
-            // -1 and 0 are both "no version"; re-encoding writes -1 as 0.
-            version: i.claimed_version().unwrap_or(0),
-            timestamp: i.milli_timestamp() / 1000,
-            changeset: i.changeset(),
-            uid: i.uid(),
-            user: i.user().unwrap_or("").to_string(),
-            visible: i.visible(),
-        })
-}
-
-/// Convert a `Node`/`DenseNode` into a `NormalizedNode`.
-fn normalize_node(n: &pbfhogg::Node<'_>) -> NormalizedNode {
-    let tags: BTreeMap<String, String> = n
-        .tags()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    NormalizedNode {
-        id: n.id(),
-        lat: n.decimicro_lat(),
-        lon: n.decimicro_lon(),
-        tags,
-        meta: meta_from_info(&n.info()),
-    }
-}
-
-fn normalize_dense_node(dn: &pbfhogg::DenseNode<'_>) -> NormalizedNode {
-    let tags: BTreeMap<String, String> = dn
-        .tags()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    NormalizedNode {
-        id: dn.id(),
-        lat: dn.decimicro_lat(),
-        lon: dn.decimicro_lon(),
-        tags,
-        meta: meta_from_dense_node(dn),
-    }
-}
-
-fn normalize_way(w: &pbfhogg::Way<'_>) -> NormalizedWay {
-    let tags: BTreeMap<String, String> = w
-        .tags()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    NormalizedWay {
-        id: w.id(),
-        refs: w.refs().collect(),
-        tags,
-        meta: meta_from_info(&w.info()),
-    }
-}
-
-fn normalize_relation(r: &pbfhogg::Relation<'_>) -> NormalizedRelation {
-    let tags: BTreeMap<String, String> = r
-        .tags()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let members: Vec<NormalizedMember> = r
-        .members()
-        .map(|m| {
-            let member_type = match m.id.member_type() {
-                pbfhogg::MemberType::Node => "node",
-                pbfhogg::MemberType::Way => "way",
-                pbfhogg::MemberType::Relation => "relation",
-                _ => "unknown",
-            }
-            .to_string();
-            NormalizedMember {
-                member_type,
-                ref_id: m.id.id(),
-                role: m.role().unwrap_or("").to_string(),
-            }
-        })
-        .collect();
-    NormalizedRelation {
-        id: r.id(),
-        members,
-        tags,
-        meta: meta_from_info(&r.info()),
-    }
-}
+// Byte-identical comparison is too strict for outputs: string-table order,
+// dense delta packing and block boundaries vary without any element changing.
+// The normalized form is the independent decode in `model`: ids,
+// nanodegree coordinates, embedded way locations, tags in stored order with
+// duplicates, members with raw unknown kinds, and metadata claims field by
+// field with millisecond timestamps. Each section is sorted by id, so outputs
+// with the same elements in a different file order compare equal; stream
+// order is `assert_sorted_file`'s subject.
 
 /// Reject incomplete framing, including the short trailing prefixes that the
 /// production reader deliberately tolerates as EOF. Successful-output oracles
@@ -1428,48 +1118,244 @@ fn assert_complete_pbf_framing(path: &Path) {
     );
 }
 
-/// Read a PBF file into its normalized, element-equivalence form.
+/// Normalized view of a complete PBF file: the independent decode
+/// ([`model`]), each section sorted by id (stably, so duplicate ids keep
+/// file order).
+#[derive(Debug)]
+pub struct NormalizedPbf {
+    pub nodes: Vec<NormalizedNode>,
+    pub ways: Vec<NormalizedWay>,
+    pub relations: Vec<NormalizedRelation>,
+}
+
+/// Read a successful output into its element-equivalence form.
 ///
-/// Both `DenseNode` and `Node` element variants are coalesced into the same
-/// `NormalizedNode` shape so the serialization choice doesn't affect
-/// comparison. Each section is sorted by id on return.
+/// The file must be completely framed and carry a header. It is decoded
+/// twice: by the independent decoder in [`model`], which is what the result
+/// holds, and by pbfhogg's reader, whose public view (ids, nanodegree
+/// coordinates, checked tags, refs, way locations, members, roles and the
+/// metadata its accessors show) must agree with the independent one. So a
+/// defect in either decoder fails the read rather than letting two outputs
+/// compare equal; a production refusal (a file the product cannot read)
+/// fails it too. Counterexamples for the decoder itself use
+/// [`model::decode_path`] directly.
 pub fn read_normalized(path: &Path) -> NormalizedPbf {
     assert_complete_pbf_framing(path);
-    let reader = BlobReader::from_path(path).expect("open pbf");
+    let decoded = model::decode_path(path);
+    assert!(decoded.header, "PBF header missing: {}", path.display());
+
+    let mut independent = public_view_of_model(&decoded);
+    let mut production = public_view_of_reader(path);
+    independent.sort();
+    production.sort();
+    assert_eq!(
+        independent,
+        production,
+        "pbfhogg's reader and the independent decoder disagree on {}",
+        path.display()
+    );
+
     let mut contents = NormalizedPbf {
-        nodes: Vec::new(),
-        ways: Vec::new(),
-        relations: Vec::new(),
+        nodes: decoded.nodes,
+        ways: decoded.ways,
+        relations: decoded.relations,
     };
-
-    // Content equality is meaningful only for a complete, header-bearing PBF.
-    // Walking to EOF also makes a malformed tail fail rather than compare equal.
-    let mut saw_header = false;
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        match blob.decode().expect("decode blob") {
-            BlobDecode::OsmHeader(_) => saw_header = true,
-            BlobDecode::OsmData(block) => {
-                assert!(saw_header, "PBF data precedes header: {}", path.display());
-                for element in block.elements() {
-                    match element {
-                        Element::DenseNode(dn) => contents.nodes.push(normalize_dense_node(&dn)),
-                        Element::Node(n) => contents.nodes.push(normalize_node(&n)),
-                        Element::Way(w) => contents.ways.push(normalize_way(&w)),
-                        Element::Relation(r) => contents.relations.push(normalize_relation(&r)),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    assert!(saw_header, "PBF header missing: {}", path.display());
-
     contents.nodes.sort_by_key(|n| n.id);
     contents.ways.sort_by_key(|w| w.id);
     contents.relations.sort_by_key(|r| r.id);
     contents
+}
+
+/// What both decoders can state about one element. Nodes carry only the
+/// claimed version and timestamp: a dense slot's other public fields are raw
+/// column values, whose claims only the independent decoder derives.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PublicView {
+    Node {
+        id: i64,
+        nano: (i64, i64),
+        tags: Vec<(String, String)>,
+        version: Option<i32>,
+        milli_timestamp: Option<i64>,
+    },
+    Way {
+        id: i64,
+        refs: Vec<i64>,
+        locations: Option<Vec<(i64, i64)>>,
+        tags: Vec<(String, String)>,
+        meta: PlainView,
+    },
+    Relation {
+        id: i64,
+        members: Vec<(MemberKind, i64, String)>,
+        tags: Vec<(String, String)>,
+        meta: PlainView,
+    },
+}
+
+/// A plain `Info` as the public accessors show it; `visible` is left out
+/// because they cannot show it absent.
+type PlainView = (
+    Option<i32>,
+    Option<i64>,
+    Option<i64>,
+    Option<i32>,
+    Option<String>,
+);
+
+fn plain_view_of_model(meta: Option<&NormalizedMeta>) -> PlainView {
+    meta.map_or((None, None, None, None, None), |m| {
+        (
+            m.version,
+            m.milli_timestamp,
+            m.changeset,
+            m.uid,
+            m.user.clone(),
+        )
+    })
+}
+
+fn plain_view_of_info(info: &pbfhogg::Info<'_>, what: &str) -> PlainView {
+    (
+        info.claimed_version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.user().map(|user| {
+            user.unwrap_or_else(|e| panic!("{what}: user: {e}"))
+                .to_owned()
+        }),
+    )
+}
+
+fn public_view_of_model(decoded: &model::DecodedPbf) -> Vec<PublicView> {
+    let nodes = decoded.nodes.iter().map(|n| PublicView::Node {
+        id: n.id,
+        nano: (n.nano_lat, n.nano_lon),
+        tags: n.tags.clone(),
+        version: n.meta.as_ref().and_then(|m| m.version),
+        milli_timestamp: n.meta.as_ref().and_then(|m| m.milli_timestamp),
+    });
+    let ways = decoded.ways.iter().map(|w| PublicView::Way {
+        id: w.id,
+        refs: w.refs.clone(),
+        locations: w.locations.clone(),
+        tags: w.tags.clone(),
+        meta: plain_view_of_model(w.meta.as_ref()),
+    });
+    let relations = decoded.relations.iter().map(|r| PublicView::Relation {
+        id: r.id,
+        members: r
+            .members
+            .iter()
+            .map(|m| (m.member_type, m.ref_id, m.role.clone()))
+            .collect(),
+        tags: r.tags.clone(),
+        meta: plain_view_of_model(r.meta.as_ref()),
+    });
+    nodes.chain(ways).chain(relations).collect()
+}
+
+/// Collect a checked tag iterator, failing on an unresolvable index.
+fn checked_tags<'a, E: std::fmt::Display>(
+    tags: impl Iterator<Item = Result<(&'a str, &'a str), E>>,
+    what: &str,
+) -> Vec<(String, String)> {
+    tags.map(|tag| {
+        let (k, v) = tag.unwrap_or_else(|e| panic!("{what}: tag: {e}"));
+        (k.to_owned(), v.to_owned())
+    })
+    .collect()
+}
+
+/// A member kind as the public API reports it, unknown values kept.
+fn member_kind(kind: pbfhogg::MemberType) -> MemberKind {
+    match kind {
+        pbfhogg::MemberType::Node => MemberKind::Node,
+        pbfhogg::MemberType::Way => MemberKind::Way,
+        pbfhogg::MemberType::Relation => MemberKind::Relation,
+        pbfhogg::MemberType::Unknown(raw) => MemberKind::Unknown(raw),
+        other => panic!("member type the oracle does not know: {other:?}"),
+    }
+}
+
+fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        let blob = blob.expect("read blob");
+        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
+            continue;
+        };
+        for element in block.elements() {
+            out.push(match element {
+                Element::DenseNode(n) => {
+                    let what = format!("dense node {}", n.id());
+                    let (version, milli_timestamp) = n.info().map_or((None, None), |i| {
+                        let version = i.claimed_version();
+                        let ms = i.milli_timestamp();
+                        let claimed = if version.is_some() {
+                            i.columns().timestamp()
+                        } else {
+                            ms != 0
+                        };
+                        (version, claimed.then_some(ms))
+                    });
+                    PublicView::Node {
+                        id: n.id(),
+                        nano: (n.nano_lat(), n.nano_lon()),
+                        tags: checked_tags(n.tags_checked(), &what),
+                        version,
+                        milli_timestamp,
+                    }
+                }
+                Element::Node(n) => {
+                    let what = format!("node {}", n.id());
+                    let info = n.info();
+                    PublicView::Node {
+                        id: n.id(),
+                        nano: (n.nano_lat(), n.nano_lon()),
+                        tags: checked_tags(n.tags_checked(), &what),
+                        version: info.claimed_version(),
+                        milli_timestamp: info.milli_timestamp(),
+                    }
+                }
+                Element::Way(w) => {
+                    let what = format!("way {}", w.id());
+                    let locations: Vec<(i64, i64)> = w
+                        .node_locations()
+                        .map(|l| (l.nano_lat(), l.nano_lon()))
+                        .collect();
+                    PublicView::Way {
+                        id: w.id(),
+                        refs: w.refs().collect(),
+                        locations: (!locations.is_empty()).then_some(locations),
+                        tags: checked_tags(w.tags_checked(), &what),
+                        meta: plain_view_of_info(&w.info(), &what),
+                    }
+                }
+                Element::Relation(r) => {
+                    let what = format!("relation {}", r.id());
+                    PublicView::Relation {
+                        id: r.id(),
+                        members: r
+                            .members()
+                            .map(|m| {
+                                let role = m
+                                    .role()
+                                    .unwrap_or_else(|e| panic!("{what}: role: {e}"))
+                                    .to_owned();
+                                (member_kind(m.id.member_type()), m.id.id(), role)
+                            })
+                            .collect(),
+                        tags: checked_tags(r.tags_checked(), &what),
+                        meta: plain_view_of_info(&r.info(), &what),
+                    }
+                }
+                other => panic!("element kind the oracle does not know: {other:?}"),
+            });
+        }
+    }
+    out
 }
 
 /// Assert that a PBF file is sorted by `Sort.Type_then_ID`:
@@ -1515,12 +1401,14 @@ pub fn assert_sorted_file(path: &Path) {
         .expect("read complete sorted PBF");
 }
 
-/// Assert that two PBF files are element-equivalent.
+/// Assert that two PBF files are element-equivalent: [`read_normalized`] of
+/// each, compared section by section, metadata claims, embedded way
+/// locations and tag order included. A command allowed to rewrite something
+/// (DEVIATIONS.md "Re-encoding: absent metadata fields stay absent") is
+/// tested against its expected output, not through a weaker comparison.
 ///
-/// Reads both via `read_normalized` and compares section-by-section. On
-/// mismatch, panics with the standard `assert_eq!` pretty-printed diff so the
-/// first diverging element is visible. Compares sizes separately from
-/// contents so a count mismatch surfaces before an iterator zip stops early.
+/// Compares sizes before contents so a count mismatch surfaces before the
+/// zip stops early.
 pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
     let a = read_normalized(path_a);
     let b = read_normalized(path_b);
@@ -1557,7 +1445,6 @@ pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
         assert_eq!(ra, rb, "relation at sorted index {i} differs");
     }
 }
-
 // ---------------------------------------------------------------------------
 // Error helpers for platform-specific I/O tests
 // ---------------------------------------------------------------------------

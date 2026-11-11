@@ -194,31 +194,6 @@ in the hooks sweep. Element-cut tests use hundreds of thousands of nodes.
 Fix: small injected thresholds, one tiered production-default test, and an injected
 planner policy. Enforcement: typed policy construction.
 
-## VER-039 - The shared equivalence oracle discards meaningful metadata
-
-Reported by lib-integration.
-
-`meta_from_info` in `common/mod.rs` drops plain metadata when `version()` is absent, the
-normalizers truncate milliseconds and collapse absent to zero or empty, and plain and
-dense follow different presence rules, while `read/claims.rs` `MetaClaims` preserves
-individual claims. Equivalence tests can miss lost unversioned metadata or subsecond
-changes.
-
-Fix: an independently decoded comparison model preserving presence and precision, with
-narrower comparisons where commands intentionally change fields. Enforcement:
-counterexamples differing by one field or one millisecond.
-
-## VER-040 - The same oracle hides decode errors, duplicate tags and unknown member types
-
-Reported by lib-integration.
-
-The normalizers in `common/mod.rs` collect tags into `BTreeMap`, turn failed user and role
-lookups into empty strings, and collapse unknown member types to `"unknown"`; the
-coordinate reader swallows role errors.
-
-Fix: preserve multiplicity and numeric unknown types, and fail on unexpected decode errors.
-Enforcement: negative tests of the helpers and a scoped lint on error-to-empty conversions.
-
 ## VER-050 - Large apply-changes fixtures pay production thresholds to test scheduling
 
 Reported by lib-integration.
@@ -231,16 +206,28 @@ Fix: extract batch scheduling and ordered-error selection behind explicit limits
 small, keeping format-limit coverage separate. Enforcement: observed batch events and a
 selected tier for large scenarios.
 
-## VER-054 - The canonical fixture writer is three implementations
+## VER-133 - Test-local metadata readers and PBF writers bypass the shared oracle
 
-Reported by lib-integration.
+Found while closing the shared-oracle work.
 
-`write_blocks`, `write_indexed_pbf` and `write_test_pbf_non_indexed` in `common/mod.rs` repeat
-traversal, metadata conversion and flushing, while parity tests claim inputs differ only in
-indexdata.
+`common::read_normalized` now decodes independently and refuses what it cannot
+resolve, but many test files keep their own lossy projections outside
+`crates/lib/tests/common`, where the `test-oracles-no-error-to-empty` text rule
+does not reach: `info_meta` and `ordered_elements` in `crates/cli/tests/cli_cat.rs`
+(version-gated, `unwrap_or(0)`, `user().unwrap_or("")`), `info_meta` and
+`assert_roundtrip` in `crates/lib/tests/proptests.rs` (seconds, `BTreeMap` tags),
+`RawNodeMeta` in `crates/lib/tests/getid.rs` and `read_raw_node_meta` in
+`crates/cli/tests/cli_sort.rs` (`unwrap_or("")`, `and_then(Result::ok)`),
+`read_nodes_with_metadata` in `crates/cli/tests/cli_time_filter.rs` (seconds,
+`version().unwrap_or(0)`), the member reader in
+`crates/cli/tests/cli_apply_changes_osmium.rs` (`_ => "unknown"`), and the sorted
+tags of `crates/lib/tests/read_paths.rs`. About 110 `PbfWriter::new` or `to_path`
+loops across some 45 test files (cli_digest's `write_full`, cli_time_filter's
+`write_node_blocks` among them) repeat the fixture traversal instead of
+`encode_fixture_blocks` plus `frame_fixture_blocks`.
 
-Fix: generate logical blocks once and parameterize framing. Enforcement: verify paired fixtures
-have identical payloads and only the intended envelope differences.
+Fix: route each through `read_normalized` or the model, or state why a projection
+is deliberately narrower; widen the text rule to the test trees once they are clean.
 
 ## VER-065 - Merge correctness fixtures scale with production batch tuning
 

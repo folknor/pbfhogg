@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use crate::common::{
-    NormalizedPbf, TestMember, TestMeta, TestNode, TestRelation, TestWay, generate_nodes,
-    generate_ways, node_ids_with_coords as node_ids, read_all_elements_with_coords,
+    NormalizedMeta, NormalizedPbf, TestMember, TestMeta, TestNode, TestRelation, TestWay,
+    generate_nodes, generate_ways, node_ids_with_coords as node_ids, read_all_elements_with_coords,
     read_normalized, relation_ids_with_coords as relation_ids, way_ids_with_coords as way_ids,
     write_multi_block_test_pbf, write_test_pbf,
 };
@@ -688,93 +688,78 @@ fn cat_with_clean(clean_attrs: &[&str]) -> NormalizedPbf {
     read_normalized(&output)
 }
 
+/// The sentinel's claims as written: every field, `visible` included.
+fn sentinel_claims() -> NormalizedMeta {
+    let m = sentinel_meta();
+    NormalizedMeta {
+        version: Some(m.version),
+        milli_timestamp: Some(m.timestamp * 1000),
+        changeset: Some(m.changeset),
+        uid: Some(m.uid),
+        user: Some(m.user.to_owned()),
+        visible: Some(m.visible),
+    }
+}
+
+/// Assert each kind's claims after a clean: `node` for the dense node,
+/// `plain` for the way and the relation, whose `Info` keeps presence per
+/// field (DEVIATIONS.md "Re-encoding: absent metadata fields stay absent").
+/// `claims` as a plain `Info` carries them: the writer leaves a plain
+/// `visible` true out, the PBF default, so it is no claim there.
+fn as_plain(claims: &NormalizedMeta) -> NormalizedMeta {
+    NormalizedMeta {
+        visible: None,
+        ..claims.clone()
+    }
+}
+
+fn assert_clean_claims(c: &NormalizedPbf, node: Option<&NormalizedMeta>, plain: &NormalizedMeta) {
+    assert_eq!(c.nodes[0].meta.as_ref(), node, "node");
+    assert_eq!(c.ways[0].meta.as_ref(), Some(plain), "way");
+    assert_eq!(c.relations[0].meta.as_ref(), Some(plain), "relation");
+}
+
 #[test]
 fn clean_default_preserves_all_metadata() {
     let c = cat_with_clean(&[]);
-
-    // Nothing cleaned - every field should round-trip to the sentinel.
-    let sentinel = sentinel_meta();
-    for (what, meta) in [
-        ("node", c.nodes[0].meta.as_ref()),
-        ("way", c.ways[0].meta.as_ref()),
-        ("relation", c.relations[0].meta.as_ref()),
-    ] {
-        let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
-        assert_eq!(m.version, sentinel.version, "{what} version");
-        assert_eq!(m.timestamp, sentinel.timestamp, "{what} timestamp");
-        assert_eq!(m.changeset, sentinel.changeset, "{what} changeset");
-        assert_eq!(m.uid, sentinel.uid, "{what} uid");
-        assert_eq!(m.user, sentinel.user, "{what} user");
-    }
+    assert_clean_claims(&c, Some(&sentinel_claims()), &as_plain(&sentinel_claims()));
 }
 
 #[test]
 fn clean_version_only() {
     let c = cat_with_clean(&["version"]);
-    let sentinel = sentinel_meta();
-
-    for (what, meta) in [
-        ("node", c.nodes[0].meta.as_ref()),
-        ("way", c.ways[0].meta.as_ref()),
-        ("relation", c.relations[0].meta.as_ref()),
-    ] {
-        let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
-        assert_eq!(m.version, 0, "{what} version must be zeroed");
-        assert_eq!(
-            m.timestamp, sentinel.timestamp,
-            "{what} timestamp must survive"
-        );
-        assert_eq!(
-            m.changeset, sentinel.changeset,
-            "{what} changeset must survive"
-        );
-        assert_eq!(m.uid, sentinel.uid, "{what} uid must survive");
-        assert_eq!(m.user, sentinel.user, "{what} user must survive");
-    }
+    let cleaned = NormalizedMeta {
+        version: None,
+        ..sentinel_claims()
+    };
+    // A dense slot below version 1 claims only values padding never holds,
+    // so its `visible` true is no longer a claim.
+    let node = NormalizedMeta {
+        visible: None,
+        ..cleaned.clone()
+    };
+    assert_clean_claims(&c, Some(&node), &as_plain(&cleaned));
 }
 
 #[test]
 fn clean_user_only() {
     let c = cat_with_clean(&["user"]);
-    let sentinel = sentinel_meta();
-
-    for (what, meta) in [
-        ("node", c.nodes[0].meta.as_ref()),
-        ("way", c.ways[0].meta.as_ref()),
-        ("relation", c.relations[0].meta.as_ref()),
-    ] {
-        let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
-        assert_eq!(m.version, sentinel.version, "{what} version must survive");
-        assert_eq!(
-            m.timestamp, sentinel.timestamp,
-            "{what} timestamp must survive"
-        );
-        assert_eq!(
-            m.changeset, sentinel.changeset,
-            "{what} changeset must survive"
-        );
-        assert_eq!(m.uid, sentinel.uid, "{what} uid must survive");
-        assert_eq!(m.user, "", "{what} user must be empty");
-    }
+    let cleaned = NormalizedMeta {
+        user: Some(String::new()),
+        ..sentinel_claims()
+    };
+    assert_clean_claims(&c, Some(&cleaned), &as_plain(&cleaned));
 }
 
 #[test]
 fn clean_timestamp_and_changeset() {
     let c = cat_with_clean(&["timestamp", "changeset"]);
-    let sentinel = sentinel_meta();
-
-    for (what, meta) in [
-        ("node", c.nodes[0].meta.as_ref()),
-        ("way", c.ways[0].meta.as_ref()),
-        ("relation", c.relations[0].meta.as_ref()),
-    ] {
-        let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
-        assert_eq!(m.version, sentinel.version, "{what} version must survive");
-        assert_eq!(m.timestamp, 0, "{what} timestamp must be zeroed");
-        assert_eq!(m.changeset, 0, "{what} changeset must be zeroed");
-        assert_eq!(m.uid, sentinel.uid, "{what} uid must survive");
-        assert_eq!(m.user, sentinel.user, "{what} user must survive");
-    }
+    let cleaned = NormalizedMeta {
+        milli_timestamp: Some(0),
+        changeset: Some(0),
+        ..sentinel_claims()
+    };
+    assert_clean_claims(&c, Some(&cleaned), &as_plain(&cleaned));
 }
 
 #[test]
@@ -783,26 +768,17 @@ fn clean_all_fields() {
 
     // A dense node with every field cleaned is version 0 with all-zero
     // fields, which on the wire is indistinguishable from a metadata-less
-    // padding slot, so it reads back as no metadata (the product's dense
-    // presence rule, `DenseNodeInfo::claims`).
-    assert!(
-        c.nodes[0].meta.is_none(),
-        "an all-zero dense slot reads as no metadata"
-    );
-
-    // Every cleanable field is zero / empty on ways and relations, whose
-    // Info carries presence per field.
-    for (what, meta) in [
-        ("way", c.ways[0].meta.as_ref()),
-        ("relation", c.relations[0].meta.as_ref()),
-    ] {
-        let m = meta.unwrap_or_else(|| panic!("{what} should carry metadata"));
-        assert_eq!(m.version, 0, "{what} version");
-        assert_eq!(m.timestamp, 0, "{what} timestamp");
-        assert_eq!(m.changeset, 0, "{what} changeset");
-        assert_eq!(m.uid, 0, "{what} uid");
-        assert_eq!(m.user, "", "{what} user");
-    }
+    // padding slot, so it claims nothing. Ways and relations keep each
+    // field present, zeroed.
+    let plain = NormalizedMeta {
+        version: None,
+        milli_timestamp: Some(0),
+        changeset: Some(0),
+        uid: Some(0),
+        user: Some(String::new()),
+        visible: None,
+    };
+    assert_clean_claims(&c, None, &plain);
 }
 
 /// Elements that started with no metadata must remain without metadata

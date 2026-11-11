@@ -1071,8 +1071,22 @@ fn degrade_strip_locations_clears_low_and_preserves_elements() {
 
     let original = read_normalized(&input);
     let degraded = read_normalized(&output);
+    assert!(
+        original.ways.iter().all(|w| w.locations.is_some()),
+        "fixture ways must carry inline locations for the strip to be meaningful"
+    );
+    // The strip removes exactly the inline locations.
+    let expected_ways: Vec<_> = original
+        .ways
+        .iter()
+        .cloned()
+        .map(|mut w| {
+            w.locations = None;
+            w
+        })
+        .collect();
     assert_eq!(original.nodes, degraded.nodes);
-    assert_eq!(original.ways, degraded.ways);
+    assert_eq!(expected_ways, degraded.ways);
     assert_eq!(original.relations, degraded.relations);
 }
 

@@ -138,8 +138,12 @@ fn assert_renumbered_input(output: &Path, stats: &RenumberStats, cell: &str) {
     assert_eq!(norm.nodes.len(), originals.len(), "{cell}");
     for ((node, original), new_id) in norm.nodes.iter().zip(&originals).zip(1_i64..) {
         assert_eq!(node.id, new_id, "{cell}");
-        assert_eq!((node.lat, node.lon), (original.lat, original.lon), "{cell}");
-        let named = node.tags.get("name").map(String::as_str);
+        assert_eq!(
+            (node.decimicro_lat(), node.decimicro_lon()),
+            (original.lat, original.lon),
+            "{cell}"
+        );
+        let named = node.tag("name");
         assert_eq!(named, (original.id == 25).then_some("pinned"), "{cell}");
     }
     assert_eq!(norm.ways.len(), 5, "{cell}");
@@ -152,7 +156,7 @@ fn assert_renumbered_input(output: &Path, stats: &RenumberStats, cell: &str) {
         norm.relations[r]
             .members
             .iter()
-            .map(|m| (m.member_type.clone(), m.ref_id, m.role.clone()))
+            .map(|m| (m.member_type.as_str().to_owned(), m.ref_id, m.role.clone()))
             .collect()
     };
     assert_eq!(norm.relations.len(), 2, "{cell}");

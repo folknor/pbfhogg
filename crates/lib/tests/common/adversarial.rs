@@ -34,7 +34,7 @@
 //!   oneof data
 //!     field 1, bytes raw            uncompressed
 //!     field 3, bytes zlib_data      zlib-compressed
-//!     field 5, bytes zstd_data      zstd-compressed
+//!     field 7, bytes zstd_data      zstd-compressed
 //! ```
 //!
 //! When a payload mutation lands we re-emit the Blob as raw (uncompressed)
@@ -611,7 +611,25 @@ fn read_bytes_field(msg: &[u8], target_field: u64) -> Option<Vec<u8>> {
     None
 }
 
-fn decompress_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
+/// `msg` with every occurrence of the fields in `drop` removed, the other
+/// fields' bytes kept as they are, in order.
+pub fn without_fields(msg: &[u8], drop: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < msg.len() {
+        let start = pos;
+        let (tag, n) = read_varint(&msg[pos..]).expect("field tag");
+        pos += n;
+        skip_field(msg, &mut pos, tag & 7).expect("field body");
+        if !drop.contains(&(tag >> 3)) {
+            out.extend_from_slice(&msg[start..pos]);
+        }
+    }
+    out
+}
+
+/// The decompressed payload of a Blob message (raw, zlib or zstd).
+pub fn decompress_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
     let mut pos = 0;
     let mut data: Option<(u64, Vec<u8>)> = None;
     while pos < blob.len() {
@@ -620,7 +638,7 @@ fn decompress_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
         let wire = tag & 7;
         pos += np;
         match (field, wire) {
-            (1, 2) | (3, 2) | (5, 2) => {
+            (1, 2) | (3, 2) | (7, 2) => {
                 let (len, n) = read_varint(&blob[pos..]).ok_or("bad blob data length")?;
                 pos += n;
                 let len_us = usize::try_from(len).map_err(|e| e.to_string())?;
@@ -646,7 +664,7 @@ fn decompress_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
                 .map_err(|e| e.to_string())?;
             Ok(out)
         }
-        5 => zstd::stream::decode_all(&bytes[..]).map_err(|e| e.to_string()),
+        7 => zstd::stream::decode_all(&bytes[..]).map_err(|e| e.to_string()),
         other => Err(format!("unsupported Blob data field {other}")),
     }
 }

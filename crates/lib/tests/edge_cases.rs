@@ -125,10 +125,7 @@ fn zero_ref_way_roundtrips() {
         "zero-ref way must round-trip with empty refs"
     );
     // Tag must still be present.
-    assert_eq!(
-        c.ways[0].tags.get("note").map(String::as_str),
-        Some("empty")
-    );
+    assert_eq!(c.ways[0].tag("note"), Some("empty"));
 }
 
 #[test]
@@ -162,10 +159,7 @@ fn zero_member_relation_roundtrips() {
         0,
         "zero-member relation must round-trip with empty members"
     );
-    assert_eq!(
-        c.relations[0].tags.get("type").map(String::as_str),
-        Some("empty")
-    );
+    assert_eq!(c.relations[0].tag("type"), Some("empty"));
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +187,7 @@ fn empty_string_tag_value_roundtrips() {
     let c = read_normalized(&path);
     assert_eq!(c.nodes.len(), 1);
     assert_eq!(
-        c.nodes[0].tags.get("empty_value").map(String::as_str),
+        c.nodes[0].tag("empty_value"),
         Some(""),
         "empty-string tag value must round-trip as \"\" (not dropped)"
     );
@@ -710,6 +704,6 @@ fn fixture_tags_borrow_local_strings_for_every_kind() {
         &contents.ways[0].tags,
         &contents.relations[0].tags,
     ] {
-        assert_eq!(tags.get(&key), Some(&value));
+        assert_eq!(tags, &vec![(key.clone(), value.clone())]);
     }
 }

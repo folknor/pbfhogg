@@ -13,10 +13,12 @@
 //! Structure: for each command, build the same logical input twice
 //! (indexed via `write_test_pbf_sorted`, non-indexed via
 //! `write_test_pbf_non_indexed`), run the command with `force: true`
-//! against both, and `assert_elements_equivalent` the outputs.
-//! `assert_elements_equivalent` ignores string-table ordering, blob
-//! layout, and metadata absence differences; it only compares the
-//! element-level content contract.
+//! against both, and `assert_elements_equivalent` the outputs. The two
+//! inputs hold the same blocks and differ only in the BlobHeaders'
+//! `indexdata` and `tagdata` (`oracle_model.rs` checks the writers keep
+//! it so). `assert_elements_equivalent` ignores string-table ordering and
+//! blob layout but compares every element field, metadata claims
+//! (presence included) and tag order among them.
 
 use crate::common::{
     TestMember, TestMeta, TestNode, TestRelation, TestWay, assert_elements_equivalent,

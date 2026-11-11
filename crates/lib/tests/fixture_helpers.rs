@@ -143,12 +143,17 @@ fn test_meta_roundtrips_through_writer() {
 
     let n1 = c.nodes.iter().find(|n| n.id == 1).expect("node 1");
     let m = n1.meta.as_ref().expect("node 1 should carry metadata");
-    assert_eq!(m.version, 3);
-    assert_eq!(m.timestamp, 1_700_000_000);
-    assert_eq!(m.changeset, 424_242);
-    assert_eq!(m.uid, 99);
-    assert_eq!(m.user, "tester");
-    assert!(m.visible);
+    assert_eq!(
+        *m,
+        crate::common::NormalizedMeta {
+            version: Some(3),
+            milli_timestamp: Some(1_700_000_000_000),
+            changeset: Some(424_242),
+            uid: Some(99),
+            user: Some("tester".to_owned()),
+            visible: Some(true),
+        }
+    );
 
     // A block mixing metadata-bearing and metadata-less nodes should still
     // round-trip: the metadata-less node reads back with no metadata.
@@ -203,8 +208,8 @@ fn base_and_changed_fixtures_differ_by_the_documented_edits() {
     expected.nodes.retain(|node| node.id != 7);
     expected.nodes.push(crate::common::NormalizedNode {
         id: 301,
-        lat: 301_000,
-        lon: 301_000,
+        nano_lat: 30_100_000,
+        nano_lon: 30_100_000,
         tags: Default::default(),
         meta: None,
     });

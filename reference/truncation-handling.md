@@ -589,14 +589,22 @@ on partial input.
   property-based: arbitrary truncation length is finite Ok/Err,
   never panics.
 
-**Command layer** (`crates/cli/tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
-drives `cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
-and `renumber` through truncation offsets inside every blob's
-length prefix, header and payload, plus uniformly spaced offsets
-across the file. The commands read the input by different routes, so
-between them they reach several of the contract sites listed above;
-the sweep does not map each command to a site. For
-shape 2-4 offsets, asserts non-zero exit. For shape 1 offsets,
+**Command layer** (`crates/cli/tests/cli_truncation_sweep.rs`) is a
+representative matrix, not an exhaustive boundary sweep: six routes
+(`cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
+`renumber`) by five cases, each case its own named test running one
+child under its own watchdog (`cat::truncated_payload` and so on).
+The cases cut the final data frame, so every route first sees a
+complete header and data: a valid-input control, a partial length
+prefix (shape 1), a complete prefix with nothing after it (shape 2),
+a header cut one byte short (shape 3) and a payload cut one byte
+short (shape 4). The routes read the input differently, so between
+them they reach several of the contract sites listed above; the
+matrix does not map each route to a site, and a test checks every
+route is still a command in the production clap tree. Exhaustive
+boundary coverage belongs to the frame-conformance and reader-layer
+tests above. For shapes 2-4 each case asserts non-zero exit; the
+valid control must succeed. For shape 1 it
 asserts no-panic + bounded stderr only - command-level outcome on
 a partial-input file is per-command policy (sort may legitimately
 reject a tail truncation that drops most data blobs even when the
@@ -656,8 +664,8 @@ and inherits the contract.
   panic rather than tripping a cheaper structural assert first.
 
 A regression at any of the contract sites surfaces as a
-reader-layer test failure (the sweep is the end-to-end backstop
-for the six commands listed above specifically).
+reader-layer test failure (the command-layer matrix is the
+end-to-end backstop for its six routes specifically).
 
 ## Implementation status
 

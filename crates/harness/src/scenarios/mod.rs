@@ -6,6 +6,7 @@ mod cancel;
 mod concurrent_cat;
 mod error_path;
 mod executor;
+pub(crate) mod file_assertions;
 mod isolation_cat;
 mod nofile;
 mod page_cache;

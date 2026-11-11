@@ -153,13 +153,7 @@ fn test_meta_roundtrips_through_writer() {
     // A block mixing metadata-bearing and metadata-less nodes should still
     // round-trip: the metadata-less node reads back with no metadata.
     let n2 = c.nodes.iter().find(|n| n.id == 2).expect("node 2");
-    // `read_normalized` returns `None` for elements that the writer emitted
-    // without an Info block. Mixing nodes with and without metadata in one
-    // block forces the backfill path inside BlockBuilder; its zeroed entries
-    // surface as `Some` metadata on read because a zero-version Info block
-    // IS written. Accept either shape - the important contract is that the
-    // writer did not crash and the element is present.
-    let _ = n2.meta.as_ref();
+    assert_eq!(n2.meta, None);
 }
 
 /// Smoke-check that `assert_indexed` passes for a file written with the
@@ -205,20 +199,80 @@ fn base_and_changed_fixtures_differ_by_the_documented_edits() {
     crate::common::write_changed_pbf(&changed);
     crate::common::assert_indexed(&base);
     crate::common::assert_sorted_file(&base);
-    let base = crate::common::read_all_elements_id_only(&base);
-    let changed = crate::common::read_all_elements_id_only(&changed);
-    let mut nodes = crate::common::node_ids_id_only(&base);
-    nodes.retain(|&id| id != 7);
-    nodes.push(301);
-    assert_eq!(crate::common::node_ids_id_only(&changed), nodes);
-    let mut ways = crate::common::way_ids_id_only(&base);
-    ways.retain(|&id| id != 40);
-    assert_eq!(crate::common::way_ids_id_only(&changed), ways);
+    let mut expected = read_normalized(&base);
+    expected.nodes.retain(|node| node.id != 7);
+    expected.nodes.push(crate::common::NormalizedNode {
+        id: 301,
+        lat: 301_000,
+        lon: 301_000,
+        tags: Default::default(),
+        meta: None,
+    });
+    expected.ways.retain(|way| way.id != 40);
+    let actual = read_normalized(&changed);
+    assert_eq!(actual.nodes, expected.nodes);
+    assert_eq!(actual.ways, expected.ways);
+    assert_eq!(actual.relations, expected.relations);
 }
 
 // ---------------------------------------------------------------------------
 // Scratch and adversarial helpers
 // ---------------------------------------------------------------------------
+
+#[test]
+fn bad_indexdata_fixture_contains_exactly_thirty_zero_bytes() {
+    let dir = crate::common::test_scratch();
+    let path = dir.child("bad-index.osm.pbf");
+    crate::common::write_bad_indexdata_pbf(&path);
+    let bytes = std::fs::read(path).expect("read fixture");
+    let stream =
+        crate::common::adversarial::locate_blobs_strict(&bytes).expect("complete fixture framing");
+    let (blob, kind) = &stream.frames[1];
+    assert_eq!(kind.as_slice(), b"OSMData");
+    assert_eq!(
+        crate::common::adversarial::blob_indexdata(&bytes[blob.header_start..blob.header_end]),
+        Some([0_u8; 30].as_slice())
+    );
+}
+
+#[test]
+fn every_blob_index_guard_rejects_empty_and_incomplete_streams() {
+    use crate::common::adversarial::locate_blobs;
+    let dir = crate::common::test_scratch();
+    let good = dir.child("good.osm.pbf");
+    write_test_pbf_sorted(&good, &generate_nodes(3, 1), &[], &[]);
+    crate::common::assert_every_data_blob_indexed(&good);
+    let bytes = std::fs::read(&good).expect("read fixture");
+    let frames = locate_blobs(&bytes);
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    let mut malformed_header = bytes.clone();
+    malformed_header[frames[1].header_start] = 0;
+    let cases = [
+        Vec::new(),
+        vec![0],
+        vec![0, 0, 0, 10, 0],
+        bytes[..frames[0].blob_end].to_vec(),
+        bytes[..bytes.len() - 1].to_vec(),
+        trailing,
+        malformed_header,
+    ];
+    for (i, input) in cases.iter().enumerate() {
+        let path = dir.child(format!("invalid-{i}.osm.pbf"));
+        std::fs::write(&path, input).expect("write invalid fixture");
+        assert!(
+            std::panic::catch_unwind(|| crate::common::assert_every_data_blob_indexed(&path))
+                .is_err(),
+            "invalid case {i} passed the index guard"
+        );
+    }
+    let unindexed = dir.child("unindexed.osm.pbf");
+    crate::common::write_test_pbf_non_indexed(&unindexed, &generate_nodes(3, 1), &[], &[]);
+    assert!(
+        std::panic::catch_unwind(|| crate::common::assert_every_data_blob_indexed(&unindexed))
+            .is_err()
+    );
+}
 
 /// Runs `snapshot_dir` on `root` and returns its panic message. The scratch
 /// guard stays outside the caught closure: a guard dropped while unwinding

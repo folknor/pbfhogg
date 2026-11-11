@@ -337,34 +337,32 @@ pub(super) fn has_gap_creates(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/create_run_fixture.rs"]
+mod create_run_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `crates/lib/tests/apply_changes_create_runs.rs`
-    /// (`a_create_run_past_one_executor_batch_is_written_whole_and_in_order`)
-    /// pins a create run past one executor batch with a run of this many full
-    /// blocks and one element, and
-    /// (`a_create_run_failing_in_a_later_batch_returns_the_earliest_failure`)
-    /// fails the two blocks after this many clean ones. They cannot read the
-    /// crate-private batch size, so the preconditions on where their blocks
-    /// fall are checked here, against the expression `write_run` batches by.
-    const BOUNDARY_FIXTURE_FULL_BLOCKS: usize = 65;
+    // Share the integration fixture's shape rather than guarding a second
+    // handwritten count that can drift independently of the actual run.
+    use super::create_run_fixture::BOUNDARY_RUN_FULL_BLOCKS;
 
     #[test]
     fn the_batch_boundary_fixture_spans_more_than_one_batch() {
         let cap = DEFAULT_ELEMENT_CAP.get();
-        let run = 0..BOUNDARY_FIXTURE_FULL_BLOCKS * cap + 1;
+        let run = 0..BOUNDARY_RUN_FULL_BLOCKS * cap + 1;
         assert!(
             chunks(run, cap * APPLY_CHANGES_CREATE_BATCH_BLOCKS).count() > 1,
             "APPLY_CHANGES_CREATE_BATCH_BLOCKS holds the batch-boundary fixture's \
              whole run in one batch: grow the run in tests/apply_changes_create_runs.rs \
-             and this constant together"
+             by changing its shared fixture definition"
         );
         // The failure fixture there fails the two blocks after the clean
         // full ones (`BOUNDARY_RUN_FULL_BLOCKS` and the one after it); they
         // must share a batch, and not the first.
         let batch_of = |block: usize| block / APPLY_CHANGES_CREATE_BATCH_BLOCKS;
-        let first_failing = BOUNDARY_FIXTURE_FULL_BLOCKS;
+        let first_failing = BOUNDARY_RUN_FULL_BLOCKS;
         assert!(
             batch_of(first_failing) > 0 && batch_of(first_failing) == batch_of(first_failing + 1),
             "the create-run failure fixture in tests/apply_changes_create_runs.rs no \

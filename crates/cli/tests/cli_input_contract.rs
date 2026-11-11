@@ -579,6 +579,8 @@ fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
 
 /// getparents with the hidden threshold instrument, which sends a small
 /// indexed file to the full-scan arm. An unindexed first blob keeps the walker.
+/// The flag exists only in test-hooks builds.
+#[cfg(feature = "test-hooks")]
 fn getparents_full_scan(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--full-scan-min-blobs", "1"])
 }
@@ -1593,6 +1595,7 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         getparents_add_self,
         Mixed::RefusesPartial,
     ),
+    #[cfg(feature = "test-hooks")]
     (
         "getparents --full-scan-min-blobs 1",
         getparents_full_scan,
@@ -1789,6 +1792,7 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
         Mixed::RefusesPartial,
     ),
     ("getparents", getparents, &[], Mixed::RefusesPartial),
+    #[cfg(feature = "test-hooks")]
     (
         "getparents --full-scan-min-blobs 1 (walker: first blob unindexed)",
         getparents_full_scan,
@@ -2080,13 +2084,15 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let missing = dir.path().join("missing-ids.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
-    let modes: [(&str, &[&str]); 4] = [
+    let modes: &[(&str, &[&str])] = &[
         ("getid", &[]),
         ("getid", &["--invert"]),
         ("getparents", &[]),
+        // The threshold flag exists only in test-hooks builds.
+        #[cfg(feature = "test-hooks")]
         ("getparents", &["--full-scan-min-blobs", "1"]),
     ];
-    for (command, extra) in modes {
+    for &(command, extra) in modes {
         let out = CliInvoker::new(&invocation_scratch)
             .arg(command)
             .arg(&fifo)
@@ -2280,9 +2286,11 @@ mod check_composition {
                 .arg(&input)
                 .args(extra)
                 .arg("--json")
-                .replace_input(&input)
-                .replace_with(&replacement)
-                .replace_after(after)
+                .replace_input(
+                    &input,
+                    &replacement,
+                    std::num::NonZeroU64::new(after).expect("opens are counted from 1"),
+                )
                 .force_pin_path_reopen(force_path)
                 .replace_report(&report_file)
                 .run();

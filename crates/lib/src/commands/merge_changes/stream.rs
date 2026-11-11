@@ -897,40 +897,27 @@ fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> cra
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// One input cut into many batches.
-    fn many_batch_input(dir: &Path) -> std::path::PathBuf {
-        let path = dir.join("input.osc");
-        let mut body = String::from("<osmChange version=\"0.6\"><create>");
-        for k in 0..crate::tunables::MERGE_CHANGES_BATCH_BYTES / 2 {
-            body.push_str(&format!("<node id=\"{k}\" lat=\"1\" lon=\"2\"/>"));
-        }
-        body.push_str("</create></osmChange>");
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    /// Every encode job runs on the caller's pool, never more than `lanes`
-    /// at once however wide the pool, and every batch is answered in order;
-    /// a one-thread pool with one lane completes too.
+    /// Exercise the executor directly: parsing and production batch sizing
+    /// are independent of lane admission. Result ordering belongs to the
+    /// coordinator, not the encoder's completion channel.
     #[test]
     fn encode_jobs_stay_on_the_executor_within_their_lanes() {
-        let scratch = crate::path_guard::tests::scratch();
-        let path = many_batch_input(scratch.path());
         let host = crate::host::Host::entered_for_tests();
         for (threads, lanes) in [(6, 2), (1, 1), (3, 1)] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .unwrap();
+                .expect("build executor");
             let running = AtomicUsize::new(0);
+            let started = AtomicUsize::new(0);
             let peak = AtomicUsize::new(0);
             let off_pool = AtomicUsize::new(0);
-            let inputs = [path.as_path()];
+            let rendezvous = std::sync::Barrier::new(lanes);
+            let inputs = [Path::new("synthetic.osc")];
             let plan = Plan {
                 inputs: &inputs,
                 is_gz: false,
@@ -939,22 +926,55 @@ mod tests {
                 executor: crate::host::ExecutorRef::Pool(&pool),
                 cancel: &host.invocation,
             };
-            let encode = |batch: &LexBatch, _: &Path| -> crate::Result<usize> {
+            let encode = |_: &LexBatch, _: &Path| -> crate::Result<()> {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 if pool.current_thread_index().is_none() {
                     off_pool.fetch_add(1, Ordering::SeqCst);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                // Only the first wave waits. A serial implementation cannot
+                // complete the two-lane case; later jobs exercise handoff.
+                if started.fetch_add(1, Ordering::SeqCst) < lanes {
+                    rendezvous.wait();
+                }
                 running.fetch_sub(1, Ordering::SeqCst);
-                Ok(batch.bytes())
+                Ok(())
             };
-            let batches = collect(&plan, &encode).unwrap();
-            let case = format!("threads={threads} lanes={lanes}");
-            assert!(batches[0].len() > 4, "{case}: {} batches", batches[0].len());
-            assert_eq!(off_pool.load(Ordering::SeqCst), 0, "{case}");
-            let peak = peak.load(Ordering::SeqCst);
-            assert!((1..=lanes).contains(&peak), "{case}: peak {peak}");
+            let ledger = Ledger::new(usize::MAX);
+            let encoder = Encoder::new(&plan, &ledger, &encode);
+            let (tx, rx) = std::sync::mpsc::channel();
+            pool.scope(|scope| {
+                for seq in 0..8 {
+                    encoder.submit(
+                        scope,
+                        Pending {
+                            input: 0,
+                            seq,
+                            credit: 0,
+                            batch: LexBatch::default(),
+                            tx: tx.clone(),
+                        },
+                    );
+                }
+            });
+            drop(tx);
+            let mut answered = Vec::new();
+            for message in rx {
+                let Msg::Member {
+                    input, seq, result, ..
+                } = message
+                else {
+                    panic!("encoder sent a reader message");
+                };
+                assert_eq!(input, 0);
+                result.expect("encode batch");
+                answered.push(seq);
+            }
+            answered.sort_unstable();
+            assert_eq!(answered, (0..8).collect::<Vec<_>>());
+            assert_eq!(off_pool.load(Ordering::SeqCst), 0);
+            assert_eq!(peak.load(Ordering::SeqCst), lanes);
+            assert_eq!(running.load(Ordering::SeqCst), 0);
         }
     }
 }

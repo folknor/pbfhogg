@@ -871,7 +871,15 @@ fn increment_version_and_update_timestamp_combined() {
     );
     write_versioned_pbf(&new, &[], &[]);
 
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
     let out = run_derive(&old, &new, &osc, true, true, Some(1));
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
     assert_derive_answered(
         &out,
         "diff --format osc --increment-version --update-timestamp",
@@ -886,14 +894,30 @@ fn increment_version_and_update_timestamp_combined() {
         xml.contains(r#"version="5""#),
         "way 10 version should be 5 (was 4); xml:\n{xml}"
     );
-    assert!(
-        xml.contains("timestamp="),
-        "delete elements should have a timestamp; xml:\n{xml}"
+    let timestamps: Vec<_> = xml
+        .split("timestamp=\"")
+        .skip(1)
+        .map(|tail| {
+            let value = tail.split('"').next().expect("timestamp value");
+            let seconds = pbfhogg::commands::parse_rfc3339_utc(value).expect("UTC timestamp");
+            u64::try_from(seconds).expect("timestamp after epoch")
+        })
+        .collect();
+    assert_eq!(
+        timestamps.len(),
+        2,
+        "both deletions need a timestamp: {xml}"
     );
-    assert!(
-        xml.contains("timestamp=\"20"),
-        "timestamp should be a recent ISO date; xml:\n{xml}"
+    assert_eq!(
+        timestamps[0], timestamps[1],
+        "one instant for the whole invocation"
     );
+    for timestamp in timestamps {
+        assert!(
+            (before..=after).contains(&timestamp),
+            "timestamp outside invocation clock bounds: {xml}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

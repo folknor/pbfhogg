@@ -85,20 +85,6 @@ Fix: keep the host in the fixture and borrow an entered view, or scope both in a
 closure helper. Enforcement: a lint against `Box::leak` in test infrastructure
 outside documented lifetime tests.
 
-## VER-006 - Test files can silently escape compilation
-
-Reported by lib-integration, library-harness, cli-tests, check-machinery.
-
-All three packages set `autotests = false`, so a file not declared in `all.rs` or
-the manifest never compiles and no inventory can notice. `reference/testing.md` and
-`crates/cli/tests/all.rs` acknowledge this. Every hunter that compared found no
-orphan today; check-machinery traversed 60 library, 38 CLI and one harness file.
-
-Fix: a pre-clippy, build-wired audit requiring each Rust file under a test directory
-to belong to a declared target's module graph or a checked helper exemption, tested
-in both directions, and verifying declared feature-gated modules land in an intended
-sweep. This keeps the consolidated binaries.
-
 ## VER-007 - New harness scenarios need no executable test
 
 Reported by library-harness.
@@ -125,21 +111,13 @@ inspecting the resolved feature graph. The gate checks release artifacts and doe
 make arbitrary hook-enabled builds impossible. A blanket release-mode ban would
 conflict with release-mode fault testing.
 
-## VER-009 - The no-global-fault-state checks are narrower than their promise
+## VER-009 - The static inventory cannot see synthesized state
 
-Reported by fault-injection, check-machinery.
-
-`gated_statics` in `scripts/check_source_invariants.py` reads only a static item's
-preceding attribute block. check-machinery confirmed it returns no finding for a
-static inside a `#[cfg(feature = "test-hooks")] mod`; macro-generated state is an
-admitted gap. The companion textlint covers `test_hooks.rs` but not equivalent state
-under another module name. No such state is claimed to exist today.
-
-Fix: a Rust-aware check over the expanded item graph, or a ban on mutable statics
-outside a small audited list regardless of feature spelling, with presence
-assertions for protected files, an architectural rule restricting fault-state
-construction to the invocation, and enclosing-module and macro cases in the checker
-tests.
+`scripts/check_source_invariants.py` now inventories every library static with counted,
+audited exceptions and presence checks for protected files, tested in
+`scripts/test_source_statics.py`. Unenforced: statics in synthesized macro output,
+changes within audited initializers, and an architectural rule that `FaultPlan` is
+constructed only through the invocation.
 
 ## VER-010 - The probe-lock and counter-emission guards are fixed-shape, not AST
 
@@ -166,19 +144,6 @@ read and write sources in all five tier-1 build shapes (see VER-013).
 Fix: one source-analysis entry point over one parsed corpus, run once per check, using
 one maintained Rust parser, with the command schema exported once. Enforcement: wiring
 into brokkr and no additional whole-tree scripts.
-
-## VER-013 - The I/O-size source guard is repeated and spelling-bound
-
-Reported by lib-core-unit.
-
-`crates/lib/src/write/io_buffer_contract.rs` scans the read and write trees at test
-runtime. It catches only spellings equivalent to `256*1024` and `262144`, so `1 << 18`,
-`128 * 2048` or hexadecimal bypass it; comments, strings and unrelated digits can fail
-it; an emptied directory passes.
-
-Fix: move it to the once-per-check phase with expected-file assertions and parsed
-expressions or a structural transfer-buffer abstraction, with runtime tests of
-alignment and boundaries.
 
 ## VER-014 - Most textlint rules can lose their whole corpus silently
 
@@ -270,18 +235,11 @@ result-collection boundary, with a smaller real-executor test. Enforcement: a so
 rule requiring an explicit exemption for test sleeps, and handshake tests. An injected
 clock does not control OS scheduling.
 
-## VER-022 - Counter tests wait for values they could supply
+## VER-022 - Nothing bans sleeps in counter unit tests
 
-Reported by lib-core-unit.
-
-`write/metrics.rs` sleeps 2 ms before `record_sync_all`, which already accepts elapsed
-nanoseconds. `counters.rs` couples stopwatch arithmetic to real time, and its blocked
-operation tests use 10 ms release delays retried up to twenty times: normally 30 ms, up
-to 600 ms.
-
-Fix: pass fixed values and assert exact totals, separate elapsed conversion from clock
-acquisition, and observe slow-path entry. Enforcement: exact-value tests and a ban on
-sleeps in counter unit tests.
+Counter and metrics tests in `counters.rs` and `write/metrics.rs` now use fixed values,
+exact totals and observed slow-path entry, with no sleeps. The proposed source rule
+banning sleeps in counter unit tests is not added.
 
 ## VER-023 - Timeout helpers and hang tests detach the work they time out
 
@@ -298,18 +256,6 @@ Fix: run irrecoverable hang probes in a killable child process, and keep recover
 rendezvous tests in-process with release-and-join guards or guaranteed cancellation.
 Enforcement: one hang-test harness and a ban on discarded test thread handles outside
 isolated targets.
-
-## VER-024 - The stalled-transform test has an unbounded failure-path leak
-
-Reported by lib-core-unit.
-
-A test in `read/pipeline.rs` spawns an orchestration thread without keeping its handle,
-and its transform spins on `release`, set only after observing `stalled`. If the first
-observation times out, a worker arriving later can spin forever.
-
-Fix: an RAII guard that releases and joins on every exit path, following the nearby
-`ReleaseTeardowns` pattern. Enforcement: a common parked-worker fixture and the
-discarded-handle lint.
 
 ## VER-025 - The parked-reader fixture can deadlock while unwinding
 
@@ -365,33 +311,12 @@ Fix: scenario objects owning transitions, notifications, release guards and obse
 with a real deadline only as a backstop, making invalid transition combinations
 unrepresentable.
 
-## VER-029 - Installing a hook callback twice silently keeps the old one
-
-Reported by fault-injection.
-
-`crates/lib/src/host.rs` and two sites in `test_hooks.rs` discard `OnceLock::set` failures,
-so a fixture and caller can both configure a hook and only the first applies.
-
-Fix: return a must-use error or panic on duplicates, or install while constructing the
-scenario. Enforcement: types and signatures.
-
 ## VER-033 - Cancellation coverage is a sample of commands and checkpoints
 
 The claims in `crates/lib/tests/cancel.rs` are renamed to what the sweep does, with
 its registry exclusions documented. Complete coverage, a command-scenario registry
 with explicit modes and exclusions compared mechanically against the command
 inventory, remains undone.
-
-## VER-035 - The publication observer docs are false about locking
-
-Reported by fault-injection.
-
-`test_hooks.rs` promises "no lock held", but publication runs under the invocation's
-execution lock per `output.rs` and `reference/testing.md`. An observer waiting on another
-publication under that invocation can form a cycle.
-
-Fix: correct the contract and state allowed blocking dependencies. Same-invocation
-re-entry can be tested; arbitrary cross-thread cycles cannot be fully enforced.
 
 ## VER-036 - Chunk tests keep large fixtures despite size injection seams
 
@@ -428,39 +353,6 @@ coordinate reader swallows role errors.
 
 Fix: preserve multiplicity and numeric unknown types, and fail on unexpected decode errors.
 Enforcement: negative tests of the helpers and a scoped lint on error-to-empty conversions.
-
-## VER-042 - One metadata assertion is absent behind an obsolete explanation
-
-Reported by lib-integration.
-
-`test_meta_roundtrips_through_writer` in `crates/lib/tests/fixture_helpers.rs` ends with
-`let _ = n2.meta.as_ref()`, which cannot fail, and its fabricated-zero explanation
-contradicts `roundtrip_mixed_metadata`.
-
-Fix: assert `None` on the decoded node. A narrow lint can reject discarded expressions in
-assertion helpers but cannot judge adequacy in general.
-
-## VER-043 - The all-blobs index guard passes with no readable blobs
-
-Reported by lib-integration.
-
-`assert_every_data_blob_indexed` checks the prefix `locate_blobs` in `common/adversarial.rs`
-managed to read, and that stops at malformed framing. Empty and malformed inputs pass.
-
-Fix: separate strict and prefix-tolerant framing APIs, the strict one returning extent and
-frame kinds. Enforcement: strict-guard malformed tests and a data-presence requirement.
-
-## VER-044 - Fixture descriptions are false and smoke tests do not hold them
-
-Reported by lib-integration.
-
-`write_bad_indexdata_pbf` promises 30 zero bytes but `resize(30, 0)` truncates a 42-byte
-index, keeping version and prefix. The multiblock example says seven data blobs where its
-smoke test expects six. The base and changed contract test checks node and way IDs only,
-despite claiming exactly the documented edits.
-
-Fix: assert exact bytes and compare complete contents against explicit edits. Executable
-examples can enforce counts; prose cannot be guaranteed.
 
 ## VER-045 - Plain-node geocode coverage still requires installed osmium
 
@@ -522,17 +414,6 @@ Fix: extract batch scheduling and ordered-error selection behind explicit limits
 small, keeping format-limit coverage separate. Enforcement: observed batch events and a
 selected tier for large scenarios.
 
-## VER-051 - The batch fixture guard checks a second handwritten constant
-
-Reported by lib-integration, lib-commands-unit.
-
-`BOUNDARY_RUN_FULL_BLOCKS = 65` in `apply_changes_create_runs.rs` and
-`BOUNDARY_FIXTURE_FULL_BLOCKS = 65` in `commands/apply_changes/stream_output.rs` are
-connected only by a comment.
-
-Fix: assert the actual batch transition from the integration invocation, which also catches
-changed dispatch, or share a definition that constructs the fixture.
-
 ## VER-052 - The io_uring size sweep emits unintended blobs and misses its boundaries
 
 Reported by lib-integration.
@@ -567,16 +448,11 @@ indexdata.
 Fix: generate logical blocks once and parameterize framing. Enforcement: verify paired fixtures
 have identical payloads and only the intended envelope differences.
 
-## VER-056 - Reader constructors bring machine probes into tests
+## VER-056 - Nothing refuses an unconfigured parallel test reader
 
-Reported by lib-core-unit.
-
-Default worker selection in `read/reader.rs` and `read/pipeline.rs` falls back to `MachineProbe`
-when resources were not attached, and inline tests start parallel iteration without fixing the
-decoder count.
-
-Fix: a resource-injection builder for public readers, keeping convenient defaults. Enforcement: a
-structural fixture API and a lint on unconfigured parallel test readers.
+`ElementReader::resources` injects resources and `ElementReader::for_tests` builds fixed
+test readers; inline reader and pipeline tests use them. The proposed lint on
+unconfigured parallel test readers is not added.
 
 ## VER-059 - The cgroup parent-limit test never exercises parent discovery
 
@@ -610,38 +486,6 @@ production-reachable, but they preserve an alternate protocol.
 Fix: rewrite around owned bound-output fixtures and remove the methods, so the compiler enforces
 sequencing.
 
-## VER-062 - The pipeline-death test replaces the shared panic hook
-
-Reported by check-machinery.
-
-A test in `read/reader.rs` replaces the process panic hook while concurrent unit tests run, and
-restoration is manual, so an unexpected unwind leaves it installed.
-
-Fix: remove the mutation or inject the failure, or use a dedicated process. Enforcement: a lint
-banning hook replacement in shared test targets.
-
-## VER-063 - The merge executor test accepts fully serial execution
-
-Reported by lib-commands-unit.
-
-`encode_jobs_stay_on_the_executor_within_their_lanes` in `merge_changes/stream.rs` sleeps 2 ms per
-job, accepts any peak from one through `lanes`, and uses 262,144 XML nodes under three pool
-configurations.
-
-Fix: small synthetic batches and a handshake establishing two simultaneous jobs, with sequence
-order checked if the comment's claim belongs there. Enforcement: the test harness, with batch size
-supplied to the parser mechanism.
-
-## VER-064 - Location-store tests create 3,000 threads for probabilistic coverage
-
-Reported by lib-commands-unit.
-
-Concurrent join tests in `commands/check/locations/store.rs` do 200 repetitions per case at three
-threads each, 1,800 and 1,200, as tier-1 in every applicable sweep.
-
-Fix: model the atomic state machine, keep a bounded smoke test, and put extended stress in a stress
-lane. Repetition cannot enforce interleaving coverage.
-
 ## VER-065 - Merge correctness fixtures scale with production batch tuning
 
 Reported by lib-commands-unit.
@@ -665,64 +509,13 @@ Fix: a small semantic reference model and independent rendered-output checks, wi
 only where byte identity is the contract. Confinement to a test module is enforceable; independence
 needs review.
 
-## VER-069 - Sparse allocation failure coverage stops before the syscall
+## VER-071 - The verbose sequence budget has no registered timing bench
 
-Reported by lib-commands-unit.
-
-Tests in `commands/altw/sparse.rs` request `u64::MAX`, which the free-space precheck refuses before
-`posix_fallocate`, so `failed_preallocation_leaves_no_file_in_scratch` does not exercise allocation
-failure. The success test requires a filesystem supporting `posix_fallocate`.
-
-Fix: separate policy from allocation, inject success and failure, and keep a named platform adapter
-test. Enforcement: an allocation interface and fault tests.
-
-## VER-070 - The sparse unlink assertion is keyed to the production filename
-
-Reported by lib-commands-unit.
-
-`successful_allocation_unlinks_the_store` checks only that no entry is named `sparse-index`.
-
-Fix: compare complete directory contents before and after and verify descriptor contents.
-
-## VER-071 - A manual release timing probe runs in the full correctness profile
-
-Reported by lib-commands-unit.
-
-`verbose_sequence_budget_timing` in `commands/diff/seq.rs` is ignored as manual release-mode timing,
-but the `full` profile includes ignored tests under `[test] debug = true`, running 22 timed calls in
-a configuration unlike the annotation. It has correctness assertions.
-
-Fix: split work-limit assertions from timing and move timing to a registered bench. Enforcement: a
-source check against timing probes in correctness targets.
-
-## VER-073 - The truncation sweep's "every command" claim is false
-
-Reported by cli-tests.
-
-The opening comment says every command, and the body hardcodes six.
-
-Fix: an explicit representative read-path matrix with named obligations, or enumeration with
-exemptions. Enforcement: a build-wired inventory comparison.
-
-## VER-074 - The truncation matrix is one watchdog unit
-
-Reported by cli-tests.
-
-Up to `6 * (8B + 12)` children for `B` blobs, each with an eight-second timeout, under one 20 s
-watchdog, repeated across CLI sweeps.
-
-Fix: independently named cases or bounded shards, byte-boundary coverage at the library reader, and
-CLI cases for routing and propagation. Enforcement: mechanical cell inventory and maximum shard size.
-
-## VER-075 - CliInvoker::run adds a polling delay to every subprocess
-
-Reported by cli-tests.
-
-`crates/cli/tests/invoker.rs` polls every 20 ms, so each child can wait up to one interval, which
-over hundreds of quick children is seconds per test.
-
-Fix: blocking completion with an independent timeout. Enforcement: an invoker test with a controlled
-child, without a host-speed assertion.
+The ignored timing probe in `commands/diff/seq.rs` is removed; its work-limit assertions
+stay. Timing belongs in a registered bench: synthetic modified-way pairs with 30,000
+refs (disjoint ranges, and every 60th ref changed), measuring `diff --verbose`, requiring
+exit 1 and checking replacement versus itemized output, with fixture preparation outside
+measurement. Not written.
 
 
 
@@ -738,58 +531,19 @@ Fix: separate process setup from execution and hand command execution a resolved
 keeping subprocess tests for process integration. Enforcement: signatures and explicit child
 configuration.
 
-## VER-079 - Cancellation and replacement hook setup fails open
+## VER-079 - Two invoker hook setters still take strings
 
-Reported by cli-tests.
+Hook configuration in `crates/cli/src/signals.rs` is validated and fails explicitly, and
+`crates/cli/tests/invoker.rs` has typed `cancel_pause`, `replace_input` and `&Path` file
+setters. `publish_faults` and `publish_pause` still take untyped strings, and the
+malformed-configuration failures have no subprocess tests.
 
-In `crates/cli/src/signals.rs`, malformed pause specifications return silently and ready, ack and
-count file writes are discarded. Input replacement returns on invalid configuration and its report
-writer discards errors. Publication and merge-spill hooks fail explicitly.
+## VER-081 - derive-changes has no fixed-instant end-to-end test
 
-Fix: parse hook configuration into validated types before dispatch and give the invoker typed hook
-methods. Enforcement: negative configuration tests.
-
-## VER-081 - The timestamp test does not prove the current time
-
-Reported by cli-tests.
-
-`cli_derive_changes.rs` accepts any timestamp beginning `20`, and production reads `SystemTime::now`
-in `crates/cli/src/lib.rs` with no injection point.
-
-Fix: resolve time at the process boundary and test exact per-element values with a fixed instant,
-keeping a small clock-wiring test. Enforcement: the signature and exact-value tests.
-
-## VER-082 - Command-table checks discover capabilities by parsing help
-
-Reported by cli-tests.
-
-`cli_flag_contract.rs` and `cli_output_contract.rs` depend on spellings such as `-j, --jobs`, a line
-starting `--force` or a `--tmp-dir` substring. The jobs check requires only five matches and one
-direction, children start per row, and the output-contract claim about binary help is stale.
-
-Fix: inspect built Clap arguments, compare both directions, and keep rendered-help tests for
-presentation. Enforcement: a shared command-tree accessor.
-
-## VER-083 - The library text rule stops recognizing stale advice after a rename
-
-Reported by cli-tests.
-
-`names_subcommand` in `crates/cli/src/library_text_rule.rs` matches `pbfhogg <word>` only for current
-commands, which is exactly the stale text the module exists to prevent.
-
-Fix: detect invocation-shaped advice independent of membership, or separate diagnostic prose from
-frontend advice. Enforcement: a rename and removal regression fixture.
-
-## VER-084 - The library text scanner's exclusions can hide production strings
-
-Reported by cli-tests.
-
-`library_literals` excludes paths named by test-only module declarations, which is not reachability:
-a file included from both test and production through `#[path]` is excluded. No current violation
-was established.
-
-Fix: parsed reachability, or a conservative lexical policy with exemptions. Enforcement: shared-file
-inclusion and path-resolution tests.
+Clock resolution in `crates/cli/src/lib.rs` is separated from conversion, with
+fixed-instant conversion tests, and `cli_derive_changes.rs` checks that deletion timestamps
+agree and fall within the invocation's clock bounds. A fixed instant through the complete
+OSC output path is not tested.
 
 ## VER-085 - Generated reference data is maintained by hand
 
@@ -827,39 +581,18 @@ or nested include in an included file), and the authoritative composed check is
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
 
-## VER-091 - Descriptor scenarios depend on the inherited process
+## VER-091 - Real descriptor limits have no child contract test
 
-Reported by library-harness.
+The descriptor scenarios in `scenarios/nofile.rs` now take exact `FdPool` grants (1024, 6,
+896) with fixed parallelism of eight and private pools, and the filler-open loop is gone.
+Not done: a child contract test for real descriptor counting and restricted launches,
+announcing unsupported hard limits.
 
-`Nofile::Soft` refuses below a hard limit of 1024, while executable tests expect a pass, and
-`nofile-altw-external` expects exactly three workers from what remains after ambient opens and global
-pool initialization. Most launches use machine parallelism. This makes the "No test depends on the
-host" claim in `reference/testing.md` false for this scope.
+## VER-093 - Nothing bans whole-file reads in scale-facing assertions
 
-Fix: inject exact allowances and keep a small child contract test for real limits, detecting
-unsupported hard limits. Enforcement: fixed resources, pool sizes and restricted-launch tests.
-
-## VER-092 - Descriptor exhaustion does nearly a thousand real opens
-
-Reported by library-harness.
-
-`fill_descriptors` in `scenarios/nofile.rs` opens repeatedly until eight remain, in three sweeps, and
-silently opens nothing with fewer than eight free. `/proc/self/fd` counting assumes procfs.
-
-Fix: inject the allowance and test counting in a child, asserting the established free count.
-Enforcement: a fixture type carrying the verified allowance.
-
-## VER-093 - Harness assertions allocate output-sized memory
-
-Reported by library-harness.
-
-`outputs_equal` in `scenarios/repeat_cat.rs` reads both outputs, about `2S` heap, which can OOM at
-planet scale and inflates process measurements. `SeededReplace::run` reads each destination into a
-`Vec`, where brokkr's `seed::holds` is bounded.
-
-Fix: compare lengths then bounded chunks, and a bounded seed-state helper also used in
-`check_bindings`. Enforcement: the helpers, a source rule against whole-file reads in scale-facing
-assertions, and edge-case tests.
+Harness output comparisons and seed checks go through bounded helpers in
+`scenarios/file_assertions.rs`. The proposed source rule refusing whole-file reads in
+scale-facing assertions is not added.
 
 ## VER-098 - Release semantics and profiling configurations are not exercised
 
@@ -910,16 +643,6 @@ move to another package or target preserves the count.
 Fix: compare complete identities with explicit, stale-checked mappings and refuse a claim when an
 inventory is missing.
 
-## VER-106 - The declared minimum Rust version is unchecked
-
-Reported by check-machinery.
-
-Root `Cargo.toml` declares `rust-version = "1.99"` and says only nightly is installed and no MSRV check
-is planned. This is not evidence 1.99 fails.
-
-Fix: a library and installable-CLI build under the declared version with the toolchain derived from the
-manifest, or remove the claim.
-
 ## VER-107 - The musl sweeps assume an x86_64 host
 
 Reported by check-machinery.
@@ -928,17 +651,7 @@ Both executable musl sweeps in `brokkr.d/checks.toml` hard-code `x86_64-unknown-
 now with comments and a host restriction stated in `reference/testing.md`. On aarch64 they
 would be cross-builds with foreign executables. Residue is brokkr-side check planning:
 resolve a runnable target from host capability, or refuse an unexecutable target before
-building.
-
-## VER-108 - A test-only dispatch instrument ships in production
-
-Reported by check-machinery.
-
-Hidden `--full-scan-min-blobs` in `crates/cli/src/lib.rs` and its entry in `commands/getparents/mod.rs`
-force a dispatch arm on small fixtures and are not gated by `test-hooks`.
-
-Fix: an internal policy input exposed across crates only in hook builds, or adopt it as a supported
-policy. Enforcement: feature-gated command-tree assertions and visibility.
+building. Filed as bz brokkr#170.
 
 ## VER-109 - The testing contract contradicts itself and duplicates inventories
 
@@ -979,15 +692,15 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-114 - The geocode result parser accepts missing evidence
+## VER-114 - The geocode-query digest does not cover the complete answer
 
-Reported by bench-verify.
-
-`geocode-query.lua` requires only `us_per_query_best`, and the digest covers only admin level and name, so
-unchanged counts can hide changed answers.
-
-Fix: a versioned structured result with every field validated and a hash of the complete answer.
-Enforcement: parser mutation tests and fixtures with equal counts but different values.
+`geocode-query.lua` now requires and validates all twelve result fields under a
+`legacy-admin-v1` label, with contract cases in `benches/tests/geocode-evidence.lua`. The
+digest still covers only admin level and name. Needed: a versioned result from the CLI
+instrument in `crates/cli/src/lib.rs` carrying a digest of every `ReverseResult` field
+(option presence, query and collection boundaries, length-prefixed strings, float bits),
+adopted by the Lua parser, with equal-count fixtures varying address, street,
+interpolation and admin values.
 
 ## VER-115 - Every geocode-query iteration rebuilds the whole index
 
@@ -1008,25 +721,12 @@ Fix: separate arms and interleaved matched single iterations. Enforcement: brokk
 measured iteration and recording order. Equal drive state cannot be proven.
 Brokkr side is the existing bz brokkr#129 (interleaved rounds), commented with this case.
 
-## VER-118 - The osmium comparison relies on aligned defaults
+## VER-118 - The osmium comparison checks only success
 
-Reported by bench-verify.
-
-`vs-osmium.lua` says both tools use zlib level 6 and neither line pins it; strategy and retention also rely
-on defaults, and only success is checked.
-
-Fix: rows as explicit operation contracts generating argv, with outputs validated in a separate run.
-Enforcement: contract tests for flags and independent output comparison for equivalence.
-
-## VER-119 - The comparison driver has drifted from its table
-
-Reported by bench-verify.
-
-`scripts/vs-osmium.sh` says every row but omits `extract`, hardcodes OSC 4705, offers no dataset selection,
-and accepts zero or negative `PAIRS`. The default schedules 63 invocations.
-
-Fix: generate rows from one registry, require positive pairs, and resolve OSC by dataset. Enforcement: a
-driver test with a recording brokkr stub.
+`vs-osmium.lua` pins zlib level 6 on both tools, with flag contracts in
+`benches/tests/comparison-flags.lua`. Outputs are still not compared for equivalence in a
+separate run, and complete-ways and node-retention behaviour rely on defaults because
+pbfhogg has no affirmative flag for them.
 
 ## VER-120 - Host identity changes coverage and build features
 
@@ -1092,6 +792,15 @@ strict order pbfhogg's `Bbox::try_new` needs. Nothing refuses a new script that 
 bbox again instead of declaring the domain.
 
 Fix: a source rule against local replacements, if one can be stated without false positives.
+
+## VER-129 - OwnedChild::wait can hang if the watchdog kill fails
+
+Found while reconciling the bounded child owner. In `crates/lib/tests/common/process.rs`,
+if the timeout thread's `kill` fails, the waiting thread stays blocked in `observe_exit`
+and never reaches the join, so a test hangs to the outer watchdog. Unlikely, because the
+child is kept as an unreaped zombie until observed.
+
+Fix: make the wait path observe the kill result and stop waiting on failure.
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 

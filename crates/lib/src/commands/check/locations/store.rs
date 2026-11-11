@@ -289,7 +289,6 @@ impl Store {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Coord, Plan, SlotState, Store, in_partition, range_meets, slots_for_budget};
     use crate::idset::IdSet;
@@ -319,7 +318,7 @@ mod tests {
             let orders = permutations(records.len());
             assert_eq!(orders.len(), (1..=records.len()).product::<usize>());
             for order in orders {
-                let store = Store::new(1).unwrap();
+                let store = Store::new(1).expect("construct location store");
                 for &r in &order {
                     store.join_node(0, records[r]);
                 }
@@ -345,7 +344,63 @@ mod tests {
         out
     }
 
-    /// The same records joined by racing threads, many times over, end in
+    /// Model every linearization of three joins over the finite classes:
+    /// empty, two distinct coordinates, conflict, and unusable. Successful
+    /// CAS operations totally order updates to a slot; a failed (including
+    /// spuriously failed) CAS retries from the observed state without an
+    /// effect. Thus all concurrent outcomes reduce to these serial orders.
+    /// The thread smoke tests below check wiring, not interleaving coverage.
+    #[test]
+    fn node_join_matches_the_lattice_model() {
+        let records = [valid(1, 2), valid(3, 4), BAD];
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    let selection = [a, b, c];
+                    let want = if selection.contains(&2) {
+                        SlotState::Unusable
+                    } else if selection.contains(&0) && selection.contains(&1) {
+                        SlotState::Conflict
+                    } else if a == 0 {
+                        SlotState::Coord { lat: 1, lon: 2 }
+                    } else {
+                        SlotState::Coord { lat: 3, lon: 4 }
+                    };
+                    for order in permutations(3) {
+                        let store = Store::new(1).expect("construct location store");
+                        assert_eq!(store.state(0), SlotState::Empty);
+                        for index in order {
+                            store.join_node(0, records[selection[index]]);
+                        }
+                        assert_eq!(store.state(0), want);
+                        assert!(store.has_authority(0));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agreement_matches_the_set_model() {
+        for mask in 0..8 {
+            for order in permutations(3) {
+                let store = Store::new(1).expect("construct location store");
+                for index in order {
+                    let lat = if mask & (1 << index) == 0 { 5 } else { 7 };
+                    store.agree(0, lat, 6);
+                }
+                let want = match mask {
+                    0 => SlotState::Coord { lat: 5, lon: 6 },
+                    7 => SlotState::Coord { lat: 7, lon: 6 },
+                    _ => SlotState::Disagree,
+                };
+                assert_eq!(store.state(0), want);
+                assert!(!store.has_authority(0));
+            }
+        }
+    }
+
+    /// A bounded smoke test: racing records end in
     /// the state a sequential join reaches.
     #[test]
     fn concurrent_node_joins_reach_the_sequential_state() {
@@ -361,20 +416,18 @@ mod tests {
             (&[valid(1, 2), valid(3, 4), BAD], SlotState::Unusable),
         ];
         for (records, want) in cases {
-            for _ in 0..200 {
-                let store = Store::new(1).unwrap();
-                let barrier = std::sync::Barrier::new(records.len());
-                std::thread::scope(|scope| {
-                    for &record in records {
-                        let (store, barrier) = (&store, &barrier);
-                        scope.spawn(move || {
-                            barrier.wait();
-                            store.join_node(0, record);
-                        });
-                    }
-                });
-                assert_eq!(store.state(0), want, "{records:?}");
-            }
+            let store = Store::new(1).expect("construct location store");
+            let barrier = std::sync::Barrier::new(records.len());
+            std::thread::scope(|scope| {
+                for &record in records {
+                    let (store, barrier) = (&store, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.join_node(0, record);
+                    });
+                }
+            });
+            assert_eq!(store.state(0), want, "{records:?}");
         }
     }
 
@@ -389,26 +442,24 @@ mod tests {
             ),
             ([(5, 6), (5, 6), (7, 8)], SlotState::Disagree),
         ] {
-            for _ in 0..200 {
-                let store = Store::new(1).unwrap();
-                let barrier = std::sync::Barrier::new(copies.len());
-                std::thread::scope(|scope| {
-                    for (lat, lon) in copies {
-                        let (store, barrier) = (&store, &barrier);
-                        scope.spawn(move || {
-                            barrier.wait();
-                            store.agree(0, lat, lon);
-                        });
-                    }
-                });
-                assert_eq!(store.state(0), want);
-            }
+            let store = Store::new(1).expect("construct location store");
+            let barrier = std::sync::Barrier::new(copies.len());
+            std::thread::scope(|scope| {
+                for (lat, lon) in copies {
+                    let (store, barrier) = (&store, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.agree(0, lat, lon);
+                    });
+                }
+            });
+            assert_eq!(store.state(0), want);
         }
     }
 
     #[test]
     fn agreement_is_absorbing() {
-        let store = Store::new(2).unwrap();
+        let store = Store::new(2).expect("construct location store");
         store.agree(0, 5, 6);
         store.agree(0, 5, 6);
         assert_eq!(store.state(0), SlotState::Coord { lat: 5, lon: 6 });
@@ -424,7 +475,7 @@ mod tests {
     /// Null Island is a coordinate, not an empty slot.
     #[test]
     fn null_island_is_a_coordinate() {
-        let store = Store::new(1).unwrap();
+        let store = Store::new(1).expect("construct location store");
         store.join_node(0, valid(0, 0));
         assert_eq!(store.state(0), SlotState::Coord { lat: 0, lon: 0 });
     }

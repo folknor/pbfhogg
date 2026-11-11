@@ -59,14 +59,60 @@ function bench(params)
     r:ok()
     if params.verbose == "yes" then print(r.stderr) end
 
-    local child = { bbox = bbox }
-    for key, value in string.gmatch(r.stderr, "([%w_]+)=([^\n]+)") do
-        child[key] = tonumber(value) or value
+    -- This is the legacy instrument schema, not a full-answer digest.
+    -- Keep parsing fail-closed until the instrument supplies a versioned
+    -- full-answer result; never interpret its admin digest as that result.
+    local fields = {
+        elapsed_ms = true, open_ms = true, queries = true, rounds = true,
+        us_per_query_best = true, us_per_query_rounds = true,
+        admin_answered = true, admin_matches = true, addresses = true,
+        streets = true, interpolations = true, admin_digest = true,
+    }
+    local child = { bbox = bbox, result_format = "legacy-admin-v1" }
+    for line in string.gmatch(r.stderr, "[^\r\n]+") do
+        local key, value = string.match(line, "^([%w_]+)=(.*)$")
+        if key and fields[key] then
+            if child[key] ~= nil then fail("duplicate geocode field: " .. key) end
+            child[key] = value
+        end
     end
-    -- Comma lists and hex digests stay text; the digest must never become a
-    -- number, which would lose bits.
-    child.admin_digest = string.match(r.stderr, "admin_digest=(%x+)")
-    child.us_per_query_rounds = string.match(r.stderr, "us_per_query_rounds=([^\n]+)")
-    if child.us_per_query_best == nil then fail("bench-geocode-query reported no us_per_query_best") end
+    for key in pairs(fields) do
+        if child[key] == nil then fail("missing geocode field: " .. key) end
+    end
+    for key in pairs(fields) do
+        if key ~= "admin_digest" and key ~= "us_per_query_rounds" then
+            local value = child[key]
+            local pattern = key == "us_per_query_best" and "^%d+%.%d%d$" or "^%d+$"
+            local n = tonumber(value)
+            if not value:match(pattern) or not n or n == math.huge then
+                fail("invalid geocode field: " .. key)
+            end
+            child[key] = n
+        end
+    end
+    if #child.admin_digest ~= 16 or not child.admin_digest:match("^%x+$") then
+        fail("invalid geocode admin_digest")
+    end
+    local count, best = 0, math.huge
+    local values = child.us_per_query_rounds
+    if values:sub(-1) == "," or values:sub(1, 1) == "," or values:find(",,", 1, true) then
+        fail("invalid geocode round list")
+    end
+    for value in values:gmatch("[^,]+") do
+        local n = tonumber(value)
+        if not value:match("^%d+%.%d%d$") or not n or n == math.huge then
+            fail("invalid geocode round latency")
+        end
+        count = count + 1
+        best = math.min(best, n)
+    end
+    if child.queries ~= tonumber(params.queries) or child.rounds ~= tonumber(params.rounds)
+        or count ~= child.rounds or best ~= child.us_per_query_best then
+        fail("geocode workload or round summary mismatch")
+    end
+    for _, key in ipairs({ "admin_answered", "addresses", "streets", "interpolations" }) do
+        if child[key] > child.queries then fail("geocode count exceeds queries: " .. key) end
+    end
+    if child.admin_matches < child.admin_answered then fail("geocode admin count mismatch") end
     record.child = child
 end

@@ -322,6 +322,56 @@ mod tests {
 pub(crate) mod test_hooks {
     use pbfhogg::host::Invocation;
 
+    fn fail(message: impl std::fmt::Display) -> ! {
+        crate::host::cli_note("cli.test_hooks", format_args!("{message}"));
+        std::process::exit(101);
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only hook file, outside every output and scratch API"
+    )]
+    fn write_hook(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        if let Err(error) = std::fs::write(path, contents) {
+            fail(format_args!(
+                "cannot write hook file {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    struct CancelPause {
+        ordinal: u64,
+        ready: std::path::PathBuf,
+        stuck: bool,
+    }
+
+    impl CancelPause {
+        fn parse(spec: &std::ffi::OsStr) -> Result<Self, &'static str> {
+            let spec = spec.to_str().ok_or("cancel pause must be UTF-8")?;
+            let mut parts = spec.splitn(3, ':');
+            let ordinal = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .ok_or("cancel pause needs a positive checkpoint")?;
+            let ready = parts
+                .next()
+                .filter(|v| !v.is_empty())
+                .ok_or("cancel pause needs a ready path")?;
+            let stuck = match parts.next() {
+                None => false,
+                Some("stuck") => true,
+                Some(_) => return Err("cancel pause suffix must be stuck"),
+            };
+            Ok(Self {
+                ordinal,
+                ready: ready.into(),
+                stuck,
+            })
+        }
+    }
+
     /// `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
     /// reaching the `k`-th checkpoint: it writes `<ready file>` and polls the
     /// token. Normally it then returns, and the checkpoint reports the
@@ -336,33 +386,36 @@ pub(crate) mod test_hooks {
         reason = "test-only hook files, outside every output and scratch API"
     )]
     pub(crate) fn arm(cancel: &Invocation) {
-        if std::env::var_os("PBFHOGG_TEST_CANCEL_COUNT").is_some() {
+        let count = std::env::var_os("PBFHOGG_TEST_CANCEL_COUNT");
+        let pause = std::env::var_os("PBFHOGG_TEST_CANCEL_PAUSE");
+        if count.is_some() && pause.is_some() {
+            fail("cancel count and pause cannot be armed together");
+        }
+        if let Some(path) = count {
+            if path.is_empty() {
+                fail("cancel count needs a path");
+            }
             cancel.on_check(|_, _| {});
             return;
         }
-        let Some(spec) = std::env::var_os("PBFHOGG_TEST_CANCEL_PAUSE") else {
-            return;
-        };
-        let spec = spec.to_string_lossy().into_owned();
-        let mut parts = spec.splitn(3, ':');
-        let (Some(k), Some(ready)) = (parts.next(), parts.next()) else {
-            return;
-        };
-        let Ok(k) = k.parse::<u64>() else { return };
-        let stuck = parts.next() == Some("stuck");
-        let ready = std::path::PathBuf::from(ready);
+        let Some(spec) = pause else { return };
+        let CancelPause {
+            ordinal: k,
+            ready,
+            stuck,
+        } = CancelPause::parse(&spec).unwrap_or_else(|error| fail(error));
         cancel.on_check(move |ordinal, token| {
             if ordinal != k {
                 return;
             }
-            drop(std::fs::write(&ready, ordinal.to_string()));
+            write_hook(&ready, ordinal.to_string());
             while !token.is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             if stuck {
                 let mut ack = ready.clone().into_os_string();
                 ack.push(".ack");
-                drop(std::fs::write(ack, b"cancelled"));
+                write_hook(std::path::Path::new(&ack), b"cancelled");
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
@@ -470,21 +523,37 @@ pub(crate) mod test_hooks {
     /// the replacement observed.
     pub(crate) fn arm_input_replacement(cancel: &Invocation) {
         let faults = cancel.faults();
-        if std::env::var_os("PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN").is_some_and(|v| v == "1") {
-            faults
-                .force_pin_path_reopen
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(value) = std::env::var_os("PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN") {
+            match value.to_str() {
+                Some("1") => faults
+                    .force_pin_path_reopen
+                    .store(true, std::sync::atomic::Ordering::Relaxed),
+                Some("0") => {}
+                _ => fail("force pin path reopen must be 0 or 1"),
+            }
         }
-        let (Some(input), Some(with), Some(after)) = (
+        let config = (
             std::env::var_os("PBFHOGG_TEST_REPLACE_INPUT"),
             std::env::var_os("PBFHOGG_TEST_REPLACE_WITH"),
             std::env::var_os("PBFHOGG_TEST_REPLACE_AFTER"),
-        ) else {
-            return;
+        );
+        let (input, with, after) = match config {
+            (None, None, None) => {
+                if std::env::var_os("PBFHOGG_TEST_REPLACE_REPORT").is_some() {
+                    fail("replacement report requires an armed replacement");
+                }
+                return;
+            }
+            (Some(input), Some(with), Some(after)) if !input.is_empty() && !with.is_empty() => {
+                (input, with, after)
+            }
+            _ => fail("replacement needs input, replacement path and positive open count"),
         };
-        let Some(after) = after.to_str().and_then(|a| a.parse::<u64>().ok()) else {
-            return;
-        };
+        let after = after
+            .to_str()
+            .and_then(|a| a.parse::<u64>().ok())
+            .filter(|a| *a > 0)
+            .unwrap_or_else(|| fail("replacement open count must be positive"));
         faults.arm_input_replacement(
             std::path::Path::new(&input),
             std::path::Path::new(&with),
@@ -527,10 +596,10 @@ pub(crate) mod test_hooks {
             return;
         };
         let Some(r) = cancel.faults().input_replacement() else {
-            return;
+            fail("replacement report requested without an armed replacement");
         };
-        drop(std::fs::write(
-            path,
+        write_hook(
+            std::path::Path::new(&path),
             format!(
                 "{} {} {} {} {}",
                 u8::from(r.fired),
@@ -539,7 +608,7 @@ pub(crate) mod test_hooks {
                 r.refused,
                 r.attempts_after_fired
             ),
-        ));
+        );
     }
 
     /// Write the checkpoint count for `PBFHOGG_TEST_CANCEL_COUNT`.
@@ -549,7 +618,44 @@ pub(crate) mod test_hooks {
     )]
     pub(crate) fn write_count(cancel: &Invocation) {
         if let Some(path) = std::env::var_os("PBFHOGG_TEST_CANCEL_COUNT") {
-            drop(std::fs::write(path, cancel.checks_passed().to_string()));
+            write_hook(
+                std::path::Path::new(&path),
+                cancel.checks_passed().to_string(),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod configuration_tests {
+        use super::CancelPause;
+
+        #[test]
+        fn pause_requires_a_reachable_checkpoint_and_a_complete_protocol() {
+            for spec in [
+                "",
+                "1",
+                "no:ready",
+                "0:ready",
+                "1:",
+                "1:ready:other",
+                "1:ready:stuck:extra",
+            ] {
+                assert!(
+                    CancelPause::parse(std::ffi::OsStr::new(spec)).is_err(),
+                    "{spec}"
+                );
+            }
+            let pause =
+                CancelPause::parse(std::ffi::OsStr::new("2:ready:stuck")).expect("valid pause");
+            assert_eq!(pause.ordinal, 2);
+            assert_eq!(pause.ready, std::path::Path::new("ready"));
+            assert!(pause.stuck);
+            assert!(
+                !CancelPause::parse(std::ffi::OsStr::new("1:ready"))
+                    .expect("valid pause")
+                    .stuck
+            );
         }
     }
 }

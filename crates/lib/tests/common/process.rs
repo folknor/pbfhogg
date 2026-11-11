@@ -35,7 +35,10 @@ pub fn isolate(cmd: &mut Command, scratch: &TestScratch) {
     cmd.env("TMPDIR", scratch.path());
 }
 
-type Capture = JoinHandle<io::Result<Vec<u8>>>;
+struct Capture {
+    thread: JoinHandle<()>,
+    result: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+}
 
 fn capture(
     mut pipe: impl Read + AsRawFd + Send + 'static,
@@ -49,41 +52,59 @@ fn capture(
             return Err(io::Error::last_os_error());
         }
     }
-    Ok(std::thread::spawn(move || {
-        let mut first = Vec::new();
-        let mut last = std::collections::VecDeque::new();
-        let mut chunk = [0; TEST_CHILD_CAPTURE_CHUNK];
-        let mut total = 0_usize;
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return Err(io::Error::other("capture cancelled before EOF"));
-            }
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    total = total.saturating_add(n);
-                    let prefix = n.min(TEST_CHILD_CAPTURE_EDGE - first.len());
-                    first.extend_from_slice(&chunk[..prefix]);
-                    for byte in &chunk[prefix..n] {
-                        if last.len() == TEST_CHILD_CAPTURE_EDGE {
-                            last.pop_front();
+    let (send, result) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let output = (|| {
+            let mut first = Vec::new();
+            let mut last = std::collections::VecDeque::new();
+            let mut chunk = [0; TEST_CHILD_CAPTURE_CHUNK];
+            let mut total = 0_usize;
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    return Err(io::Error::other("capture cancelled before EOF"));
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total = total.saturating_add(n);
+                        let prefix = n.min(TEST_CHILD_CAPTURE_EDGE - first.len());
+                        first.extend_from_slice(&chunk[..prefix]);
+                        for byte in &chunk[prefix..n] {
+                            if last.len() == TEST_CHILD_CAPTURE_EDGE {
+                                last.pop_front();
+                            }
+                            last.push_back(*byte);
                         }
-                        last.push_back(*byte);
                     }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        let mut fd = libc::pollfd {
+                            fd: pipe.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let timeout = libc::c_int::try_from(TEST_CHILD_POLL.as_millis())
+                            .expect("capture cancellation interval fits poll");
+                        // SAFETY: poll borrows the live pipe for this call only.
+                        if unsafe { libc::poll(&mut fd, 1, timeout) } < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::Interrupted {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(TEST_CHILD_POLL);
-                }
-                Err(e) => return Err(e),
             }
-        }
-        if total > TEST_CHILD_CAPTURE_EDGE * 2 {
-            first.extend_from_slice(b"\n[output truncated; first and last MiB retained]\n");
-        }
-        first.extend(last);
-        Ok(first)
-    }))
+            if total > TEST_CHILD_CAPTURE_EDGE * 2 {
+                first.extend_from_slice(b"\n[output truncated; first and last MiB retained]\n");
+            }
+            first.extend(last);
+            Ok(first)
+        })();
+        let _sent = send.send(output);
+    });
+    Ok(Capture { thread, result })
 }
 
 /// The child and its pipe readers stay owned even if waiting or assertions fail.
@@ -129,58 +150,110 @@ impl<'a> OwnedChild<'a> {
     }
 
     pub fn wait(&mut self, timeout: Duration) -> io::Result<Output> {
-        self.wait_with_poll(timeout, Child::try_wait)
-    }
-
-    pub fn wait_with_poll(
-        &mut self,
-        timeout: Duration,
-        mut poll: impl FnMut(&mut Child) -> io::Result<Option<std::process::ExitStatus>>,
-    ) -> io::Result<Output> {
-        let start = Instant::now();
-        let status = loop {
-            if let Some(status) = poll(&mut self.child)? {
-                break status;
-            }
-            if start.elapsed() >= timeout {
+        let status = if let Some(status) = self.child.try_wait()? {
+            // has_exited() may already have cached and reaped this child.
+            status
+        } else {
+            let pid = libc::pid_t::try_from(self.child.id())
+                .map_err(|_| io::Error::other("pid does not fit pid_t"))?;
+            // Observe exit without reaping. The watchdog is joined before wait()
+            // releases the PID, so its kill can never target a reused PID.
+            let (observed, expired) = std::thread::scope(|scope| {
+                let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+                let watchdog = scope.spawn(move || {
+                    match cancelled.recv_timeout(timeout) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // SAFETY: this child remains unreaped until we join.
+                            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    }
+                });
+                let observed = observe_exit(pid);
+                let _cancelled = cancel.send(());
+                let expired = watchdog
+                    .join()
+                    .map_err(|_| io::Error::other("child watchdog panicked"))?;
+                Ok::<_, io::Error>((observed, expired?))
+            })?;
+            observed?;
+            let status = self.child.wait()?;
+            if expired {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "test child timed out",
                 ));
             }
-            std::thread::sleep(TEST_CHILD_POLL);
+            status
         };
-        let stdout = finish(&mut self.stdout)?;
-        let stderr = finish(&mut self.stderr)?;
         Ok(Output {
             status,
-            stdout,
-            stderr,
+            stdout: finish(&mut self.stdout)?,
+            stderr: finish(&mut self.stderr)?,
         })
+    }
+
+    /// Exercise ownership on a wait failure without changing normal waiting.
+    pub fn wait_with_check(
+        &mut self,
+        timeout: Duration,
+        check: impl FnOnce(&mut Child) -> io::Result<()>,
+    ) -> io::Result<Output> {
+        check(&mut self.child)?;
+        self.wait(timeout)
+    }
+}
+
+/// Block for exit while retaining the zombie and thus ownership of its PID.
+fn observe_exit(pid: libc::pid_t) -> io::Result<()> {
+    let id = libc::id_t::try_from(pid).map_err(|_| io::Error::other("non-positive child PID"))?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // SAFETY: info is writable; WNOWAIT leaves reaping to the Child owner.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
 fn finish(slot: &mut Option<Capture>) -> io::Result<Vec<u8>> {
-    let start = Instant::now();
-    if let Some(thread) = slot.as_ref() {
-        while !thread.is_finished() {
-            if start.elapsed() >= TEST_CHILD_CLEANUP {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "child pipe did not reach EOF",
-                ));
-            }
-            std::thread::sleep(TEST_CHILD_POLL);
+    let Some(capture) = slot.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let output = match capture.result.recv_timeout(TEST_CHILD_CLEANUP) {
+        Ok(output) => output,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child pipe did not reach EOF",
+            ));
         }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("capture thread panicked"))
+        }
+    };
+    if let Some(capture) = slot.take() {
+        capture
+            .thread
+            .join()
+            .map_err(|_| io::Error::other("capture thread panicked"))?;
     }
-    slot.take().map_or_else(
-        || Ok(Vec::new()),
-        |thread| {
-            thread
-                .join()
-                .map_err(|_| io::Error::other("capture thread panicked"))?
-        },
-    )
+    output
 }
 
 impl Drop for OwnedChild<'_> {

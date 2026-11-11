@@ -91,8 +91,15 @@ NAME` list each harness in turn to find one test.
   `commands` off for the `minimal` sweep. `crates/lib/tests/common/` holds fixtures
   only; nothing in it spawns the binary.
 - **A new test file not declared in the `all.rs` under its package's test directory (or as
-  its own `[[test]]`) is never compiled, and no test or coverage audit
-  reports it.** Add the `mod` line with the file.
+  its own `[[test]]`) is never compiled.** Add the `mod` line with the file.
+  The pre-clippy `test-modules` script check (`scripts/check_test_modules.py`)
+  reports such a file: every `.rs` under a member's `tests/` must be
+  reachable from a `[[test]]` target that some sweep in `brokkr.d/checks.toml`
+  builds, following `mod` declarations, `#[path]` attributes and `cfg` gates
+  evaluated against that sweep's features. It is lexical: it reads source
+  reachability, not macro expansion or whether a test executes; an external
+  `mod` inside an inline module, a `cfg_attr` on a module, or a `cfg` form its
+  small evaluator does not know fails closed until the audit is extended.
 - **A test that must own its process** gets its own `[[test]]` target
   in its package's `Cargo.toml` with the reason written beside it; the `[[test]]`
   entries are the list. Arming a fault is not such a reason: fault
@@ -485,7 +492,10 @@ exception, not a tier - should not survive across many PRs.
   linked, a rollback step, a backup removed, the directory syncs done) to
   the token's publication observer, from the publishing thread, holding
   only the invocation's publication execution lock (so an observer must not
-  publish under the same invocation: that is refused as re-entry). The
+  publish under the same invocation: that is refused as re-entry; nor may it
+  wait for another thread to publish under the same invocation, or for any
+  work that needs that execution lock, since the lock is held until the
+  observer returns and the wait never ends). The
   effect a step implies is recorded before the observer runs, so an
   observer that panics still leaves a truthful publication row. The
   publication log's own contract (ordinals, decisions, cancel outcomes,
@@ -651,6 +661,21 @@ exception, not a tier - should not survive across many PRs.
 `pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
 use `NoProcessActions`; the CLI raises its descriptor limit in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
+The split is deliberate: a deterministic descriptor grant (an exact
+`host::FdPool` budget, as the library harness's descriptor scenarios use)
+tests command admission and sizing independently of inherited limits and
+ambient opens, while child-process contracts test behaviour under a real
+`RLIMIT_NOFILE`. Neither stands in for the other.
+
+The shared I/O transfer size `IO_BUF_BYTES` (`crates/lib/src/tunables.rs`) has
+one owner, checked before clippy by `scripts/check_io_sizes.py` (`io-sizes`):
+no maximal integer-only literal expression in `crates/lib/src/read/` or
+`crates/lib/src/write/` may evaluate to it. It is lexical, not Rust const
+evaluation: named aliases, casts and macro-built arithmetic are outside its
+promise, and a larger expression such as a scan budget is evaluated whole.
+The test-module and I/O-size audits, like the other Python checkers, mask Rust comments and
+literals through `scripts/rust_source_shapes.py` and carry in-memory
+self-tests run as their own pre-clippy script checks.
 
 Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.
 `PbfWriter` and the file reader and writer constructors return

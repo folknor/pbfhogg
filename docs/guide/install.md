@@ -8,7 +8,7 @@ Install the `pbfhogg` binary from crates.io:
 cargo install pbfhogg-cli
 ```
 
-This builds from source with fat LTO. The binary is called `pbfhogg`. Requires the Rust version named by `rust-version` in the workspace `Cargo.toml` (the MSRV badge in the README).
+This builds from source with fat LTO. The binary is called `pbfhogg`. Cargo refuses toolchains older than the `rust-version` in the workspace `Cargo.toml` (the README badge). That value is an admission floor, not a verified minimum supported Rust version: the project builds and tests on a current nightly, and no check builds on that version, so a stable toolchain at the floor may still fail to compile it.
 
 ## Library
 
@@ -49,18 +49,18 @@ pbfhogg = { version = "0.6", default-features = false, features = ["geocode-read
 ```sh
 git clone https://github.com/folknor/pbfhogg
 cd pbfhogg
-cargo install --path cli
+cargo install --path crates/cli
 ```
 
 To enable O_DIRECT and io_uring support:
 
 ```sh
-cargo install --path cli --features linux-direct-io,linux-io-uring
+cargo install --path crates/cli --features linux-direct-io,linux-io-uring
 ```
 
 ### Build requirements
 
-- Rust at or above the workspace `rust-version` in `Cargo.toml`
+- Rust at or above the workspace `rust-version` in `Cargo.toml` (an unverified floor; see above)
 - No C compiler required - all protobuf encoding is hand-rolled wire format, and zlib uses `zlib-rs` (pure Rust)
 - No `protoc` or Protocol Buffers toolchain needed
 

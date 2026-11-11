@@ -194,6 +194,18 @@ let reader = ElementReader::from_path("crates/lib/tests/test.osm.pbf")?
 # Ok::<(), std::io::Error>(())
 ```
 
+Worker counts for the pipelined methods and `par_map_reduce` are sized from
+a `host::Resources` (its `parallelism()`), reserving threads for the I/O
+reader and the consumer. A reader opened with a host uses that host's
+resources; any other reader probes the current machine, unless you supply
+resources yourself with `.resources(Arc<dyn host::Resources>)`, for example
+`host::Fixed` to get the same sizing on every machine. The setter is lazy: it
+probes nothing itself, and it changes nothing else about the reader (its
+invocation, diagnostics, executor and page-cache policy stay as they were).
+An explicit `.decode_threads(n)` takes precedence over the resources for
+both the pipelined methods and `par_map_reduce`, and the resources are then
+not consulted at all.
+
 ## Element types
 
 PBF elements are represented by the `Element` enum:

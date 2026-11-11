@@ -367,16 +367,16 @@ mod tests {
     #[test]
     fn record_sync_all_bumps_calls_and_nanos_together() {
         let metrics = super::WriterMetrics::new();
-        let start = crate::counters::Stopwatch::start();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        metrics.record_sync_all(start.elapsed_ns());
+        metrics.record_sync_all(2_000_003);
+        metrics.record_sync_all(7);
         assert_eq!(
             metrics.sync_all_calls.load(Relaxed),
-            1,
-            "record_sync_all must count the call"
+            2,
+            "record_sync_all must count each call"
         );
-        assert!(
-            metrics.sync_all_ns.load(Relaxed) >= 2_000_000,
+        assert_eq!(
+            metrics.sync_all_ns.load(Relaxed),
+            2_000_010,
             "record_sync_all must accumulate the elapsed time"
         );
     }

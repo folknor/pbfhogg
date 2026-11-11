@@ -15,8 +15,9 @@ serde_json = { version = "1.0.150", features = ["float_roundtrip", "raw_value"] 
 [workspace.package]
 version = "0.6.0"
 edition = "2024"
-# This declaration is not itself an MSRV check, and none is planned: only a
-# nightly toolchain is installed, and no sweep builds on this pinned version.
+# Cargo admission floor only, not a verified minimum supported Rust version.
+# Checks currently use the installed nightly; Rust 1.99 compatibility has not
+# been established for either the library or the installable CLI.
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 authors = ["folknor <folk@folk.wtf>"]

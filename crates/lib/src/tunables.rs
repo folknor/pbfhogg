@@ -39,7 +39,8 @@
 //! small-fixture test, prefer a narrow private parameter at the mechanism that
 //! owns it. A test instrument public only because its callers live in another
 //! crate (`getparents_with_min_blobs`, behind the CLI's hidden
-//! `--full-scan-min-blobs`) is a documented exception, hidden and unsupported.
+//! `--full-scan-min-blobs`) is a documented exception, hidden, unsupported and
+//! compiled only with the `test-hooks` feature, so no production build has it.
 //! Known and accepted: altw external's small fixtures still open all
 //! `NUM_BUCKETS` id-shard files per worker, which costs fixture time, not
 //! coverage. No tunable reads the environment (ADR-0016).

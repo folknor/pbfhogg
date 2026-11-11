@@ -50,6 +50,21 @@ fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64)
     use std::os::fd::AsRawFd as _;
 
     let available = super::filesystem_available_bytes(scratch_dir, "sparse index")?;
+    preallocate_sparse_file_with(file, scratch_dir, bytes, available, |file, length| {
+        // Safety: `file` owns a valid writable descriptor and length is nonnegative.
+        unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) }
+    })
+}
+
+// Static dispatch keeps the platform adapter free of runtime fault checks.
+#[cfg(target_os = "linux")]
+fn preallocate_sparse_file_with(
+    file: &std::fs::File,
+    scratch_dir: &Path,
+    bytes: u64,
+    available: u64,
+    allocate: impl FnOnce(&std::fs::File, libc::off_t) -> i32,
+) -> Result<()> {
     if available < bytes {
         return Err(Error::io_kind(
             std::io::ErrorKind::StorageFull,
@@ -62,8 +77,7 @@ fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64)
     let length: libc::off_t = bytes.try_into().map_err(|_| {
         Error::internal("sparse index size does not fit the platform file-offset type")
     })?;
-    // Safety: `file` owns a valid writable descriptor and length is nonnegative.
-    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
+    let rc = allocate(file, length);
     if rc != 0 {
         return Err(
             Error::from(std::io::Error::from_raw_os_error(rc)).context(format!(
@@ -90,6 +104,15 @@ fn open_anonymous_sparse_file(
     scratch: &crate::scratch::RunScratch,
     total_bytes: u64,
 ) -> Result<crate::scratch::ScratchFile> {
+    open_anonymous_sparse_file_with(scratch, total_bytes, preallocate_sparse_file)
+}
+
+// The allocator is monomorphized; production adds no hook lookup or branch.
+fn open_anonymous_sparse_file_with(
+    scratch: &crate::scratch::RunScratch,
+    total_bytes: u64,
+    allocate: impl FnOnce(&std::fs::File, &Path, u64) -> Result<()>,
+) -> Result<crate::scratch::ScratchFile> {
     let temp_path = scratch.file("sparse-index")?;
     let file = crate::scratch::create_read_write(&temp_path, true).map_err(|e| {
         Error::from(e).context(format!(
@@ -97,7 +120,7 @@ fn open_anonymous_sparse_file(
             temp_path.display()
         ))
     })?;
-    preallocate_sparse_file(&file, scratch.path(), total_bytes)?;
+    allocate(&file, scratch.path(), total_bytes)?;
     scratch.unlink(&temp_path).map_err(|e| {
         Error::from(e).context(format!(
             "failed to unlink sparse index temp file {} after allocation",
@@ -427,6 +450,42 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 0);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_allocation_policy_calls_allocator_on_success_only() {
+        let dir = crate::path_guard::tests::scratch();
+        let file = std::fs::File::create(dir.path().join("store")).expect("create store");
+        super::preallocate_sparse_file_with(&file, dir.path(), 8, 7, |_, _| {
+            panic!("free-space refusal must precede allocation")
+        })
+        .expect_err("insufficient space");
+        let mut called = false;
+        super::preallocate_sparse_file_with(&file, dir.path(), 8, 8, |_, length| {
+            called = true;
+            assert_eq!(length, 8);
+            0
+        })
+        .expect("allocator success");
+        assert!(called);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_preallocation_platform_adapter() {
+        let dir = crate::path_guard::tests::scratch();
+        let file = std::fs::File::create(dir.path().join("store")).expect("create store");
+        if let Err(err) = super::preallocate_sparse_file(&file, dir.path(), 4096) {
+            if matches!(err.kind(), crate::ErrorKind::Io(io)
+                if matches!(io.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)))
+            {
+                crate::test_support::skip(format!("filesystem preallocation unsupported: {err}"));
+                return;
+            }
+            panic!("platform allocation failed: {err}");
+        }
+        assert_eq!(file.metadata().expect("store metadata").len(), 4096);
+    }
+
     /// A failed preallocation leaves its file to the run directory, and the
     /// run directory's drop removes it: nothing is left in the parent.
     #[cfg(target_os = "linux")]
@@ -436,8 +495,20 @@ mod tests {
         let scratch =
             crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
                 .unwrap();
-        super::open_anonymous_sparse_file(&scratch, u64::MAX)
-            .expect_err("impossible allocation must be rejected");
+        let mut called = false;
+        let err = super::open_anonymous_sparse_file_with(&scratch, 4096, |file, path, bytes| {
+            super::preallocate_sparse_file_with(file, path, bytes, bytes, |_, length| {
+                called = true;
+                assert_eq!(length, 4096);
+                libc::ENOSPC
+            })
+        })
+        .expect_err("allocator failure must be returned");
+        assert!(
+            called,
+            "free-space policy must allow the allocation attempt"
+        );
+        assert!(err.to_string().contains("failed to allocate 4096 bytes"));
         drop(scratch);
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -457,12 +528,34 @@ mod tests {
         let scratch =
             crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
                 .unwrap();
-        let file = super::open_anonymous_sparse_file(&scratch, 4096).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 4096);
-        let names: Vec<_> = std::fs::read_dir(scratch.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert!(!names.iter().any(|n| n == "sparse-index"), "{names:?}");
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(scratch.path())
+                .expect("read scratch directory")
+                .map(|e| e.expect("directory entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = names();
+        let mut file = super::open_anonymous_sparse_file_with(&scratch, 4096, |file, _, bytes| {
+            file.set_len(bytes).map_err(crate::error::Error::from)
+        })
+        .expect("injected successful allocation");
+        assert_eq!(file.metadata().expect("store metadata").len(), 4096);
+        assert_eq!(names(), before, "allocation must leave no directory entry");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .expect("read anonymous store");
+        assert_eq!(contents, vec![0; 4096]);
+        file.rewind().expect("rewind store");
+        file.write_all(b"anonymous store").expect("write store");
+        file.rewind().expect("rewind store");
+        let mut written = [0; 15];
+        file.read_exact(&mut written).expect("read stored bytes");
+        assert_eq!(&written, b"anonymous store");
+        drop(file);
+        assert_eq!(names(), before);
     }
 }

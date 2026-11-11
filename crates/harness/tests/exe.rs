@@ -450,10 +450,11 @@ fn cancel_post_decision_lets_the_publication_stand() {
 }
 
 #[test]
-fn nofile_cat_is_refused_at_soft_1024() {
+fn nofile_cat_is_refused_with_a_1024_grant() {
     let (run, _) = scenario_passes("nofile-cat-refused", false, &["out"], &[]);
     let doc = run.doc("calls/a.json");
-    assert_eq!(doc["context"]["rlimit_nofile_soft"], 1024);
+    assert_eq!(doc["context"]["process_actions"], "fd_pool");
+    assert_eq!(doc["context"]["fd_pool_budget"], 1024);
     assert_eq!(doc["outcome"]["kind"], "invalid_argument");
 }
 
@@ -466,14 +467,20 @@ fn nofile_multi_extract_is_refused_with_few_descriptors_free() {
         &[],
     );
     let doc = run.doc("calls/a.json");
-    assert_eq!(doc["context"]["rlimit_nofile_soft"], 1024);
+    assert_eq!(doc["context"]["process_actions"], "fd_pool");
+    assert_eq!(doc["context"]["fd_pool_budget"], 6);
     assert_eq!(doc["outcome"]["kind"], "invalid_argument");
 }
 
 #[test]
 fn nofile_altw_external_runs_three_workers() {
     let (run, _) = scenario_passes("nofile-altw-external", true, &["out"], &[]);
-    assert_eq!(run.doc("calls/a.json")["context"]["parallelism"], 8);
+    let context = &run.doc("calls/a.json")["context"];
+    assert_eq!(context["parallelism"], 8);
+    assert_eq!(context["process_actions"], "fd_pool");
+    assert_eq!(context["fd_pool_budget"], 896);
+    assert_eq!(context["executor"], "pool");
+    assert_eq!(context["executor_threads"], 8);
 }
 
 #[test]

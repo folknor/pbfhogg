@@ -34,7 +34,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Declare a set of sidecar counters.
 ///
@@ -262,13 +262,23 @@ impl Stopwatch {
     /// Nanoseconds since the start.
     #[inline]
     pub(crate) fn elapsed_ns(&self) -> u64 {
-        u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        Self::duration_ns(self.0.elapsed())
     }
 
     /// Whole milliseconds since the start (truncated, see the type docs).
     #[inline]
     pub(crate) fn elapsed_ms(&self) -> u64 {
-        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+        Self::duration_ms(self.0.elapsed())
+    }
+
+    #[inline]
+    fn duration_ns(elapsed: Duration) -> u64 {
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[inline]
+    fn duration_ms(elapsed: Duration) -> u64 {
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Add the nanoseconds since the start to `into`.
@@ -313,13 +323,27 @@ pub(crate) fn lock_recording_wait<'a, T>(
     mutex: &'a Mutex<T>,
     wait_ns: &AtomicU64,
 ) -> MutexGuard<'a, T> {
+    lock_recording_wait_observing(mutex, wait_ns, || {}, |watch| watch.elapsed_ns())
+}
+
+// Static callbacks expose slow-path entry and its elapsed sample to tests.
+// Production uses a no-op observer and the same stopwatch read as before;
+// neither callback is invoked on the fast path.
+#[inline]
+fn lock_recording_wait_observing<'a, T>(
+    mutex: &'a Mutex<T>,
+    wait_ns: &AtomicU64,
+    on_slow_path: impl FnOnce(),
+    elapsed_ns: impl FnOnce(Stopwatch) -> u64,
+) -> MutexGuard<'a, T> {
     match mutex.try_lock() {
         Ok(guard) => guard,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => {
             let blocked = Stopwatch::start();
+            on_slow_path();
             let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
-            blocked.record_ns(wait_ns);
+            wait_ns.fetch_add(elapsed_ns(blocked), Relaxed);
             guard
         }
     }
@@ -335,13 +359,25 @@ pub(crate) fn send_recording_wait<T>(
     item: T,
     wait_ns: &AtomicU64,
 ) -> Result<(), SendError<T>> {
+    send_recording_wait_observing(tx, item, wait_ns, || {}, |watch| watch.elapsed_ns())
+}
+
+#[inline]
+fn send_recording_wait_observing<T>(
+    tx: &SyncSender<T>,
+    item: T,
+    wait_ns: &AtomicU64,
+    on_slow_path: impl FnOnce(),
+    elapsed_ns: impl FnOnce(Stopwatch) -> u64,
+) -> Result<(), SendError<T>> {
     match tx.try_send(item) {
         Ok(()) => Ok(()),
         Err(TrySendError::Disconnected(item)) => Err(SendError(item)),
         Err(TrySendError::Full(item)) => {
             let blocked = Stopwatch::start();
+            on_slow_path();
             let sent = tx.send(item);
-            blocked.record_ns(wait_ns);
+            wait_ns.fetch_add(elapsed_ns(blocked), Relaxed);
             sent
         }
     }
@@ -356,13 +392,24 @@ pub(crate) fn recv_recording_wait<T>(
     rx: &Receiver<T>,
     wait_ns: &AtomicU64,
 ) -> Result<T, RecvError> {
+    recv_recording_wait_observing(rx, wait_ns, || {}, |watch| watch.elapsed_ns())
+}
+
+#[inline]
+fn recv_recording_wait_observing<T>(
+    rx: &Receiver<T>,
+    wait_ns: &AtomicU64,
+    on_slow_path: impl FnOnce(),
+    elapsed_ns: impl FnOnce(Stopwatch) -> u64,
+) -> Result<T, RecvError> {
     match rx.try_recv() {
         Ok(item) => Ok(item),
         Err(TryRecvError::Disconnected) => Err(RecvError),
         Err(TryRecvError::Empty) => {
             let blocked = Stopwatch::start();
+            on_slow_path();
             let received = rx.recv();
-            blocked.record_ns(wait_ns);
+            wait_ns.fetch_add(elapsed_ns(blocked), Relaxed);
             received
         }
     }
@@ -472,16 +519,17 @@ mod tests {
     }
 
     #[test]
-    fn stopwatch_records_without_resetting() {
-        let watch = super::Stopwatch::start();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let ns = AtomicU64::new(0);
-        let ms = AtomicU64::new(0);
-        watch.record_ms(&ms);
-        watch.record_ns(&ns);
-        assert!(ms.load(Relaxed) >= 2);
-        assert!(ns.load(Relaxed) >= 2_000_000);
-        assert!(watch.elapsed_ns() >= ns.load(Relaxed));
+    fn elapsed_conversion_is_exact_and_saturates() {
+        use super::Stopwatch;
+        use std::time::Duration;
+
+        let sample = Duration::from_nanos(2_999_999);
+        assert_eq!(Stopwatch::duration_ns(sample), 2_999_999);
+        assert_eq!(Stopwatch::duration_ms(sample), 2);
+        assert_eq!(Stopwatch::duration_ms(Duration::from_nanos(999_999)), 0);
+        assert_eq!(Stopwatch::duration_ns(Duration::ZERO), 0);
+        assert_eq!(Stopwatch::duration_ns(Duration::MAX), u64::MAX);
+        assert_eq!(Stopwatch::duration_ms(Duration::MAX), u64::MAX);
     }
 
     /// An operation that does not block records nothing: not a clock read's
@@ -528,71 +576,69 @@ mod tests {
         assert_eq!(wait.load(Relaxed), 0);
     }
 
-    /// Runs `attempt` until one reports a recorded wait. Each attempt has a
-    /// peer release the operation after a pause; an attempt whose peer
-    /// released before the operation was tried takes the fast path and
-    /// records nothing, which is correct and proves nothing, so it is tried
-    /// again. Nothing here asserts how long a wait was, only that a blocked
-    /// operation recorded one.
-    fn some_attempt_blocks(mut attempt: impl FnMut() -> u64) -> bool {
-        (0..20).any(|_| attempt() > 0)
-    }
-
-    const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_millis(10);
-
+    // The observer runs only after try_* declines the fast path. Release
+    // there, rather than guessing when a peer has reached a blocking call.
+    // It is a no-op in production and is never called on the fast path.
     #[test]
     fn a_blocked_lock_records_its_wait() {
-        assert!(some_attempt_blocks(|| {
-            let mutex = std::sync::Mutex::new(0_u32);
-            let wait = AtomicU64::new(0);
-            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-            std::thread::scope(|scope| {
-                let mutex = &mutex;
-                scope.spawn(move || {
-                    let mut guard = mutex.lock().expect("unpoisoned");
-                    held_tx.send(()).expect("the test is listening");
-                    std::thread::sleep(RELEASE_AFTER);
-                    *guard += 1;
-                });
-                held_rx.recv().expect("the holder reports");
-                let guard = super::lock_recording_wait(mutex, &wait);
-                assert_eq!(*guard, 1, "the holder's write precedes our guard");
-            });
-            wait.load(Relaxed)
-        }));
+        let mutex = std::sync::Mutex::new(1_u32);
+        let held = mutex.lock().expect("unpoisoned");
+        let wait = AtomicU64::new(0);
+        let mut observed = false;
+        let guard = super::lock_recording_wait_observing(
+            &mutex,
+            &wait,
+            || {
+                observed = true;
+                drop(held);
+            },
+            |_| 17,
+        );
+        assert_eq!(*guard, 1);
+        assert!(observed);
+        assert_eq!(wait.load(Relaxed), 17);
     }
 
     #[test]
     fn a_blocked_send_records_its_wait() {
-        assert!(some_attempt_blocks(|| {
-            let wait = AtomicU64::new(0);
-            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
-            tx.send(1).expect("room for the first item");
-            std::thread::scope(|scope| {
-                scope.spawn(move || {
-                    std::thread::sleep(RELEASE_AFTER);
-                    assert_eq!(rx.recv(), Ok(1));
-                    assert_eq!(rx.recv(), Ok(2));
-                });
-                super::send_recording_wait(&tx, 2, &wait).expect("the receiver drains");
-            });
-            wait.load(Relaxed)
-        }));
+        let wait = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        tx.send(1).expect("room for the first item");
+        let mut observed = false;
+        super::send_recording_wait_observing(
+            &tx,
+            2,
+            &wait,
+            || {
+                observed = true;
+                assert_eq!(rx.recv(), Ok(1));
+            },
+            |_| 17,
+        )
+        .expect("the receiver drains");
+        assert!(observed);
+        assert_eq!(wait.load(Relaxed), 17);
+        assert_eq!(rx.recv(), Ok(2));
     }
 
     #[test]
     fn a_blocked_recv_records_its_wait() {
-        assert!(some_attempt_blocks(|| {
-            let wait = AtomicU64::new(0);
-            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
-            std::thread::scope(|scope| {
-                scope.spawn(move || {
-                    std::thread::sleep(RELEASE_AFTER);
+        let wait = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        let mut observed = false;
+        assert_eq!(
+            super::recv_recording_wait_observing(
+                &rx,
+                &wait,
+                || {
+                    observed = true;
                     tx.send(9).expect("the test is listening");
-                });
-                assert_eq!(super::recv_recording_wait(&rx, &wait), Ok(9));
-            });
-            wait.load(Relaxed)
-        }));
+                },
+                |_| 17,
+            ),
+            Ok(9)
+        );
+        assert!(observed);
+        assert_eq!(wait.load(Relaxed), 17);
     }
 }

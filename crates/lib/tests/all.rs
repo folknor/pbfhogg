@@ -5,7 +5,8 @@
 //! `brokkr test NAME` lists every harness one at a time to find one test.
 //! `crates/lib/Cargo.toml` sets `autotests = false`, so a file in `crates/lib/tests/`
 //! that is not declared here (or as its own `[[test]]` target) is never
-//! compiled, and nothing reports it.
+//! compiled; the pre-clippy `scripts/check_test_modules.py` audit reports such
+//! a file.
 //!
 //! Nothing here drives the `pbfhogg` binary: those tests are the CLI
 //! package's (`crates/cli/tests/all.rs`), where cargo builds the binary with the

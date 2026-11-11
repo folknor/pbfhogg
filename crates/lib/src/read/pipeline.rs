@@ -975,7 +975,7 @@ mod tests {
     fn fused_output_matches_block_pipelined() {
         let bytes = fused_pbf(3);
         let mut pipelined = Vec::new();
-        ElementReader::new(Cursor::new(bytes.clone()))
+        ElementReader::for_tests(Cursor::new(bytes.clone()))
             .unwrap()
             .for_each_block_pipelined(|block| {
                 pipelined.push(block.elements().count());
@@ -983,7 +983,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            fused_counts(ElementReader::new(Cursor::new(bytes)).unwrap()).unwrap(),
+            fused_counts(ElementReader::for_tests(Cursor::new(bytes)).unwrap()).unwrap(),
             pipelined
         );
     }
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn fused_transform_error_surfaces_after_prior_blocks() {
         let mut consumed = Vec::new();
-        let result = ElementReader::new(Cursor::new(fused_pbf(4)))
+        let result = ElementReader::for_tests(Cursor::new(fused_pbf(4)))
             .unwrap()
             .decode_threads(1)
             .for_each_fused_block(
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn fused_transform_panic_reports_error() {
         let result = assert_completes("fused transform panic", || {
-            ElementReader::new(Cursor::new(fused_pbf(1)))
+            ElementReader::for_tests(Cursor::new(fused_pbf(1)))
                 .unwrap()
                 .for_each_fused_block(
                     |_| -> crate::Result<()> { panic!("test panic") },
@@ -1045,7 +1045,7 @@ mod tests {
         let bytes = fused_pbf(128);
         let full_len = bytes.len();
         let bytes_read = Arc::new(AtomicUsize::new(0));
-        let result = ElementReader::new(CountingRead::new(bytes, Arc::clone(&bytes_read)))
+        let result = ElementReader::for_tests(CountingRead::new(bytes, Arc::clone(&bytes_read)))
             .unwrap()
             .for_each_fused_block(
                 |_| Ok::<_, crate::Error>(()),
@@ -1059,7 +1059,7 @@ mod tests {
     fn fused_tiny_count_bounds_complete_in_order() {
         assert_eq!(
             fused_counts(
-                ElementReader::new(Cursor::new(fused_pbf(3)))
+                ElementReader::for_tests(Cursor::new(fused_pbf(3)))
                     .unwrap()
                     .read_ahead(1)
                     .decode_ahead(1)
@@ -1069,6 +1069,47 @@ mod tests {
         );
     }
 
+    /// Release the transform before joining, including when observing the
+    /// stall times out and a decode worker reaches the transform later.
+    struct ReleaseTransform {
+        release: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ReleaseTransform {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_transform_guard_releases_and_joins_on_unwind() {
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let worker_finished = Arc::clone(&finished);
+        let result = std::panic::catch_unwind(move || {
+            let handle = std::thread::spawn(move || {
+                // This worker may only get scheduled after the assertion
+                // unwinds: release must remain set for that late arrival.
+                while !worker_release.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                worker_finished.store(true, Ordering::Relaxed);
+            });
+            let _release = ReleaseTransform {
+                release,
+                handle: Some(handle),
+            };
+            panic!("failed before observing the stalled transform");
+        });
+        assert!(result.is_err());
+        assert!(finished.load(Ordering::Relaxed), "worker joined on unwind");
+    }
+
     #[test]
     fn fused_stalled_transform_preserves_order() {
         let stalled = Arc::new(AtomicBool::new(false));
@@ -1076,14 +1117,14 @@ mod tests {
         let worker_stalled = Arc::clone(&stalled);
         let worker_release = Arc::clone(&release);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut ids = Vec::new();
-            let result = ElementReader::new(Cursor::new(fused_pbf(3)))
+            let result = ElementReader::for_tests(Cursor::new(fused_pbf(3)))
                 .unwrap()
                 .decode_threads(2)
                 .for_each_fused_block(
                     |block| {
-                        let id = match block.elements().next().unwrap() {
+                        let id = match block.elements().next().expect("fixture element") {
                             crate::Element::DenseNode(node) => node.id(),
                             crate::Element::Node(node) => node.id(),
                             crate::Element::Way(way) => way.id(),
@@ -1102,8 +1143,12 @@ mod tests {
                         Ok(())
                     },
                 );
-            done_tx.send((result, ids)).unwrap();
+            done_tx.send((result, ids)).expect("result receiver open");
         });
+        let _release = ReleaseTransform {
+            release: Arc::clone(&release),
+            handle: Some(handle),
+        };
         let start = std::time::Instant::now();
         while !stalled.load(Ordering::Relaxed) {
             assert!(
@@ -1167,7 +1212,7 @@ mod tests {
         let worker_state = Arc::clone(&state);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
-            let result = ElementReader::new(Cursor::new(fused_pbf(8)))
+            let result = ElementReader::for_tests(Cursor::new(fused_pbf(8)))
                 .unwrap()
                 .decode_threads(2)
                 .for_each_fused_block(
@@ -1267,13 +1312,13 @@ mod tests {
     #[test]
     fn fused_thread_count_parity() {
         let one = fused_counts(
-            ElementReader::new(Cursor::new(fused_pbf(8)))
+            ElementReader::for_tests(Cursor::new(fused_pbf(8)))
                 .unwrap()
                 .decode_threads(1),
         )
         .unwrap();
         let many = fused_counts(
-            ElementReader::new(Cursor::new(fused_pbf(8)))
+            ElementReader::for_tests(Cursor::new(fused_pbf(8)))
                 .unwrap()
                 .decode_threads(8),
         )
@@ -1312,11 +1357,11 @@ mod tests {
     fn refusing_kind_claims_refuses_a_block_holding_another_kind() {
         let bytes = pbf_with_a_way_blob_claiming_nodes();
 
-        let unchecked = fused_counts(ElementReader::new(Cursor::new(bytes.clone())).unwrap());
+        let unchecked = fused_counts(ElementReader::for_tests(Cursor::new(bytes.clone())).unwrap());
         assert_eq!(unchecked.unwrap(), [1, 1], "unchecked reads deliver both");
 
         for filtered in [false, true] {
-            let mut reader = ElementReader::new(Cursor::new(bytes.clone()))
+            let mut reader = ElementReader::for_tests(Cursor::new(bytes.clone()))
                 .unwrap()
                 .refusing_kind_claims();
             if filtered {
@@ -1337,7 +1382,7 @@ mod tests {
 
     #[test]
     fn fused_blobfilter_skips_blobs() {
-        let reader = ElementReader::new(Cursor::new(fused_pbf(2)))
+        let reader = ElementReader::for_tests(Cursor::new(fused_pbf(2)))
             .unwrap()
             .with_blob_filter(BlobFilter::new(false, true, false));
         assert!(fused_counts(reader).unwrap().is_empty());

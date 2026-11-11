@@ -188,37 +188,24 @@ fn myers<T: Eq>(
 mod tests {
     use super::*;
 
-    // Manual timing probe, not a host-dependent pass/fail latency test.
+    // Keep the production-budget obligations in correctness coverage. Timing
+    // belongs in a registered release bench, outside the test profiles.
     #[test]
-    #[ignore = "manual release-mode timing of the verbose sequence work limit"]
-    fn verbose_sequence_budget_timing() {
-        use std::io::Write as _;
+    fn verbose_sequence_budget_handles_disjoint_and_scattered_edits() {
         let old: Vec<usize> = (0..30_000).collect();
         let disjoint: Vec<usize> = (30_000..60_000).collect();
+        assert!(matches!(
+            seq_diff(&old, &disjoint),
+            SeqEdit::Replaced { .. }
+        ));
         let mut scattered = old.clone();
         for i in (0..30_000).step_by(60) {
             scattered[i] += 30_000;
         }
-        for (name, new, omitted) in [
-            ("disjoint", disjoint, true),
-            ("scattered", scattered, false),
-        ] {
-            let mut samples = Vec::new();
-            for _ in 0..11 {
-                let start = std::time::Instant::now();
-                let edit = seq_diff(std::hint::black_box(&old), std::hint::black_box(&new));
-                assert_eq!(matches!(edit, SeqEdit::Replaced { .. }), omitted);
-                samples.push(start.elapsed());
-            }
-            samples.sort();
-            writeln!(
-                std::io::stderr(),
-                "{name}: median {:?}, max {:?} (11 calls)",
-                samples[5],
-                samples[10]
-            )
-            .expect("write verbose sequence timing to stderr");
-        }
+        let (removed, inserted) = exact(seq_diff(&old, &scattered));
+        let changed: Vec<usize> = (0..30_000).step_by(60).collect();
+        assert_eq!(removed, changed);
+        assert_eq!(inserted, changed);
     }
 
     fn exact(e: SeqEdit) -> (Vec<usize>, Vec<usize>) {

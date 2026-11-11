@@ -1,45 +1,29 @@
-//! Source contract for the shared I/O transfer size.
-
-use std::path::Path;
+//! Runtime arithmetic contract for the shared I/O transfer size.
+//!
+//! Source ownership is audited once before clippy by scripts/check_io_sizes.py.
+//! Backend boundary and allocation tests live beside each backend.
 
 #[test]
-fn io_transfer_size_has_one_owner() -> std::io::Result<()> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for directory in ["read", "write"] {
-        check_directory(&root.join(directory))?;
-    }
-    Ok(())
+fn io_transfer_size_is_nonzero_and_aligned() {
+    use crate::direct_io::DIO_ALIGN_FLOOR;
+    use crate::tunables::IO_BUF_BYTES;
+
+    const { assert!(IO_BUF_BYTES > 0) };
+    assert!(IO_BUF_BYTES.is_multiple_of(DIO_ALIGN_FLOOR));
 }
 
-fn check_directory(directory: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            check_directory(&path)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            check_source(&path)?;
-        }
-    }
-    Ok(())
-}
+#[test]
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+fn io_transfer_rounding_preserves_boundaries() {
+    use crate::direct_io::DIO_ALIGN_FLOOR;
+    use crate::tunables::IO_BUF_BYTES;
 
-fn check_source(path: &Path) -> std::io::Result<()> {
-    let source = std::fs::read_to_string(path)?;
-    let product = format!("{}*{}", 256, 1024);
-    let budget = format!("{product}*{}", 1024);
-    let decimal = (1usize << 18).to_string();
-    for line in source.lines() {
-        let compact: String = line
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '_')
-            .collect();
-        // The larger scan/cache budgets are not transfer buffers.
-        let compact = compact.replace(&budget, "SCAN_BUDGET");
-        assert!(
-            !compact.contains(&product) && !compact.contains(&decimal),
-            "{} duplicates the I/O transfer size; use IO_BUF_BYTES",
-            path.display(),
-        );
-    }
-    Ok(())
+    assert_eq!(
+        crate::direct_io::round_up(IO_BUF_BYTES - 1, DIO_ALIGN_FLOOR),
+        IO_BUF_BYTES,
+    );
+    assert_eq!(
+        crate::direct_io::round_up(IO_BUF_BYTES + 1, DIO_ALIGN_FLOOR),
+        IO_BUF_BYTES + DIO_ALIGN_FLOOR,
+    );
 }

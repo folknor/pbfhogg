@@ -621,11 +621,14 @@ impl Invocation {
     }
 
     /// Test hook: run `hook` at every checkpoint with its 1-based ordinal.
-    /// Set once; a second call is ignored.
+    /// Panics if a hook is already installed.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn on_check(&self, hook: impl Fn(u64, &Invocation) + Send + Sync + 'static) {
-        drop(self.0.hook.set(Box::new(hook)));
+        assert!(
+            self.0.hook.set(Box::new(hook)).is_ok(),
+            "a checkpoint hook is already installed"
+        );
     }
 
     /// Test hook: how many checkpoints have run under an installed
@@ -1961,6 +1964,15 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    #[should_panic(expected = "a checkpoint hook is already installed")]
+    fn duplicate_checkpoint_hook_is_refused() {
+        let invocation = Invocation::new();
+        invocation.on_check(|_, _| {});
+        invocation.on_check(|_, _| {});
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

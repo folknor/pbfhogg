@@ -12,7 +12,7 @@ use super::{
 };
 use crate::protocol::{
     Arg, AssertionDecl, CallDecl, Counterpart, Expect, Outcome, Role, RoleDecl, STREAM_SEALED,
-    ScenarioDecl, seed,
+    ScenarioDecl,
 };
 use crate::runner::{CallSpec, Ctx};
 use pbfhogg::Overwrite;
@@ -137,18 +137,15 @@ impl Scenario for SeededReplace {
                 pbfhogg::cat::cat(&[input], out, None, &CLEAN_NONE, &WRITE, &overrides(), host)
                     .map(drop)
             })?;
-            let now = std::fs::read(ctx.binding(role)).ok();
-            let holds_seed = now.as_deref() == Some(seed(role).as_slice());
+            let seed_state = super::file_assertions::holds_seed(ctx.binding(role), role);
+            let holds_seed = matches!(seed_state, Ok(true));
             let results = if call == "replace" {
                 vec![
                     installed_ok("replace.outcome", &record, role),
                     Outcome::judge(
                         "replace.seed-replaced",
-                        now.is_some() && !holds_seed,
-                        format!(
-                            "destination present {}, holds its seed {holds_seed}",
-                            now.is_some()
-                        ),
+                        matches!(seed_state, Ok(false)),
+                        format!("seed observation {seed_state:?}"),
                     ),
                 ]
             } else {
@@ -161,7 +158,7 @@ impl Scenario for SeededReplace {
                 vec![Outcome::judge(
                     "refuse.refused",
                     ok,
-                    format!("{}, holds its seed {holds_seed}", account(&record)),
+                    format!("{}, seed observation {seed_state:?}", account(&record)),
                 )]
             };
             ctx.finish_call(&record, &results)?;

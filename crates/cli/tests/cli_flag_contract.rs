@@ -8,10 +8,10 @@
 //!   instead.
 //! - `-j/--jobs` means the same on every command that has it: `0` automatic,
 //!   `1` sequential, `N` a cap. Which values each command accepts is one
-//!   table, read against the commands' own `--help`.
+//!   table, read against the built command tree.
 //! - `--force` is offered only by commands that refuse unindexed input, and
 //!   each of them refuses through the shared indexdata gate and proceeds with
-//!   `--force`. The commands are read from their own `--help`.
+//!   `--force`. The commands are read from the built command tree.
 
 #![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
 
@@ -712,56 +712,66 @@ fn jobs_is_accepted_or_refused_per_command_and_value() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
-/// Every command offering `-j` in its `--help` has a row, and the help text
-/// is the one shared text.
+/// Jobs capability and argument documentation come from the built Clap tree.
 #[test]
 fn every_command_with_jobs_is_in_the_table_and_shares_one_help_text() {
-    let mut problems = Vec::new();
+    let mut tree = pbfhogg_cli::cli_command();
+    tree.build();
+    let mut offering = Vec::new();
     let mut texts = Vec::new();
     for path in subcommand_paths() {
-        let help = help(&path);
-        let Some(line) = help
-            .lines()
-            .position(|l| l.trim_start().starts_with("-j, --jobs"))
+        let command = command_at(&tree, &path);
+        let Some(arg) = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("jobs"))
         else {
             continue;
         };
         let name = path.join(" ");
-        if !JOBS
-            .iter()
-            .any(|row| row.words.join(" ").starts_with(&name))
-        {
-            problems.push(format!("`{name}` offers -j but has no row in JOBS"));
-        }
-        // The flag line and its wrapped continuation (indented past the flag
-        // column), whitespace normalised: clap aligns and wraps per command,
-        // and prints the default on a line of its own in long-form help.
-        let lines = help.lines().skip(line);
-        let mut words: Vec<&str> = Vec::new();
-        for (i, l) in lines.enumerate() {
-            let continuation = l.starts_with("        ") && !l.trim_start().starts_with('-');
-            if i > 0 && !continuation {
-                break;
-            }
-            words.extend(l.split_whitespace());
-        }
-        let text = words
-            .join(" ")
-            .replace(" [default: 0]", "")
-            .replace("[default: 0]", "");
-        texts.push((name, text));
+        assert_eq!(arg.get_short(), Some('j'), "{name}");
+        offering.push(name.clone());
+        texts.push((name, arg.get_help().map(ToString::to_string)));
     }
-    if let Some((first_name, first)) = texts.first() {
-        for (name, text) in &texts {
-            if text != first {
-                problems.push(format!(
-                    "`{name}` -j help differs from `{first_name}`:\n  {text}\n  {first}"
-                ));
+    // Rows that refuse every value deliberately exercise commands without jobs.
+    let mut table: Vec<String> = JOBS
+        .iter()
+        .filter(|row| row.accepts.iter().any(|accepted| *accepted))
+        .map(|row| {
+            let mut command = &tree;
+            let mut path = Vec::new();
+            for word in row.words {
+                let Some(sub) = command.find_subcommand(word) else {
+                    break;
+                };
+                path.push(*word);
+                command = sub;
             }
-        }
+            path.join(" ")
+        })
+        .collect();
+    offering.sort();
+    table.sort();
+    table.dedup();
+    assert_eq!(offering, table);
+    let (first_name, first) = texts.first().expect("jobs arguments exist");
+    assert!(first.is_some(), "{first_name} has no jobs documentation");
+    for (name, text) in &texts {
+        assert_eq!(text, first, "{name} jobs help differs from {first_name}");
     }
-    assert!(texts.len() >= 5, "found -j on only {texts:?}");
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+fn command_at<'a>(tree: &'a clap::Command, path: &[String]) -> &'a clap::Command {
+    path.iter().fold(tree, |command, name| {
+        command
+            .find_subcommand(name)
+            .expect("path comes from the command tree")
+    })
+}
+
+/// Rendering remains a presentation check, independent of capability discovery.
+#[test]
+fn jobs_help_renders_the_short_and_long_spelling() {
+    assert!(help(&["diff".to_owned()]).contains("-j, --jobs"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,17 +1264,19 @@ fn the_printed_sort_recipe_makes_the_refused_diff_succeed() {
     );
 }
 
-/// The table covers exactly the commands whose `--help` offers `--force`:
+/// The table covers exactly the commands whose Clap arguments offer `--force`:
 /// a command that gains the flag without refusing anything, or refuses
 /// without the flag being tested, fails here.
 #[test]
 fn the_force_table_is_every_command_offering_force() {
+    let mut tree = pbfhogg_cli::cli_command();
+    tree.build();
     let mut offering: Vec<String> = subcommand_paths()
         .into_iter()
         .filter(|path| {
-            help(path)
-                .lines()
-                .any(|l| l.trim_start().starts_with("--force"))
+            command_at(&tree, path)
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("force"))
         })
         .map(|path| path.join(" "))
         .collect();

@@ -67,6 +67,27 @@ impl<R: Read + Send> ElementReader<R> {
         })
     }
 
+    /// Supplies the resources used to choose parallel reader worker counts.
+    ///
+    /// Without this setting, readers opened with a host use that host's
+    /// resources, and other readers probe the current machine. An explicit
+    /// [`decode_threads`](Self::decode_threads) count takes precedence for
+    /// both pipelined iteration and [`par_map_reduce`](Self::par_map_reduce).
+    /// This setter does not probe resources or change the reader's invocation,
+    /// diagnostics, executor, or page-cache policy.
+    #[must_use]
+    pub fn resources(mut self, resources: Arc<dyn crate::host::Resources>) -> Self {
+        self.resources = Some(crate::host::ResourcesHandle(resources));
+        self
+    }
+
+    /// Inline reader fixtures always supply the same resources, including
+    /// tests of default worker selection rather than an explicit count.
+    #[cfg(test)]
+    pub(crate) fn for_tests(reader: R) -> Result<Self> {
+        Self::new(reader).map(|reader| reader.resources(crate::host::Host::for_tests().resources))
+    }
+
     /// Attach per-run diagnostics to this reader.
     #[must_use]
     pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
@@ -1410,6 +1431,50 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    #[test]
+    fn injected_resources_are_lazy_and_explicit_workers_take_precedence() {
+        use std::num::NonZeroUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountProbes(Arc<AtomicUsize>);
+        impl crate::host::Resources for CountProbes {
+            fn parallelism(&self) -> Option<NonZeroUsize> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                NonZeroUsize::new(4)
+            }
+
+            fn memory_available(&self) -> Option<u64> {
+                panic!("reader worker sizing must not probe memory");
+            }
+        }
+
+        for pipelined in [false, true] {
+            for explicit in [false, true] {
+                let probes = Arc::new(AtomicUsize::new(0));
+                let mut reader = ElementReader::for_tests(Cursor::new(build_pbf(1)))
+                    .expect("fixture header")
+                    .resources(Arc::new(CountProbes(Arc::clone(&probes))));
+                assert_eq!(probes.load(Ordering::Relaxed), 0, "setter is lazy");
+                if explicit {
+                    reader = reader.decode_threads(1);
+                }
+                let count = if pipelined {
+                    let mut count = 0;
+                    reader
+                        .for_each_pipelined(|_| count += 1)
+                        .expect("pipelined fixture");
+                    count
+                } else {
+                    reader
+                        .par_map_reduce(|_| 1_usize, || 0, |a, b| a + b)
+                        .expect("parallel fixture")
+                };
+                assert_eq!(count, 4);
+                assert_eq!(probes.load(Ordering::Relaxed), usize::from(!explicit));
+            }
+        }
+    }
+
     /// Public file readers keep the page cache unless asked, and an eviction
     /// request has to be supplied before the header blob is read to cover it.
     ///
@@ -1504,14 +1569,14 @@ mod tests {
         }
 
         let mut sequential_count = 0;
-        ElementReader::new(Cursor::new(pbf.clone()))
+        ElementReader::for_tests(Cursor::new(pbf.clone()))
             .unwrap()
             .for_each(|_| sequential_count += 1)
             .unwrap();
         assert_eq!(sequential_count, 2);
 
         let mut pipelined_count = 0;
-        ElementReader::new(Cursor::new(pbf))
+        ElementReader::for_tests(Cursor::new(pbf))
             .unwrap()
             .decode_threads(1)
             .for_each_pipelined(|_| pipelined_count += 1)
@@ -1574,7 +1639,8 @@ mod tests {
             panic!("6 + 4 fits a budget of 10");
         };
         let buf = build_pbf(2);
-        let ElementReader { mut blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+        let ElementReader { mut blob_iter, .. } =
+            ElementReader::for_tests(Cursor::new(buf)).unwrap();
         let mut batch = Batch::new(&budget);
         batch.add(blob_iter.next_blob().unwrap().unwrap(), first);
         batch.add(blob_iter.next_blob().unwrap().unwrap(), second);
@@ -1594,7 +1660,8 @@ mod tests {
     fn a_budget_below_a_partial_batch_still_completes() {
         let buf = build_pbf(6);
         let result = assert_completes("tiny budget", move || {
-            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            let ElementReader { blob_iter, .. } =
+                ElementReader::for_tests(Cursor::new(buf)).unwrap();
             par_fold_blobs(
                 blob_iter,
                 2,
@@ -1777,7 +1844,7 @@ mod tests {
         // `buf`, so this only compiles if the bound really is absent - and the
         // count proves the borrowed path decodes correctly.
         let buf = build_pbf(3);
-        let reader = ElementReader::new(Cursor::new(buf.as_slice())).unwrap();
+        let reader = ElementReader::for_tests(Cursor::new(buf.as_slice())).unwrap();
         let count = reader
             .par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
             .unwrap();
@@ -1792,7 +1859,8 @@ mod tests {
         // block in `acquire` forever and never reach the join loop.
         let buf = build_pbf(4);
         let result = assert_completes("worker panic", move || {
-            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            let ElementReader { blob_iter, .. } =
+                ElementReader::for_tests(Cursor::new(buf)).unwrap();
             par_fold_blobs(
                 blob_iter,
                 1, // one worker
@@ -1819,7 +1887,7 @@ mod tests {
         let buf = build_pbf(3);
         let panic_at = first_data_blob_offset(&buf);
         let result = assert_completes("panicking read", move || {
-            let reader = ElementReader::new(PanicAfterRead {
+            let reader = ElementReader::for_tests(PanicAfterRead {
                 data: buf,
                 pos: 0,
                 panic_at,
@@ -1852,7 +1920,8 @@ mod tests {
         buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // 65536 == MAX
 
         let result = assert_completes("read vs decode", move || {
-            let ElementReader { blob_iter, .. } = ElementReader::new(Cursor::new(buf)).unwrap();
+            let ElementReader { blob_iter, .. } =
+                ElementReader::for_tests(Cursor::new(buf)).unwrap();
             par_fold_blobs(
                 blob_iter,
                 2,
@@ -1912,12 +1981,9 @@ mod tests {
             }
         };
 
-        // Silence the panic backtrace this test deliberately provokes.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // Leave the process panic hook alone: other tests share this binary.
         let mut crashed = build(true);
         let item = crashed.next();
-        std::panic::set_hook(previous);
 
         let err = item
             .expect("a dead pipeline must yield an item, not end-of-iteration")
@@ -1946,6 +2012,7 @@ mod tests {
         crate::test_support::multi_blob_pbf(&fixture);
         let real = ElementReader::from_path(&fixture)
             .unwrap()
+            .resources(crate::host::Host::for_tests().resources)
             .into_blocks_pipelined()
             .unwrap();
         let mut blocks = 0;
@@ -1964,6 +2031,7 @@ mod tests {
         // on the next call.
         let mut partial = ElementReader::from_path(&fixture)
             .unwrap()
+            .resources(crate::host::Host::for_tests().resources)
             .into_blocks_pipelined()
             .unwrap();
         partial

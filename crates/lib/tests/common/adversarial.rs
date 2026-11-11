@@ -106,6 +106,44 @@ pub fn locate_blobs(pbf: &[u8]) -> Vec<BlobLocation> {
     out
 }
 
+/// Fully framed stream, including its consumed extent and each frame's type.
+pub struct StrictFrames {
+    pub extent: usize,
+    pub frames: Vec<(BlobLocation, Vec<u8>)>,
+}
+
+/// Unlike the prefix-tolerant `locate_blobs`, reject incomplete framing and
+/// malformed headers anywhere in the stream, including after readable frames.
+pub fn locate_blobs_strict(pbf: &[u8]) -> Result<StrictFrames, &'static str> {
+    let blobs = locate_blobs(pbf);
+    let extent = blobs.last().map_or(0, |blob| blob.blob_end);
+    if extent != pbf.len() {
+        return Err("incomplete or malformed PBF frame");
+    }
+    let mut frames = Vec::with_capacity(blobs.len());
+    for blob in blobs {
+        let header = &pbf[blob.header_start..blob.header_end];
+        let mut pos = 0;
+        while pos < header.len() {
+            let (tag, n) = read_varint(&header[pos..]).ok_or("invalid header tag")?;
+            if tag >> 3 == 0 {
+                return Err("invalid header field number");
+            }
+            pos += n;
+            skip_field(header, &mut pos, tag & 7).ok_or("invalid header field")?;
+        }
+        let kind = read_bytes_field(header, 1).ok_or("missing frame type")?;
+        frames.push((blob, kind));
+    }
+    Ok(StrictFrames { extent, frames })
+}
+
+/// Raw indexdata bytes for fixture contract assertions.
+pub fn blob_indexdata(header: &[u8]) -> Option<&[u8]> {
+    let (start, end) = locate_indexdata(header)?;
+    header.get(start..end)
+}
+
 /// Mutate the BlobHeader.indexdata bytes of frame `blob_idx`.
 ///
 /// The closure receives the raw indexdata bytes (an empty `Vec` if the

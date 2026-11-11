@@ -45,6 +45,19 @@ add-locations-to-ways mode, so both add-locations-to-ways rows time the
 same osmium command against pbfhogg's two index types. The commands are
 the `vs-osmium` bench, `benches/compare/vs-osmium.lua`.
 
+The figures below were recorded with each tool's default compression
+(zlib level 6 on both). The bench now pins that on both sides
+explicitly on every row that writes a PBF (`--compression zlib:6` for
+pbfhogg, `pbf_compression=zlib,pbf_compression_level=6` for osmium), so
+a change of either tool's default cannot move the comparison. The
+timings do not establish that the two tools' outputs are equivalent: a
+successful exit proves the command ran, and output equivalence is
+unresolved here, left to separate validation such as `brokkr verify`.
+To rerun the table, `scripts/vs-osmium.sh PAIRS DATASET OSC` runs every
+row as `PAIRS` alternating single-iteration pairs (the inspect row,
+pbfhogg only), with `OSC` an explicit key in the dataset's OSC table for
+the apply-changes row; all three arguments are required.
+
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
 | inspect (indexdata) | **111 ms** | -- | answers from indexdata; no osmium counterpart |

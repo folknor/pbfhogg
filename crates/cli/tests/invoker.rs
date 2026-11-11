@@ -48,6 +48,7 @@
 use crate::common::process::OwnedChild;
 use pbfhogg_test_scratch::TestScratch;
 use std::ffi::OsStr;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -108,15 +109,28 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Park the thread reaching checkpoint `ordinal`: the child writes
+    /// `ready` and waits for cancellation; `stuck` keeps it parked after
+    /// cancellation (writing `ready` plus `.ack`). The hook's wire form is
+    /// colon-separated, so `ready` must be UTF-8 without a colon.
     #[allow(dead_code)]
-    pub fn cancel_pause(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_CANCEL_PAUSE", value);
+    pub fn cancel_pause(mut self, ordinal: NonZeroU64, ready: &Path, stuck: bool) -> Self {
+        let ready = ready
+            .to_str()
+            .filter(|r| !r.is_empty() && !r.contains(':'))
+            .expect("cancel pause ready path is nonempty UTF-8 without a colon");
+        let suffix = if stuck { ":stuck" } else { "" };
+        self.cmd.env(
+            "PBFHOGG_TEST_CANCEL_PAUSE",
+            format!("{ordinal}:{ready}{suffix}"),
+        );
         self
     }
 
+    /// Count checkpoints passed and write the count to `path` at exit.
     #[allow(dead_code)]
-    pub fn cancel_count(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_CANCEL_COUNT", value);
+    pub fn cancel_count(mut self, path: &Path) -> Self {
+        self.cmd.env("PBFHOGG_TEST_CANCEL_COUNT", path);
         self
     }
 
@@ -127,8 +141,8 @@ impl<'a> CliInvoker<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn publish_steps(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_PUBLISH_STEPS", value);
+    pub fn publish_steps(mut self, path: &Path) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_STEPS", path);
         self
     }
 
@@ -139,27 +153,19 @@ impl<'a> CliInvoker<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn publish_ready(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_PUBLISH_READY", value);
+    pub fn publish_ready(mut self, path: &Path) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_READY", path);
         self
     }
 
+    /// Replace `input` with `replacement` after its `after`-th open. The
+    /// CLI refuses a partial arming, so the three travel together.
     #[allow(dead_code)]
-    pub fn replace_input(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_REPLACE_INPUT", value);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn replace_with(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_REPLACE_WITH", value);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn replace_after(mut self, value: u64) -> Self {
+    pub fn replace_input(mut self, input: &Path, replacement: &Path, after: NonZeroU64) -> Self {
         self.cmd
-            .env("PBFHOGG_TEST_REPLACE_AFTER", value.to_string());
+            .env("PBFHOGG_TEST_REPLACE_INPUT", input)
+            .env("PBFHOGG_TEST_REPLACE_WITH", replacement)
+            .env("PBFHOGG_TEST_REPLACE_AFTER", after.to_string());
         self
     }
 
@@ -180,8 +186,8 @@ impl<'a> CliInvoker<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn replace_report(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_REPLACE_REPORT", value);
+    pub fn replace_report(mut self, path: &Path) -> Self {
+        self.cmd.env("PBFHOGG_TEST_REPLACE_REPORT", path);
         self
     }
 
@@ -594,7 +600,7 @@ mod tests {
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             running
                 .owner
-                .wait_with_poll(pbfhogg::TEST_CHILD_TIMEOUT, |_| {
+                .wait_with_check(pbfhogg::TEST_CHILD_TIMEOUT, |_| {
                     Err(std::io::Error::other("injected wait error"))
                 })
                 .expect("injected failure");
@@ -610,6 +616,47 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    /// The input gate controls completion independently of host speed. Keeping
+    /// it open without writing also exercises the independent timeout path.
+    #[test]
+    fn owned_child_blocks_for_completion_and_times_out_a_gated_child() {
+        use super::OwnedChild;
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+
+        let scratch = pbfhogg_test_scratch::scratch();
+        for release in [true, false] {
+            let (reader, mut gate) = UnixStream::pair().expect("input gate");
+            let mut command = Command::new("/bin/sh");
+            crate::common::process::isolate(&mut command, &scratch);
+            command
+                .args(["-c", "read value; printf '%s' \"$value\""])
+                .stdin(Stdio::from(OwnedFd::from(reader)))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = OwnedChild::spawn(&mut command, &scratch).expect("gated child");
+            if release {
+                gate.write_all(b"released\n").expect("release input gate");
+                let output = child.wait(pbfhogg::TEST_CHILD_TIMEOUT).expect("completion");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"released");
+                assert!(output.stderr.is_empty());
+                // A status cached by an earlier wait must not call waitid on
+                // a PID that has already been reaped.
+                let cached = child
+                    .wait(pbfhogg::TEST_CHILD_TIMEOUT)
+                    .expect("cached exit");
+                assert!(cached.status.success());
+            } else {
+                let error = child.wait(std::time::Duration::ZERO).expect_err("timeout");
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                assert!(child.has_exited().expect("timeout reaped child"));
+            }
+        }
     }
 
     #[test]

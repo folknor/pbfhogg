@@ -1,104 +1,130 @@
-//! Truncation sweep: drive every command through a known-good PBF
-//! truncated at every blob/frame/payload boundary plus a deterministic
-//! set of intermediate offsets.
-//!
-//! The contract this file pins follows
-//! `reference/truncation-handling.md`:
-//!
-//! - **Shape 1** (clean cut at a frame boundary, 0-3 leftover bytes
-//!   from an incomplete next length prefix): tolerated. Commands may
-//!   exit 0; we only require no panic + bounded stderr.
-//! - **Shapes 2-4** (length prefix past EOF, mid-header EOF, mid-
-//!   payload EOF): hard error. Commands MUST exit non-zero.
-//!
-//! Decompression failure (shape 5) is exercised separately by the
-//! `mutate_blob_payload`-based tests in `cli_defensive_input.rs`.
+//! Representative CLI read-path matrix, not an inventory of every command.
+//! Each named case runs one child under its own watchdog. Exhaustive framing
+//! boundaries belong to read/frame_conformance_tests.rs and tests/read_paths.rs;
+//! these cases pin CLI routing, error propagation, and valid-input controls.
 
-use std::time::Duration;
-
-use crate::common::adversarial::{BlobLocation, locate_blobs, truncate_to};
+use crate::common::adversarial::locate_blobs;
 use crate::common::{
     generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf,
 };
 use crate::invoker::CliInvoker;
 
-/// Wall clock cap per truncation × command invocation.
-const PER_INVOCATION_TIMEOUT: Duration = Duration::from_secs(8);
+#[derive(Clone, Copy)]
+enum Cut {
+    Valid,
+    PartialPrefix,
+    CommittedPrefix,
+    Header,
+    Payload,
+}
 
-#[test]
-fn truncation_sweep_no_panic() {
+fn run_case(subcmd: &str, extra: &[&str], cut: Cut) {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let truncated = dir.path().join("truncated.osm.pbf");
-
-    // Small multi-blob fixture: ~6 OSMData blobs (4 node + 1 way + 1 rel).
+    let input = dir.child("input.osm.pbf");
     let nodes = generate_nodes(40, 1);
     let ways = generate_ways(10, 1_000, 3, 1);
     let relations = generate_relations(4, 10_000, 2, 1_000);
     write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 10);
-
     let pbf = std::fs::read(&input).expect("read fixture");
     let blobs = locate_blobs(&pbf);
-
-    let mut offsets: Vec<usize> = Vec::new();
-    for b in &blobs {
-        // Shape 1 boundaries (1-3 bytes into the length prefix).
-        offsets.push(b.frame_start + 1);
-        offsets.push(b.frame_start + 2);
-        offsets.push(b.frame_start + 3);
-        // Shape 3 boundaries (committed length prefix, header truncated).
-        offsets.push(b.header_start + (b.header_end - b.header_start) / 2);
-        offsets.push(b.header_end - 1);
-        // Shape 4 boundaries (committed header, payload truncated).
-        offsets.push(b.blob_start + 1);
-        offsets.push((b.blob_start + b.blob_end) / 2);
-        offsets.push(b.blob_end - 1);
-    }
-    // Uniform offsets across the file (deterministic, no RNG) to catch
-    // boundaries the structural list misses. Each gets classified
-    // below.
-    for k in 1..=12 {
-        offsets.push((pbf.len() * k) / 13);
-    }
-    offsets.retain(|&o| o > 0 && o < pbf.len());
-    offsets.sort_unstable();
-    offsets.dedup();
-
-    // Each configuration must read valid input successfully before corruption
-    // can count as a detected framing failure.
-    for (subcmd, extra) in [
-        ("cat", &[][..]),
-        ("inspect", &[][..]),
-        ("sort", &[][..]),
-        ("getid", &["--", "n1"][..]),
-        ("add-locations-to-ways", &[][..]),
-        ("renumber", &[][..]),
-    ] {
-        run_and_assert(&dir, subcmd, &input, 0, Classification::Valid, extra);
-    }
-
-    for &len in &offsets {
-        let bytes = truncate_to(&pbf, len);
-        std::fs::write(&truncated, &bytes).expect("write truncated");
-
-        let class = classify_offset(&blobs, len);
-        run_and_assert(&dir, "cat", &truncated, len, class, &[]);
-        run_and_assert(&dir, "inspect", &truncated, len, class, &[]);
-        run_and_assert(&dir, "sort", &truncated, len, class, &[]);
-        // Broaden coverage to exercise read-path sites the cat/inspect/
-        // sort triple doesn't hit:
-        //   - getid: HeaderWalker fast path with pread for matching
-        //     blobs (`--` + `n1` so we ask for at least one positive id
-        //     without tripping the parse-time negative-id reject).
-        //   - add-locations-to-ways: `altw::passthrough`'s
-        //     `FileReader::skip` path - one of the contract sites that
-        //     the original audit missed and 12699db landed.
-        //   - renumber: full-read + pass-2 reframe walker.
-        run_and_assert(&dir, "getid", &truncated, len, class, &["--", "n1"]);
-        run_and_assert(&dir, "add-locations-to-ways", &truncated, len, class, &[]);
-        run_and_assert(&dir, "renumber", &truncated, len, class, &[]);
-    }
+    // Cut the final data frame so every route first sees a complete header
+    // and data. Missing-header policy cannot mask the framing diagnosis.
+    let frame = blobs.last().expect("fixture has frames");
+    let (len, class) = match cut {
+        Cut::Valid => (pbf.len(), Classification::Valid),
+        Cut::PartialPrefix => (frame.frame_start + 2, Classification::Tolerated),
+        Cut::CommittedPrefix => (frame.header_start, Classification::HardError),
+        Cut::Header => (frame.header_end - 1, Classification::HardError),
+        Cut::Payload => (frame.blob_end - 1, Classification::HardError),
+    };
+    std::fs::write(&input, &pbf[..len]).expect("write case input");
+    run_and_assert(&dir, subcmd, &input, len, class, extra);
 }
+
+// One declaration generates exactly five independently scheduled one-child
+// tests. Adding a route cannot enlarge an existing watchdog unit. Each route
+// has a valid-input control and all four CLI propagation obligations.
+macro_rules! route {
+    ($name:ident, $command:literal, [$($extra:literal),*], $obligation:literal) => {
+        #[doc = $obligation]
+        mod $name {
+            use super::*;
+            #[test]
+            fn valid_control() {
+                run_case($command, &[$($extra),*], Cut::Valid);
+            }
+            #[test]
+            fn partial_prefix() {
+                run_case($command, &[$($extra),*], Cut::PartialPrefix);
+            }
+            #[test]
+            fn committed_prefix() {
+                run_case($command, &[$($extra),*], Cut::CommittedPrefix);
+            }
+            #[test]
+            fn truncated_header() {
+                run_case($command, &[$($extra),*], Cut::Header);
+            }
+            #[test]
+            fn truncated_payload() {
+                run_case($command, &[$($extra),*], Cut::Payload);
+            }
+        }
+    };
+}
+
+// The inventory and generated cases share one declaration. Every route must
+// remain a real command in the production clap tree; new commands need not
+// duplicate these representative obligations.
+macro_rules! matrix {
+    ($(($name:ident, $command:literal, [$($extra:literal),*], $obligation:literal)),* $(,)?) => {
+        $(route!($name, $command, [$($extra),*], $obligation);)*
+
+        #[test]
+        fn representative_route_inventory() {
+            let commands = crate::invoker::subcommands();
+            let mut seen = std::collections::BTreeSet::new();
+            $(
+                assert!(commands.iter().any(|command| command == $command));
+                assert!(seen.insert($command), "duplicate representative route");
+            )*
+        }
+    };
+}
+
+matrix!(
+    (
+        cat,
+        "cat",
+        [],
+        "Raw passthrough framing and CLI error propagation."
+    ),
+    (
+        inspect,
+        "inspect",
+        [],
+        "Read-only inspection without an output writer."
+    ),
+    (sort, "sort", [], "Sort scan and partial-input policy."),
+    (
+        getid,
+        "getid",
+        ["--", "n1"],
+        "Selective header walk with positional blob reads."
+    ),
+    (
+        altw,
+        "add-locations-to-ways",
+        [],
+        "Location front probe and payload skipping."
+    ),
+    (
+        renumber,
+        "renumber",
+        [],
+        "Full-read renumber scan and rewrite routing."
+    ),
+);
 
 /// Classification of a truncation offset.
 ///
@@ -110,7 +136,7 @@ fn truncation_sweep_no_panic() {
 /// "less data than expected" because it can't sort what it doesn't
 /// have. So this sweep can only pin shape 1 as no-panic + bounded
 /// stderr at the command level. The reader-level tolerance contract
-/// is pinned separately by inline unit tests on `BlobReader::next`
+/// is pinned separately by integration tests on `BlobReader::next`
 /// (see `crates/lib/tests/read_paths.rs::trailing_partial_length_prefix_*`).
 #[derive(Debug, Clone, Copy)]
 enum Classification {
@@ -121,19 +147,6 @@ enum Classification {
     /// Shapes 2-4: committed length prefix or further. Reader must
     /// hard-error; command must exit non-zero.
     HardError,
-}
-
-fn classify_offset(blobs: &[BlobLocation], offset: usize) -> Classification {
-    for b in blobs {
-        if offset >= b.frame_start && offset < b.frame_start + 4 {
-            return Classification::Tolerated;
-        }
-        if offset >= b.frame_start + 4 && offset < b.blob_end {
-            return Classification::HardError;
-        }
-    }
-    // Past the end of all blobs - clean EOF.
-    Classification::Tolerated
 }
 
 fn run_and_assert(
@@ -147,10 +160,7 @@ fn run_and_assert(
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let cell = dir.cell();
     let output = cell.join("output.osm.pbf");
-    let mut inv = CliInvoker::new(&invocation_scratch)
-        .arg(subcmd)
-        .arg(input)
-        .timeout(PER_INVOCATION_TIMEOUT);
+    let mut inv = CliInvoker::new(&invocation_scratch).arg(subcmd).arg(input);
     if subcmd != "inspect" {
         inv = inv.arg("-o").arg(&output);
     }

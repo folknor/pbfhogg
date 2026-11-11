@@ -1908,17 +1908,9 @@ enum Command {
         /// Also include the queried objects themselves in the output
         #[arg(long = "add-self")]
         add_self: bool,
-        /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
-        // Bounded at the CLI boundary rather than trusted raw into the
-        // library entry point: 0 is not a threshold, it just pins the
-        // FullScan arm unconditionally, and the upper bound keeps the
-        // instrument inside the range a blob count can actually reach.
-        #[arg(
-            long,
-            hide = true,
-            value_parser = clap::value_parser!(u64).range(1..=1_000_000_000)
-        )]
-        full_scan_min_blobs: Option<u64>,
+        // Test instrument, present only in test-hooks builds.
+        #[command(flatten)]
+        full_scan: FullScanArg,
         /// Read IDs from text file (one per line, e.g. n123 or node/123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
@@ -3191,7 +3183,7 @@ pub fn run() -> process::ExitCode {
                     file,
                     output,
                     add_self,
-                    full_scan_min_blobs,
+                    full_scan,
                     id_file,
                     id_osm_file,
                     default_type,
@@ -3218,14 +3210,7 @@ pub fn run() -> process::ExitCode {
                     // throughout.
                     let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
                     run_getparents(
-                        &input,
-                        output,
-                        add_self,
-                        sources,
-                        &write,
-                        &overrides,
-                        full_scan_min_blobs,
-                        &host,
+                        &input, output, add_self, sources, &write, &overrides, &full_scan, &host,
                     )
                 }
                 Command::Extract {
@@ -4573,6 +4558,42 @@ fn run_diff(
     })
 }
 
+// Keep clock resolution at the CLI boundary. The library receives one instant
+// for every deletion; the clock is called only when the flag requests it.
+fn derive_timestamp(
+    update: bool,
+    now: impl FnOnce() -> std::time::SystemTime,
+) -> Result<Option<u64>, std::time::SystemTimeError> {
+    if update {
+        Ok(Some(now().duration_since(std::time::UNIX_EPOCH)?.as_secs()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod derive_clock_tests {
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn resolves_one_exact_instant_only_when_requested() {
+        let instant = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123);
+        assert_eq!(
+            super::derive_timestamp(true, || instant).expect("valid instant"),
+            Some(1_700_000_123)
+        );
+        assert_eq!(
+            super::derive_timestamp(false, || panic!("clock must not be read"))
+                .expect("no clock needed"),
+            None
+        );
+        assert!(
+            super::derive_timestamp(true, || std::time::UNIX_EPOCH
+                - std::time::Duration::from_secs(1))
+            .is_err()
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_derive_changes(
     old: &std::path::Path,
@@ -4585,15 +4606,7 @@ fn run_derive_changes(
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let timestamp = if update_timestamp {
-        Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        )
-    } else {
-        None
-    };
+    let timestamp = derive_timestamp(update_timestamp, std::time::SystemTime::now)?;
     let stats = pbfhogg::diff::derive::derive_changes(
         old,
         new,
@@ -4652,6 +4665,32 @@ fn run_getid(
     Ok(())
 }
 
+/// `getparents --full-scan-min-blobs`: overrides the ADR-0006 FullScan
+/// dispatch threshold so the suite can fire that arm on a small fixture.
+/// A test instrument, so it exists only in test-hooks builds (with the
+/// library entry point behind it); a production build has no such flag and
+/// clap refuses it as unknown.
+#[cfg(feature = "test-hooks")]
+#[derive(Args)]
+struct FullScanArg {
+    /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
+    // Bounded at the CLI boundary rather than trusted raw into the
+    // library entry point: 0 is not a threshold, it just pins the
+    // FullScan arm unconditionally, and the upper bound keeps the
+    // instrument inside the range a blob count can actually reach.
+    #[arg(
+        long,
+        hide = true,
+        value_parser = clap::value_parser!(u64).range(1..=1_000_000_000)
+    )]
+    full_scan_min_blobs: Option<u64>,
+}
+
+/// The production build's empty counterpart: no flag, no threshold.
+#[cfg(not(feature = "test-hooks"))]
+#[derive(Args)]
+struct FullScanArg {}
+
 #[allow(clippy::too_many_arguments)]
 fn run_getparents(
     input: &pbfhogg::read::input::PinnedInput,
@@ -4660,18 +4699,23 @@ fn run_getparents(
     sources: IdSources,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
-    full_scan_min_blobs: Option<u64>,
+    full_scan: &FullScanArg,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = sources.resolve(write.direct_reads, host)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
-    let stats = if let Some(min_blobs) = full_scan_min_blobs {
-        pbfhogg::getparents::getparents_with_min_blobs(
+    #[cfg(feature = "test-hooks")]
+    if let Some(min_blobs) = full_scan.full_scan_min_blobs {
+        let stats = pbfhogg::getparents::getparents_with_min_blobs(
             input, output, &id_set, &opts, write, overrides, min_blobs, host,
-        )?
-    } else {
-        pbfhogg::getparents::getparents(input, output, &id_set, &opts, write, overrides, host)?
-    };
+        )?;
+        stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
+        return Ok(());
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let FullScanArg {} = full_scan;
+    let stats =
+        pbfhogg::getparents::getparents(input, output, &id_set, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
     Ok(())
 }

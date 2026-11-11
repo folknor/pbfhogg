@@ -862,7 +862,7 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **3-stage pipeline** - `crates/lib/src/read/pipeline.rs`
 1. **I/O thread**: reads raw compressed blobs (~32KB each) sequentially, sends via channel (READ_AHEAD=16 slots)
-2. **Rayon decode pool**: parallel decompress + parse. A dedicated per-read rayon pool, not the host's `Executor`. Thread count = `host::sized_workers` over the reader's resources, reserving threads for the I/O reader and the consumer (`ElementReader::decode_threads` overrides). Built as a `joined_pool::JoinedPool` on the dispatcher thread, which joins every worker (thread-local destructors included, so the per-thread decompressor and scratch below are freed) before the read returns
+2. **Rayon decode pool**: parallel decompress + parse. A dedicated per-read rayon pool, not the host's `Executor`. Thread count = `host::sized_workers` over the reader's resources, reserving threads for the I/O reader and the consumer. The reader's resources are, in order: those set by `ElementReader::resources`, the host's for a reader opened with a host, else the machine probe. An explicit `ElementReader::decode_threads` count overrides all three here and in `par_map_reduce`, and then no resources are consulted. The setter is lazy and touches nothing but worker sizing. Built as a `joined_pool::JoinedPool` on the dispatcher thread, which joins every worker (thread-local destructors included, so the per-thread decompressor and scratch below are freed) before the read returns
    - `decompress_blob()` - thread-local `flate2::Decompress` with `reset(true)`, reused per thread
    - `DecompressPool` - returns `Vec<u8>` to pool on drop instead of freeing
    - `PooledBuffer` wrapper - custom Drop via `Bytes::from_owner`

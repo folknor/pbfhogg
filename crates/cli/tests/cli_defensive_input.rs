@@ -465,6 +465,7 @@ fn cat_rejects_truncated_node_blob_payload() {
 /// input is opened, which is why this passes a path that does not exist:
 /// if the bound were dropped the command would get as far as the file and
 /// fail with a different message.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn getparents_rejects_zero_full_scan_min_blobs() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -484,6 +485,21 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
         !stderr.contains("never-opened"),
         "argument validation must reject before touching the input; stderr:\n{stderr}",
     );
+}
+
+/// The threshold instrument is in the command tree exactly when the build
+/// has test-hooks: a production build cannot be steered onto a dispatch arm.
+#[test]
+fn full_scan_min_blobs_exists_only_in_test_hooks_builds() {
+    let command = pbfhogg_cli::cli_command();
+    let getparents = command
+        .get_subcommands()
+        .find(|sub| sub.get_name() == "getparents")
+        .expect("getparents subcommand");
+    let present = getparents
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some("full-scan-min-blobs"));
+    assert_eq!(present, cfg!(feature = "test-hooks"));
 }
 
 /// Public readers discard diagnostics unless the CLI explicitly attaches its

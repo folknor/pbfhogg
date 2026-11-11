@@ -413,8 +413,8 @@ pub struct FaultPlan {
     seal_observer: OnceLock<SealObserver>,
 }
 
-/// A publication observer; it may block (a test parks the publishing thread
-/// in it until the process is killed).
+/// A publication observer running under the invocation execution lock.
+/// See [`FaultPlan::on_publish_step`] for permitted blocking dependencies.
 type PublishObserver = Box<dyn Fn(PublishStep) + Send + Sync>;
 
 /// A seal observer; it may block or panic.
@@ -604,10 +604,13 @@ impl FaultPlan {
 
     /// Run `observer` on the finalizing thread at every [`SealStep`] of a
     /// seal of this token's invocation. It may block (concurrent sealers are
-    /// refused meanwhile) or panic (see each step). Set once; a second call
-    /// is ignored.
+    /// refused meanwhile) or panic (see each step). Panics if an observer
+    /// is already installed.
     pub fn on_seal_step(&self, observer: impl Fn(SealStep) + Send + Sync + 'static) {
-        drop(self.seal_observer.set(Box::new(observer)));
+        assert!(
+            self.seal_observer.set(Box::new(observer)).is_ok(),
+            "a seal observer is already installed"
+        );
     }
 
     /// Called by the finalizing seal at each step.
@@ -637,11 +640,22 @@ impl FaultPlan {
     }
 
     /// Run `observer` on the publishing thread after every namespace step
-    /// of every publication under this token, with no lock held. It may
-    /// block: publication is not cancellable, so a test that parks it there
-    /// ends the process to move on. Set once; a second call is ignored.
+    /// of every publication under this token. The invocation's publication
+    /// execution lock is held; the publication log lock is not held.
+    /// Same-thread publication re-entry under this invocation is refused.
+    /// An observer must not wait for another thread to publish under this
+    /// invocation, or for any work that depends on acquiring its execution
+    /// lock: that forms a deadlock. It may wait for an independent test
+    /// controller that guarantees release on every exit path. Cancellation
+    /// does not release a parked observer; an intentionally permanent park
+    /// requires a killable child process.
+    ///
+    /// Panics if an observer is already installed.
     pub fn on_publish_step(&self, observer: impl Fn(PublishStep) + Send + Sync + 'static) {
-        drop(self.publish_observer.set(Box::new(observer)));
+        assert!(
+            self.publish_observer.set(Box::new(observer)).is_ok(),
+            "a publication observer is already installed"
+        );
     }
 
     /// Called by publication after each step.
@@ -1347,5 +1361,24 @@ pub(crate) struct LivePoolWorker<'a>(&'a FaultPlan);
 impl Drop for LivePoolWorker<'_> {
     fn drop(&mut self) {
         self.0.live_pool_workers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[should_panic(expected = "a seal observer is already installed")]
+    fn duplicate_seal_observer_is_refused() {
+        let plan = super::FaultPlan::new();
+        plan.on_seal_step(|_| {});
+        plan.on_seal_step(|_| {});
+    }
+
+    #[test]
+    #[should_panic(expected = "a publication observer is already installed")]
+    fn duplicate_publication_observer_is_refused() {
+        let plan = super::FaultPlan::new();
+        plan.on_publish_step(|_| {});
+        plan.on_publish_step(|_| {});
     }
 }

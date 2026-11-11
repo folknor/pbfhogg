@@ -9,14 +9,14 @@
 //!
 //! The rule is a source scan: every string literal under `crates/lib/src/`, outside
 //! comments, attributes and test-only items, is checked for `pbfhogg
-//! <subcommand>` (the subcommand names come from the built command tree) and
-//! for any long-flag shape `--word`. It lives in this crate because only here
-//! is the command tree available to name the subcommands.
+//! <word>` independently of the current command names, and
+//! for any long-flag shape `--word`. The CLI owns this source-level boundary rule.
 //!
 //! Test-only means gated by an attribute whose cfg predicate *requires*
 //! `test` (`#[test]`, `#[cfg(test)]`, `#[cfg(all(test, ..))]`; never
-//! `cfg(any(test, ..))`, `cfg(not(test))` or `cfg_attr`), or a module file
-//! declared behind one, with its whole subtree. Inside a macro invocation or
+//! `cfg(any(test, ..))`, `cfg(not(test))` or `cfg_attr`), or a file with its own
+//! inner test gate. Module declarations never exempt other files: a file can
+//! also be included by a production module. Inside a macro invocation or
 //! a `macro_rules!` definition nothing is exempt: attribute-shaped tokens
 //! there are macro input, not gates, and every literal is collected.
 
@@ -39,12 +39,10 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// The literals of one file and the test-only module files it declares.
+/// The literals and file-local gate of one physical source file.
 #[derive(Default)]
 struct Scan {
     literals: Vec<(usize, String)>,
-    /// `mod x;` items behind a test gate: the module name and its `#[path]`.
-    test_mods: Vec<(String, Option<String>)>,
     file_is_test_only: bool,
 }
 
@@ -372,12 +370,8 @@ impl Lexer {
         }
     }
 
-    /// Skip the item after a test-only attribute. Returns its text,
-    /// whitespace collapsed (to recognise `mod x;`), and any `#[path]` among
-    /// its further attributes.
-    fn skip_item(&mut self) -> (String, Option<String>) {
-        let mut text = String::new();
-        let mut path = None;
+    /// Skip the item after a test-only attribute, including further attributes.
+    fn skip_item(&mut self) {
         let (mut paren, mut bracket) = (0_i32, 0_i32);
         let mut keyword_item = None;
         while let Some(c) = self.peek(0) {
@@ -386,7 +380,7 @@ impl Lexer {
             }
             match c {
                 '#' => match self.attribute() {
-                    Some((attr, _)) => path = path_attribute(&attr).or(path),
+                    Some(_) => {}
                     None => {
                         self.bump();
                     }
@@ -412,7 +406,6 @@ impl Lexer {
                 '}' => break,
                 ';' if paren == 0 && bracket == 0 => {
                     self.bump();
-                    text.push(';');
                     break;
                 }
                 ',' if paren == 0 && bracket == 0 && keyword_item == Some(false) => break,
@@ -444,28 +437,11 @@ impl Lexer {
                                 | "macro_rules"
                         ));
                     }
-                    if text.len() < 200 {
-                        if c.is_whitespace() {
-                            if !text.ends_with(' ') {
-                                text.push(' ');
-                            }
-                        } else {
-                            text.push(c);
-                        }
-                    }
                     self.bump();
                 }
             }
         }
-        (text, path)
     }
-}
-
-/// The value of a `#[path = "..."]` attribute (whitespace-free text).
-fn path_attribute(attr: &str) -> Option<String> {
-    attr.strip_prefix("path=\"")
-        .and_then(|rest| rest.strip_suffix('"'))
-        .map(str::to_owned)
 }
 
 /// Split a cfg predicate list at top-level commas.
@@ -522,8 +498,6 @@ fn scan(src: &str) -> Scan {
     let mut lx = Lexer::new(src);
     let mut out = Scan::default();
     let mut depth = 0_i32;
-    // A `#[path]` seen on the item being started, for a test-only `mod x;`.
-    let mut pending_path: Option<String> = None;
     while let Some(c) = lx.peek(0) {
         if let Some(found) = lx.trivia() {
             out.literals.extend(found);
@@ -557,48 +531,26 @@ fn scan(src: &str) -> Scan {
                         }
                         continue;
                     }
-                    let (item, path) = lx.skip_item();
-                    let path = path.or(pending_path.take());
-                    let words: Vec<&str> = item
-                        .trim_end_matches(';')
-                        .split(|c: char| !is_ident(c))
-                        .filter(|w| !w.is_empty())
-                        .collect();
-                    if item.ends_with(';')
-                        && let Some(at) = words.iter().position(|w| *w == "mod")
-                        && let Some(name) = words.get(at + 1)
-                        && at + 2 == words.len()
-                    {
-                        out.test_mods.push(((*name).to_owned(), path));
-                    }
+                    lx.skip_item();
                 }
-                Some((attr, _)) => {
-                    if let Some(path) = path_attribute(&attr) {
-                        pending_path = Some(path);
-                    }
-                }
+                Some(_) => {}
                 None => {
                     lx.bump();
                 }
             },
             c if is_ident(c) => {
-                if lx.word_then_macro_group(&mut out.literals) {
-                    pending_path = None;
-                }
+                lx.word_then_macro_group(&mut out.literals);
             }
             '{' => {
                 depth += 1;
                 lx.bump();
-                pending_path = None;
             }
             '}' => {
                 depth -= 1;
                 lx.bump();
-                pending_path = None;
             }
             ';' => {
                 lx.bump();
-                pending_path = None;
             }
             _ => {
                 lx.bump();
@@ -606,33 +558,6 @@ fn scan(src: &str) -> Scan {
         }
     }
     out
-}
-
-/// The directory the child modules of `file` live in.
-fn module_dir(file: &Path) -> PathBuf {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    if matches!(stem, "lib" | "main" | "mod") {
-        dir.to_path_buf()
-    } else {
-        dir.join(stem)
-    }
-}
-
-/// The files and subtree a test-only `mod name;` in `file` covers: an entry
-/// is excluded when it equals one of these or lies under the directory.
-fn excluded_by(file: &Path, name: &str, path: Option<&str>) -> Vec<PathBuf> {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    match path {
-        Some(path) => {
-            let target = dir.join(path);
-            vec![target.with_extension(""), target]
-        }
-        None => {
-            let base = module_dir(file);
-            vec![base.join(format!("{name}.rs")), base.join(name)]
-        }
-    }
 }
 
 /// Every `.rs` file under `dir`, recursively.
@@ -669,22 +594,19 @@ fn library_literals() -> Vec<Literal> {
         files.len(),
         root.display()
     );
-    let mut excluded: Vec<PathBuf> = Vec::new();
-    let mut found: Vec<(PathBuf, Scan)> = Vec::new();
+    literals_in(&files)
+}
+
+/// Scan each physical file independently. A test-only module declaration is
+/// not proof that its target is unreachable from a production module. In
+/// particular, neither `#[path]` nor `..` resolution grants an exemption.
+fn literals_in(files: &[PathBuf]) -> Vec<Literal> {
+    let mut literals = Vec::new();
     for file in files {
-        let src = std::fs::read_to_string(&file)
+        let src = std::fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let scan = scan(&src);
-        for (name, path) in &scan.test_mods {
-            excluded.extend(excluded_by(&file, name, path.as_deref()));
-        }
-        found.push((file, scan));
-    }
-    // Component-wise: `x/contract.rs` is not under `x/contract`.
-    let is_excluded = |file: &Path| excluded.iter().any(|ex| file.starts_with(ex));
-    let mut literals = Vec::new();
-    for (file, scan) in found {
-        if scan.file_is_test_only || is_excluded(&file) {
+        if scan.file_is_test_only {
             continue;
         }
         for (line, text) in scan.literals {
@@ -698,40 +620,39 @@ fn library_literals() -> Vec<Literal> {
     literals
 }
 
-/// Every subcommand name and alias in the built command tree.
-fn subcommand_names() -> Vec<String> {
-    fn walk(cmd: &clap::Command, out: &mut Vec<String>) {
-        for sub in cmd.get_subcommands() {
-            out.push(sub.get_name().to_owned());
-            out.extend(sub.get_all_aliases().map(str::to_owned));
-            walk(sub, out);
-        }
-    }
-    let mut cmd = crate::cli_command();
-    cmd.build();
-    let mut out = Vec::new();
-    walk(&cmd, &mut out);
-    out.retain(|name| name != "help");
-    out
-}
+/// Diagnostic prose naming the program, rather than an invocation. Keep the
+/// whole grammatical phrase here, never a bare word that could become a command.
+const PROGRAM_PROSE: &[&str] = &[
+    "pbfhogg uses for its own staging",
+    "pbfhogg never deletes",
+    "pbfhogg will not remove",
+    "pbfhogg kept (",
+    "pbfhogg run that did not finish",
+    "pbfhogg run did not finish",
+    "pbfhogg does not remove",
+    "pbfhogg write paths do",
+];
 
-/// The `pbfhogg <subcommand>` phrase in `text`, if any; any run of
-/// whitespace may separate the two words.
-fn names_subcommand<'a>(text: &str, subcommands: &'a [String]) -> Option<&'a str> {
+/// Invocation-shaped text must stay forbidden after a command is renamed or
+/// removed. Membership in today's command tree cannot establish that boundary.
+fn names_subcommand(text: &str) -> Option<&str> {
     text.match_indices("pbfhogg").find_map(|(i, _)| {
-        let rest = &text[i + "pbfhogg".len()..];
-        let trimmed = rest.trim_start();
-        if trimmed.len() == rest.len() {
+        if text[..i].chars().next_back().is_some_and(is_ident) {
             return None;
         }
-        let word: String = trimmed
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        subcommands
-            .iter()
-            .find(|name| **name == word)
-            .map(String::as_str)
+        let phrase = &text[i..];
+        if PROGRAM_PROSE.iter().any(|prose| phrase.starts_with(prose)) {
+            return None;
+        }
+        let rest = &phrase["pbfhogg".len()..];
+        let trimmed = rest.trim_start();
+        if trimmed.len() == rest.len() || !trimmed.starts_with(|c: char| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let end = trimmed
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(trimmed.len());
+        Some(&trimmed[..end])
     })
 }
 
@@ -770,16 +691,11 @@ fn allowed_at(file: &Path, text: &str, range: &std::ops::Range<usize>) -> Option
 
 #[test]
 fn library_text_names_no_subcommand_and_no_flag() {
-    let subcommands = subcommand_names();
-    assert!(
-        subcommands.iter().any(|s| s == "cat"),
-        "the command tree lists no `cat`: {subcommands:?}"
-    );
     let mut problems = Vec::new();
     let mut allowed_used = vec![false; ALLOWED.len()];
     for literal in library_literals() {
         let at = format!("{}:{}", literal.file.display(), literal.line);
-        if let Some(name) = names_subcommand(&literal.text, &subcommands) {
+        if let Some(name) = names_subcommand(&literal.text) {
             problems.push(format!("{at}: names `pbfhogg {name}`"));
         }
         for (range, flag) in long_flags(&literal.text) {
@@ -852,13 +768,6 @@ fn the_scanner_sees_what_it_must_and_skips_what_it_must() {
             "after"
         ],
     );
-    assert_eq!(
-        scan.test_mods,
-        [
-            ("gated".to_owned(), None),
-            ("moved".to_owned(), Some("elsewhere.rs".to_owned()))
-        ]
-    );
     assert_eq!(scan.literals[0].0, 4, "{:?}", scan.literals[0]);
     assert!(!scan.file_is_test_only);
     assert!(scan_is_test_only("#![cfg(test)]\nconst X: &str = \"--x\";"));
@@ -869,14 +778,10 @@ fn the_scanner_sees_what_it_must_and_skips_what_it_must() {
         .collect();
     assert_eq!(flags, ["--io-uring", "--x"]);
     assert!(long_flags("a---b x--y <!-- c").is_empty());
-    let subs = ["cat".to_owned()];
-    assert_eq!(
-        names_subcommand("e.g. pbfhogg cat --clean", &subs),
-        Some("cat")
-    );
-    assert_eq!(names_subcommand("pbfhogg\n   cat", &subs), Some("cat"));
-    assert_eq!(names_subcommand("pbfhogg never deletes", &subs), None);
-    assert_eq!(names_subcommand("pbfhogg catalogue", &subs), None);
+    assert_eq!(names_subcommand("e.g. pbfhogg cat --clean"), Some("cat"));
+    assert_eq!(names_subcommand("pbfhogg\n   cat"), Some("cat"));
+    assert_eq!(names_subcommand("pbfhogg never deletes"), None);
+    assert_eq!(names_subcommand("pbfhogg catalogue"), Some("catalogue"));
 
     // The allow-list covers its own occurrence, not the whole literal.
     let file = Path::new("/x/src/commands/time_filter/mod.rs");
@@ -887,15 +792,63 @@ fn the_scanner_sees_what_it_must_and_skips_what_it_must() {
         .map(|(_, f)| f)
         .collect();
     assert_eq!(flagged, ["--force"]);
-
-    // A test-only module's subtree is excluded, nothing beside it.
-    let excluded = excluded_by(Path::new("/s/write/mod.rs"), "contract", None);
-    assert!(excluded.contains(&PathBuf::from("/s/write/contract.rs")));
-    assert!(excluded.contains(&PathBuf::from("/s/write/contract")));
-    let excluded = excluded_by(Path::new("/s/a.rs"), "b", Some("../t/b.rs"));
-    assert!(excluded.contains(&PathBuf::from("/s/../t/b.rs")));
 }
 
 fn scan_is_test_only(src: &str) -> bool {
     scan(src).file_is_test_only
+}
+
+#[test]
+fn renamed_and_removed_commands_still_count_as_frontend_advice() {
+    for name in ["retired-command", "renamed-command", "cat"] {
+        let advice = format!("run pbfhogg {name} input.pbf");
+        assert_eq!(names_subcommand(&advice), Some(name));
+    }
+    assert_eq!(names_subcommand("other_pbfhogg cat"), None);
+    assert_eq!(names_subcommand("pbfhogg 0.5.0"), None);
+    assert_eq!(
+        names_subcommand("pbfhogg never deletes; run pbfhogg retired"),
+        Some("retired")
+    );
+}
+
+#[test]
+fn module_paths_never_hide_shared_production_literals() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let root = scratch.path();
+    std::fs::create_dir(root.join("nested")).expect("create nested directory");
+    let entry = root.join("lib.rs");
+    let shared = root.join("shared.rs");
+    let neighbor = root.join("nested/neighbor.rs");
+    std::fs::write(
+        &entry,
+        r#"
+        #[cfg(test)]
+        #[path = "nested/../shared.rs"]
+        mod test_view;
+        #[path = "shared.rs"]
+        mod production_view;
+        mod inline {
+            #[cfg(test)]
+            #[path = "../shared.rs"]
+            mod another_test_view;
+        }
+    "#,
+    )
+    .expect("write module declarations");
+    std::fs::write(&shared, "const LIVE: &str = \"--production\";").expect("write shared file");
+    std::fs::write(&neighbor, "const LIVE: &str = \"--neighbor\";").expect("write neighbor");
+    let mut files = Vec::new();
+    rust_files(root, &mut files);
+    let literals = literals_in(&files);
+    assert!(
+        literals
+            .iter()
+            .any(|literal| { literal.file == shared && literal.text == "--production" })
+    );
+    assert!(
+        literals
+            .iter()
+            .any(|literal| { literal.file == neighbor && literal.text == "--neighbor" })
+    );
 }

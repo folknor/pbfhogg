@@ -358,8 +358,8 @@ pub fn write_test_pbf_sorted(
 /// merge-join block-pair logic without needing ~8000+ elements per type.
 ///
 /// Example: `write_multi_block_test_pbf(path, &nodes_100, &ways_20, &rels_5, 25)`
-/// lays the nodes out as four blocks of 25 (or 24+24+24+28 tail), ways as one
-/// block, relations as one block - seven data blobs total.
+/// lays the nodes out as four blocks of 25, ways as one block, and relations
+/// as one block - six data blobs total.
 pub fn write_multi_block_test_pbf(
     path: &Path,
     nodes: &[TestNode],
@@ -400,7 +400,7 @@ pub fn write_changed_pbf(path: &Path) {
 pub fn write_bad_indexdata_pbf(path: &Path) {
     write_base_pbf(path);
     let bytes = std::fs::read(path).expect("read base fixture");
-    let bad = adversarial::mutate_blob_header_indexdata(&bytes, 1, |v| v.resize(30, 0));
+    let bad = adversarial::mutate_blob_header_indexdata(&bytes, 1, |v| *v = vec![0; 30]);
     std::fs::write(path, bad).expect("write bad-indexdata fixture");
 }
 
@@ -918,11 +918,18 @@ pub fn assert_non_indexed(path: &Path) {
 /// partially indexed file, which every schedule walk refuses.
 pub fn assert_every_data_blob_indexed(path: &Path) {
     let bytes = std::fs::read(path).expect("read pbf");
-    let blobs = adversarial::locate_blobs(&bytes);
-    let unindexed: Vec<usize> = blobs
+    let stream = adversarial::locate_blobs_strict(&bytes).expect("strict PBF framing");
+    assert_eq!(stream.extent, bytes.len());
+    let data: Vec<_> = stream
+        .frames
         .iter()
         .enumerate()
-        .filter(|(_, blob)| {
+        .filter(|(_, (_, kind))| kind.as_slice() == b"OSMData")
+        .collect();
+    assert!(!data.is_empty(), "expected at least one data blob");
+    let unindexed: Vec<usize> = data
+        .into_iter()
+        .filter(|(_, (blob, _))| {
             adversarial::is_unindexed_data_blob(&bytes[blob.header_start..blob.header_end])
         })
         .map(|(i, _)| i)

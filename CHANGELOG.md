@@ -19,9 +19,19 @@
   the relation, the member and the index. It is the conversion every
   re-encoding command uses, now public so `BlockBuilder` users need not map
   `RelMember::role` errors by hand.
+- **`ElementReader::resources`** supplies the `host::Resources` the reader
+  sizes its pipelined and `par_map_reduce` workers from, so a reader opened
+  without a host no longer has to probe the machine; `host::Fixed` gives the
+  same worker counts everywhere. The setter probes nothing and changes nothing
+  else about the reader, and an explicit `decode_threads` still wins. Readers
+  that do not call it keep their sizing.
 
 ### Changed
 
+- **The hidden, unsupported `getparents --full-scan-min-blobs` test flag
+  and `getparents::getparents_with_min_blobs` are gone from release builds.**
+  They now exist only with the `test-hooks` feature; elsewhere the flag is
+  refused as unknown. Ordinary `getparents` dispatch is unchanged.
 - **`bench-write` fails on a relation member whose role does not resolve**
   instead of encoding an empty role and completing the run. It also reuses
   one member buffer per block rather than allocating one per relation, so its

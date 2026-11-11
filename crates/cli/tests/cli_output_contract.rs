@@ -19,11 +19,11 @@
 //!
 //! ## Complete by construction
 //!
-//! The list of subcommands is read from the binary's own `--help`, not
+//! The list of subcommands is read from the built Clap tree, not
 //! written here. A subcommand the binary has that is in neither [`ROWS`] nor
 //! [`NO_OUTPUT`] fails `every_subcommand_is_in_the_table_or_marked_as_writing_no_output`,
 //! as does a table entry the binary no longer has. A command in `NO_OUTPUT`
-//! must also show no output flag in its `--help`, so the claim "writes no
+//! must also expose no output argument in that tree, so the claim "writes no
 //! output" is checked against the command's own surface.
 //!
 //! ## Known gaps
@@ -1400,7 +1400,8 @@ fn run_property_on<'a>(prop: Prop, check: Check, rows: impl Iterator<Item = &'a 
 
 #[test]
 fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
-    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut tree = pbfhogg_cli::cli_command();
+    tree.build();
     let commands = subcommands();
     assert!(
         commands.len() >= 20,
@@ -1431,14 +1432,18 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     }
     // The table and the command's own surface must agree.
     for row in ROWS {
-        let help = CliInvoker::new(&invocation_scratch)
-            .args([row.command, "--help"])
-            .assert_success()
-            .stdout_str();
-        for flag in ["--overwrite", "--staging-dir"] {
-            if !help.contains(flag) {
+        let command = tree
+            .find_subcommand(row.command)
+            .expect("table command exists");
+        let has_flag = |long| {
+            command
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some(long))
+        };
+        for flag in ["overwrite", "staging-dir"] {
+            if !has_flag(flag) {
                 problems.push(format!(
-                    "[{}] is in ROWS but `{} --help` offers no {flag}",
+                    "[{}] is in ROWS but {} offers no --{flag}",
                     row.label, row.command
                 ));
             }
@@ -1446,20 +1451,22 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
         // A command offers --tmp-dir when any of its rows takes it (a text
         // diff does not, `diff --format osc` does).
         let command_takes_tmp = ROWS.iter().any(|r| r.command == row.command && r.tmp_dir);
-        if command_takes_tmp != help.contains("--tmp-dir") {
+        if command_takes_tmp != has_flag("tmp-dir") {
             problems.push(format!(
-                "[{}] tmp_dir is {} but `{} --help` says otherwise",
+                "[{}] tmp_dir is {} but the Clap arguments for {} say otherwise",
                 row.label, row.tmp_dir, row.command
             ));
         }
     }
     for (name, reason) in NO_OUTPUT {
-        let help = CliInvoker::new(&invocation_scratch)
-            .args([name, "--help"])
-            .assert_success()
-            .stdout_str();
-        for flag in ["--overwrite", "--output-dir", "--output <", "--staging-dir"] {
-            if help.contains(flag) {
+        let command = tree
+            .find_subcommand(name)
+            .expect("no-output command exists");
+        for flag in ["overwrite", "output-dir", "output", "staging-dir"] {
+            if command
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some(flag))
+            {
                 problems.push(format!(
                     "`{name}` is marked as writing no output ({reason}) but offers {flag}"
                 ));
@@ -1699,14 +1706,16 @@ mod interrupted {
         }
         let control = crate::common::test_scratch();
         let ready = control.path().join("ready");
-        let mut pause = OsString::from(format!("{k}:"));
-        pause.push(ready.as_os_str());
+        let ordinal = std::num::NonZeroU64::new(k).ok_or("checkpoint ordinals start at 1")?;
         let extra: Vec<OsString> = if replace {
             vec!["--overwrite".into()]
         } else {
             Vec::new()
         };
-        let mut child = run.invoker(&extra).cancel_pause(&pause).spawn();
+        let mut child = run
+            .invoker(&extra)
+            .cancel_pause(ordinal, &ready, false)
+            .spawn();
 
         let start = Instant::now();
         let mut seen = Seen::default();
@@ -1957,15 +1966,14 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     let mut extra: Vec<OsString> = vec!["--staging-dir".into(), staging.path().into()];
     extra.extend(tmp_args(row.tmp_dir.then_some(tmp)));
     let ready = control.path().join("ready");
-    let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
-    pause.push(ready.as_os_str());
-    pause.push(":stuck");
+    let ordinal =
+        std::num::NonZeroU64::new(count.div_ceil(2)).ok_or("the run passes no checkpoint")?;
     let mut child = interrupted::with_visible_scratch(
         row,
         CliInvoker::new(&invocation_scratch).args(&inv.args),
     )
     .args(&extra)
-    .cancel_pause(&pause)
+    .cancel_pause(ordinal, &ready, true)
     .spawn();
     let start = Instant::now();
     while !ready.exists() {
@@ -2945,15 +2953,14 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         );
         let ready = control.path().join("ready");
         let ack = control.path().join("ready.ack");
-        let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
-        pause.push(ready.as_os_str());
-        pause.push(":stuck");
+        let ordinal =
+            std::num::NonZeroU64::new(count.div_ceil(2)).expect("the altw row passes a checkpoint");
         let mut child = interrupted::with_visible_scratch(
             row,
             CliInvoker::new(&invocation_scratch).args(&inv.args),
         )
         .args(tmp_args(Some(tmp.path())))
-        .cancel_pause(&pause)
+        .cancel_pause(ordinal, &ready, true)
         .spawn();
         let wait_for = |path: &Path, child: &mut crate::invoker::RunningCli| {
             let start = Instant::now();
@@ -3042,13 +3049,15 @@ fn a_command_without_an_output_is_interrupted_too() {
         let cwd = crate::common::test_scratch();
         let control = crate::common::test_scratch();
         let ready = control.path().join("ready");
-        let mut pause = OsString::from("2:");
-        pause.push(ready.as_os_str());
         let mut child = CliInvoker::new(&invocation_scratch)
             .args(*words)
             .arg(&good)
             .current_dir(cwd.path())
-            .cancel_pause(&pause)
+            .cancel_pause(
+                std::num::NonZeroU64::new(2).expect("nonzero"),
+                &ready,
+                false,
+            )
             .spawn();
         let start = Instant::now();
         while !ready.exists() {

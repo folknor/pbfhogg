@@ -107,17 +107,16 @@ impl Scenario for RepeatCat {
 
 /// `outputs-equal`: the two outputs are byte-identical.
 fn outputs_equal(ctx: &Ctx<'_>) -> Outcome {
-    let read = |role| std::fs::read(ctx.binding(role));
-    match (read("out-a"), read("out-b")) {
-        (Ok(a), Ok(b)) => Outcome::judge(
+    match super::file_assertions::files_equal(ctx.binding("out-a"), ctx.binding("out-b")) {
+        Ok(equal) => Outcome::judge(
             "outputs-equal",
-            a == b,
-            format!("out-a {} bytes, out-b {} bytes", a.len(), b.len()),
+            equal,
+            format!("outputs byte-identical {equal}"),
         ),
-        (a, b) => Outcome::judge(
+        Err(error) => Outcome::judge(
             "outputs-equal",
             false,
-            format!("cannot read both outputs: {:?} {:?}", a.err(), b.err()),
+            format!("cannot compare outputs: {error}"),
         ),
     }
 }

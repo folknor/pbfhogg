@@ -155,3 +155,79 @@ def lifecycle_errors(cli, scratch):
             found.append("CLI run counter hooks belong in finish_invocation")
     return found
 
+
+
+# Every exception is a declaration header and an exact occurrence count, not
+# a file exemption. No fault-plan owner is exempt. Immutable Rust statics can
+# contain interior mutability, so checking only `static mut` is insufficient.
+# Production exceptions are thread-local decoder/framer scratch and output
+# name sequencing; the remaining exceptions are existing unit-test helpers.
+STATIC_INVENTORY = {
+    "crates/lib/src/fadvise.rs": {"static ATTEMPTS: RefCell<Vec<(Advice, Range)>> =": 1},
+    "crates/lib/src/write/framing.rs": {"static PIPELINE_SCRATCH: RefCell<FrameScratch> =": 1},
+    "crates/lib/src/commands/getparents/mod.rs": {
+        "static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =": 1},
+    "crates/lib/src/commands/tags_filter/mod.rs": {
+        "static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =": 1},
+    "crates/lib/src/threads.rs": {
+        "static FINISHED: AtomicUsize =": 1,
+        "static HELD: Cell<Option<SlowTeardown>> =": 1,
+        "static LATE: AtomicBool =": 2},
+    "crates/lib/src/error.rs": {"static FOREIGN_ROOT: ForeignRoot =": 1},
+    "crates/lib/src/output.rs": {
+        "static SEQ: AtomicU64 =": 1,
+        "static TOKEN: std::sync::OnceLock<crate::host::Invocation> =": 1},
+    "crates/lib/src/read/pipeline.rs": {
+        "static ST_SCRATCH: RefCell<Vec<(u32, u32)>> =": 1,
+        "static GR_SCRATCH: RefCell<Vec<(u32, u32)>> =": 1,
+        "static TEARDOWN: RefCell<Option<Teardown>> =": 1},
+    "crates/lib/src/read/header_walker.rs": {
+        "static DIRECT_OPENS: std::cell::Cell<usize> =": 1},
+    "crates/lib/src/read/decompress.rs": {
+        "static ZLIB_DECOMPRESS: RefCell<Decompress> =": 1},
+}
+
+
+def static_items(source):
+    """Literal static keywords and declaration headers, including macro bodies.
+
+    This deliberately scans all token trees, not just item positions. Unknown
+    headers (including macro metavariables) fail closed. Lifetimes and raw
+    identifiers are not keywords. Macro expansion that synthesizes the keyword
+    is outside this lexical check's promise.
+    """
+    code = blank_comments_and_literals(source)
+    for match in re.finditer(r"(?<!['\w])\bstatic\b(?!\w)", code):
+        if code[max(0, match.start() - 2):match.start()] == "r#":
+            continue
+        header = re.match(r"static\s+[A-Za-z_]\w*\s*:[^=;{}]*=", code[match.start():])
+        yield (code.count("\n", 0, match.start()) + 1,
+               re.sub(r"\s+", "", header[0]) if header else None)
+
+
+def static_inventory_errors(sources, inventory=None):
+    """Refuse new static state regardless of its module name or cfg spelling.
+
+    Counts also prevent copying an audited declaration into a fault module.
+    The inventory is an audit boundary, not proof about an allowed initializer
+    or about non-static global state supplied by dependencies.
+    """
+    if inventory is None:
+        inventory = STATIC_INVENTORY
+    found = []
+    for path in sorted(sources.keys() | inventory.keys()):
+        if path not in sources:
+            found.append(f"{path}: audited static owner missing")
+            continue
+        remaining = {re.sub(r"\s+", "", header): count
+                     for header, count in inventory.get(path, {}).items()}
+        for line, header in static_items(sources[path]):
+            if remaining.get(header, 0):
+                remaining[header] -= 1
+            else:
+                found.append(f"{path}:{line}: unaudited static state; fault state belongs "
+                             "in FaultPlan carried by the invocation token")
+        for header, count in remaining.items():
+            if count:
+                found.append(f"{path}: missing {count} audited static declaration(s): {header}")
+    return found

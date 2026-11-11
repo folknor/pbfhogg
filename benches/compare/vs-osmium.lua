@@ -13,8 +13,8 @@
 --   brokkr bench --iterations 1 vs-osmium --row apply-changes --osc 4705 --tool osmium
 --
 -- Both tools read the same file (the indexed variant by default; osmium
--- ignores the indexdata, and making that file is not timed). Default
--- compression on both sides is zlib level 6. Where the defaults differ in
+-- ignores the indexdata, and making that file is not timed). Explicit
+-- compression on both sides is zlib level 6 where encoding is needed. Where the defaults differ in
 -- what is produced or promised, osmium gets the flag that matches pbfhogg:
 -- --fsync on every row that writes a PBF, since pbfhogg syncs its output
 -- (and, beyond what osmium does, the output's directory) before it exits;
@@ -26,6 +26,9 @@
 -- run that passes proves every ID exists. The inspect row has no osmium
 -- counterpart: bare inspect answers from indexdata, and `osmium fileinfo -e`
 -- computes a census (timestamps, bbox, metadata coverage) pbfhogg does not.
+-- Output equivalence is not certified by these timing runs. A successful
+-- exit proves execution only; an independent, field-complete comparison
+-- belongs in a separate validation run, never in the measured child.
 -- extract uses the dataset bbox and the complete-ways strategy on both
 -- sides (pbfhogg's default, osmium's explicit complete_ways).
 
@@ -46,33 +49,44 @@ end
 local function rows(params, keys)
     local pbf = params.variant.file
     local out = function() return output("out.osm.pbf") end
-    local osm = function(flags) flags.fsync = true; flags.output = out(); return flags end
+    local pbf_flags = function(flags)
+        flags = flags or {}
+        flags.compression = "zlib:6"
+        flags.output = out()
+        return flags
+    end
+    local osm = function(flags)
+        flags.fsync = true
+        flags["output-format"] = "pbf,pbf_compression=zlib,pbf_compression_level=6"
+        flags.output = out()
+        return flags
+    end
     return {
         ["inspect"] = {
             pbfhogg = function() return { "inspect", pbf } end,
         },
         ["sort"] = {
-            pbfhogg = function() return { "sort", pbf, { output = out() } } end,
+            pbfhogg = function() return { "sort", pbf, pbf_flags() } end,
             osmium = function() return { "sort", pbf, osm({}) } end,
         },
         ["extract"] = {
-            pbfhogg = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, { output = out() } } end,
+            pbfhogg = function() return { "extract", pbf, "-b=" .. params.dataset.bbox, pbf_flags() } end,
             osmium = function() return { "extract", pbf, "--bbox=" .. params.dataset.bbox, osm({ strategy = "complete_ways" }) } end,
         },
         ["apply-changes"] = {
-            pbfhogg = function() return { "apply-changes", pbf, params.osc.file, { output = out() } } end,
+            pbfhogg = function() return { "apply-changes", pbf, params.osc.file, pbf_flags() } end,
             osmium = function() return { "apply-changes", pbf, params.osc.file, osm({}) } end,
         },
         ["tags-filter-highway"] = {
-            pbfhogg = function() return { "tags-filter", pbf, "w/highway=primary", { R = true, output = out() } } end,
+            pbfhogg = function() return { "tags-filter", pbf, "w/highway=primary", pbf_flags({ R = true }) } end,
             osmium = function() return { "tags-filter", pbf, "w/highway=primary", osm({ R = true }) } end,
         },
         ["tags-filter-restaurant"] = {
-            pbfhogg = function() return { "tags-filter", pbf, "amenity=restaurant", { R = true, output = out() } } end,
+            pbfhogg = function() return { "tags-filter", pbf, "amenity=restaurant", pbf_flags({ R = true }) } end,
             osmium = function() return { "tags-filter", pbf, "amenity=restaurant", osm({ R = true }) } end,
         },
         ["cat-way"] = {
-            pbfhogg = function() return { "cat", pbf, { type = "way", output = out() } } end,
+            pbfhogg = function() return { "cat", pbf, pbf_flags({ type = "way" }) } end,
             osmium = function() return { "cat", pbf, osm({ t = "way" }) } end,
         },
         ["inspect-tags"] = {
@@ -84,15 +98,15 @@ local function rows(params, keys)
             osmium = function() return { "tags-count", pbf, { t = "way" } } end,
         },
         ["getid"] = {
-            pbfhogg = function() return getid_args(keys.dataset, pbf, { output = out() }) end,
+            pbfhogg = function() return getid_args(keys.dataset, pbf, pbf_flags()) end,
             osmium = function() return getid_args(keys.dataset, pbf, osm({})) end,
         },
         ["altw-sparse"] = {
-            pbfhogg = function() return { "add-locations-to-ways", pbf, { ["index-type"] = "sparse", output = out() } } end,
+            pbfhogg = function() return { "add-locations-to-ways", pbf, pbf_flags({ ["index-type"] = "sparse" }) } end,
             osmium = function() return { "add-locations-to-ways", pbf, osm({ ["keep-member-nodes"] = true }) } end,
         },
         ["altw-external"] = {
-            pbfhogg = function() return { "add-locations-to-ways", pbf, { ["index-type"] = "external", output = out() } } end,
+            pbfhogg = function() return { "add-locations-to-ways", pbf, pbf_flags({ ["index-type"] = "external" }) } end,
             osmium = function() return { "add-locations-to-ways", pbf, osm({ ["keep-member-nodes"] = true }) } end,
         },
     }

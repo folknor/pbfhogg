@@ -174,15 +174,10 @@ fn create_runs_are_cut_at_the_element_cap_and_written_in_order() {
     }
 }
 
-/// Full blocks in the run that crosses the batch boundary. The executor
-/// encodes a long run in batches of `APPLY_CHANGES_CREATE_BATCH_BLOCKS`
-/// (64) blocks, so 65 full blocks and a one-element block make a full first
-/// batch and a second, final batch of one full and one partial block. The
-/// constant is private to the crate, so this test cannot read it; raised to
-/// 66 or more it would hold this whole run in one batch and the test would
-/// stop crossing the boundary. A unit test in
-/// `crates/lib/src/commands/apply_changes/stream_output.rs` fails first in that case.
-const BOUNDARY_RUN_FULL_BLOCKS: usize = 65;
+// The unit batch guard reads this same fixture definition.
+#[path = "create_run_fixture.rs"]
+mod create_run_fixture;
+use create_run_fixture::BOUNDARY_RUN_FULL_BLOCKS;
 
 #[test]
 fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {

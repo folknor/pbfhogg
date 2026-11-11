@@ -214,7 +214,8 @@ fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> 
                 let seeded = matches!(role.role, Role::OutputPbf { seeded: true, .. });
                 let initial_ok = if seeded {
                     path.symlink_metadata().is_ok_and(|m| m.is_file())
-                        && std::fs::read(path).is_ok_and(|b| b == crate::protocol::seed(role.id))
+                        && crate::scenarios::file_assertions::holds_seed(path, role.id)
+                            .map_err(|e| format!("inspect seed {}: {e}", role.id))?
                 } else {
                     crate::scenarios::absent(path)
                         .map_err(|e| format!("inspect role {}: {e}", role.id))?

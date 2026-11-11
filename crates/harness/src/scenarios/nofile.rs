@@ -1,46 +1,19 @@
-//! The descriptor-limit scenarios: single calls on `NoProcessActions` with
-//! the process's soft `RLIMIT_NOFILE` set to 1024 at launch (hard limit
-//! untouched, read back, reported in each context), before any library
-//! work.
-//!
-//! `nofile-cat-refused`: cat of 1100 distinct spellings of one path asks
-//! for 1108 descriptors, more than the soft limit allows whatever is open,
-//! so it is refused before any input is pinned. The path does not exist:
-//! had the call opened or read an input before its descriptor admission,
-//! that would have failed first with a not-found I/O error, so the typed
-//! descriptor refusal (with `CAT_SCAN_START` never passed) shows admission
-//! ran before any input was acquired. No counterpart: the CLI raises its
-//! soft limit whenever a command asks, so it would not refuse.
-//!
-//! `nofile-multi-extract-refused`: the call first opens read-only
-//! descriptors on its private directory until 8 remain free under the soft
-//! limit (an embedding process near its limit), then builds two outputs
-//! (two staging descriptors, leaving 6) and runs a simple two-region
-//! extract of a missing path, which asks for 11: a writer per region, the
-//! pin and an allowance of 8. Refused before the input is pinned, by the
-//! same argument as the refused cat (a not-found error would have come
-//! first otherwise, and `MULTI_EXTRACT_START` is never passed), and both
-//! members of the set are decided refused with no effect. The fillers stand
-//! in for many regions: the brokkr protocol binds output roles one by one,
-//! so the scenario shrinks the free count rather than growing the region
-//! count. No counterpart, as for cat.
-//!
-//! `nofile-altw-external`: the external join at fixed parallelism 8 (a CPU
-//! cap of 6 stage-1 workers) is held to 3 by the descriptor allowance,
-//! `(available - 64) / 256`, and completes. That needs between 832 and
-//! 1087 descriptors available at stage 1, so a launch that already holds
-//! more than about 190 fails the assertion, naming the allowance it saw: a
-//! launch condition, not a worker-selection defect.
+//! Descriptor admission with caller-owned grants, independent of inherited
+//! limits and ambient opens. Refused calls name missing inputs so a typed
+//! descriptor refusal also proves admission preceded input acquisition.
+//! The external join receives 896 descriptors and fixed parallelism eight:
+//! its CPU cap is six and its descriptor cap is three.
+//! Real process-limit probing belongs in a separate child contract test;
+//! these scenarios test command admission and sizing, not the host probe.
 
 use super::{
     CLEAN_NONE, Scenario, WRITE, account, cat_plan, host_json, output_policy_json, overrides,
     overrides_json, process_json, published_once, write_json,
 };
-use crate::process::Nofile;
 use crate::protocol::{
     Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
 };
-use crate::runner::{CallSpec, Ctx, Tap};
+use crate::runner::{CallSpec, Ctx, Exec, Process, Tap};
 use pbfhogg::altw::{AltwOptions, IndexType};
 use pbfhogg::debug::InstrumentSink;
 use pbfhogg::{Decision, Effect};
@@ -50,8 +23,34 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// The soft limit both scenarios run under.
-const SOFT: u64 = 1024;
+/// Exact caller grants used as scenario inputs, not process limits.
+const CAT_GRANT: u64 = 1024;
+const MULTI_GRANT: u64 = 6;
+const ALTW_GRANT: u64 = 896;
+
+/// The same explicit resources and executor for each descriptor scenario.
+fn call_spec(grant: u64) -> Result<CallSpec, String> {
+    let mut spec = CallSpec::plain("a");
+    spec.parallelism = NonZeroUsize::new(ALTW_PARALLELISM);
+    spec.executor = Exec::Pool(Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(ALTW_PARALLELISM)
+            .build()
+            .map_err(|e| format!("build descriptor scenario pool: {e}"))?,
+    ));
+    spec.process = Process::Pool {
+        actions: Arc::new(pbfhogg::host::FdPool::new(grant)),
+        budget: grant,
+    };
+    Ok(spec)
+}
+
+fn descriptor_host(grant: u64) -> Value {
+    let mut host = host_json(&json!(ALTW_PARALLELISM), &json!("pool"), &json!("fd_pool"));
+    host["fd_pool_budget"] = json!(grant);
+    host["executor_threads"] = json!(ALTW_PARALLELISM);
+    host
+}
 
 /// How many spellings of its one input the refused cat names.
 const SPELLINGS: usize = 1100;
@@ -62,13 +61,13 @@ impl Scenario for NofileCatRefused {
     fn decl(&self) -> ScenarioDecl {
         ScenarioDecl {
             id: "nofile-cat-refused",
-            description: "cat of 1100 spellings of a missing path at soft RLIMIT_NOFILE 1024, refused up front",
+            description: "cat of 1100 spellings of a missing path with a caller grant of 1024 descriptors, refused up front",
             deadline_s: 120,
             hotpath: false,
             isolation: false,
             calls: vec![CallDecl {
                 id: "a",
-                label: "cat 1100 spellings of a missing path -> out at soft nofile 1024",
+                label: "cat 1100 spellings of a missing path -> out with a 1024 descriptor grant",
                 cli: None,
                 stream: STREAM_SEALED,
             }],
@@ -85,22 +84,24 @@ impl Scenario for NofileCatRefused {
         let inputs = json!({ "path": "absent.osm.pbf in the call's private directory, never created",
                              "spellings": SPELLINGS,
                              "spelling": "k ./ segments before the file name, k from 0" });
+        let mut call = cat_plan(&inputs, "out", false);
+        call["host"] = descriptor_host(CAT_GRANT);
         json!({
             "schedule": { "order": ["a"], "concurrency": "sequential",
                           "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [], "rayon_global_pool": "started before the first call" },
+            "setup": { "generated": [], "rayon_global_pool": "not started" },
             "process": process_json(self.nofile()),
-            "calls": { "a": cat_plan(&inputs, "out", false) },
+            "calls": { "a": call },
         })
     }
 
-    fn nofile(&self) -> Nofile {
-        Nofile::Soft(SOFT)
+    fn starts_global_pool(&self) -> bool {
+        false
     }
 
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
         let markers = Arc::new(Markers(Mutex::new(Vec::new())));
-        let mut spec = CallSpec::plain("a");
+        let mut spec = call_spec(CAT_GRANT)?;
         spec.tap = Some(Arc::clone(&markers) as Arc<dyn Tap>);
         let mut missing_exists = false;
         let record = ctx.call(spec, |host, env| {
@@ -174,12 +175,6 @@ impl Markers {
 
 pub(crate) struct NofileMultiExtractRefused;
 
-/// Descriptors left free under the soft limit when the call starts building
-/// its outputs: the two staging descriptors take two, leaving six, under
-/// the eleven the single-pass extract asks for (two writers, one pin, an
-/// allowance of eight).
-const MULTI_FREE: u64 = 8;
-
 /// The two output roles of the refused multi-extract.
 const MULTI_OUTPUTS: [&str; 2] = ["out-a", "out-b"];
 
@@ -187,13 +182,13 @@ impl Scenario for NofileMultiExtractRefused {
     fn decl(&self) -> ScenarioDecl {
         ScenarioDecl {
             id: "nofile-multi-extract-refused",
-            description: "single-pass two-region extract of a missing path with 8 descriptors free under soft RLIMIT_NOFILE 1024, refused up front",
+            description: "single-pass two-region extract of a missing path with a caller grant of 6 descriptors, refused up front",
             deadline_s: 120,
             hotpath: false,
             isolation: false,
             calls: vec![CallDecl {
                 id: "a",
-                label: "extract --simple of a missing path into out-a and out-b with 8 descriptors free",
+                label: "extract --simple of a missing path into out-a and out-b with a 6 descriptor grant",
                 cli: None,
                 stream: STREAM_SEALED,
             }],
@@ -213,7 +208,7 @@ impl Scenario for NofileMultiExtractRefused {
         json!({
             "schedule": { "order": ["a"], "concurrency": "sequential",
                           "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [], "rayon_global_pool": "started before the first call" },
+            "setup": { "generated": [], "rayon_global_pool": "not started" },
             "process": process_json(self.nofile()),
             "calls": { "a": {
                 "command": "extract",
@@ -226,33 +221,24 @@ impl Scenario for NofileMultiExtractRefused {
                 "write": write_json(),
                 "header_overrides": overrides_json(),
                 "output_policy": output_policy_json("refuse"),
-                "descriptors_free": format!(
-                    "{MULTI_FREE} under the soft limit before the outputs are built, the rest \
-                     held by the call's own opens of its private directory"
-                ),
-                "host": host_json(&json!("machine"), &json!("ambient"), &json!("none")),
+                "host": descriptor_host(MULTI_GRANT),
             } },
         })
     }
 
-    fn nofile(&self) -> Nofile {
-        Nofile::Soft(SOFT)
+    fn starts_global_pool(&self) -> bool {
+        false
     }
 
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
         let markers = Arc::new(Markers(Mutex::new(Vec::new())));
-        let mut spec = CallSpec::plain("a");
+        let mut spec = call_spec(MULTI_GRANT)?;
         spec.tap = Some(Arc::clone(&markers) as Arc<dyn Tap>);
         let mut missing_exists = false;
-        let mut filled = None;
         let record = ctx.call(spec, |host, env| {
             let dir = env.private_dir();
             let missing = dir.join(MISSING);
             missing_exists = !super::absent(&missing)?;
-            // Held to the end of the call: every descriptor but MULTI_FREE
-            // under the soft limit.
-            let fillers = fill_descriptors(dir, MULTI_FREE)?;
-            filled = Some(fillers.len());
             let outputs = pbfhogg::OutputSet::files_with_staging(
                 MULTI_OUTPUTS.iter().map(|role| env.binding(role)),
                 pbfhogg::Overwrite::Refuse,
@@ -275,7 +261,6 @@ impl Scenario for NofileMultiExtractRefused {
                 &overrides(),
                 host,
             );
-            drop(fillers);
             result.map(drop)
         })?;
         let mut outs_absent = true;
@@ -300,28 +285,12 @@ impl Scenario for NofileMultiExtractRefused {
             && !missing_exists;
         let detail = format!(
             "{}, outputs absent {outs_absent}, MULTI_EXTRACT_START passed {scanned}, \
-             missing input existed {missing_exists}, filler descriptors {filled:?}",
+             missing input existed {missing_exists}, descriptor grant {MULTI_GRANT}",
             account(&record)
         );
         ctx.finish_call(&record, &[Outcome::judge("a.refused", ok, detail)])?;
         Ok(Vec::new())
     }
-}
-
-/// Open read-only descriptors on `dir` until only `free` remain under the
-/// soft limit, counting the open ones in `/proc/self/fd` (less the one the
-/// count itself holds). Opens nothing when fewer are free already.
-fn fill_descriptors(dir: &std::path::Path, free: u64) -> pbfhogg::Result<Vec<std::fs::File>> {
-    let entries = std::fs::read_dir("/proc/self/fd")?
-        .count()
-        .saturating_sub(1);
-    let open = u64::try_from(entries).unwrap_or(u64::MAX);
-    let target = SOFT.saturating_sub(free);
-    let mut fillers = Vec::new();
-    for _ in open..target {
-        fillers.push(std::fs::File::open(dir)?);
-    }
-    Ok(fillers)
 }
 
 pub(crate) struct NofileAltwExternal;
@@ -345,7 +314,7 @@ const ARGV: &[Arg] = &[
 
 const ALTW_DIFFERENCES: &[&str] = &[
     "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
-    "the CLI raises its soft RLIMIT_NOFILE when a command asks, so it may run more stage-1 workers; the call stays at 1024",
+    "the CLI probes real descriptor availability; the call uses a caller grant of 896",
     "the CLI sizes work by probing the machine; the call gets fixed parallelism 8 and no memory figure",
 ];
 
@@ -384,7 +353,7 @@ impl Scenario for NofileAltwExternal {
     fn decl(&self) -> ScenarioDecl {
         ScenarioDecl {
             id: "nofile-altw-external",
-            description: "external add-locations-to-ways at soft RLIMIT_NOFILE 1024 completes with three stage-1 workers",
+            description: "external add-locations-to-ways with a caller grant of 896 descriptors completes with three stage-1 workers",
             deadline_s: 1800,
             hotpath: false,
             isolation: false,
@@ -423,7 +392,7 @@ impl Scenario for NofileAltwExternal {
         json!({
             "schedule": { "order": ["a"], "concurrency": "sequential",
                           "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [], "rayon_global_pool": "started before the first call" },
+            "setup": { "generated": [], "rayon_global_pool": "not started" },
             "process": process_json(self.nofile()),
             "calls": { "a": {
                 "command": "add-locations-to-ways",
@@ -437,19 +406,18 @@ impl Scenario for NofileAltwExternal {
                 "header_overrides": overrides_json(),
                 "output_policy": output_policy_json("refuse"),
                 "scratch": "a run scratch in the private directory",
-                "host": host_json(&json!(ALTW_PARALLELISM), &json!("ambient"), &json!("none")),
+                "host": descriptor_host(ALTW_GRANT),
             } },
         })
     }
 
-    fn nofile(&self) -> Nofile {
-        Nofile::Soft(SOFT)
+    fn starts_global_pool(&self) -> bool {
+        false
     }
 
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
         let workers = Arc::new(Workers(Mutex::new(Vec::new())));
-        let mut spec = CallSpec::plain("a");
-        spec.parallelism = NonZeroUsize::new(ALTW_PARALLELISM);
+        let mut spec = call_spec(ALTW_GRANT)?;
         spec.tap = Some(Arc::clone(&workers) as Arc<dyn Tap>);
         let record = ctx.call(spec, |host, env| {
             let out = super::output(env, "out", pbfhogg::Overwrite::Refuse, host)?;
@@ -477,11 +445,14 @@ impl Scenario for NofileAltwExternal {
             workers.get("extjoin_num_shard_workers"),
             workers.get("extjoin_fd_available"),
         );
-        let three = cpu == Some(6) && fd == Some(3) && ran == Some(3);
+        let three = cpu == Some(6)
+            && fd == Some(3)
+            && ran == Some(3)
+            && available == i64::try_from(ALTW_GRANT).ok();
         let detail = format!(
             "cpu cap {cpu:?}, descriptor cap {fd:?}, shard workers run {ran:?}, \
              descriptors available {available:?}: \
-             workers are the smaller cap; three need 832 to 1087 available at soft {SOFT}"
+             workers are the smaller cap; caller grant {ALTW_GRANT}"
         );
         let results = [
             super::installed_ok("a.outcome", &record, "out"),

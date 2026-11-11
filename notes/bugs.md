@@ -33,20 +33,3 @@ belongs with VER-098's compile-only profiling shapes in
 
 Fix: a compile-only musl shape with the profiling features, landed with
 VER-098's.
-
-## BUG-012 - An all-default id-0 element may vanish on write
-
-Lateral finding from the verification waves, unconfirmed. Twice a test
-fixture lost an element: an untagged id-0 node in a sort-order control
-(`crates/lib/tests/edge_cases.rs`) and an id-0 way or relation with no tags,
-refs or members in a proptest control case (`crates/lib/tests/proptests.rs`).
-Both read back with the element missing. The suspected cause is that an
-element message whose every field is default encodes as an empty message,
-probably in the shared `protohoggr` encoder, and the reader then yields
-nothing for it. Both tests now avoid the case rather than assert it. If the
-writer can drop an element it was given, that is a silent wrong answer.
-
-Fix: confirm the mechanism in `block_builder.rs` and `protohoggr`; either
-encode every element the caller adds, or refuse id 0 at the builder with a
-typed error. Enforcement: a round-trip test of an all-default id-0 node,
-way and relation.

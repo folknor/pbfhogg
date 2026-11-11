@@ -15,8 +15,8 @@
 //! own the coordinates from `NodeIndex`, the input's are stale at best.
 
 use protohoggr::{
-    Cursor, WIRE_LEN, WIRE_VARINT, encode_bytes_field, encode_int64_field, encode_tag,
-    encode_varint, zigzag_decode_64, zigzag_encode_64,
+    Cursor, WIRE_LEN, WIRE_VARINT, encode_bytes_field, encode_tag, encode_varint, zigzag_decode_64,
+    zigzag_encode_64,
 };
 
 use super::NodeIndex;
@@ -264,7 +264,9 @@ fn process_group(
                 member_way_ids,
                 inject_prepass,
             )?;
-            encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
+            // Always written: an all-default way body is empty and must not
+            // vanish from the output.
+            protohoggr::encode_bytes_field_always(&mut scratch.group_out, 3, &scratch.reframed_way);
         } else {
             let raw = gr_cursor
                 .read_raw_field(wire_type)
@@ -314,7 +316,9 @@ fn splice_way_locations(
                     .read_varint_i64()
                     .map_err(|e| crate::Error::from(e).context("reframe wid"))?;
                 have_id = true;
-                encode_int64_field(&mut scratch.reframed_way, 1, way_id);
+                // Explicit even for id 0: the id is required, and this
+                // reframe refuses a way without one on the next run.
+                protohoggr::encode_int64_field_always(&mut scratch.reframed_way, 1, way_id);
             }
             // Both legal wire forms of the packed `refs` field. Matching only
             // WIRE_LEN meant a spec-legal unpacked `refs` fell to the verbatim

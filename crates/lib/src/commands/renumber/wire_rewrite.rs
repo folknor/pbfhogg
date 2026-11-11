@@ -580,7 +580,7 @@ pub(super) fn reframe_ways_with_new_ids(
                     orphans = orphans
                         .checked_add(way_orphans)
                         .ok_or_else(|| Error::invalid_data("renumber: orphan count overflow"))?;
-                    protohoggr::encode_bytes_field(&mut s.group, 3, &s.element);
+                    protohoggr::encode_bytes_field_always(&mut s.group, 3, &s.element);
                     total = inc(total)?;
                 }
                 (1 | 2 | 4, _) => {
@@ -811,7 +811,7 @@ pub(super) fn reframe_relations_with_new_ids(
                         None => (new_id, new_id),
                         Some((lo, hi)) => (lo.min(new_id), hi.max(new_id)),
                     });
-                    protohoggr::encode_bytes_field(&mut s.group, 4, &s.element);
+                    protohoggr::encode_bytes_field_always(&mut s.group, 4, &s.element);
                     total = inc(total)?;
                 }
                 (1..=3, _) => {

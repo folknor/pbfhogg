@@ -347,13 +347,8 @@ fn codec_strategy_control_cases() {
     // include empty collections, all member types, metadata and both signs.
     for id in [-1, 0, 1] {
         for populated in [false, true] {
-            // An id-0 way or relation with no tags, refs or members encodes as
-            // an all-default (zero-length) message, which the writer does not
-            // emit; id 0 is not a valid OSM id, so only the populated form is
-            // a round-trip case.
-            if id == 0 && !populated {
-                continue;
-            }
+            // Includes the all-default id-0 way and relation: no tags, refs,
+            // members or metadata, which the writer must still emit.
             let case = CodecCase {
                 id,
                 lat: -900_000_000,

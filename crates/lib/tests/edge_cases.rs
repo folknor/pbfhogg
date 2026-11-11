@@ -600,9 +600,9 @@ fn write_order_control(path: &std::path::Path, elements: &[(u8, i64)]) {
     writer.write_header(&header).expect("write header");
     for &(kind, id) in elements {
         let mut block = block_builder::BlockBuilder::new();
-        // A tag keeps an id-0 element from encoding as an empty message,
-        // which a reader may not surface as an element at all.
-        let tags = [("k", "v")];
+        // Untagged on purpose: an id-0 element with no other content must
+        // still be written and read back.
+        let tags: [(&str, &str); 0] = [];
         match kind {
             0 => {
                 block.add_node(id, 0, 0, tags, None);
@@ -620,6 +620,33 @@ fn write_order_control(path: &std::path::Path, elements: &[(u8, i64)]) {
             .expect("write control block");
     }
     writer.flush().expect("flush");
+}
+
+/// An id-0 node, way and relation with no tags, refs, members or metadata
+/// encode with no other content than their id; each must read back.
+#[test]
+fn all_default_id_zero_elements_round_trip() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("id0.pbf");
+    write_order_control(&path, &[(0, 0), (1, 0), (2, 0)]);
+    let c = read_normalized(&path);
+    assert_eq!(c.nodes.len(), 1, "node");
+    assert_eq!(c.ways.len(), 1, "way");
+    assert_eq!(c.relations.len(), 1, "relation");
+    let mut ids = Vec::new();
+    ElementReader::from_path(&path)
+        .expect("open element reader")
+        .for_each(|element| {
+            ids.push(match element {
+                pbfhogg::Element::Node(n) => n.id(),
+                pbfhogg::Element::DenseNode(n) => n.id(),
+                pbfhogg::Element::Way(w) => w.id(),
+                pbfhogg::Element::Relation(r) => r.id(),
+                _ => panic!("unexpected element kind"),
+            });
+        })
+        .expect("for_each");
+    assert_eq!(ids, [0, 0, 0]);
 }
 
 #[test]

@@ -1,5 +1,20 @@
 # Write Pipeline
 
+### Element ids and bodies always written (bygg, 2026-11-11, against `4f95b255`)
+
+Way and relation encoders write `id` unconditionally and wrap every element
+body with the always-written field writer, so an all-default id-0 element is
+no longer dropped. Output is byte-identical for every other element. Planet
+`copy-pbf --clean yes`, interleaved `--iterations 1` cells, variant
+uncommitted on `4f95b255`:
+
+| Pair | Variant | Baseline `4f95b255` |
+|------|---------|---------------------|
+| 1 | 2m24s (`4332710c`) | 2m26s (`865df00a`) |
+| 2 | 2m25s (`df7cce2a`) | 2m25s (`cf7b2bee`) |
+
+Verdict: no difference beyond noise; adopted.
+
 ### Encode storage kept across blocks (bygg, 2026-11-01, against `5789830e`)
 
 The change cells ran as uncommitted edits on `5789830e`; the change

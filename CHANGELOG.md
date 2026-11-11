@@ -152,6 +152,15 @@
   element; past the cap the element's tag detail is one line giving the
   tag counts and saying details were omitted.
 
+### Fixed
+
+- `BlockBuilder` no longer drops a way or relation whose every field is
+  default (id 0, no tags, refs, members or metadata): it was written as
+  nothing while the blob index still counted it. Way and relation ids are
+  now always written, 0 included, as OSMPBF requires, and
+  `add-locations-to-ways` keeps such a way instead of losing it, so its
+  output carries an id a later run accepts.
+
 ## 0.6.0 - 2026-11-09
 
 This release makes pbfhogg safe to embed as a library and strict about its

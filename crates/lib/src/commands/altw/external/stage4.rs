@@ -1253,7 +1253,12 @@ fn reframe_way_blob_with_locations(
                     }
                 }
 
-                protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
+                // Always written: an empty input way body is kept, not dropped.
+                protohoggr::encode_bytes_field_always(
+                    &mut scratch.group_out,
+                    3,
+                    &scratch.reframed_way,
+                );
                 total_ways += 1;
             } else {
                 // Non-way field in the group - copy verbatim.

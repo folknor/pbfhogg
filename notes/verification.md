@@ -390,12 +390,6 @@ Fix: release contract tests for build-mode behaviour, compile and lint-only `hot
 `hotpath-alloc` shapes, and a small profiling lane with expectations for describe, inactive and active
 modes. Enforcement: required shapes in the gate.
 
-## VER-100 - Nothing enforces the complete gate at merge time
-
-`reference/testing.md` now names `brokkr check --gate` as the before-merge command and
-calls `full` partial. Nothing enforces it: the only workflow, `.github/workflows/docs.yml`,
-deploys documentation. Residue: a required merge check, if the project wants one.
-
 ## VER-104 - The document checker is not verified against renderer output
 
 `scripts/check_doc_links.py` is tested against 18 fixtures in `scripts/doc_links_fixtures/`,

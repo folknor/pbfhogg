@@ -1,10 +1,20 @@
 //! Wire-format encoders for `PrimitiveGroup` elements. These are called from
 //! `BlockBuilder`'s `add_*` methods to append serialized bytes into the
 //! current group buffer.
+//!
+//! Every element encoder writes the `id` field even when it is 0 (OSMPBF
+//! declares `Way.id` and `Relation.id` required, and libosmium writes them
+//! unconditionally) and wraps the element body with the `_always` field
+//! writer. A skip-if-empty wrapper drops an element whose every field is
+//! default - an untagged id-0 way or relation with no refs, members or
+//! Info - while the block index still counts it.
 
 use rustc_hash::FxHashSet;
 
-use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint, zigzag_encode_64};
+use protohoggr::{
+    encode_bytes_field, encode_bytes_field_always, encode_int64_field_always, encode_varint,
+    zigzag_encode_64,
+};
 
 use super::block_builder::{MemberData, Metadata, member_type_value};
 use super::string_table::StringTable;
@@ -191,7 +201,7 @@ pub(super) fn encode_way<'t, M: EncodeMetadata>(
     elem.clear();
 
     // Field 1: id (int64)
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
 
     // Fields 2+3: keys/vals
     encode_tags(
@@ -223,7 +233,7 @@ pub(super) fn encode_way<'t, M: EncodeMetadata>(
     }
 
     // Wrap as PrimitiveGroup field 3 (Way submessage)
-    encode_bytes_field(group_buf, 3, elem);
+    encode_bytes_field_always(group_buf, 3, elem);
 }
 
 /// Encode a Way with embedded node locations (fields 9/10: lat/lon).
@@ -248,7 +258,7 @@ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
     metadata: Option<&M>,
 ) {
     elem.clear();
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
 
     // Fields 2+3: keys/vals
     encode_tags(
@@ -293,7 +303,7 @@ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
         encode_bytes_field(elem, 10, packed_lons);
     }
 
-    encode_bytes_field(group_buf, 3, elem);
+    encode_bytes_field_always(group_buf, 3, elem);
 }
 
 /// Encode a Way from raw wire-format bytes (zero decode/reencode passthrough).
@@ -312,14 +322,14 @@ pub(super) fn encode_way_raw_bytes(
     info_data: Option<&[u8]>,
 ) {
     elem.clear();
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
     encode_bytes_field(elem, 2, keys_data);
     encode_bytes_field(elem, 3, vals_data);
     if let Some(info) = info_data {
         encode_bytes_field(elem, 4, info);
     }
     encode_bytes_field(elem, 8, refs_data);
-    encode_bytes_field(group_buf, 3, elem);
+    encode_bytes_field_always(group_buf, 3, elem);
 }
 
 /// Encode a Way with LocationsOnWays raw bytes and append to `group_buf`.
@@ -338,7 +348,7 @@ pub(super) fn encode_way_raw_bytes_with_locations(
     info_data: Option<&[u8]>,
 ) {
     elem.clear();
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
     encode_bytes_field(elem, 2, keys_data);
     encode_bytes_field(elem, 3, vals_data);
     if let Some(info) = info_data {
@@ -351,7 +361,7 @@ pub(super) fn encode_way_raw_bytes_with_locations(
     if !lon_data.is_empty() {
         encode_bytes_field(elem, 10, lon_data);
     }
-    encode_bytes_field(group_buf, 3, elem);
+    encode_bytes_field_always(group_buf, 3, elem);
 }
 
 /// Encode a Relation and append it as `PrimitiveGroup.relations` (field 4) to `group_buf`.
@@ -370,7 +380,7 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
     metadata: Option<&M>,
 ) {
     elem.clear();
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
 
     // Fields 2+3: keys/vals
     encode_tags(
@@ -422,7 +432,7 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
     }
 
     // PrimitiveGroup field 4 = Relation
-    encode_bytes_field(group_buf, 4, elem);
+    encode_bytes_field_always(group_buf, 4, elem);
 }
 
 /// Encode a Relation from raw wire-format bytes (zero decode/reencode passthrough).
@@ -442,7 +452,7 @@ pub(super) fn encode_relation_raw_bytes(
     info_data: Option<&[u8]>,
 ) {
     elem.clear();
-    encode_int64_field(elem, 1, id);
+    encode_int64_field_always(elem, 1, id);
     encode_bytes_field(elem, 2, keys_data);
     encode_bytes_field(elem, 3, vals_data);
     if let Some(info) = info_data {
@@ -451,7 +461,7 @@ pub(super) fn encode_relation_raw_bytes(
     encode_bytes_field(elem, 8, roles_sid_data);
     encode_bytes_field(elem, 9, memids_data);
     encode_bytes_field(elem, 10, types_data);
-    encode_bytes_field(group_buf, 4, elem);
+    encode_bytes_field_always(group_buf, 4, elem);
 }
 
 /// Decode a raw way's or relation's packed `keys` and insert each string
@@ -616,5 +626,97 @@ mod tests {
             PackedSint64Iter::new(relation.memids_data).collect::<Vec<_>>(),
             [i64::MIN, -1],
         );
+    }
+
+    /// An all-default id-0 way or relation - no tags, refs, members or
+    /// Info - is still written, with its id explicit, by every encoder.
+    #[test]
+    fn every_encoder_writes_an_all_default_id_zero_element() {
+        let way = [0x1a, 0x02, 0x08, 0x00];
+        let relation = [0x22, 0x02, 0x08, 0x00];
+        let mut strings = StringTable::new();
+        let (mut group, mut elem, mut a, mut b, mut c, mut d, mut info) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut keys = FxHashSet::default();
+        let none = None::<&super::Metadata<'_>>;
+
+        encode_way(
+            &mut strings,
+            &mut group,
+            &mut elem,
+            &mut a,
+            &mut b,
+            &mut info,
+            &mut keys,
+            0,
+            [],
+            &[],
+            none,
+        );
+        assert_eq!(group, way, "encode_way");
+
+        group.clear();
+        encode_way_with_locations(
+            &mut strings,
+            &mut group,
+            &mut elem,
+            &mut a,
+            &mut b,
+            &mut c,
+            &mut d,
+            &mut info,
+            &mut keys,
+            0,
+            [],
+            &[],
+            &[],
+            none,
+        );
+        assert_eq!(group, way, "encode_way_with_locations");
+
+        group.clear();
+        super::encode_way_raw_bytes(&mut group, &mut elem, 0, &[], &[], &[], None);
+        assert_eq!(group, way, "encode_way_raw_bytes");
+
+        group.clear();
+        super::encode_way_raw_bytes_with_locations(
+            &mut group,
+            &mut elem,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(group, way, "encode_way_raw_bytes_with_locations");
+
+        group.clear();
+        encode_relation(
+            &mut strings,
+            &mut group,
+            &mut elem,
+            &mut a,
+            &mut b,
+            &mut info,
+            &mut keys,
+            0,
+            [],
+            &[],
+            none,
+        );
+        assert_eq!(group, relation, "encode_relation");
+
+        group.clear();
+        super::encode_relation_raw_bytes(&mut group, &mut elem, 0, &[], &[], &[], &[], &[], None);
+        assert_eq!(group, relation, "encode_relation_raw_bytes");
     }
 }

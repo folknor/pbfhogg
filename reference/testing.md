@@ -81,7 +81,7 @@ NAME` list each harness in turn to find one test.
   (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
   on those means the same thing in all three packages. `commands` does not: in
   `pbfhogg` it is on by default, in `pbfhogg-cli` it is a no-op feature
-  that is off in the `all` and `musl` sweeps. A
+  that is off in the `all`, `musl` and `musl-all` sweeps. A
   `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
   helper would therefore silently drop CLI tests out of those sweeps, so
   the `no-library-feature-gates-in-tests-common` textlint rule in
@@ -139,10 +139,10 @@ the command-table tests in `crates/cli/tests/` take their subcommand lists
 from it (`invoker::subcommands`, `invoker::subcommand_paths`), never
 from `--help` text. It is not an API and sets `doctest = false`.
 
-The `all`, `consumer` and `musl` check sweeps select both packages, so
-the CLI tests run against a binary with `test-hooks` and both platform
-features, one without the platform features (pbfhogg-cli's default
-build), and one for musl. No sweep pre-builds the binary
+The `all`, `consumer`, `musl` and `musl-all` check sweeps select all three
+packages, so the CLI tests run against a binary with `test-hooks` and both
+platform features, one without the platform features (pbfhogg-cli's default
+build), and the same two shapes again for musl. No sweep pre-builds the binary
 (`build_packages`): cargo builds it for each test build. The `minimal`
 and `geocode-reader` sweeps stay library-only: the CLI's lib dep would turn
 `commands` back on. `brokkr test NAME` searches one package,
@@ -294,8 +294,8 @@ files.
 
 ### Tests that do not run everywhere
 
-- The O_DIRECT and io_uring tests exist only in the `all` sweep (the
-  one build with `linux-direct-io` and `linux-io-uring`) and skip and
+- The O_DIRECT and io_uring tests exist only in the `all` and `musl-all`
+  sweeps (the builds with `linux-direct-io` and `linux-io-uring`) and skip and
   pass on a typed platform refusal: O_DIRECT where the scratch
   filesystem rejects it, io_uring when setup fails for an
   environmental reason, most often an `RLIMIT_MEMLOCK` soft limit too
@@ -354,7 +354,7 @@ exception, not a tier - should not survive across many PRs.
 
 - **`test-hooks` Cargo feature.** Off by default and never on in a
   product build, which therefore never sees the hook code; the `all`
-  check sweep enables it.
+  and `musl-all` check sweeps enable it.
 - **Fault plans ride the token.** `pbfhogg::test_hooks` is the one
   answer to "what can a test inject". Its `FaultPlan` holds every
   token-scoped hook (arming fields and observation counters, public

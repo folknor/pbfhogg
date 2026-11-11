@@ -1183,7 +1183,7 @@ mod backends {
 // sweep in `brokkr.toml` (`no_default_features = true, features =
 // ["commands"]`, which builds pbfhogg-cli and its binary without the linux
 // features) and the `musl` sweep (default features). Under the
-// `all` sweep both features are on and these tests are excluded by
+// `all` and `musl-all` sweeps both features are on and these tests are excluded by
 // cfg, so the positive tests in `mod backends` cover that path.
 
 #[cfg(not(feature = "linux-direct-io"))]

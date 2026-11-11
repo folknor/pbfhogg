@@ -18,18 +18,18 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-010 - Feature-gated code never builds for musl
+## BUG-010 - Profiling features never build for musl
 
-Lateral finding from the BUG-008 work, not yet judged. The `musl` sweep in
-`brokkr.d/checks.toml` builds default features only, so code behind
-`linux-direct-io`, `linux-io-uring`, `test-hooks` and the profiling features
-never compiles for musl. The allocator textlint exempts `crates/lib/src/debug.rs`
-and `crates/lib/src/process.rs` wholesale, so an ungated glibc call added inside
-either file behind one of those features escapes both guards. Source reading
-suggests the Linux features build on musl (`direct_io.rs` already has a
-non-gnu `statx` fallback), but no build has confirmed it. The profiling features
-are kept off broad sweeps on purpose because their instrumentation disturbs the
-CLI tests.
+The `musl` and `musl-all` sweeps in `brokkr.d/checks.toml` cover default
+features and the `all` shape (test-hooks plus both platform features) on
+x86_64 musl. Code behind `hotpath` and `hotpath-alloc` still never compiles for
+musl, and the allocator textlint exempts `crates/lib/src/debug.rs` and
+`crates/lib/src/process.rs` wholesale, so an ungated glibc call added there
+behind a profiling feature escapes both guards. The profiling features stay off
+test sweeps on purpose (their instrumentation disturbs the CLI tests), so this
+belongs with VER-098's compile-only profiling shapes in
+`notes/verification.md`. Mixed platform shapes (one of `linux-direct-io`,
+`linux-io-uring` without the other) are built on neither target.
 
-Fix: add musl coverage for the platform and test-hooks features, compile-only
-if running them is not wanted.
+Fix: a compile-only musl shape with the profiling features, landed with
+VER-098's.

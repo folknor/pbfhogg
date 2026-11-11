@@ -108,6 +108,21 @@ packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 
+# The `all` feature shape on musl. The default-feature `musl` sweep above
+# never compiles code behind test-hooks, linux-direct-io or linux-io-uring,
+# so a glibc-only call there, or a musl-only behaviour such as the direct
+# I/O alignment query returning None off glibc (crates/lib/src/direct_io.rs),
+# went unbuilt and unrun. Both musl sweeps are kept: `musl` still covers the
+# feature-off branches and the CLI's feature_missing tests on musl. Mixed
+# shapes (one platform feature without the other) are covered by neither
+# target. The profiling features stay out for the reason given for `all`.
+[[check]]
+name = "musl-all"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+target = "x86_64-unknown-linux-musl"
+parallel = {}
+
 # Lint-only, on an architecture the promise guard (crates/cli/tests/guard.rs)
 # does not support: its seccomp filter compiles only on little-endian x86_64
 # and aarch64. This type-checks the guard's unguarded fallback, and only that,
@@ -145,13 +160,13 @@ gate_profile = "gate"
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
 # refactor. Skips the tier2/tier3/serial submodules; runs everything
 # else across every listed sweep, the O_DIRECT and io_uring tests
-# included (they exist only in the `all` sweep, which builds both
-# features, and skip on a typed platform refusal). `minimal` contributes
+# included (they exist only in the `all` and `musl-all` sweeps, which build
+# both features, and skip on a typed platform refusal). `minimal` contributes
 # mostly a compile + clippy gate: the commands-gated test files cfg
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all"]
 skip = ["tier2::", "tier3::", "serial::"]
 include_ignored = false
 
@@ -203,12 +218,12 @@ test_threads = 1
 # cli_sort test. Verified with `brokkr check --profile sort` and the tier1
 # sweep list at a time it held a root-only sweep ahead of these: the run
 # stopped there with "cargo test: zero tests ran", and the sweeps after it
-# never ran. These three are every
+# never ran. These are every
 # shape the CLI tests run in.
 [test.profiles.sort]
 description = "Tier 2: expanded sort command tests"
 extends = "tier1"
-sweeps = ["all", "consumer", "musl"]
+sweeps = ["all", "consumer", "musl", "musl-all"]
 tests = ["all"]
 only = ["cli_sort::"]
 skip = ["serial::"]
@@ -221,7 +236,7 @@ skip = ["serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

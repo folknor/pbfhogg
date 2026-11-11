@@ -7,7 +7,7 @@
 //
 // CAUTION: the features do NOT all mean the same in both packages.
 // `commands` is on by default in `pbfhogg` but is a no-op feature in
-// `pbfhogg-cli`, off in the `all` and `musl` sweeps; `geocode-reader` is
+// `pbfhogg-cli`, off in every sweep but `consumer`; `geocode-reader` is
 // likewise absent there. A gate on either in anything under crates/lib/tests/common/
 // would silently drop CLI tests out of those sweeps. Gate the `mod` line in
 // crates/lib/tests/all.rs instead; the `no-library-feature-gates-in-tests-common`

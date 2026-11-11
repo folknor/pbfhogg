@@ -13,10 +13,10 @@ stage = "pre-clippy"
 # crates/lib/src/process.rs, behind
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
 # A call gated on `target_os = "linux"` alone also compiles for musl, where
-# these symbols do not exist. The `musl` sweep in checks.toml catches that,
-# but only in what it compiles: default features, so code behind
-# linux-direct-io, linux-io-uring, test-hooks or the profiling features, and
-# any `not(feature = ...)` branch those flip, never builds for musl there.
+# these symbols do not exist. The `musl` and `musl-all` sweeps in checks.toml
+# catch that, but only in what they compile: default features and the `all`
+# feature shape, so code behind the profiling features, and branches only a
+# mixed platform-feature shape selects, never build for musl.
 # This rule scans source whatever its features and keeps the calls in the
 # reviewed wrappers even when a stray one is correctly gated. It checks
 # placement only: the excluded wrapper files are trusted for their own gates,
@@ -44,7 +44,7 @@ message = "glibc-only allocator calls belong in target_env gnu gated debug/proce
 # clap help strings out of scope. `eprintln!` stays legal.
 # crates/lib/tests/common is mounted by path into pbfhogg (where `commands` is on by
 # default) and into pbfhogg-cli (where `commands` is a no-op feature, off in
-# the `all` and `musl` sweeps). A gate on either feature in a shared helper
+# the `all`, `musl` and `musl-all` sweeps). A gate on either feature in a shared helper
 # would silently drop CLI tests out of those sweeps. Comment lines are exempt
 # so the explanation can name the features.
 [[textlint]]

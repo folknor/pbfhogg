@@ -364,7 +364,7 @@ fn check_refs_resolves_ids_above_the_allocation() {
             .complete()
             .expect("check_refs completes");
         // The high node, way and relation lay above the pre-allocation.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         assert_eq!(
             host.invocation
                 .faults()
@@ -423,7 +423,7 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     // duplicates were found by the serial overflow insertion. Its blobs
     // settle in completion order, which may decide which copy counts as the
     // first, but never how many duplicates there are.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     assert_eq!(
         host.invocation
             .faults()
@@ -480,7 +480,7 @@ fn check_ids_full_proves_an_ordered_kind_duplicate_free_without_its_set() {
 
     let host = crate::common::test_host();
     let report = verify_ids_full(&input, 0, &host);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     assert_eq!(
         host.invocation
             .faults()

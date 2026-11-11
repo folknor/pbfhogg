@@ -188,7 +188,7 @@ pub(super) fn addr_point_cells(
 /// Test-only: the fault plan's `geocode_misfile_address`, which files one
 /// address point at one level under its antipode's cell instead of its own,
 /// leaving every other entry (streets included) where it belongs.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn misfile_address(
     faults: &crate::test_hooks::FaultPlan,
     idx: usize,
@@ -508,7 +508,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                     // holding `fine_bucket_dir` / `coarse_bucket_dir`
                     // (ADR-0018) is removed on the unwind.
                     // Release builds compile this out entirely.
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     if cancel
                         .faults()
                         .geocode_streets_panic_at_way
@@ -596,7 +596,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                     };
                     let (fine_cid, coarse_cid) =
                         addr_point_cells(pt.lat_e7, pt.lon_e7, fine_level, coarse_level);
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     let (fine_cid, coarse_cid) = misfile_address(
                         cancel.faults(),
                         idx,

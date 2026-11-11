@@ -648,7 +648,7 @@ fn a_panicking_sink_does_not_fail_the_run() {
 /// Records the publication events of its invocation, and holds every
 /// `PUBLISH_START` until a second one arrives or `PUBLISH_OVERLAP_WAIT`
 /// passes, so two publications that could overlap do.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 struct PublishOrder {
     events: std::sync::Mutex<Vec<(String, Option<i64>)>>,
     starts: std::sync::atomic::AtomicUsize,
@@ -659,9 +659,9 @@ struct PublishOrder {
 }
 /// Bound on the first span's wait for the second publication: a correct
 /// lock has it waiting on the lock at once.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 const PUBLISH_OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 impl pbfhogg::debug::InstrumentSink for PublishOrder {
     fn marker(&self, name: &str) {
         if !name.starts_with("PUBLISH_") {
@@ -713,7 +713,7 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
 /// invocation's publication execution lock, so without that lock the two
 /// spans interleave on the stream. The lock is taken before the decision, so
 /// the `before_publish` hooks (which run after it) never overlap either.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn concurrent_publications_of_one_invocation_do_not_interleave() {
     let sink = Arc::new(PublishOrder {
@@ -976,7 +976,7 @@ fn ambient_writer_inside_a_foreign_pool_flushes() {
         .expect("flush under Ambient inside a one-thread pool");
     assert_eq!(count_data_blobs(&path), POOL_BLOCKS);
 }
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn swallowed_framing_panic_surfaces_at_flush() {
     let dir = crate::common::test_scratch();
@@ -1007,7 +1007,7 @@ fn swallowed_framing_panic_surfaces_at_flush() {
 /// Write `count` empty blocks, then flush; the first error from either.
 /// A framing panic is an ordered error at its position, so it may surface
 /// on a later write (once the writer thread has stopped on it) or at flush.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn write_then_flush<W: std::io::Write>(
     writer: &mut pbfhogg::writer::PbfWriter<W>,
     count: usize,
@@ -1020,7 +1020,7 @@ fn write_then_flush<W: std::io::Write>(
 /// A swallowed panic must return its permit even when flush itself has to
 /// run the framing job on the pool's only worker. Cover an interior item, the
 /// final one, and a stream whose only task panics.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn swallowed_framing_panics_on_one_worker_fail_flush() {
     let dir = crate::common::test_scratch();
@@ -1089,7 +1089,7 @@ fn run_external_join(
 /// cannot force the refusal without a host assumption, so the fault plan
 /// injects it at the one place a backend becomes a writer. Buffered reads, so no genuine input-side refusal can stand in for
 /// the injected one; its source message proves which refusal arrived.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
     let dir = crate::common::test_scratch();

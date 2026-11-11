@@ -7,8 +7,9 @@ from rust_source_shapes import static_inventory_errors, static_items
 class StaticInventory(unittest.TestCase):
     def test_nested_modules_and_macro_bodies(self):
         for source in (
-            '#[cfg(feature = "test-hooks")] mod renamed { static X: u8 = 0; }',
-            '#[cfg(all(test, feature = "test-hooks"))] mod a { mod b { static X: u8 = 0; }}',
+            '#[cfg(pbfhogg_test_hooks)] mod renamed { static X: u8 = 0; }',
+            '#[cfg(all(test, pbfhogg_test_hooks))] mod a { mod b { static X: u8 = 0; }}',
+            '#[cfg(feature = "hooks")] mod gated { static X: u8 = 0; }',
             'macro_rules! state { () => { static X: AtomicBool = AtomicBool::new(false); }}',
             'macro_rules! state { ($name:ident) => { static $name: u8 = 0; }}',
             'thread_local! { static X: Cell<u8> = Cell::new(0); }',

@@ -43,21 +43,6 @@ Residue: a fixture type owning the pool's join handles, joined once every execut
 owner is released (never on one of the pool's own workers), which every `test_host()`
 caller would then hold.
 
-## VER-008 - "Product builds never enable test-hooks" is a convention
-
-Reported by fault-injection, cli-tests.
-
-`crates/lib/Cargo.toml` and `crates/cli/Cargo.toml` expose ordinary additive
-features that enable environment-controlled pauses, faults, file writes, input
-replacement and scheduling controls in the production executable. Off-by-default
-compilation is enforced; absence from product artifacts is not, and feature
-unification can enable it.
-
-Fix: a dedicated test executable or internal test build, or a product-build gate
-inspecting the resolved feature graph. The gate checks release artifacts and does not
-make arbitrary hook-enabled builds impossible. A blanket release-mode ban would
-conflict with release-mode fault testing.
-
 ## VER-009 - The static inventory cannot see synthesized state
 
 `scripts/check_source_invariants.py` now inventories every library static with counted,

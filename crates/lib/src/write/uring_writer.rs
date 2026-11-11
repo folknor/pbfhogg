@@ -778,9 +778,9 @@ impl UringSink<'_> {
     /// `RawChunks`, each `CopyRange`). Simulates a mid-stream panic in the
     /// uring writer thread; the writer's join surfaces it as an error.
     /// Release builds compile this out entirely.
-    #[cfg_attr(not(feature = "test-hooks"), inline(always))]
+    #[cfg_attr(not(pbfhogg_test_hooks), inline(always))]
     fn fault_point(&self) {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.cancel.faults().on_uring_dispatch();
     }
 }

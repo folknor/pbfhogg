@@ -40,7 +40,7 @@
 //! owns it. A test instrument public only because its callers live in another
 //! crate (`getparents_with_min_blobs`, behind the CLI's hidden
 //! `--full-scan-min-blobs`) is a documented exception, hidden, unsupported and
-//! compiled only with the `test-hooks` feature, so no production build has it;
+//! compiled only under the `pbfhogg_test_hooks` cfg, which no feature reaches;
 //! the fault plan's nonzero threshold overrides (diff units, text chunks,
 //! apply-changes create batches) are the same kind of instrument for the
 //! library's integration tests. One narrow exception to "no per-scope tuning

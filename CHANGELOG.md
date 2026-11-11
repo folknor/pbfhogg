@@ -29,9 +29,17 @@
 ### Changed
 
 - **The hidden, unsupported `getparents --full-scan-min-blobs` test flag
-  and `getparents::getparents_with_min_blobs` are gone from release builds.**
-  They now exist only with the `test-hooks` feature; elsewhere the flag is
-  refused as unknown. Ordinary `getparents` dispatch is unchanged.
+  and `getparents::getparents_with_min_blobs` are gone from ordinary builds.**
+  They now exist only in builds compiled with the `pbfhogg_test_hooks`
+  compiler cfg; elsewhere the flag is refused as unknown. Ordinary
+  `getparents` dispatch is unchanged.
+- **The doc-hidden `test-hooks` Cargo feature is removed** from `pbfhogg`
+  and `pbfhogg-cli`. Test fault injection (`pbfhogg::test_hooks`) and the
+  CLI's `PBFHOGG_TEST_*` environment hooks now compile only under the
+  compiler cfg `pbfhogg_test_hooks` (`RUSTFLAGS="--cfg pbfhogg_test_hooks"`),
+  so no feature selection or feature unification, including a registry
+  `cargo install`, can build them into an executable without that cfg. A build that named
+  `--features test-hooks` now fails as an unknown feature.
 - **`bench-write` fails on a relation member whose role does not resolve**
   instead of encoding an empty role and completing the run. It also reuses
   one member buffer per block rather than allocating one per relation, so its

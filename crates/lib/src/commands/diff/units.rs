@@ -138,11 +138,11 @@ pub(super) trait UnitConsumer {
     }
 
     /// The fault plan's unit-panic hook for this command.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize;
 
     /// The panic message of an armed unit.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_message(idx: usize) -> String;
 }
 
@@ -309,7 +309,7 @@ fn drive<C: UnitConsumer>(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Test-only: the fault plan's unit-panic hook simulates a unit
             // worker crash mid-run. Release builds compile this out.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             if C::panic_hook(invocation.faults()).load(std::sync::atomic::Ordering::Relaxed) == task
             {
                 panic!("{}", C::panic_message(task));
@@ -495,13 +495,13 @@ impl UnitCut {
     /// The production thresholds, or the fault plan's nonzero overrides in
     /// a test-hooks build (so a small fixture runs every cut).
     fn new(invocation: &crate::host::Recorder, prints_every_element: bool) -> Self {
-        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
+        #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_mut))]
         let mut cut = Self {
             target: DIFF_UNIT_TARGET_BYTES,
             lone_elements: DIFF_UNIT_LONE_ELEMENTS,
             prints_every_element,
         };
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let faults = invocation.faults();
@@ -514,7 +514,7 @@ impl UnitCut {
                 cut.lone_elements = lone;
             }
         }
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = invocation;
         cut
     }

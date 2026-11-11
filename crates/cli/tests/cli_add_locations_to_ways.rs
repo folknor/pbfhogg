@@ -899,7 +899,7 @@ fn auto_on_sorted_indexed_input_reports_its_choice() {
 /// external one byte above the fixed anonymous allowance, and sparse again
 /// with no budget left or memory unknown (the boundaries
 /// `host_contract::fixed_memory_routes_auto` pins in-process).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn auto_routes_on_the_childs_supplied_memory() {
     let dir = crate::common::test_scratch();

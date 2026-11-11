@@ -1395,9 +1395,10 @@ header fields set.
 `getparents --full-scan-min-blobs` is a hidden (`hide = true`) test
 instrument: it overrides an internal threshold so the suite can fire a
 code path without building a full-scale fixture. It is not part of the
-supported surface, and it exists only in builds with the `test-hooks`
-feature, which release and `cargo install` builds never enable; there the
-flag is unknown and refused as a usage error. In test-hooks builds it is
+supported surface, and it exists only in builds compiled with the
+`pbfhogg_test_hooks` compiler cfg (`--cfg` in rustflags), which no Cargo
+feature enables, so no feature selection or `cargo install` without that
+cfg produces it; elsewhere the flag is unknown and refused as a usage error. In hook builds it is
 range-checked at the CLI boundary (1 to 1,000,000,000): the library entry
 point behind it takes the value raw, and 0 is not a threshold - it pins
 the FullScan arm unconditionally.

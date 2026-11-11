@@ -155,7 +155,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
     ///
     /// `cancel` is the invocation's token. The pool has no cancellation of
     /// its own; its `writer_parallel_gzip_*` counters record into the
-    /// invocation, and under the `test-hooks` feature the workers and `flush`
+    /// invocation, and under the `pbfhogg_test_hooks` cfg the workers and `flush`
     /// read the token's fault plan (`crate::test_hooks`).
     pub fn new(
         inner: W,
@@ -219,7 +219,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             let raw_rx = Arc::clone(&raw_rx);
             let compressed_tx = compressed_tx.clone();
             let worker_failure = Arc::clone(&failure);
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             let worker_cancel = cancel.clone();
             #[allow(
                 clippy::disallowed_methods,
@@ -234,7 +234,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                         &raw_rx,
                         &compressed_tx,
                         &worker_failure,
-                        #[cfg(feature = "test-hooks")]
+                        #[cfg(pbfhogg_test_hooks)]
                         worker_cancel.faults(),
                     );
                 }));
@@ -524,7 +524,7 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         self.flush_current()?;
         let (ack_tx, ack_rx) = sync_channel::<io::Result<()>>(1);
         self.dispatch(Job::Barrier(ack_tx))?;
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.cancel.faults().on_gzip_barrier_queued();
         #[cfg(test)]
         self.flush_waiting
@@ -579,7 +579,7 @@ fn worker_loop(
     raw_rx: &Mutex<Receiver<(usize, Job)>>,
     compressed_tx: &SyncSender<(usize, Out)>,
     failure: &FirstFailure,
-    #[cfg(feature = "test-hooks")] faults: &crate::test_hooks::FaultPlan,
+    #[cfg(pbfhogg_test_hooks)] faults: &crate::test_hooks::FaultPlan,
 ) {
     loop {
         let item = {
@@ -608,7 +608,7 @@ fn worker_loop(
                 seq,
                 &raw,
                 failure,
-                #[cfg(feature = "test-hooks")]
+                #[cfg(pbfhogg_test_hooks)]
                 faults,
             ),
         };
@@ -628,19 +628,19 @@ fn compress_job(
     seq: usize,
     raw: &[u8],
     failure: &FirstFailure,
-    #[cfg(feature = "test-hooks")] faults: &crate::test_hooks::FaultPlan,
+    #[cfg(pbfhogg_test_hooks)] faults: &crate::test_hooks::FaultPlan,
 ) -> Out {
     // One Acquire load per 2 MB chunk.
     if failure.stopped() {
         return Out::Dropped;
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = seq;
     let compressed = guarded(failure, "parallel gzip worker", || {
         // Test-only: the fault plan's `gzip_panic_at_op`. Simulates an OOM
         // or internal unwrap inside a compress worker. Release builds
         // compile this out entirely.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         faults.on_gzip_compress(seq);
         compress_one(raw)
     });
@@ -828,7 +828,7 @@ fn discard_failed_out(out: Out, failure: &FirstFailure, reorder_permit_tx: &Sync
 
 /// Worker-death fault tests, through the fault plan of the token the writer
 /// is built under (`crate::test_hooks`).
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, pbfhogg_test_hooks))]
 mod fault_tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;

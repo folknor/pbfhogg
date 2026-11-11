@@ -2133,10 +2133,10 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
             "query() at ({outside_lat}, {lon}) is outside the polygon and must \
              not be attributed to Bigland via an interior-flagged neighbor cell"
         );
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         reader.reset_admin_pip_calls();
         let raw = reader.candidates(outside_lat, lon).expect("valid query");
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         assert!(
             reader.admin_pip_calls() <= 1,
             "one polygon shared by neighboring cells must be containment-tested at most once"

@@ -23,6 +23,13 @@ license = "MIT OR Apache-2.0"
 authors = ["folknor <folk@folk.wtf>"]
 repository = "https://github.com/folknor/pbfhogg"
 
+# Test-only fault and environment hooks compile under this compiler cfg, never
+# under a Cargo feature, so feature unification cannot reach them; the
+# hook-testing check sweeps in brokkr.d/checks.toml pass `--cfg`. Declaring it
+# here makes a misspelled predicate an unexpected_cfgs diagnostic.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pbfhogg_test_hooks)"] }
+
 [workspace.lints.clippy]
 uninlined_format_args = "deny"
 cloned_instead_of_copied = "deny"

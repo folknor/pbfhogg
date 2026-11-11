@@ -235,9 +235,9 @@ fn run_pool<'w, 'scope, 'env>(
     // output after the caller had been handed the result.
     drop(worker_txs);
     for (index, handle) in worker_handles.into_iter().enumerate() {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         cancel.faults().before_pool_join(index);
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = index;
         // `pool_worker` catches its own panics, so this is a backstop for a
         // panic outside that catch (in the payload's own destructor, say).
@@ -348,7 +348,7 @@ fn pool_worker(
     failure: &FirstFailure,
     cancel: &crate::host::Recorder,
 ) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     let _live = cancel.faults().live_pool_worker();
     let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
         worker_loop(index, &rx, file, failure, cancel);
@@ -370,7 +370,7 @@ fn worker_loop(
     failure: &FirstFailure,
     cancel: &crate::host::Recorder,
 ) {
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = index;
     while let Ok(op) = rx.recv() {
         // One Acquire load per op - next to the Relaxed RMW on the
@@ -382,7 +382,7 @@ fn worker_loop(
         // Test-only: the run's fault plan (`crate::test_hooks`). Simulates
         // an OOM or internal unwrap inside a pool worker, and parks siblings
         // for the join handshake. Release builds compile this out entirely.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         cancel.faults().on_pool_op(index);
 
         let t = crate::counters::Stopwatch::start();

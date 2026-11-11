@@ -47,12 +47,11 @@ hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
-# Test-only fault injection (`pbfhogg::test_hooks`): a fault plan carried by
-# each invocation's cancellation token, plus a few per-object hooks. Nothing
-# is process-global, so an armed fault cannot fire in a sibling test and any
-# test harness may use them. Product builds never enable it; the hook state
-# and checks then compile out entirely.
-test-hooks = []
+# Test-only fault injection (`pbfhogg::test_hooks`) is deliberately not a
+# feature: it compiles only under the compiler cfg `pbfhogg_test_hooks`
+# (declared in the workspace's check-cfg list), which the hook-testing check
+# sweeps pass as rustflags. No feature selection, dependency edge or feature
+# unification can switch it on; only an explicit `--cfg` can.
 
 [dependencies]
 protohoggr = "0.5.0"

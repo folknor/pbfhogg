@@ -549,7 +549,7 @@ impl WritePipeline {
     pub(super) fn wait_for_framing(&self) {
         let metrics = self.metrics();
         let mut taken = 0;
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.invocation
             .faults()
             .on_framing_wait(taken, PIPELINE_DISPATCH_PERMITS);
@@ -560,12 +560,12 @@ impl WritePipeline {
                 break;
             }
             taken += 1;
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             self.invocation
                 .faults()
                 .on_framing_wait(taken, PIPELINE_DISPATCH_PERMITS);
         }
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.invocation.faults().after_framing_wait();
         for _ in 0..taken {
             // Cannot block: the channel holds `PIPELINE_DISPATCH_PERMITS`

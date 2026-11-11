@@ -37,7 +37,7 @@ pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation, resources: Arc<dyn Res
 /// still exceed the core count. A malformed value ends the process with
 /// status 101, like the other test hooks.
 pub(crate) fn cli_resources() -> Arc<dyn Resources> {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     if let Some(spec) = std::env::var_os("PBFHOGG_TEST_RESOURCES") {
         let Some(fixed) = spec.to_str().and_then(parse_test_resources) else {
             cli_warning(
@@ -54,7 +54,7 @@ pub(crate) fn cli_resources() -> Arc<dyn Resources> {
 }
 
 /// `<cores>:<memory bytes or none>`, cores nonzero.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn parse_test_resources(spec: &str) -> Option<pbfhogg::host::Fixed> {
     let (cores, memory) = spec.split_once(':')?;
     let parallelism = Some(cores.parse::<std::num::NonZeroUsize>().ok()?);

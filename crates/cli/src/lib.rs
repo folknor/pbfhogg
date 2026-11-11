@@ -2721,13 +2721,13 @@ pub fn run() -> process::ExitCode {
             ),
         );
     }
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::arm(&cancel);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::arm_input_replacement(&cancel);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::arm_publication(&cancel);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::arm_merge_changes(&cancel);
     let host = host::cli_host(cancel, host::cli_resources());
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
@@ -3605,9 +3605,9 @@ pub fn run() -> process::ExitCode {
 
     pbfhogg::write::report_writer_degradations(&host);
     host.report_io_degradations();
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::write_count(&host.invocation);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::write_replacement_report(&host.invocation);
 
     // From here on the outcome is decided; a "stopping" notice the signal
@@ -4770,7 +4770,7 @@ fn run_getid(
 /// A test instrument, so it exists only in test-hooks builds (with the
 /// library entry point behind it); a production build has no such flag and
 /// clap refuses it as unknown.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[derive(Args)]
 struct FullScanArg {
     /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
@@ -4787,7 +4787,7 @@ struct FullScanArg {
 }
 
 /// The production build's empty counterpart: no flag, no threshold.
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 #[derive(Args)]
 struct FullScanArg {}
 
@@ -4804,7 +4804,7 @@ fn run_getparents(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = sources.resolve(write.direct_reads, host)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     if let Some(min_blobs) = full_scan.full_scan_min_blobs {
         let stats = pbfhogg::getparents::getparents_with_min_blobs(
             input, output, &id_set, &opts, write, overrides, min_blobs, host,
@@ -4812,7 +4812,7 @@ fn run_getparents(
         stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
         return Ok(());
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let FullScanArg {} = full_scan;
     let stats =
         pbfhogg::getparents::getparents(input, output, &id_set, &opts, write, overrides, host)?;

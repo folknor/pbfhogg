@@ -328,13 +328,13 @@ pub(super) fn try_extract_multi_single_pass(
     let grid = if n >= GRID_REGION_THRESHOLD {
         // A test can decline the grid to drive the same config down the
         // linear scan and compare output byte for byte.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         let grid = if host.invocation.faults().forces_linear_region_grid() {
             None
         } else {
             RegionGrid::build(&region_bboxes)
         };
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let grid = RegionGrid::build(&region_bboxes);
         if grid.is_none() {
             // Output is unchanged (the linear classifier tests every

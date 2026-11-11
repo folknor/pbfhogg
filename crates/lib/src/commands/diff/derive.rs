@@ -656,12 +656,12 @@ impl<'a> super::units::UnitConsumer for OscConsumer<'a> {
         invocation.counter(min_name, min_blobs);
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize {
         &faults.derive_unit_panic
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_message(idx: usize) -> String {
         format!("test-hooks: derive unit {idx} panicking")
     }
@@ -793,7 +793,7 @@ fn derive_changes_block_pair(
 /// A derive unit's chunk bytes and forced-spill point: the tunable and
 /// "never", or the fault plan's overrides in a test-hooks build.
 fn unit_output_limits(invocation: &crate::host::Recorder) -> (usize, usize) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     {
         let faults = invocation.faults();
         let chunk = faults
@@ -809,7 +809,7 @@ fn unit_output_limits(invocation: &crate::host::Recorder) -> (usize, usize) {
         };
         (chunk, spill_after)
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     {
         let _ = invocation;
         (crate::tunables::DIFF_OUTPUT_CHUNK_BYTES, usize::MAX)

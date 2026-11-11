@@ -160,7 +160,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         // before reading the next header until the drain has begun
         // processing an item past the node phase, so a test can prove way
         // work starts before the walk ends.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         if barrier_signalled {
             host.invocation
                 .faults()
@@ -173,7 +173,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         if meta.blob_type != BlobKind::OsmData {
             continue;
         }
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         host.invocation
             .faults()
             .apply_changes_scanner_headers_walked
@@ -304,7 +304,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
             send_boundary(&loc.boundary_tx, last_node_seq, host)?;
             wait_for_barrier(&loc.barrier_rx, false, host)?;
             barrier_signalled = true;
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             {
                 let faults = host.invocation.faults();
                 faults.apply_changes_headers_walked_at_release.store(
@@ -324,7 +324,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         if matches!(kind, ElementKind::Node) {
             last_node_seq = Some(seq);
         }
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         if !matches!(kind, ElementKind::Node) {
             host.invocation
                 .faults()
@@ -341,7 +341,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
             &mut max_item_bytes_fastpath,
             &mut max_item_bytes_slowpath,
             approx_cost,
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             host.invocation.faults(),
         )?;
 
@@ -352,13 +352,13 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         if let Some(loc) = locations.as_ref() {
             // Test-only: hold this poll until the drain has returned, so it
             // provably finds the channel closed.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             host.invocation.faults().before_apply_changes_poll(seq - 1);
             poll_barrier(&loc.barrier_rx, barrier_signalled, host)?;
         }
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .apply_changes_scanner_reached_eof
@@ -419,7 +419,7 @@ fn dispatch_item(
     max_item_bytes_fast: &mut usize,
     max_item_bytes_slow: &mut usize,
     approx_cost: usize,
-    #[cfg(feature = "test-hooks")] faults: &crate::test_hooks::FaultPlan,
+    #[cfg(pbfhogg_test_hooks)] faults: &crate::test_hooks::FaultPlan,
 ) -> Result<()> {
     match item {
         ScannerEmit::Drain(tx, drain_item) => {
@@ -430,7 +430,7 @@ fn dispatch_item(
             *max_item_bytes_slow = (*max_item_bytes_slow).max(approx_cost);
             // Test-only: report a full candidate channel before blocking on
             // it, so a fault can be timed to land while dispatch is blocked.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             let scanned = match channels.candidate_tx.try_send(scanned) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Disconnected(scanned)) => scanned,
@@ -467,9 +467,7 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
 fn poll_barrier(
     rx: &mpsc::Receiver<()>,
     signalled: bool,
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Entered<
-        '_,
-    >,
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))] host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     match rx.try_recv() {
         Ok(()) => Err(crate::Error::internal(
@@ -477,7 +475,7 @@ fn poll_barrier(
         )),
         Err(mpsc::TryRecvError::Empty) => Ok(()),
         Err(mpsc::TryRecvError::Disconnected) => {
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             host.invocation
                 .faults()
                 .apply_changes_scanner_stopped_before_eof
@@ -499,17 +497,17 @@ fn poll_barrier(
 /// its own, which `merge` ranks below the drain's.
 fn wait_for_barrier(
     rx: &mpsc::Receiver<()>,
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] at_eof: bool,
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))] at_eof: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_START");
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .apply_changes_scanner_in_barrier_wait
         .store(true, std::sync::atomic::Ordering::SeqCst);
     if rx.recv().is_err() {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         if !at_eof {
             host.invocation
                 .faults()
@@ -530,12 +528,10 @@ fn wait_for_barrier(
 fn send_boundary(
     tx: &mpsc::SyncSender<DrainMessage>,
     last_node_seq: Option<u64>,
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Entered<
-        '_,
-    >,
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))] host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let node_end_seq = last_node_seq.map_or(0, |seq| seq + 1);
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .before_apply_changes_boundary(node_end_seq);

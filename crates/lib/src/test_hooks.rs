@@ -1,8 +1,10 @@
 //! Fault injection for tests: what a test can inject, in one place.
 //!
-//! Compiled only under the `test-hooks` feature; a product build has none of
-//! it, and every hook site is gated on the same feature, so release code is
-//! unchanged by its presence.
+//! Compiled only under the compiler cfg `pbfhogg_test_hooks`, which is not a
+//! Cargo feature: no feature selection, dependency or feature unification can
+//! switch it on, only an explicit `--cfg` (the hook-testing check sweeps pass
+//! it). Every hook site is gated on the same cfg, so a build without it has
+//! none of this code.
 //!
 //! # The fault plan rides the invocation token
 //!

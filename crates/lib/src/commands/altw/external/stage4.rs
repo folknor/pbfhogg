@@ -264,9 +264,9 @@ impl S4Consumer<'_> {
         ordinal: usize,
         (blocks, block_stats): (Vec<OwnedBlock>, Stats),
     ) -> crate::Result<()> {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.cancel.faults().on_altw_stage4_consume(ordinal)?;
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = ordinal;
         self.total_stats.merge(&block_stats);
         for block in blocks {
@@ -334,7 +334,7 @@ pub(super) fn stage4_assembly(
         backend,
         ..
     } = *write;
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation.faults().on_altw_stage4_start()?;
     // Build the blob schedule from the shared metadata scan.
     host.invocation.marker("EXTJOIN_S4_SCHEDULE_START");
@@ -565,7 +565,7 @@ pub(super) fn stage4_assembly(
             // returned error stays an ordered failure and reaches the
             // router through `abandon`.
             let guard = AbortOnDrop::new(coord_payloads_reader, "stage 4 worker");
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             host.invocation.faults().on_altw_stage4_work(ordinal);
             let desc = &schedule[decode_at.position(ordinal)];
             let file = &shared_file;
@@ -600,7 +600,7 @@ pub(super) fn stage4_assembly(
                     // block + StringTable resident. Non-way blobs skip
                     // this entirely - they never consume a coord payload.
                     if desc.is_way_blob {
-                        #[cfg(feature = "test-hooks")]
+                        #[cfg(pbfhogg_test_hooks)]
                         host.invocation
                             .faults()
                             .on_altw_stage4_ready_wait(desc.way_blob_idx);

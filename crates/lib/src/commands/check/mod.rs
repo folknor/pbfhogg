@@ -239,12 +239,12 @@ pub(super) fn insert_overflow_ids(
     ids: Vec<i64>,
     host: &crate::host::Entered<'_>,
 ) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .check_overflow_ids
         .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = host;
     for id in ids {
         overflow.set(id);

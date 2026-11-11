@@ -2238,7 +2238,7 @@ mod tests {
     /// other route. Three opens: the probe, the estimate walk and the
     /// streaming reader. The replacement is armed after each in turn, in
     /// both reopen modes, buffered and `O_DIRECT`.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn full_scan_arm_reads_only_the_pinned_input() {

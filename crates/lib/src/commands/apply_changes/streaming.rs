@@ -149,7 +149,7 @@ pub(super) struct StreamingConfig {
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
     /// The run's invocation: its writer counters record the workers'
-    /// framing, and under the `test-hooks` feature its fault plan is
+    /// framing, and under the `pbfhogg_test_hooks` cfg its fault plan is
     /// consulted at each dequeue (`FaultPlan::on_apply_changes_dequeue`:
     /// panic, park or hold).
     pub cancel: crate::host::Permit,
@@ -388,7 +388,7 @@ pub(super) fn run_workers(
     counters.emit_all(&cancel);
     // Test-only: the same counters, kept on the run's token, so a test can
     // assert on them without an instrumentation sink.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     {
         let mut recorded = Vec::new();
         counters.for_each(|name, value| recorded.push((name, value)));
@@ -447,7 +447,7 @@ fn worker_loop(
         // hold this worker at a deterministic point, exercising panic
         // publication, barrier shutdown, cancellation and scratch cleanup.
         // Production builds don't compile this block.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         {
             let seq = match &item {
                 ScannedBlob::Candidate(d) | ScannedBlob::Passthrough(d) => d.seq,
@@ -475,7 +475,7 @@ fn worker_loop(
                     &cancel.metrics().writer,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
-                #[cfg(feature = "test-hooks")]
+                #[cfg(pbfhogg_test_hooks)]
                 cancel.faults().on_apply_changes_candidate_done(desc.seq);
             }
             ScannedBlob::Passthrough(mut desc) => {

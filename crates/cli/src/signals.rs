@@ -315,10 +315,10 @@ mod tests {
     }
 }
 
-/// Test hooks driven by the environment, compiled only with `test-hooks`,
-/// which no product build enables. They park a run at a chosen checkpoint so
+/// Test hooks driven by the environment, compiled only under the
+/// `pbfhogg_test_hooks` cfg, which no Cargo feature enables. They park a run at a chosen checkpoint so
 /// a test can signal it while it is provably mid-run.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 pub(crate) mod test_hooks {
     use pbfhogg::host::Invocation;
 

@@ -150,7 +150,7 @@ fn merge_changes(
     // before the first is read: every checkpoint of the run then falls at a
     // fixed point of the spill, so the sweep trips inside it and inside the
     // copy-back.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .merge_changes_spill_first
@@ -497,7 +497,7 @@ fn run_once(
 ) -> Result<bool, String> {
     let out = crate::common::test_scratch();
     let scratch = crate::common::test_scratch();
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     let token = cancel.clone();
     let host = host_with(cancel);
     let result = command(inputs, out.path(), scratch.path(), &host);
@@ -505,7 +505,7 @@ fn run_once(
     // Every command, whatever its outcome, leaves its invocation with no
     // call guard, no permit and nothing in its census once it has returned
     // and everything it handed out is gone.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     {
         let rest = token.capabilities();
         if rest != pbfhogg::host::Capabilities::default() {
@@ -555,7 +555,7 @@ fn a_tripped_token_stops_selected_scenarios_before_they_start() {
 
 /// The result of targeting one ordinal of a fixture's counting run.
 /// A missing callback is a coverage failure, not a successful cancellation.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[derive(Debug)]
 enum CheckpointRun {
     Unreached { observed: u64 },
@@ -563,7 +563,7 @@ enum CheckpointRun {
     CompletedAfterDecision { authorized: u64 },
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn run_at_checkpoint(
     name: &str,
     command: Command,
@@ -597,7 +597,7 @@ fn run_at_checkpoint(
 }
 
 /// A strict per-scenario replay budget, independent of checkpoint count.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn checkpoint_sample(count: u64) -> Vec<u64> {
     if count <= 64 {
         (1..=count).collect()
@@ -608,7 +608,7 @@ fn checkpoint_sample(count: u64) -> Vec<u64> {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn checkpoint_sampling_has_a_strict_budget_and_includes_endpoints() {
     for count in [0, 1, 63, 64, 65, 127, 128, 1000, u64::MAX] {
@@ -627,7 +627,7 @@ fn checkpoint_sampling_has_a_strict_budget_and_includes_endpoints() {
 
 /// Sample fixture checkpoint ordinals for the selected command scenarios.
 /// Each reached target must cancel or report an already decided publication.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision() {
     let inputs = Inputs::new();
@@ -678,7 +678,7 @@ fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision
 /// At observed checkpoints of selected fixture scenarios, the census of
 /// issued outputs, writers, readers and buffers is empty. This cannot rule
 /// out a value issued and retired entirely between two observations.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -713,7 +713,7 @@ fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
 /// A public command reached from inside another (`sort` runs `sort_with`)
 /// is a nested entry: it mints its own call guard while the outer one is
 /// held, so a checkpoint inside it sees two, and both retire.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_nested_entry_mints_its_own_guard() {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -813,7 +813,7 @@ fn a_cancelled_output_writer_cannot_be_published() {
 
 /// After the decision, publication's own outcome stands: an unsynced
 /// directory is reported as such, not turned into a cancellation.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
     let dir = crate::common::test_scratch();
@@ -846,7 +846,7 @@ fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
 
 /// Each invocation observes its own token: two sorts running at once, one
 /// cancelled mid-run, the other completing.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_token_stops_only_the_runs_that_observe_it() {
     let inputs = Inputs::new();

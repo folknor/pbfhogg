@@ -79,8 +79,9 @@ NAME` list each harness in turn to find one test.
   The harness's own unit tests live in its bin target.
 - **`crates/lib/tests/common/` is shared by path, not by a crate.** Each package
   compiles it with its own features, which carry the same names
-  (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
-  on those means the same thing in all three packages. `commands` does not: in
+  (`linux-direct-io`, `linux-io-uring`), and the hook cfg
+  `pbfhogg_test_hooks` reaches every package of a sweep alike, so a `cfg`
+  gate on those means the same thing in all three packages. `commands` does not: in
   `pbfhogg` it is on by default, in `pbfhogg-cli` it is a no-op feature
   that is off in the `all`, `musl` and `musl-all` sweeps. A
   `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
@@ -163,7 +164,7 @@ from it (`invoker::subcommands`, `invoker::subcommand_paths`), never
 from `--help` text. It is not an API and sets `doctest = false`.
 
 The `all`, `consumer`, `musl` and `musl-all` check sweeps select all three
-packages, so the CLI tests run against a binary with `test-hooks` and both
+packages, so the CLI tests run against a binary with the hook cfg and both
 platform features, one without the platform features (pbfhogg-cli's default
 build), and the same two shapes again for musl. No sweep pre-builds the binary
 (`build_packages`): cargo builds it for each test build. The `minimal`
@@ -460,9 +461,21 @@ exception, not a tier - should not survive across many PRs.
 
 ## Conventions
 
-- **`test-hooks` Cargo feature.** Off by default and never on in a
-  product build, which therefore never sees the hook code; the `all`
-  and `musl-all` check sweeps enable it.
+- **`pbfhogg_test_hooks` compiler cfg, not a Cargo feature.** Every
+  test hook (the library's fault plans and observers, the CLI's
+  `PBFHOGG_TEST_*` environment hooks, getparents' hidden threshold flag)
+  compiles only under `cfg(pbfhogg_test_hooks)`. No member declares a
+  feature for it, so no feature selection, dependency edge or feature
+  unification, a registry `cargo install` included, can put hooks in an
+  executable; only an explicit `--cfg pbfhogg_test_hooks` in rustflags
+  can, in debug or release alike. The workspace declares the cfg in its
+  check-cfg list, so a misspelled predicate is a diagnostic. The `all`,
+  `all-serial` and `musl-all` check sweeps pass it as `rustflags`. The
+  rustdoc phase does not receive it (brokkr carries no sweep `--cfg`
+  into rustdoc's flags), so doc comments on hook-only items are not
+  linted. `scripts/check_test_modules.py` reads the sweeps' rustflags
+  for it, so a hook-gated test module counts as covered only while some
+  sweep sets the cfg.
 - **Fault plans ride the token.** `pbfhogg::test_hooks` is the one
   answer to "what can a test inject". Its `FaultPlan` holds every
   token-scoped hook (arming fields and observation counters, public
@@ -472,7 +485,7 @@ exception, not a tier - should not survive across many PRs.
   pipeline, the output writers, the diff and derive work units, altw's
   stages, the geocode passes), so a new hook is a `FaultPlan` field
   read at the site through the token in hand, gated on
-  `cfg(feature = "test-hooks")`. A test arms the plan of the token in
+  `cfg(pbfhogg_test_hooks)`. A test arms the plan of the token in
   the `Host` it passes; `common::test_host()` mints a fresh token per
   call. One token is one fault scenario: everything run under it shares
   its plan (sequence numbers, worker indices, counters), so an armed and
@@ -489,7 +502,7 @@ exception, not a tier - should not survive across many PRs.
 - **Cancellation hooks.** `Invocation::on_check` (per-instance, `test-hooks`)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from
-  the callback (`crates/lib/tests/cancel.rs`). The CLI, built with `test-hooks`, reads
+  the callback (`crates/lib/tests/cancel.rs`). The CLI, built with the hook cfg, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and
   `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
@@ -565,7 +578,7 @@ exception, not a tier - should not survive across many PRs.
   effects through every fault, re-entry, an unwinding observer) is tested
   through the public API in `crates/lib/tests/publication.rs`, parking at a
   `before_publish` hook or an `on_check` checkpoint and releasing over a
-  channel within a bounded wait. The CLI, built with `test-hooks`, reads
+  channel within a bounded wait. The CLI, built with the hook cfg, reads
   `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>,...` (faults spelled as
   `PublishFault` parses them; a bad spelling exits 101, as does a trace
   or ready file that cannot be written),
@@ -608,7 +621,7 @@ exception, not a tier - should not survive across many PRs.
   `MachineProbe`, and `RAYON_NUM_THREADS=<cores>`, which bounds the CLI's
   ambient executor in any build. These are fixed sizing and routing inputs,
   not a thread cap (`-j` and concurrent stage threads can exceed them). A
-  child built without `test-hooks` (the `consumer` and `musl` sweeps)
+  child built without the hook cfg (the `consumer` and `musl` sweeps)
   ignores the resource variable and still sizes its pools and routes altw's
   auto backend on the runner's machine: those runs are process-integration
   coverage, and no assertion may depend on the machine. Hook setters are

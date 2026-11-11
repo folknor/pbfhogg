@@ -157,7 +157,7 @@ impl<'a> CliInvoker<'a> {
     }
 
     /// Arm only faults represented by the library's publication protocol.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[allow(dead_code)]
     pub fn publish_faults(mut self, faults: &[pbfhogg::test_hooks::PublishFault]) -> Self {
         use pbfhogg::test_hooks::PublishFault;
@@ -195,7 +195,7 @@ impl<'a> CliInvoker<'a> {
     }
 
     /// Pause at a typed publication step and announce it at `ready`.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[allow(dead_code)]
     pub fn publish_pause(mut self, step: pbfhogg::test_hooks::PublishStep, ready: &Path) -> Self {
         self.cmd
@@ -627,7 +627,7 @@ fn listed(cmd: &clap::Command) -> impl Iterator<Item = &clap::Command> {
 mod tests {
     use super::{CliInvoker, CliOutput};
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn typed_publication_faults_round_trip_through_the_child_protocol() {
         use pbfhogg::test_hooks::PublishFault::{self, *};
@@ -676,7 +676,7 @@ mod tests {
     /// Malformed protocol values must fail before even a version-only run.
     /// Raw environment access stays private to this refusal test; callers
     /// configure valid publication hooks through the typed setters.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn malformed_publication_hooks_fail_explicitly() {
         let scratch = pbfhogg_test_scratch::scratch();
@@ -736,7 +736,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn malformed_resources_hook_fails_explicitly() {
         let scratch = pbfhogg_test_scratch::scratch();
@@ -760,7 +760,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn malformed_checkpoint_and_replacement_hooks_fail_explicitly() {
         let scratch = pbfhogg_test_scratch::scratch();
@@ -816,7 +816,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "test-hooks", unix))]
+    #[cfg(all(pbfhogg_test_hooks, unix))]
     #[test]
     fn publication_hook_names_require_utf8() {
         use std::os::unix::ffi::OsStrExt;

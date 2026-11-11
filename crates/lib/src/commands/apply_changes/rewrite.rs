@@ -455,7 +455,7 @@ pub(crate) fn merge_to<'a>(
     // so they are descriptions of one file.
     let splice = backend.supports_copy_range();
     // Test-only: exercise the owned route on any backend.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     let splice = splice
         && !host
             .invocation
@@ -614,7 +614,7 @@ pub(crate) fn merge_to<'a>(
         );
         // Test-only: the drain has returned, so its config, channels and
         // locations state, the barrier sender included, are dropped by now.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         host.invocation
             .faults()
             .apply_changes_drain_returned

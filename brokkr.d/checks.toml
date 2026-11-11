@@ -2,9 +2,19 @@
 # test) pass with its own feature shape. Profiles in [test.profiles]
 # reference these by name and layer libtest filters on top.
 #
-#  - "all"      = test-hooks (fault injection, `pbfhogg::test_hooks`; the
+#  - "all"      = the pbfhogg_test_hooks cfg (fault injection,
+#                 `pbfhogg::test_hooks`, and the CLI's environment hooks; the
 #                 fault tests run here with every other test) +
-#                 linux-direct-io + linux-io-uring. Mirrors what --all-features used to
+#                 linux-direct-io + linux-io-uring. The hooks are a compiler
+#                 cfg, not a feature, so no feature unification can put them
+#                 in a product build; the sweeps that test them (all,
+#                 all-serial, musl-all) pass it as rustflags. brokkr's
+#                 rustdoc phase does not carry a sweep's `--cfg` into
+#                 rustdoc's flags, so it documents these sweeps without the
+#                 hooks: hook-only doc comments go unlinted until it does.
+#                 A per-sweep RUSTDOCFLAGS env would leak into ad-hoc runs,
+#                 which union entry env but not rustflags.
+#                 Mirrors what --all-features used to
 #                 pull in MINUS hotpath (#[hotpath::measure] turns into
 #                 runtime measurement that emits a banner to stdout at
 #                 process exit, contaminating stdout-output commands
@@ -34,7 +44,7 @@
 # pbfhogg-harness (crates/harness/tests/all.rs), where cargo builds the binary
 # with that test build's features and hands its path as
 # CARGO_BIN_EXE_<name> - so there is no build_packages pre-build and no
-# binary from another sweep to pick up. Every package declares test-hooks,
+# binary from another sweep to pick up. Every package declares
 # linux-direct-io, linux-io-uring and commands under the same names, so
 # one feature list serves all three. A sweep that must keep the library
 # alone (minimal, geocode-reader) leaves the other two out: their lib dep
@@ -43,7 +53,8 @@
 [[check]]
 name = "all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
-features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+features = ["linux-direct-io", "linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
 # binaries executed directly, budget = tests in flight, defaulting to the L3
 # cache domain (the right default for a compute-bound suite). Until 2026-09-02
@@ -68,7 +79,8 @@ parallel = {}
 [[check]]
 name = "all-serial"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
-features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+features = ["linux-direct-io", "linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
 only = ["serial::"]
 curated = true
 
@@ -129,7 +141,7 @@ target = "x86_64-unknown-linux-musl"
 parallel = {}
 
 # The `all` feature shape on musl. The default-feature `musl` sweep above
-# never compiles code behind test-hooks, linux-direct-io or linux-io-uring,
+# never compiles code behind the hook cfg, linux-direct-io or linux-io-uring,
 # so a glibc-only call there, or a musl-only behaviour such as the direct
 # I/O alignment query returning None off glibc (crates/lib/src/direct_io.rs),
 # went unbuilt and unrun. Both musl sweeps are kept: `musl` still covers the
@@ -139,7 +151,8 @@ parallel = {}
 [[check]]
 name = "musl-all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
-features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+features = ["linux-direct-io", "linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 

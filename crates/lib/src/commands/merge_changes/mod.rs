@@ -1121,7 +1121,7 @@ mod tests {
     /// merge writes, reports the spilled bytes, takes the copy-back branch it
     /// was forced into, and has removed the spill file itself: the run
     /// directory, still alive after the merge, holds only its bookkeeping.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn a_forced_spill_is_copied_back_and_removed() -> crate::Result<()> {
         use std::sync::atomic::Ordering::SeqCst;

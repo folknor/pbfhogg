@@ -46,7 +46,7 @@ mod common;
 // package mounts `fifo_capture` by path on its own.
 #[path = "common/fifo_capture.rs"]
 mod fifo_capture;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[path = "common/reopen_cell.rs"]
 mod reopen_cell;
 
@@ -68,72 +68,72 @@ mod geocode_reader;
 mod inspect;
 
 mod apply_changes_create_runs;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod capabilities;
 mod corrupt_input;
 mod degrade;
 mod digest_input;
 mod edge_cases;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_altw_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_altw_stage3;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_altw_stage4;
 mod fault_apply_changes;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_cat_input;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_check_ids_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_degrade_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_derive_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_derive_parallel;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_diff_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_diff_parallel;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_digest_input;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_extract_grid;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_extract_input;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_geocode_input;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_geocode_pass3;
-#[cfg(all(feature = "test-hooks", feature = "commands"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "commands"))]
 mod fault_geocode_smoke;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_getid_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_getparents_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_inspect_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_library_pools;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_parallel_writer;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_pipelined_writer;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_read_pipeline;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_renumber_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_repack_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_sort_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_tags_count_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_tags_filter_input;
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod fault_time_filter_input;
-#[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
+#[cfg(all(pbfhogg_test_hooks, feature = "linux-io-uring"))]
 mod fault_uring_writer;
 mod fd_pool;
 mod fixture_helpers;
@@ -151,7 +151,7 @@ mod read_paths;
 mod renumber_external;
 mod roundtrip;
 mod roundtrip_invariants;
-#[cfg(all(feature = "test-hooks", unix))]
+#[cfg(all(pbfhogg_test_hooks, unix))]
 mod seal;
 mod tags_count;
 mod tags_filter_osc;

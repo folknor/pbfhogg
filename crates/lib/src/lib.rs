@@ -288,7 +288,7 @@ pub mod host;
 pub use host::Parallelism;
 pub mod process;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[doc(hidden)]
 pub mod test_hooks;
 

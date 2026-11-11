@@ -279,7 +279,7 @@ struct Pin {
     #[cfg(unix)]
     reopen: Reopen,
     /// Where the fault plan lives (see `crate::test_hooks`).
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     cancel: crate::host::Invocation,
 }
 
@@ -302,7 +302,7 @@ enum Reopen {
     /// Through the path, verified.
     Path,
     /// A test-owned name of the pinned inode, independent of procfs.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     Injected(PathBuf),
 }
 
@@ -356,7 +356,7 @@ impl PinnedInput {
     ///
     /// # Errors
     /// Pinning or opening the supplied name failed, or it names another file.
-    #[cfg(all(unix, feature = "test-hooks"))]
+    #[cfg(all(unix, pbfhogg_test_hooks))]
     pub fn pin_with_reopen_path(
         path: &Path,
         reopen_path: Option<&Path>,
@@ -381,16 +381,16 @@ impl PinnedInput {
     /// a regular file; the error names it.
     pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
         let host = &host.enter()?;
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         let force_path = host.invocation.faults().forces_pin_path_reopen();
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let force_path = false;
         Self::pin_with(path, host, force_path)
     }
 
     #[cfg(unix)]
     fn pin_with(path: &Path, host: &crate::host::Entered<'_>, force_path: bool) -> Result<Self> {
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = host;
         #[cfg(target_os = "linux")]
         let flags = libc::O_PATH;
@@ -418,14 +418,14 @@ impl PinnedInput {
             anchor,
             identity,
             reopen,
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             cancel: host.invocation.clone(),
         })))
     }
 
     #[cfg(not(unix))]
     fn pin_with(path: &Path, host: &crate::host::Entered<'_>, _force_path: bool) -> Result<Self> {
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = host;
         let meta = metadata(path)?;
         if !meta.is_file() {
@@ -438,7 +438,7 @@ impl PinnedInput {
         }
         Ok(Self(Arc::new(Pin {
             path: Arc::from(path),
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             cancel: host.invocation.clone(),
         })))
     }
@@ -509,7 +509,7 @@ impl PinnedInput {
         match &self.0.reopen {
             Reopen::Procfs => std::borrow::Cow::Owned(procfs_entry(&self.0.anchor)),
             Reopen::Path => std::borrow::Cow::Borrowed(&self.0.path),
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             Reopen::Injected(path) => std::borrow::Cow::Borrowed(path),
         }
     }
@@ -527,12 +527,12 @@ impl PinnedInput {
         clear_nonblock(file, &self.0.path)
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
         self.0.cancel.faults().pinned_open(&self.0.path, open)
     }
 
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     #[allow(clippy::unused_self)]
     fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
         open()
@@ -542,7 +542,7 @@ impl PinnedInput {
     /// input does not affect the run) rather than the path (a replaced input
     /// fails the run with `InputReplaced`), so a replacement test can tell
     /// which outcome this host owes.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, pbfhogg_test_hooks))]
     #[must_use]
     pub fn reopens_through_procfs(&self) -> bool {
         #[cfg(unix)]
@@ -936,7 +936,7 @@ mod pin_tests {
 
     /// The test-hooks replacement fires after the armed open and the later
     /// opens see it: refused through the path, unaffected through procfs.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn armed_replacement_fires_between_opens() {
         let dir = crate::path_guard::tests::scratch();

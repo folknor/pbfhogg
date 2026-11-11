@@ -14,6 +14,25 @@ import tomllib
 from rust_source_shapes import blank_comments_and_literals
 
 
+# Bare compiler cfgs the project declares in its check-cfg list. One is true
+# in a sweep only when that sweep's rustflags pass `--cfg NAME`.
+CUSTOM_CFGS = ('pbfhogg_test_hooks',)
+
+
+def sweep_cfgs(sweep):
+    """The CUSTOM_CFGS a sweep's rustflags set, as `--cfg NAME` or `--cfg=NAME`."""
+    flags = sweep.get('rustflags', [])
+    assert isinstance(flags, list), 'sweep rustflags must be a list'
+    found = set()
+    for index, flag in enumerate(flags):
+        if flag == '--cfg':
+            assert index + 1 < len(flags), 'trailing --cfg in sweep rustflags'
+            found.add(flags[index + 1])
+        elif flag.startswith('--cfg='):
+            found.add(flag[len('--cfg='):])
+    return found & set(CUSTOM_CFGS)
+
+
 def cfg_value(expression, features):
     tokens = re.findall(r'"[^"]*"|[A-Za-z_][\w-]*|[(),=]', expression)
     position = 0
@@ -40,6 +59,9 @@ def cfg_value(expression, features):
             return all(values) if name == 'all' else any(values)
         if name in ('test', 'unix'):
             return True
+        if name in CUSTOM_CFGS:
+            # Set only by a sweep's `--cfg` rustflags (see sweep_cfgs).
+            return name in features
         assert name in ('feature', 'target_os', 'target_env', 'target_endian', 'target_arch'), \
             f'unsupported cfg: {name}'
         assert tokens[position] == '='
@@ -183,7 +205,14 @@ def audit(root):
                 if expanded == features:
                     break
                 features = expanded
+            # Custom cfgs share the evaluator's name set with features, so a
+            # feature of the same name (declared, or implicit from an optional
+            # dependency and reached by expansion) would credit them without
+            # the cfg. Checked after expansion, before the cfgs join.
+            clash = (features | set(feature_map)) & set(CUSTOM_CFGS)
+            assert not clash, f'{member}: feature named like a custom cfg: {sorted(clash)}'
             features.add('musl' if sweep.get('target', '').endswith('-musl') else 'gnu')
+            features |= sweep_cfgs(sweep)
             for target in manifest.get('test', []):
                 if not set(target.get('required-features', [])).issubset(features):
                     continue

@@ -235,12 +235,12 @@ fn merge_creates(
         allow_version_regression: false,
     };
     let host = crate::common::test_host();
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .apply_changes_create_batch_blocks
         .store(batch_blocks, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     assert_eq!(batch_blocks, 0, "a batch override needs test-hooks");
     pbfhogg::apply_changes::merge(
         &base,
@@ -282,7 +282,7 @@ fn assert_run_written_whole(full_blocks: usize, batch_blocks: usize) {
 
 /// Batches of two blocks over three full blocks and one element: two full
 /// batches' worth crossed, the last batch partial.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
     assert_run_written_whole(3, 2);
@@ -295,7 +295,7 @@ fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
 /// that refusal and nothing is published. Which of two failures wins, and
 /// what reached the writer first, is `write_run`'s, pinned by its unit
 /// tests in `crates/lib/src/commands/apply_changes/stream_output.rs`.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_create_block_over_the_blob_limit_fails_the_merge_from_a_later_batch() {
     const OVERSIZE: usize = 33 << 20;

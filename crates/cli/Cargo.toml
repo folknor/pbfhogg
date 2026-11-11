@@ -56,10 +56,10 @@ hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
-# pbfhogg's fault plans (`pbfhogg::test_hooks`), and the CLI's own hooks (the
-# cancellation pause and count read from the environment, src/signals.rs).
-# The `all` check sweep enables it; production builds never do.
-test-hooks = ["pbfhogg/test-hooks"]
+# The CLI's environment hooks (src/signals.rs, src/host.rs) and pbfhogg's
+# fault plans compile only under the compiler cfg `pbfhogg_test_hooks`, not a
+# feature, so no feature selection or unification can put them in an
+# installed executable. The hook-testing check sweeps pass it as rustflags.
 
 [dependencies]
 pbfhogg = { version = "0.6", path = "../lib", default-features = false, features = ["commands"] }

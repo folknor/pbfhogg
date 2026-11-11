@@ -580,7 +580,7 @@ fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
 /// getparents with the hidden threshold instrument, which sends a small
 /// indexed file to the full-scan arm. An unindexed first blob keeps the walker.
 /// The flag exists only in test-hooks builds.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn getparents_full_scan(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--full-scan-min-blobs", "1"])
 }
@@ -1595,7 +1595,7 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         getparents_add_self,
         Mixed::RefusesPartial,
     ),
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     (
         "getparents --full-scan-min-blobs 1",
         getparents_full_scan,
@@ -1792,7 +1792,7 @@ const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
         Mixed::RefusesPartial,
     ),
     ("getparents", getparents, &[], Mixed::RefusesPartial),
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     (
         "getparents --full-scan-min-blobs 1 (walker: first blob unindexed)",
         getparents_full_scan,
@@ -2089,7 +2089,7 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
         ("getid", &["--invert"]),
         ("getparents", &[]),
         // The threshold flag exists only in test-hooks builds.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         ("getparents", &["--full-scan-min-blobs", "1"]),
     ];
     for &(command, extra) in modes {
@@ -2216,7 +2216,7 @@ fn check_pins_its_input_when_it_composes_checks() {
 /// that pinned or opened the path per check would report the replacement
 /// for the checks after it. One test per selector set, each a few dozen
 /// runs of the binary, so each stays inside the per-test watchdog.
-#[cfg(all(unix, feature = "test-hooks"))]
+#[cfg(all(unix, pbfhogg_test_hooks))]
 mod check_composition {
     use super::{CHECK_COMPOSITIONS, CliInvoker, Path};
 

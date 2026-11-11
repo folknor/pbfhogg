@@ -6,12 +6,30 @@ from pathlib import Path
 from unittest.mock import patch
 from check_test_modules import (
     cfg_value, module_edges, reachable, require_coverage, module_presence,
-    require_module_coverage,
+    require_module_coverage, sweep_cfgs,
 )
 
 
 def main():
-    assert cfg_value('all(feature = "commands", not(feature = "test-hooks"))', {'commands'})
+    assert cfg_value('all(feature = "commands", not(pbfhogg_test_hooks))', {'commands'})
+    assert not cfg_value('pbfhogg_test_hooks', {'commands'})
+    assert cfg_value('all(test, pbfhogg_test_hooks)', {'pbfhogg_test_hooks'})
+    assert sweep_cfgs({'rustflags': ['--cfg', 'pbfhogg_test_hooks']}) == {'pbfhogg_test_hooks'}
+    assert sweep_cfgs({'rustflags': ['--cfg=pbfhogg_test_hooks']}) == {'pbfhogg_test_hooks'}
+    assert sweep_cfgs({'features': ['pbfhogg_test_hooks']}) == set()
+    assert sweep_cfgs({'rustflags': ['--cfg', 'other']}) == set()
+    # A hook-gated module is covered only through a sweep that sets the cfg.
+    gated = '#[cfg(pbfhogg_test_hooks)]\nmod hooked {}\nmod always {}'
+    declared, plain = module_presence(gated, sweep_cfgs({}))
+    _, hooked = module_presence(gated, sweep_cfgs({'rustflags': ['--cfg', 'pbfhogg_test_hooks']}))
+    qualify_gated = lambda entries: {(Path('/g.rs'), line, name) for line, name in entries}
+    require_module_coverage(qualify_gated(declared), qualify_gated(hooked))
+    try:
+        require_module_coverage(qualify_gated(declared), qualify_gated(plain))
+    except AssertionError as error:
+        assert 'mod hooked' in str(error)
+    else:
+        raise AssertionError('hook module accepted without a hook-enabled sweep')
     assert not cfg_value('feature = "new-feature"', {'commands'})
     assert cfg_value('any(feature = "a", feature = "b")', {'b'})
     base = Path('/project/tests')

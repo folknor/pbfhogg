@@ -209,7 +209,7 @@ pub(super) fn stage3_slot_reorder(
 
                     // Test-only: hold this bucket, before any of its work,
                     // until stage 4 aborts the router (bounded).
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     cancel
                         .faults()
                         .on_altw_stage3_bucket(bucket_idx, || router.is_aborted());
@@ -221,7 +221,7 @@ pub(super) fn stage3_slot_reorder(
                     // stage 4 waiters; dropping the run's `RunScratch`
                     // removes the scratch directory. Release builds compile this out
                     // entirely.
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     if cancel.faults().altw_stage3_panic_at_bucket.load(Relaxed) == bucket_idx {
                         panic!(
                             "test-hooks: altw stage 3 worker {worker_id} panicking at bucket {bucket_idx}"

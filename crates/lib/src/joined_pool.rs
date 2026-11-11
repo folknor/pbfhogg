@@ -57,14 +57,14 @@ impl JoinedPool {
         threads: usize,
         invocation: &crate::host::Invocation,
     ) -> crate::Result<Self> {
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = invocation;
         // Exists before the first spawn, so a build that fails or unwinds
         // part way still joins what it started (rayon has told those threads
         // to stop by then).
         let mut workers = Workers {
             handles: Vec::with_capacity(threads),
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             hooks: invocation.clone(),
         };
         #[allow(
@@ -74,9 +74,9 @@ impl JoinedPool {
         let built = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .spawn_handler(|thread| {
-                #[cfg(feature = "test-hooks")]
+                #[cfg(pbfhogg_test_hooks)]
                 invocation.faults().on_built_pool_spawn(thread.index())?;
-                #[cfg(feature = "test-hooks")]
+                #[cfg(pbfhogg_test_hooks)]
                 let hooks = invocation.clone();
                 #[allow(
                     clippy::disallowed_methods,
@@ -84,7 +84,7 @@ impl JoinedPool {
                 )]
                 let handle = std::thread::Builder::new().spawn(move || {
                     thread.run();
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     hooks.faults().on_built_pool_thread_exit();
                 })?;
                 workers.handles.push(handle);
@@ -106,13 +106,13 @@ impl JoinedPool {
 /// The join guard: joins every handle it holds when it drops.
 struct Workers {
     handles: Vec<JoinHandle<()>>,
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     hooks: crate::host::Invocation,
 }
 
 impl Drop for Workers {
     fn drop(&mut self) {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.hooks.faults().on_built_pool_join();
         for handle in self.handles.drain(..) {
             // A worker that panicked does not stop the join of the rest. Its
@@ -126,7 +126,7 @@ impl Drop for Workers {
     }
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, pbfhogg_test_hooks))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

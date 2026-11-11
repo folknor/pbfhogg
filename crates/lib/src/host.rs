@@ -98,13 +98,13 @@ struct InvocationState {
     /// and the `Arc`'s reference counts at the head of the allocation move
     /// whenever a pool or a framing job clones the token.
     tripped: crate::counters::Padded<std::sync::atomic::AtomicBool>,
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     hook: std::sync::OnceLock<CheckHook>,
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     checks: std::sync::atomic::AtomicU64,
     /// The invocation's fault plan: every worker loop already holds the
     /// token, so this is where a test's injected faults reach them.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     faults: crate::test_hooks::FaultPlan,
     /// Every engine-level metric set of the invocation. Each set is on cache
     /// lines of its own (`counters::Padded`), apart from `tripped`.
@@ -173,7 +173,7 @@ fn contained(failed: &std::sync::atomic::AtomicBool, emit: impl FnOnce()) {
 /// A test-only callback run at every checkpoint with the checkpoint's
 /// 1-based ordinal; it may block (a test parks the run there until it is
 /// cancelled).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 type CheckHook = Box<dyn Fn(u64, &Invocation) + Send + Sync>;
 
 impl std::fmt::Debug for Invocation {
@@ -403,7 +403,7 @@ impl Invocation {
     fn finalize(&self) -> SealOutcome {
         use std::sync::atomic::Ordering::Release;
         let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             self.0
                 .faults
                 .seal_step(crate::test_hooks::SealStep::Snapshot);
@@ -425,7 +425,7 @@ impl Invocation {
         drop(self.0.sealed.set(Arc::clone(&snapshot)));
         if let SinkSlot::Call { sink, .. } = &self.0.sink {
             sink.close(&snapshot, || {
-                #[cfg(feature = "test-hooks")]
+                #[cfg(pbfhogg_test_hooks)]
                 self.0.faults.seal_step(crate::test_hooks::SealStep::Stream);
             });
         }
@@ -458,7 +458,7 @@ impl Invocation {
     }
 
     /// Test hook: the transition word and the census as they stand.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, pbfhogg_test_hooks))]
     #[doc(hidden)]
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
@@ -538,7 +538,7 @@ impl Invocation {
     /// hook that cancels must not run there.
     #[inline]
     pub(crate) fn checkpoint_hook(&self) {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.run_hook();
     }
 
@@ -562,7 +562,7 @@ impl Invocation {
     /// is tripped.
     #[inline]
     pub fn check(&self) -> crate::Result<()> {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.run_hook();
         if self.0.tripped.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(crate::error::new_cancelled());
@@ -607,7 +607,7 @@ impl Invocation {
         self.0.metrics.for_each(visit);
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[cold]
     fn run_hook(&self) {
         if let Some(hook) = self.0.hook.get() {
@@ -622,7 +622,7 @@ impl Invocation {
 
     /// Test hook: run `hook` at every checkpoint with its 1-based ordinal.
     /// Panics if a hook is already installed.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[doc(hidden)]
     pub fn on_check(&self, hook: impl Fn(u64, &Invocation) + Send + Sync + 'static) {
         assert!(
@@ -633,7 +633,7 @@ impl Invocation {
 
     /// Test hook: how many checkpoints have run under an installed
     /// [`on_check`](Self::on_check) hook.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[doc(hidden)]
     #[must_use]
     pub fn checks_passed(&self) -> u64 {
@@ -642,7 +642,7 @@ impl Invocation {
 
     /// Test hook: this token's fault plan, shared by every clone. Arm it on
     /// the token a test passes in its `Host`; see [`crate::test_hooks`].
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[doc(hidden)]
     #[must_use]
     pub fn faults(&self) -> &crate::test_hooks::FaultPlan {
@@ -717,7 +717,7 @@ impl Kind {
 }
 
 /// The transition word and census of an invocation, for tests.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, pbfhogg_test_hooks))]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
@@ -1022,7 +1022,7 @@ impl Recorder {
     /// poisoned lock is recovered: it guards no state, only exclusion.
     pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         let lock = &self.0.0.publishing;
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         match lock.try_lock() {
             Ok(guard) => return guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
@@ -2006,7 +2006,7 @@ impl Host {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     #[should_panic(expected = "a checkpoint hook is already installed")]
     fn duplicate_checkpoint_hook_is_refused() {

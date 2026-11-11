@@ -10,7 +10,7 @@ use pbfhogg::host::Invocation;
 use pbfhogg::{BoundOutput, CancelOutcome, Decision, Effect, Publication};
 
 /// Bound on every park; see the test time bounds in the library's tunables.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 const PARK: std::time::Duration = pbfhogg::TEST_HANG_BOUND;
 
 fn rows(invocation: &Invocation) -> Vec<Publication> {
@@ -78,7 +78,7 @@ fn reversed_creation_and_publication_order() {
 /// execution lock: a second publication waits undecided, and is row 2. The
 /// second is seen waiting on the lock (the plan's count of contended
 /// acquires), not assumed to after a pause.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn ordinal_order_is_execution_order_with_a_hook_parked() {
     let dir = crate::common::test_scratch();
@@ -284,7 +284,7 @@ fn publication_cannot_be_reentered_from_a_hook() {
     );
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod faults {
     use super::*;
     use pbfhogg::output::PublishFault;

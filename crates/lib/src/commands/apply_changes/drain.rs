@@ -303,7 +303,7 @@ pub(super) fn run_drain(
             match drain_rx.recv_timeout(recv_timeout) {
                 Ok(DrainMessage::Item(item)) => Some(item),
                 Ok(DrainMessage::NodeBoundary { node_end_seq: end }) => {
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(pbfhogg_test_hooks)]
                     cancel
                         .faults()
                         .on_apply_changes_boundary(end, state.next_seq);
@@ -372,7 +372,7 @@ pub(super) fn run_drain(
             // writer still counts against the window.
             window.release();
         }
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         cancel
             .faults()
             .apply_changes_drain_next_seq
@@ -453,7 +453,7 @@ pub(super) fn run_drain(
     // `rewrite.rs` so the cursor walk after end-of-stream emits creates
     // for any kinds whose blobs we never saw (or saw and finished).
     cancel.marker("MERGE_TRAILING_CREATES_START");
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     cancel
         .faults()
         .apply_changes_drain_past_nodes
@@ -725,7 +725,7 @@ fn process_item(
             item_kind.as_str()
         )));
     }
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     if item_kind != ElementKind::Node {
         writer
             .cancel_token()
@@ -986,7 +986,7 @@ impl DrainLocations {
             ignore_missing_nodes,
         } = self;
 
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         invocation.faults().before_apply_changes_coord_merge();
 
         // Seed with OSC pre-seeded coords (from
@@ -1041,7 +1041,7 @@ impl DrainLocations {
         if missing != 0 && !ignore_missing_nodes {
             // Test-only: a producer failure or a cancellation landing after the
             // drain's per-receive checks, which the checks below must rank.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             {
                 let faults = invocation.faults();
                 if faults
@@ -1080,7 +1080,7 @@ impl DrainLocations {
             ));
         }
 
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         invocation.faults().before_apply_changes_barrier_send();
         // A scanner that succeeds always receives this before exiting, small
         // inputs included: it blocks on it at its first way or relation
@@ -1091,7 +1091,7 @@ impl DrainLocations {
         if let Err(e) = barrier_tx.send(()) {
             let _: mpsc::SendError<()> = e;
         }
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         invocation
             .faults()
             .apply_changes_barrier_signalled

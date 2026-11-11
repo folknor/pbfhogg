@@ -393,28 +393,28 @@ impl FramingJob {
 
 /// Test hook: whether the framing closure for `seq` should panic (the
 /// fault plan's `framing_panic_at`, see `crate::test_hooks`).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn framing_panics_at(cancel: &crate::host::Recorder, seq: usize) -> bool {
     cancel.faults().framing_panics_at(seq)
 }
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 fn framing_panics_at(_cancel: &crate::host::Recorder, _seq: usize) -> bool {
     false
 }
 
 /// Test hooks: a framing job starting and finishing (the fault plan's
 /// `hold_framing_at` and `framing_jobs_done`, see `crate::test_hooks`).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn framing_job_starts(invocation: &crate::host::Recorder, seq: usize) {
     invocation.faults().on_framing_job(seq);
 }
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 fn framing_job_starts(_invocation: &crate::host::Recorder, _seq: usize) {}
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn framing_job_ends(invocation: &crate::host::Recorder) {
     invocation.faults().on_framing_job_done();
 }
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 fn framing_job_ends(_invocation: &crate::host::Recorder) {}
 
 /// Writes PBF files as a sequence of framed, compressed blobs.
@@ -903,7 +903,7 @@ impl<W: Write> PbfWriter<W> {
     /// `framing_panic_at` makes the framing work for that data blob (0-based,
     /// counting every blob sent through the pipeline) panic before it frames;
     /// a sync [`PbfWriter::new`] writer has no framing work.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[doc(hidden)]
     #[must_use]
     pub fn test_faults(&self) -> &crate::test_hooks::FaultPlan {
@@ -1120,7 +1120,7 @@ impl<W: Write> PbfWriter<W> {
                 executor: pipeline.executor.clone(),
                 permit,
             };
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             job.invocation.faults().on_framing_dispatch();
             pipeline.executor.spawn(move || job.run());
             self.mark_pending();

@@ -250,11 +250,11 @@ enum Prop {
     Published,
     TmpDir,
     Quiet,
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(dead_code))]
     Interrupted,
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(dead_code))]
     StagingDir,
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(dead_code))]
     SharedDir,
 }
 
@@ -1536,7 +1536,7 @@ fn a_quiet_run_prints_only_warnings_and_writes_the_same_outputs() {
 // payload) at some pause, so cleanup was exercised against real state rather
 // than inferred.
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod interrupted {
     use super::*;
     use std::time::{Duration, Instant};
@@ -1814,7 +1814,7 @@ mod interrupted {
 /// Every output-writing command, SIGINT or SIGTERM at checkpoints across the
 /// run (and once while replacing an existing output): the interrupted exit
 /// status, nothing at the destination, no `.pbfhogg-*` entry anywhere.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     use interrupted::{checkpoint_count, interrupt_at, sample};
     let count = checkpoint_count(fx, row)?;
@@ -1854,7 +1854,7 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
     run_property(Prop::Interrupted, interrupted_run_leaves_nothing, |_| true);
@@ -1862,7 +1862,7 @@ fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
 
 /// What one entry under a snapshotted directory is: a directory, a file and
 /// its bytes, or a symlink and its target.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[derive(Debug, PartialEq, Eq)]
 enum Snapshot {
     Dir,
@@ -1872,7 +1872,7 @@ enum Snapshot {
 
 /// Every entry under `dir` at any depth, by path relative to `dir`, sorted.
 /// Symlinks are recorded, never followed.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn tree_snapshot(dir: &Path) -> Vec<(PathBuf, Snapshot)> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Snapshot)>) {
         for name in names(dir) {
@@ -1896,7 +1896,7 @@ fn tree_snapshot(dir: &Path) -> Vec<(PathBuf, Snapshot)> {
 }
 
 /// Every name pbfhogg leaves behind anywhere under `dir`.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for name in names(dir) {
@@ -1916,7 +1916,7 @@ fn hidden_anywhere(dir: &Path) -> Vec<PathBuf> {
 /// `--tmp-dir`, and nothing beside its outputs, for every output form a
 /// caller can pass. The next run in the same directories succeeds and
 /// reports the staging entry it finds there.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Result<(), String> {
     killed_run_in(fx, row, false)
 }
@@ -1929,7 +1929,7 @@ fn killed_run_leaves_only_what_its_directories_hold(fx: &Fx, row: &Row) -> Resul
 /// replacing run through a fresh one leaves it empty. Rows without
 /// `--tmp-dir` make no run scratch, so `--staging-dir` alone is their whole
 /// layout and the property above covers them.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn killed_run_sharing_one_directory_leaves_everything_there(
     fx: &Fx,
     row: &Row,
@@ -1939,7 +1939,7 @@ fn killed_run_sharing_one_directory_leaves_everything_there(
 
 /// A run killed outright with `--staging-dir` (and `--tmp-dir` where the
 /// row takes it; with `shared`, the same directory for both).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[allow(clippy::too_many_lines)]
 fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -2104,7 +2104,7 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_killed_run_leaves_disposable_entries_only_in_the_directories_it_was_given() {
     run_property(
@@ -2114,7 +2114,7 @@ fn a_killed_run_leaves_disposable_entries_only_in_the_directories_it_was_given()
     );
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
     run_property(
@@ -2141,7 +2141,7 @@ fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
 // commands: publication is one routine behind every shape, and the
 // per-command `--staging-dir` wiring is the properties above.
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod in_publication {
     use super::*;
     use std::time::{Duration, Instant};
@@ -2594,7 +2594,7 @@ mod in_publication {
 
 /// One test per scenario: `name`, the row standing for the output shape,
 /// which outputs are planted, the faults, and whether they fail the run.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 macro_rules! killed_in_publication {
     ($($name:ident: $row:expr, $seeded:ident, $faults:expr, $fails:expr;)*) => {$(
         #[test]
@@ -2609,7 +2609,7 @@ macro_rules! killed_in_publication {
     )*};
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod killed_in_publication {
     use super::in_publication;
     use pbfhogg::test_hooks::PublishFault::*;
@@ -2791,7 +2791,7 @@ fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_wo
 /// `part` of `parts` takes the ordinals `k` with `k % parts == part`, so a
 /// row whose ordinals together outlast the check watchdog can be spread over
 /// several tests; `0` of `1` is every ordinal.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn every_ordinal_unwinds(fx: &Fx, row: &Row, part: u64, parts: u64) -> Result<(), String> {
     use interrupted::{checkpoint_count, interrupt_at};
     let count = checkpoint_count(fx, row)?;
@@ -2841,7 +2841,7 @@ fn every_ordinal_unwinds(fx: &Fx, row: &Row, part: u64, parts: u64) -> Result<()
 /// [`SPLIT`] one part of its ordinals: build-geocode-index alone ran about
 /// 23 s single-threaded, past the 20 s per-test kill however the rows were
 /// dealt.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod tier3 {
     use super::*;
 
@@ -2925,7 +2925,7 @@ mod tier3 {
 /// the next run's leftover scan. The paused thread is told to stay parked
 /// after seeing the cancellation, so the run cannot finish its cleanup and
 /// only the second signal ends it.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -3026,7 +3026,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
 
 /// The commands that write no output honour the same signals: the
 /// interrupted exit status and nothing left in the current directory.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_command_without_an_output_is_interrupted_too() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();

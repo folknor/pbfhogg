@@ -109,11 +109,11 @@ pub(crate) fn getparents_to<'a>(
 /// Not part of the supported library surface: it exists for this crate's
 /// own tests and for the CLI's hidden `--full-scan-min-blobs` flag, and may
 /// change or disappear without a deprecation cycle. It is public only
-/// because those callers live in other crates, and compiled only with the
-/// `test-hooks` feature, which production builds never enable. The
+/// because those callers live in other crates, and compiled only under the
+/// `pbfhogg_test_hooks` compiler cfg, which no Cargo feature enables. The
 /// threshold is otherwise a constant, not a tuning knob (see
 /// `crates/lib/src/tunables.rs`).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn getparents_with_min_blobs<'a>(
@@ -136,7 +136,7 @@ pub fn getparents_with_min_blobs<'a>(
 }
 
 /// [`getparents_with_min_blobs`] writing to a borrowed output it does not publish.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn getparents_with_min_blobs_to<'a>(
     input: impl Into<InputSource<'a>>,

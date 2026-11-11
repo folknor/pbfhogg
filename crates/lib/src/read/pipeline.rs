@@ -502,7 +502,7 @@ struct DecodeTask<'scope, X: DecodeTransform> {
     /// The read's running scratch sum, borrowed like `source`.
     scratch_pool: &'scope AtomicU64,
     /// The run's fault plan (the decode gate), borrowed like `source`.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     faults: &'scope crate::test_hooks::FaultPlan,
 }
 
@@ -523,7 +523,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         source,
         metrics,
         scratch_pool,
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         faults,
     } = task;
     scope.spawn(move |_| {
@@ -531,7 +531,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
             // Inside catch_unwind so the hook's park-timeout panic becomes a
             // decode error on the pipeline instead of escaping the rayon
             // spawn, which has no panic handler and would abort the process.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             faults.maybe_block_decode(seq);
             if blob.get_type() == BlobType::OsmData
                 && let Some(filter) = blob_filter.as_ref()
@@ -713,7 +713,7 @@ where
     let cancel = rec;
     // Borrowed into the decode tasks; the dispatcher closure moves the
     // reference, not the token.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     let faults = cancel.faults();
     let metrics: &PipelineMetrics = &cancel.metrics().pipeline;
     // The decode pool's buffers count their drops into the same invocation.
@@ -849,7 +849,7 @@ where
                                     source,
                                     metrics,
                                     scratch_pool,
-                                    #[cfg(feature = "test-hooks")]
+                                    #[cfg(pbfhogg_test_hooks)]
                                     faults,
                                 },
                             );
@@ -1186,10 +1186,10 @@ mod tests {
 
     /// What a decode worker's thread-local holds, torn down when its thread
     /// exits: it parks (bounded) until the test releases it.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     struct Teardown(Arc<TeardownState>);
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[derive(Default)]
     struct TeardownState {
         installed: AtomicUsize,
@@ -1198,7 +1198,7 @@ mod tests {
         release: AtomicBool,
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     impl Drop for Teardown {
         fn drop(&mut self) {
             self.0.started.fetch_add(1, Ordering::SeqCst);
@@ -1212,10 +1212,10 @@ mod tests {
 
     /// Releases every parked teardown and joins the reading thread on every
     /// exit path, a failed assertion included.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     struct ReleaseTeardowns(Arc<TeardownState>, Option<std::thread::JoinHandle<()>>);
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     impl Drop for ReleaseTeardowns {
         fn drop(&mut self) {
             self.0.release.store(true, Ordering::SeqCst);
@@ -1231,7 +1231,7 @@ mod tests {
     /// thread-locals hold outlives the read. The release waits until the
     /// read has reached its decode pool's join (the pool's test hook), so
     /// the read is provably at its join while a teardown is still parked.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     #[test]
     fn a_decode_worker_tearing_down_holds_the_read() {
         thread_local! {

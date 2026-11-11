@@ -1064,12 +1064,12 @@ fn settle_overflow(
         }
         false
     });
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()
         .check_overflow_ids
         .fetch_add(inserted, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = (host, inserted);
 }
 

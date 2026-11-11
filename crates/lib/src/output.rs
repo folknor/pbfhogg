@@ -204,7 +204,7 @@ impl<'a> Staging<'a> {
 pub type Validator = fn(&Path) -> Result<()>;
 
 /// A fault injected into publication by a test.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishFault {
@@ -257,7 +257,7 @@ pub enum PublishFault {
 
 /// One spelling per fault, the one [`std::str::FromStr`] reads: kebab case,
 /// a member index after a colon (`after-installed:1`).
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 impl std::str::FromStr for PublishFault {
     type Err = Error;
 
@@ -289,7 +289,7 @@ impl std::str::FromStr for PublishFault {
 }
 
 /// `name` or `name:k`.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 fn split_member(s: &str) -> Result<(&str, Option<usize>)> {
     match s.split_once(':') {
         None => Ok((s, None)),
@@ -314,7 +314,7 @@ fn split_member(s: &str) -> Result<(&str, Option<usize>)> {
 /// output). Directory syncs change no names, so they are one step that
 /// says every attempt finished, whatever the outcome; durability is not
 /// something a killed process can show.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishStep {
@@ -353,7 +353,7 @@ pub enum PublishStep {
     StagingRemoved(usize),
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 impl std::fmt::Display for PublishStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (name, member) = match *self {
@@ -378,7 +378,7 @@ impl std::fmt::Display for PublishStep {
 }
 
 /// Reads what [`Display`](std::fmt::Display) writes.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 impl std::str::FromStr for PublishStep {
     type Err = Error;
 
@@ -412,13 +412,13 @@ impl std::str::FromStr for PublishStep {
 /// whose observer hears every [`PublishStep`]. Publication faults ride the
 /// token like every other fault, so a front end that builds its outputs in
 /// several places arms them in one.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 struct Faults {
     armed: Vec<PublishFault>,
     invocation: crate::host::Invocation,
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 impl Faults {
     fn of(invocation: &crate::host::Recorder) -> Self {
         Self {
@@ -437,11 +437,11 @@ impl Faults {
 }
 
 /// Without `test-hooks` there are no faults to carry.
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 #[derive(Clone, Copy, Debug, Default)]
 struct Faults;
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(pbfhogg_test_hooks))]
 impl Faults {
     fn of(_invocation: &crate::host::Recorder) -> Self {
         Self
@@ -451,9 +451,9 @@ impl Faults {
 /// Spell a fault in a way that compiles away without `test-hooks`.
 macro_rules! fault_is {
     ($faults:expr, $variant:expr) => {{
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         let hit = $faults.has($variant);
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let hit = {
             let _ = $faults;
             false
@@ -465,9 +465,9 @@ macro_rules! fault_is {
 /// Announce a [`PublishStep`]; compiles away without `test-hooks`.
 macro_rules! step {
     ($faults:expr, $step:expr) => {{
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         $faults.step($step);
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let _ = $faults;
     }};
 }
@@ -1642,7 +1642,7 @@ impl Target {
     ///
     /// `member` is this target's position in its group (0 for a lone
     /// output), which only a test's fault plan reads.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn install(
         &mut self,
         member: usize,
@@ -1684,7 +1684,7 @@ impl Target {
         }
     }
 
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn install_exclusive(
         &mut self,
         member: usize,
@@ -1731,7 +1731,7 @@ impl Target {
     /// `link(2)` fails when the destination exists, so it is exclusive. It
     /// publishes at the moment it succeeds; removing the staging name after
     /// that is cleanup, never a publication failure.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn install_by_link(
         &mut self,
         member: usize,
@@ -1783,7 +1783,7 @@ impl Target {
         }
     }
 
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn install_replacing(
         &mut self,
         member: usize,
@@ -1829,7 +1829,7 @@ impl Target {
 
     /// Move the present destination into an exclusively reserved backup
     /// and make that durable, for a replacement that must stay reversible.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn move_aside(
         &mut self,
         member: usize,
@@ -2035,7 +2035,7 @@ impl Target {
     }
 
     /// Rename the previous output back to the destination.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn restore(&mut self, member: usize, backup: &Backup, faults: &Faults) -> bool {
         let restored = !fault_is!(faults, PublishFault::RestoreRename)
             && fs::rename(&backup.entry, &self.dest).is_ok();
@@ -2054,7 +2054,7 @@ impl Target {
     /// new file, so it is never taken out without being restored; a
     /// directory is renamed back into staging first, so it can be taken
     /// out and its previous generation still fail to come back.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn uninstall(&mut self, member: usize, backup: Option<&Backup>, faults: &Faults) -> Undone {
         let taken_out = match (self.shape, backup) {
             (Shape::File, Some(_)) => false,
@@ -2082,7 +2082,7 @@ impl Target {
     }
 
     /// Remove a backup container that a restore just emptied.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn remove_empty_backup(&mut self, member: usize, backup: &Backup, faults: &Faults) {
         match fs::remove_dir(&backup.container) {
             Ok(()) => step!(faults, PublishStep::BackupRemoved(member)),
@@ -2104,7 +2104,7 @@ impl Target {
     /// deletes, or cannot complete: then it is kept and reported. Cleanup is
     /// best effort: the output is already in place, so trouble is recorded
     /// for the warning, never returned as an error.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn commit(&mut self, member: usize, remove_backup: bool, faults: &Faults) -> Option<PathBuf> {
         let mut kept = None;
         if let State::Installed {
@@ -2132,7 +2132,7 @@ impl Target {
         kept
     }
 
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_variables))]
     fn remove_backup(&mut self, member: usize, backup: &Backup, faults: &Faults) {
         match crate::scratch::protected_entries(&backup.container) {
             Ok(found) if found.is_empty() => {}
@@ -2769,9 +2769,9 @@ impl Output {
         // A test can make every backend refuse as a platform would; the
         // refusal is the constructor's result, so the failure handling below
         // runs exactly as for a real one.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         let refused = host.invocation.faults().output_backend_refusal();
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(pbfhogg_test_hooks))]
         let refused: Option<Error> = None;
         let writer = if let Some(refusal) = refused {
             Err(refusal)
@@ -4864,7 +4864,7 @@ mod tests {
         assert!(rename_refused_between(dir.path(), proc));
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     mod faults {
         use super::*;
         use crate::host::Invocation;

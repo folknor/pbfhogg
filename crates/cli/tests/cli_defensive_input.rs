@@ -465,7 +465,7 @@ fn cat_rejects_truncated_node_blob_payload() {
 /// input is opened, which is why this passes a path that does not exist:
 /// if the bound were dropped the command would get as far as the file and
 /// fail with a different message.
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 #[test]
 fn getparents_rejects_zero_full_scan_min_blobs() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -499,7 +499,7 @@ fn full_scan_min_blobs_exists_only_in_test_hooks_builds() {
     let present = getparents
         .get_arguments()
         .any(|arg| arg.get_long() == Some("full-scan-min-blobs"));
-    assert_eq!(present, cfg!(feature = "test-hooks"));
+    assert_eq!(present, cfg!(pbfhogg_test_hooks));
 }
 
 /// Public readers discard diagnostics unless the CLI explicitly attaches its

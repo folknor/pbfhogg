@@ -115,7 +115,7 @@ impl<'a> CreateEncoder<'a> {
 /// fault plan's nonzero override in a test-hooks build. Scheduling only:
 /// the blocks are cut at the element cap whatever the batch.
 fn create_batch_blocks(invocation: &crate::host::Invocation) -> NonZeroUsize {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     if let Some(forced) = NonZeroUsize::new(
         invocation
             .faults()
@@ -124,7 +124,7 @@ fn create_batch_blocks(invocation: &crate::host::Invocation) -> NonZeroUsize {
     ) {
         return forced;
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = invocation;
     APPLY_CHANGES_CREATE_BATCH_BLOCKS
 }

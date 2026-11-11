@@ -655,7 +655,7 @@ fn text_unit_limits(invocation: &crate::host::Recorder) -> (usize, usize) {
         crate::tunables::DIFF_OUTPUT_CHUNK_BYTES,
         crate::tunables::DIFF_TEXT_OVERFLOW_BYTES,
     );
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     {
         use std::sync::atomic::Ordering;
         let faults = invocation.faults();
@@ -668,7 +668,7 @@ fn text_unit_limits(invocation: &crate::host::Recorder) -> (usize, usize) {
             overflow = forced;
         }
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(pbfhogg_test_hooks))]
     let _ = (invocation, &mut chunk, &mut overflow);
     (chunk, overflow)
 }
@@ -717,12 +717,12 @@ impl<'o, W: Write> units::UnitConsumer for TextConsumer<'_, 'o, W> {
         invocation.counter(name, units);
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize {
         &faults.diff_unit_panic
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     fn panic_message(idx: usize) -> String {
         format!("test-hooks: diff unit {idx} panicking")
     }

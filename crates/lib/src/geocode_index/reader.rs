@@ -208,7 +208,7 @@ impl<'a> Candidates<'a> {
 pub struct Reader {
     /// Admin point-in-polygon tests run by this reader since it was opened
     /// or last reset. Per reader, so a test observes only its own queries.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     admin_pip_calls: std::sync::atomic::AtomicUsize,
 
     header: Header,
@@ -344,7 +344,7 @@ impl Reader {
             })
             .unwrap_or(0);
         let mut reader = Self {
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             fine_max_dist_sq: geo::meters_to_radians_sq(fine_radius_m),
             coarse_max_dist_sq: geo::meters_to_radians_sq(coarse_radius_m),
@@ -900,7 +900,7 @@ impl Reader {
     }
 
     /// Zero this reader's admin point-in-polygon call count.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     pub fn reset_admin_pip_calls(&self) {
         self.admin_pip_calls
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -909,7 +909,7 @@ impl Reader {
     /// Admin point-in-polygon tests this reader has run since it was opened
     /// or last reset. Other readers do not contribute; concurrent queries on
     /// this same reader do.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(pbfhogg_test_hooks)]
     pub fn admin_pip_calls(&self) -> usize {
         self.admin_pip_calls
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1829,7 +1829,7 @@ impl Reader {
     }
 
     fn admin_polygon_contains(&self, ctx: &QueryContext, poly: &AdminPolygon) -> bool {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(pbfhogg_test_hooks)]
         self.admin_pip_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if poly.vertex_count < 3 {
@@ -2374,7 +2374,7 @@ mod tests {
         let empty = scratch.child("empty");
         std::fs::write(&empty, b"").expect("empty record file");
         Reader {
-            #[cfg(feature = "test-hooks")]
+            #[cfg(pbfhogg_test_hooks)]
             admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             header: Header {
                 format_version: format::FORMAT_VERSION,

@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-#[cfg(feature = "test-hooks")]
+#[cfg(pbfhogg_test_hooks)]
 mod apply_changes {
     use std::fs::File;
     use std::io::Write;

@@ -745,7 +745,7 @@ fn build_generation(
         "Pass 3: S2 cells + write (bucketed)..."
     );
     #[cfg(feature = "hotpath")]
-    let pass4_start = crate::counters::Stopwatch::start();
+    let pass3_start = crate::counters::Stopwatch::start();
 
     let sl = config.street_level;
     let cl = config.coarse_level;
@@ -798,6 +798,13 @@ fn build_generation(
     host.invocation.marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(output_dir, &mut { admin_cell_entries })?;
     host.invocation.marker("GEOCODE_PASS3_ADMIN_INDEX_END");
+    // Pass 3 ends with the last cell file. The header write and the smoke
+    // test below are not cell work, so they stay outside its span (and its
+    // hotpath stopwatch); the smoke test, which reopens and validates every
+    // written file, gets its own marker pair.
+    #[cfg(feature = "hotpath")]
+    let pass3_ms = pass3_start.elapsed_ms();
+    host.invocation.marker("GEOCODE_PASS3_END");
     host.invocation.check()?;
 
     crate::host::diag!(
@@ -845,6 +852,7 @@ fn build_generation(
     // record gets one entry per level unconditionally, so no input can make
     // it miss: a miss is a builder bug and refuses publication. Public query
     // behaviour is the tests' to prove, not this check's.
+    host.invocation.marker("GEOCODE_SMOKE_TEST_START");
     let first_addr_point = if addr_point_count > 0 {
         Some(addr_points.table().get(0).ok_or_else(|| {
             Error::internal(
@@ -884,9 +892,7 @@ fn build_generation(
             SmokeOutcome::SkippedNoAddressPoints
         }
     };
-
-    #[cfg(feature = "hotpath")]
-    let pass4_ms = pass4_start.elapsed_ms();
+    host.invocation.marker("GEOCODE_SMOKE_TEST_END");
 
     let stats = BuildStats {
         addr_points: u64::from(header.addr_point_count),
@@ -944,7 +950,7 @@ fn build_generation(
             host.diagnostics,
             Developer,
             "geocode.hotpath.pass3_cells_ms",
-            "pass3_cells_ms={pass4_ms}"
+            "pass3_cells_ms={pass3_ms}"
         );
         crate::host::diag!(
             host.diagnostics,
@@ -986,7 +992,6 @@ fn build_generation(
             strings.unique_count()
         );
     }
-    host.invocation.marker("GEOCODE_PASS3_END");
 
     Ok(stats)
 }

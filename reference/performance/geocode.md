@@ -227,8 +227,11 @@ planet it did not (29.7 s), and moving the address merge loop into one
 out-of-line function shared by both merges did (21.7 s). A `--hotpath`
 build of the slow variant also ran Pass 2a in 21.5 s, so the slowdown was
 code generation of the inlined merge, not work. The remaining
-difference is the segment after the admin index, which writes the index
-files (about 14 to 16.5 s, 24.8 to 26.0 GB written): the larger records.
+difference is the segment after the admin index (about 14 to 16.5 s,
+24.8 to 26.0 GB written). That segment held the header write and the
+smoke test's reader-open validation, and these cells do not separate the
+two, so what in it the larger records cost is unattributed. Builds since `GEOCODE_SMOKE_TEST` was added time the smoke
+test as its own span and end `GEOCODE_PASS3` before the header write.
 The variant planet index holds 167,816,443 address points; no baseline
 count was taken. Only `82d91ad9` of the baseline cells is stored in
 `results.db`.

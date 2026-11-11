@@ -83,9 +83,10 @@ params.jobs = { validated = true, help = "unsigned 64-bit worker count; 0 is aut
 [bench.geocode-build]
 script_file = "../benches/build-geocode-index/geocode-build.lua"
 description = "Build a reverse geocoding index from a dataset or snapshot"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-11
 changelog = [
+  { version = 2, date = 2026-11-11, note = "GEOCODE_PASS3_END now fires after the admin index, before the header write and the new GEOCODE_SMOKE_TEST pair, so a stop at Pass 3 no longer includes them; full builds stay comparable" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed build-geocode-index: forced overwrite and unindexed fallback, snapshots, direct I/O and profiling with marker stops" },
 ]

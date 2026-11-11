@@ -18,16 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-009 - Geocode Pass 3's span includes the header write and smoke test
-
-Lateral finding from the BUG-006 scout, not yet judged. The geocode builder's smoke
-test has no marker pair of its own, and `GEOCODE_PASS3_END` fires after it, so
-Pass 3's sidecar span also counts the header write and the smoke test. Timing
-attribution only, not correctness.
-
-Fix: end the Pass 3 span before the header write and give the smoke test its own
-START/END pair.
-
 ## BUG-010 - Feature-gated code never builds for musl
 
 Lateral finding from the BUG-008 work, not yet judged. The `musl` sweep in
